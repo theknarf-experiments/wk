@@ -18,7 +18,10 @@ use sdl2::keyboard::Keycode;
 use sdl2::video::Window;
 use sdl2::mouse::{Cursor,SystemCursor,MouseState};
 use sdl2::keyboard::Scancode;
-use imgui::{Context,MouseCursor,Key,ConfigFlags};
+use imgui::*;
+
+use wk::{Renderer, RendererConfig};
+use pollster::block_on;
 
 pub struct ImguiSdl2 {
   mouse_press: [bool; 5],
@@ -243,15 +246,24 @@ impl ImguiSdl2 {
 }
 
 fn main() -> Result<(), String> {
-    //example1()
-    //example2()
-    example3()
+		use std::env;
+    env_logger::init();
+
+    let args: Vec<String> = env::args().collect();
+
+    if args.len() < 2 {
+        return Err("Please provide an argument to choose the function (example1, example2, example3)".to_string());
+    }
+
+    match args[1].as_str() {
+        "example1" => example1(),
+        "example2" => example2(),
+        "example3" => example3(),
+        _ => Err("Invalid argument. Please use example1, example2, or example3".to_string()),
+    }
 }
 
 fn example1() -> Result<(), String> {
-    // Show logs from wgpu
-    env_logger::init();
-
     let sdl_context = sdl2::init()?;
     let video = sdl_context.video()?;
 
@@ -442,9 +454,6 @@ fn example1() -> Result<(), String> {
 }
 
 fn example2() -> Result<(), String> {
- // Show logs from wgpu
-    env_logger::init();
-
     let sdl_context = sdl2::init()?;
     let video = sdl_context.video()?;
 
@@ -480,9 +489,6 @@ fn example2() -> Result<(), String> {
 
 
   'running: loop {
-    use sdl2::event::Event;
-    use sdl2::keyboard::Keycode;
-
     for event in event_pump.poll_iter() {
       imgui_sdl2.handle_event(&mut imgui, &event);
       if imgui_sdl2.ignore_event(&event) { continue; }
@@ -522,19 +528,12 @@ fn example2() -> Result<(), String> {
 }
 
 fn example3() -> Result<(), String> {
-    use imgui::*;
-    use wk::{Renderer, RendererConfig};
-    use pollster::block_on;
-
     use winit::{
         dpi::LogicalSize,
         event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent},
         event_loop::{ControlFlow, EventLoop},
         window::Window,
     };
-
-
-    env_logger::init();
 
     // Set up window and GPU
     let event_loop = EventLoop::new();
@@ -545,14 +544,12 @@ fn example3() -> Result<(), String> {
     });
 
     let (window, size, surface) = {
-        let version = env!("CARGO_PKG_VERSION");
-
         let window = Window::new(&event_loop).unwrap();
         window.set_inner_size(LogicalSize {
             width: 1280.0,
             height: 720.0,
         });
-        window.set_title(&format!("imgui-wgpu {version}"));
+        window.set_title(&format!("imgui-wgpu-winit"));
         let size = window.inner_size();
 
         let surface = unsafe { instance.create_surface(&window) }.unwrap();
@@ -756,6 +753,4 @@ fn example3() -> Result<(), String> {
 
         platform.handle_event(imgui.io_mut(), &window, &event);
     });
-
-    Ok(())
 }
