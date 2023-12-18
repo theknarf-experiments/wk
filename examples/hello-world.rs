@@ -1,18 +1,23 @@
 extern crate imgui_winit_support;
 
-use imgui::*;
-use wk::{Renderer, RendererConfig};
-use pollster::block_on;
-
-use std::time::Instant;
-use winit::{
-    dpi::LogicalSize,
-    event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent},
-    event_loop::{ControlFlow, EventLoop},
-    window::Window,
-};
-
 fn main() {
+    example3()
+}
+
+fn example3() {
+    use imgui::*;
+    use wk::{Renderer, RendererConfig};
+    use pollster::block_on;
+
+    use std::time::Instant;
+    use winit::{
+        dpi::LogicalSize,
+        event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent},
+        event_loop::{ControlFlow, EventLoop},
+        window::Window,
+    };
+
+
     env_logger::init();
 
     // Set up window and GPU
