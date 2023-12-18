@@ -1,0 +1,29 @@
+[licenses]
+unlicensed = "deny"
+allow-osi-fsf-free = "either"
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "MPL-2.0",
+    "Unlicense",
+]
+
+[bans]
+multiple-versions = "deny"
+skip = [
+]
+skip-tree = [
+    { name = "winit", version = "0.27.5" },
+    { name = "windows-sys", version = "0.36.1" },
+]
+
+[advisories]
+vulnerability = "deny"
+unmaintained = "deny"
+ignore = [
+    "RUSTSEC-2022-0048"
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "allow"
