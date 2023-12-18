@@ -1,9 +1,10 @@
-use image::ImageFormat;
+extern crate imgui_winit_support;
+
 use imgui::*;
-use imgui_wgpu::{Renderer, RendererConfig, Texture, TextureConfig};
+use wk::{Renderer, RendererConfig};
 use pollster::block_on;
+
 use std::time::Instant;
-use wgpu::Extent3d;
 use winit::{
     dpi::LogicalSize,
     event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent},
@@ -47,15 +48,8 @@ fn main() {
     }))
     .unwrap();
 
-    let (device, queue) = block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: None,
-            features: wgpu::Features::empty(),
-            limits: wgpu::Limits::default(),
-        },
-        None,
-    ))
-    .unwrap();
+    let (device, queue) =
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).unwrap();
 
     // Set up swap chain
     let surface_desc = wgpu::SurfaceConfiguration {
@@ -101,6 +95,7 @@ fn main() {
         b: 0.3,
         a: 1.0,
     };
+
     let renderer_config = RendererConfig {
         texture_format: surface_desc.format,
         ..Default::default()
@@ -109,30 +104,7 @@ fn main() {
     let mut renderer = Renderer::new(&mut imgui, &device, &queue, renderer_config);
 
     let mut last_frame = Instant::now();
-
-    // Set up Lenna texture
-    let lenna_bytes = include_bytes!("../resources/checker.png");
-    let image =
-        image::load_from_memory_with_format(lenna_bytes, ImageFormat::Png).expect("invalid image");
-    let image = image.to_rgba8();
-    let (width, height) = image.dimensions();
-    let raw_data = image.into_raw();
-
-    let texture_config = TextureConfig {
-        size: Extent3d {
-            width,
-            height,
-            ..Default::default()
-        },
-        label: Some("lenna texture"),
-        format: Some(wgpu::TextureFormat::Rgba8Unorm),
-        ..Default::default()
-    };
-
-    let texture = Texture::new(&device, &renderer, texture_config);
-
-    texture.write(&queue, &raw_data, width, height);
-    let lenna_texture_id = renderer.textures.insert(texture);
+    let mut demo_open = true;
 
     let mut last_cursor = None;
 
@@ -179,10 +151,9 @@ fn main() {
             } => {
                 *control_flow = ControlFlow::Exit;
             }
-            Event::MainEventsCleared => {
-                window.request_redraw();
-            }
+            Event::MainEventsCleared => window.request_redraw(),
             Event::RedrawEventsCleared => {
+                let delta_s = last_frame.elapsed();
                 let now = Instant::now();
                 imgui.io_mut().update_delta_time(now - last_frame);
                 last_frame = now;
@@ -200,15 +171,29 @@ fn main() {
                 let ui = imgui.frame();
 
                 {
-                    let size = [width as f32, height as f32];
                     let window = ui.window("Hello world");
                     window
-                        .size([400.0, 600.0], Condition::FirstUseEver)
+                        .size([300.0, 100.0], Condition::FirstUseEver)
                         .build(|| {
-                            ui.text("Hello textures!");
-                            ui.text("Say hello to checker.png");
-                            Image::new(lenna_texture_id, size).build(ui);
+                            ui.text("Hello world!");
+                            ui.text("This...is...imgui-rs on WGPU!");
+                            ui.separator();
+                            let mouse_pos = ui.io().mouse_pos;
+                            ui.text(format!(
+                                "Mouse Position: ({:.1},{:.1})",
+                                mouse_pos[0], mouse_pos[1]
+                            ));
                         });
+
+                    let window = ui.window("Hello too");
+                    window
+                        .size([400.0, 200.0], Condition::FirstUseEver)
+                        .position([400.0, 200.0], Condition::FirstUseEver)
+                        .build(|| {
+                            ui.text(format!("Frametime: {delta_s:?}"));
+                        });
+
+                    ui.show_demo_window(&mut demo_open);
                 }
 
                 let mut encoder: wgpu::CommandEncoder =
@@ -242,6 +227,7 @@ fn main() {
                 drop(rpass);
 
                 queue.submit(Some(encoder.finish()));
+
                 frame.present();
             }
             _ => (),

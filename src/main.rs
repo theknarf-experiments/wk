@@ -4,9 +4,7 @@ extern crate gl;
 extern crate imgui_opengl_renderer;
 extern crate pollster;
 extern crate wgpu;
-extern crate imgui_wgpu;
-
-use imgui_wgpu::{Renderer, RendererConfig};
+extern crate wk;
 
 use std::time::Instant;
 
@@ -244,8 +242,8 @@ impl ImguiSdl2 {
 }
 
 fn main() -> Result<(), String> {
-    example1()
-    //example2()
+    //example1()
+    example2()
 }
 
 fn example1() -> Result<(), String> {

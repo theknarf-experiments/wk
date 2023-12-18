@@ -1,6 +1,6 @@
 use bytemuck::{Pod, Zeroable};
 use imgui::*;
-use imgui_wgpu::{Renderer, RendererConfig, Texture, TextureConfig};
+use wk::{Renderer, RendererConfig, Texture, TextureConfig};
 use pollster::block_on;
 use std::time::Instant;
 use wgpu::{include_wgsl, util::DeviceExt, Extent3d};

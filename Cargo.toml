@@ -8,15 +8,27 @@ edition = "2021"
 [dependencies]
 env_logger = "0.10.0"
 imgui = "0.11.0"
-imgui-wgpu = "0.24.0"
+#imgui-wgpu = "0.24.0"
 pollster = "0.3.0"
 raw-window-handle = "0.5.2"
 wgpu = "0.17.0"
 # don't really need these, but just for the imgui-sdl2 original example to get it working
 gl = "0.10.0"
 imgui-opengl-renderer = "0.12.1"
+# from imgui-wgpu:
+bytemuck = "1"
+log = "0.4"
+smallvec = "1"
 
 [dependencies.sdl2]
 git = "https://github.com/rust-sdl2/rust-sdl2"
 default-features = false
 features = ["raw-window-handle"]
+
+# from imgui-wgpu:
+[dev-dependencies]
+bytemuck = { version = "1.13", features = ["derive"] }
+cgmath = "0.18"
+image = { version = "0.24", default-features = false, features = ["png"] }
+imgui-winit-support = "0.11"
+winit = "0.27.5"
