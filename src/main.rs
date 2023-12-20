@@ -166,10 +166,12 @@ impl ImguiSdl2 {
         let (win_w, win_h) = window.size();
         let (draw_w, draw_h) = window.drawable_size();
 
+        let dpi_scaling = 1.0 / 2.0; // TODO: get dpi dynamically
+
         io.display_size = [win_w as f32, win_h as f32];
         io.display_framebuffer_scale = [
-            (draw_w as f32) / (win_w as f32),
-            (draw_h as f32) / (win_h as f32),
+            (draw_w as f32) / (win_w as f32) * dpi_scaling,
+            (draw_h as f32) / (win_h as f32) * dpi_scaling,
         ];
 
         // Merging the mousedown events we received into the current state prevents us from missing
@@ -250,6 +252,7 @@ fn main() -> Result<(), String> {
         "example1" => example1(),
         "example2" => example2(),
         "example3" => example3(),
+        "example4" => example4(),
         _ => Err("Invalid argument. Please use example1, example2, or example3".to_string()),
     }
 }
@@ -748,4 +751,167 @@ fn example3() -> Result<(), String> {
 
         platform.handle_event(imgui.io_mut(), &window, &event);
     });
+}
+
+fn example4() -> Result<(), String> {
+    let sdl_context = sdl2::init()?;
+    let video = sdl_context.video()?;
+
+    let window = video
+        .window("Raw Window Handle Example", 800, 600)
+        .position_centered()
+        .resizable()
+        .metal_view()
+        .allow_highdpi()
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let (width, height) = window.size();
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY,
+        ..Default::default()
+    });
+
+    let surface = unsafe { instance.create_surface(&window) }.unwrap();
+
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: Some(&surface),
+        force_fallback_adapter: false,
+    }))
+    .unwrap();
+
+    let (device, queue) =
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+        .unwrap();
+
+    // Set up swap chain
+    let surface_desc = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format: wgpu::TextureFormat::Bgra8UnormSrgb,
+        width: width,
+        height: height,
+        present_mode: wgpu::PresentMode::Fifo,
+        alpha_mode: wgpu::CompositeAlphaMode::Auto,
+        view_formats: vec![wgpu::TextureFormat::Bgra8Unorm],
+    };
+
+    surface.configure(&device, &surface_desc);
+
+    // Set up dear imgui
+    let mut imgui = imgui::Context::create();
+    imgui.set_ini_filename(None);
+
+    let hidpi_factor = 1.0;
+    let font_size = (13.0 * hidpi_factor) as f32;
+    imgui.io_mut().font_global_scale = (1.0 / hidpi_factor) as f32;
+
+    imgui.fonts().add_font(&[FontSource::DefaultFontData {
+        config: Some(imgui::FontConfig {
+            oversample_h: 1,
+            pixel_snap_h: true,
+            size_pixels: font_size,
+            ..Default::default()
+        }),
+    }]);
+
+    //
+    // Set up dear imgui wgpu renderer
+    //
+    let clear_color = wgpu::Color {
+        r: 0.1,
+        g: 0.2,
+        b: 0.3,
+        a: 1.0,
+    };
+
+    let renderer_config = RendererConfig {
+        texture_format: surface_desc.format,
+        ..Default::default()
+    };
+
+    let mut renderer = Renderer::new(&mut imgui, &device, &queue, renderer_config);
+
+    let mut last_frame = Instant::now();
+
+    //let mut last_cursor = None;
+
+    let mut imgui_sdl2 = ImguiSdl2::new(&mut imgui, &window);
+    let mut event_pump = sdl_context.event_pump().unwrap();
+
+    // Game loop / rendering loop
+    'running: loop {
+        for event in event_pump.poll_iter() {
+            imgui_sdl2.handle_event(&mut imgui, &event);
+            if imgui_sdl2.ignore_event(&event) {
+                continue;
+            }
+
+            match event {
+                Event::Quit { .. }
+                | Event::KeyDown {
+                    keycode: Some(Keycode::Escape),
+                    ..
+                } => break 'running Ok(()),
+                _ => {}
+            }
+        }
+
+        imgui_sdl2.prepare_frame(imgui.io_mut(), &window, &event_pump.mouse_state());
+
+        let now = Instant::now();
+        let delta = now - last_frame;
+        let delta_s = delta.as_secs() as f32 + delta.subsec_nanos() as f32 / 1_000_000_000.0;
+        last_frame = now;
+
+        imgui.io_mut().delta_time = delta_s;
+
+        let frame = match surface.get_current_texture() {
+            Ok(frame) => frame,
+            Err(e) => {
+                eprintln!("dropped frame: {e:?}");
+                continue;
+            }
+        };
+
+        let ui = imgui.frame();
+        ui.show_demo_window(&mut true);
+
+        imgui_sdl2.prepare_render(&ui, &window);
+
+        let mut encoder = device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor {
+                label: Some("command_encoder"),
+            }
+        );
+
+        {
+            let view = frame
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(clear_color),
+                        store: true,
+                    },
+                })],
+                depth_stencil_attachment: None,
+            });
+
+            renderer
+                .render(imgui.render(), &queue, &device, &mut rpass)
+                .expect("Rendering failed");
+        }
+
+        queue.submit([encoder.finish()]);
+        frame.present();
+
+        ::std::thread::sleep(::std::time::Duration::new(0, 1_000_000_000u32 / 60));
+    }
 }
