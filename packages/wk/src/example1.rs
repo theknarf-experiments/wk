@@ -109,6 +109,19 @@ pub fn example1() -> Result<(), String> {
                     keycode: Some(Keycode::Escape),
                     ..
                 } => break 'running Ok(()),
+                Event::Window { win_event: sdl2::event::WindowEvent::Resized(width, height), .. } => {
+                    // Update surface configuration with new dimensions
+                    let surface_desc = wgpu::SurfaceConfiguration {
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                        format: surface_desc.format,
+                        width: width as u32,
+                        height: height as u32,
+                        present_mode: wgpu::PresentMode::Fifo,
+                        alpha_mode: wgpu::CompositeAlphaMode::Auto,
+                        view_formats: vec![wgpu::TextureFormat::Bgra8Unorm],
+                    };
+                    surface.configure(&device, &surface_desc);
+                }
                 _ => {}
             }
         }
