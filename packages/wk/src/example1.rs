@@ -30,7 +30,14 @@ pub fn example1() -> Result<(), String> {
         ..Default::default()
     });
 
-    let surface = unsafe { instance.create_surface(&window) }.unwrap();
+    let surface = unsafe {
+        match instance
+            .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::from_window(&window).unwrap())
+            {
+                Ok(s) => s,
+                Err(e) => return Err(e.to_string()),
+            }
+    };
 
     let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
@@ -50,6 +57,7 @@ pub fn example1() -> Result<(), String> {
         width: width,
         height: height,
         present_mode: wgpu::PresentMode::Fifo,
+        desired_maximum_frame_latency: 2,
         alpha_mode: wgpu::CompositeAlphaMode::Auto,
         view_formats: vec![wgpu::TextureFormat::Bgra8Unorm],
     };
@@ -117,6 +125,7 @@ pub fn example1() -> Result<(), String> {
                         width: width as u32,
                         height: height as u32,
                         present_mode: wgpu::PresentMode::Fifo,
+                        desired_maximum_frame_latency: 2,
                         alpha_mode: wgpu::CompositeAlphaMode::Auto,
                         view_formats: vec![wgpu::TextureFormat::Bgra8Unorm],
                     };
@@ -192,10 +201,12 @@ pub fn example1() -> Result<(), String> {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(clear_color),
-                        store: true,
+                        store: wgpu::StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
             });
 
             renderer
