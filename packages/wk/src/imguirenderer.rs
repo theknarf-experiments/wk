@@ -613,12 +613,12 @@ impl Renderer {
             });
             render_data.index_buffer = Some(buffer);
             render_data.index_buffer_size = indices.len();
-        } else if let Some(buffer) = render_data.index_buffer.as_ref() {
+        } else { match render_data.index_buffer.as_ref() { Some(buffer) => {
             // The buffer is large enough for the new indices, so reuse it
             queue.write_buffer(buffer, 0, &indices);
-        } else {
+        } _ => {
             unreachable!()
-        }
+        }}}
 
         // If the buffer is not created or is too small for the new vertices, create a new buffer
         if render_data.vertex_buffer.is_none() || render_data.vertex_buffer_size < vertices.len() {
@@ -629,12 +629,12 @@ impl Renderer {
             });
             render_data.vertex_buffer = Some(buffer);
             render_data.vertex_buffer_size = vertices.len();
-        } else if let Some(buffer) = render_data.vertex_buffer.as_ref() {
+        } else { match render_data.vertex_buffer.as_ref() { Some(buffer) => {
             // The buffer is large enough for the new vertices, so reuse it
             queue.write_buffer(buffer, 0, &vertices);
-        } else {
+        } _ => {
             unreachable!()
-        }
+        }}}
 
         render_data
     }
