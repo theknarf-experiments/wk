@@ -436,13 +436,13 @@ impl Renderer {
         });
 
         // Create the render pipeline.
-        // Create the render pipeline.
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("imgui-wgpu pipeline"),
             layout: Some(&pipeline_layout),
             vertex: VertexState {
                 module: &shader_module,
-                entry_point: vertex_shader_entry_point.unwrap(),
+                entry_point: Some(vertex_shader_entry_point.unwrap()),
+                compilation_options: Default::default(),
                 buffers: &[VertexBufferLayout {
                     array_stride: size_of::<DrawVert>() as BufferAddress,
                     step_mode: VertexStepMode::Vertex,
@@ -471,7 +471,8 @@ impl Renderer {
             },
             fragment: Some(FragmentState {
                 module: &shader_module,
-                entry_point: fragment_shader_entry_point.unwrap(),
+                entry_point: Some(fragment_shader_entry_point.unwrap()),
+                compilation_options: Default::default(),
                 targets: &[Some(ColorTargetState {
                     format: texture_format,
                     blend: Some(BlendState {
@@ -490,6 +491,7 @@ impl Renderer {
                 })],
             }),
             multiview: None,
+            cache: None,
         });
 
         let mut renderer = Self {
@@ -718,7 +720,7 @@ impl Renderer {
                     .textures
                     .get(texture_id)
                     .ok_or(RendererError::BadTexture(texture_id))?;
-                rpass.set_bind_group(1, &tex.bind_group, &[]);
+                rpass.set_bind_group(1, &*tex.bind_group, &[]);
 
                 // Set scissors on the renderpass.
                 let end = start + count as u32;

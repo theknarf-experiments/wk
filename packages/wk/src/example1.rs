@@ -25,7 +25,7 @@ pub fn example1() -> Result<(), String> {
 
     let (width, height) = window.size();
 
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         ..Default::default()
     });
