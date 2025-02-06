@@ -21,3 +21,9 @@ and then run:
 ```
 cargo run -- example1
 ```
+
+### Setup for components
+
+```
+cargo install cargo-component
+```
