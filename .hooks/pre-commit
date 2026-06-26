@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Forbid silencing dead-code warnings; prune the dead code instead.
-if matches=$(grep -rnE 'allow\([^)]*dead_code' src); then
+# Forbid silencing dead-code warnings; prune the dead code instead. Uses
+# `git grep` so it covers all tracked Rust (host + plugin crates) while skipping
+# untracked/generated files (e.g. wit-bindgen's bindings.rs).
+if matches=$(git grep -nE 'allow\([^)]*dead_code' -- '*.rs'); then
     echo "error: allow(dead_code) is not permitted -- prune the dead code instead:" >&2
     echo "$matches" >&2
     exit 1
