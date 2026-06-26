@@ -5,17 +5,20 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use imgui::{Condition, MouseButton};
 use sdl3::event::Event;
 use sdl3::keyboard::{Keycode, Mod, Scancode};
 
 use crate::host_shell::HostShell;
-use crate::imguirenderer::{Texture, TextureConfig};
+use crate::imguirenderer::{Renderer, Texture, TextureConfig};
 use crate::plugin::{
     Key, KeyEvent, PluginHost, PointerEvent, ResizeEvent, SharedSurface, SurfaceRegistry,
 };
+
+/// Target frame time (~60 fps).
+const FRAME: Duration = Duration::from_nanos(1_000_000_000 / 60);
 
 /// Map an SDL physical key to the wasi-gfx W3C `key` code. Returns `None` for
 /// keys we don't translate (the client still gets the event, just `key: none`).
@@ -116,6 +119,50 @@ fn clamp_size(v: f32) -> u32 {
     (v.max(16.0) as u32).min(4096)
 }
 
+/// Return the `TextureId` for surface `i` at size `w`x`h`, (re)creating the
+/// backing wgpu texture when it is missing or the size changed.
+fn surface_texture(
+    views: &mut Vec<SurfaceView>,
+    i: usize,
+    w: u32,
+    h: u32,
+    device: &wgpu::Device,
+    renderer: &mut Renderer,
+) -> imgui::TextureId {
+    if let Some(v) = views.get(i) {
+        if v.width == w && v.height == h {
+            return v.id;
+        }
+    }
+    let tex = Texture::new(
+        device,
+        renderer,
+        TextureConfig {
+            label: Some("plugin-surface"),
+            format: Some(wgpu::TextureFormat::Rgba8Unorm),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            ..Default::default()
+        },
+    );
+    let id = renderer.textures.insert(tex);
+    let view = SurfaceView {
+        id,
+        width: w,
+        height: h,
+    };
+    if let Some(old) = views.get(i) {
+        renderer.textures.remove(old.id);
+        views[i] = view;
+    } else {
+        views.push(view);
+    }
+    id
+}
+
 pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
     let host = PluginHost::new().map_err(|e| format!("{e:#}"))?;
     let registry: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
@@ -188,10 +235,8 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
         imgui_sdl2.prepare_frame(imgui.io_mut(), &window, &event_pump.mouse_state());
 
         let now = Instant::now();
-        let delta = now - last_frame;
-        let delta_s = delta.as_secs() as f32 + delta.subsec_nanos() as f32 / 1_000_000_000.0;
+        imgui.io_mut().delta_time = (now - last_frame).as_secs_f32();
         last_frame = now;
-        imgui.io_mut().delta_time = delta_s;
 
         // Snapshot the client surfaces (cheap Arc clones) without holding the
         // registry lock during compositing.
@@ -209,43 +254,9 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
             if w == 0 || h == 0 {
                 continue;
             }
-            // (Re)create the texture if missing or resized.
-            let needs_new = match views.get(i) {
-                Some(v) => v.width != w || v.height != h,
-                None => true,
-            };
-            if needs_new {
-                let tex = Texture::new(
-                    &device,
-                    &renderer,
-                    TextureConfig {
-                        label: Some("plugin-surface"),
-                        format: Some(wgpu::TextureFormat::Rgba8Unorm),
-                        size: wgpu::Extent3d {
-                            width: w,
-                            height: h,
-                            depth_or_array_layers: 1,
-                        },
-                        ..Default::default()
-                    },
-                );
-                let id = renderer.textures.insert(tex);
-                if let Some(old) = views.get(i) {
-                    renderer.textures.remove(old.id);
-                }
-                let view = SurfaceView {
-                    id,
-                    width: w,
-                    height: h,
-                };
-                if i < views.len() {
-                    views[i] = view;
-                } else {
-                    views.push(view);
-                }
-            }
+            let id = surface_texture(&mut views, i, w, h, &device, &mut renderer);
             if let Some(pixels) = pixels {
-                if let Some(tex) = renderer.textures.get(views[i].id) {
+                if let Some(tex) = renderer.textures.get(id) {
                     tex.write(&queue, &pixels, w, h);
                 }
             }
@@ -292,7 +303,7 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
             _ => {
-                std::thread::sleep(std::time::Duration::new(0, 1_000_000_000u32 / 60));
+                std::thread::sleep(FRAME);
                 continue;
             }
         };
@@ -333,7 +344,7 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
             }
         }
 
-        imgui_sdl2.prepare_render(&ui);
+        imgui_sdl2.prepare_render(ui);
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("command_encoder"),
@@ -370,6 +381,6 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
         queue.submit([encoder.finish()]);
         frame.present();
 
-        std::thread::sleep(std::time::Duration::new(0, 1_000_000_000u32 / 60));
+        std::thread::sleep(FRAME);
     }
 }

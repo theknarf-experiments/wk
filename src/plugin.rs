@@ -243,7 +243,7 @@ impl HostState {
     ) -> Result<Resource<DynPollable>> {
         let shared = self.surface_shared(res)?;
         let p = self.table.push(SurfacePollable { shared, kind })?;
-        Ok(subscribe(&mut self.table, p)?)
+        subscribe(&mut self.table, p)
     }
 }
 

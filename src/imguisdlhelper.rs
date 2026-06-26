@@ -23,7 +23,7 @@ impl imgui::ClipboardBackend for Sdl2ClipboardBackend {
             return None;
         }
 
-        self.0.clipboard_text().ok().map(String::from)
+        self.0.clipboard_text().ok()
     }
 
     fn set(&mut self, value: &str) {
@@ -104,20 +104,18 @@ impl ImguiSdl2 {
 
         match *event {
             Event::MouseWheel { y, .. } => {
-                imgui.io_mut().mouse_wheel = y as f32;
+                imgui.io_mut().mouse_wheel = y;
             }
-            Event::MouseButtonDown { mouse_btn, .. } => {
-                if mouse_btn != MouseButton::Unknown {
-                    let index = match mouse_btn {
-                        MouseButton::Left => 0,
-                        MouseButton::Right => 1,
-                        MouseButton::Middle => 2,
-                        MouseButton::X1 => 3,
-                        MouseButton::X2 => 4,
-                        MouseButton::Unknown => unreachable!(),
-                    };
-                    self.mouse_press[index] = true;
-                }
+            Event::MouseButtonDown { mouse_btn, .. } if mouse_btn != MouseButton::Unknown => {
+                let index = match mouse_btn {
+                    MouseButton::Left => 0,
+                    MouseButton::Right => 1,
+                    MouseButton::Middle => 2,
+                    MouseButton::X1 => 3,
+                    MouseButton::X2 => 4,
+                    MouseButton::Unknown => unreachable!(),
+                };
+                self.mouse_press[index] = true;
             }
             Event::TextInput { ref text, .. } => {
                 for chr in text.chars() {
@@ -170,7 +168,7 @@ impl ImguiSdl2 {
         let any_mouse_down = io.mouse_down.iter().any(|&b| b);
         self.mouse_util.capture(any_mouse_down);
 
-        io.mouse_pos = [mouse_state.x() as f32, mouse_state.y() as f32];
+        io.mouse_pos = [mouse_state.x(), mouse_state.y()];
 
         self.ignore_keyboard = io.want_capture_keyboard;
         self.ignore_mouse = io.want_capture_mouse;
