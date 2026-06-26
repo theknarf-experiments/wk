@@ -14,6 +14,11 @@ smallvec = "1.15.2"
 clap = { version = "4.6.1", features = ["derive"] }
 wasmtime = { version = "46", features = ["component-model", "async"] }
 wasmtime-wasi = "46"
+wasmtime-wasi-io = "46"
+wasi-webgpu-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime" }
+wasi-graphics-context-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime" }
+wgpu-core = "29"
+wgpu-types = "29"
 
 [dependencies.sdl3]
 version = "0.18"

@@ -172,6 +172,8 @@ pub struct HostState {
     ctx: WasiCtx,
     table: ResourceTable,
     registry: SurfaceRegistry,
+    /// Shared wgpu-core instance backing the wasi:webgpu host.
+    gpu: Arc<wgpu_core::global::Global>,
 }
 
 impl WasiView for HostState {
@@ -181,6 +183,52 @@ impl WasiView for HostState {
             table: &mut self.table,
         }
     }
+}
+
+impl wasmtime_wasi_io::IoView for HostState {
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.table
+    }
+}
+
+/// A `MainThreadSpawner` that runs the closure in place: wk does not create
+/// wgpu surfaces on a dedicated UI thread (we render offscreen), so no thread
+/// hop is needed.
+struct InPlaceSpawner;
+
+impl wasi_webgpu_wasmtime::MainThreadSpawner for InPlaceSpawner {
+    async fn spawn<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        f()
+    }
+}
+
+impl wasi_webgpu_wasmtime::WasiWebGpuView for HostState {
+    fn instance(&self) -> Arc<wgpu_core::global::Global> {
+        Arc::clone(&self.gpu)
+    }
+
+    fn ui_thread_spawner(&self) -> Box<impl wasi_webgpu_wasmtime::MainThreadSpawner + 'static> {
+        Box::new(InPlaceSpawner)
+    }
+}
+
+/// Create the shared wgpu-core instance used by the wasi:webgpu host.
+fn new_gpu_instance() -> Arc<wgpu_core::global::Global> {
+    Arc::new(wgpu_core::global::Global::new(
+        "wk-webgpu",
+        wgpu_types::InstanceDescriptor {
+            backends: wgpu_types::Backends::all(),
+            flags: wgpu_types::InstanceFlags::from_build_config(),
+            backend_options: Default::default(),
+            memory_budget_thresholds: Default::default(),
+            display: None,
+        },
+        None,
+    ))
 }
 
 impl HostState {
@@ -444,6 +492,7 @@ impl wasi::frame_buffer::frame_buffer::HostBuffer for HostState {
 /// Owns the wasmtime engine and spawns plugin clients on their own threads.
 pub struct PluginHost {
     engine: Engine,
+    gpu: Arc<wgpu_core::global::Global>,
 }
 
 impl PluginHost {
@@ -452,6 +501,7 @@ impl PluginHost {
         config.wasm_component_model(true);
         Ok(Self {
             engine: Engine::new(&config)?,
+            gpu: new_gpu_instance(),
         })
     }
 
@@ -466,12 +516,14 @@ impl PluginHost {
             |s| s,
         )?;
         wasi::frame_buffer::frame_buffer::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
+        wasi_webgpu_wasmtime::add_to_linker(&mut linker)?;
 
         let component = Component::from_file(&self.engine, path)?;
         let state = HostState {
             ctx: WasiCtxBuilder::new().inherit_stdio().build(),
             table: ResourceTable::new(),
             registry,
+            gpu: Arc::clone(&self.gpu),
         };
         let mut store = Store::new(&self.engine, state);
 
