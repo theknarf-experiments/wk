@@ -10,13 +10,16 @@ First install SDL2:
 brew install sdl2
 ```
 
-Then setup the env variable:
+This repo uses [mise](https://mise.jdx.dev/) to manage the environment
+(it sets `LIBRARY_PATH` so SDL2 is found at link time). Install it and
+allow this directory's config:
 
 ```
-export LIBRARY_PATH="$LIBRARY_PATH:$(brew --prefix)/lib"
+brew install mise
+mise trust
 ```
 
-and then run:
+Then run:
 
 ```
 cargo run -- example1

@@ -1,0 +1,2 @@
+[env]
+LIBRARY_PATH = "{{env.LIBRARY_PATH | default(value='')}}:{{exec(command='brew --prefix')}}/lib"
