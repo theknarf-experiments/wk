@@ -3,6 +3,7 @@
 //! to the client. wk is "the OS + compositor"; the client thinks it owns its
 //! window.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -95,9 +96,9 @@ fn key_event(sc: Scancode, keymod: Mod) -> KeyEvent {
 }
 
 /// Per-surface compositor-side state: the wgpu texture we upload the client's
-/// pixels into and draw with `imgui::Image`.
+/// pixels into and draw with `imgui::Image`. Keyed by surface id.
 struct SurfaceView {
-    id: imgui::TextureId,
+    texture: imgui::TextureId,
     width: u32,
     height: u32,
 }
@@ -126,19 +127,19 @@ fn plugin_name(path: &Path) -> String {
         .unwrap_or_else(|| "plugin".to_string())
 }
 
-/// Return the `TextureId` for surface `i` at size `w`x`h`, (re)creating the
+/// Return the `TextureId` for surface `sid` at size `w`x`h`, (re)creating the
 /// backing wgpu texture when it is missing or the size changed.
 fn surface_texture(
-    views: &mut Vec<SurfaceView>,
-    i: usize,
+    views: &mut HashMap<u64, SurfaceView>,
+    sid: u64,
     w: u32,
     h: u32,
     device: &wgpu::Device,
     renderer: &mut Renderer,
 ) -> imgui::TextureId {
-    if let Some(v) = views.get(i) {
+    if let Some(v) = views.get(&sid) {
         if v.width == w && v.height == h {
-            return v.id;
+            return v.texture;
         }
     }
     let tex = Texture::new(
@@ -155,19 +156,18 @@ fn surface_texture(
             ..Default::default()
         },
     );
-    let id = renderer.textures.insert(tex);
-    let view = SurfaceView {
-        id,
-        width: w,
-        height: h,
-    };
-    if let Some(old) = views.get(i) {
-        renderer.textures.remove(old.id);
-        views[i] = view;
-    } else {
-        views.push(view);
+    let texture = renderer.textures.insert(tex);
+    if let Some(old) = views.insert(
+        sid,
+        SurfaceView {
+            texture,
+            width: w,
+            height: h,
+        },
+    ) {
+        renderer.textures.remove(old.texture);
     }
-    id
+    texture
 }
 
 pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
@@ -195,9 +195,10 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
         mut last_frame,
     } = HostShell::new("wk compositor")?;
 
-    let mut views: Vec<SurfaceView> = Vec::new();
+    // Per-surface compositor state, keyed by surface id so it survives removal.
+    let mut views: HashMap<u64, SurfaceView> = HashMap::new();
     // Input over each surface's window, collected last frame.
-    let mut inputs: Vec<SurfaceInput> = Vec::new();
+    let mut inputs: HashMap<u64, SurfaceInput> = HashMap::new();
 
     'running: loop {
         // Key events captured this frame, delivered to the focused client below.
@@ -255,25 +256,25 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
         // Upload each surface's latest pixels into its texture, then signal the
         // client to paint its next frame. This drives the client every
         // iteration, independent of whether the host window is presented.
-        for (i, shared) in surfaces.iter().enumerate() {
-            let (w, h, pixels) = {
+        for shared in &surfaces {
+            let (sid, w, h, pixels) = {
                 let s = shared.lock().unwrap();
                 let ready = s.pixels.len() == (s.width * s.height * 4) as usize;
-                (s.width, s.height, ready.then(|| s.pixels.clone()))
+                (s.id, s.width, s.height, ready.then(|| s.pixels.clone()))
             };
             if w == 0 || h == 0 {
                 continue;
             }
-            let id = surface_texture(&mut views, i, w, h, &device, &mut renderer);
+            let tex = surface_texture(&mut views, sid, w, h, &device, &mut renderer);
             if let Some(pixels) = pixels {
-                if let Some(tex) = renderer.textures.get(id) {
-                    tex.write(&queue, &pixels, w, h);
+                if let Some(t) = renderer.textures.get(tex) {
+                    t.write(&queue, &pixels, w, h);
                 }
             }
 
             // Deliver last frame's input, then signal the next frame.
             let mut s = shared.lock().unwrap();
-            if let Some(input) = inputs.get(i) {
+            if let Some(input) = inputs.get(&sid) {
                 if let Some((x, y)) = input.moved {
                     s.pointer_move.push_back(PointerEvent { x, y });
                 }
@@ -318,8 +319,9 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
             }
         };
 
-        // Apps the user clicked to launch this frame.
+        // Apps the user clicked to launch, and surfaces whose window was closed.
         let mut to_launch: Vec<(String, PathBuf)> = Vec::new();
+        let mut to_close: Vec<SharedSurface> = Vec::new();
 
         let ui = imgui.frame();
         {
@@ -336,37 +338,46 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
             });
 
             inputs.clear();
-            for (i, shared) in surfaces.iter().enumerate() {
+            for shared in &surfaces {
+                let (sid, title) = {
+                    let s = shared.lock().unwrap();
+                    (s.id, s.title.clone())
+                };
+                let Some(view) = views.get(&sid) else {
+                    continue;
+                };
+                let (tex, w, h) = (view.texture, view.width as f32, view.height as f32);
                 let mut input = SurfaceInput::default();
-                if let Some(view) = views.get(i) {
-                    let (id, w, h) = (view.id, view.width as f32, view.height as f32);
-                    let title = shared.lock().unwrap().title.clone();
-                    ui.window(format!("{title}##{i}"))
-                        .size([w + 16.0, h + 36.0], Condition::FirstUseEver)
-                        .build(|| {
-                            input.focused = ui.is_window_focused();
+                let mut open = true;
+                ui.window(format!("{title}##{sid}"))
+                    .opened(&mut open)
+                    .size([w + 16.0, h + 36.0], Condition::FirstUseEver)
+                    .build(|| {
+                        input.focused = ui.is_window_focused();
 
-                            // Resize the client to fill the window's content area.
-                            let avail = ui.content_region_avail();
-                            input.resize = Some((clamp_size(avail[0]), clamp_size(avail[1])));
+                        // Resize the client to fill the window's content area.
+                        let avail = ui.content_region_avail();
+                        input.resize = Some((clamp_size(avail[0]), clamp_size(avail[1])));
 
-                            let origin = ui.cursor_screen_pos();
-                            imgui::Image::new(id, [w, h]).build(ui);
-                            if ui.is_item_hovered() {
-                                let mouse = ui.io().mouse_pos;
-                                let local =
-                                    ((mouse[0] - origin[0]) as f64, (mouse[1] - origin[1]) as f64);
-                                input.moved = Some(local);
-                                if ui.is_mouse_clicked(MouseButton::Left) {
-                                    input.down.push(local);
-                                }
-                                if ui.is_mouse_released(MouseButton::Left) {
-                                    input.up.push(local);
-                                }
+                        let origin = ui.cursor_screen_pos();
+                        imgui::Image::new(tex, [w, h]).build(ui);
+                        if ui.is_item_hovered() {
+                            let mouse = ui.io().mouse_pos;
+                            let local =
+                                ((mouse[0] - origin[0]) as f64, (mouse[1] - origin[1]) as f64);
+                            input.moved = Some(local);
+                            if ui.is_mouse_clicked(MouseButton::Left) {
+                                input.down.push(local);
                             }
-                        });
+                            if ui.is_mouse_released(MouseButton::Left) {
+                                input.up.push(local);
+                            }
+                        }
+                    });
+                if !open {
+                    to_close.push(shared.clone());
                 }
-                inputs.push(input);
+                inputs.insert(sid, input);
             }
         }
 
@@ -375,6 +386,22 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
             if let Err(e) = host.spawn(path, name, registry.clone()) {
                 eprintln!("failed to launch {name}: {e:#}");
             }
+        }
+
+        // Close any windows the user dismissed: trap the client (ending its
+        // thread), drop it from the registry, and free its texture.
+        for shared in &to_close {
+            let sid = {
+                let mut s = shared.lock().unwrap();
+                s.closed = true;
+                s.wake();
+                s.id
+            };
+            registry.lock().unwrap().retain(|x| !Arc::ptr_eq(x, shared));
+            if let Some(v) = views.remove(&sid) {
+                renderer.textures.remove(v.texture);
+            }
+            inputs.remove(&sid);
         }
 
         imgui_sdl2.prepare_render(ui);

@@ -12,6 +12,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll, Waker};
 
@@ -41,6 +42,8 @@ pub use wasi::surface::surface::{Key, KeyEvent, PointerEvent, ResizeEvent};
 /// Shared state of one virtual surface, touched by both the client thread (via
 /// the host interface impls) and the compositor thread.
 pub struct VirtualSurface {
+    /// Stable unique id, used by the compositor to track this surface.
+    pub id: u64,
     /// Display name of the plugin instance that owns this surface.
     pub title: String,
     pub width: u32,
@@ -49,6 +52,9 @@ pub struct VirtualSurface {
     pub pixels: Vec<u8>,
     /// Set by the compositor once per frame; consumed by the frame pollable.
     pub frame_ready: bool,
+    /// Set by the compositor to close this instance: the client traps on its
+    /// next `get_frame` and its thread exits.
+    pub closed: bool,
     pub resize: Option<ResizeEvent>,
     pub pointer_move: VecDeque<PointerEvent>,
     pub pointer_down: VecDeque<PointerEvent>,
@@ -59,14 +65,18 @@ pub struct VirtualSurface {
     wakers: Vec<Waker>,
 }
 
+static NEXT_SURFACE_ID: AtomicU64 = AtomicU64::new(0);
+
 impl VirtualSurface {
     fn new(title: String, width: u32, height: u32) -> Self {
         Self {
+            id: NEXT_SURFACE_ID.fetch_add(1, Ordering::Relaxed),
             title,
             width,
             height,
             pixels: vec![0; (width * height * 4) as usize],
             frame_ready: false,
+            closed: false,
             resize: None,
             pointer_move: VecDeque::new(),
             pointer_down: VecDeque::new(),
@@ -149,7 +159,9 @@ impl Future for WaitCondition {
     fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
         let mut s = self.shared.lock().unwrap();
         let ready = match self.kind {
-            PollKind::Frame => s.frame_ready,
+            // A closed surface wakes the frame poll so the client proceeds to
+            // `get_frame`, which then traps and ends the client thread.
+            PollKind::Frame => s.frame_ready || s.closed,
             PollKind::Resize => s.resize.is_some(),
             PollKind::PointerMove => !s.pointer_move.is_empty(),
             PollKind::PointerDown => !s.pointer_down.is_empty(),
@@ -319,7 +331,11 @@ impl wasi::surface::surface::HostSurface for HostState {
     fn subscribe_frame(&mut self, self_: Resource<SurfaceState>) -> Result<Resource<DynPollable>> {
         self.subscribe_kind(&self_, PollKind::Frame)
     }
-    fn get_frame(&mut self, _self_: Resource<SurfaceState>) -> Result<Option<FrameEvent>> {
+    fn get_frame(&mut self, self_: Resource<SurfaceState>) -> Result<Option<FrameEvent>> {
+        if self.surface_shared(&self_)?.lock().unwrap().closed {
+            // Compositor closed this surface: trap to unwind and end the client.
+            return Err(wasmtime::Error::msg("surface closed"));
+        }
         Ok(Some(FrameEvent { nothing: false }))
     }
 
