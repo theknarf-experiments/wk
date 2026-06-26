@@ -102,20 +102,23 @@ impl Guest for Component {
             label: None,
         });
 
-        // Readback rows must be aligned to 256 bytes.
-        let unpadded_bpr = W * 4;
-        let padded_bpr = unpadded_bpr.div_ceil(256) * 256;
-        let buf_size = (padded_bpr * H) as u64;
-
         let mut t: u32 = 0;
         loop {
             frame.block();
             let _ = surface.get_frame();
 
+            // Track the surface size the host gives us (it follows the window).
+            let w = surface.width().max(1);
+            let h = surface.height().max(1);
+            // Readback rows must be aligned to 256 bytes.
+            let unpadded_bpr = w * 4;
+            let padded_bpr = unpadded_bpr.div_ceil(256) * 256;
+            let buf_size = (padded_bpr * h) as u64;
+
             let texture = device.create_texture(&GpuTextureDescriptor {
                 size: GpuExtent3D {
-                    width: W,
-                    height: Some(H),
+                    width: w,
+                    height: Some(h),
                     depth_or_array_layers: Some(1),
                 },
                 mip_level_count: None,
@@ -174,11 +177,11 @@ impl Guest for Component {
                     buffer: &buffer,
                     offset: None,
                     bytes_per_row: Some(padded_bpr),
-                    rows_per_image: Some(H),
+                    rows_per_image: Some(h),
                 },
                 GpuExtent3D {
-                    width: W,
-                    height: Some(H),
+                    width: w,
+                    height: Some(h),
                     depth_or_array_layers: Some(1),
                 },
             );
@@ -195,8 +198,8 @@ impl Guest for Component {
             let _ = buffer.unmap();
 
             // Strip row padding to a tight RGBA buffer.
-            let mut pixels = vec![0u8; (W * H * 4) as usize];
-            for row in 0..H as usize {
+            let mut pixels = vec![0u8; (w * h * 4) as usize];
+            for row in 0..h as usize {
                 let src = row * padded_bpr as usize;
                 let dst = row * unpadded_bpr as usize;
                 pixels[dst..dst + unpadded_bpr as usize]
