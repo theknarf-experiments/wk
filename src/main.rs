@@ -1,4 +1,6 @@
+mod compositor;
 mod example1;
+mod host_shell;
 mod imguirenderer;
 mod imguisdlhelper;
 mod plugin;
@@ -50,7 +52,7 @@ fn main() -> Result<(), String> {
             Ok(())
         }
         Some(Commands::Example1 {}) => example1(),
-        Some(Commands::Run { plugin }) => plugin::run(plugin).map_err(|e| format!("{e:#}")),
+        Some(Commands::Run { plugin }) => compositor::run(plugin),
         None => {
             println!("Default subcommand");
             Ok(())

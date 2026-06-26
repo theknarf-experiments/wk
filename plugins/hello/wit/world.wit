@@ -1,6 +1,6 @@
 package component:hello;
 
-/// An example world for the component to target.
+/// Matches the host's `wk:plugin` contract: paint RGBA8 frames on demand.
 world example {
-    export hello-world: func() -> string;
+    export render: func(width: u32, height: u32, time-ms: u64) -> list<u8>;
 }

@@ -1,8 +1,14 @@
-// Host-side view of a wk plugin. For now this mirrors the scaffolded `hello`
-// component so we can verify the wasmtime <-> component boundary end to end.
-// The compositor interfaces (surface / frame-buffer) are added in later steps.
-package wk:host;
+package wk:plugin;
 
+/// A wk plugin client.
+///
+/// For this milestone the host (compositor) drives the client: it calls `render`
+/// once per frame and composites the returned RGBA8 pixels into an imgui window.
+/// A later milestone lets the client own its own loop (the X11/Wayland-style
+/// "app that thinks it owns its window" model).
 world plugin {
-    export hello-world: func() -> string;
+    /// Paint one `width` x `height` frame. Returns `width * height * 4` bytes of
+    /// RGBA8 pixels (row-major, no padding). `time-ms` is a monotonic clock the
+    /// client can use to animate.
+    export render: func(width: u32, height: u32, time-ms: u64) -> list<u8>;
 }

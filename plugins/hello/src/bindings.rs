@@ -3,11 +3,11 @@
 //   * runtime_path: "wit_bindgen_rt"
 #[doc(hidden)]
 #[allow(non_snake_case)]
-pub unsafe fn _export_hello_world_cabi<T: Guest>() -> *mut u8 {
+pub unsafe fn _export_render_cabi<T: Guest>(arg0: i32, arg1: i32, arg2: i64) -> *mut u8 {
     #[cfg(target_arch = "wasm32")] _rt::run_ctors_once();
-    let result0 = T::hello_world();
+    let result0 = T::render(arg0 as u32, arg1 as u32, arg2 as u64);
     let ptr1 = (&raw mut _RET_AREA.0).cast::<u8>();
-    let vec2 = (result0.into_bytes()).into_boxed_slice();
+    let vec2 = (result0).into_boxed_slice();
     let ptr2 = vec2.as_ptr().cast::<u8>();
     let len2 = vec2.len();
     ::core::mem::forget(vec2);
@@ -17,22 +17,24 @@ pub unsafe fn _export_hello_world_cabi<T: Guest>() -> *mut u8 {
 }
 #[doc(hidden)]
 #[allow(non_snake_case)]
-pub unsafe fn __post_return_hello_world<T: Guest>(arg0: *mut u8) {
+pub unsafe fn __post_return_render<T: Guest>(arg0: *mut u8) {
     let l0 = *arg0.add(0).cast::<*mut u8>();
     let l1 = *arg0.add(::core::mem::size_of::<*const u8>()).cast::<usize>();
-    _rt::cabi_dealloc(l0, l1, 1);
+    let base2 = l0;
+    let len2 = l1;
+    _rt::cabi_dealloc(base2, len2 * 1, 1);
 }
 pub trait Guest {
-    fn hello_world() -> _rt::String;
+    fn render(width: u32, height: u32, time_ms: u64) -> _rt::Vec<u8>;
 }
 #[doc(hidden)]
 macro_rules! __export_world_example_cabi {
     ($ty:ident with_types_in $($path_to_types:tt)*) => {
-        const _ : () = { #[unsafe (export_name = "hello-world")] unsafe extern "C" fn
-        export_hello_world() -> * mut u8 { unsafe { $($path_to_types)*::
-        _export_hello_world_cabi::<$ty > () } } #[unsafe (export_name =
-        "cabi_post_hello-world")] unsafe extern "C" fn _post_return_hello_world(arg0 : *
-        mut u8,) { unsafe { $($path_to_types)*:: __post_return_hello_world::<$ty > (arg0)
+        const _ : () = { #[unsafe (export_name = "render")] unsafe extern "C" fn
+        export_render(arg0 : i32, arg1 : i32, arg2 : i64,) -> * mut u8 { unsafe {
+        $($path_to_types)*:: _export_render_cabi::<$ty > (arg0, arg1, arg2) } } #[unsafe
+        (export_name = "cabi_post_render")] unsafe extern "C" fn _post_return_render(arg0
+        : * mut u8,) { unsafe { $($path_to_types)*:: __post_return_render::<$ty > (arg0)
         } } };
     };
 }
@@ -58,7 +60,7 @@ mod _rt {
         let layout = alloc::Layout::from_size_align_unchecked(size, align);
         alloc::dealloc(ptr, layout);
     }
-    pub use alloc_crate::string::String;
+    pub use alloc_crate::vec::Vec;
     pub use alloc_crate::alloc;
     extern crate alloc as alloc_crate;
 }
@@ -97,11 +99,11 @@ pub(crate) use __export_example_impl as export;
 )]
 #[doc(hidden)]
 #[allow(clippy::octal_escapes)]
-pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 180] = *b"\
-\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x077\x01A\x02\x01A\x02\x01\
-@\0\0s\x04\0\x0bhello-world\x01\0\x04\0\x17component:hello/example\x04\0\x0b\x0d\
-\x01\0\x07example\x03\0\0\0G\x09producers\x01\x0cprocessed-by\x02\x0dwit-compone\
-nt\x070.227.1\x10wit-bindgen-rust\x060.41.0";
+pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 202] = *b"\
+\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07M\x01A\x02\x01A\x03\x01\
+p}\x01@\x03\x05widthy\x06heighty\x07time-msw\0\0\x04\0\x06render\x01\x01\x04\0\x17\
+component:hello/example\x04\0\x0b\x0d\x01\0\x07example\x03\0\0\0G\x09producers\x01\
+\x0cprocessed-by\x02\x0dwit-component\x070.227.1\x10wit-bindgen-rust\x060.41.0";
 #[inline(never)]
 #[doc(hidden)]
 pub fn __link_custom_section_describing_imports() {
