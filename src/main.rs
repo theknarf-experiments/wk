@@ -51,17 +51,19 @@ fn main() -> Result<(), String> {
         Some(Commands::Init { name }) => project::init(name.clone()),
         Some(Commands::Add { plugin }) => project::add(plugin.clone()),
         Some(Commands::Example1 {}) => example1(),
-        Some(Commands::Run { plugins }) => {
-            let plugins = if plugins.is_empty() {
-                project::Project::load()?.plugins
-            } else {
-                plugins.clone()
-            };
-            compositor::run(&plugins)
-        }
-        None => {
-            println!("Default subcommand");
-            Ok(())
-        }
+        // `wk run [paths...]`, or bare `wk`, both run the project (or the given
+        // ad-hoc paths).
+        Some(Commands::Run { plugins }) => run(plugins),
+        None => run(&[]),
     }
+}
+
+/// Run the given plugin paths, or the project's plugins if none are given.
+fn run(plugins: &[PathBuf]) -> Result<(), String> {
+    let plugins = if plugins.is_empty() {
+        project::Project::load()?.plugins
+    } else {
+        plugins.to_vec()
+    };
+    compositor::run(&plugins)
 }
