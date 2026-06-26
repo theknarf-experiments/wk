@@ -1,0 +1,13 @@
+package wk:triangle;
+
+/// A GPU client: it renders with wasi:webgpu into an offscreen texture, reads
+/// the pixels back, and delivers them through wasi:frame-buffer so the host
+/// composites them — no winit canvas/swapchain needed.
+world triangle {
+    import wasi:webgpu/webgpu@0.0.1;
+    import wasi:surface/surface@0.0.1;
+    import wasi:graphics-context/graphics-context@0.0.1;
+    import wasi:frame-buffer/frame-buffer@0.0.1;
+
+    export run: func();
+}
