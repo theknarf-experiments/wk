@@ -12,9 +12,9 @@ fi
 
 cargo fmt --all -- --check
 
-# RUSTFLAGS="-D warnings" treats warnings as errors so a commit is blocked
-# on any warning.
-RUSTFLAGS="-D warnings" cargo check
+# clippy compiles like `cargo check` and adds lints; `-D warnings` blocks the
+# commit on any rustc or clippy warning.
+cargo clippy --all-targets -- -D warnings
 
 # --no-tests=pass so an empty test suite doesn't block the commit.
 cargo nextest run --no-tests=pass

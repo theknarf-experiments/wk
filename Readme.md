@@ -20,7 +20,7 @@ mise trust
 ```
 
 Point git at the tracked `.hooks` directory. The pre-commit hook runs
-`cargo fmt --all -- --check`, `cargo check` (warnings denied) and
+`cargo fmt --all -- --check`, `cargo clippy` (warnings denied) and
 `cargo nextest run`, so install nextest first:
 
 ```
