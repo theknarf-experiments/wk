@@ -1,7 +1,7 @@
 use std::time::Instant;
 
-use sdl2::event::Event;
-use sdl2::keyboard::Keycode;
+use sdl3::event::Event;
+use sdl3::keyboard::Keycode;
 
 use imgui::*;
 
@@ -11,15 +11,15 @@ use crate::imguirenderer::{Renderer, RendererConfig};
 use crate::imguisdlhelper::ImguiSdl2;
 
 pub fn example1() -> Result<(), String> {
-    let sdl_context = sdl2::init()?;
-    let video = sdl_context.video()?;
+    let sdl_context = sdl3::init().map_err(|e| e.to_string())?;
+    let video = sdl_context.video().map_err(|e| e.to_string())?;
 
     let window = video
         .window("Raw Window Handle Example", 800, 600)
         .position_centered()
         .resizable()
         .metal_view()
-        .allow_highdpi()
+        .high_pixel_density()
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -100,7 +100,7 @@ pub fn example1() -> Result<(), String> {
 
     let mut last_frame = Instant::now();
 
-    let mut imgui_sdl2 = ImguiSdl2::new(&mut imgui, &window);
+    let mut imgui_sdl2 = ImguiSdl2::new(&mut imgui, &window, &sdl_context);
     let mut event_pump = sdl_context.event_pump().unwrap();
 
     // Game loop / rendering loop
@@ -117,7 +117,7 @@ pub fn example1() -> Result<(), String> {
                     keycode: Some(Keycode::Escape),
                     ..
                 } => break 'running Ok(()),
-                Event::Window { win_event: sdl2::event::WindowEvent::Resized(width, height), .. } => {
+                Event::Window { win_event: sdl3::event::WindowEvent::Resized(width, height), .. } => {
                     // Update surface configuration with new dimensions
                     let surface_desc = wgpu::SurfaceConfiguration {
                         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -181,7 +181,7 @@ pub fn example1() -> Result<(), String> {
             ui.show_demo_window(&mut true);
         }
 
-        imgui_sdl2.prepare_render(&ui, &window);
+        imgui_sdl2.prepare_render(&ui);
 
         let mut encoder = device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor {

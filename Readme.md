@@ -4,10 +4,10 @@
 
 ## Setup
 
-First install SDL2:
+First install SDL3:
 
 ```
-brew install sdl2
+brew install sdl3
 ```
 
 This repo uses [mise](https://mise.jdx.dev/) to manage the environment

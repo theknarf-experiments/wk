@@ -13,8 +13,6 @@ bytemuck = { version = "1.21.0", features = ["derive"] }
 smallvec = "1.13.2"
 clap = { version = "4.5.28", features = ["derive"] }
 
-[dependencies.sdl2]
-git = "https://github.com/rust-sdl2/rust-sdl2"
-default-features = false
+[dependencies.sdl3]
+version = "0.18"
 features = ["raw-window-handle"]
-rev = "400e033411b239de10b680f20de800dcb70e9ade"

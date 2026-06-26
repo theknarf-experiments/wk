@@ -1,9 +1,10 @@
-use sdl2::event::Event;
+use sdl3::event::Event;
 
 use imgui::*;
-use sdl2::keyboard::Scancode;
-use sdl2::mouse::{Cursor, MouseState, SystemCursor};
-use sdl2::video::Window;
+use sdl3::keyboard::Scancode;
+use sdl3::mouse::{Cursor, MouseState, MouseUtil, SystemCursor};
+use sdl3::video::Window;
+use sdl3::Sdl;
 
 pub struct ImguiSdl2 {
     mouse_press: [bool; 5],
@@ -11,9 +12,10 @@ pub struct ImguiSdl2 {
     ignore_keyboard: bool,
     cursor: Option<MouseCursor>,
     sdl_cursor: Option<Cursor>,
+    mouse_util: MouseUtil,
 }
 
-struct Sdl2ClipboardBackend(sdl2::clipboard::ClipboardUtil);
+struct Sdl2ClipboardBackend(sdl3::clipboard::ClipboardUtil);
 
 impl imgui::ClipboardBackend for Sdl2ClipboardBackend {
     fn get(&mut self) -> Option<String> {
@@ -30,7 +32,7 @@ impl imgui::ClipboardBackend for Sdl2ClipboardBackend {
 }
 
 impl ImguiSdl2 {
-    pub fn new(imgui: &mut Context, window: &Window) -> Self {
+    pub fn new(imgui: &mut Context, window: &Window, sdl: &Sdl) -> Self {
         let clipboard_util = window.subsystem().clipboard();
         imgui.set_clipboard_backend(Sdl2ClipboardBackend(clipboard_util));
 
@@ -61,6 +63,7 @@ impl ImguiSdl2 {
             ignore_mouse: false,
             cursor: None,
             sdl_cursor: None,
+            mouse_util: sdl.mouse(),
         }
     }
 
@@ -77,7 +80,6 @@ impl ImguiSdl2 {
             | Event::FingerDown { .. }
             | Event::FingerUp { .. }
             | Event::FingerMotion { .. }
-            | Event::DollarGesture { .. }
             | Event::DollarRecord { .. }
             | Event::MultiGesture { .. } => self.ignore_mouse,
             _ => false,
@@ -85,8 +87,8 @@ impl ImguiSdl2 {
     }
 
     pub fn handle_event(&mut self, imgui: &mut Context, event: &Event) {
-        use sdl2::keyboard;
-        use sdl2::mouse::MouseButton;
+        use sdl3::keyboard;
+        use sdl3::mouse::MouseButton;
 
         fn set_mod(imgui: &mut Context, keymod: keyboard::Mod) {
             let ctrl = keymod.intersects(keyboard::Mod::RCTRLMOD | keyboard::Mod::LCTRLMOD);
@@ -143,10 +145,8 @@ impl ImguiSdl2 {
     }
 
     pub fn prepare_frame(&mut self, io: &mut imgui::Io, window: &Window, mouse_state: &MouseState) {
-        let mouse_util = window.subsystem().sdl().mouse();
-
         let (win_w, win_h) = window.size();
-        let (draw_w, draw_h) = window.drawable_size();
+        let (draw_w, draw_h) = window.size_in_pixels();
 
         let dpi_scaling = 1.0 / 2.0; // TODO: get dpi dynamically
 
@@ -168,7 +168,7 @@ impl ImguiSdl2 {
         self.mouse_press = [false; 5];
 
         let any_mouse_down = io.mouse_down.iter().any(|&b| b);
-        mouse_util.capture(any_mouse_down);
+        self.mouse_util.capture(any_mouse_down);
 
         io.mouse_pos = [mouse_state.x() as f32, mouse_state.y() as f32];
 
@@ -176,17 +176,15 @@ impl ImguiSdl2 {
         self.ignore_mouse = io.want_capture_mouse;
     }
 
-    pub fn prepare_render(&mut self, ui: &imgui::Ui, window: &Window) {
+    pub fn prepare_render(&mut self, ui: &imgui::Ui) {
         let io = ui.io();
         if !io
             .config_flags
             .contains(ConfigFlags::NO_MOUSE_CURSOR_CHANGE)
         {
-            let mouse_util = window.subsystem().sdl().mouse();
-
             match ui.mouse_cursor() {
                 Some(mouse_cursor) if !io.mouse_draw_cursor => {
-                    mouse_util.show_cursor(true);
+                    self.mouse_util.show_cursor(true);
 
                     let sdl_cursor = match mouse_cursor {
                         MouseCursor::Arrow => SystemCursor::Arrow,
@@ -210,7 +208,7 @@ impl ImguiSdl2 {
                 _ => {
                     self.cursor = None;
                     self.sdl_cursor = None;
-                    mouse_util.show_cursor(false);
+                    self.mouse_util.show_cursor(false);
                 }
             }
         }
