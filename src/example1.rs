@@ -25,10 +25,9 @@ pub fn example1() -> Result<(), String> {
 
     let (width, height) = window.size();
 
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
-        ..Default::default()
-    });
+    let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    instance_desc.backends = wgpu::Backends::PRIMARY;
+    let instance = wgpu::Instance::new(instance_desc);
 
     let surface = unsafe {
         match instance
@@ -47,7 +46,7 @@ pub fn example1() -> Result<(), String> {
     .unwrap();
 
     let (device, queue) =
-        block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
         .unwrap();
 
     // Set up swap chain
@@ -145,9 +144,10 @@ pub fn example1() -> Result<(), String> {
         imgui.io_mut().delta_time = delta_s;
 
         let frame = match surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(e) => {
-                eprintln!("dropped frame: {e:?}");
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            other => {
+                eprintln!("dropped frame: {other:?}");
                 continue;
             }
         };
@@ -198,6 +198,7 @@ pub fn example1() -> Result<(), String> {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(clear_color),
@@ -207,6 +208,7 @@ pub fn example1() -> Result<(), String> {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             renderer

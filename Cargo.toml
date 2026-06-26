@@ -4,14 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-wgpu = "24.0.1"
-env_logger = "0.11.6"
+wgpu = "29.0.3"
+env_logger = "0.11.11"
 imgui = "0.12.0"
 pollster = "0.4.0"
 raw-window-handle = "0.6.2"
-bytemuck = { version = "1.21.0", features = ["derive"] }
-smallvec = "1.13.2"
-clap = { version = "4.5.28", features = ["derive"] }
+bytemuck = { version = "1.25.0", features = ["derive"] }
+smallvec = "1.15.2"
+clap = { version = "4.6.1", features = ["derive"] }
 
 [dependencies.sdl3]
 version = "0.18"

@@ -90,7 +90,7 @@ impl<'a> Default for TextureConfig<'a> {
             address_mode_w: AddressMode::ClampToEdge,
             mag_filter: FilterMode::Linear,
             min_filter: FilterMode::Linear,
-            mipmap_filter: FilterMode::Linear,
+            mipmap_filter: MipmapFilterMode::Linear,
             lod_min_clamp: 0.0,
             lod_max_clamp: 100.0,
             compare: None,
@@ -219,7 +219,7 @@ impl Texture {
     pub fn write(&self, queue: &Queue, data: &[u8], width: u32, height: u32) {
         queue.write_texture(
             // destination (sub)texture
-            ImageCopyTexture {
+            TexelCopyTextureInfo {
                 texture: &self.texture,
                 mip_level: 0,
                 origin: Origin3d { x: 0, y: 0, z: 0 },
@@ -228,7 +228,7 @@ impl Texture {
             // source bitmap data
             data,
             // layout of the source bitmap
-            ImageDataLayout {
+            TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(width * 4),
                 rows_per_image: Some(height),
@@ -431,8 +431,8 @@ impl Renderer {
         // Create the render pipeline layout.
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("imgui-wgpu pipeline layout"),
-            bind_group_layouts: &[&uniform_layout, &texture_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&uniform_layout), Some(&texture_layout)],
+            immediate_size: 0,
         });
 
         // Create the render pipeline.
@@ -460,8 +460,8 @@ impl Renderer {
             },
             depth_stencil: depth_format.map(|format| wgpu::DepthStencilState {
                 format,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Always,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: wgpu::StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
@@ -490,7 +490,7 @@ impl Renderer {
                     write_mask: ColorWrites::ALL,
                 })],
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
