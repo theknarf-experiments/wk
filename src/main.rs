@@ -7,6 +7,7 @@ mod plugin;
 mod project;
 
 use crate::example1::example1;
+use clap::CommandFactory;
 use clap::Parser;
 use clap::Subcommand;
 use std::path::PathBuf;
@@ -21,7 +22,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize a new wk project (creates wk.toml)
+    /// Initialize a new wk project (creates wk.kdl)
     Init {
         /// Project name (defaults to the directory name)
         name: Option<String>,
@@ -51,10 +52,13 @@ fn main() -> Result<(), String> {
         Some(Commands::Init { name }) => project::init(name.clone()),
         Some(Commands::Add { plugin }) => project::add(plugin.clone()),
         Some(Commands::Example1 {}) => example1(),
-        // `wk run [paths...]`, or bare `wk`, both run the project (or the given
-        // ad-hoc paths).
+        // `wk run [paths...]` runs the project (or the given ad-hoc paths).
         Some(Commands::Run { plugins }) => run(plugins),
-        None => run(&[]),
+        // Bare `wk` shows help.
+        None => {
+            Cli::command().print_help().map_err(|e| e.to_string())?;
+            Ok(())
+        }
     }
 }
 
