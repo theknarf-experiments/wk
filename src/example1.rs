@@ -3,6 +3,8 @@ use std::time::Instant;
 use sdl3::event::Event;
 use sdl3::keyboard::Keycode;
 
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+
 use imgui::*;
 
 use pollster::block_on;
@@ -29,13 +31,20 @@ pub fn example1() -> Result<(), String> {
     instance_desc.backends = wgpu::Backends::PRIMARY;
     let instance = wgpu::Instance::new(instance_desc);
 
+    // wgpu 29's `from_window` leaves the display handle as `None`, and our
+    // instance is created without one, so build the target with both the
+    // window and display handles taken from the SDL window.
     let surface = unsafe {
-        match instance
-            .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::from_window(&window).unwrap())
-            {
-                Ok(s) => s,
-                Err(e) => return Err(e.to_string()),
-            }
+        let target = wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: Some(
+                window.display_handle().map_err(|e| e.to_string())?.as_raw(),
+            ),
+            raw_window_handle: window.window_handle().map_err(|e| e.to_string())?.as_raw(),
+        };
+        match instance.create_surface_unsafe(target) {
+            Ok(s) => s,
+            Err(e) => return Err(e.to_string()),
+        }
     };
 
     let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
