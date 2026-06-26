@@ -1,10 +1,12 @@
 mod example1;
 mod imguirenderer;
 mod imguisdlhelper;
+mod plugin;
 
 use crate::example1::example1;
 use clap::Parser;
 use clap::Subcommand;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -25,6 +27,12 @@ enum Commands {
     },
 
     Example1 {},
+
+    /// Run a WASM plugin component
+    Run {
+        /// Path to the plugin `.wasm` component
+        plugin: PathBuf,
+    },
 }
 
 fn main() -> Result<(), String> {
@@ -42,6 +50,7 @@ fn main() -> Result<(), String> {
             Ok(())
         }
         Some(Commands::Example1 {}) => example1(),
+        Some(Commands::Run { plugin }) => plugin::run(plugin).map_err(|e| format!("{e:#}")),
         None => {
             println!("Default subcommand");
             Ok(())

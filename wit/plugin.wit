@@ -1,0 +1,8 @@
+// Host-side view of a wk plugin. For now this mirrors the scaffolded `hello`
+// component so we can verify the wasmtime <-> component boundary end to end.
+// The compositor interfaces (surface / frame-buffer) are added in later steps.
+package wk:host;
+
+world plugin {
+    export hello-world: func() -> string;
+}
