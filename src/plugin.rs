@@ -41,6 +41,8 @@ pub use wasi::surface::surface::{Key, KeyEvent, PointerEvent, ResizeEvent};
 /// Shared state of one virtual surface, touched by both the client thread (via
 /// the host interface impls) and the compositor thread.
 pub struct VirtualSurface {
+    /// Display name of the plugin instance that owns this surface.
+    pub title: String,
     pub width: u32,
     pub height: u32,
     /// Latest painted RGBA8 pixels (`width * height * 4`).
@@ -58,8 +60,9 @@ pub struct VirtualSurface {
 }
 
 impl VirtualSurface {
-    fn new(width: u32, height: u32) -> Self {
+    fn new(title: String, width: u32, height: u32) -> Self {
         Self {
+            title,
             width,
             height,
             pixels: vec![0; (width * height * 4) as usize],
@@ -172,6 +175,8 @@ pub struct HostState {
     ctx: WasiCtx,
     table: ResourceTable,
     registry: SurfaceRegistry,
+    /// Display name for the surfaces this client creates.
+    plugin_name: String,
     /// Shared wgpu-core instance backing the wasi:webgpu host.
     gpu: Arc<wgpu_core::global::Global>,
 }
@@ -259,7 +264,11 @@ impl wasi::surface::surface::HostSurface for HostState {
     fn new(&mut self, desc: CreateDesc) -> Result<Resource<SurfaceState>> {
         let width = desc.width.unwrap_or(256);
         let height = desc.height.unwrap_or(256);
-        let shared = Arc::new(Mutex::new(VirtualSurface::new(width, height)));
+        let shared = Arc::new(Mutex::new(VirtualSurface::new(
+            self.plugin_name.clone(),
+            width,
+            height,
+        )));
         self.registry.lock().unwrap().push(shared.clone());
         Ok(self.table.push(SurfaceState { shared })?)
     }
@@ -506,8 +515,9 @@ impl PluginHost {
     }
 
     /// Load a client component and run its `run` export on a dedicated thread.
-    /// Surfaces the client creates appear in `registry` for the compositor.
-    pub fn spawn(&self, path: &Path, registry: SurfaceRegistry) -> Result<()> {
+    /// Surfaces the client creates appear in `registry` for the compositor,
+    /// labelled with `name`.
+    pub fn spawn(&self, path: &Path, name: &str, registry: SurfaceRegistry) -> Result<()> {
         let mut linker: Linker<HostState> = Linker::new(&self.engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
         wasi::surface::surface::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
@@ -523,6 +533,7 @@ impl PluginHost {
             ctx: WasiCtxBuilder::new().inherit_stdio().build(),
             table: ResourceTable::new(),
             registry,
+            plugin_name: name.to_string(),
             gpu: Arc::clone(&self.gpu),
         };
         let mut store = Store::new(&self.engine, state);

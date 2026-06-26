@@ -3,7 +3,7 @@
 //! to the client. wk is "the OS + compositor"; the client thinks it owns its
 //! window.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -119,6 +119,13 @@ fn clamp_size(v: f32) -> u32 {
     (v.max(16.0) as u32).min(4096)
 }
 
+/// Derive a display name for a plugin from its file stem.
+fn plugin_name(path: &Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "plugin".to_string())
+}
+
 /// Return the `TextureId` for surface `i` at size `w`x`h`, (re)creating the
 /// backing wgpu texture when it is missing or the size changed.
 fn surface_texture(
@@ -166,10 +173,13 @@ fn surface_texture(
 pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
     let host = PluginHost::new().map_err(|e| format!("{e:#}"))?;
     let registry: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
-    for plugin in plugins {
-        host.spawn(plugin, registry.clone())
-            .map_err(|e| format!("{e:#}"))?;
-    }
+
+    // The project's plugins become launchable "apps" (named by file stem). The
+    // workspace starts empty; instances are launched from the top bar.
+    let available: Vec<(String, PathBuf)> = plugins
+        .iter()
+        .map(|p| (plugin_name(p), p.clone()))
+        .collect();
 
     let HostShell {
         surface,
@@ -308,14 +318,30 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
             }
         };
 
+        // Apps the user clicked to launch this frame.
+        let mut to_launch: Vec<(String, PathBuf)> = Vec::new();
+
         let ui = imgui.frame();
         {
+            // Top bar: launch an instance of any project plugin (apps can have
+            // multiple instances).
+            ui.main_menu_bar(|| {
+                ui.menu("Apps", || {
+                    for (idx, (name, path)) in available.iter().enumerate() {
+                        if ui.menu_item(format!("{name}##app{idx}")) {
+                            to_launch.push((name.clone(), path.clone()));
+                        }
+                    }
+                });
+            });
+
             inputs.clear();
-            for (i, _shared) in surfaces.iter().enumerate() {
+            for (i, shared) in surfaces.iter().enumerate() {
                 let mut input = SurfaceInput::default();
                 if let Some(view) = views.get(i) {
                     let (id, w, h) = (view.id, view.width as f32, view.height as f32);
-                    ui.window(format!("plugin {i}"))
+                    let title = shared.lock().unwrap().title.clone();
+                    ui.window(format!("{title}##{i}"))
                         .size([w + 16.0, h + 36.0], Condition::FirstUseEver)
                         .build(|| {
                             input.focused = ui.is_window_focused();
@@ -341,6 +367,13 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
                         });
                 }
                 inputs.push(input);
+            }
+        }
+
+        // Launch any apps clicked in the top bar (a fresh instance each click).
+        for (name, path) in &to_launch {
+            if let Err(e) = host.spawn(path, name, registry.clone()) {
+                eprintln!("failed to launch {name}: {e:#}");
             }
         }
 
