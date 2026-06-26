@@ -1,6 +1,6 @@
 //! Shared host setup: an SDL3 window + wgpu device/surface + dear imgui and the
-//! custom imgui renderer. Both `example1` and the plugin compositor build their
-//! run loops on top of a `HostShell`.
+//! custom imgui renderer. The plugin compositor builds its run loop on top of a
+//! `HostShell`.
 
 use std::time::Instant;
 
@@ -12,7 +12,7 @@ use crate::imguirenderer::{Renderer, RendererConfig};
 use crate::imguisdlhelper::ImguiSdl2;
 
 /// Everything needed to drive a frame loop. Callers typically destructure this
-/// into locals and run their own loop (see `example1` and `compositor`).
+/// into locals and run their own loop (see `compositor`).
 pub struct HostShell {
     // `surface` is declared before `window` so it is dropped first: the surface
     // is created from the window's raw handle and must not outlive it.

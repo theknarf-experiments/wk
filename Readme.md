@@ -31,7 +31,7 @@ mise run setup-hooks
 Then run:
 
 ```
-cargo run -- example1
+cargo run -- --help
 ```
 
 ### Setup for components
