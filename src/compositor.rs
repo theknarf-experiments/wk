@@ -9,11 +9,87 @@ use std::time::Instant;
 
 use imgui::{Condition, MouseButton};
 use sdl3::event::Event;
-use sdl3::keyboard::Keycode;
+use sdl3::keyboard::{Keycode, Mod, Scancode};
 
 use crate::host_shell::HostShell;
 use crate::imguirenderer::{Texture, TextureConfig};
-use crate::plugin::{PluginHost, PointerEvent, ResizeEvent, SharedSurface, SurfaceRegistry};
+use crate::plugin::{
+    Key, KeyEvent, PluginHost, PointerEvent, ResizeEvent, SharedSurface, SurfaceRegistry,
+};
+
+/// Map an SDL physical key to the wasi-gfx W3C `key` code. Returns `None` for
+/// keys we don't translate (the client still gets the event, just `key: none`).
+fn map_key(sc: Scancode) -> Option<Key> {
+    use Scancode as S;
+    Some(match sc {
+        S::A => Key::KeyA,
+        S::B => Key::KeyB,
+        S::C => Key::KeyC,
+        S::D => Key::KeyD,
+        S::E => Key::KeyE,
+        S::F => Key::KeyF,
+        S::G => Key::KeyG,
+        S::H => Key::KeyH,
+        S::I => Key::KeyI,
+        S::J => Key::KeyJ,
+        S::K => Key::KeyK,
+        S::L => Key::KeyL,
+        S::M => Key::KeyM,
+        S::N => Key::KeyN,
+        S::O => Key::KeyO,
+        S::P => Key::KeyP,
+        S::Q => Key::KeyQ,
+        S::R => Key::KeyR,
+        S::S => Key::KeyS,
+        S::T => Key::KeyT,
+        S::U => Key::KeyU,
+        S::V => Key::KeyV,
+        S::W => Key::KeyW,
+        S::X => Key::KeyX,
+        S::Y => Key::KeyY,
+        S::Z => Key::KeyZ,
+        S::_1 => Key::Digit1,
+        S::_2 => Key::Digit2,
+        S::_3 => Key::Digit3,
+        S::_4 => Key::Digit4,
+        S::_5 => Key::Digit5,
+        S::_6 => Key::Digit6,
+        S::_7 => Key::Digit7,
+        S::_8 => Key::Digit8,
+        S::_9 => Key::Digit9,
+        S::_0 => Key::Digit0,
+        S::Up => Key::ArrowUp,
+        S::Down => Key::ArrowDown,
+        S::Left => Key::ArrowLeft,
+        S::Right => Key::ArrowRight,
+        S::Space => Key::Space,
+        S::Return => Key::Enter,
+        S::Tab => Key::Tab,
+        S::Escape => Key::Escape,
+        S::Backspace => Key::Backspace,
+        S::LShift => Key::ShiftLeft,
+        S::RShift => Key::ShiftRight,
+        S::LCtrl => Key::ControlLeft,
+        S::RCtrl => Key::ControlRight,
+        S::LAlt => Key::AltLeft,
+        S::RAlt => Key::AltRight,
+        S::LGui => Key::MetaLeft,
+        S::RGui => Key::MetaRight,
+        _ => return None,
+    })
+}
+
+/// Build a wasi-gfx key event from an SDL scancode + modifier state.
+fn key_event(sc: Scancode, keymod: Mod) -> KeyEvent {
+    KeyEvent {
+        key: map_key(sc),
+        text: None,
+        alt_key: keymod.intersects(Mod::LALTMOD | Mod::RALTMOD),
+        ctrl_key: keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD),
+        meta_key: keymod.intersects(Mod::LGUIMOD | Mod::RGUIMOD),
+        shift_key: keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD),
+    }
+}
 
 /// Per-surface compositor-side state: the wgpu texture we upload the client's
 /// pixels into and draw with `imgui::Image`.
@@ -31,6 +107,8 @@ struct SurfaceInput {
     down: Vec<(f64, f64)>,
     up: Vec<(f64, f64)>,
     resize: Option<(u32, u32)>,
+    /// Whether this surface's window held keyboard focus last frame.
+    focused: bool,
 }
 
 /// Clamp a requested surface size to something sane.
@@ -65,8 +143,27 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
     let mut inputs: Vec<SurfaceInput> = Vec::new();
 
     'running: loop {
+        // Key events captured this frame, delivered to the focused client below.
+        let mut key_events: Vec<(KeyEvent, bool)> = Vec::new();
+
         for event in event_pump.poll_iter() {
             imgui_sdl2.handle_event(&mut imgui, &event);
+
+            // Capture keyboard regardless of imgui's own handling.
+            match &event {
+                Event::KeyDown {
+                    scancode: Some(sc),
+                    keymod,
+                    ..
+                } => key_events.push((key_event(*sc, *keymod), true)),
+                Event::KeyUp {
+                    scancode: Some(sc),
+                    keymod,
+                    ..
+                } => key_events.push((key_event(*sc, *keymod), false)),
+                _ => {}
+            }
+
             if imgui_sdl2.ignore_event(&event) {
                 continue;
             }
@@ -176,6 +273,16 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
                         });
                     }
                 }
+                // Keyboard goes to the focused client only.
+                if input.focused {
+                    for (ev, down) in &key_events {
+                        if *down {
+                            s.key_down.push_back(ev.clone());
+                        } else {
+                            s.key_up.push_back(ev.clone());
+                        }
+                    }
+                }
             }
             s.frame_ready = true;
             s.wake();
@@ -200,6 +307,8 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
                     ui.window(format!("plugin {i}"))
                         .size([w + 16.0, h + 36.0], Condition::FirstUseEver)
                         .build(|| {
+                            input.focused = ui.is_window_focused();
+
                             // Resize the client to fill the window's content area.
                             let avail = ui.content_region_avail();
                             input.resize = Some((clamp_size(avail[0]), clamp_size(avail[1])));

@@ -3,7 +3,7 @@ mod bindings;
 
 use bindings::wasi::frame_buffer::frame_buffer::{Buffer, Device};
 use bindings::wasi::graphics_context::graphics_context::Context;
-use bindings::wasi::surface::surface::{CreateDesc, Surface};
+use bindings::wasi::surface::surface::{CreateDesc, Key, Surface};
 use bindings::Guest;
 
 struct Component;
@@ -25,9 +25,9 @@ impl Guest for Component {
 
         let frame = surface.subscribe_frame();
         let mut t: u32 = 0;
-        // Pointer state, updated from the input the compositor routes in.
-        let mut px: i32 = -100;
-        let mut py: i32 = -100;
+        // Marker position, driven by both the pointer and the arrow keys.
+        let mut px: i32 = 128;
+        let mut py: i32 = 128;
         loop {
             frame.block();
             let _ = surface.get_frame();
@@ -42,6 +42,19 @@ impl Guest for Component {
                 clicked = true;
             }
             while surface.get_pointer_up().is_some() {}
+
+            // Drain keyboard input: arrow keys nudge the marker; any key flashes.
+            while let Some(ev) = surface.get_key_down() {
+                clicked = true;
+                match ev.key {
+                    Some(Key::ArrowUp) => py -= 8,
+                    Some(Key::ArrowDown) => py += 8,
+                    Some(Key::ArrowLeft) => px -= 8,
+                    Some(Key::ArrowRight) => px += 8,
+                    _ => {}
+                }
+            }
+            while surface.get_key_up().is_some() {}
 
             let w = surface.width().max(1);
             let h = surface.height().max(1);
