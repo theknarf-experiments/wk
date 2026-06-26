@@ -1,0 +1,12 @@
+package wk:host;
+
+/// The compositor's view of a plugin. The host *provides* the standard wasi-gfx
+/// interfaces (backed by a virtual surface composited into an imgui window) and
+/// calls the client's `run`, inside which the client drives its own frame loop.
+world compositor {
+    import wasi:surface/surface@0.0.1;
+    import wasi:graphics-context/graphics-context@0.0.1;
+    import wasi:frame-buffer/frame-buffer@0.0.1;
+
+    export run: func();
+}

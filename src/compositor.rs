@@ -1,9 +1,10 @@
-//! The wk compositor: loads a plugin component and composites the surface it
-//! paints into an imgui window. For this milestone the compositor drives the
-//! plugin (calls `render` each frame); input routing and self-driving clients
-//! come next.
+//! The wk compositor: spawns a self-driving wasi-gfx client and composites the
+//! virtual surface(s) it paints into imgui windows, routing pointer input back
+//! to the client. wk is "the OS + compositor"; the client thinks it owns its
+//! window.
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use imgui::Condition;
@@ -12,16 +13,20 @@ use sdl3::keyboard::Keycode;
 
 use crate::host_shell::HostShell;
 use crate::imguirenderer::{Texture, TextureConfig};
-use crate::plugin::PluginHost;
+use crate::plugin::{PluginHost, PointerEvent, SharedSurface, SurfaceRegistry};
 
-/// Size of the virtual surface handed to the plugin, in pixels.
-const SURFACE_W: u32 = 256;
-const SURFACE_H: u32 = 256;
+/// Per-surface compositor-side state: the wgpu texture we upload the client's
+/// pixels into and draw with `imgui::Image`.
+struct SurfaceView {
+    id: imgui::TextureId,
+    width: u32,
+    height: u32,
+}
 
 pub fn run(plugin_path: &Path) -> Result<(), String> {
     let host = PluginHost::new().map_err(|e| format!("{e:#}"))?;
-    let mut plugin = host
-        .instantiate(plugin_path)
+    let registry: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
+    host.spawn(plugin_path, registry.clone())
         .map_err(|e| format!("{e:#}"))?;
 
     let HostShell {
@@ -38,25 +43,9 @@ pub fn run(plugin_path: &Path) -> Result<(), String> {
         mut last_frame,
     } = HostShell::new("wk compositor")?;
 
-    let start = Instant::now();
-
-    // The plugin's virtual surface: a wgpu texture registered with the imgui
-    // renderer so we can draw it inside a window with `imgui::Image`.
-    let surface_tex = Texture::new(
-        &device,
-        &renderer,
-        TextureConfig {
-            label: Some("plugin-surface"),
-            format: Some(wgpu::TextureFormat::Rgba8Unorm),
-            size: wgpu::Extent3d {
-                width: SURFACE_W,
-                height: SURFACE_H,
-                depth_or_array_layers: 1,
-            },
-            ..Default::default()
-        },
-    );
-    let surface_id = renderer.textures.insert(surface_tex);
+    let mut views: Vec<SurfaceView> = Vec::new();
+    // Pointer position over each surface's image, from the previous frame.
+    let mut hovers: Vec<Option<(f64, f64)>> = Vec::new();
 
     'running: loop {
         for event in event_pump.poll_iter() {
@@ -90,48 +79,121 @@ pub fn run(plugin_path: &Path) -> Result<(), String> {
         last_frame = now;
         imgui.io_mut().delta_time = delta_s;
 
+        // Snapshot the client surfaces (cheap Arc clones) without holding the
+        // registry lock during compositing.
+        let surfaces: Vec<SharedSurface> = registry.lock().unwrap().clone();
+
+        // Upload each surface's latest pixels into its texture, then signal the
+        // client to paint its next frame. This drives the client every
+        // iteration, independent of whether the host window is presented.
+        for (i, shared) in surfaces.iter().enumerate() {
+            let (w, h, pixels) = {
+                let s = shared.lock().unwrap();
+                let ready = s.pixels.len() == (s.width * s.height * 4) as usize;
+                (s.width, s.height, ready.then(|| s.pixels.clone()))
+            };
+            if w == 0 || h == 0 {
+                continue;
+            }
+            // (Re)create the texture if missing or resized.
+            let needs_new = match views.get(i) {
+                Some(v) => v.width != w || v.height != h,
+                None => true,
+            };
+            if needs_new {
+                let tex = Texture::new(
+                    &device,
+                    &renderer,
+                    TextureConfig {
+                        label: Some("plugin-surface"),
+                        format: Some(wgpu::TextureFormat::Rgba8Unorm),
+                        size: wgpu::Extent3d {
+                            width: w,
+                            height: h,
+                            depth_or_array_layers: 1,
+                        },
+                        ..Default::default()
+                    },
+                );
+                let id = renderer.textures.insert(tex);
+                if let Some(old) = views.get(i) {
+                    renderer.textures.remove(old.id);
+                }
+                let view = SurfaceView {
+                    id,
+                    width: w,
+                    height: h,
+                };
+                if i < views.len() {
+                    views[i] = view;
+                } else {
+                    views.push(view);
+                }
+            }
+            if let Some(pixels) = pixels {
+                if let Some(tex) = renderer.textures.get(views[i].id) {
+                    tex.write(&queue, &pixels, w, h);
+                }
+            }
+
+            // Deliver last frame's pointer input, then signal the next frame.
+            let mut s = shared.lock().unwrap();
+            if let Some(Some((x, y))) = hovers.get(i).copied() {
+                s.pointer_move.push_back(PointerEvent { x, y });
+            }
+            s.frame_ready = true;
+            s.wake();
+        }
+
         let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            other => {
-                eprintln!("dropped frame: {other:?}");
+            _ => {
+                std::thread::sleep(std::time::Duration::new(0, 1_000_000_000u32 / 60));
                 continue;
             }
         };
 
-        // Drive the plugin one frame and upload its pixels into the surface texture.
-        let time_ms = start.elapsed().as_millis() as u64;
-        let pixels = plugin
-            .render(SURFACE_W, SURFACE_H, time_ms)
-            .map_err(|e| format!("{e:#}"))?;
-        if let Some(tex) = renderer.textures.get(surface_id) {
-            tex.write(&queue, &pixels, SURFACE_W, SURFACE_H);
-        }
-
         let ui = imgui.frame();
         {
-            ui.window("plugin")
-                .size(
-                    [SURFACE_W as f32 + 16.0, SURFACE_H as f32 + 36.0],
-                    Condition::FirstUseEver,
-                )
-                .build(|| {
-                    imgui::Image::new(surface_id, [SURFACE_W as f32, SURFACE_H as f32]).build(ui);
-                });
+            hovers.clear();
+            for (i, _shared) in surfaces.iter().enumerate() {
+                let Some(view) = views.get(i) else {
+                    hovers.push(None);
+                    continue;
+                };
+                let (id, w, h) = (view.id, view.width as f32, view.height as f32);
+                let mut hover_local: Option<(f64, f64)> = None;
+                ui.window(format!("plugin {i}"))
+                    .size([w + 16.0, h + 36.0], Condition::FirstUseEver)
+                    .build(|| {
+                        let origin = ui.cursor_screen_pos();
+                        imgui::Image::new(id, [w, h]).build(ui);
+                        if ui.is_item_hovered() {
+                            let mouse = ui.io().mouse_pos;
+                            hover_local = Some((
+                                (mouse[0] - origin[0]) as f64,
+                                (mouse[1] - origin[1]) as f64,
+                            ));
+                        }
+                    });
+                hovers.push(hover_local);
+            }
         }
+
         imgui_sdl2.prepare_render(&ui);
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("command_encoder"),
         });
         {
-            let view = frame
+            let texture_view = frame
                 .texture
                 .create_view(&wgpu::TextureViewDescriptor::default());
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &texture_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
