@@ -1,8 +1,3 @@
-// Vendored imgui-wgpu renderer: keeps the full public surface (texture
-// helpers, srgb config, etc.) even though the example binary only uses part
-// of it, so don't warn about the unused-but-intentional items.
-#![allow(dead_code)]
-
 use imgui::{
     Context, DrawCmd::Elements, DrawData, DrawIdx, DrawList, DrawVert, TextureId, Textures,
 };
@@ -16,7 +11,6 @@ use wgpu::*;
 
 static VS_ENTRY_POINT: &str = "vs_main";
 static FS_ENTRY_POINT_LINEAR: &str = "fs_main_linear";
-static FS_ENTRY_POINT_SRGB: &str = "fs_main_srgb";
 
 pub type RendererResult<T> = Result<T, RendererError>;
 
@@ -44,23 +38,6 @@ impl fmt::Display for RendererError {
 }
 
 impl Error for RendererError {}
-
-#[allow(dead_code)]
-enum ShaderStage {
-    Vertex,
-    Fragment,
-    Compute,
-}
-
-/// Config for creating a texture from raw parts
-///
-#[derive(Clone)]
-pub struct RawTextureConfig<'a> {
-    /// An optional label for the bind group used for debugging.
-    pub label: Option<&'a str>,
-    /// The sampler descriptor of the texture.
-    pub sampler_desc: SamplerDescriptor<'a>,
-}
 
 /// Config for creating a texture.
 ///
@@ -123,55 +100,10 @@ impl<'a> Default for TextureConfig<'a> {
 /// A container for a bindable texture.
 pub struct Texture {
     texture: Arc<wgpu::Texture>,
-    view: Arc<wgpu::TextureView>,
     bind_group: Arc<BindGroup>,
-    size: Extent3d,
 }
 
 impl Texture {
-    /// Create a `Texture` from its raw parts.
-    /// - `bind_group`: The bind group used by the texture. If it is `None`, the bind group will be created like in `Self::new`.
-    /// - `config`: The config used for creating the bind group. If `bind_group` is `Some(_)`, it will be ignored
-    pub fn from_raw_parts(
-        device: &Device,
-        renderer: &Renderer,
-        texture: Arc<wgpu::Texture>,
-        view: Arc<wgpu::TextureView>,
-        bind_group: Option<Arc<BindGroup>>,
-        config: Option<&RawTextureConfig>,
-        size: Extent3d,
-    ) -> Self {
-        let bind_group = bind_group.unwrap_or_else(|| {
-            let config = config.unwrap();
-
-            // Create the texture sampler.
-            let sampler = device.create_sampler(&config.sampler_desc);
-
-            // Create the texture bind group from the layout.
-            Arc::new(device.create_bind_group(&BindGroupDescriptor {
-                label: config.label,
-                layout: &renderer.texture_layout,
-                entries: &[
-                    BindGroupEntry {
-                        binding: 0,
-                        resource: BindingResource::TextureView(&view),
-                    },
-                    BindGroupEntry {
-                        binding: 1,
-                        resource: BindingResource::Sampler(&sampler),
-                    },
-                ],
-            }))
-        });
-
-        Self {
-            texture,
-            view,
-            bind_group,
-            size,
-        }
-    }
-
     /// Create a new GPU texture width the specified `config`.
     pub fn new(device: &Device, renderer: &Renderer, config: TextureConfig) -> Self {
         // Create the wgpu texture.
@@ -210,9 +142,7 @@ impl Texture {
 
         Self {
             texture,
-            view,
             bind_group,
-            size: config.size,
         }
     }
 
@@ -245,36 +175,6 @@ impl Texture {
                 depth_or_array_layers: 1,
             },
         );
-    }
-
-    /// The width of the texture in pixels.
-    pub fn width(&self) -> u32 {
-        self.size.width
-    }
-
-    /// The height of the texture in pixels.
-    pub fn height(&self) -> u32 {
-        self.size.height
-    }
-
-    /// The depth of the texture.
-    pub fn depth(&self) -> u32 {
-        self.size.depth_or_array_layers
-    }
-
-    /// The size of the texture in pixels.
-    pub fn size(&self) -> Extent3d {
-        self.size
-    }
-
-    /// The underlying `wgpu::Texture`.
-    pub fn texture(&self) -> &wgpu::Texture {
-        &self.texture
-    }
-
-    /// The `wgpu::TextureView` of the underlying texture.
-    pub fn view(&self) -> &wgpu::TextureView {
-        &self.view
     }
 }
 
@@ -318,16 +218,6 @@ impl RendererConfig<'_> {
     pub fn new() -> Self {
         RendererConfig {
             fragment_shader_entry_point: Some(FS_ENTRY_POINT_LINEAR),
-            ..Self::with_shaders(include_wgsl!("imgui.wgsl"))
-        }
-    }
-
-    /// Create a new renderer config with precompiled default shaders outputting srgb color.
-    ///
-    /// If you write to a Bgra8Unorm framebuffer, this is what you want.
-    pub fn new_srgb() -> Self {
-        RendererConfig {
-            fragment_shader_entry_point: Some(FS_ENTRY_POINT_SRGB),
             ..Self::with_shaders(include_wgsl!("imgui.wgsl"))
         }
     }
