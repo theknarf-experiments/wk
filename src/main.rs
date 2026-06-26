@@ -4,6 +4,7 @@ mod host_shell;
 mod imguirenderer;
 mod imguisdlhelper;
 mod plugin;
+mod project;
 
 use crate::example1::example1;
 use clap::Parser;
@@ -20,20 +21,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize new project
-    Init {},
-
-    /// Adds dependency
-    Add {
+    /// Initialize a new wk project (creates wk.toml)
+    Init {
+        /// Project name (defaults to the directory name)
         name: Option<String>,
+    },
+
+    /// Add a plugin component to the project
+    Add {
+        /// Path to the plugin `.wasm` component
+        plugin: PathBuf,
     },
 
     Example1 {},
 
-    /// Run one or more WASM plugin components, each composited in its own window
+    /// Run the project's plugins, or explicit `.wasm` paths if given
     Run {
-        /// Paths to the plugin `.wasm` components
-        #[arg(required = true)]
+        /// Plugin `.wasm` paths; if omitted, the project's plugins are used
         plugins: Vec<PathBuf>,
     },
 }
@@ -44,16 +48,17 @@ fn main() -> Result<(), String> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Some(Commands::Init {}) => {
-            println!("'init' was used");
-            Ok(())
-        }
-        Some(Commands::Add { name }) => {
-            println!("'add' was used, name is: {:?}", name);
-            Ok(())
-        }
+        Some(Commands::Init { name }) => project::init(name.clone()),
+        Some(Commands::Add { plugin }) => project::add(plugin.clone()),
         Some(Commands::Example1 {}) => example1(),
-        Some(Commands::Run { plugins }) => compositor::run(plugins),
+        Some(Commands::Run { plugins }) => {
+            let plugins = if plugins.is_empty() {
+                project::Project::load()?.plugins
+            } else {
+                plugins.clone()
+            };
+            compositor::run(&plugins)
+        }
         None => {
             println!("Default subcommand");
             Ok(())
