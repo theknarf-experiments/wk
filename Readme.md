@@ -52,10 +52,10 @@ Run plugins directly:
 cargo run -- run plugins/triangle/target/wasm32-wasip1/debug/triangle.wasm
 ```
 
-Or manage a set of plugins with a `wk.toml` project:
+Or manage a set of plugins with a [KDL](https://kdl.dev/) `wk.kdl` project:
 
 ```
-wk init my-workspace          # create wk.toml
+wk init my-workspace          # create wk.kdl
 wk add path/to/plugin.wasm    # register a plugin
 wk run                        # run every plugin in the project
 ```

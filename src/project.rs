@@ -1,21 +1,21 @@
-//! The wk project model: a `wk.toml` manifest in the working directory that
+//! The wk project model: a `wk.kdl` manifest in the working directory that
 //! lists the plugin components the project loads.
 //!
-//! ```toml
-//! name = "my-workspace"
-//! plugins = ["plugins/paint/.../paint.wasm"]
+//! ```kdl
+//! name "my-workspace"
+//! plugin "plugins/paint/.../paint.wasm"
+//! plugin "plugins/triangle/.../triangle.wasm"
 //! ```
 
-use serde::{Deserialize, Serialize};
+use kdl::{KdlDocument, KdlEntry, KdlNode};
 use std::path::{Path, PathBuf};
 
 /// Manifest file name, looked up in the current directory.
-pub const MANIFEST: &str = "wk.toml";
+pub const MANIFEST: &str = "wk.kdl";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct Project {
     pub name: String,
-    #[serde(default)]
     pub plugins: Vec<PathBuf>,
 }
 
@@ -24,14 +24,45 @@ impl Project {
     pub fn load() -> Result<Self, String> {
         let text = std::fs::read_to_string(MANIFEST)
             .map_err(|e| format!("no {MANIFEST} in this directory ({e}); run `wk init` first"))?;
-        toml::from_str(&text).map_err(|e| format!("failed to parse {MANIFEST}: {e}"))
+        let doc: KdlDocument = text
+            .parse()
+            .map_err(|e| format!("failed to parse {MANIFEST}: {e}"))?;
+
+        let name = doc
+            .get("name")
+            .and_then(|n| n.get(0))
+            .and_then(|v| v.as_string())
+            .unwrap_or("wk-project")
+            .to_string();
+
+        let plugins = doc
+            .nodes()
+            .iter()
+            .filter(|n| n.name().value() == "plugin")
+            .filter_map(|n| n.get(0).and_then(|v| v.as_string()))
+            .map(PathBuf::from)
+            .collect();
+
+        Ok(Project { name, plugins })
     }
 
     /// Write the manifest back to the current directory.
     pub fn save(&self) -> Result<(), String> {
-        let text = toml::to_string_pretty(self)
-            .map_err(|e| format!("failed to serialize project: {e}"))?;
-        std::fs::write(MANIFEST, text).map_err(|e| format!("failed to write {MANIFEST}: {e}"))
+        let mut doc = KdlDocument::new();
+
+        let mut name_node = KdlNode::new("name");
+        name_node.push(KdlEntry::new(self.name.clone()));
+        doc.nodes_mut().push(name_node);
+
+        for plugin in &self.plugins {
+            let mut node = KdlNode::new("plugin");
+            node.push(KdlEntry::new(plugin.to_string_lossy().to_string()));
+            doc.nodes_mut().push(node);
+        }
+
+        doc.autoformat();
+        std::fs::write(MANIFEST, doc.to_string())
+            .map_err(|e| format!("failed to write {MANIFEST}: {e}"))
     }
 
     /// Add a plugin path to the project (idempotent), persisting the manifest.
@@ -46,7 +77,7 @@ impl Project {
     }
 }
 
-/// Create a new `wk.toml` in the current directory. Errors if one exists.
+/// Create a new `wk.kdl` in the current directory. Errors if one exists.
 pub fn init(name: Option<String>) -> Result<(), String> {
     if Path::new(MANIFEST).exists() {
         return Err(format!("{MANIFEST} already exists"));
