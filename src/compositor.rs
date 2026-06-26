@@ -13,7 +13,7 @@ use sdl3::keyboard::Keycode;
 
 use crate::host_shell::HostShell;
 use crate::imguirenderer::{Texture, TextureConfig};
-use crate::plugin::{PluginHost, PointerEvent, SharedSurface, SurfaceRegistry};
+use crate::plugin::{PluginHost, PointerEvent, ResizeEvent, SharedSurface, SurfaceRegistry};
 
 /// Per-surface compositor-side state: the wgpu texture we upload the client's
 /// pixels into and draw with `imgui::Image`.
@@ -23,13 +23,19 @@ struct SurfaceView {
     height: u32,
 }
 
-/// Pointer input collected over a surface's image during one frame, delivered to
-/// the client on the next.
+/// Input collected over a surface's window during one frame, delivered to the
+/// client on the next: pointer events and an optional resize request.
 #[derive(Default)]
-struct PointerInput {
+struct SurfaceInput {
     moved: Option<(f64, f64)>,
     down: Vec<(f64, f64)>,
     up: Vec<(f64, f64)>,
+    resize: Option<(u32, u32)>,
+}
+
+/// Clamp a requested surface size to something sane.
+fn clamp_size(v: f32) -> u32 {
+    (v.max(16.0) as u32).min(4096)
 }
 
 pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
@@ -55,8 +61,8 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
     } = HostShell::new("wk compositor")?;
 
     let mut views: Vec<SurfaceView> = Vec::new();
-    // Pointer input over each surface's image, collected last frame.
-    let mut inputs: Vec<PointerInput> = Vec::new();
+    // Input over each surface's window, collected last frame.
+    let mut inputs: Vec<SurfaceInput> = Vec::new();
 
     'running: loop {
         for event in event_pump.poll_iter() {
@@ -147,7 +153,7 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
                 }
             }
 
-            // Deliver last frame's pointer input, then signal the next frame.
+            // Deliver last frame's input, then signal the next frame.
             let mut s = shared.lock().unwrap();
             if let Some(input) = inputs.get(i) {
                 if let Some((x, y)) = input.moved {
@@ -158,6 +164,17 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
                 }
                 for &(x, y) in &input.up {
                     s.pointer_up.push_back(PointerEvent { x, y });
+                }
+                if let Some((rw, rh)) = input.resize {
+                    if rw != s.width || rh != s.height {
+                        s.width = rw;
+                        s.height = rh;
+                        s.pixels = vec![0; (rw * rh * 4) as usize];
+                        s.resize = Some(ResizeEvent {
+                            width: rw,
+                            height: rh,
+                        });
+                    }
                 }
             }
             s.frame_ready = true;
@@ -177,12 +194,16 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
         {
             inputs.clear();
             for (i, _shared) in surfaces.iter().enumerate() {
-                let mut input = PointerInput::default();
+                let mut input = SurfaceInput::default();
                 if let Some(view) = views.get(i) {
                     let (id, w, h) = (view.id, view.width as f32, view.height as f32);
                     ui.window(format!("plugin {i}"))
                         .size([w + 16.0, h + 36.0], Condition::FirstUseEver)
                         .build(|| {
+                            // Resize the client to fill the window's content area.
+                            let avail = ui.content_region_avail();
+                            input.resize = Some((clamp_size(avail[0]), clamp_size(avail[1])));
+
                             let origin = ui.cursor_screen_pos();
                             imgui::Image::new(id, [w, h]).build(ui);
                             if ui.is_item_hovered() {

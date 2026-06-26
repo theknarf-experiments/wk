@@ -35,8 +35,8 @@ wasmtime::component::bindgen!({
     },
 });
 
-pub use wasi::surface::surface::PointerEvent;
-use wasi::surface::surface::{CreateDesc, FrameEvent, KeyEvent, ResizeEvent};
+use wasi::surface::surface::{CreateDesc, FrameEvent, KeyEvent};
+pub use wasi::surface::surface::{PointerEvent, ResizeEvent};
 
 /// Shared state of one virtual surface, touched by both the client thread (via
 /// the host interface impls) and the compositor thread.
