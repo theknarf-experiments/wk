@@ -19,10 +19,12 @@ brew install mise
 mise trust
 ```
 
-Point git at the tracked `.hooks` directory (runs `cargo check` before
-each commit):
+Point git at the tracked `.hooks` directory. The pre-commit hook runs
+`cargo fmt --all -- --check`, `cargo check` (warnings denied) and
+`cargo nextest run`, so install nextest first:
 
 ```
+cargo install cargo-nextest
 mise run setup-hooks
 ```
 

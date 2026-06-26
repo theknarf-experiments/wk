@@ -7,8 +7,8 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use imgui::*;
 
-use pollster::block_on;
 use crate::imguirenderer::{Renderer, RendererConfig};
+use pollster::block_on;
 
 use crate::imguisdlhelper::ImguiSdl2;
 
@@ -36,9 +36,7 @@ pub fn example1() -> Result<(), String> {
     // window and display handles taken from the SDL window.
     let surface = unsafe {
         let target = wgpu::SurfaceTargetUnsafe::RawHandle {
-            raw_display_handle: Some(
-                window.display_handle().map_err(|e| e.to_string())?.as_raw(),
-            ),
+            raw_display_handle: Some(window.display_handle().map_err(|e| e.to_string())?.as_raw()),
             raw_window_handle: window.window_handle().map_err(|e| e.to_string())?.as_raw(),
         };
         match instance.create_surface_unsafe(target) {
@@ -55,8 +53,7 @@ pub fn example1() -> Result<(), String> {
     .unwrap();
 
     let (device, queue) =
-        block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-        .unwrap();
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
 
     // Set up swap chain
     let surface_desc = wgpu::SurfaceConfiguration {
@@ -125,7 +122,10 @@ pub fn example1() -> Result<(), String> {
                     keycode: Some(Keycode::Escape),
                     ..
                 } => break 'running Ok(()),
-                Event::Window { win_event: sdl3::event::WindowEvent::Resized(width, height), .. } => {
+                Event::Window {
+                    win_event: sdl3::event::WindowEvent::Resized(width, height),
+                    ..
+                } => {
                     // Update surface configuration with new dimensions
                     let surface_desc = wgpu::SurfaceConfiguration {
                         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -173,8 +173,8 @@ pub fn example1() -> Result<(), String> {
                     ui.separator();
                     let mouse_pos = ui.io().mouse_pos;
                     ui.text(format!(
-                            "Mouse Position: ({:.1},{:.1})",
-                            mouse_pos[0], mouse_pos[1]
+                        "Mouse Position: ({:.1},{:.1})",
+                        mouse_pos[0], mouse_pos[1]
                     ));
                 });
 
@@ -186,17 +186,14 @@ pub fn example1() -> Result<(), String> {
                     ui.text(format!("Frametime: {delta_s:?}"));
                 });
 
-
             ui.show_demo_window(&mut true);
         }
 
         imgui_sdl2.prepare_render(&ui);
 
-        let mut encoder = device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor {
-                label: Some("command_encoder"),
-            }
-        );
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("command_encoder"),
+        });
 
         {
             let view = frame

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run through `mise exec` so the project env (e.g. LIBRARY_PATH for SDL3) is
-# applied even when git invokes the hook from a shell without mise activated.
-mise exec -- cargo check
+cargo fmt --all -- --check
+
+# RUSTFLAGS="-D warnings" treats warnings as errors so a commit is blocked
+# on any warning.
+RUSTFLAGS="-D warnings" cargo check
+
+# --no-tests=pass so an empty test suite doesn't block the commit.
+cargo nextest run --no-tests=pass

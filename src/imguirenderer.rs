@@ -1,3 +1,8 @@
+// Vendored imgui-wgpu renderer: keeps the full public surface (texture
+// helpers, srgb config, etc.) even though the example binary only uses part
+// of it, so don't warn about the unused-but-intentional items.
+#![allow(dead_code)]
+
 use imgui::{
     Context, DrawCmd::Elements, DrawData, DrawIdx, DrawList, DrawVert, TextureId, Textures,
 };
@@ -615,12 +620,17 @@ impl Renderer {
             });
             render_data.index_buffer = Some(buffer);
             render_data.index_buffer_size = indices.len();
-        } else { match render_data.index_buffer.as_ref() { Some(buffer) => {
-            // The buffer is large enough for the new indices, so reuse it
-            queue.write_buffer(buffer, 0, &indices);
-        } _ => {
-            unreachable!()
-        }}}
+        } else {
+            match render_data.index_buffer.as_ref() {
+                Some(buffer) => {
+                    // The buffer is large enough for the new indices, so reuse it
+                    queue.write_buffer(buffer, 0, &indices);
+                }
+                _ => {
+                    unreachable!()
+                }
+            }
+        }
 
         // If the buffer is not created or is too small for the new vertices, create a new buffer
         if render_data.vertex_buffer.is_none() || render_data.vertex_buffer_size < vertices.len() {
@@ -631,12 +641,17 @@ impl Renderer {
             });
             render_data.vertex_buffer = Some(buffer);
             render_data.vertex_buffer_size = vertices.len();
-        } else { match render_data.vertex_buffer.as_ref() { Some(buffer) => {
-            // The buffer is large enough for the new vertices, so reuse it
-            queue.write_buffer(buffer, 0, &vertices);
-        } _ => {
-            unreachable!()
-        }}}
+        } else {
+            match render_data.vertex_buffer.as_ref() {
+                Some(buffer) => {
+                    // The buffer is large enough for the new vertices, so reuse it
+                    queue.write_buffer(buffer, 0, &vertices);
+                }
+                _ => {
+                    unreachable!()
+                }
+            }
+        }
 
         render_data
     }

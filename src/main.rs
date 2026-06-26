@@ -1,10 +1,10 @@
-mod imguisdlhelper;
-mod imguirenderer;
 mod example1;
+mod imguirenderer;
+mod imguisdlhelper;
 
+use crate::example1::example1;
 use clap::Parser;
 use clap::Subcommand;
-use crate::example1::example1;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -17,12 +17,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Initialize new project
-    Init { },
+    Init {},
 
     /// Adds dependency
-    Add { name: Option<String> },
+    Add {
+        name: Option<String>,
+    },
 
-    Example1 { },
+    Example1 {},
 }
 
 fn main() -> Result<(), String> {
@@ -39,9 +41,7 @@ fn main() -> Result<(), String> {
             println!("'add' was used, name is: {:?}", name);
             Ok(())
         }
-        Some(Commands::Example1 {}) => {
-            example1()
-        }
+        Some(Commands::Example1 {}) => example1(),
         None => {
             println!("Default subcommand");
             Ok(())
