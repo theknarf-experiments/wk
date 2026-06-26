@@ -30,10 +30,11 @@ enum Commands {
 
     Example1 {},
 
-    /// Run a WASM plugin component
+    /// Run one or more WASM plugin components, each composited in its own window
     Run {
-        /// Path to the plugin `.wasm` component
-        plugin: PathBuf,
+        /// Paths to the plugin `.wasm` components
+        #[arg(required = true)]
+        plugins: Vec<PathBuf>,
     },
 }
 
@@ -52,7 +53,7 @@ fn main() -> Result<(), String> {
             Ok(())
         }
         Some(Commands::Example1 {}) => example1(),
-        Some(Commands::Run { plugin }) => compositor::run(plugin),
+        Some(Commands::Run { plugins }) => compositor::run(plugins),
         None => {
             println!("Default subcommand");
             Ok(())

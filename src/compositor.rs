@@ -3,11 +3,11 @@
 //! to the client. wk is "the OS + compositor"; the client thinks it owns its
 //! window.
 
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use imgui::Condition;
+use imgui::{Condition, MouseButton};
 use sdl3::event::Event;
 use sdl3::keyboard::Keycode;
 
@@ -23,11 +23,22 @@ struct SurfaceView {
     height: u32,
 }
 
-pub fn run(plugin_path: &Path) -> Result<(), String> {
+/// Pointer input collected over a surface's image during one frame, delivered to
+/// the client on the next.
+#[derive(Default)]
+struct PointerInput {
+    moved: Option<(f64, f64)>,
+    down: Vec<(f64, f64)>,
+    up: Vec<(f64, f64)>,
+}
+
+pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
     let host = PluginHost::new().map_err(|e| format!("{e:#}"))?;
     let registry: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
-    host.spawn(plugin_path, registry.clone())
-        .map_err(|e| format!("{e:#}"))?;
+    for plugin in plugins {
+        host.spawn(plugin, registry.clone())
+            .map_err(|e| format!("{e:#}"))?;
+    }
 
     let HostShell {
         surface,
@@ -44,8 +55,8 @@ pub fn run(plugin_path: &Path) -> Result<(), String> {
     } = HostShell::new("wk compositor")?;
 
     let mut views: Vec<SurfaceView> = Vec::new();
-    // Pointer position over each surface's image, from the previous frame.
-    let mut hovers: Vec<Option<(f64, f64)>> = Vec::new();
+    // Pointer input over each surface's image, collected last frame.
+    let mut inputs: Vec<PointerInput> = Vec::new();
 
     'running: loop {
         for event in event_pump.poll_iter() {
@@ -138,8 +149,16 @@ pub fn run(plugin_path: &Path) -> Result<(), String> {
 
             // Deliver last frame's pointer input, then signal the next frame.
             let mut s = shared.lock().unwrap();
-            if let Some(Some((x, y))) = hovers.get(i).copied() {
-                s.pointer_move.push_back(PointerEvent { x, y });
+            if let Some(input) = inputs.get(i) {
+                if let Some((x, y)) = input.moved {
+                    s.pointer_move.push_back(PointerEvent { x, y });
+                }
+                for &(x, y) in &input.down {
+                    s.pointer_down.push_back(PointerEvent { x, y });
+                }
+                for &(x, y) in &input.up {
+                    s.pointer_up.push_back(PointerEvent { x, y });
+                }
             }
             s.frame_ready = true;
             s.wake();
@@ -156,28 +175,31 @@ pub fn run(plugin_path: &Path) -> Result<(), String> {
 
         let ui = imgui.frame();
         {
-            hovers.clear();
+            inputs.clear();
             for (i, _shared) in surfaces.iter().enumerate() {
-                let Some(view) = views.get(i) else {
-                    hovers.push(None);
-                    continue;
-                };
-                let (id, w, h) = (view.id, view.width as f32, view.height as f32);
-                let mut hover_local: Option<(f64, f64)> = None;
-                ui.window(format!("plugin {i}"))
-                    .size([w + 16.0, h + 36.0], Condition::FirstUseEver)
-                    .build(|| {
-                        let origin = ui.cursor_screen_pos();
-                        imgui::Image::new(id, [w, h]).build(ui);
-                        if ui.is_item_hovered() {
-                            let mouse = ui.io().mouse_pos;
-                            hover_local = Some((
-                                (mouse[0] - origin[0]) as f64,
-                                (mouse[1] - origin[1]) as f64,
-                            ));
-                        }
-                    });
-                hovers.push(hover_local);
+                let mut input = PointerInput::default();
+                if let Some(view) = views.get(i) {
+                    let (id, w, h) = (view.id, view.width as f32, view.height as f32);
+                    ui.window(format!("plugin {i}"))
+                        .size([w + 16.0, h + 36.0], Condition::FirstUseEver)
+                        .build(|| {
+                            let origin = ui.cursor_screen_pos();
+                            imgui::Image::new(id, [w, h]).build(ui);
+                            if ui.is_item_hovered() {
+                                let mouse = ui.io().mouse_pos;
+                                let local =
+                                    ((mouse[0] - origin[0]) as f64, (mouse[1] - origin[1]) as f64);
+                                input.moved = Some(local);
+                                if ui.is_mouse_clicked(MouseButton::Left) {
+                                    input.down.push(local);
+                                }
+                                if ui.is_mouse_released(MouseButton::Left) {
+                                    input.up.push(local);
+                                }
+                            }
+                        });
+                }
+                inputs.push(input);
             }
         }
 
