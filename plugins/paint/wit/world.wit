@@ -1,0 +1,13 @@
+package wk:paint;
+
+/// A self-driving wk client. It imports the standard wasi-gfx interfaces for
+/// windowing + software rendering, exactly as an existing app's graphics
+/// backend would. The host calls `run`, inside which the client drives its own
+/// frame loop (this is the X11/Wayland-style "app that owns its window" model).
+world paint {
+    import wasi:surface/surface@0.0.1;
+    import wasi:graphics-context/graphics-context@0.0.1;
+    import wasi:frame-buffer/frame-buffer@0.0.1;
+
+    export run: func();
+}
