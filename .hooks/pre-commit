@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Run through `mise exec` so the project env (e.g. LIBRARY_PATH for SDL3) is
+# applied even when git invokes the hook from a shell without mise activated.
+mise exec -- cargo check

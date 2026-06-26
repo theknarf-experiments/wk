@@ -1,2 +1,6 @@
 [env]
 LIBRARY_PATH = "{{env.LIBRARY_PATH | default(value='')}}:{{exec(command='brew --prefix')}}/lib"
+
+[tasks.setup-hooks]
+description = "Use .hooks as the git hooks directory"
+run = "git config core.hooksPath .hooks"
