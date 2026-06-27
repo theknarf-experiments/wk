@@ -388,22 +388,6 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
             }
         }
 
-        // Close any windows the user dismissed: trap the client (ending its
-        // thread), drop it from the registry, and free its texture.
-        for shared in &to_close {
-            let sid = {
-                let mut s = shared.lock().unwrap();
-                s.closed = true;
-                s.wake();
-                s.id
-            };
-            registry.lock().unwrap().retain(|x| !Arc::ptr_eq(x, shared));
-            if let Some(v) = views.remove(&sid) {
-                renderer.textures.remove(v.texture);
-            }
-            inputs.remove(&sid);
-        }
-
         imgui_sdl2.prepare_render(ui);
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -440,6 +424,24 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
         }
         queue.submit([encoder.finish()]);
         frame.present();
+
+        // Close dismissed windows AFTER rendering: this frame's draw data still
+        // references their textures, so freeing them earlier panics the renderer.
+        // Trap the client (ending its thread), drop it from the registry, and
+        // free its texture.
+        for shared in &to_close {
+            let sid = {
+                let mut s = shared.lock().unwrap();
+                s.closed = true;
+                s.wake();
+                s.id
+            };
+            registry.lock().unwrap().retain(|x| !Arc::ptr_eq(x, shared));
+            if let Some(v) = views.remove(&sid) {
+                renderer.textures.remove(v.texture);
+            }
+            inputs.remove(&sid);
+        }
 
         std::thread::sleep(FRAME);
     }
