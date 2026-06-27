@@ -1,0 +1,7 @@
+package wk:sockets-demo;
+
+/// Two instances open the shared socket file and exchange a greeting, like two
+/// processes talking over a Unix domain socket.
+world sockets-demo {
+    export run: func();
+}

@@ -533,6 +533,9 @@ impl wasi::frame_buffer::frame_buffer::HostBuffer for HostState {
 pub struct PluginHost {
     engine: Engine,
     gpu: Arc<wgpu_core::global::Global>,
+    /// The shared workspace filesystem, mounted into every instance at
+    /// `/shared` so instances can exchange files and talk over `/shared/sock`.
+    shared_fs: crate::vfs::SharedFs,
 }
 
 impl PluginHost {
@@ -542,6 +545,7 @@ impl PluginHost {
         Ok(Self {
             engine: Engine::new(&config)?,
             gpu: new_gpu_instance(),
+            shared_fs: crate::vfs::new_shared_workspace(),
         })
     }
 
@@ -568,7 +572,7 @@ impl PluginHost {
             table: ResourceTable::new(),
             registry,
             plugin_name: name.to_string(),
-            fs: crate::vfs::SharedFs::default(),
+            fs: crate::vfs::new_instance_fs(&self.shared_fs),
             gpu: Arc::clone(&self.gpu),
         };
         let mut store = Store::new(&self.engine, state);

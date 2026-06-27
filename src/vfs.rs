@@ -2,8 +2,11 @@
 //! (instead of wasmtime-wasi's cap-std one) so each plugin instance sees its own
 //! sandboxed, in-RAM filesystem. Nothing touches the host disk.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Condvar, Mutex};
+use std::task::{Context as TaskContext, Poll, Waker};
 
 use wasmtime::component::{HasData, Linker, Resource, ResourceTable};
 use wasmtime::Result;
@@ -11,7 +14,9 @@ use wasmtime_wasi::WasiView;
 use wasmtime_wasi_io::async_trait;
 use wasmtime_wasi_io::bytes::Bytes;
 use wasmtime_wasi_io::poll::Pollable;
-use wasmtime_wasi_io::streams::{DynInputStream, DynOutputStream, OutputStream, StreamError};
+use wasmtime_wasi_io::streams::{
+    DynInputStream, DynOutputStream, InputStream, OutputStream, StreamError,
+};
 use wasmtime_wasi_io::IoView;
 
 wasmtime::component::bindgen!({
@@ -41,6 +46,12 @@ use wasi::filesystem::types::{
 enum Node {
     File(Vec<u8>),
     Dir(BTreeMap<String, u64>),
+    /// A mount point: descending into it crosses over to another filesystem's
+    /// root. Used to graft the shared workspace into each instance at `/shared`.
+    Mount(SharedFs),
+    /// A socket file: two openers become the two endpoints of a duplex byte
+    /// stream and can read/write to talk to each other (Unix AF_UNIX-like).
+    Socket(Socket),
 }
 
 const ROOT: u64 = 0;
@@ -66,9 +77,109 @@ impl Fs {
         self.nodes.insert(id, node);
         id
     }
+
+    /// Insert `node` as a child named `name` under `parent` (a directory).
+    fn add_child(&mut self, parent: u64, name: &str, node: Node) {
+        let id = self.alloc(node);
+        if let Some(Node::Dir(children)) = self.nodes.get_mut(&parent) {
+            children.insert(name.to_string(), id);
+        }
+    }
 }
 
 pub type SharedFs = Arc<Mutex<Fs>>;
+
+// ---- sockets ----
+
+/// A bidirectional in-memory socket, shared by its (up to) two endpoints. The
+/// `Condvar` lets a blocking `read` syscall park its thread until the peer
+/// writes or closes; the wakers serve the async `read-via-stream` path.
+type Socket = Arc<(Mutex<SocketChannel>, Condvar)>;
+
+#[derive(Default)]
+struct SocketChannel {
+    /// Bytes pending for endpoint `i`, written by its peer `1 - i`.
+    queues: [VecDeque<u8>; 2],
+    /// Wakers parked by an async reader on endpoint `i`.
+    read_wakers: [Vec<Waker>; 2],
+    /// Endpoint `i` has closed (its descriptor was dropped).
+    closed: [bool; 2],
+    /// How many endpoints have bound so far (first opener is 0, rest are 1).
+    connected: u8,
+}
+
+fn new_socket() -> Socket {
+    Arc::new((Mutex::new(SocketChannel::default()), Condvar::new()))
+}
+
+/// Bind the next endpoint: the first opener is endpoint 0, every later opener
+/// shares endpoint 1 (the two-app case is the supported one).
+fn socket_connect(sock: &Socket) -> usize {
+    let (lock, _) = &**sock;
+    let mut c = lock.lock().unwrap();
+    let ep = if c.connected == 0 { 0 } else { 1 };
+    c.connected = c.connected.saturating_add(1);
+    ep
+}
+
+/// Queue `data` for endpoint `to`, waking whoever is reading it.
+fn socket_write(sock: &Socket, to: usize, data: &[u8]) {
+    let (lock, cvar) = &**sock;
+    let mut c = lock.lock().unwrap();
+    c.queues[to].extend(data.iter().copied());
+    for w in c.read_wakers[to].drain(..) {
+        w.wake();
+    }
+    drop(c);
+    cvar.notify_all();
+}
+
+/// Block the calling thread until endpoint `ep` has bytes to read or its peer
+/// closes, then return up to `len` bytes (and whether EOF was reached). This is
+/// the blocking-read syscall behaviour for a socket file.
+fn socket_read_blocking(sock: &Socket, ep: usize, len: usize) -> (Vec<u8>, bool) {
+    let (lock, cvar) = &**sock;
+    let mut c = lock.lock().unwrap();
+    loop {
+        let q = &mut c.queues[ep];
+        if !q.is_empty() {
+            let n = len.min(q.len());
+            return (q.drain(..n).collect(), false);
+        }
+        if c.closed[1 - ep] {
+            return (Vec::new(), true);
+        }
+        c = cvar.wait(c).unwrap();
+    }
+}
+
+/// Mark endpoint `ep` closed and wake the peer so it observes EOF.
+fn socket_close(sock: &Socket, ep: usize) {
+    let (lock, cvar) = &**sock;
+    let mut c = lock.lock().unwrap();
+    c.closed[ep] = true;
+    for w in c.read_wakers[1 - ep].drain(..) {
+        w.wake();
+    }
+    drop(c);
+    cvar.notify_all();
+}
+
+/// Create the host-global shared workspace filesystem, seeded with a socket
+/// file at `/sock` that two instances can use to talk to each other.
+pub fn new_shared_workspace() -> SharedFs {
+    let mut fs = Fs::default();
+    fs.add_child(ROOT, "sock", Node::Socket(new_socket()));
+    Arc::new(Mutex::new(fs))
+}
+
+/// Create a fresh per-instance filesystem with the shared workspace grafted in
+/// at `/shared`.
+pub fn new_instance_fs(shared: &SharedFs) -> SharedFs {
+    let mut fs = Fs::default();
+    fs.add_child(ROOT, "shared", Node::Mount(shared.clone()));
+    Arc::new(Mutex::new(fs))
+}
 
 /// Split a path into normal components (ignoring empty and `.`).
 fn components(path: &str) -> Vec<&str> {
@@ -77,38 +188,48 @@ fn components(path: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Resolve an existing node from `start` following `path`.
-fn resolve(fs: &Fs, start: u64, path: &str) -> Option<u64> {
+/// Resolve an existing node from `start` following `path`, crossing `Mount`
+/// points into their target filesystem. Returns the filesystem that actually
+/// holds the node together with the node id.
+fn resolve(fs: &SharedFs, start: u64, path: &str) -> Option<(SharedFs, u64)> {
+    let mut cur_fs = fs.clone();
     let mut cur = start;
     for comp in components(path) {
-        match fs.nodes.get(&cur)? {
-            Node::Dir(children) => cur = *children.get(comp)?,
-            Node::File(_) => return None,
+        // Look up the child and, if it is a mount, the filesystem to cross into.
+        let (cross, next) = {
+            let g = cur_fs.lock().unwrap();
+            match g.nodes.get(&cur)? {
+                Node::Dir(children) => {
+                    let child = *children.get(comp)?;
+                    match g.nodes.get(&child)? {
+                        Node::Mount(shared) => (Some(shared.clone()), ROOT),
+                        _ => (None, child),
+                    }
+                }
+                _ => return None,
+            }
+        };
+        if let Some(shared) = cross {
+            cur_fs = shared;
         }
+        cur = next;
     }
-    Some(cur)
+    Some((cur_fs, cur))
 }
 
-/// Resolve the parent directory of the last component of `path`.
-fn resolve_parent(fs: &Fs, start: u64, path: &str) -> Option<(u64, String)> {
+/// Resolve the parent directory of the last component of `path`, returning the
+/// filesystem that holds it, the parent node id, and the final name.
+fn resolve_parent(fs: &SharedFs, start: u64, path: &str) -> Option<(SharedFs, u64, String)> {
     let comps = components(path);
     let (name, dirs) = comps.split_last()?;
-    let mut cur = start;
-    for comp in dirs {
-        match fs.nodes.get(&cur)? {
-            Node::Dir(children) => cur = *children.get(*comp)?,
-            Node::File(_) => return None,
-        }
-    }
-    match fs.nodes.get(&cur)? {
-        Node::Dir(_) => Some((cur, (*name).to_string())),
-        Node::File(_) => None,
-    }
+    let (pfs, parent) = resolve(fs, start, &dirs.join("/"))?;
+    let is_dir = matches!(pfs.lock().unwrap().nodes.get(&parent), Some(Node::Dir(_)));
+    is_dir.then(|| (pfs, parent, (*name).to_string()))
 }
 
 fn node_type(fs: &Fs, id: u64) -> DescriptorType {
     match fs.nodes.get(&id) {
-        Some(Node::Dir(_)) => DescriptorType::Directory,
+        Some(Node::Dir(_)) | Some(Node::Mount(_)) => DescriptorType::Directory,
         _ => DescriptorType::RegularFile,
     }
 }
@@ -119,6 +240,8 @@ fn node_type(fs: &Fs, id: u64) -> DescriptorType {
 pub struct Descriptor {
     fs: SharedFs,
     node: u64,
+    /// For an open socket: which endpoint (0 or 1) this handle owns.
+    endpoint: Option<usize>,
 }
 
 /// A snapshot directory listing.
@@ -155,6 +278,92 @@ impl OutputStream for VfsOutputStream {
             }
             _ => Err(StreamError::Closed),
         }
+    }
+    fn flush(&mut self) -> std::result::Result<(), StreamError> {
+        Ok(())
+    }
+    fn check_write(&mut self) -> std::result::Result<usize, StreamError> {
+        Ok(1024 * 1024)
+    }
+}
+
+/// Reading end of a socket: drains the bytes queued for this endpoint.
+struct SocketInputStream {
+    sock: Socket,
+    endpoint: usize,
+}
+
+impl InputStream for SocketInputStream {
+    fn read(&mut self, size: usize) -> std::result::Result<Bytes, StreamError> {
+        let (lock, _) = &*self.sock;
+        let mut c = lock.lock().unwrap();
+        let q = &mut c.queues[self.endpoint];
+        let n = size.min(q.len());
+        if n == 0 {
+            // Nothing buffered: EOF once the peer has closed, else just empty.
+            if c.closed[1 - self.endpoint] {
+                return Err(StreamError::Closed);
+            }
+            return Ok(Bytes::new());
+        }
+        Ok(Bytes::from(q.drain(..n).collect::<Vec<u8>>()))
+    }
+}
+
+#[async_trait]
+impl Pollable for SocketInputStream {
+    async fn ready(&mut self) {
+        SocketReadable {
+            sock: self.sock.clone(),
+            endpoint: self.endpoint,
+        }
+        .await
+    }
+}
+
+/// Future that resolves once this endpoint has bytes to read or the peer closed.
+struct SocketReadable {
+    sock: Socket,
+    endpoint: usize,
+}
+
+impl Future for SocketReadable {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
+        let (lock, _) = &*self.sock;
+        let mut c = lock.lock().unwrap();
+        if !c.queues[self.endpoint].is_empty() || c.closed[1 - self.endpoint] {
+            Poll::Ready(())
+        } else {
+            c.read_wakers[self.endpoint].push(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+/// Writing end of a socket: queues bytes for the peer endpoint.
+struct SocketOutputStream {
+    sock: Socket,
+    /// This handle's own endpoint; writes go to the peer `1 - endpoint`.
+    endpoint: usize,
+}
+
+#[async_trait]
+impl Pollable for SocketOutputStream {
+    async fn ready(&mut self) {}
+}
+
+impl OutputStream for SocketOutputStream {
+    fn write(&mut self, bytes: Bytes) -> std::result::Result<(), StreamError> {
+        let peer = 1 - self.endpoint;
+        {
+            let (lock, _) = &*self.sock;
+            if lock.lock().unwrap().closed[peer] {
+                return Err(StreamError::Closed);
+            }
+        }
+        socket_write(&self.sock, peer, &bytes);
+        Ok(())
     }
     fn flush(&mut self) -> std::result::Result<(), StreamError> {
         Ok(())
@@ -224,12 +433,21 @@ impl HostState {
         let d = self.table().get(fd)?;
         Ok((d.fs.clone(), d.node))
     }
+
+    /// The socket endpoint owned by `fd`, defaulting to 0 for non-socket fds.
+    fn fd_endpoint(&mut self, fd: &Resource<Descriptor>) -> Result<usize> {
+        Ok(self.table().get(fd)?.endpoint.unwrap_or(0))
+    }
 }
 
 impl wasi::filesystem::preopens::Host for HostState {
     fn get_directories(&mut self) -> Result<Vec<(Resource<Descriptor>, String)>> {
         let fs = self.fs.clone();
-        let root = self.table().push(Descriptor { fs, node: ROOT })?;
+        let root = self.table().push(Descriptor {
+            fs,
+            node: ROOT,
+            endpoint: None,
+        })?;
         Ok(vec![(root, "/".to_string())])
     }
 }
@@ -250,18 +468,30 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         offset: Filesize,
     ) -> Result<std::result::Result<Resource<DynInputStream>, ErrorCode>> {
         let (fs, node) = self.fd_fs(&fd)?;
-        let bytes = {
+        // A socket reads live bytes from its peer; a file reads its contents.
+        enum Source {
+            File(Bytes),
+            Socket(Socket),
+        }
+        let source = {
             let g = fs.lock().unwrap();
             match g.nodes.get(&node) {
                 Some(Node::File(data)) => {
                     let start = (offset as usize).min(data.len());
-                    Bytes::copy_from_slice(&data[start..])
+                    Source::File(Bytes::copy_from_slice(&data[start..]))
                 }
-                Some(Node::Dir(_)) => return err(ErrorCode::IsDirectory),
+                Some(Node::Socket(sock)) => Source::Socket(sock.clone()),
+                Some(Node::Dir(_)) | Some(Node::Mount(_)) => return err(ErrorCode::IsDirectory),
                 None => return err(ErrorCode::NoEntry),
             }
         };
-        let stream: DynInputStream = Box::new(wasmtime_wasi::p2::pipe::MemoryInputPipe::new(bytes));
+        let stream: DynInputStream = match source {
+            Source::File(bytes) => Box::new(wasmtime_wasi::p2::pipe::MemoryInputPipe::new(bytes)),
+            Source::Socket(sock) => Box::new(SocketInputStream {
+                sock,
+                endpoint: self.fd_endpoint(&fd)?,
+            }),
+        };
         Ok(Ok(self.table().push(stream)?))
     }
 
@@ -271,10 +501,21 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         offset: Filesize,
     ) -> Result<std::result::Result<Resource<DynOutputStream>, ErrorCode>> {
         let (fs, node) = self.fd_fs(&fd)?;
-        if !matches!(fs.lock().unwrap().nodes.get(&node), Some(Node::File(_))) {
-            return err(ErrorCode::IsDirectory);
-        }
-        let stream: DynOutputStream = Box::new(VfsOutputStream { fs, node, offset });
+        let sock = {
+            let g = fs.lock().unwrap();
+            match g.nodes.get(&node) {
+                Some(Node::File(_)) => None,
+                Some(Node::Socket(sock)) => Some(sock.clone()),
+                _ => return err(ErrorCode::IsDirectory),
+            }
+        };
+        let stream: DynOutputStream = match sock {
+            Some(sock) => Box::new(SocketOutputStream {
+                sock,
+                endpoint: self.fd_endpoint(&fd)?,
+            }),
+            None => Box::new(VfsOutputStream { fs, node, offset }),
+        };
         Ok(Ok(self.table().push(stream)?))
     }
 
@@ -283,12 +524,23 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         fd: Resource<Descriptor>,
     ) -> Result<std::result::Result<Resource<DynOutputStream>, ErrorCode>> {
         let (fs, node) = self.fd_fs(&fd)?;
-        let offset = match fs.lock().unwrap().nodes.get(&node) {
-            Some(Node::File(data)) => data.len() as u64,
-            Some(Node::Dir(_)) => return err(ErrorCode::IsDirectory),
+        enum Sink {
+            File(u64),
+            Socket(Socket),
+        }
+        let sink = match fs.lock().unwrap().nodes.get(&node) {
+            Some(Node::File(data)) => Sink::File(data.len() as u64),
+            Some(Node::Socket(sock)) => Sink::Socket(sock.clone()),
+            Some(Node::Dir(_)) | Some(Node::Mount(_)) => return err(ErrorCode::IsDirectory),
             None => return err(ErrorCode::NoEntry),
         };
-        let stream: DynOutputStream = Box::new(VfsOutputStream { fs, node, offset });
+        let stream: DynOutputStream = match sink {
+            Sink::File(offset) => Box::new(VfsOutputStream { fs, node, offset }),
+            Sink::Socket(sock) => Box::new(SocketOutputStream {
+                sock,
+                endpoint: self.fd_endpoint(&fd)?,
+            }),
+        };
         Ok(Ok(self.table().push(stream)?))
     }
 
@@ -299,17 +551,24 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         offset: Filesize,
     ) -> Result<std::result::Result<(Vec<u8>, bool), ErrorCode>> {
         let (fs, node) = self.fd_fs(&fd)?;
-        let g = fs.lock().unwrap();
-        match g.nodes.get(&node) {
-            Some(Node::File(data)) => {
-                let start = (offset as usize).min(data.len());
-                let end = (start + len as usize).min(data.len());
-                let eof = end >= data.len();
-                Ok(Ok((data[start..end].to_vec(), eof)))
+        let endpoint = self.fd_endpoint(&fd)?;
+        // For a socket, block this client's thread until the peer writes or
+        // closes — a blocking read syscall on a Unix socket.
+        let sock = {
+            let g = fs.lock().unwrap();
+            match g.nodes.get(&node) {
+                Some(Node::File(data)) => {
+                    let start = (offset as usize).min(data.len());
+                    let end = (start + len as usize).min(data.len());
+                    let eof = end >= data.len();
+                    return Ok(Ok((data[start..end].to_vec(), eof)));
+                }
+                Some(Node::Socket(sock)) => sock.clone(),
+                Some(Node::Dir(_)) | Some(Node::Mount(_)) => return err(ErrorCode::IsDirectory),
+                None => return err(ErrorCode::NoEntry),
             }
-            Some(Node::Dir(_)) => err(ErrorCode::IsDirectory),
-            None => err(ErrorCode::NoEntry),
-        }
+        };
+        Ok(Ok(socket_read_blocking(&sock, endpoint, len as usize)))
     }
 
     fn write(
@@ -319,20 +578,26 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         offset: Filesize,
     ) -> Result<std::result::Result<Filesize, ErrorCode>> {
         let (fs, node) = self.fd_fs(&fd)?;
-        let mut g = fs.lock().unwrap();
-        match g.nodes.get_mut(&node) {
-            Some(Node::File(data)) => {
-                let start = offset as usize;
-                let end = start + buf.len();
-                if data.len() < end {
-                    data.resize(end, 0);
+        let endpoint = self.fd_endpoint(&fd)?;
+        let sock = {
+            let mut g = fs.lock().unwrap();
+            match g.nodes.get_mut(&node) {
+                Some(Node::File(data)) => {
+                    let start = offset as usize;
+                    let end = start + buf.len();
+                    if data.len() < end {
+                        data.resize(end, 0);
+                    }
+                    data[start..end].copy_from_slice(&buf);
+                    return Ok(Ok(buf.len() as u64));
                 }
-                data[start..end].copy_from_slice(&buf);
-                Ok(Ok(buf.len() as u64))
+                Some(Node::Socket(sock)) => sock.clone(),
+                Some(Node::Dir(_)) | Some(Node::Mount(_)) => return err(ErrorCode::IsDirectory),
+                None => return err(ErrorCode::NoEntry),
             }
-            Some(Node::Dir(_)) => err(ErrorCode::IsDirectory),
-            None => err(ErrorCode::NoEntry),
-        }
+        };
+        socket_write(&sock, 1 - endpoint, &buf);
+        Ok(Ok(buf.len() as u64))
     }
 
     fn read_directory(
@@ -350,7 +615,7 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
                         name: name.clone(),
                     })
                     .collect(),
-                Some(Node::File(_)) => return err(ErrorCode::NotDirectory),
+                Some(_) => return err(ErrorCode::NotDirectory),
                 None => return err(ErrorCode::NoEntry),
             }
         };
@@ -363,10 +628,10 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         path: String,
     ) -> Result<std::result::Result<(), ErrorCode>> {
         let (fs, node) = self.fd_fs(&fd)?;
-        let mut g = fs.lock().unwrap();
-        let Some((parent, name)) = resolve_parent(&g, node, &path) else {
+        let Some((pfs, parent, name)) = resolve_parent(&fs, node, &path) else {
             return err(ErrorCode::NoEntry);
         };
+        let mut g = pfs.lock().unwrap();
         if let Some(Node::Dir(children)) = g.nodes.get(&parent) {
             if children.contains_key(&name) {
                 return err(ErrorCode::Exist);
@@ -398,8 +663,11 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         path: String,
     ) -> Result<std::result::Result<DescriptorStat, ErrorCode>> {
         let (fs, node) = self.fd_fs(&fd)?;
-        let g = fs.lock().unwrap();
-        match resolve(&g, node, &path).and_then(|id| stat_node(&g, id)) {
+        let Some((tfs, id)) = resolve(&fs, node, &path) else {
+            return err(ErrorCode::NoEntry);
+        };
+        let g = tfs.lock().unwrap();
+        match stat_node(&g, id) {
             Some(s) => Ok(Ok(s)),
             None => err(ErrorCode::NoEntry),
         }
@@ -446,41 +714,53 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         _flags: DescriptorFlags,
     ) -> Result<std::result::Result<Resource<Descriptor>, ErrorCode>> {
         let (fs, start) = self.fd_fs(&fd)?;
-        let node = {
-            let mut g = fs.lock().unwrap();
-            match resolve(&g, start, &path) {
-                Some(id) => {
-                    if oflags.contains(OpenFlags::EXCLUSIVE) {
-                        return err(ErrorCode::Exist);
-                    }
-                    if oflags.contains(OpenFlags::TRUNCATE) {
-                        if let Some(Node::File(data)) = g.nodes.get_mut(&id) {
-                            data.clear();
-                        }
-                    }
-                    if oflags.contains(OpenFlags::DIRECTORY)
-                        && !matches!(g.nodes.get(&id), Some(Node::Dir(_)))
-                    {
-                        return err(ErrorCode::NotDirectory);
-                    }
-                    id
+        // Resolve (crossing mounts) to the filesystem and node being opened,
+        // creating a file in the target filesystem if it does not yet exist.
+        let (tfs, node) = match resolve(&fs, start, &path) {
+            Some((tfs, id)) => {
+                if oflags.contains(OpenFlags::EXCLUSIVE) {
+                    return err(ErrorCode::Exist);
                 }
-                None => {
-                    if !oflags.contains(OpenFlags::CREATE) {
-                        return err(ErrorCode::NoEntry);
+                let mut g = tfs.lock().unwrap();
+                if oflags.contains(OpenFlags::TRUNCATE) {
+                    if let Some(Node::File(data)) = g.nodes.get_mut(&id) {
+                        data.clear();
                     }
-                    let Some((parent, name)) = resolve_parent(&g, start, &path) else {
-                        return err(ErrorCode::NoEntry);
-                    };
-                    let id = g.alloc(Node::File(Vec::new()));
-                    if let Some(Node::Dir(children)) = g.nodes.get_mut(&parent) {
-                        children.insert(name, id);
-                    }
-                    id
                 }
+                if oflags.contains(OpenFlags::DIRECTORY)
+                    && !matches!(g.nodes.get(&id), Some(Node::Dir(_)))
+                {
+                    return err(ErrorCode::NotDirectory);
+                }
+                drop(g);
+                (tfs, id)
+            }
+            None => {
+                if !oflags.contains(OpenFlags::CREATE) {
+                    return err(ErrorCode::NoEntry);
+                }
+                let Some((pfs, parent, name)) = resolve_parent(&fs, start, &path) else {
+                    return err(ErrorCode::NoEntry);
+                };
+                let mut g = pfs.lock().unwrap();
+                let id = g.alloc(Node::File(Vec::new()));
+                if let Some(Node::Dir(children)) = g.nodes.get_mut(&parent) {
+                    children.insert(name, id);
+                }
+                drop(g);
+                (pfs, id)
             }
         };
-        Ok(Ok(self.table().push(Descriptor { fs, node })?))
+        // Opening a socket binds this handle to one of its two endpoints.
+        let endpoint = match tfs.lock().unwrap().nodes.get(&node) {
+            Some(Node::Socket(sock)) => Some(socket_connect(sock)),
+            _ => None,
+        };
+        Ok(Ok(self.table().push(Descriptor {
+            fs: tfs,
+            node,
+            endpoint,
+        })?))
     }
 
     fn remove_directory_at(
@@ -507,20 +787,27 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         new_path: String,
     ) -> Result<std::result::Result<(), ErrorCode>> {
         let (fs, old_start) = self.fd_fs(&fd)?;
-        let new_start = self.table().get(&new_fd)?.node;
-        let mut g = fs.lock().unwrap();
-        let Some((old_parent, old_name)) = resolve_parent(&g, old_start, &old_path) else {
+        let (new_fs, new_start) = self.fd_fs(&new_fd)?;
+        let Some((old_pfs, old_parent, old_name)) = resolve_parent(&fs, old_start, &old_path)
+        else {
             return err(ErrorCode::NoEntry);
         };
+        let Some((new_pfs, new_parent, new_name)) = resolve_parent(&new_fs, new_start, &new_path)
+        else {
+            return err(ErrorCode::NoEntry);
+        };
+        // A node id only means something within its own filesystem, so renames
+        // across a mount boundary are not supported.
+        if !Arc::ptr_eq(&old_pfs, &new_pfs) {
+            return err(ErrorCode::CrossDevice);
+        }
+        let mut g = old_pfs.lock().unwrap();
         let id = match g.nodes.get(&old_parent) {
             Some(Node::Dir(c)) => match c.get(&old_name) {
                 Some(id) => *id,
                 None => return err(ErrorCode::NoEntry),
             },
             _ => return err(ErrorCode::NotDirectory),
-        };
-        let Some((new_parent, new_name)) = resolve_parent(&g, new_start, &new_path) else {
-            return err(ErrorCode::NoEntry);
         };
         if let Some(Node::Dir(c)) = g.nodes.get_mut(&old_parent) {
             c.remove(&old_name);
@@ -555,9 +842,8 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         path: String,
     ) -> Result<std::result::Result<MetadataHashValue, ErrorCode>> {
         let (fs, node) = self.fd_fs(&fd)?;
-        let g = fs.lock().unwrap();
-        match resolve(&g, node, &path) {
-            Some(id) => Ok(Ok(MetadataHashValue {
+        match resolve(&fs, node, &path) {
+            Some((_tfs, id)) => Ok(Ok(MetadataHashValue {
                 lower: id,
                 upper: 0,
             })),
@@ -630,6 +916,20 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
     }
 
     fn drop(&mut self, fd: Resource<Descriptor>) -> Result<()> {
+        // Closing a socket handle disconnects its endpoint so the peer sees EOF.
+        let (fs, node, endpoint) = {
+            let d = self.table().get(&fd)?;
+            (d.fs.clone(), d.node, d.endpoint)
+        };
+        if let Some(ep) = endpoint {
+            let sock = match fs.lock().unwrap().nodes.get(&node) {
+                Some(Node::Socket(sock)) => Some(sock.clone()),
+                _ => None,
+            };
+            if let Some(sock) = sock {
+                socket_close(&sock, ep);
+            }
+        }
         self.table().delete(fd)?;
         Ok(())
     }
@@ -644,10 +944,10 @@ impl HostState {
         dir: bool,
     ) -> Result<std::result::Result<(), ErrorCode>> {
         let (fs, start) = self.fd_fs(&fd)?;
-        let mut g = fs.lock().unwrap();
-        let Some((parent, name)) = resolve_parent(&g, start, path) else {
+        let Some((pfs, parent, name)) = resolve_parent(&fs, start, path) else {
             return err(ErrorCode::NoEntry);
         };
+        let mut g = pfs.lock().unwrap();
         let id = match g.nodes.get(&parent) {
             Some(Node::Dir(c)) => match c.get(&name) {
                 Some(id) => *id,
@@ -673,7 +973,8 @@ impl HostState {
 fn stat_node(fs: &Fs, id: u64) -> Option<DescriptorStat> {
     let (ty, size) = match fs.nodes.get(&id)? {
         Node::File(data) => (DescriptorType::RegularFile, data.len() as u64),
-        Node::Dir(_) => (DescriptorType::Directory, 0),
+        Node::Dir(_) | Node::Mount(_) => (DescriptorType::Directory, 0),
+        Node::Socket(_) => (DescriptorType::RegularFile, 0),
     };
     Some(DescriptorStat {
         type_: ty,
@@ -700,5 +1001,86 @@ impl wasi::filesystem::types::HostDirectoryEntryStream for HostState {
     fn drop(&mut self, stream: Resource<DirEntryStream>) -> Result<()> {
         self.table().delete(stream)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shared workspace is grafted into an instance at `/shared`, so a path
+    /// crossing the mount resolves into the same shared filesystem and node.
+    #[test]
+    fn shared_mount_resolves_socket() {
+        let shared = new_shared_workspace();
+        let inst = new_instance_fs(&shared);
+
+        let (tfs, node) = resolve(&inst, ROOT, "/shared/sock").expect("socket resolves");
+        assert!(Arc::ptr_eq(&tfs, &shared), "resolves into the shared fs");
+        assert!(matches!(
+            tfs.lock().unwrap().nodes.get(&node),
+            Some(Node::Socket(_))
+        ));
+
+        // Two separate instances reach the very same socket node.
+        let other = new_instance_fs(&shared);
+        let (ofs, onode) = resolve(&other, ROOT, "/shared/sock").unwrap();
+        assert!(Arc::ptr_eq(&ofs, &tfs) && onode == node);
+    }
+
+    /// Two endpoints exchange bytes both ways, and a reader sees EOF once its
+    /// peer closes.
+    #[test]
+    fn socket_duplex_and_eof() {
+        let sock = new_socket();
+        let a = socket_connect(&sock);
+        let b = socket_connect(&sock);
+        assert_eq!((a, b), (0, 1));
+
+        // A writes to its peer (B); B reads it.
+        socket_write(&sock, 1 - a, b"ping");
+        let mut rb = SocketInputStream {
+            sock: sock.clone(),
+            endpoint: b,
+        };
+        assert_eq!(&rb.read(64).unwrap()[..], b"ping");
+
+        // B writes to its peer (A); A reads it.
+        socket_write(&sock, 1 - b, b"pong");
+        let mut ra = SocketInputStream {
+            sock: sock.clone(),
+            endpoint: a,
+        };
+        assert_eq!(&ra.read(64).unwrap()[..], b"pong");
+
+        // Nothing buffered and peer still open: a non-blocking read is empty.
+        assert!(ra.read(64).unwrap().is_empty());
+
+        // Once A closes, B's read reports EOF (a closed stream).
+        socket_close(&sock, a);
+        assert!(matches!(rb.read(64), Err(StreamError::Closed)));
+    }
+
+    /// A blocking read parks until the peer (on another thread) writes.
+    #[test]
+    fn socket_blocking_read_unblocks_on_peer_write() {
+        let sock = new_socket();
+        let a = socket_connect(&sock);
+        let b = socket_connect(&sock);
+
+        let writer = sock.clone();
+        // Endpoint `b` delivering to reader `a` writes into queue `a`.
+        let handle = std::thread::spawn(move || {
+            // Give the reader time to actually block on the condvar first.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            socket_write(&writer, a, b"delivered");
+        });
+
+        // This blocks until the writer thread delivers.
+        let (data, eof) = socket_read_blocking(&sock, a, 64);
+        handle.join().unwrap();
+        assert_eq!(&data, b"delivered");
+        assert!(!eof);
+        let _ = b;
     }
 }

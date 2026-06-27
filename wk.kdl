@@ -1,3 +1,4 @@
 name wk
 plugin "plugins/triangle/target/wasm32-wasip1/debug/triangle.wasm"
 plugin "plugins/paint/target/wasm32-wasip1/debug/paint.wasm"
+plugin "plugins/sockets-demo/target/wasm32-wasip1/debug/sockets_demo.wasm"
