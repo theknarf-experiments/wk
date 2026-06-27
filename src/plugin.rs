@@ -548,7 +548,10 @@ impl PluginHost {
     /// labelled with `name`.
     pub fn spawn(&self, path: &Path, name: &str, registry: SurfaceRegistry) -> Result<()> {
         let mut linker: Linker<HostState> = Linker::new(&self.engine);
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+        // Provide every wasmtime-wasi interface except its filesystem, then our
+        // own in-memory filesystem in its place.
+        crate::vfs::add_wasi_except_fs(&mut linker)?;
+        crate::vfs::add_to_linker(&mut linker)?;
         wasi::surface::surface::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
         wasi::graphics_context::graphics_context::add_to_linker::<_, HasSelf<_>>(
             &mut linker,

@@ -4,6 +4,7 @@ mod imguirenderer;
 mod imguisdlhelper;
 mod plugin;
 mod project;
+mod vfs;
 
 use clap::CommandFactory;
 use clap::Parser;
