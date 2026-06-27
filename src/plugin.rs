@@ -67,6 +67,19 @@ pub struct VirtualSurface {
 
 static NEXT_SURFACE_ID: AtomicU64 = AtomicU64::new(0);
 
+/// Error a closed surface returns to unwind and end its client cleanly. The
+/// driver recognises it and exits the client thread without logging an error.
+#[derive(Debug)]
+struct SurfaceClosed;
+
+impl std::fmt::Display for SurfaceClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "surface closed")
+    }
+}
+
+impl std::error::Error for SurfaceClosed {}
+
 impl VirtualSurface {
     fn new(title: String, width: u32, height: u32) -> Self {
         Self {
@@ -334,7 +347,7 @@ impl wasi::surface::surface::HostSurface for HostState {
     fn get_frame(&mut self, self_: Resource<SurfaceState>) -> Result<Option<FrameEvent>> {
         if self.surface_shared(&self_)?.lock().unwrap().closed {
             // Compositor closed this surface: trap to unwind and end the client.
-            return Err(wasmtime::Error::msg("surface closed"));
+            return Err(wasmtime::Error::new(SurfaceClosed));
         }
         Ok(Some(FrameEvent { nothing: false }))
     }
@@ -560,8 +573,11 @@ impl PluginHost {
                     Compositor::instantiate_async(&mut store, &component, &linker).await?;
                 compositor.call_run(&mut store).await
             });
-            if let Err(e) = result {
-                eprintln!("plugin client exited with error: {e:#}");
+            match result {
+                // A clean close (the compositor closed the surface): exit quietly.
+                Err(e) if e.downcast_ref::<SurfaceClosed>().is_some() => {}
+                Err(e) => eprintln!("plugin client exited with error: {e:#}"),
+                Ok(()) => {}
             }
         });
         Ok(())
