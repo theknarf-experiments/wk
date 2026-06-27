@@ -202,6 +202,8 @@ pub struct HostState {
     registry: SurfaceRegistry,
     /// Display name for the surfaces this client creates.
     plugin_name: String,
+    /// This instance's private in-memory filesystem.
+    pub(crate) fs: crate::vfs::SharedFs,
     /// Shared wgpu-core instance backing the wasi:webgpu host.
     gpu: Arc<wgpu_core::global::Global>,
 }
@@ -566,6 +568,7 @@ impl PluginHost {
             table: ResourceTable::new(),
             registry,
             plugin_name: name.to_string(),
+            fs: crate::vfs::SharedFs::default(),
             gpu: Arc::clone(&self.gpu),
         };
         let mut store = Store::new(&self.engine, state);

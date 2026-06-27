@@ -1,0 +1,6 @@
+package wk:fs-demo;
+
+/// Exercises std::fs against wk's in-memory filesystem.
+world fs-demo {
+    export run: func();
+}
