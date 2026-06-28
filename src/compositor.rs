@@ -301,7 +301,9 @@ struct App {
     prev_lmb: bool,
     mods: ModifiersState,
     pan_delta: [f32; 2],
-    zoom_step: f32,
+    /// Accumulated zoom multiplier this frame (1.0 = none); fed by Cmd/Ctrl +
+    /// scroll and by trackpad pinch.
+    zoom_factor: f32,
     zoom_focus: [f32; 2],
     key_events: Vec<(KeyEvent, bool)>,
     should_exit: bool,
@@ -338,7 +340,7 @@ impl App {
             prev_lmb: false,
             mods: ModifiersState::empty(),
             pan_delta: [0.0, 0.0],
-            zoom_step: 0.0,
+            zoom_factor: 1.0,
             zoom_focus: [0.0, 0.0],
             key_events: Vec::new(),
             should_exit: false,
@@ -399,9 +401,8 @@ impl App {
         self.host.tick_epoch();
 
         // Apply pan/zoom (zoom immediate, pan eased).
-        if self.zoom_step != 0.0 {
-            self.cam
-                .zoom_at(ZOOM_STEP.powf(self.zoom_step), self.zoom_focus);
+        if (self.zoom_factor - 1.0).abs() > f32::EPSILON {
+            self.cam.zoom_at(self.zoom_factor, self.zoom_focus);
             self.pan_target = self.cam.pan;
         }
         self.pan_target[0] += self.pan_delta[0];
@@ -411,7 +412,7 @@ impl App {
             ease(self.cam.pan[1], self.pan_target[1]),
         ];
         self.pan_delta = [0.0, 0.0];
-        self.zoom_step = 0.0;
+        self.zoom_factor = 1.0;
 
         let mp = self.mouse;
         let lmb = self.lmb;
@@ -946,12 +947,18 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::PixelDelta(p) => (p.x as f32 / 50.0, p.y as f32 / 50.0),
                 };
                 if self.mods.control_key() || self.mods.super_key() {
-                    self.zoom_step += dy;
+                    self.zoom_factor *= ZOOM_STEP.powf(dy);
                     self.zoom_focus = self.mouse;
                 } else {
                     self.pan_delta[0] -= dx * SCROLL_PAN_SPEED;
                     self.pan_delta[1] += dy * SCROLL_PAN_SPEED;
                 }
+            }
+            // Native trackpad pinch (macOS): delta is the incremental
+            // magnification; zoom around the cursor.
+            WindowEvent::PinchGesture { delta, .. } if delta.is_finite() => {
+                self.zoom_factor *= (1.0 + delta as f32).clamp(0.1, 10.0);
+                self.zoom_focus = self.mouse;
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::KeyboardInput { event, .. } => {
