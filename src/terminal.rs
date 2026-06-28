@@ -233,6 +233,8 @@ pub struct CellView {
 pub struct Terminal {
     term: Term<EventProxy>,
     parser: Processor,
+    /// The line being edited, in cooked mode (delivered to the guest on Enter).
+    line: Vec<u8>,
 }
 
 impl Terminal {
@@ -241,6 +243,52 @@ impl Terminal {
         Terminal {
             term,
             parser: Processor::new(),
+            line: Vec::new(),
+        }
+    }
+
+    /// Feed keyboard bytes through a cooked-mode line discipline (the default a
+    /// terminal app expects when it hasn't gone raw): echo what's typed, edit
+    /// the line with Backspace, and deliver a whole line to the guest's stdin on
+    /// Enter (with `\n`). Ctrl-C discards the line; Ctrl-D on an empty line is
+    /// end-of-input. Escape sequences (arrow keys etc.) are swallowed. (A future
+    /// raw-mode/termios path would bypass this and forward bytes verbatim.)
+    pub fn key_input(&mut self, bytes: &[u8], io: &SharedTermIo) {
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            i += 1;
+            match b {
+                b'\r' | b'\n' => {
+                    self.feed(b"\r\n");
+                    self.line.push(b'\n');
+                    io.feed_in(&self.line);
+                    self.line.clear();
+                }
+                0x7f | 0x08 if !self.line.is_empty() => {
+                    self.line.pop();
+                    self.feed(b"\x08 \x08");
+                }
+                0x03 => {
+                    self.line.clear();
+                    self.feed(b"^C\r\n");
+                }
+                // Ctrl-D on an empty line is end-of-input.
+                0x04 if self.line.is_empty() => io.close(),
+                // Swallow a CSI sequence so arrows etc. don't enter the line.
+                0x1b if bytes.get(i) == Some(&b'[') => {
+                    i += 1;
+                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                0x20..=0x7e => {
+                    self.line.push(b);
+                    self.feed(&[b]);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -435,5 +483,22 @@ mod tests {
         io.write_out(b"out");
         assert_eq!(io.drain_out(), b"out");
         assert!(io.drain_out().is_empty());
+    }
+
+    #[test]
+    fn cooked_line_discipline_edits_then_submits() {
+        let io = TermIo::new();
+        let mut term = Terminal::new(io.clone());
+        // Type 'a', 'b', Backspace, 'c', Enter — the line is "ac\n".
+        term.key_input(b"ab\x7fc\r", &io);
+
+        let mut pipe = InPipe(io.clone());
+        assert_eq!(&pipe.read(64).unwrap()[..], b"ac\n", "whole line on Enter");
+
+        // The grid echoed a and c; the backspaced b was erased.
+        let cells = term.cells();
+        assert!(cells.iter().any(|c| c.ch == 'a'));
+        assert!(cells.iter().any(|c| c.ch == 'c'));
+        assert!(!cells.iter().any(|c| c.ch == 'b'), "backspaced char erased");
     }
 }

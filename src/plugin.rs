@@ -562,6 +562,15 @@ impl wasi::frame_buffer::frame_buffer::HostBuffer for HostState {
 
 // ---- the driver ----
 
+/// Whether a component is a standard `wasi:cli/command` (exports `wasi:cli/run`)
+/// rather than a wk-world guest (which exports a bare `run`).
+fn component_is_command(component: &Component, engine: &Engine) -> bool {
+    component
+        .component_type()
+        .exports(engine)
+        .any(|(name, _)| name == "wasi:cli/run" || name.starts_with("wasi:cli/run@"))
+}
+
 /// Add the standard `wasi:random` interfaces, backed by this store's own RNG.
 /// (We replicate wasmtime-wasi's linker setup without its filesystem, so its
 /// `add_to_linker_async` — which would also add the cap-std fs — can't be used;
@@ -650,6 +659,9 @@ impl PluginHost {
         }));
 
         let component = Component::from_file(&self.engine, path)?;
+        // A standard `wasi:cli/command` (any `fn main` recompiled to wasm) is run
+        // through its `wasi:cli/run` export; a wk-world guest through its `run`.
+        let is_command = component_is_command(&component, &self.engine);
         let state = HostState {
             ctx: WasiCtxBuilder::new()
                 .stdout(crate::terminal::stdout(&term_io))
@@ -689,9 +701,24 @@ impl PluginHost {
                 .build()
                 .expect("tokio runtime");
             let result: Result<()> = rt.block_on(async move {
-                let compositor =
-                    Compositor::instantiate_async(&mut store, &component, &linker).await?;
-                compositor.call_run(&mut store).await
+                if is_command {
+                    let command = wasmtime_wasi::p2::bindings::Command::instantiate_async(
+                        &mut store, &component, &linker,
+                    )
+                    .await?;
+                    // A clean `exit()` (incl. `main` returning) surfaces as an
+                    // `I32Exit` trap; that's a normal end, not a host error. The
+                    // run result's inner Err is just a non-zero exit code.
+                    match command.wasi_cli_run().call_run(&mut store).await {
+                        Ok(_) => Ok(()),
+                        Err(e) if e.downcast_ref::<wasmtime_wasi::I32Exit>().is_some() => Ok(()),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    let compositor =
+                        Compositor::instantiate_async(&mut store, &component, &linker).await?;
+                    compositor.call_run(&mut store).await
+                }
             });
             finished.store(true, Ordering::Relaxed);
             match result {

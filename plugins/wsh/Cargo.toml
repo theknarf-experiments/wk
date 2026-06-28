@@ -1,0 +1,9 @@
+[package]
+name = "wsh"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[package.metadata.component]
+package = "wk:wsh"

@@ -5,5 +5,5 @@ dependencies {
     file_demo "plugins/file-demo/target/wasm32-wasip1/debug/file_demo.wasm"
     piano "plugins/piano/target/wasm32-wasip1/debug/piano.wasm"
     synth "plugins/synth/target/wasm32-wasip1/debug/synth.wasm"
-    term_demo "plugins/term-demo/target/wasm32-wasip1/debug/term_demo.wasm"
+    wsh "plugins/wsh/target/wasm32-wasip1/debug/wsh.wasm"
 }

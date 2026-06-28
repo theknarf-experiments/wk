@@ -943,8 +943,10 @@ impl App {
                     }
                 }
             } else if !self.term_input.is_empty() {
-                if let Some(node) = node_by_id.get(&fid) {
-                    node.term_io.feed_in(&self.term_input);
+                if let (Some(term), Some(node)) =
+                    (self.terminals.get_mut(&fid), node_by_id.get(&fid))
+                {
+                    term.key_input(&self.term_input, &node.term_io);
                 }
             }
         }
