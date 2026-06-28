@@ -289,6 +289,8 @@ const FILE_BG: [f32; 4] = [0.20, 0.17, 0.10, 1.0];
 const FILE_BORDER: [f32; 4] = [0.55, 0.45, 0.25, 1.0];
 const PORT_COL: [f32; 4] = [0.70, 0.72, 0.80, 1.0];
 const WIRE_COL: [f32; 4] = [0.55, 0.60, 0.72, 1.0];
+/// MIDI connection wires get a distinct (teal/green) colour.
+const MIDI_WIRE_COL: [f32; 4] = [0.35, 0.78, 0.62, 1.0];
 
 /// The connection port sits at the right edge, vertically centred.
 fn port_pos(r: [f32; 4]) -> [f32; 2] {
@@ -330,6 +332,9 @@ struct App {
     // and share `win_pos`/`win_size`/`z`.
     file_nodes: HashMap<u64, FileNode>,
     connections: Vec<(u64, u64)>,
+    /// MIDI connections wiring one app node's output to another's input,
+    /// as (source node id, destination node id).
+    midi_links: Vec<(u64, u64)>,
     next_node_id: u64,
     file_seq: u32,
 
@@ -376,6 +381,7 @@ impl App {
             pending_layout: HashMap::new(),
             file_nodes: HashMap::new(),
             connections: Vec::new(),
+            midi_links: Vec::new(),
             file_seq: 0,
             mouse: [0.0, 0.0],
             lmb: false,
@@ -457,7 +463,7 @@ impl App {
             );
         }
 
-        // Re-wire connections: mount each file into its connected app's fs.
+        // Re-wire file connections: mount each file into its connected app's fs.
         for &(file_id, app_id) in &saved.connections {
             let (Some(file), Some(app)) = (self.file_nodes.get(&file_id), self.app_node(app_id))
             else {
@@ -465,6 +471,19 @@ impl App {
             };
             crate::vfs::mount_file(&app.fs, &file.name, file.data.clone());
             self.connections.push((file_id, app_id));
+        }
+
+        // Re-wire MIDI connections through the router.
+        for &(src, dst) in &saved.midi {
+            let (Some(_), Some(dst_node)) = (self.app_node(src), self.app_node(dst)) else {
+                continue;
+            };
+            self.host
+                .midi()
+                .lock()
+                .unwrap()
+                .connect(src, dst, dst_node.midi_in.clone());
+            self.midi_links.push((src, dst));
         }
 
         self.next_node_id = max_id + 1;
@@ -524,17 +543,23 @@ impl App {
             .cloned()
     }
 
-    /// Toggle a connection between two nodes (exactly one file, one app): wire
-    /// the file into the app's filesystem, or unwire it if already connected.
+    /// Toggle a connection between two nodes. A file⇄app pair makes a file
+    /// connection (mounting the shared file into the app); an app→app pair makes
+    /// a MIDI connection (wiring `a`'s MIDI output into `b`'s input).
     fn connect_toggle(&mut self, a: u64, b: u64) {
-        let (file_id, app_id) = match (
+        match (
             self.file_nodes.contains_key(&a),
             self.file_nodes.contains_key(&b),
         ) {
-            (true, false) => (a, b),
-            (false, true) => (b, a),
-            _ => return,
-        };
+            (true, false) => self.toggle_file(a, b),
+            (false, true) => self.toggle_file(b, a),
+            (false, false) => self.toggle_midi(a, b),
+            (true, true) => {}
+        }
+    }
+
+    /// Wire (or unwire) file node `file_id` into app node `app_id`'s filesystem.
+    fn toggle_file(&mut self, file_id: u64, app_id: u64) {
         let Some(app) = self.app_node(app_id) else {
             return;
         };
@@ -549,6 +574,26 @@ impl App {
         } else {
             crate::vfs::mount_file(&app.fs, &name, self.file_nodes[&file_id].data.clone());
             self.connections.push((file_id, app_id));
+        }
+    }
+
+    /// Wire (or unwire) app node `src`'s MIDI output into app node `dst`'s input.
+    fn toggle_midi(&mut self, src: u64, dst: u64) {
+        let (Some(_src), Some(dst_node)) = (self.app_node(src), self.app_node(dst)) else {
+            return;
+        };
+        let router = self.host.midi();
+        let mut routes = router.lock().unwrap();
+        if let Some(pos) = self
+            .midi_links
+            .iter()
+            .position(|&(s, d)| s == src && d == dst)
+        {
+            routes.disconnect(src, dst);
+            self.midi_links.remove(pos);
+        } else {
+            routes.connect(src, dst, dst_node.midi_in.clone());
+            self.midi_links.push((src, dst));
         }
     }
 
@@ -861,6 +906,21 @@ impl App {
                 let a = center(self.rect_of(file_id));
                 let b = center(self.rect_of(app_id));
                 quads.push(Quad::line(white, a, b, (2.0 * zf).max(1.5), WIRE_COL, full));
+            }
+        }
+        // MIDI connection wires (source -> destination), in a distinct colour.
+        for &(src, dst) in &self.midi_links {
+            if self.win_pos.contains_key(&src) && self.win_pos.contains_key(&dst) {
+                let a = center(self.rect_of(src));
+                let b = center(self.rect_of(dst));
+                quads.push(Quad::line(
+                    white,
+                    a,
+                    b,
+                    (2.0 * zf).max(1.5),
+                    MIDI_WIRE_COL,
+                    full,
+                ));
             }
         }
 
@@ -1197,8 +1257,11 @@ impl App {
                 false
             });
             self.node_reg.lock().unwrap().retain(|x| x.id != *id);
-            // A closed app drops its connections (its filesystem is gone).
+            // A closed app drops its connections (its filesystem is gone) and
+            // any MIDI links it took part in.
             self.connections.retain(|&(_, app)| app != *id);
+            self.host.midi().lock().unwrap().remove_node(*id);
+            self.midi_links.retain(|&(s, d)| s != *id && d != *id);
             self.win_pos.remove(id);
             self.win_size.remove(id);
             self.z.retain(|x| x != id);
@@ -1246,6 +1309,7 @@ impl App {
             nodes,
             files,
             connections: self.connections.clone(),
+            midi: self.midi_links.clone(),
         };
         if let Err(e) = saved.save() {
             eprintln!("failed to save session: {e}");

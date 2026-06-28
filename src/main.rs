@@ -1,6 +1,7 @@
 mod audio;
 mod compositor;
 mod host_shell;
+mod midi;
 mod plugin;
 mod project;
 mod render2d;

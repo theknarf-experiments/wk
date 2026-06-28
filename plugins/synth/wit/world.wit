@@ -1,0 +1,15 @@
+package wk:synth;
+
+/// A small polyphonic synth. It receives MIDI note-on/off on a wk:midi input
+/// port (wire a keyboard plugin to it on the canvas) and sounds each note
+/// through wk's Web Audio host, with on-screen knobs for volume, waveform and
+/// tuning. Combines wasi-gfx (knob UI) with wk:midi + wk:webaudio.
+world synth {
+    import wasi:surface/surface@0.0.1;
+    import wasi:graphics-context/graphics-context@0.0.1;
+    import wasi:frame-buffer/frame-buffer@0.0.1;
+    import wk:midi/midi;
+    import wk:webaudio/audio;
+
+    export run: func();
+}

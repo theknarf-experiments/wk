@@ -127,6 +127,9 @@ pub struct Node {
     /// This node's in-memory filesystem, so the compositor can mount connected
     /// file nodes into it.
     pub fs: crate::vfs::SharedFs,
+    /// This node's MIDI input queue, so the compositor can wire a MIDI source's
+    /// output to it.
+    pub midi_in: crate::midi::SharedInbox,
     /// Set by the guest thread when its `run` returns (it exited on its own).
     pub finished: Arc<AtomicBool>,
     /// Kill switch: set by the compositor to stop a still-running node.
@@ -225,10 +228,18 @@ pub struct HostState {
     ctx: WasiCtx,
     table: ResourceTable,
     registry: SurfaceRegistry,
-    /// The instance this store belongs to; tags the surfaces it creates.
-    node_id: u64,
+    /// The instance this store belongs to; tags the surfaces it creates and the
+    /// MIDI it sends.
+    pub(crate) node_id: u64,
     /// This node's private in-memory filesystem.
     pub(crate) fs: crate::vfs::SharedFs,
+    /// This node's MIDI input queue (drained by its `input` ports).
+    pub(crate) midi_in: crate::midi::SharedInbox,
+    /// Shared MIDI router; this node's `output` ports send through it.
+    pub(crate) midi_router: crate::midi::Router,
+    /// This store's RNG, backing the standard `wasi:random` interface (needed by
+    /// e.g. a guest's `HashMap`).
+    random_ctx: wasmtime_wasi::random::WasiRandomCtx,
     /// Shared wgpu-core instance backing the wasi:webgpu host.
     gpu: Arc<wgpu_core::global::Global>,
 }
@@ -550,10 +561,24 @@ impl wasi::frame_buffer::frame_buffer::HostBuffer for HostState {
 
 // ---- the driver ----
 
+/// Add the standard `wasi:random` interfaces, backed by this store's own RNG.
+/// (We replicate wasmtime-wasi's linker setup without its filesystem, so its
+/// `add_to_linker_async` — which would also add the cap-std fs — can't be used;
+/// its random accessor reads a private `WasiCtx` field, so we carry our own.)
+fn add_random(l: &mut Linker<HostState>) -> Result<()> {
+    use wasmtime_wasi::p2::bindings::random;
+    use wasmtime_wasi::random::WasiRandom;
+    random::random::add_to_linker::<_, WasiRandom>(l, |s: &mut HostState| &mut s.random_ctx)?;
+    random::insecure::add_to_linker::<_, WasiRandom>(l, |s| &mut s.random_ctx)?;
+    random::insecure_seed::add_to_linker::<_, WasiRandom>(l, |s| &mut s.random_ctx)?;
+    Ok(())
+}
+
 /// Owns the wasmtime engine and spawns plugin clients on their own threads.
 pub struct PluginHost {
     engine: Engine,
     gpu: Arc<wgpu_core::global::Global>,
+    midi: crate::midi::Router,
 }
 
 impl PluginHost {
@@ -566,7 +591,13 @@ impl PluginHost {
         Ok(Self {
             engine: Engine::new(&config)?,
             gpu: new_gpu_instance(),
+            midi: crate::midi::new_router(),
         })
+    }
+
+    /// The shared MIDI router, so the compositor can wire MIDI connections.
+    pub fn midi(&self) -> crate::midi::Router {
+        self.midi.clone()
     }
 
     /// Advance the epoch so every running node re-checks its kill switch.
@@ -590,8 +621,10 @@ impl PluginHost {
         // Provide every wasmtime-wasi interface except its filesystem, then our
         // own in-memory filesystem in its place.
         crate::vfs::add_wasi_except_fs(&mut linker)?;
+        add_random(&mut linker)?;
         crate::vfs::add_to_linker(&mut linker)?;
         crate::audio::add_to_linker(&mut linker)?;
+        crate::midi::add_to_linker(&mut linker)?;
         wasi::surface::surface::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
         wasi::graphics_context::graphics_context::add_to_linker::<_, HasSelf<_>>(
             &mut linker,
@@ -605,11 +638,13 @@ impl PluginHost {
         let finished = Arc::new(AtomicBool::new(false));
         let kill = Arc::new(AtomicBool::new(false));
         let fs = crate::vfs::new_fs();
+        let midi_in = crate::midi::new_inbox();
         nodes.lock().unwrap().push(Arc::new(Node {
             id,
             name: name.to_string(),
             console: console.clone(),
             fs: fs.clone(),
+            midi_in: midi_in.clone(),
             finished: finished.clone(),
             kill: kill.clone(),
         }));
@@ -624,6 +659,9 @@ impl PluginHost {
             registry: surfaces,
             node_id: id,
             fs,
+            midi_in,
+            midi_router: self.midi.clone(),
+            random_ctx: wasmtime_wasi::random::WasiRandomCtx::default(),
             gpu: Arc::clone(&self.gpu),
         };
         let mut store = Store::new(&self.engine, state);

@@ -4,7 +4,7 @@ mod bindings;
 use bindings::wasi::frame_buffer::frame_buffer::{Buffer, Device};
 use bindings::wasi::graphics_context::graphics_context::Context as GfxContext;
 use bindings::wasi::surface::surface::{CreateDesc, Key, Surface};
-use bindings::wk::webaudio::audio::{Context as Audio, Gain, Oscillator, OscillatorType};
+use bindings::wk::midi::midi::Output;
 use bindings::Guest;
 
 /// The 13 chromatic notes from C to C (one octave). White keys are the natural
@@ -14,10 +14,9 @@ const WHITE: [usize; 8] = [0, 2, 4, 5, 7, 9, 11, 12];
 /// white keys C-D, D-E, F-G, G-A, A-B.
 const BLACK: [(f32, usize); 5] = [(1.0, 1), (2.0, 3), (4.0, 6), (5.0, 8), (6.0, 10)];
 
-/// Equal-temperament frequency of semitone `i` above C4 (MIDI 60).
-fn freq(i: usize) -> f32 {
-    let midi = 60 + i as i32;
-    440.0 * 2.0f32.powf((midi as f32 - 69.0) / 12.0)
+/// MIDI note number of key `i` (semitones above C4 = MIDI note 60).
+fn midi_note(i: usize) -> u8 {
+    60 + i as u8
 }
 
 /// Computer-keyboard piano mapping (FL-Studio style): the home row plays the
@@ -41,41 +40,27 @@ fn key_to_note(k: Key) -> Option<usize> {
     })
 }
 
-/// A sounding note: oscillator -> gain -> speakers.
-struct Voice {
-    osc: Oscillator,
-    _gain: Gain,
-}
-
-/// The synth: ref-counts how many inputs (mouse + keyboard) hold each note so
-/// overlapping presses don't cut each other off.
-struct Synth {
-    audio: Audio,
+/// A MIDI keyboard: ref-counts how many inputs (mouse + keyboard) hold each note
+/// so overlapping presses don't send a spurious note-off, and emits note-on/off
+/// MIDI messages out of its output port.
+struct Keyboard {
+    out: Output,
     held: [u32; 13],
-    voices: [Option<Voice>; 13],
 }
 
-impl Synth {
+impl Keyboard {
     fn new() -> Self {
-        Synth {
-            audio: Audio::new(),
+        Keyboard {
+            out: Output::new(),
             held: [0; 13],
-            voices: core::array::from_fn(|_| None),
         }
     }
 
     fn press(&mut self, note: usize) {
         self.held[note] += 1;
         if self.held[note] == 1 {
-            let osc = self.audio.create_oscillator();
-            let gain = self.audio.create_gain();
-            gain.set_gain(0.15);
-            gain.connect_destination();
-            osc.set_type(OscillatorType::Triangle);
-            osc.set_frequency(freq(note));
-            osc.connect(&gain);
-            osc.start(0.0);
-            self.voices[note] = Some(Voice { osc, _gain: gain });
+            // Note-on, channel 0, velocity 100.
+            self.out.send(&[0x90, midi_note(note), 100]);
         }
     }
 
@@ -85,10 +70,13 @@ impl Synth {
         }
         self.held[note] -= 1;
         if self.held[note] == 0 {
-            if let Some(v) = self.voices[note].take() {
-                v.osc.stop(0.0);
-            }
+            // Note-off, channel 0.
+            self.out.send(&[0x80, midi_note(note), 0]);
         }
+    }
+
+    fn active(&self, note: usize) -> bool {
+        self.held[note] > 0
     }
 }
 
@@ -123,7 +111,7 @@ impl Guest for Component {
         device.connect_graphics_context(&ctx);
         let frame = surface.subscribe_frame();
 
-        let mut synth = Synth::new();
+        let mut keyboard = Keyboard::new();
         // Keyboard de-bounce (the host re-sends key-down while a key is held).
         let mut key_held = [false; 13];
         let mut mouse_note: Option<usize> = None;
@@ -139,15 +127,15 @@ impl Guest for Component {
                 let note = hit_test(ev.x as f32, ev.y as f32, w as f32, h as f32);
                 if mouse_note != Some(note) {
                     if let Some(prev) = mouse_note.take() {
-                        synth.release(prev);
+                        keyboard.release(prev);
                     }
-                    synth.press(note);
+                    keyboard.press(note);
                     mouse_note = Some(note);
                 }
             }
             while surface.get_pointer_up().is_some() {
                 if let Some(note) = mouse_note.take() {
-                    synth.release(note);
+                    keyboard.release(note);
                 }
             }
             while surface.get_pointer_move().is_some() {}
@@ -157,7 +145,7 @@ impl Guest for Component {
                 if let Some(note) = ev.key.and_then(key_to_note) {
                     if !key_held[note] {
                         key_held[note] = true;
-                        synth.press(note);
+                        keyboard.press(note);
                     }
                 }
             }
@@ -165,7 +153,7 @@ impl Guest for Component {
                 if let Some(note) = ev.key.and_then(key_to_note) {
                     if key_held[note] {
                         key_held[note] = false;
-                        synth.release(note);
+                        keyboard.release(note);
                     }
                 }
             }
@@ -174,7 +162,7 @@ impl Guest for Component {
             let buffer = Buffer::from_graphics_buffer(ctx.get_current_buffer());
             let mut active = [false; 13];
             for (n, a) in active.iter_mut().enumerate() {
-                *a = synth.voices[n].is_some();
+                *a = keyboard.active(n);
             }
             let mut pixels = vec![0u8; (w * h * 4) as usize];
             let white_w = w as f32 / 8.0;

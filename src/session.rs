@@ -8,6 +8,7 @@
 //! node "file_demo" 1 { pos 19 88; size 360 260 }
 //! file "chan" 2 { pos 400 120; size 130 44 }
 //! connection 2 1
+//! midi 3 4
 //! ```
 
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
@@ -29,8 +30,10 @@ pub struct Session {
     pub camera: (f32, f32, f32),
     pub nodes: Vec<SessionNode>,
     pub files: Vec<SessionNode>,
-    /// Connections as (file id, app node id).
+    /// File connections as (file id, app node id).
     pub connections: Vec<(u64, u64)>,
+    /// MIDI connections as (source node id, destination node id).
+    pub midi: Vec<(u64, u64)>,
 }
 
 fn num(v: &KdlValue) -> Option<f32> {
@@ -95,18 +98,21 @@ impl Session {
             }
         }
 
+        let pair = |n: &KdlNode| match (n.get(0).and_then(uint), n.get(1).and_then(uint)) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
+        };
+
         let mut nodes = Vec::new();
         let mut files = Vec::new();
         let mut connections = Vec::new();
+        let mut midi = Vec::new();
         for n in doc.nodes() {
             match n.name().value() {
                 "node" => nodes.extend(parse_placed(n)),
                 "file" => files.extend(parse_placed(n)),
-                "connection" => {
-                    if let (Some(f), Some(t)) = (n.get(0).and_then(uint), n.get(1).and_then(uint)) {
-                        connections.push((f, t));
-                    }
-                }
+                "connection" => connections.extend(pair(n)),
+                "midi" => midi.extend(pair(n)),
                 _ => {}
             }
         }
@@ -116,6 +122,7 @@ impl Session {
             nodes,
             files,
             connections,
+            midi,
         })
     }
 
@@ -140,10 +147,10 @@ impl Session {
             doc.nodes_mut().push(placed_kdl("file", f));
         }
         for &(file, node) in &self.connections {
-            let mut c = KdlNode::new("connection");
-            c.push(KdlEntry::new(file as i128));
-            c.push(KdlEntry::new(node as i128));
-            doc.nodes_mut().push(c);
+            doc.nodes_mut().push(pair_kdl("connection", file, node));
+        }
+        for &(src, dst) in &self.midi {
+            doc.nodes_mut().push(pair_kdl("midi", src, dst));
         }
 
         doc.autoformat();
@@ -156,6 +163,14 @@ fn node2(name: &str, a: f32, b: f32) -> KdlNode {
     let mut n = KdlNode::new(name);
     n.push(KdlEntry::new(a as f64));
     n.push(KdlEntry::new(b as f64));
+    n
+}
+
+/// A KDL node `name a b` with two integer-id args.
+fn pair_kdl(name: &str, a: u64, b: u64) -> KdlNode {
+    let mut n = KdlNode::new(name);
+    n.push(KdlEntry::new(a as i128));
+    n.push(KdlEntry::new(b as i128));
     n
 }
 
@@ -180,6 +195,7 @@ mod tests {
                 size: [130.0, 44.0],
             }],
             connections: vec![(2, 1)],
+            midi: vec![(3, 4)],
         };
 
         let back = Session::from_kdl(&s.to_kdl()).expect("parses");
@@ -190,5 +206,6 @@ mod tests {
         assert_eq!(back.files.len(), 1);
         assert_eq!(back.files[0].name, "chan");
         assert_eq!(back.connections, vec![(2, 1)]);
+        assert_eq!(back.midi, vec![(3, 4)]);
     }
 }

@@ -1,5 +1,5 @@
 [package]
-name = "piano"
+name = "synth"
 version = "0.1.0"
 edition = "2024"
 
@@ -10,7 +10,7 @@ wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
 crate-type = ["cdylib"]
 
 [package.metadata.component]
-package = "wk:piano"
+package = "wk:synth"
 
 [package.metadata.component.dependencies]
 
@@ -20,3 +20,4 @@ package = "wk:piano"
 "wasi:frame-buffer" = { path = "wit/deps/wasi-frame-buffer" }
 "wasi:io" = { path = "wit/deps/wasi-io" }
 "wk:midi" = { path = "wit/deps/wk-midi" }
+"wk:webaudio" = { path = "wit/deps/wk-webaudio" }

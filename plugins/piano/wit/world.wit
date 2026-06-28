@@ -1,13 +1,14 @@
 package wk:piano;
 
-/// A small piano: it paints a keyboard into its surface and plays notes through
-/// wk's Web Audio host, driven by mouse clicks and the computer keyboard.
-/// Combines the wasi-gfx (graphics) and wk:webaudio (sound) interfaces.
+/// A small MIDI keyboard: it paints an octave of keys into its surface and emits
+/// MIDI note-on/off messages (from mouse clicks and the computer keyboard) out
+/// of a wk:midi output port — to drive a separate synth plugin wired to it on
+/// the canvas. Combines wasi-gfx (graphics) with wk:midi (note transport).
 world piano {
     import wasi:surface/surface@0.0.1;
     import wasi:graphics-context/graphics-context@0.0.1;
     import wasi:frame-buffer/frame-buffer@0.0.1;
-    import wk:webaudio/audio;
+    import wk:midi/midi;
 
     export run: func();
 }

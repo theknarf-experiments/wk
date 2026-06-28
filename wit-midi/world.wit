@@ -1,0 +1,30 @@
+package wk:midi;
+
+/// A minimal MIDI transport. A plugin sends MIDI messages out of an `output`
+/// port and receives them on an `input` port; wk routes messages from a source
+/// node's output to the inputs of the nodes it is wired to on the canvas (a
+/// "midi" connection). So a keyboard plugin can drive a separate synth plugin,
+/// the way two pieces of MIDI gear connect with a cable.
+interface midi {
+    /// A MIDI input port: messages from connected sources queue here until the
+    /// plugin drains them.
+    resource input {
+        constructor();
+        /// Pop the next pending MIDI message, if any (raw status + data bytes,
+        /// e.g. note-on `90 3c 64`). Returns none when the queue is empty.
+        receive: func() -> option<list<u8>>;
+    }
+
+    /// A MIDI output port: messages sent here are delivered to every node this
+    /// node is wired to.
+    resource output {
+        constructor();
+        /// Send a raw MIDI message (e.g. note-on `90 3c 64`).
+        send: func(data: list<u8>);
+    }
+}
+
+/// The host side: wk implements (imports) the midi interface for plugins.
+world midi-host {
+    import midi;
+}
