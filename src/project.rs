@@ -23,6 +23,9 @@ pub struct Dependency {
     pub name: String,
     /// For now always a local `.wasm` path; later, possibly a package version.
     pub source: PathBuf,
+    /// Command-line arguments passed to the plugin (after argv[0] = name), e.g.
+    /// a filename for an editor. Set in wk.kdl as `name "path" { args "..." }`.
+    pub args: Vec<String>,
 }
 
 impl Dependency {
@@ -31,7 +34,11 @@ impl Dependency {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "plugin".to_string());
-        Dependency { name, source }
+        Dependency {
+            name,
+            source,
+            args: Vec::new(),
+        }
     }
 }
 
@@ -67,9 +74,20 @@ impl Project {
                         // Tolerate an npm-style trailing colon on the name.
                         let name = n.name().value().trim_end_matches(':').to_string();
                         let source = n.get(0).and_then(|v| v.as_string())?;
+                        let args = n
+                            .children()
+                            .and_then(|ch| ch.get("args"))
+                            .map(|a| {
+                                a.entries()
+                                    .iter()
+                                    .filter_map(|e| e.value().as_string().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
                         Some(Dependency {
                             name,
                             source: PathBuf::from(source),
+                            args,
                         })
                     })
                     .collect()
@@ -92,6 +110,15 @@ impl Project {
         for dep in &self.dependencies {
             let mut node = KdlNode::new(dep.name.clone());
             node.push(KdlEntry::new(dep.source.to_string_lossy().to_string()));
+            if !dep.args.is_empty() {
+                let mut sub = KdlDocument::new();
+                let mut args_node = KdlNode::new("args");
+                for a in &dep.args {
+                    args_node.push(KdlEntry::new(a.clone()));
+                }
+                sub.nodes_mut().push(args_node);
+                node.set_children(sub);
+            }
             children.nodes_mut().push(node);
         }
         deps.set_children(children);

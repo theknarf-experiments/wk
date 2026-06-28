@@ -512,6 +512,7 @@ impl App {
                 &dep.source,
                 &dep.name,
                 n.id,
+                &dep.args,
                 self.registry.clone(),
                 self.node_reg.clone(),
             ) {
@@ -576,6 +577,7 @@ impl App {
             &dep.source,
             &dep.name,
             id,
+            &dep.args,
             self.registry.clone(),
             self.node_reg.clone(),
         ) {
@@ -946,7 +948,12 @@ impl App {
                 if let (Some(term), Some(node)) =
                     (self.terminals.get_mut(&fid), node_by_id.get(&fid))
                 {
-                    term.key_input(&self.term_input, &node.term_io);
+                    if term.is_raw() {
+                        // Raw mode: keystrokes go to the guest verbatim (no echo).
+                        node.term_io.feed_in(&self.term_input);
+                    } else {
+                        term.key_input(&self.term_input, &node.term_io);
+                    }
                 }
             }
         }

@@ -235,6 +235,10 @@ pub struct Terminal {
     parser: Processor,
     /// The line being edited, in cooked mode (delivered to the guest on Enter).
     line: Vec<u8>,
+    /// Raw mode: the guest gets keystrokes verbatim with no echo or line editing
+    /// (what a full-screen TUI like an editor needs). Toggled by the guest via a
+    /// private escape (see `feed`).
+    raw: bool,
 }
 
 impl Terminal {
@@ -244,7 +248,13 @@ impl Terminal {
             term,
             parser: Processor::new(),
             line: Vec::new(),
+            raw: false,
         }
+    }
+
+    /// Whether the guest has put the terminal in raw mode.
+    pub fn is_raw(&self) -> bool {
+        self.raw
     }
 
     /// Feed keyboard bytes through a cooked-mode line discipline (the default a
@@ -294,16 +304,29 @@ impl Terminal {
 
     /// Feed guest stdout bytes through the VT parser, updating the grid.
     pub fn feed(&mut self, bytes: &[u8]) {
-        // ONLCR-style translation (the cooked-mode default a guest expects when
-        // it hasn't set raw mode): a bare LF also returns the carriage, so naive
-        // `println!` output doesn't stair-step. Apps that emit `\r\n` just get a
-        // harmless extra carriage return; raw TUIs position with CSI regardless.
+        // Intercept wk's private raw-mode toggle and strip it from what the VT
+        // parser sees. This is wk's stand-in for `termios` raw mode until WASI
+        // gains a tty interface: `ESC[?7777h` enters raw, `ESC[?7777l` leaves it.
+        // Outside raw mode, do ONLCR (a bare LF also returns the carriage) so
+        // naive `println!` guests don't stair-step; raw TUIs emit their own CRLF.
+        const RAW_ON: &[u8] = b"\x1b[?7777h";
+        const RAW_OFF: &[u8] = b"\x1b[?7777l";
         let mut buf = Vec::with_capacity(bytes.len());
-        for &b in bytes {
-            if b == b'\n' {
-                buf.push(b'\r');
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i..].starts_with(RAW_ON) {
+                self.raw = true;
+                i += RAW_ON.len();
+            } else if bytes[i..].starts_with(RAW_OFF) {
+                self.raw = false;
+                i += RAW_OFF.len();
+            } else {
+                if !self.raw && bytes[i] == b'\n' {
+                    buf.push(b'\r');
+                }
+                buf.push(bytes[i]);
+                i += 1;
             }
-            buf.push(b);
         }
         self.parser.advance(&mut self.term, &buf);
     }
@@ -483,6 +506,22 @@ mod tests {
         io.write_out(b"out");
         assert_eq!(io.drain_out(), b"out");
         assert!(io.drain_out().is_empty());
+    }
+
+    #[test]
+    fn raw_mode_toggle_is_intercepted() {
+        let mut term = Terminal::new(TermIo::new());
+        assert!(!term.is_raw());
+        term.feed(b"\x1b[?7777hX"); // enter raw, then print X
+        assert!(term.is_raw());
+        let cells = term.cells();
+        assert!(cells.iter().any(|c| c.ch == 'X'));
+        assert!(
+            !cells.iter().any(|c| c.ch == '7'),
+            "toggle stripped, not drawn"
+        );
+        term.feed(b"\x1b[?7777l");
+        assert!(!term.is_raw());
     }
 
     #[test]

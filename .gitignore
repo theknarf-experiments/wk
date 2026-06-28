@@ -57,3 +57,10 @@ plugins/*/src/bindings.rs
 
 # wk workspace session (local runtime state)
 wk.session.kdl
+
+# kilo build artifacts
+plugins/kilo/kilo.wasm
+plugins/kilo/kilo.core.wasm
+
+# stray literal-tilde dir from tools that mis-expand $HOME
+/~/

@@ -6,4 +6,7 @@ dependencies {
     piano "plugins/piano/target/wasm32-wasip1/debug/piano.wasm"
     synth "plugins/synth/target/wasm32-wasip1/debug/synth.wasm"
     wsh "plugins/wsh/target/wasm32-wasip1/debug/wsh.wasm"
+    kilo "plugins/kilo/kilo.wasm" {
+        args "welcome.txt"
+    }
 }

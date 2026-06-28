@@ -624,6 +624,7 @@ impl PluginHost {
         path: &Path,
         name: &str,
         id: u64,
+        args: &[String],
         surfaces: SurfaceRegistry,
         nodes: NodeRegistry,
     ) -> Result<()> {
@@ -662,11 +663,15 @@ impl PluginHost {
         // A standard `wasi:cli/command` (any `fn main` recompiled to wasm) is run
         // through its `wasi:cli/run` export; a wk-world guest through its `run`.
         let is_command = component_is_command(&component, &self.engine);
+        // argv[0] is the program name, then the configured args (e.g. a filename).
+        let mut argv = vec![name.to_string()];
+        argv.extend(args.iter().cloned());
         let state = HostState {
             ctx: WasiCtxBuilder::new()
                 .stdout(crate::terminal::stdout(&term_io))
                 .stderr(crate::terminal::stdout(&term_io))
                 .stdin(crate::terminal::stdin(&term_io))
+                .args(&argv)
                 .env("TERM", "xterm-256color")
                 .env("COLUMNS", crate::terminal::COLS.to_string())
                 .env("LINES", crate::terminal::ROWS.to_string())
