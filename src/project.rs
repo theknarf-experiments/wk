@@ -1,13 +1,13 @@
 //! The wk project model: a `wk.kdl` manifest in the working directory. It names
 //! the project and lists its dependencies — plugins referenced by a short name
-//! (npm-style), each resolved to a source. Today a source is a local `.wasm`
-//! path; in future it may be a version fetched from a package manager.
+//! (npm-style), each resolved to a source: a local `.wasm` path, or an `oci://`
+//! reference pulled from a registry as a Wasm OCI Artifact (see [`crate::oci`]).
 //!
 //! ```kdl
 //! name "my-workspace"
 //! dependencies {
 //!     triangle "plugins/triangle/.../triangle.wasm"
-//!     paint    "plugins/paint/.../paint.wasm"
+//!     foo      "oci://ghcr.io/org/foo:1.0"
 //! }
 //! ```
 
@@ -17,12 +17,64 @@ use std::path::{Path, PathBuf};
 /// Manifest file name, looked up in the current directory.
 pub const MANIFEST: &str = "wk.kdl";
 
+/// Where a dependency's wasm comes from.
+#[derive(Debug, Clone)]
+pub enum Source {
+    /// A local `.wasm` file.
+    Path(PathBuf),
+    /// An OCI registry reference (e.g. `ghcr.io/org/name:1.0`), pulled + cached.
+    Oci(String),
+}
+
+impl Source {
+    /// Parse the string form stored in wk.kdl (an `oci://` prefix means OCI).
+    pub fn parse(s: &str) -> Self {
+        match s.strip_prefix("oci://") {
+            Some(reference) => Source::Oci(reference.to_string()),
+            None => Source::Path(PathBuf::from(s)),
+        }
+    }
+
+    /// The string written back to wk.kdl.
+    pub fn to_kdl(&self) -> String {
+        match self {
+            Source::Path(p) => p.to_string_lossy().into_owned(),
+            Source::Oci(reference) => format!("oci://{reference}"),
+        }
+    }
+
+    /// The local path to load the wasm from. For OCI this is the cache location
+    /// (which [`Source::ensure`] populates); it may not exist until then.
+    pub fn local_path(&self) -> PathBuf {
+        match self {
+            Source::Path(p) => p.clone(),
+            Source::Oci(reference) => crate::oci::cache_path(reference),
+        }
+    }
+
+    /// Make the wasm available locally: pull + cache an OCI artifact if it isn't
+    /// already cached. A no-op for local paths.
+    pub fn ensure(&self) -> Result<(), String> {
+        if let Source::Oci(reference) = self {
+            let path = crate::oci::cache_path(reference);
+            if !path.exists() {
+                println!("pulling {reference} ...");
+                let bytes = crate::oci::pull(reference)?;
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One project dependency: a short name resolving to a plugin source.
 #[derive(Debug, Clone)]
 pub struct Dependency {
     pub name: String,
-    /// For now always a local `.wasm` path; later, possibly a package version.
-    pub source: PathBuf,
+    pub source: Source,
     /// Command-line arguments passed to the plugin (after argv[0] = name), e.g.
     /// a filename for an editor. Set in wk.kdl as `name "path" { args "..." }`.
     pub args: Vec<String>,
@@ -36,9 +88,19 @@ impl Dependency {
             .unwrap_or_else(|| "plugin".to_string());
         Dependency {
             name,
-            source,
+            source: Source::Path(source),
             args: Vec::new(),
         }
+    }
+
+    /// The local path to load this dependency's wasm from.
+    pub fn local_path(&self) -> PathBuf {
+        self.source.local_path()
+    }
+
+    /// Pull + cache the dependency if it's an OCI artifact not yet local.
+    pub fn ensure(&self) -> Result<(), String> {
+        self.source.ensure()
     }
 }
 
@@ -86,7 +148,7 @@ impl Project {
                             .unwrap_or_default();
                         Some(Dependency {
                             name,
-                            source: PathBuf::from(source),
+                            source: Source::parse(source),
                             args,
                         })
                     })
@@ -109,7 +171,7 @@ impl Project {
         let mut children = KdlDocument::new();
         for dep in &self.dependencies {
             let mut node = KdlNode::new(dep.name.clone());
-            node.push(KdlEntry::new(dep.source.to_string_lossy().to_string()));
+            node.push(KdlEntry::new(dep.source.to_kdl()));
             if !dep.args.is_empty() {
                 let mut sub = KdlDocument::new();
                 let mut args_node = KdlNode::new("args");
@@ -173,11 +235,25 @@ pub fn init(name: Option<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// Add a plugin to the project as a dependency (named after its file stem).
-pub fn add(plugin: PathBuf) -> Result<(), String> {
+/// Add a plugin to the project as a dependency. `target` is a local `.wasm`
+/// path or an `oci://<ref>` registry reference; the name is its file stem or the
+/// OCI repository's last segment. An OCI artifact is pulled now to validate it.
+pub fn add(target: String) -> Result<(), String> {
     let mut project = Project::load()?;
-    let dep = Dependency::from_path(plugin);
-    let name = dep.name.clone();
+    let source = Source::parse(&target);
+    let name = match &source {
+        Source::Path(p) => p
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "plugin".to_string()),
+        Source::Oci(reference) => crate::oci::name_for(reference),
+    };
+    source.ensure()?;
+    let dep = Dependency {
+        name: name.clone(),
+        source,
+        args: Vec::new(),
+    };
     if project.add_dependency(dep)? {
         println!("added dependency: {name}");
     } else {
@@ -194,7 +270,7 @@ pub fn list() -> Result<(), String> {
         println!("  (no dependencies; add one with `wk add <path>`)");
     }
     for dep in &project.dependencies {
-        println!("  {}  {}", dep.name, dep.source.display());
+        println!("  {}  {}", dep.name, dep.source.to_kdl());
     }
     Ok(())
 }
@@ -207,4 +283,23 @@ pub fn remove(name: String) -> Result<(), String> {
         n => println!("removed {n} dependency named {name:?}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_parse_and_roundtrip() {
+        match Source::parse("oci://ghcr.io/org/foo:1.0") {
+            Source::Oci(r) => assert_eq!(r, "ghcr.io/org/foo:1.0"),
+            other => panic!("expected oci, got {other:?}"),
+        }
+        assert!(matches!(Source::parse("plugins/x.wasm"), Source::Path(_)));
+        assert_eq!(
+            Source::Oci("ghcr.io/o/f:1".into()).to_kdl(),
+            "oci://ghcr.io/o/f:1"
+        );
+        assert_eq!(Source::Path("a/b.wasm".into()).to_kdl(), "a/b.wasm");
+    }
 }

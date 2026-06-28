@@ -509,7 +509,7 @@ impl App {
                 continue;
             };
             match self.host.spawn(
-                &dep.source,
+                &dep.local_path(),
                 &dep.name,
                 n.id,
                 &dep.args,
@@ -574,7 +574,7 @@ impl App {
     fn launch(&mut self, dep: &Dependency) {
         let id = self.alloc_id();
         if let Err(e) = self.host.spawn(
-            &dep.source,
+            &dep.local_path(),
             &dep.name,
             id,
             &dep.args,

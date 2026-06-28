@@ -2,6 +2,7 @@ mod audio;
 mod compositor;
 mod host_shell;
 mod midi;
+mod oci;
 mod plugin;
 mod project;
 mod render2d;
@@ -31,10 +32,10 @@ enum Commands {
         name: Option<String>,
     },
 
-    /// Add a plugin component to the project as a named dependency
+    /// Add a plugin to the project as a named dependency
     Add {
-        /// Path to the plugin `.wasm` component (named after its file stem)
-        plugin: PathBuf,
+        /// A local `.wasm` path, or an `oci://<ref>` registry artifact
+        target: String,
     },
 
     /// List the project's dependencies
@@ -60,7 +61,7 @@ fn main() -> Result<(), String> {
 
     match &cli.command {
         Some(Commands::Init { name }) => project::init(name.clone()),
-        Some(Commands::Add { plugin }) => project::add(plugin.clone()),
+        Some(Commands::Add { target }) => project::add(target.clone()),
         Some(Commands::List) => project::list(),
         Some(Commands::Remove { plugin }) => project::remove(plugin.clone()),
         // `wk run [paths...]` runs the project (or the given ad-hoc paths).
@@ -86,5 +87,11 @@ fn run(plugins: &[PathBuf]) -> Result<(), String> {
             .map(project::Dependency::from_path)
             .collect()
     };
+    // Pull any OCI-artifact dependencies into the local cache before launching.
+    for dep in &deps {
+        if let Err(e) = dep.ensure() {
+            eprintln!("warning: dependency {:?} unavailable: {e}", dep.name);
+        }
+    }
     compositor::run(&deps, project_mode)
 }
