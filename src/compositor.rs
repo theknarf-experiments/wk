@@ -263,6 +263,9 @@ fn console_window(
     let mut win = ui
         .window(title)
         .opened(&mut open)
+        // Keep app windows in imgui's background layer so the Apps menu bar
+        // (a normal window) always draws on top of them.
+        .bring_to_front_on_focus(false)
         .position(p.default_pos, Condition::FirstUseEver)
         .size(p.default_size, Condition::FirstUseEver);
     if let Some(fp) = p.force_pos {
@@ -610,6 +613,8 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
                     let mut win = ui
                         .window(format!("{title}##{sid}"))
                         .opened(&mut open)
+                        // Stay in the background layer so the menu bar is on top.
+                        .bring_to_front_on_focus(false)
                         .position(p.default_pos, Condition::FirstUseEver)
                         .size(p.default_size, Condition::FirstUseEver);
                     if let Some(fp) = p.force_pos {
