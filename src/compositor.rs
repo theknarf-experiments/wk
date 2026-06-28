@@ -4,7 +4,6 @@
 //! window.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -19,6 +18,7 @@ use crate::plugin::{
     InstanceRegistry, Key, KeyEvent, PluginHost, PointerEvent, ResizeEvent, SharedInstance,
     SharedSurface, SurfaceRegistry,
 };
+use crate::project::PluginSpec;
 
 /// Target frame time (~60 fps).
 const FRAME: Duration = Duration::from_nanos(1_000_000_000 / 60);
@@ -162,13 +162,6 @@ fn push_zoom_chrome<'ui>(
     ]
 }
 
-/// Derive a display name for a plugin from its file stem.
-fn plugin_name(path: &Path) -> String {
-    path.file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "plugin".to_string())
-}
-
 /// The infinite-canvas camera: app windows live in canvas space and are mapped
 /// to screen space by panning (scroll) and zooming (Cmd/Ctrl + scroll). The top
 /// menu bar is drawn in screen space and so stays fixed.
@@ -275,7 +268,11 @@ fn console_window(
     let text = String::from_utf8_lossy(&bytes);
 
     let key = format!("console:{}", inst.id);
-    let p = placement(&key, [460.0, 280.0], spawn_idx, cam, prev_cam, last_win);
+    let default = inst
+        .default_size
+        .map(|(w, h)| [w as f32, h as f32])
+        .unwrap_or([460.0, 280.0]);
+    let p = placement(&key, default, spawn_idx, cam, prev_cam, last_win);
 
     let mut open = true;
     let mut cur = WinScreen {
@@ -358,17 +355,14 @@ fn surface_texture(
     texture
 }
 
-pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
+pub fn run(plugins: &[PluginSpec]) -> Result<(), String> {
     let host = PluginHost::new().map_err(|e| format!("{e:#}"))?;
     let registry: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
     let instance_reg: InstanceRegistry = Arc::new(Mutex::new(Vec::new()));
 
-    // The project's plugins become launchable "apps" (named by file stem). The
-    // workspace starts empty; instances are launched from the top bar.
-    let available: Vec<(String, PathBuf)> = plugins
-        .iter()
-        .map(|p| (plugin_name(p), p.clone()))
-        .collect();
+    // The project's plugins become launchable "apps". The workspace starts
+    // empty; instances are launched from the top bar.
+    let available: Vec<PluginSpec> = plugins.to_vec();
 
     let HostShell {
         surface,
@@ -576,7 +570,7 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
         };
 
         // Apps the user clicked to launch, and instances whose window was closed.
-        let mut to_launch: Vec<(String, PathBuf)> = Vec::new();
+        let mut to_launch: Vec<PluginSpec> = Vec::new();
         let mut to_close: Vec<SharedInstance> = Vec::new();
         // Snapshot of launched instances (cheap Arc clones).
         let instances: Vec<SharedInstance> = instance_reg.lock().unwrap().clone();
@@ -590,9 +584,9 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
             // multiple instances).
             ui.main_menu_bar(|| {
                 ui.menu("Apps", || {
-                    for (idx, (name, path)) in available.iter().enumerate() {
-                        if ui.menu_item(format!("{name}##app{idx}")) {
-                            to_launch.push((name.clone(), path.clone()));
+                    for (idx, spec) in available.iter().enumerate() {
+                        if ui.menu_item(format!("{}##app{idx}", spec.label())) {
+                            to_launch.push(spec.clone());
                         }
                     }
                 });
@@ -627,7 +621,10 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
                     };
                     let tex = view.texture;
                     let key = format!("surf:{sid}");
-                    let default = [view.width as f32 + 16.0, view.height as f32 + 36.0];
+                    let default = inst
+                        .default_size
+                        .map(|(w, h)| [w as f32, h as f32])
+                        .unwrap_or([view.width as f32 + 16.0, view.height as f32 + 36.0]);
                     let p = placement(&key, default, idx, &cam, &prev_cam, &last_win);
 
                     let mut input = SurfaceInput::default();
@@ -716,9 +713,15 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
         }
 
         // Launch any apps clicked in the top bar (a fresh instance each click).
-        for (name, path) in &to_launch {
-            if let Err(e) = host.spawn(path, name, registry.clone(), instance_reg.clone()) {
-                eprintln!("failed to launch {name}: {e:#}");
+        for spec in &to_launch {
+            if let Err(e) = host.spawn(
+                &spec.path,
+                &spec.label(),
+                spec.size,
+                registry.clone(),
+                instance_reg.clone(),
+            ) {
+                eprintln!("failed to launch {}: {e:#}", spec.label());
             }
         }
 

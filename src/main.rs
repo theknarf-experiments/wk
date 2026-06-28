@@ -33,6 +33,15 @@ enum Commands {
         plugin: PathBuf,
     },
 
+    /// List the project's plugins
+    List,
+
+    /// Remove a plugin from the project (by path, file stem, or title)
+    Remove {
+        /// Plugin path, file stem, or title
+        plugin: String,
+    },
+
     /// Run the project's plugins, or explicit `.wasm` paths if given
     Run {
         /// Plugin `.wasm` paths; if omitted, the project's plugins are used
@@ -48,6 +57,8 @@ fn main() -> Result<(), String> {
     match &cli.command {
         Some(Commands::Init { name }) => project::init(name.clone()),
         Some(Commands::Add { plugin }) => project::add(plugin.clone()),
+        Some(Commands::List) => project::list(),
+        Some(Commands::Remove { plugin }) => project::remove(plugin.clone()),
         // `wk run [paths...]` runs the project (or the given ad-hoc paths).
         Some(Commands::Run { plugins }) => run(plugins),
         // Bare `wk` shows help.
@@ -60,10 +71,14 @@ fn main() -> Result<(), String> {
 
 /// Run the given plugin paths, or the project's plugins if none are given.
 fn run(plugins: &[PathBuf]) -> Result<(), String> {
-    let plugins = if plugins.is_empty() {
+    let specs = if plugins.is_empty() {
         project::Project::load()?.plugins
     } else {
-        plugins.to_vec()
+        plugins
+            .iter()
+            .cloned()
+            .map(project::PluginSpec::from_path)
+            .collect()
     };
-    compositor::run(&plugins)
+    compositor::run(&specs)
 }

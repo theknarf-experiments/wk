@@ -124,6 +124,8 @@ static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
 pub struct Instance {
     pub id: u64,
     pub name: String,
+    /// Configured default window size on the canvas, if the project set one.
+    pub default_size: Option<(u32, u32)>,
     /// Captured stdout+stderr, rendered in the instance's console window.
     pub console: MemoryOutputPipe,
     /// Set by the guest thread when its `run` returns (it exited on its own).
@@ -595,9 +597,10 @@ impl PluginHost {
         &self,
         path: &Path,
         name: &str,
+        default_size: Option<(u32, u32)>,
         surfaces: SurfaceRegistry,
         instances: InstanceRegistry,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let mut linker: Linker<HostState> = Linker::new(&self.engine);
         // Provide every wasmtime-wasi interface except its filesystem, then our
         // own in-memory filesystem in its place.
@@ -619,6 +622,7 @@ impl PluginHost {
         instances.lock().unwrap().push(Arc::new(Instance {
             id,
             name: name.to_string(),
+            default_size,
             console: console.clone(),
             finished: finished.clone(),
             kill: kill.clone(),
@@ -666,6 +670,6 @@ impl PluginHost {
                 Err(e) => eprintln!("plugin client exited with error: {e:#}"),
             }
         });
-        Ok(())
+        Ok(id)
     }
 }
