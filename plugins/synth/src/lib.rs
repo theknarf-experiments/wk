@@ -8,12 +8,23 @@ use bindings::wasi::frame_buffer::frame_buffer::{Buffer, Device};
 use bindings::wasi::graphics_context::graphics_context::Context as GfxContext;
 use bindings::wasi::surface::surface::{CreateDesc, Surface};
 use bindings::wk::midi::midi::Input;
-use bindings::wk::webaudio::audio::{Context as Audio, Gain, Oscillator, OscillatorType};
+use bindings::wk::webaudio::audio::{
+    BiquadFilter, Context as Audio, FilterType, Gain, Oscillator, OscillatorType,
+};
 use bindings::Guest;
 
-const VOLUME: usize = 0;
+// Knob indices.
+const VOL: usize = 0;
 const WAVE: usize = 1;
 const TUNE: usize = 2;
+const CUT: usize = 3;
+const RES: usize = 4;
+const ATK: usize = 5;
+const REL: usize = 6;
+const NUM_KNOBS: usize = 7;
+
+/// Unison spread of the two oscillators per voice, in cents (fixed).
+const UNISON_CENTS: f32 = 7.0;
 
 /// Equal-temperament frequency of a MIDI `note`, shifted by `tune` semitones.
 fn freq(note: u8, tune: f32) -> f32 {
@@ -31,7 +42,7 @@ fn osc_type(wave: f32) -> OscillatorType {
 }
 
 /// One cycle of waveform `idx` at `phase` in 0..1, returning -1..1 (for the
-/// on-screen preview).
+/// mini waveform drawn on the wave knob).
 fn wave_sample(idx: i32, phase: f32) -> f32 {
     match idx {
         0 => (phase * 2.0 * PI).sin(),
@@ -53,35 +64,52 @@ fn wave_sample(idx: i32, phase: f32) -> f32 {
     }
 }
 
-/// A knob: a value in `[min, max]` with a display colour.
+/// A knob: a value in `[min, max]` (mapped linearly, or logarithmically for
+/// frequency/time controls) with a label and colour.
 struct Knob {
+    label: &'static str,
     value: f32,
     min: f32,
     max: f32,
+    log: bool,
     color: [u8; 3],
 }
 
 impl Knob {
     fn norm(&self) -> f32 {
-        (self.value - self.min) / (self.max - self.min)
+        if self.log {
+            (self.value.ln() - self.min.ln()) / (self.max.ln() - self.min.ln())
+        } else {
+            (self.value - self.min) / (self.max - self.min)
+        }
     }
     fn set_norm(&mut self, n: f32) {
-        self.value = self.min + n.clamp(0.0, 1.0) * (self.max - self.min);
+        let n = n.clamp(0.0, 1.0);
+        self.value = if self.log {
+            (self.min.ln() + n * (self.max.ln() - self.min.ln())).exp()
+        } else {
+            self.min + n * (self.max - self.min)
+        };
     }
 }
 
-/// A sounding note: oscillator -> gain -> speakers.
+/// A sounding note: two detuned oscillators -> low-pass filter -> envelope gain
+/// -> speakers. `release_end` marks when the release ramp finishes so the voice
+/// can be reaped.
 struct Voice {
-    osc: Oscillator,
+    osc_a: Oscillator,
+    osc_b: Oscillator,
+    filter: BiquadFilter,
     gain: Gain,
+    release_end: Option<f64>,
 }
 
-/// The synth: a bank of voices keyed by MIDI note, plus three knobs whose values
-/// are applied live to every sounding voice.
+/// The synth: a bank of voices keyed by MIDI note, plus knobs whose values are
+/// applied live to every sounding voice.
 struct Synth {
     audio: Audio,
     voices: HashMap<u8, Voice>,
-    knobs: [Knob; 3],
+    knobs: [Knob; NUM_KNOBS],
 }
 
 impl Synth {
@@ -91,80 +119,167 @@ impl Synth {
             voices: HashMap::new(),
             knobs: [
                 Knob {
-                    value: 0.2,
+                    label: "VOL",
+                    value: 0.3,
                     min: 0.0,
                     max: 1.0,
+                    log: false,
                     color: [90, 150, 240],
                 },
                 Knob {
-                    value: 3.0,
+                    label: "WAVE",
+                    value: 2.0,
                     min: 0.0,
                     max: 3.0,
+                    log: false,
                     color: [90, 230, 160],
                 },
                 Knob {
+                    label: "TUNE",
                     value: 0.0,
                     min: -12.0,
                     max: 12.0,
+                    log: false,
                     color: [240, 170, 80],
+                },
+                Knob {
+                    label: "CUT",
+                    value: 1800.0,
+                    min: 80.0,
+                    max: 10000.0,
+                    log: true,
+                    color: [200, 130, 240],
+                },
+                Knob {
+                    label: "RES",
+                    value: 3.0,
+                    min: 0.1,
+                    max: 18.0,
+                    log: false,
+                    color: [240, 110, 140],
+                },
+                Knob {
+                    label: "ATK",
+                    value: 0.02,
+                    min: 0.003,
+                    max: 1.5,
+                    log: true,
+                    color: [110, 210, 230],
+                },
+                Knob {
+                    label: "REL",
+                    value: 0.35,
+                    min: 0.02,
+                    max: 2.5,
+                    log: true,
+                    color: [230, 210, 100],
                 },
             ],
         }
     }
 
-    fn volume(&self) -> f32 {
-        self.knobs[VOLUME].value
-    }
-    fn wave(&self) -> OscillatorType {
-        osc_type(self.knobs[WAVE].value)
-    }
-    fn tune(&self) -> f32 {
-        self.knobs[TUNE].value
-    }
-
     fn note_on(&mut self, note: u8) {
-        if self.voices.contains_key(&note) {
+        let peak = self.knobs[VOL].value;
+        let attack = self.knobs[ATK].value;
+        if let Some(v) = self.voices.get_mut(&note) {
+            // Retrigger a still-releasing voice instead of stacking a new one.
+            v.release_end = None;
+            v.gain.ramp_to(peak, attack);
             return;
         }
-        let osc = self.audio.create_oscillator();
+
+        let osc_a = self.audio.create_oscillator();
+        let osc_b = self.audio.create_oscillator();
+        let filter = self.audio.create_biquad_filter();
         let gain = self.audio.create_gain();
-        gain.set_gain(self.volume());
+
+        filter.set_type(FilterType::Lowpass);
+        filter.set_frequency(self.knobs[CUT].value);
+        filter.set_q(self.knobs[RES].value);
+        filter.connect(&gain);
+        gain.set_gain(0.0);
         gain.connect_destination();
-        osc.set_type(self.wave());
-        osc.set_frequency(freq(note, self.tune()));
-        osc.connect(&gain);
-        osc.start(0.0);
-        self.voices.insert(note, Voice { osc, gain });
+
+        let f = freq(note, self.knobs[TUNE].value);
+        let wave = osc_type(self.knobs[WAVE].value);
+        for (osc, sign) in [(&osc_a, -1.0f32), (&osc_b, 1.0)] {
+            osc.set_type(wave);
+            osc.set_frequency(f);
+            osc.set_detune(sign * UNISON_CENTS);
+            osc.connect_filter(&filter);
+            osc.start(0.0);
+        }
+        // Attack: ramp from silence to the volume peak.
+        gain.ramp_to(peak, attack);
+
+        self.voices.insert(
+            note,
+            Voice {
+                osc_a,
+                osc_b,
+                filter,
+                gain,
+                release_end: None,
+            },
+        );
     }
 
     fn note_off(&mut self, note: u8) {
-        if let Some(v) = self.voices.remove(&note) {
-            v.osc.stop(0.0);
+        let release = self.knobs[REL].value;
+        let end = self.audio.current_time() + release as f64;
+        if let Some(v) = self.voices.get_mut(&note) {
+            v.gain.ramp_to(0.0, release);
+            v.release_end = Some(end);
         }
     }
 
-    /// Re-apply the current knob values to every sounding voice.
+    /// Reap voices whose release ramp has finished.
+    fn reap(&mut self) {
+        let now = self.audio.current_time();
+        self.voices.retain(|_, v| match v.release_end {
+            Some(end) if now >= end => {
+                v.osc_a.stop(0.0);
+                v.osc_b.stop(0.0);
+                false
+            }
+            _ => true,
+        });
+    }
+
+    /// Re-apply live-tweakable knob values to every sounding voice.
     fn apply_knobs(&mut self) {
-        let vol = self.volume();
-        let wave = self.wave();
-        let tune = self.tune();
+        let wave = osc_type(self.knobs[WAVE].value);
+        let tune = self.knobs[TUNE].value;
+        let cut = self.knobs[CUT].value;
+        let res = self.knobs[RES].value;
+        let vol = self.knobs[VOL].value;
         for (note, v) in &self.voices {
-            v.gain.set_gain(vol);
-            v.osc.set_type(wave);
-            v.osc.set_frequency(freq(*note, tune));
+            let f = freq(*note, tune);
+            v.osc_a.set_type(wave);
+            v.osc_b.set_type(wave);
+            v.osc_a.set_frequency(f);
+            v.osc_b.set_frequency(f);
+            v.filter.set_frequency(cut);
+            v.filter.set_q(res);
+            // Volume tracks the sustaining level; don't fight an active release.
+            if v.release_end.is_none() {
+                v.gain.set_gain(vol);
+            }
         }
     }
 }
 
-/// Knob centres and radius for the current surface size.
-fn layout(w: u32, h: u32) -> ([(i32, i32); 3], i32) {
-    let r = ((h as f32 * 0.22).min(w as f32 * 0.13)).max(10.0) as i32;
-    let cy = (h as f32 * 0.36) as i32;
-    let centers = [
-        ((w as f32 * 0.2) as i32, cy),
-        ((w as f32 * 0.5) as i32, cy),
-        ((w as f32 * 0.8) as i32, cy),
-    ];
+/// Knob centres and radius for the current surface size (two rows: 4 then 3).
+fn layout(w: u32, h: u32) -> ([(i32, i32); NUM_KNOBS], i32) {
+    let cw = w as f32 / 4.0;
+    let r = ((cw * 0.3).min(h as f32 * 0.16)).max(8.0) as i32;
+    let row_y = [h as f32 * 0.32, h as f32 * 0.72];
+    let mut centers = [(0, 0); NUM_KNOBS];
+    for (i, c) in centers.iter_mut().enumerate() {
+        let col = (i % 4) as f32;
+        let row = i / 4;
+        *c = ((cw * (col + 0.5)) as i32, row_y[row] as i32);
+    }
     (centers, r)
 }
 
@@ -225,8 +340,60 @@ fn line(buf: &mut [u8], w: u32, h: u32, mut x0: i32, mut y0: i32, x1: i32, y1: i
     }
 }
 
-/// Draw a knob: a dark body, a coloured ring, and an indicator pointing from the
-/// value (270° sweep, straight up = mid).
+/// A 3x5 bitmap glyph: 5 rows, each holding 3 bits (4=left, 2=mid, 1=right).
+fn glyph(c: char) -> [u8; 5] {
+    match c {
+        'A' => [0b010, 0b101, 0b111, 0b101, 0b101],
+        'C' => [0b111, 0b100, 0b100, 0b100, 0b111],
+        'E' => [0b111, 0b100, 0b111, 0b100, 0b111],
+        'K' => [0b101, 0b101, 0b110, 0b101, 0b101],
+        'L' => [0b100, 0b100, 0b100, 0b100, 0b111],
+        'N' => [0b101, 0b111, 0b111, 0b111, 0b101],
+        'O' => [0b111, 0b101, 0b101, 0b101, 0b111],
+        'R' => [0b110, 0b101, 0b110, 0b101, 0b101],
+        'S' => [0b111, 0b100, 0b111, 0b001, 0b111],
+        'T' => [0b111, 0b010, 0b010, 0b010, 0b010],
+        'U' => [0b101, 0b101, 0b101, 0b101, 0b111],
+        'V' => [0b101, 0b101, 0b101, 0b101, 0b010],
+        'W' => [0b101, 0b101, 0b101, 0b111, 0b101],
+        _ => [0; 5],
+    }
+}
+
+/// Draw `s` (uppercase) with its top-left at `x,y`, each cell `scale` px.
+fn text(buf: &mut [u8], w: u32, h: u32, x: i32, y: i32, s: &str, scale: i32, c: [u8; 3]) {
+    let mut cx = x;
+    for ch in s.chars() {
+        let g = glyph(ch);
+        for (row, bits) in g.iter().enumerate() {
+            for col in 0..3 {
+                if bits & (1 << (2 - col)) != 0 {
+                    for sy in 0..scale {
+                        for sx in 0..scale {
+                            put(
+                                buf,
+                                w,
+                                h,
+                                cx + col * scale + sx,
+                                y + row as i32 * scale + sy,
+                                c,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        cx += 4 * scale; // 3 px glyph + 1 px gap
+    }
+}
+
+/// Pixel width of `s` at `scale`.
+fn text_w(s: &str, scale: i32) -> i32 {
+    (s.chars().count() as i32 * 4 - 1) * scale
+}
+
+/// Draw a knob: dark body, coloured ring, an indicator from the value (270°
+/// sweep, straight up = mid), and a centred label below.
 fn draw_knob(buf: &mut [u8], w: u32, h: u32, cx: i32, cy: i32, r: i32, k: &Knob) {
     disc(buf, w, h, cx, cy, r, [30, 30, 38]);
     ring(buf, w, h, cx, cy, r, 2, k.color);
@@ -236,6 +403,10 @@ fn draw_knob(buf: &mut [u8], w: u32, h: u32, cx: i32, cy: i32, r: i32, k: &Knob)
     let ty = cy - (len * theta.cos()) as i32;
     line(buf, w, h, cx, cy, tx, ty, k.color);
     disc(buf, w, h, tx, ty, 2, k.color);
+
+    let scale = (r / 9).max(1);
+    let lx = cx - text_w(k.label, scale) / 2;
+    text(buf, w, h, lx, cy + r + 3, k.label, scale, [190, 190, 200]);
 }
 
 struct Component;
@@ -243,8 +414,8 @@ struct Component;
 impl Guest for Component {
     fn run() {
         let surface = Surface::new(CreateDesc {
-            width: Some(380),
-            height: Some(200),
+            width: Some(420),
+            height: Some(240),
         });
         let ctx = GfxContext::new();
         surface.connect_graphics_context(&ctx);
@@ -265,6 +436,8 @@ impl Guest for Component {
             let w = surface.width().max(1);
             let h = surface.height().max(1);
             let (centers, r) = layout(w, h);
+
+            synth.reap();
 
             // Incoming MIDI: note-on (status 0x90, vel>0) / note-off (0x80, or
             // 0x90 vel 0).
@@ -305,7 +478,7 @@ impl Guest for Component {
                 grab = None;
             }
 
-            // Paint the panel: background, knobs, and a preview of the waveform.
+            // Paint the panel: background, then each knob with its label.
             let buffer = Buffer::from_graphics_buffer(ctx.get_current_buffer());
             let mut pixels = vec![0u8; (w * h * 4) as usize];
             for px in pixels.chunks_exact_mut(4) {
@@ -315,18 +488,20 @@ impl Guest for Component {
                 draw_knob(&mut pixels, w, h, cx, cy, r, &synth.knobs[i]);
             }
 
-            // Waveform preview strip along the bottom, in the wave knob colour.
+            // A mini view of the current waveform across the WAVE knob body.
+            let (wcx, wcy) = centers[WAVE];
             let wave_idx = synth.knobs[WAVE].value.round() as i32;
-            let color = synth.knobs[WAVE].color;
-            let strip_h = (h as f32 * 0.2) as i32;
-            let mid = h as i32 - strip_h / 2 - 6;
-            let amp = (strip_h / 2 - 2).max(1) as f32;
-            for x in 0..w as i32 {
-                let phase = ((x as f32 / w as f32) * 2.0) % 1.0;
-                let s = wave_sample(wave_idx, phase);
-                let y = mid - (s * amp) as i32;
-                put(&mut pixels, w, h, x, y, color);
-                put(&mut pixels, w, h, x, y + 1, color);
+            let span = (r as f32 * 0.6) as i32;
+            let amp = r as f32 * 0.32;
+            let mut prev: Option<(i32, i32)> = None;
+            for dx in -span..=span {
+                let phase = ((dx + span) as f32 / (2 * span) as f32) * 2.0 % 1.0;
+                let y = wcy - (wave_sample(wave_idx, phase) * amp) as i32;
+                let x = wcx + dx;
+                if let Some((px, py)) = prev {
+                    line(&mut pixels, w, h, px, py, x, y, [225, 225, 230]);
+                }
+                prev = Some((x, y));
             }
 
             buffer.set(&pixels);

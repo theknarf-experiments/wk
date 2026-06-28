@@ -1,6 +1,6 @@
 package wk:webaudio;
 
-/// A minimal subset of the W3C Web Audio API, implemented by wk on top of
+/// A subset of the W3C Web Audio API, implemented by wk on top of
 /// web-audio-api-rs — so a plugin makes sound the same way a web app would
 /// (the audio analogue of how wk implements wasi:webgpu for graphics).
 interface audio {
@@ -9,6 +9,12 @@ interface audio {
         square,
         sawtooth,
         triangle,
+    }
+
+    enum filter-type {
+        lowpass,
+        highpass,
+        bandpass,
     }
 
     /// An audio graph wired to the output device. One per plugin, like a web
@@ -21,14 +27,19 @@ interface audio {
         current-time: func() -> f64;
         create-oscillator: func() -> oscillator;
         create-gain: func() -> gain;
+        create-biquad-filter: func() -> biquad-filter;
     }
 
     /// A periodic-waveform source.
     resource oscillator {
         set-type: func(ty: oscillator-type);
         set-frequency: func(hz: f32);
+        /// Fine-tune in cents (1/100 of a semitone), e.g. for unison detune.
+        set-detune: func(cents: f32);
         /// Route this oscillator into a gain node.
         connect: func(dst: borrow<gain>);
+        /// Route this oscillator into a filter node.
+        connect-filter: func(dst: borrow<biquad-filter>);
         /// Route this oscillator straight to the speakers.
         connect-destination: func();
         /// Begin playback at `when` seconds on the context clock (0 = now).
@@ -40,7 +51,25 @@ interface audio {
     /// A volume node.
     resource gain {
         set-gain: func(value: f32);
+        /// Linearly ramp the gain to `value` over `seconds` from now, anchored
+        /// at the current value — for click-free envelopes.
+        ramp-to: func(value: f32, seconds: f32);
+        /// Route this gain into another gain node.
+        connect: func(dst: borrow<gain>);
         /// Route this gain to the speakers.
+        connect-destination: func();
+    }
+
+    /// A biquad filter (e.g. a resonant low-pass for subtractive synthesis).
+    resource biquad-filter {
+        set-type: func(ty: filter-type);
+        /// Cutoff/centre frequency, in Hz.
+        set-frequency: func(hz: f32);
+        /// Resonance (quality factor).
+        set-q: func(value: f32);
+        /// Route this filter into a gain node.
+        connect: func(dst: borrow<gain>);
+        /// Route this filter to the speakers.
         connect-destination: func();
     }
 }
