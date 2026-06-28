@@ -1717,6 +1717,16 @@ impl ApplicationHandler for App {
         }
     }
 
+    /// Called each loop iteration once events are drained — we render here so it
+    /// runs *inside* winit's handler (set for the whole pump). Rendering in the
+    /// outer loop instead left a window where the handler was unset and a
+    /// quit/close event would log "no handler was set".
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if self.gfx.is_some() {
+            self.frame();
+        }
+    }
+
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let scale = self
             .gfx
@@ -1784,17 +1794,13 @@ pub fn run(plugins: &[Dependency], persist_session: bool) -> Result<(), String> 
     let mut event_loop = EventLoop::builder().build().map_err(|e| e.to_string())?;
     let mut app = App::new(plugins, persist_session)?;
     loop {
-        // A quit (window close / Escape / gfx failure) calls `ActiveEventLoop::
-        // exit()` in the handler, so winit shuts the NSApp down cleanly and the
-        // next pump returns `Exit` — dropping the loop without exit() leaves a
-        // dangling macOS handler ("no handler was set").
-        if let PumpStatus::Exit(_) = event_loop.pump_app_events(Some(Duration::ZERO), &mut app) {
+        // Pump (and render, via `about_to_wait`) with the handler set the whole
+        // time, blocking up to a frame for events — this paces ~60fps when idle
+        // and leaves no window where a macOS event has no handler to run.
+        // A quit calls `ActiveEventLoop::exit()`, so the next pump returns Exit.
+        if let PumpStatus::Exit(_) = event_loop.pump_app_events(Some(FRAME), &mut app) {
             break;
         }
-        if app.gfx.is_some() {
-            app.frame();
-        }
-        std::thread::sleep(FRAME);
     }
     app.save_session();
     Ok(())
