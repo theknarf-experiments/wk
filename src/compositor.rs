@@ -182,47 +182,53 @@ impl Camera {
     }
 }
 
-/// A window's position and size in canvas space, kept independent of pan/zoom
-/// so the user can drag/resize it (captured back from imgui each frame).
+/// A window's last on-screen position and size, read back from imgui each frame
+/// so the camera can move it when it pans/zooms.
 #[derive(Clone, Copy)]
-struct WinState {
+struct WinScreen {
     pos: [f32; 2],
     size: [f32; 2],
 }
 
-/// Look up (or spawn, cascaded) a window's canvas rect, returning its current
-/// screen position and size for this frame's camera.
-fn window_screen_rect(
-    win_state: &mut HashMap<String, WinState>,
+/// How to place a window this frame. imgui owns the position/size natively (so
+/// the user can drag and resize), and we only *override* on frames where the
+/// camera moved, transforming the window's last screen rect by the camera delta.
+struct Placement {
+    default_pos: [f32; 2],
+    default_size: [f32; 2],
+    force_pos: Option<[f32; 2]>,
+    force_size: Option<[f32; 2]>,
+}
+
+fn placement(
     key: &str,
     default_size: [f32; 2],
     spawn_idx: usize,
     cam: &Camera,
-) -> ([f32; 2], [f32; 2]) {
-    let st = *win_state.entry(key.to_string()).or_insert_with(|| {
-        let step = (spawn_idx % 8) as f32 * 28.0;
-        WinState {
-            pos: [40.0 + step, 56.0 + step],
-            size: default_size,
-        }
-    });
-    (
-        cam.to_screen(st.pos),
-        [st.size[0] * cam.zoom, st.size[1] * cam.zoom],
-    )
-}
+    prev_cam: &Camera,
+    last: &HashMap<String, WinScreen>,
+) -> Placement {
+    let step = (spawn_idx % 8) as f32 * 28.0;
+    let default_pos = [40.0 + step, 56.0 + step];
 
-/// Record where the user dragged/resized a window to, back in canvas space.
-fn capture_window(
-    win_state: &mut HashMap<String, WinState>,
-    key: &str,
-    screen_pos: [f32; 2],
-    screen_size: [f32; 2],
-    cam: &Camera,
-) {
-    if let Some(st) = win_state.get_mut(key) {
-        st.pos = cam.to_canvas(screen_pos);
-        st.size = [screen_size[0] / cam.zoom, screen_size[1] / cam.zoom];
+    let mut force_pos = None;
+    let mut force_size = None;
+    let cam_moved = cam.pan != prev_cam.pan || cam.zoom != prev_cam.zoom;
+    if cam_moved {
+        if let Some(ls) = last.get(key) {
+            // Keep the window pinned to its canvas spot as the camera moves.
+            force_pos = Some(cam.to_screen(prev_cam.to_canvas(ls.pos)));
+            if cam.zoom != prev_cam.zoom {
+                let r = cam.zoom / prev_cam.zoom;
+                force_size = Some([ls.size[0] * r, ls.size[1] * r]);
+            }
+        }
+    }
+    Placement {
+        default_pos,
+        default_size,
+        force_pos,
+        force_size,
     }
 }
 
@@ -232,8 +238,9 @@ fn capture_window(
 fn console_window(
     ui: &imgui::Ui,
     inst: &SharedInstance,
-    win_state: &mut HashMap<String, WinState>,
+    last_win: &mut HashMap<String, WinScreen>,
     cam: &Camera,
+    prev_cam: &Camera,
     spawn_idx: usize,
 ) -> bool {
     let finished = inst.finished.load(Ordering::Relaxed);
@@ -246,31 +253,42 @@ fn console_window(
     let text = String::from_utf8_lossy(&bytes);
 
     let key = format!("console:{}", inst.id);
-    let (pos, size) = window_screen_rect(win_state, &key, [460.0, 280.0], spawn_idx, cam);
+    let p = placement(&key, [460.0, 280.0], spawn_idx, cam, prev_cam, last_win);
 
     let mut open = true;
-    let mut cur_pos = pos;
-    let mut cur_size = size;
-    ui.window(title)
+    let mut cur = WinScreen {
+        pos: p.default_pos,
+        size: p.default_size,
+    };
+    let mut win = ui
+        .window(title)
         .opened(&mut open)
-        .position(pos, Condition::Always)
-        .size(size, Condition::Always)
-        .build(|| {
-            ui.set_window_font_scale(cam.zoom);
-            ui.child_window("##console")
-                .horizontal_scrollbar(true)
-                .build(|| {
-                    let at_bottom = ui.scroll_y() >= ui.scroll_max_y();
-                    ui.text_wrapped(text.as_ref());
-                    // Keep following the tail unless the user scrolled up.
-                    if at_bottom {
-                        ui.set_scroll_here_y_with_ratio(1.0);
-                    }
-                });
-            cur_pos = ui.window_pos();
-            cur_size = ui.window_size();
-        });
-    capture_window(win_state, &key, cur_pos, cur_size, cam);
+        .position(p.default_pos, Condition::FirstUseEver)
+        .size(p.default_size, Condition::FirstUseEver);
+    if let Some(fp) = p.force_pos {
+        win = win.position(fp, Condition::Always);
+    }
+    if let Some(fs) = p.force_size {
+        win = win.size(fs, Condition::Always);
+    }
+    win.build(|| {
+        ui.set_window_font_scale(cam.zoom);
+        ui.child_window("##console")
+            .horizontal_scrollbar(true)
+            .build(|| {
+                let at_bottom = ui.scroll_y() >= ui.scroll_max_y();
+                ui.text_wrapped(text.as_ref());
+                // Keep following the tail unless the user scrolled up.
+                if at_bottom {
+                    ui.set_scroll_here_y_with_ratio(1.0);
+                }
+            });
+        cur = WinScreen {
+            pos: ui.window_pos(),
+            size: ui.window_size(),
+        };
+    });
+    last_win.insert(key, cur);
     open
 }
 
@@ -354,8 +372,11 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
         pan: [0.0, 0.0],
         zoom: 1.0,
     };
+    // The camera as of last frame; windows are re-pinned only when it moves.
+    let mut prev_cam = cam;
     let mut pan_target = [0.0f32, 0.0];
-    let mut win_state: HashMap<String, WinState> = HashMap::new();
+    // Each window's last on-screen rect, read back from imgui every frame.
+    let mut last_win: HashMap<String, WinScreen> = HashMap::new();
 
     'running: loop {
         // Advance the epoch so any killed instance traps and ends this frame.
@@ -561,7 +582,7 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
                     .collect();
 
                 if inst_surfaces.is_empty() {
-                    if !console_window(ui, inst, &mut win_state, &cam, idx) {
+                    if !console_window(ui, inst, &mut last_win, &cam, &prev_cam, idx) {
                         to_close.push(inst.clone());
                     }
                     continue;
@@ -578,42 +599,53 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
                     let tex = view.texture;
                     let key = format!("surf:{sid}");
                     let default = [view.width as f32 + 16.0, view.height as f32 + 36.0];
-                    let (pos, size) = window_screen_rect(&mut win_state, &key, default, idx, &cam);
+                    let p = placement(&key, default, idx, &cam, &prev_cam, &last_win);
 
                     let mut input = SurfaceInput::default();
                     let mut open = true;
-                    let mut cur_pos = pos;
-                    let mut cur_size = size;
-                    ui.window(format!("{title}##{sid}"))
+                    let mut cur = WinScreen {
+                        pos: p.default_pos,
+                        size: p.default_size,
+                    };
+                    let mut win = ui
+                        .window(format!("{title}##{sid}"))
                         .opened(&mut open)
-                        .position(pos, Condition::Always)
-                        .size(size, Condition::Always)
-                        .build(|| {
-                            input.focused = ui.is_window_focused();
+                        .position(p.default_pos, Condition::FirstUseEver)
+                        .size(p.default_size, Condition::FirstUseEver);
+                    if let Some(fp) = p.force_pos {
+                        win = win.position(fp, Condition::Always);
+                    }
+                    if let Some(fs) = p.force_size {
+                        win = win.size(fs, Condition::Always);
+                    }
+                    win.build(|| {
+                        input.focused = ui.is_window_focused();
 
-                            // The client renders at the window's on-screen pixel
-                            // size, so zooming in gives a sharper surface.
-                            let avail = ui.content_region_avail();
-                            input.resize = Some((clamp_size(avail[0]), clamp_size(avail[1])));
+                        // The client renders at the window's on-screen pixel
+                        // size, so zooming in gives a sharper surface.
+                        let avail = ui.content_region_avail();
+                        input.resize = Some((clamp_size(avail[0]), clamp_size(avail[1])));
 
-                            let origin = ui.cursor_screen_pos();
-                            imgui::Image::new(tex, avail).build(ui);
-                            if ui.is_item_hovered() {
-                                let mouse = ui.io().mouse_pos;
-                                let local =
-                                    ((mouse[0] - origin[0]) as f64, (mouse[1] - origin[1]) as f64);
-                                input.moved = Some(local);
-                                if ui.is_mouse_clicked(MouseButton::Left) {
-                                    input.down.push(local);
-                                }
-                                if ui.is_mouse_released(MouseButton::Left) {
-                                    input.up.push(local);
-                                }
+                        let origin = ui.cursor_screen_pos();
+                        imgui::Image::new(tex, avail).build(ui);
+                        if ui.is_item_hovered() {
+                            let mouse = ui.io().mouse_pos;
+                            let local =
+                                ((mouse[0] - origin[0]) as f64, (mouse[1] - origin[1]) as f64);
+                            input.moved = Some(local);
+                            if ui.is_mouse_clicked(MouseButton::Left) {
+                                input.down.push(local);
                             }
-                            cur_pos = ui.window_pos();
-                            cur_size = ui.window_size();
-                        });
-                    capture_window(&mut win_state, &key, cur_pos, cur_size, &cam);
+                            if ui.is_mouse_released(MouseButton::Left) {
+                                input.up.push(local);
+                            }
+                        }
+                        cur = WinScreen {
+                            pos: ui.window_pos(),
+                            size: ui.window_size(),
+                        };
+                    });
+                    last_win.insert(key, cur);
                     if !open {
                         to_close.push(inst.clone());
                     }
@@ -673,7 +705,7 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
         // free their textures, and drop the instance.
         for inst in &to_close {
             inst.kill.store(true, Ordering::Relaxed);
-            win_state.remove(&format!("console:{}", inst.id));
+            last_win.remove(&format!("console:{}", inst.id));
             registry.lock().unwrap().retain(|s| {
                 let mut g = s.lock().unwrap();
                 if g.instance_id != inst.id {
@@ -685,7 +717,7 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
                     renderer.textures.remove(v.texture);
                 }
                 inputs.remove(&g.id);
-                win_state.remove(&format!("surf:{}", g.id));
+                last_win.remove(&format!("surf:{}", g.id));
                 false
             });
             instance_reg
@@ -693,6 +725,9 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
                 .unwrap()
                 .retain(|x| !Arc::ptr_eq(x, inst));
         }
+
+        // Remember this frame's camera so next frame can detect movement.
+        prev_cam = cam;
 
         std::thread::sleep(FRAME);
     }
