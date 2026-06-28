@@ -48,8 +48,13 @@ pub type SharedFile = Arc<Mutex<Vec<u8>>>;
 enum Node {
     File(Vec<u8>),
     Dir(BTreeMap<String, u64>),
-    /// A file whose bytes live in a canvas file node connected to this app.
+    /// A file whose bytes live in a canvas VirtualFile node connected to this
+    /// app (in-memory, shared between connected apps).
     Shared(SharedFile),
+    /// A file backed by a real file on the host disk (a canvas HostMappedFile
+    /// node connected to this app): reads and writes hit the actual path, so
+    /// they persist and are visible to the host.
+    Host(std::path::PathBuf),
 }
 
 const ROOT: u64 = 0;
@@ -96,6 +101,13 @@ pub fn new_fs() -> SharedFs {
 pub fn mount_file(fs: &SharedFs, name: &str, data: SharedFile) {
     unmount_file(fs, name);
     fs.lock().unwrap().add_child(ROOT, name, Node::Shared(data));
+}
+
+/// Connect a canvas HostMappedFile node into `fs` as `/name`, backed by the
+/// real host file at `path`. Reads and writes go straight to disk.
+pub fn mount_host_file(fs: &SharedFs, name: &str, path: std::path::PathBuf) {
+    unmount_file(fs, name);
+    fs.lock().unwrap().add_child(ROOT, name, Node::Host(path));
 }
 
 /// Disconnect the shared file `/name` from `fs` (leaves the file node's bytes
@@ -217,6 +229,55 @@ impl OutputStream for SharedOutputStream {
     }
 }
 
+/// An output stream that writes into a host-backed file at a moving offset.
+struct HostOutputStream {
+    path: std::path::PathBuf,
+    offset: u64,
+}
+
+#[async_trait]
+impl Pollable for HostOutputStream {
+    async fn ready(&mut self) {}
+}
+
+impl OutputStream for HostOutputStream {
+    fn write(&mut self, bytes: Bytes) -> std::result::Result<(), StreamError> {
+        host_write_at(&self.path, self.offset, &bytes).map_err(|_| StreamError::Closed)?;
+        self.offset += bytes.len() as u64;
+        Ok(())
+    }
+    fn flush(&mut self) -> std::result::Result<(), StreamError> {
+        Ok(())
+    }
+    fn check_write(&mut self) -> std::result::Result<usize, StreamError> {
+        Ok(1024 * 1024)
+    }
+}
+
+/// Read the whole host file (a missing file reads as empty).
+fn host_read(path: &std::path::Path) -> Vec<u8> {
+    std::fs::read(path).unwrap_or_default()
+}
+
+/// Size of the host file in bytes (0 if it doesn't exist yet).
+fn host_size(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Write `buf` into the host file at `offset`, creating it if needed.
+fn host_write_at(path: &std::path::Path, offset: u64, buf: &[u8]) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    f.seek(SeekFrom::Start(offset))?;
+    f.write_all(buf)?;
+    Ok(())
+}
+
 /// Copy `bytes` into `data` at `offset`, growing it if needed.
 fn write_at(data: &mut Vec<u8>, offset: u64, bytes: &[u8]) {
     let start = offset as usize;
@@ -292,6 +353,7 @@ fn err<T>(code: ErrorCode) -> Result<std::result::Result<T, ErrorCode>> {
 enum Kind {
     File,
     Shared(SharedFile),
+    Host(std::path::PathBuf),
     Dir,
     Missing,
 }
@@ -308,6 +370,7 @@ impl HostState {
         match fs.lock().unwrap().nodes.get(&node) {
             Some(Node::File(_)) => Kind::File,
             Some(Node::Shared(sh)) => Kind::Shared(sh.clone()),
+            Some(Node::Host(p)) => Kind::Host(p.clone()),
             Some(Node::Dir(_)) => Kind::Dir,
             None => Kind::Missing,
         }
@@ -352,6 +415,11 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
                 let start = (offset as usize).min(d.len());
                 Bytes::copy_from_slice(&d[start..])
             }
+            Kind::Host(p) => {
+                let d = host_read(&p);
+                let start = (offset as usize).min(d.len());
+                Bytes::copy_from_slice(&d[start..])
+            }
             Kind::Dir => return err(ErrorCode::IsDirectory),
             Kind::Missing => return err(ErrorCode::NoEntry),
         };
@@ -368,6 +436,7 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         let stream: DynOutputStream = match Self::kind(&fs, node) {
             Kind::File => Box::new(VfsOutputStream { fs, node, offset }),
             Kind::Shared(data) => Box::new(SharedOutputStream { data, offset }),
+            Kind::Host(path) => Box::new(HostOutputStream { path, offset }),
             _ => return err(ErrorCode::IsDirectory),
         };
         Ok(Ok(self.table().push(stream)?))
@@ -389,6 +458,10 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
             Kind::Shared(data) => {
                 let offset = data.lock().unwrap().len() as u64;
                 Box::new(SharedOutputStream { data, offset })
+            }
+            Kind::Host(path) => {
+                let offset = host_size(&path);
+                Box::new(HostOutputStream { path, offset })
             }
             Kind::Dir => return err(ErrorCode::IsDirectory),
             Kind::Missing => return err(ErrorCode::NoEntry),
@@ -412,6 +485,7 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
                 Ok(Ok(read_at(data, offset, len)))
             }
             Kind::Shared(sh) => Ok(Ok(read_at(&sh.lock().unwrap(), offset, len))),
+            Kind::Host(p) => Ok(Ok(read_at(&host_read(&p), offset, len))),
             Kind::Dir => err(ErrorCode::IsDirectory),
             Kind::Missing => err(ErrorCode::NoEntry),
         }
@@ -433,6 +507,11 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
                 write_at(data, offset, &buf);
             }
             Kind::Shared(sh) => write_at(&mut sh.lock().unwrap(), offset, &buf),
+            Kind::Host(p) => {
+                if host_write_at(&p, offset, &buf).is_err() {
+                    return err(ErrorCode::Io);
+                }
+            }
             Kind::Dir => return err(ErrorCode::IsDirectory),
             Kind::Missing => return err(ErrorCode::NoEntry),
         }
@@ -542,6 +621,18 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
                 sh.lock().unwrap().resize(size as usize, 0);
                 Ok(Ok(()))
             }
+            Kind::Host(p) => {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&p)
+                    .and_then(|f| f.set_len(size))
+                {
+                    Ok(()) => Ok(Ok(())),
+                    Err(_) => err(ErrorCode::Io),
+                }
+            }
             _ => err(ErrorCode::IsDirectory),
         }
     }
@@ -566,6 +657,10 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
                         match g.nodes.get_mut(&id) {
                             Some(Node::File(data)) => data.clear(),
                             Some(Node::Shared(sh)) => sh.lock().unwrap().clear(),
+                            // Truncate (or create) the backing host file to empty.
+                            Some(Node::Host(p)) => {
+                                let _ = std::fs::File::create(p.as_path());
+                            }
                             _ => {}
                         }
                     }
@@ -790,6 +885,7 @@ fn stat_node(fs: &Fs, id: u64) -> Option<DescriptorStat> {
         Node::File(data) => (DescriptorType::RegularFile, data.len() as u64),
         Node::Dir(_) => (DescriptorType::Directory, 0),
         Node::Shared(sh) => (DescriptorType::RegularFile, sh.lock().unwrap().len() as u64),
+        Node::Host(p) => (DescriptorType::RegularFile, host_size(p)),
     };
     Some(DescriptorStat {
         type_: ty,
@@ -856,5 +952,29 @@ mod tests {
         unmount_file(&a, "chan");
         assert!(resolve(&a.lock().unwrap(), ROOT, "/chan").is_none());
         assert!(resolve(&b.lock().unwrap(), ROOT, "/chan").is_some());
+    }
+
+    #[test]
+    fn host_mapped_file_reads_and_writes_disk() {
+        let path = std::env::temp_dir().join("wk_host_mapped_test.txt");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"on disk").unwrap();
+
+        let fs = new_fs();
+        mount_host_file(&fs, "h", path.clone());
+        let node = resolve(&fs.lock().unwrap(), ROOT, "/h").expect("mounted");
+
+        // The mounted node reports the real file's size, and a write through it
+        // lands on disk.
+        assert_eq!(stat_node(&fs.lock().unwrap(), node).unwrap().size, 7);
+        host_write_at(&path, 0, b"changed!").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"changed!");
+        assert_eq!(host_read(&path), b"changed!");
+
+        // Unmounting leaves the disk file untouched.
+        unmount_file(&fs, "h");
+        assert!(resolve(&fs.lock().unwrap(), ROOT, "/h").is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), b"changed!");
+        let _ = std::fs::remove_file(&path);
     }
 }

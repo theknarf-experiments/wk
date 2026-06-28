@@ -6,7 +6,8 @@
 //! ```kdl
 //! camera { pan 0 0; zoom 1 }
 //! node "file_demo" 1 { pos 19 88; size 360 260 }
-//! file "chan" 2 { pos 400 120; size 130 44 }
+//! virtualfile "chan" 2 { pos 400 120; size 130 44 }
+//! hostfile "notes.txt" 6 { pos 400 200; size 130 44 }
 //! connection 2 1
 //! midi 3 4
 //! hostport "8080" 5 { pos 600 100; size 130 44 }
@@ -31,7 +32,10 @@ pub struct Session {
     /// Canvas camera: pan x, pan y, zoom.
     pub camera: (f32, f32, f32),
     pub nodes: Vec<SessionNode>,
-    pub files: Vec<SessionNode>,
+    /// In-memory VirtualFile nodes; `name` holds the mount name.
+    pub virtual_files: Vec<SessionNode>,
+    /// HostMappedFile nodes; `name` holds the host file path.
+    pub host_files: Vec<SessionNode>,
     /// HostPort nodes; `name` holds the port number as a string.
     pub host_ports: Vec<SessionNode>,
     /// File connections as (file id, app node id).
@@ -110,7 +114,8 @@ impl Session {
         };
 
         let mut nodes = Vec::new();
-        let mut files = Vec::new();
+        let mut virtual_files = Vec::new();
+        let mut host_files = Vec::new();
         let mut host_ports = Vec::new();
         let mut connections = Vec::new();
         let mut midi = Vec::new();
@@ -118,7 +123,8 @@ impl Session {
         for n in doc.nodes() {
             match n.name().value() {
                 "node" => nodes.extend(parse_placed(n)),
-                "file" => files.extend(parse_placed(n)),
+                "virtualfile" => virtual_files.extend(parse_placed(n)),
+                "hostfile" => host_files.extend(parse_placed(n)),
                 "hostport" => host_ports.extend(parse_placed(n)),
                 "connection" => connections.extend(pair(n)),
                 "midi" => midi.extend(pair(n)),
@@ -130,7 +136,8 @@ impl Session {
         Some(Session {
             camera,
             nodes,
-            files,
+            virtual_files,
+            host_files,
             host_ports,
             connections,
             midi,
@@ -155,8 +162,11 @@ impl Session {
         for n in &self.nodes {
             doc.nodes_mut().push(placed_kdl("node", n));
         }
-        for f in &self.files {
-            doc.nodes_mut().push(placed_kdl("file", f));
+        for f in &self.virtual_files {
+            doc.nodes_mut().push(placed_kdl("virtualfile", f));
+        }
+        for f in &self.host_files {
+            doc.nodes_mut().push(placed_kdl("hostfile", f));
         }
         for hp in &self.host_ports {
             doc.nodes_mut().push(placed_kdl("hostport", hp));
@@ -206,10 +216,16 @@ mod tests {
                 pos: [40.0, 56.0],
                 size: [360.0, 260.0],
             }],
-            files: vec![SessionNode {
+            virtual_files: vec![SessionNode {
                 name: "chan".into(),
                 id: 2,
                 pos: [200.0, 120.0],
+                size: [130.0, 44.0],
+            }],
+            host_files: vec![SessionNode {
+                name: "notes.txt".into(),
+                id: 6,
+                pos: [200.0, 200.0],
                 size: [130.0, 44.0],
             }],
             host_ports: vec![SessionNode {
@@ -228,8 +244,11 @@ mod tests {
         assert_eq!(back.nodes.len(), 1);
         assert_eq!(back.nodes[0].name, "file_demo");
         assert_eq!(back.nodes[0].id, 1);
-        assert_eq!(back.files.len(), 1);
-        assert_eq!(back.files[0].name, "chan");
+        assert_eq!(back.virtual_files.len(), 1);
+        assert_eq!(back.virtual_files[0].name, "chan");
+        assert_eq!(back.host_files.len(), 1);
+        assert_eq!(back.host_files[0].name, "notes.txt");
+        assert_eq!(back.host_files[0].id, 6);
         assert_eq!(back.host_ports.len(), 1);
         assert_eq!(back.host_ports[0].name, "8080");
         assert_eq!(back.host_ports[0].id, 5);

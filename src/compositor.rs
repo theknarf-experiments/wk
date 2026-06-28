@@ -349,11 +349,56 @@ struct Drag {
     grab: [f32; 2],
 }
 
-/// A canvas file node: a named shared file you wire into app nodes. Its bytes
-/// are the shared state connected apps read and write.
-struct FileNode {
+/// An in-memory canvas file node: a named shared buffer you wire into app
+/// nodes. Its bytes are ephemeral shared state connected apps read and write.
+struct VirtualFile {
     name: String,
     data: crate::vfs::SharedFile,
+}
+
+/// A canvas file node backed by a real file on the host disk. Wiring it into an
+/// app maps the actual path into that app at `/name`, so reads and writes
+/// persist to disk and are visible outside wk.
+struct HostMappedFile {
+    /// In-app mount name (the file's base name).
+    name: String,
+    /// The real path on the host.
+    path: std::path::PathBuf,
+}
+
+/// A canvas file node, wired into app nodes as a shared file `/name`. Either an
+/// in-memory `VirtualFile` or a disk-backed `HostMappedFile`.
+enum FileNode {
+    Virtual(VirtualFile),
+    HostMapped(HostMappedFile),
+}
+
+impl FileNode {
+    /// The in-app file name this node mounts as.
+    fn name(&self) -> &str {
+        match self {
+            FileNode::Virtual(f) => &f.name,
+            FileNode::HostMapped(f) => &f.name,
+        }
+    }
+
+    /// Current size in bytes (in-memory length, or the host file's size).
+    fn size(&self) -> usize {
+        match self {
+            FileNode::Virtual(f) => f.data.lock().unwrap().len(),
+            FileNode::HostMapped(f) => {
+                std::fs::metadata(&f.path).map(|m| m.len()).unwrap_or(0) as usize
+            }
+        }
+    }
+
+    /// Mount this file into app filesystem `fs` (by kind).
+    fn mount(&self, fs: &crate::vfs::SharedFs) {
+        match self {
+            FileNode::Virtual(f) => crate::vfs::mount_file(fs, &f.name, f.data.clone()),
+            FileNode::HostMapped(f) => crate::vfs::mount_host_file(fs, &f.name, f.path.clone()),
+        }
+    }
 }
 
 /// Connection port radius and file-node default size, in canvas pixels.
@@ -362,6 +407,10 @@ const FILE_W: f32 = 130.0;
 const FILE_H: f32 = 44.0;
 const FILE_BG: [f32; 4] = [0.20, 0.17, 0.10, 1.0];
 const FILE_BORDER: [f32; 4] = [0.55, 0.45, 0.25, 1.0];
+/// HostMappedFile nodes are tinted (blue/grey) to distinguish disk-backed files
+/// from in-memory VirtualFiles.
+const HOSTFILE_BG: [f32; 4] = [0.10, 0.14, 0.22, 1.0];
+const HOSTFILE_BORDER: [f32; 4] = [0.30, 0.45, 0.65, 1.0];
 const PORT_COL: [f32; 4] = [0.70, 0.72, 0.80, 1.0];
 /// HostPort node colours and wire (exposes a wasi:http node to localhost).
 const HOSTPORT_BG: [f32; 4] = [0.10, 0.18, 0.20, 1.0];
@@ -381,6 +430,13 @@ fn center(r: [f32; 4]) -> [f32; 2] {
 fn near(a: [f32; 2], b: [f32; 2], radius: f32) -> bool {
     let (dx, dy) = (a[0] - b[0], a[1] - b[1]);
     dx * dx + dy * dy <= radius * radius
+}
+
+/// The in-app mount name for a host-mapped file: the path's base name.
+fn host_file_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "hostfile".to_string())
 }
 
 /// The compositor application: owns all state. winit drives it via
@@ -424,6 +480,7 @@ struct App {
     next_node_id: u64,
     next_port: u16,
     file_seq: u32,
+    host_seq: u32,
 
     // Input state, fed by winit events between frames.
     mouse: [f32; 2],
@@ -475,6 +532,7 @@ impl App {
             serves: HashMap::new(),
             next_port: 8080,
             file_seq: 0,
+            host_seq: 0,
             mouse: [0.0, 0.0],
             lmb: false,
             prev_lmb: false,
@@ -534,8 +592,8 @@ impl App {
             }
         }
 
-        // File nodes: recreate empty shared files at their saved positions.
-        for f in &saved.files {
+        // VirtualFile nodes: recreate empty shared buffers at their saved spots.
+        for f in &saved.virtual_files {
             max_id = max_id.max(f.id);
             self.win_pos.insert(f.id, f.pos);
             self.win_size.insert(f.id, f.size);
@@ -549,11 +607,29 @@ impl App {
             }
             self.file_nodes.insert(
                 f.id,
-                FileNode {
+                FileNode::Virtual(VirtualFile {
                     name: f.name.clone(),
                     data: Arc::new(Mutex::new(Vec::new())),
-                },
+                }),
             );
+        }
+
+        // HostMappedFile nodes: re-map their saved host paths (name = path).
+        for f in &saved.host_files {
+            max_id = max_id.max(f.id);
+            self.win_pos.insert(f.id, f.pos);
+            self.win_size.insert(f.id, f.size);
+            self.z.push(f.id);
+            let path = std::path::PathBuf::from(&f.name);
+            let name = host_file_name(&path);
+            if let Some(num) = name
+                .strip_prefix("host")
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                self.host_seq = self.host_seq.max(num);
+            }
+            self.file_nodes
+                .insert(f.id, FileNode::HostMapped(HostMappedFile { name, path }));
         }
 
         // Re-wire file connections: mount each file into its connected app's fs.
@@ -562,7 +638,7 @@ impl App {
             else {
                 continue;
             };
-            crate::vfs::mount_file(&app.fs, &file.name, file.data.clone());
+            file.mount(&app.fs);
             self.connections.push((file_id, app_id));
         }
 
@@ -628,22 +704,52 @@ impl App {
             .find(|&id| contains(self.rect_of(id), mp))
     }
 
-    /// Create a new, empty file node on the canvas.
-    fn add_file_node(&mut self) {
+    /// Create a new, empty in-memory VirtualFile node on the canvas.
+    fn add_virtual_file(&mut self) {
         self.file_seq += 1;
         let id = self.alloc_id();
-        let step = (self.file_nodes.len() % 8) as f32 * 24.0;
-        let pos = self.cam.to_canvas([240.0 + step, 120.0 + step]);
+        let pos = self.next_file_pos();
         self.win_pos.insert(id, pos);
         self.win_size.insert(id, [FILE_W, FILE_H]);
         self.z.push(id);
         self.file_nodes.insert(
             id,
-            FileNode {
+            FileNode::Virtual(VirtualFile {
                 name: format!("file{}", self.file_seq),
                 data: Arc::new(Mutex::new(Vec::new())),
-            },
+            }),
         );
+    }
+
+    /// Create a HostMappedFile node backed by a fresh host file in the working
+    /// directory (`host<n>`). The path persists in the session; the file is
+    /// created on disk so connected apps read/write a real file.
+    fn add_host_mapped_file(&mut self) {
+        self.host_seq += 1;
+        let id = self.alloc_id();
+        let name = format!("host{}", self.host_seq);
+        let path = std::path::PathBuf::from(&name);
+        // Touch the file so it exists (and shows 0 B) before anything writes it.
+        if let Err(e) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+        {
+            eprintln!("failed to create host file {}: {e}", path.display());
+        }
+        let pos = self.next_file_pos();
+        self.win_pos.insert(id, pos);
+        self.win_size.insert(id, [FILE_W, FILE_H]);
+        self.z.push(id);
+        self.file_nodes
+            .insert(id, FileNode::HostMapped(HostMappedFile { name, path }));
+    }
+
+    /// A cascading canvas position for a newly added file node.
+    fn next_file_pos(&self) -> [f32; 2] {
+        let step = (self.file_nodes.len() % 8) as f32 * 24.0;
+        self.cam.to_canvas([240.0 + step, 120.0 + step])
     }
 
     /// The live app node with id `id`, if it is an app (not a file) node.
@@ -742,16 +848,16 @@ impl App {
         let Some(app) = self.app_node(app_id) else {
             return;
         };
-        let name = self.file_nodes[&file_id].name.clone();
+        let file = &self.file_nodes[&file_id];
         if let Some(pos) = self
             .connections
             .iter()
             .position(|&(f, a)| f == file_id && a == app_id)
         {
-            crate::vfs::unmount_file(&app.fs, &name);
+            crate::vfs::unmount_file(&app.fs, file.name());
             self.connections.remove(pos);
         } else {
-            crate::vfs::mount_file(&app.fs, &name, self.file_nodes[&file_id].data.clone());
+            file.mount(&app.fs);
             self.connections.push((file_id, app_id));
         }
     }
@@ -785,7 +891,7 @@ impl App {
         for &(f, a) in self.connections.iter().filter(|&&(f, _)| f == id) {
             let _ = f;
             if let Some(app) = nodes.iter().find(|n| n.id == a) {
-                crate::vfs::unmount_file(&app.fs, &file.name);
+                crate::vfs::unmount_file(&app.fs, file.name());
             }
         }
         self.connections.retain(|&(f, _)| f != id);
@@ -880,10 +986,12 @@ impl App {
             .fold(120.0, f32::max)
             + 2.0 * PAD;
 
-        let file_btn_w = gfx.fonts.measure("+ File") as f32 + 2.0 * PAD;
-        let file_btn = [menu_w, 0.0, menu_w + file_btn_w, MENU_H];
+        let vfile_btn_w = gfx.fonts.measure("+ Virtual File") as f32 + 2.0 * PAD;
+        let vfile_btn = [menu_w, 0.0, menu_w + vfile_btn_w, MENU_H];
+        let hfile_btn_w = gfx.fonts.measure("+ Host File") as f32 + 2.0 * PAD;
+        let hfile_btn = [vfile_btn[2], 0.0, vfile_btn[2] + hfile_btn_w, MENU_H];
         let port_btn_w = gfx.fonts.measure("+ Port") as f32 + 2.0 * PAD;
-        let port_btn = [file_btn[2], 0.0, file_btn[2] + port_btn_w, MENU_H];
+        let port_btn = [hfile_btn[2], 0.0, hfile_btn[2] + port_btn_w, MENU_H];
 
         // Continue an in-progress drag (move / resize / connect).
         if let Some(d) = self.drag.take() {
@@ -924,8 +1032,12 @@ impl App {
             if contains(apps_rect, mp) {
                 self.menu_open = !self.menu_open;
                 consumed = true;
-            } else if contains(file_btn, mp) {
-                self.add_file_node();
+            } else if contains(vfile_btn, mp) {
+                self.add_virtual_file();
+                self.menu_open = false;
+                consumed = true;
+            } else if contains(hfile_btn, mp) {
+                self.add_host_mapped_file();
                 self.menu_open = false;
                 consumed = true;
             } else if contains(port_btn, mp) {
@@ -1174,16 +1286,22 @@ impl App {
 
             // A file node renders as a small labelled box with a port.
             if let Some(file) = self.file_nodes.get(&id) {
-                let name = file.name.clone();
-                let bytes = file.data.lock().unwrap().len();
-                quads.push(Quad::solid(white, r, FILE_BORDER, clip));
+                let name = file.name().to_string();
+                let bytes = file.size();
+                let host = matches!(file, FileNode::HostMapped(_));
+                let (border, bg, sub_col) = if host {
+                    (HOSTFILE_BORDER, HOSTFILE_BG, [0.55, 0.68, 0.85, 1.0])
+                } else {
+                    (FILE_BORDER, FILE_BG, [0.65, 0.6, 0.5, 1.0])
+                };
+                quads.push(Quad::solid(white, r, border, clip));
                 let body = [
                     r[0] + BORDER * zf,
                     r[1] + BORDER * zf,
                     r[2] - BORDER * zf,
                     r[3] - BORDER * zf,
                 ];
-                quads.push(Quad::solid(white, body, FILE_BG, clip));
+                quads.push(Quad::solid(white, body, bg, clip));
                 let lh = gfx.fonts.line_height() as f32;
                 self.text_cache.draw(
                     &mut quads,
@@ -1198,17 +1316,24 @@ impl App {
                     TEXT,
                     clip,
                 );
+                // VirtualFiles show their byte count; HostMappedFiles show the
+                // size plus a "disk" marker so they read as backed by a path.
+                let sub = if host {
+                    format!("{bytes} B · disk")
+                } else {
+                    format!("{bytes} B")
+                };
                 self.text_cache.draw(
                     &mut quads,
                     &mut gfx.renderer,
                     &gfx.fonts,
                     &gfx.device,
                     &gfx.queue,
-                    &format!("{bytes} B"),
+                    &sub,
                     r[0] + PAD * zf,
                     r[1] + (PAD + lh) * zf,
                     zf * 0.85,
-                    [0.65, 0.6, 0.5, 1.0],
+                    sub_col,
                     clip,
                 );
                 let cb = close_btn(r, zf);
@@ -1468,9 +1593,9 @@ impl App {
         if self.menu_open || contains(apps_rect, mp) {
             quads.push(Quad::solid(white, apps_rect, MENU_HOVER, full));
         }
-        // "+ File" button.
-        if contains(file_btn, mp) {
-            quads.push(Quad::solid(white, file_btn, MENU_HOVER, full));
+        // "+ Virtual File" button.
+        if contains(vfile_btn, mp) {
+            quads.push(Quad::solid(white, vfile_btn, MENU_HOVER, full));
         }
         self.text_cache.draw(
             &mut quads,
@@ -1478,8 +1603,25 @@ impl App {
             &gfx.fonts,
             &gfx.device,
             &gfx.queue,
-            "+ File",
-            file_btn[0] + PAD,
+            "+ Virtual File",
+            vfile_btn[0] + PAD,
+            (MENU_H - gfx.fonts.line_height() as f32) * 0.5,
+            1.0,
+            TEXT,
+            full,
+        );
+        // "+ Host File" button.
+        if contains(hfile_btn, mp) {
+            quads.push(Quad::solid(white, hfile_btn, MENU_HOVER, full));
+        }
+        self.text_cache.draw(
+            &mut quads,
+            &mut gfx.renderer,
+            &gfx.fonts,
+            &gfx.device,
+            &gfx.queue,
+            "+ Host File",
+            hfile_btn[0] + PAD,
             (MENU_H - gfx.fonts.line_height() as f32) * 0.5,
             1.0,
             TEXT,
@@ -1660,16 +1802,32 @@ impl App {
                 })
             })
             .collect();
-        let files = self
+        // VirtualFiles save by mount name; HostMappedFiles save by host path
+        // (so the real file is re-mapped on restore).
+        let virtual_files = self
             .file_nodes
             .iter()
-            .filter_map(|(&id, f)| {
-                Some(crate::session::SessionNode {
-                    name: f.name.clone(),
+            .filter_map(|(&id, f)| match f {
+                FileNode::Virtual(v) => Some(crate::session::SessionNode {
+                    name: v.name.clone(),
                     id,
                     pos: *self.win_pos.get(&id)?,
                     size: *self.win_size.get(&id)?,
-                })
+                }),
+                FileNode::HostMapped(_) => None,
+            })
+            .collect();
+        let host_files = self
+            .file_nodes
+            .iter()
+            .filter_map(|(&id, f)| match f {
+                FileNode::HostMapped(h) => Some(crate::session::SessionNode {
+                    name: h.path.to_string_lossy().into_owned(),
+                    id,
+                    pos: *self.win_pos.get(&id)?,
+                    size: *self.win_size.get(&id)?,
+                }),
+                FileNode::Virtual(_) => None,
             })
             .collect();
         let host_ports = self
@@ -1692,7 +1850,8 @@ impl App {
         let saved = crate::session::Session {
             camera: (self.cam.pan[0], self.cam.pan[1], self.cam.zoom),
             nodes,
-            files,
+            virtual_files,
+            host_files,
             host_ports,
             connections: self.connections.clone(),
             midi: self.midi_links.clone(),
