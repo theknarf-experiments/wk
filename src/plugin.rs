@@ -241,8 +241,21 @@ pub struct HostState {
     /// This store's RNG, backing the standard `wasi:random` interface (needed by
     /// e.g. a guest's `HashMap`).
     random_ctx: wasmtime_wasi::random::WasiRandomCtx,
+    /// This store's `wasi:http` context (outbound requests, and serving when a
+    /// node exports `wasi:http/incoming-handler`).
+    http_ctx: wasmtime_wasi_http::WasiHttpCtx,
     /// Shared wgpu-core instance backing the wasi:webgpu host.
     gpu: Arc<wgpu_core::global::Global>,
+}
+
+impl wasmtime_wasi_http::p2::WasiHttpView for HostState {
+    fn http(&mut self) -> wasmtime_wasi_http::p2::WasiHttpCtxView<'_> {
+        wasmtime_wasi_http::p2::WasiHttpCtxView {
+            ctx: &mut self.http_ctx,
+            table: &mut self.table,
+            hooks: Default::default(),
+        }
+    }
 }
 
 impl WasiView for HostState {
@@ -633,6 +646,9 @@ impl PluginHost {
         // own in-memory filesystem in its place.
         crate::vfs::add_wasi_except_fs(&mut linker)?;
         add_random(&mut linker)?;
+        // Only the wasi:http interfaces (outgoing-handler + types); the rest of
+        // the wasi world is already linked above.
+        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
         crate::vfs::add_to_linker(&mut linker)?;
         crate::audio::add_to_linker(&mut linker)?;
         crate::midi::add_to_linker(&mut linker)?;
@@ -683,6 +699,7 @@ impl PluginHost {
             midi_in,
             midi_router: self.midi.clone(),
             random_ctx: wasmtime_wasi::random::WasiRandomCtx::default(),
+            http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
             gpu: Arc::clone(&self.gpu),
         };
         let mut store = Store::new(&self.engine, state);
