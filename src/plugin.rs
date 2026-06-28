@@ -124,6 +124,8 @@ static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
 pub struct Instance {
     pub id: u64,
     pub name: String,
+    /// The plugin component this instance runs (for session persistence).
+    pub path: std::path::PathBuf,
     /// Configured default window size on the canvas, if the project set one.
     pub default_size: Option<(u32, u32)>,
     /// Captured stdout+stderr, rendered in the instance's console window.
@@ -622,6 +624,7 @@ impl PluginHost {
         instances.lock().unwrap().push(Arc::new(Instance {
             id,
             name: name.to_string(),
+            path: path.to_path_buf(),
             default_size,
             console: console.clone(),
             finished: finished.clone(),

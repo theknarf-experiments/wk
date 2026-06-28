@@ -216,14 +216,17 @@ struct Placement {
 
 fn placement(
     key: &str,
+    default_pos: Option<[f32; 2]>,
     default_size: [f32; 2],
     spawn_idx: usize,
     cam: &Camera,
     prev_cam: &Camera,
     last: &HashMap<String, WinScreen>,
 ) -> Placement {
-    let step = (spawn_idx % 8) as f32 * 28.0;
-    let default_pos = [40.0 + step, 56.0 + step];
+    let default_pos = default_pos.unwrap_or_else(|| {
+        let step = (spawn_idx % 8) as f32 * 28.0;
+        [40.0 + step, 56.0 + step]
+    });
 
     let mut force_pos = None;
     let mut force_size = None;
@@ -249,10 +252,12 @@ fn placement(
 /// Draw the console window for a non-graphical instance: its captured
 /// stdout/stderr in a scrolling region, placed on the canvas. Returns `false`
 /// if its close box was clicked this frame.
+#[allow(clippy::too_many_arguments)]
 fn console_window(
     ui: &imgui::Ui,
     inst: &SharedInstance,
     base_style: &imgui::Style,
+    restore: Option<([f32; 2], [f32; 2])>,
     last_win: &mut HashMap<String, WinScreen>,
     cam: &Camera,
     prev_cam: &Camera,
@@ -268,11 +273,18 @@ fn console_window(
     let text = String::from_utf8_lossy(&bytes);
 
     let key = format!("console:{}", inst.id);
-    let default = inst
+    let derived = inst
         .default_size
         .map(|(w, h)| [w as f32, h as f32])
         .unwrap_or([460.0, 280.0]);
-    let p = placement(&key, default, spawn_idx, cam, prev_cam, last_win);
+    let (def_pos, def_size) = match restore {
+        Some((cp, cs)) => (
+            Some(cam.to_screen(cp)),
+            [cs[0] * cam.zoom, cs[1] * cam.zoom],
+        ),
+        None => (None, derived),
+    };
+    let p = placement(&key, def_pos, def_size, spawn_idx, cam, prev_cam, last_win);
 
     let mut open = true;
     let mut cur = WinScreen {
@@ -355,7 +367,7 @@ fn surface_texture(
     texture
 }
 
-pub fn run(plugins: &[PluginSpec]) -> Result<(), String> {
+pub fn run(plugins: &[PluginSpec], persist_session: bool) -> Result<(), String> {
     let host = PluginHost::new().map_err(|e| format!("{e:#}"))?;
     let registry: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
     let instance_reg: InstanceRegistry = Arc::new(Mutex::new(Vec::new()));
@@ -397,8 +409,39 @@ pub fn run(plugins: &[PluginSpec]) -> Result<(), String> {
     // The surface that keyboard goes to. Tracked ourselves (not imgui focus) so
     // that re-focusing the menu bar to keep it on top doesn't steal it.
     let mut kbd_focus: Option<u64> = None;
+    // Canvas rect a restored instance's window should first appear at, by id.
+    let mut pending_layout: HashMap<u64, ([f32; 2], [f32; 2])> = HashMap::new();
 
-    'running: loop {
+    // Restore the saved workspace: camera and the instances that were open.
+    if persist_session {
+        if let Some(saved) = crate::session::Session::load() {
+            cam.pan = [saved.camera.0, saved.camera.1];
+            cam.zoom = saved.camera.2;
+            prev_cam = cam;
+            pan_target = cam.pan;
+            for w in &saved.windows {
+                let spec = available
+                    .iter()
+                    .find(|s| s.path == w.path)
+                    .cloned()
+                    .unwrap_or_else(|| PluginSpec::from_path(w.path.clone()));
+                match host.spawn(
+                    &spec.path,
+                    &spec.label(),
+                    spec.size,
+                    registry.clone(),
+                    instance_reg.clone(),
+                ) {
+                    Ok(id) => {
+                        pending_layout.insert(id, (w.pos, w.size));
+                    }
+                    Err(e) => eprintln!("failed to restore {}: {e:#}", spec.label()),
+                }
+            }
+        }
+    }
+
+    let exit: Result<(), String> = 'running: loop {
         // Advance the epoch so any killed instance traps and ends this frame.
         host.tick_epoch();
 
@@ -605,7 +648,19 @@ pub fn run(plugins: &[PluginSpec]) -> Result<(), String> {
                     .collect();
 
                 if inst_surfaces.is_empty() {
-                    if !console_window(ui, inst, &base_style, &mut last_win, &cam, &prev_cam, idx) {
+                    let restore = pending_layout.get(&inst.id).copied();
+                    let open = console_window(
+                        ui,
+                        inst,
+                        &base_style,
+                        restore,
+                        &mut last_win,
+                        &cam,
+                        &prev_cam,
+                        idx,
+                    );
+                    pending_layout.remove(&inst.id);
+                    if !open {
                         to_close.push(inst.clone());
                     }
                     continue;
@@ -621,11 +676,19 @@ pub fn run(plugins: &[PluginSpec]) -> Result<(), String> {
                     };
                     let tex = view.texture;
                     let key = format!("surf:{sid}");
-                    let default = inst
+                    let derived = inst
                         .default_size
                         .map(|(w, h)| [w as f32, h as f32])
                         .unwrap_or([view.width as f32 + 16.0, view.height as f32 + 36.0]);
-                    let p = placement(&key, default, idx, &cam, &prev_cam, &last_win);
+                    // A restored window first appears at its saved canvas rect.
+                    let (def_pos, def_size) = match pending_layout.get(&inst.id) {
+                        Some((cp, cs)) => (
+                            Some(cam.to_screen(*cp)),
+                            [cs[0] * cam.zoom, cs[1] * cam.zoom],
+                        ),
+                        None => (None, derived),
+                    };
+                    let p = placement(&key, def_pos, def_size, idx, &cam, &prev_cam, &last_win);
 
                     let mut input = SurfaceInput::default();
                     let mut open = true;
@@ -680,6 +743,7 @@ pub fn run(plugins: &[PluginSpec]) -> Result<(), String> {
                         };
                     });
                     last_win.insert(key, cur);
+                    pending_layout.remove(&inst.id);
                     if input.focused {
                         kbd_focus = Some(sid);
                     }
@@ -794,5 +858,40 @@ pub fn run(plugins: &[PluginSpec]) -> Result<(), String> {
         prev_cam = cam;
 
         std::thread::sleep(FRAME);
+    };
+
+    // Persist the workspace: camera and each open instance's window rect, in
+    // canvas space so it restores regardless of the next session's pan/zoom.
+    if persist_session {
+        let surfaces: Vec<SharedSurface> = registry.lock().unwrap().clone();
+        let windows = instance_reg
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|inst| {
+                let key = surfaces
+                    .iter()
+                    .find_map(|s| {
+                        let g = s.lock().unwrap();
+                        (g.instance_id == inst.id).then(|| format!("surf:{}", g.id))
+                    })
+                    .unwrap_or_else(|| format!("console:{}", inst.id));
+                let ws = last_win.get(&key)?;
+                Some(crate::session::SessionWindow {
+                    path: inst.path.clone(),
+                    pos: cam.to_canvas(ws.pos),
+                    size: [ws.size[0] / cam.zoom, ws.size[1] / cam.zoom],
+                })
+            })
+            .collect();
+        let saved = crate::session::Session {
+            camera: (cam.pan[0], cam.pan[1], cam.zoom),
+            windows,
+        };
+        if let Err(e) = saved.save() {
+            eprintln!("failed to save session: {e}");
+        }
     }
+
+    exit
 }

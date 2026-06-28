@@ -4,6 +4,7 @@ mod imguirenderer;
 mod imguisdlhelper;
 mod plugin;
 mod project;
+mod session;
 mod vfs;
 
 use clap::CommandFactory;
@@ -71,7 +72,9 @@ fn main() -> Result<(), String> {
 
 /// Run the given plugin paths, or the project's plugins if none are given.
 fn run(plugins: &[PathBuf]) -> Result<(), String> {
-    let specs = if plugins.is_empty() {
+    // Project mode (no explicit paths) persists the workspace session.
+    let project_mode = plugins.is_empty();
+    let specs = if project_mode {
         project::Project::load()?.plugins
     } else {
         plugins
@@ -80,5 +83,5 @@ fn run(plugins: &[PathBuf]) -> Result<(), String> {
             .map(project::PluginSpec::from_path)
             .collect()
     };
-    compositor::run(&specs)
+    compositor::run(&specs, project_mode)
 }
