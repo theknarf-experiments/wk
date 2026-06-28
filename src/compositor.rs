@@ -438,7 +438,6 @@ struct App {
     key_events: Vec<(KeyEvent, bool)>,
     /// Keyboard encoded as terminal input bytes for the focused terminal node.
     term_input: Vec<u8>,
-    should_exit: bool,
 }
 
 impl App {
@@ -485,7 +484,6 @@ impl App {
             zoom_focus: [0.0, 0.0],
             key_events: Vec::new(),
             term_input: Vec::new(),
-            should_exit: false,
         };
         app.restore_session();
         Ok(app)
@@ -1713,20 +1711,20 @@ impl ApplicationHandler for App {
                 Ok(gfx) => self.gfx = Some(gfx),
                 Err(e) => {
                     eprintln!("failed to create window: {e}");
-                    self.should_exit = true;
+                    event_loop.exit();
                 }
             }
         }
     }
 
-    fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let scale = self
             .gfx
             .as_ref()
             .map(|g| g.window.scale_factor())
             .unwrap_or(1.0);
         match event {
-            WindowEvent::CloseRequested => self.should_exit = true,
+            WindowEvent::CloseRequested => el.exit(),
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 if let Some(gfx) = &mut self.gfx {
                     gfx.resize();
@@ -1766,7 +1764,7 @@ impl ApplicationHandler for App {
                     // Escape quits wk only when nothing is focused; otherwise it
                     // belongs to the focused app/terminal (vim lives on Escape).
                     if code == KeyCode::Escape && pressed && self.kbd_focus.is_none() {
-                        self.should_exit = true;
+                        el.exit();
                     }
                     if pressed {
                         if let Some(bytes) = encode_term_key(code, event.text.as_deref(), self.mods)
@@ -1786,11 +1784,11 @@ pub fn run(plugins: &[Dependency], persist_session: bool) -> Result<(), String> 
     let mut event_loop = EventLoop::builder().build().map_err(|e| e.to_string())?;
     let mut app = App::new(plugins, persist_session)?;
     loop {
-        let status = event_loop.pump_app_events(Some(Duration::ZERO), &mut app);
-        if let PumpStatus::Exit(_) = status {
-            break;
-        }
-        if app.should_exit {
+        // A quit (window close / Escape / gfx failure) calls `ActiveEventLoop::
+        // exit()` in the handler, so winit shuts the NSApp down cleanly and the
+        // next pump returns `Exit` — dropping the loop without exit() leaves a
+        // dangling macOS handler ("no handler was set").
+        if let PumpStatus::Exit(_) = event_loop.pump_app_events(Some(Duration::ZERO), &mut app) {
             break;
         }
         if app.gfx.is_some() {
