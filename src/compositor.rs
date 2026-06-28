@@ -263,9 +263,6 @@ fn console_window(
     let mut win = ui
         .window(title)
         .opened(&mut open)
-        // Keep app windows in imgui's background layer so the Apps menu bar
-        // (a normal window) always draws on top of them.
-        .bring_to_front_on_focus(false)
         .position(p.default_pos, Condition::FirstUseEver)
         .size(p.default_size, Condition::FirstUseEver);
     if let Some(fp) = p.force_pos {
@@ -380,6 +377,9 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
     let mut pan_target = [0.0f32, 0.0];
     // Each window's last on-screen rect, read back from imgui every frame.
     let mut last_win: HashMap<String, WinScreen> = HashMap::new();
+    // The surface that keyboard goes to. Tracked ourselves (not imgui focus) so
+    // that re-focusing the menu bar to keep it on top doesn't steal it.
+    let mut kbd_focus: Option<u64> = None;
 
     'running: loop {
         // Advance the epoch so any killed instance traps and ends this frame.
@@ -528,8 +528,8 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
                         });
                     }
                 }
-                // Keyboard goes to the focused client only.
-                if input.focused {
+                // Keyboard goes to the most recently focused client only.
+                if kbd_focus == Some(sid) {
                     for (ev, down) in &key_events {
                         if *down {
                             s.key_down.push_back(ev.clone());
@@ -613,8 +613,6 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
                     let mut win = ui
                         .window(format!("{title}##{sid}"))
                         .opened(&mut open)
-                        // Stay in the background layer so the menu bar is on top.
-                        .bring_to_front_on_focus(false)
                         .position(p.default_pos, Condition::FirstUseEver)
                         .size(p.default_size, Condition::FirstUseEver);
                     if let Some(fp) = p.force_pos {
@@ -651,12 +649,33 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
                         };
                     });
                     last_win.insert(key, cur);
+                    if input.focused {
+                        kbd_focus = Some(sid);
+                    }
                     if !open {
                         to_close.push(inst.clone());
                     }
                     inputs.insert(sid, input);
                 }
             }
+
+            // Keep the Apps menu bar on top of the (raisable) app windows: when
+            // no mouse button is held we re-focus it to the front, which also
+            // brings it to the top of the draw order. We skip this while the
+            // mouse is down so clicking/dragging a window isn't disturbed.
+            if !ui.is_any_mouse_down() {
+                // SAFETY: focusing an existing window by its imgui name; the
+                // main menu bar always uses this name.
+                unsafe { imgui::sys::igSetWindowFocus_Str(c"##MainMenuBar".as_ptr()) };
+            }
+
+            // Zoom level, lower-left corner.
+            let h = ui.io().display_size[1];
+            ui.get_foreground_draw_list().add_text(
+                [10.0, h - 22.0],
+                [1.0, 1.0, 1.0, 0.6],
+                format!("{:.0}%", cam.zoom * 100.0),
+            );
         }
 
         // Launch any apps clicked in the top bar (a fresh instance each click).
