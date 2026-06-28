@@ -1,14 +1,14 @@
-//! The wk project model: a `wk.kdl` manifest in the working directory that
-//! lists the plugin components the project loads, with optional per-plugin
-//! config.
+//! The wk project model: a `wk.kdl` manifest in the working directory. It names
+//! the project and lists its dependencies — plugins referenced by a short name
+//! (npm-style), each resolved to a source. Today a source is a local `.wasm`
+//! path; in future it may be a version fetched from a package manager.
 //!
 //! ```kdl
 //! name "my-workspace"
-//! plugin "plugins/paint/.../paint.wasm" {
-//!     title "Paint"
-//!     size 320 240
+//! dependencies {
+//!     triangle "plugins/triangle/.../triangle.wasm"
+//!     paint    "plugins/paint/.../paint.wasm"
 //! }
-//! plugin "plugins/triangle/.../triangle.wasm"
 //! ```
 
 use kdl::{KdlDocument, KdlEntry, KdlNode};
@@ -17,47 +17,28 @@ use std::path::{Path, PathBuf};
 /// Manifest file name, looked up in the current directory.
 pub const MANIFEST: &str = "wk.kdl";
 
-/// One plugin entry in the project, with optional display config.
+/// One project dependency: a short name resolving to a plugin source.
 #[derive(Debug, Clone)]
-pub struct PluginSpec {
-    pub path: PathBuf,
-    /// Display name in the launcher and window title; defaults to the file stem.
-    pub title: Option<String>,
-    /// Default window size on the canvas.
-    pub size: Option<(u32, u32)>,
+pub struct Dependency {
+    pub name: String,
+    /// For now always a local `.wasm` path; later, possibly a package version.
+    pub source: PathBuf,
 }
 
-impl PluginSpec {
-    pub fn from_path(path: PathBuf) -> Self {
-        Self {
-            path,
-            title: None,
-            size: None,
-        }
-    }
-
-    /// The launcher/window label: the configured title, else the file stem.
-    pub fn label(&self) -> String {
-        self.title.clone().unwrap_or_else(|| {
-            self.path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "plugin".to_string())
-        })
-    }
-
-    /// Whether `arg` names this plugin (its path, file stem, or title).
-    fn matches(&self, arg: &str) -> bool {
-        self.path.to_string_lossy() == arg
-            || self.path.file_stem().is_some_and(|s| s == arg)
-            || self.label() == arg
+impl Dependency {
+    pub fn from_path(source: PathBuf) -> Self {
+        let name = source
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "plugin".to_string());
+        Dependency { name, source }
     }
 }
 
 #[derive(Debug)]
 pub struct Project {
     pub name: String,
-    pub plugins: Vec<PluginSpec>,
+    pub dependencies: Vec<Dependency>,
 }
 
 impl Project {
@@ -76,33 +57,26 @@ impl Project {
             .unwrap_or("wk-project")
             .to_string();
 
-        let plugins = doc
-            .nodes()
-            .iter()
-            .filter(|n| n.name().value() == "plugin")
-            .filter_map(|n| {
-                let path = n.get(0)?.as_string()?;
-                let mut spec = PluginSpec::from_path(PathBuf::from(path));
-                if let Some(children) = n.children() {
-                    spec.title = children
-                        .get("title")
-                        .and_then(|t| t.get(0))
-                        .and_then(|v| v.as_string())
-                        .map(String::from);
-                    if let Some(size) = children.get("size") {
-                        if let (Some(w), Some(h)) = (
-                            size.get(0).and_then(|v| v.as_integer()),
-                            size.get(1).and_then(|v| v.as_integer()),
-                        ) {
-                            spec.size = Some((w as u32, h as u32));
-                        }
-                    }
-                }
-                Some(spec)
+        let dependencies = doc
+            .get("dependencies")
+            .and_then(|n| n.children())
+            .map(|ch| {
+                ch.nodes()
+                    .iter()
+                    .filter_map(|n| {
+                        // Tolerate an npm-style trailing colon on the name.
+                        let name = n.name().value().trim_end_matches(':').to_string();
+                        let source = n.get(0).and_then(|v| v.as_string())?;
+                        Some(Dependency {
+                            name,
+                            source: PathBuf::from(source),
+                        })
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
 
-        Ok(Project { name, plugins })
+        Ok(Project { name, dependencies })
     }
 
     /// Write the manifest back to the current directory.
@@ -113,49 +87,38 @@ impl Project {
         name_node.push(KdlEntry::new(self.name.clone()));
         doc.nodes_mut().push(name_node);
 
-        for spec in &self.plugins {
-            let mut node = KdlNode::new("plugin");
-            node.push(KdlEntry::new(spec.path.to_string_lossy().to_string()));
-            if spec.title.is_some() || spec.size.is_some() {
-                let mut children = KdlDocument::new();
-                if let Some(title) = &spec.title {
-                    let mut t = KdlNode::new("title");
-                    t.push(KdlEntry::new(title.clone()));
-                    children.nodes_mut().push(t);
-                }
-                if let Some((w, h)) = spec.size {
-                    let mut s = KdlNode::new("size");
-                    s.push(KdlEntry::new(w as i128));
-                    s.push(KdlEntry::new(h as i128));
-                    children.nodes_mut().push(s);
-                }
-                node.set_children(children);
-            }
-            doc.nodes_mut().push(node);
+        let mut deps = KdlNode::new("dependencies");
+        let mut children = KdlDocument::new();
+        for dep in &self.dependencies {
+            let mut node = KdlNode::new(dep.name.clone());
+            node.push(KdlEntry::new(dep.source.to_string_lossy().to_string()));
+            children.nodes_mut().push(node);
         }
+        deps.set_children(children);
+        doc.nodes_mut().push(deps);
 
         doc.autoformat();
         std::fs::write(MANIFEST, doc.to_string())
             .map_err(|e| format!("failed to write {MANIFEST}: {e}"))
     }
 
-    /// Add a plugin path to the project (idempotent), persisting the manifest.
-    /// Returns `true` if the plugin was newly added.
-    pub fn add_plugin(&mut self, plugin: PathBuf) -> Result<bool, String> {
-        if self.plugins.iter().any(|s| s.path == plugin) {
+    /// Add a dependency (idempotent by name), persisting the manifest. Returns
+    /// `true` if newly added.
+    pub fn add_dependency(&mut self, dep: Dependency) -> Result<bool, String> {
+        if self.dependencies.iter().any(|d| d.name == dep.name) {
             return Ok(false);
         }
-        self.plugins.push(PluginSpec::from_path(plugin));
+        self.dependencies.push(dep);
         self.save()?;
         Ok(true)
     }
 
-    /// Remove every plugin matching `arg` (path, file stem, or title),
-    /// persisting the manifest. Returns how many were removed.
-    pub fn remove_plugin(&mut self, arg: &str) -> Result<usize, String> {
-        let before = self.plugins.len();
-        self.plugins.retain(|s| !s.matches(arg));
-        let removed = before - self.plugins.len();
+    /// Remove a dependency by name, persisting the manifest. Returns how many
+    /// were removed.
+    pub fn remove_dependency(&mut self, name: &str) -> Result<usize, String> {
+        let before = self.dependencies.len();
+        self.dependencies.retain(|d| d.name != name);
+        let removed = before - self.dependencies.len();
         if removed > 0 {
             self.save()?;
         }
@@ -176,47 +139,45 @@ pub fn init(name: Option<String>) -> Result<(), String> {
     });
     let project = Project {
         name,
-        plugins: Vec::new(),
+        dependencies: Vec::new(),
     };
     project.save()?;
     println!("created {MANIFEST}");
     Ok(())
 }
 
-/// Add a plugin to the project manifest.
+/// Add a plugin to the project as a dependency (named after its file stem).
 pub fn add(plugin: PathBuf) -> Result<(), String> {
     let mut project = Project::load()?;
-    if project.add_plugin(plugin.clone())? {
-        println!("added plugin: {}", plugin.display());
+    let dep = Dependency::from_path(plugin);
+    let name = dep.name.clone();
+    if project.add_dependency(dep)? {
+        println!("added dependency: {name}");
     } else {
-        println!("plugin already in project: {}", plugin.display());
+        println!("dependency already in project: {name}");
     }
     Ok(())
 }
 
-/// Print the project's plugins.
+/// Print the project's dependencies.
 pub fn list() -> Result<(), String> {
     let project = Project::load()?;
     println!("{}", project.name);
-    if project.plugins.is_empty() {
-        println!("  (no plugins; add one with `wk add <path>`)");
+    if project.dependencies.is_empty() {
+        println!("  (no dependencies; add one with `wk add <path>`)");
     }
-    for (i, spec) in project.plugins.iter().enumerate() {
-        let mut line = format!("  [{i}] {}  {}", spec.label(), spec.path.display());
-        if let Some((w, h)) = spec.size {
-            line += &format!("  {w}x{h}");
-        }
-        println!("{line}");
+    for dep in &project.dependencies {
+        println!("  {}  {}", dep.name, dep.source.display());
     }
     Ok(())
 }
 
-/// Remove a plugin from the project manifest by path, file stem, or title.
-pub fn remove(arg: String) -> Result<(), String> {
+/// Remove a dependency from the project by name.
+pub fn remove(name: String) -> Result<(), String> {
     let mut project = Project::load()?;
-    match project.remove_plugin(&arg)? {
-        0 => println!("no plugin matching {arg:?}"),
-        n => println!("removed {n} plugin(s) matching {arg:?}"),
+    match project.remove_dependency(&name)? {
+        0 => println!("no dependency named {name:?}"),
+        n => println!("removed {n} dependency named {name:?}"),
     }
     Ok(())
 }

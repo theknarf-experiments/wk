@@ -21,7 +21,7 @@ use crate::plugin::{
     Key, KeyEvent, NodeRegistry, PluginHost, PointerEvent, ResizeEvent, SharedNode, SharedSurface,
     SurfaceRegistry,
 };
-use crate::project::PluginSpec;
+use crate::project::Dependency;
 use crate::render2d::{Quad, Renderer, TextureId};
 use crate::text::Fonts;
 
@@ -310,7 +310,7 @@ struct App {
     host: PluginHost,
     registry: SurfaceRegistry,
     node_reg: NodeRegistry,
-    available: Vec<PluginSpec>,
+    available: Vec<Dependency>,
 
     views: HashMap<u64, (TextureId, u32, u32)>,
     text_cache: TextCache,
@@ -326,11 +326,11 @@ struct App {
     pending_layout: HashMap<u64, ([f32; 2], [f32; 2])>,
 
     // File nodes (canvas-owned shared files) and the connections wiring them
-    // into app nodes. File node ids are offset so they never collide with the
-    // app (plugin) node ids; both share `win_pos`/`win_size`/`z`.
+    // into app nodes. App and file nodes draw from one id space (`next_node_id`)
+    // and share `win_pos`/`win_size`/`z`.
     file_nodes: HashMap<u64, FileNode>,
     connections: Vec<(u64, u64)>,
-    next_file_id: u64,
+    next_node_id: u64,
     file_seq: u32,
 
     // Input state, fed by winit events between frames.
@@ -348,7 +348,7 @@ struct App {
 }
 
 impl App {
-    fn new(plugins: &[PluginSpec], persist_session: bool) -> Result<Self, String> {
+    fn new(plugins: &[Dependency], persist_session: bool) -> Result<Self, String> {
         let host = PluginHost::new().map_err(|e| format!("{e:#}"))?;
         let registry: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
         let node_reg: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
@@ -359,6 +359,7 @@ impl App {
             registry,
             node_reg,
             available: plugins.to_vec(),
+            next_node_id: 0,
             views: HashMap::new(),
             text_cache: TextCache::default(),
             cam: Camera {
@@ -375,7 +376,6 @@ impl App {
             pending_layout: HashMap::new(),
             file_nodes: HashMap::new(),
             connections: Vec::new(),
-            next_file_id: 1 << 32,
             file_seq: 0,
             mouse: [0.0, 0.0],
             lmb: false,
@@ -391,6 +391,13 @@ impl App {
         Ok(app)
     }
 
+    /// Allocate the next stable node id (shared by app and file nodes).
+    fn alloc_id(&mut self) -> u64 {
+        let id = self.next_node_id;
+        self.next_node_id += 1;
+        id
+    }
+
     fn restore_session(&mut self) {
         if !self.persist_session {
             return;
@@ -401,37 +408,78 @@ impl App {
         self.cam.pan = [saved.camera.0, saved.camera.1];
         self.cam.zoom = saved.camera.2;
         self.pan_target = self.cam.pan;
-        for w in &saved.nodes {
-            let spec = self
-                .available
-                .iter()
-                .find(|s| s.path == w.path)
-                .cloned()
-                .unwrap_or_else(|| PluginSpec::from_path(w.path.clone()));
+
+        let mut max_id = 0;
+
+        // App nodes: resolve the dependency by name, spawn with the saved id.
+        for n in &saved.nodes {
+            max_id = max_id.max(n.id);
+            let Some(dep) = self.available.iter().find(|d| d.name == n.name).cloned() else {
+                eprintln!(
+                    "session references unknown dependency {:?}; skipping",
+                    n.name
+                );
+                continue;
+            };
             match self.host.spawn(
-                &spec.path,
-                &spec.label(),
-                spec.size,
+                &dep.source,
+                &dep.name,
+                n.id,
                 self.registry.clone(),
                 self.node_reg.clone(),
             ) {
-                Ok(id) => {
-                    self.pending_layout.insert(id, (w.pos, w.size));
+                Ok(()) => {
+                    self.pending_layout.insert(n.id, (n.pos, n.size));
                 }
-                Err(e) => eprintln!("failed to restore {}: {e:#}", spec.label()),
+                Err(e) => eprintln!("failed to restore {}: {e:#}", dep.name),
             }
         }
+
+        // File nodes: recreate empty shared files at their saved positions.
+        for f in &saved.files {
+            max_id = max_id.max(f.id);
+            self.win_pos.insert(f.id, f.pos);
+            self.win_size.insert(f.id, f.size);
+            self.z.push(f.id);
+            if let Some(num) = f
+                .name
+                .strip_prefix("file")
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                self.file_seq = self.file_seq.max(num);
+            }
+            self.file_nodes.insert(
+                f.id,
+                FileNode {
+                    name: f.name.clone(),
+                    data: Arc::new(Mutex::new(Vec::new())),
+                },
+            );
+        }
+
+        // Re-wire connections: mount each file into its connected app's fs.
+        for &(file_id, app_id) in &saved.connections {
+            let (Some(file), Some(app)) = (self.file_nodes.get(&file_id), self.app_node(app_id))
+            else {
+                continue;
+            };
+            crate::vfs::mount_file(&app.fs, &file.name, file.data.clone());
+            self.connections.push((file_id, app_id));
+        }
+
+        self.next_node_id = max_id + 1;
     }
 
-    fn launch(&mut self, spec: &PluginSpec) {
+    fn launch(&mut self, dep: &Dependency) {
+        let id = self.alloc_id();
         if let Err(e) = self.host.spawn(
-            &spec.path,
-            &spec.label(),
-            spec.size,
+            &dep.source,
+            &dep.name,
+            id,
             self.registry.clone(),
             self.node_reg.clone(),
         ) {
-            eprintln!("failed to launch {}: {e:#}", spec.label());
+            eprintln!("failed to launch {}: {e:#}", dep.name);
         }
     }
 
@@ -451,8 +499,7 @@ impl App {
     /// Create a new, empty file node on the canvas.
     fn add_file_node(&mut self) {
         self.file_seq += 1;
-        let id = self.next_file_id;
-        self.next_file_id += 1;
+        let id = self.alloc_id();
         let step = (self.file_nodes.len() % 8) as f32 * 24.0;
         let pos = self.cam.to_canvas([240.0 + step, 120.0 + step]);
         self.win_pos.insert(id, pos);
@@ -562,11 +609,7 @@ impl App {
             if let std::collections::hash_map::Entry::Vacant(slot) = self.win_pos.entry(node.id) {
                 let (pos, size) = self.pending_layout.remove(&node.id).unwrap_or_else(|| {
                     let step = (self.z.len() % 8) as f32 * 28.0;
-                    let size = node
-                        .default_size
-                        .map(|(w, h)| [w as f32, h as f32])
-                        .unwrap_or([360.0, 260.0]);
-                    ([40.0 + step, 56.0 + step], size)
+                    ([40.0 + step, 56.0 + step], [360.0, 260.0])
                 });
                 slot.insert(pos);
                 self.win_size.insert(node.id, size);
@@ -589,7 +632,7 @@ impl App {
         let item_w = self
             .available
             .iter()
-            .map(|s| gfx.fonts.measure(&s.label()) as f32)
+            .map(|d| gfx.fonts.measure(&d.name) as f32)
             .fold(120.0, f32::max)
             + 2.0 * PAD;
 
@@ -640,7 +683,7 @@ impl App {
                 self.menu_open = false;
                 consumed = true;
             } else if self.menu_open {
-                for (i, spec) in self.available.iter().enumerate() {
+                for (i, dep) in self.available.iter().enumerate() {
                     let r = [
                         0.0,
                         MENU_H + i as f32 * MENU_H,
@@ -648,8 +691,8 @@ impl App {
                         MENU_H + (i + 1) as f32 * MENU_H,
                     ];
                     if contains(r, mp) {
-                        let spec = spec.clone();
-                        self.launch(&spec);
+                        let dep = dep.clone();
+                        self.launch(&dep);
                         self.menu_open = false;
                         consumed = true;
                         break;
@@ -1053,7 +1096,7 @@ impl App {
             full,
         );
         if self.menu_open {
-            for (i, spec) in self.available.iter().enumerate() {
+            for (i, dep) in self.available.iter().enumerate() {
                 let r = [
                     0.0,
                     MENU_H + i as f32 * MENU_H,
@@ -1072,7 +1115,7 @@ impl App {
                     &gfx.fonts,
                     &gfx.device,
                     &gfx.queue,
-                    &spec.label(),
+                    &dep.name,
                     PAD,
                     r[1] + (MENU_H - gfx.fonts.line_height() as f32) * 0.5,
                     1.0,
@@ -1172,22 +1215,37 @@ impl App {
         if !self.persist_session {
             return;
         }
-        let session_nodes = self
+        let nodes = self
             .node_reg
             .lock()
             .unwrap()
             .iter()
             .filter_map(|node| {
                 Some(crate::session::SessionNode {
-                    path: node.path.clone(),
+                    name: node.name.clone(),
+                    id: node.id,
                     pos: *self.win_pos.get(&node.id)?,
                     size: *self.win_size.get(&node.id)?,
                 })
             })
             .collect();
+        let files = self
+            .file_nodes
+            .iter()
+            .filter_map(|(&id, f)| {
+                Some(crate::session::SessionNode {
+                    name: f.name.clone(),
+                    id,
+                    pos: *self.win_pos.get(&id)?,
+                    size: *self.win_size.get(&id)?,
+                })
+            })
+            .collect();
         let saved = crate::session::Session {
             camera: (self.cam.pan[0], self.cam.pan[1], self.cam.zoom),
-            nodes: session_nodes,
+            nodes,
+            files,
+            connections: self.connections.clone(),
         };
         if let Err(e) = saved.save() {
             eprintln!("failed to save session: {e}");
@@ -1265,7 +1323,7 @@ impl ApplicationHandler for App {
     }
 }
 
-pub fn run(plugins: &[PluginSpec], persist_session: bool) -> Result<(), String> {
+pub fn run(plugins: &[Dependency], persist_session: bool) -> Result<(), String> {
     let mut event_loop = EventLoop::builder().build().map_err(|e| e.to_string())?;
     let mut app = App::new(plugins, persist_session)?;
     loop {

@@ -29,24 +29,24 @@ enum Commands {
         name: Option<String>,
     },
 
-    /// Add a plugin component to the project
+    /// Add a plugin component to the project as a named dependency
     Add {
-        /// Path to the plugin `.wasm` component
+        /// Path to the plugin `.wasm` component (named after its file stem)
         plugin: PathBuf,
     },
 
-    /// List the project's plugins
+    /// List the project's dependencies
     List,
 
-    /// Remove a plugin from the project (by path, file stem, or title)
+    /// Remove a dependency from the project (by name)
     Remove {
-        /// Plugin path, file stem, or title
+        /// Dependency name
         plugin: String,
     },
 
-    /// Run the project's plugins, or explicit `.wasm` paths if given
+    /// Run the project's dependencies, or explicit `.wasm` paths if given
     Run {
-        /// Plugin `.wasm` paths; if omitted, the project's plugins are used
+        /// Plugin `.wasm` paths; if omitted, the project's dependencies are used
         plugins: Vec<PathBuf>,
     },
 }
@@ -71,18 +71,18 @@ fn main() -> Result<(), String> {
     }
 }
 
-/// Run the given plugin paths, or the project's plugins if none are given.
+/// Run the project's dependencies, or the given ad-hoc `.wasm` paths.
 fn run(plugins: &[PathBuf]) -> Result<(), String> {
     // Project mode (no explicit paths) persists the workspace session.
     let project_mode = plugins.is_empty();
-    let specs = if project_mode {
-        project::Project::load()?.plugins
+    let deps = if project_mode {
+        project::Project::load()?.dependencies
     } else {
         plugins
             .iter()
             .cloned()
-            .map(project::PluginSpec::from_path)
+            .map(project::Dependency::from_path)
             .collect()
     };
-    compositor::run(&specs, project_mode)
+    compositor::run(&deps, project_mode)
 }

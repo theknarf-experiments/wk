@@ -113,18 +113,15 @@ pub type SharedSurface = Arc<Mutex<VirtualSurface>>;
 /// All virtual surfaces created by clients, shared with the compositor thread.
 pub type SurfaceRegistry = Arc<Mutex<Vec<SharedSurface>>>;
 
-static NEXT_NODE_ID: AtomicU64 = AtomicU64::new(0);
-
 /// A launched plugin instance. Every instance gets a window in the compositor —
 /// its surface if it created one, otherwise a console showing this captured
 /// output — so nothing ever runs invisibly or un-quittably.
 pub struct Node {
+    /// Stable id, assigned by the compositor and persisted in the session so
+    /// connections can refer to this node across restarts.
     pub id: u64,
+    /// The dependency name this node was launched from.
     pub name: String,
-    /// The plugin component this node runs (for session persistence).
-    pub path: std::path::PathBuf,
-    /// Configured default window size on the canvas, if the project set one.
-    pub default_size: Option<(u32, u32)>,
     /// Captured stdout+stderr, rendered in the node's console window.
     pub console: MemoryOutputPipe,
     /// This node's in-memory filesystem, so the compositor can mount connected
@@ -578,17 +575,17 @@ impl PluginHost {
     }
 
     /// Load a client component and run its `run` export on a dedicated thread,
-    /// registering it as a `Node`. Surfaces it creates appear in `surfaces`
-    /// (tagged with the node id); its stdout/stderr are captured for the node's
-    /// console window.
+    /// registering it as a `Node` under the compositor-assigned `id`. Surfaces
+    /// it creates appear in `surfaces` (tagged with the node id); its
+    /// stdout/stderr are captured for the node's console window.
     pub fn spawn(
         &self,
         path: &Path,
         name: &str,
-        default_size: Option<(u32, u32)>,
+        id: u64,
         surfaces: SurfaceRegistry,
         nodes: NodeRegistry,
-    ) -> Result<u64> {
+    ) -> Result<()> {
         let mut linker: Linker<HostState> = Linker::new(&self.engine);
         // Provide every wasmtime-wasi interface except its filesystem, then our
         // own in-memory filesystem in its place.
@@ -603,7 +600,6 @@ impl PluginHost {
         wasi::frame_buffer::frame_buffer::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
         wasi_webgpu_wasmtime::add_to_linker(&mut linker)?;
 
-        let id = NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed);
         // ~1 MiB of scrollback; the guest traps if it overruns this (rare).
         let console = MemoryOutputPipe::new(1 << 20);
         let finished = Arc::new(AtomicBool::new(false));
@@ -612,8 +608,6 @@ impl PluginHost {
         nodes.lock().unwrap().push(Arc::new(Node {
             id,
             name: name.to_string(),
-            path: path.to_path_buf(),
-            default_size,
             console: console.clone(),
             fs: fs.clone(),
             finished: finished.clone(),
@@ -667,6 +661,6 @@ impl PluginHost {
                 Err(e) => eprintln!("plugin client exited with error: {e:#}"),
             }
         });
-        Ok(id)
+        Ok(())
     }
 }
