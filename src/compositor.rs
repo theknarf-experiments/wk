@@ -950,7 +950,7 @@ impl ApplicationHandler for App {
                     self.zoom_factor *= ZOOM_STEP.powf(dy);
                     self.zoom_focus = self.mouse;
                 } else {
-                    self.pan_delta[0] -= dx * SCROLL_PAN_SPEED;
+                    self.pan_delta[0] += dx * SCROLL_PAN_SPEED;
                     self.pan_delta[1] += dy * SCROLL_PAN_SPEED;
                 }
             }
