@@ -1,7 +1,7 @@
 name wk
 plugin "plugins/triangle/target/wasm32-wasip1/debug/triangle.wasm"
 plugin "plugins/paint/target/wasm32-wasip1/debug/paint.wasm"
-plugin "plugins/sockets-demo/target/wasm32-wasip1/debug/sockets_demo.wasm"
+plugin "plugins/file-demo/target/wasm32-wasip1/debug/file_demo.wasm"
 plugin "plugins/piano/target/wasm32-wasip1/debug/piano.wasm" {
     title "Piano"
     size 580 230

@@ -12,7 +12,7 @@ use std::path::PathBuf;
 pub const SESSION: &str = "wk.session.kdl";
 
 /// One open window: which plugin it runs and its rect in canvas space.
-pub struct SessionWindow {
+pub struct SessionNode {
     pub path: PathBuf,
     pub pos: [f32; 2],
     pub size: [f32; 2],
@@ -21,7 +21,7 @@ pub struct SessionWindow {
 pub struct Session {
     /// Canvas camera: pan x, pan y, zoom.
     pub camera: (f32, f32, f32),
-    pub windows: Vec<SessionWindow>,
+    pub nodes: Vec<SessionNode>,
 }
 
 /// Read a KDL value as a number, accepting either a float or an integer.
@@ -60,16 +60,16 @@ impl Session {
             }
         }
 
-        let windows = doc
+        let nodes = doc
             .nodes()
             .iter()
-            .filter(|n| n.name().value() == "window")
+            .filter(|n| n.name().value() == "node")
             .filter_map(|n| {
                 let path = PathBuf::from(n.get(0)?.as_string()?);
                 let ch = n.children()?;
                 let pos = ch.get("pos")?;
                 let size = ch.get("size")?;
-                Some(SessionWindow {
+                Some(SessionNode {
                     path,
                     pos: [pos.get(0).and_then(num)?, pos.get(1).and_then(num)?],
                     size: [size.get(0).and_then(num)?, size.get(1).and_then(num)?],
@@ -77,7 +77,7 @@ impl Session {
             })
             .collect();
 
-        Some(Session { camera, windows })
+        Some(Session { camera, nodes })
     }
 
     /// Render the session to KDL text.
@@ -95,8 +95,8 @@ impl Session {
         cam.set_children(cam_ch);
         doc.nodes_mut().push(cam);
 
-        for w in &self.windows {
-            let mut node = KdlNode::new("window");
+        for w in &self.nodes {
+            let mut node = KdlNode::new("node");
             node.push(KdlEntry::new(w.path.to_string_lossy().to_string()));
             let mut ch = KdlDocument::new();
             ch.nodes_mut().push(node2("pos", w.pos[0], w.pos[1]));
@@ -126,13 +126,13 @@ mod tests {
     fn session_kdl_round_trips() {
         let s = Session {
             camera: (12.5, -40.0, 1.5),
-            windows: vec![
-                SessionWindow {
+            nodes: vec![
+                SessionNode {
                     path: PathBuf::from("plugins/paint/paint.wasm"),
                     pos: [40.0, 56.0],
                     size: [320.0, 240.0],
                 },
-                SessionWindow {
+                SessionNode {
                     path: PathBuf::from("plugins/triangle/triangle.wasm"),
                     pos: [200.0, 120.0],
                     size: [256.0, 256.0],
@@ -142,8 +142,8 @@ mod tests {
 
         let back = Session::from_kdl(&s.to_kdl()).expect("parses");
         assert_eq!(back.camera, s.camera);
-        assert_eq!(back.windows.len(), 2);
-        for (a, b) in back.windows.iter().zip(&s.windows) {
+        assert_eq!(back.nodes.len(), 2);
+        for (a, b) in back.nodes.iter().zip(&s.nodes) {
             assert_eq!(a.path, b.path);
             assert_eq!(a.pos, b.pos);
             assert_eq!(a.size, b.size);

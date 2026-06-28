@@ -46,7 +46,7 @@ pub struct VirtualSurface {
     /// Stable unique id, used by the compositor to track this surface.
     pub id: u64,
     /// The instance that created this surface (its window belongs to it).
-    pub instance_id: u64,
+    pub node_id: u64,
     pub width: u32,
     pub height: u32,
     /// Latest painted RGBA8 pixels (`width * height * 4`).
@@ -82,10 +82,10 @@ impl std::fmt::Display for SurfaceClosed {
 impl std::error::Error for SurfaceClosed {}
 
 impl VirtualSurface {
-    fn new(instance_id: u64, width: u32, height: u32) -> Self {
+    fn new(node_id: u64, width: u32, height: u32) -> Self {
         Self {
             id: NEXT_SURFACE_ID.fetch_add(1, Ordering::Relaxed),
-            instance_id,
+            node_id,
             width,
             height,
             pixels: vec![0; (width * height * 4) as usize],
@@ -113,29 +113,32 @@ pub type SharedSurface = Arc<Mutex<VirtualSurface>>;
 /// All virtual surfaces created by clients, shared with the compositor thread.
 pub type SurfaceRegistry = Arc<Mutex<Vec<SharedSurface>>>;
 
-static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_NODE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// A launched plugin instance. Every instance gets a window in the compositor —
 /// its surface if it created one, otherwise a console showing this captured
 /// output — so nothing ever runs invisibly or un-quittably.
-pub struct Instance {
+pub struct Node {
     pub id: u64,
     pub name: String,
-    /// The plugin component this instance runs (for session persistence).
+    /// The plugin component this node runs (for session persistence).
     pub path: std::path::PathBuf,
     /// Configured default window size on the canvas, if the project set one.
     pub default_size: Option<(u32, u32)>,
-    /// Captured stdout+stderr, rendered in the instance's console window.
+    /// Captured stdout+stderr, rendered in the node's console window.
     pub console: MemoryOutputPipe,
+    /// This node's in-memory filesystem, so the compositor can mount connected
+    /// file nodes into it.
+    pub fs: crate::vfs::SharedFs,
     /// Set by the guest thread when its `run` returns (it exited on its own).
     pub finished: Arc<AtomicBool>,
-    /// Kill switch: set by the compositor to stop a still-running instance.
+    /// Kill switch: set by the compositor to stop a still-running node.
     pub kill: Arc<AtomicBool>,
 }
 
-pub type SharedInstance = Arc<Instance>;
-/// All launched instances, shared with the compositor thread.
-pub type InstanceRegistry = Arc<Mutex<Vec<SharedInstance>>>;
+pub type SharedNode = Arc<Node>;
+/// All launched app nodes, shared with the compositor thread.
+pub type NodeRegistry = Arc<Mutex<Vec<SharedNode>>>;
 
 // ---- resource representations stored in the wasmtime ResourceTable ----
 
@@ -226,12 +229,9 @@ pub struct HostState {
     table: ResourceTable,
     registry: SurfaceRegistry,
     /// The instance this store belongs to; tags the surfaces it creates.
-    instance_id: u64,
-    /// This instance's private in-memory filesystem.
+    node_id: u64,
+    /// This node's private in-memory filesystem.
     pub(crate) fs: crate::vfs::SharedFs,
-    /// Set by the compositor to stop this instance; observed by blocking host
-    /// calls (e.g. a socket read) so they unwind instead of hanging forever.
-    pub(crate) kill: Arc<AtomicBool>,
     /// Shared wgpu-core instance backing the wasi:webgpu host.
     gpu: Arc<wgpu_core::global::Global>,
 }
@@ -319,11 +319,7 @@ impl wasi::surface::surface::HostSurface for HostState {
     fn new(&mut self, desc: CreateDesc) -> Result<Resource<SurfaceState>> {
         let width = desc.width.unwrap_or(256);
         let height = desc.height.unwrap_or(256);
-        let shared = Arc::new(Mutex::new(VirtualSurface::new(
-            self.instance_id,
-            width,
-            height,
-        )));
+        let shared = Arc::new(Mutex::new(VirtualSurface::new(self.node_id, width, height)));
         self.registry.lock().unwrap().push(shared.clone());
         Ok(self.table.push(SurfaceState { shared })?)
     }
@@ -561,41 +557,37 @@ impl wasi::frame_buffer::frame_buffer::HostBuffer for HostState {
 pub struct PluginHost {
     engine: Engine,
     gpu: Arc<wgpu_core::global::Global>,
-    /// The shared workspace filesystem, mounted into every instance at
-    /// `/shared` so instances can exchange files and talk over `/shared/sock`.
-    shared_fs: crate::vfs::SharedFs,
 }
 
 impl PluginHost {
     pub fn new() -> Result<Self> {
         let mut config = Config::new();
         config.wasm_component_model(true);
-        // Lets the compositor stop a runaway instance: increment_epoch() each
-        // frame trips the per-store deadline callback, which traps on `kill`.
+        // Lets the compositor stop a runaway node: increment_epoch() each frame
+        // trips the per-store deadline callback, which traps on `kill`.
         config.epoch_interruption(true);
         Ok(Self {
             engine: Engine::new(&config)?,
             gpu: new_gpu_instance(),
-            shared_fs: crate::vfs::new_shared_workspace(),
         })
     }
 
-    /// Advance the epoch so every running instance re-checks its kill switch.
+    /// Advance the epoch so every running node re-checks its kill switch.
     pub fn tick_epoch(&self) {
         self.engine.increment_epoch();
     }
 
     /// Load a client component and run its `run` export on a dedicated thread,
-    /// registering it as an `Instance`. Surfaces it creates appear in `surfaces`
-    /// (tagged with the instance id); its stdout/stderr are captured for the
-    /// instance's console window.
+    /// registering it as a `Node`. Surfaces it creates appear in `surfaces`
+    /// (tagged with the node id); its stdout/stderr are captured for the node's
+    /// console window.
     pub fn spawn(
         &self,
         path: &Path,
         name: &str,
         default_size: Option<(u32, u32)>,
         surfaces: SurfaceRegistry,
-        instances: InstanceRegistry,
+        nodes: NodeRegistry,
     ) -> Result<u64> {
         let mut linker: Linker<HostState> = Linker::new(&self.engine);
         // Provide every wasmtime-wasi interface except its filesystem, then our
@@ -611,17 +603,19 @@ impl PluginHost {
         wasi::frame_buffer::frame_buffer::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
         wasi_webgpu_wasmtime::add_to_linker(&mut linker)?;
 
-        let id = NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
+        let id = NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed);
         // ~1 MiB of scrollback; the guest traps if it overruns this (rare).
         let console = MemoryOutputPipe::new(1 << 20);
         let finished = Arc::new(AtomicBool::new(false));
         let kill = Arc::new(AtomicBool::new(false));
-        instances.lock().unwrap().push(Arc::new(Instance {
+        let fs = crate::vfs::new_fs();
+        nodes.lock().unwrap().push(Arc::new(Node {
             id,
             name: name.to_string(),
             path: path.to_path_buf(),
             default_size,
             console: console.clone(),
+            fs: fs.clone(),
             finished: finished.clone(),
             kill: kill.clone(),
         }));
@@ -634,9 +628,8 @@ impl PluginHost {
                 .build(),
             table: ResourceTable::new(),
             registry: surfaces,
-            instance_id: id,
-            fs: crate::vfs::new_instance_fs(&self.shared_fs),
-            kill: kill.clone(),
+            node_id: id,
+            fs,
             gpu: Arc::clone(&self.gpu),
         };
         let mut store = Store::new(&self.engine, state);

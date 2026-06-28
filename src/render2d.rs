@@ -13,22 +13,64 @@ use wgpu::*;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TextureId(pub u32);
 
-/// One quad to draw: destination rect and uv rect (both as x0,y0,x1,y1), an RGBA
-/// color the texture is multiplied by, the texture, and a scissor clip rect.
+/// One quad to draw: four corners (tl, tr, br, bl), a uv rect (x0,y0,x1,y1), an
+/// RGBA color the texture is multiplied by, the texture, and a scissor clip.
 #[derive(Clone, Copy)]
 pub struct Quad {
-    pub dst: [f32; 4],
-    pub uv: [f32; 4],
-    pub color: [f32; 4],
-    pub tex: TextureId,
-    pub clip: [f32; 4],
+    corners: [[f32; 2]; 4],
+    uv: [f32; 4],
+    color: [f32; 4],
+    tex: TextureId,
+    clip: [f32; 4],
+}
+
+fn rect_corners(r: [f32; 4]) -> [[f32; 2]; 4] {
+    [[r[0], r[1]], [r[2], r[1]], [r[2], r[3]], [r[0], r[3]]]
 }
 
 impl Quad {
+    /// A textured rect.
+    pub fn tex(
+        rect: [f32; 4],
+        uv: [f32; 4],
+        color: [f32; 4],
+        tex: TextureId,
+        clip: [f32; 4],
+    ) -> Self {
+        Quad {
+            corners: rect_corners(rect),
+            uv,
+            color,
+            tex,
+            clip,
+        }
+    }
+
     /// A solid-colored rect (uses the renderer's white texture).
     pub fn solid(white: TextureId, rect: [f32; 4], color: [f32; 4], clip: [f32; 4]) -> Self {
+        Quad::tex(rect, [0.0, 0.0, 1.0, 1.0], color, white, clip)
+    }
+
+    /// A solid line segment of the given thickness, in screen pixels.
+    pub fn line(
+        white: TextureId,
+        a: [f32; 2],
+        b: [f32; 2],
+        thickness: f32,
+        color: [f32; 4],
+        clip: [f32; 4],
+    ) -> Self {
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let len = (dx * dx + dy * dy).sqrt().max(0.001);
+        // Perpendicular offset, half-thickness on each side.
+        let (nx, ny) = (-dy / len * thickness * 0.5, dx / len * thickness * 0.5);
         Quad {
-            dst: rect,
+            corners: [
+                [a[0] + nx, a[1] + ny],
+                [b[0] + nx, b[1] + ny],
+                [b[0] - nx, b[1] - ny],
+                [a[0] - nx, a[1] - ny],
+            ],
             uv: [0.0, 0.0, 1.0, 1.0],
             color,
             tex: white,
@@ -307,7 +349,6 @@ impl Renderer {
 
         let mut verts: Vec<Vertex> = Vec::with_capacity(quads.len() * 6);
         for q in quads {
-            let [x0, y0, x1, y1] = q.dst;
             let [u0, v0, u1, v1] = q.uv;
             let c = [
                 (q.color[0] * 255.0) as u8,
@@ -316,22 +357,22 @@ impl Renderer {
                 (q.color[3] * 255.0) as u8,
             ];
             let tl = Vertex {
-                pos: [x0, y0],
+                pos: q.corners[0],
                 uv: [u0, v0],
                 color: c,
             };
             let tr = Vertex {
-                pos: [x1, y0],
+                pos: q.corners[1],
                 uv: [u1, v0],
                 color: c,
             };
             let br = Vertex {
-                pos: [x1, y1],
+                pos: q.corners[2],
                 uv: [u1, v1],
                 color: c,
             };
             let bl = Vertex {
-                pos: [x0, y1],
+                pos: q.corners[3],
                 uv: [u0, v1],
                 color: c,
             };

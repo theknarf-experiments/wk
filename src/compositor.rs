@@ -18,8 +18,8 @@ use winit::window::WindowId;
 
 use crate::host_shell::Gfx;
 use crate::plugin::{
-    InstanceRegistry, Key, KeyEvent, PluginHost, PointerEvent, ResizeEvent, SharedInstance,
-    SharedSurface, SurfaceRegistry,
+    Key, KeyEvent, NodeRegistry, PluginHost, PointerEvent, ResizeEvent, SharedNode, SharedSurface,
+    SurfaceRegistry,
 };
 use crate::project::PluginSpec;
 use crate::render2d::{Quad, Renderer, TextureId};
@@ -252,24 +252,54 @@ impl TextCache {
                 e
             }
         };
-        quads.push(Quad {
-            dst: [x, y, x + w * scale, y + h * scale],
-            uv: [0.0, 0.0, 1.0, 1.0],
+        quads.push(Quad::tex(
+            [x, y, x + w * scale, y + h * scale],
+            [0.0, 0.0, 1.0, 1.0],
             color,
             tex,
             clip,
-        });
+        ));
     }
 }
 
 enum DragMode {
     Move,
     Resize,
+    /// Dragging a connection wire out of a node's port toward another node.
+    Connect,
 }
 struct Drag {
     id: u64,
     mode: DragMode,
     grab: [f32; 2],
+}
+
+/// A canvas file node: a named shared file you wire into app nodes. Its bytes
+/// are the shared state connected apps read and write.
+struct FileNode {
+    name: String,
+    data: crate::vfs::SharedFile,
+}
+
+/// Connection port radius and file-node default size, in canvas pixels.
+const PORT_R: f32 = 6.0;
+const FILE_W: f32 = 130.0;
+const FILE_H: f32 = 44.0;
+const FILE_BG: [f32; 4] = [0.20, 0.17, 0.10, 1.0];
+const FILE_BORDER: [f32; 4] = [0.55, 0.45, 0.25, 1.0];
+const PORT_COL: [f32; 4] = [0.70, 0.72, 0.80, 1.0];
+const WIRE_COL: [f32; 4] = [0.55, 0.60, 0.72, 1.0];
+
+/// The connection port sits at the right edge, vertically centred.
+fn port_pos(r: [f32; 4]) -> [f32; 2] {
+    [r[2], (r[1] + r[3]) * 0.5]
+}
+fn center(r: [f32; 4]) -> [f32; 2] {
+    [(r[0] + r[2]) * 0.5, (r[1] + r[3]) * 0.5]
+}
+fn near(a: [f32; 2], b: [f32; 2], radius: f32) -> bool {
+    let (dx, dy) = (a[0] - b[0], a[1] - b[1]);
+    dx * dx + dy * dy <= radius * radius
 }
 
 /// The compositor application: owns all state. winit drives it via
@@ -279,7 +309,7 @@ struct App {
     persist_session: bool,
     host: PluginHost,
     registry: SurfaceRegistry,
-    instance_reg: InstanceRegistry,
+    node_reg: NodeRegistry,
     available: Vec<PluginSpec>,
 
     views: HashMap<u64, (TextureId, u32, u32)>,
@@ -294,6 +324,14 @@ struct App {
     drag: Option<Drag>,
     menu_open: bool,
     pending_layout: HashMap<u64, ([f32; 2], [f32; 2])>,
+
+    // File nodes (canvas-owned shared files) and the connections wiring them
+    // into app nodes. File node ids are offset so they never collide with the
+    // app (plugin) node ids; both share `win_pos`/`win_size`/`z`.
+    file_nodes: HashMap<u64, FileNode>,
+    connections: Vec<(u64, u64)>,
+    next_file_id: u64,
+    file_seq: u32,
 
     // Input state, fed by winit events between frames.
     mouse: [f32; 2],
@@ -313,13 +351,13 @@ impl App {
     fn new(plugins: &[PluginSpec], persist_session: bool) -> Result<Self, String> {
         let host = PluginHost::new().map_err(|e| format!("{e:#}"))?;
         let registry: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
-        let instance_reg: InstanceRegistry = Arc::new(Mutex::new(Vec::new()));
+        let node_reg: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
         let mut app = App {
             gfx: None,
             persist_session,
             host,
             registry,
-            instance_reg,
+            node_reg,
             available: plugins.to_vec(),
             views: HashMap::new(),
             text_cache: TextCache::default(),
@@ -335,6 +373,10 @@ impl App {
             drag: None,
             menu_open: false,
             pending_layout: HashMap::new(),
+            file_nodes: HashMap::new(),
+            connections: Vec::new(),
+            next_file_id: 1 << 32,
+            file_seq: 0,
             mouse: [0.0, 0.0],
             lmb: false,
             prev_lmb: false,
@@ -359,7 +401,7 @@ impl App {
         self.cam.pan = [saved.camera.0, saved.camera.1];
         self.cam.zoom = saved.camera.2;
         self.pan_target = self.cam.pan;
-        for w in &saved.windows {
+        for w in &saved.nodes {
             let spec = self
                 .available
                 .iter()
@@ -371,7 +413,7 @@ impl App {
                 &spec.label(),
                 spec.size,
                 self.registry.clone(),
-                self.instance_reg.clone(),
+                self.node_reg.clone(),
             ) {
                 Ok(id) => {
                     self.pending_layout.insert(id, (w.pos, w.size));
@@ -387,10 +429,98 @@ impl App {
             &spec.label(),
             spec.size,
             self.registry.clone(),
-            self.instance_reg.clone(),
+            self.node_reg.clone(),
         ) {
             eprintln!("failed to launch {}: {e:#}", spec.label());
         }
+    }
+
+    fn rect_of(&self, id: u64) -> [f32; 4] {
+        win_rect(self.cam, self.win_pos[&id], self.win_size[&id])
+    }
+
+    /// The topmost canvas node (app or file) under `mp`, if any.
+    fn topmost_under(&self, mp: [f32; 2]) -> Option<u64> {
+        self.z
+            .iter()
+            .rev()
+            .copied()
+            .find(|&id| contains(self.rect_of(id), mp))
+    }
+
+    /// Create a new, empty file node on the canvas.
+    fn add_file_node(&mut self) {
+        self.file_seq += 1;
+        let id = self.next_file_id;
+        self.next_file_id += 1;
+        let step = (self.file_nodes.len() % 8) as f32 * 24.0;
+        let pos = self.cam.to_canvas([240.0 + step, 120.0 + step]);
+        self.win_pos.insert(id, pos);
+        self.win_size.insert(id, [FILE_W, FILE_H]);
+        self.z.push(id);
+        self.file_nodes.insert(
+            id,
+            FileNode {
+                name: format!("file{}", self.file_seq),
+                data: Arc::new(Mutex::new(Vec::new())),
+            },
+        );
+    }
+
+    /// The live app node with id `id`, if it is an app (not a file) node.
+    fn app_node(&self, id: u64) -> Option<SharedNode> {
+        self.node_reg
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|n| n.id == id)
+            .cloned()
+    }
+
+    /// Toggle a connection between two nodes (exactly one file, one app): wire
+    /// the file into the app's filesystem, or unwire it if already connected.
+    fn connect_toggle(&mut self, a: u64, b: u64) {
+        let (file_id, app_id) = match (
+            self.file_nodes.contains_key(&a),
+            self.file_nodes.contains_key(&b),
+        ) {
+            (true, false) => (a, b),
+            (false, true) => (b, a),
+            _ => return,
+        };
+        let Some(app) = self.app_node(app_id) else {
+            return;
+        };
+        let name = self.file_nodes[&file_id].name.clone();
+        if let Some(pos) = self
+            .connections
+            .iter()
+            .position(|&(f, a)| f == file_id && a == app_id)
+        {
+            crate::vfs::unmount_file(&app.fs, &name);
+            self.connections.remove(pos);
+        } else {
+            crate::vfs::mount_file(&app.fs, &name, self.file_nodes[&file_id].data.clone());
+            self.connections.push((file_id, app_id));
+        }
+    }
+
+    /// Remove a file node, unmounting it from every app it was connected to.
+    fn remove_file_node(&mut self, id: u64) {
+        let Some(file) = self.file_nodes.remove(&id) else {
+            return;
+        };
+        let nodes = self.node_reg.lock().unwrap().clone();
+        for &(f, a) in self.connections.iter().filter(|&&(f, _)| f == id) {
+            let _ = f;
+            if let Some(app) = nodes.iter().find(|n| n.id == a) {
+                crate::vfs::unmount_file(&app.fs, &file.name);
+            }
+        }
+        self.connections.retain(|&(f, _)| f != id);
+        self.win_pos.remove(&id);
+        self.win_size.remove(&id);
+        self.z.retain(|&x| x != id);
     }
 
     /// One compositor frame: update from input, drive surfaces, render.
@@ -424,31 +554,32 @@ impl App {
             gfx.surface_desc.height as f32,
         ];
 
-        // ---- sync windows with the instance registry ----
-        let instances: Vec<SharedInstance> = self.instance_reg.lock().unwrap().clone();
-        let inst_by_id: HashMap<u64, SharedInstance> =
-            instances.iter().map(|i| (i.id, i.clone())).collect();
-        for inst in &instances {
-            if let std::collections::hash_map::Entry::Vacant(slot) = self.win_pos.entry(inst.id) {
-                let (pos, size) = self.pending_layout.remove(&inst.id).unwrap_or_else(|| {
+        // ---- sync windows with the node registry ----
+        let nodes: Vec<SharedNode> = self.node_reg.lock().unwrap().clone();
+        let node_by_id: HashMap<u64, SharedNode> =
+            nodes.iter().map(|i| (i.id, i.clone())).collect();
+        for node in &nodes {
+            if let std::collections::hash_map::Entry::Vacant(slot) = self.win_pos.entry(node.id) {
+                let (pos, size) = self.pending_layout.remove(&node.id).unwrap_or_else(|| {
                     let step = (self.z.len() % 8) as f32 * 28.0;
-                    let size = inst
+                    let size = node
                         .default_size
                         .map(|(w, h)| [w as f32, h as f32])
                         .unwrap_or([360.0, 260.0]);
                     ([40.0 + step, 56.0 + step], size)
                 });
                 slot.insert(pos);
-                self.win_size.insert(inst.id, size);
-                self.z.push(inst.id);
+                self.win_size.insert(node.id, size);
+                self.z.push(node.id);
             }
         }
-        self.z.retain(|id| inst_by_id.contains_key(id));
+        self.z
+            .retain(|id| node_by_id.contains_key(id) || self.file_nodes.contains_key(id));
 
         let surfaces: Vec<SharedSurface> = self.registry.lock().unwrap().clone();
-        let inst_surface: HashMap<u64, SharedSurface> = surfaces
+        let node_surface: HashMap<u64, SharedSurface> = surfaces
             .iter()
-            .map(|s| (s.lock().unwrap().instance_id, s.clone()))
+            .map(|s| (s.lock().unwrap().node_id, s.clone()))
             .collect();
 
         // ---- interaction ----
@@ -462,27 +593,40 @@ impl App {
             .fold(120.0, f32::max)
             + 2.0 * PAD;
 
-        if let Some(d) = &self.drag {
-            if lmb {
-                let mc = self.cam.to_canvas(mp);
-                match d.mode {
-                    DragMode::Move => {
-                        self.win_pos
-                            .insert(d.id, [mc[0] - d.grab[0], mc[1] - d.grab[1]]);
-                    }
-                    DragMode::Resize => {
-                        let p = self.win_pos[&d.id];
-                        self.win_size.insert(
-                            d.id,
-                            [
-                                (mc[0] - p[0]).max(100.0),
-                                (mc[1] - p[1]).max(TITLE_H + 40.0),
-                            ],
-                        );
+        let file_btn_w = gfx.fonts.measure("+ File") as f32 + 2.0 * PAD;
+        let file_btn = [menu_w, 0.0, menu_w + file_btn_w, MENU_H];
+
+        // Continue an in-progress drag (move / resize / connect).
+        if let Some(d) = self.drag.take() {
+            match d.mode {
+                DragMode::Move if lmb => {
+                    let mc = self.cam.to_canvas(mp);
+                    self.win_pos
+                        .insert(d.id, [mc[0] - d.grab[0], mc[1] - d.grab[1]]);
+                    self.drag = Some(d);
+                }
+                DragMode::Resize if lmb => {
+                    let p = self.win_pos[&d.id];
+                    let mc = self.cam.to_canvas(mp);
+                    self.win_size.insert(
+                        d.id,
+                        [
+                            (mc[0] - p[0]).max(100.0),
+                            (mc[1] - p[1]).max(TITLE_H + 40.0),
+                        ],
+                    );
+                    self.drag = Some(d);
+                }
+                DragMode::Connect if lmb => self.drag = Some(d),
+                // Released: a connect drag wires to the node under the cursor.
+                DragMode::Connect => {
+                    if let Some(target) = self.topmost_under(mp) {
+                        if target != d.id {
+                            self.connect_toggle(d.id, target);
+                        }
                     }
                 }
-            } else {
-                self.drag = None;
+                _ => {} // move/resize released: drop the drag
             }
         }
 
@@ -490,6 +634,10 @@ impl App {
             let mut consumed = false;
             if contains(apps_rect, mp) {
                 self.menu_open = !self.menu_open;
+                consumed = true;
+            } else if contains(file_btn, mp) {
+                self.add_file_node();
+                self.menu_open = false;
                 consumed = true;
             } else if self.menu_open {
                 for (i, spec) in self.available.iter().enumerate() {
@@ -512,33 +660,50 @@ impl App {
                 }
             }
             if !consumed {
-                if let Some(&id) = self.z.iter().rev().find(|&&id| {
-                    contains(
-                        win_rect(self.cam, self.win_pos[&id], self.win_size[&id]),
-                        mp,
-                    )
-                }) {
+                if let Some(id) = self.topmost_under(mp) {
                     self.z.retain(|&x| x != id);
                     self.z.push(id);
-                    // Clicking anywhere on a window activates it (header included).
-                    self.kbd_focus = Some(id);
-                    let r = win_rect(self.cam, self.win_pos[&id], self.win_size[&id]);
-                    if contains(close_btn(r, zf), mp) {
-                        to_close.push(id);
-                    } else if contains(resize_grip(r, zf), mp) {
+                    let r = self.rect_of(id);
+                    let is_file = self.file_nodes.contains_key(&id);
+                    if near(mp, port_pos(r), PORT_R * zf + 3.0) {
+                        // Drag a connection wire out of the port.
                         self.drag = Some(Drag {
                             id,
-                            mode: DragMode::Resize,
+                            mode: DragMode::Connect,
                             grab: [0.0, 0.0],
                         });
-                    } else if contains(title_bar(r, zf), mp) {
-                        let mc = self.cam.to_canvas(mp);
-                        let p = self.win_pos[&id];
-                        self.drag = Some(Drag {
-                            id,
-                            mode: DragMode::Move,
-                            grab: [mc[0] - p[0], mc[1] - p[1]],
-                        });
+                    } else if is_file {
+                        if contains(close_btn(r, zf), mp) {
+                            self.remove_file_node(id);
+                        } else {
+                            let mc = self.cam.to_canvas(mp);
+                            let p = self.win_pos[&id];
+                            self.drag = Some(Drag {
+                                id,
+                                mode: DragMode::Move,
+                                grab: [mc[0] - p[0], mc[1] - p[1]],
+                            });
+                        }
+                    } else {
+                        // App node: clicking anywhere activates it.
+                        self.kbd_focus = Some(id);
+                        if contains(close_btn(r, zf), mp) {
+                            to_close.push(id);
+                        } else if contains(resize_grip(r, zf), mp) {
+                            self.drag = Some(Drag {
+                                id,
+                                mode: DragMode::Resize,
+                                grab: [0.0, 0.0],
+                            });
+                        } else if contains(title_bar(r, zf), mp) {
+                            let mc = self.cam.to_canvas(mp);
+                            let p = self.win_pos[&id];
+                            self.drag = Some(Drag {
+                                id,
+                                mode: DragMode::Move,
+                                grab: [mc[0] - p[0], mc[1] - p[1]],
+                            });
+                        }
                     }
                     consumed = true;
                 }
@@ -561,7 +726,7 @@ impl App {
                 let r = win_rect(self.cam, self.win_pos[&id], self.win_size[&id]);
                 let ca = content_rect(r, zf);
                 if contains(ca, mp) {
-                    if let Some(surf) = inst_surface.get(&id) {
+                    if let Some(surf) = node_surface.get(&id) {
                         let local = PointerEvent {
                             x: ((mp[0] - ca[0]) / zf) as f64,
                             y: ((mp[1] - ca[1]) / zf) as f64,
@@ -581,7 +746,7 @@ impl App {
 
         // Keyboard to the focused window's surface.
         if let Some(fid) = self.kbd_focus {
-            if let Some(surf) = inst_surface.get(&fid) {
+            if let Some(surf) = node_surface.get(&fid) {
                 let mut s = surf.lock().unwrap();
                 for (ev, down) in &self.key_events {
                     if *down {
@@ -598,7 +763,7 @@ impl App {
         for shared in &surfaces {
             let (sid, w, h, pixels) = {
                 let mut s = shared.lock().unwrap();
-                if let Some(size) = self.win_size.get(&s.instance_id) {
+                if let Some(size) = self.win_size.get(&s.node_id) {
                     let cw = (size[0] - 2.0 * BORDER).max(16.0) as u32;
                     let ch = (size[1] - TITLE_H - BORDER).max(16.0) as u32;
                     if cw != s.width || ch != s.height {
@@ -647,6 +812,15 @@ impl App {
         let full = [0.0, 0.0, fb[0], fb[1]];
         let mut quads: Vec<Quad> = Vec::new();
 
+        // Connection wires, under the nodes.
+        for &(file_id, app_id) in &self.connections {
+            if self.win_pos.contains_key(&file_id) && self.win_pos.contains_key(&app_id) {
+                let a = center(self.rect_of(file_id));
+                let b = center(self.rect_of(app_id));
+                quads.push(Quad::line(white, a, b, (2.0 * zf).max(1.5), WIRE_COL, full));
+            }
+        }
+
         for &id in &self.z {
             let pos = self.win_pos[&id];
             let size = self.win_size[&id];
@@ -655,6 +829,74 @@ impl App {
                 continue;
             }
             let clip = intersect(r, full);
+
+            // A file node renders as a small labelled box with a port.
+            if let Some(file) = self.file_nodes.get(&id) {
+                let name = file.name.clone();
+                let bytes = file.data.lock().unwrap().len();
+                quads.push(Quad::solid(white, r, FILE_BORDER, clip));
+                let body = [
+                    r[0] + BORDER * zf,
+                    r[1] + BORDER * zf,
+                    r[2] - BORDER * zf,
+                    r[3] - BORDER * zf,
+                ];
+                quads.push(Quad::solid(white, body, FILE_BG, clip));
+                let lh = gfx.fonts.line_height() as f32;
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    &name,
+                    r[0] + PAD * zf,
+                    r[1] + PAD * zf,
+                    zf,
+                    TEXT,
+                    clip,
+                );
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    &format!("{bytes} B"),
+                    r[0] + PAD * zf,
+                    r[1] + (PAD + lh) * zf,
+                    zf * 0.85,
+                    [0.65, 0.6, 0.5, 1.0],
+                    clip,
+                );
+                let cb = close_btn(r, zf);
+                if contains(cb, mp) {
+                    quads.push(Quad::solid(white, cb, CLOSE_HOT, clip));
+                }
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    "x",
+                    cb[0] + (cb[2] - cb[0]) * 0.28,
+                    cb[1] + (cb[3] - cb[1]) * 0.05,
+                    zf * 0.8,
+                    TEXT,
+                    clip,
+                );
+                let pp = port_pos(r);
+                let pr = PORT_R * zf;
+                quads.push(Quad::solid(
+                    white,
+                    [pp[0] - pr, pp[1] - pr, pp[0] + pr, pp[1] + pr],
+                    PORT_COL,
+                    full,
+                ));
+                continue;
+            }
+
             let focused = self.kbd_focus == Some(id);
             quads.push(Quad::solid(white, r, BORDER_COL, clip));
             let body = [
@@ -672,11 +914,11 @@ impl App {
                 clip,
             ));
 
-            if let Some(inst) = inst_by_id.get(&id) {
-                let label = if inst.finished.load(Ordering::Relaxed) {
-                    format!("{} (exited)", inst.name)
+            if let Some(node) = node_by_id.get(&id) {
+                let label = if node.finished.load(Ordering::Relaxed) {
+                    format!("{} (exited)", node.name)
                 } else {
-                    inst.name.clone()
+                    node.name.clone()
                 };
                 let ty = tb[1] + (TITLE_H * zf - gfx.fonts.line_height() as f32 * zf) * 0.5;
                 self.text_cache.draw(
@@ -714,19 +956,19 @@ impl App {
 
             let ca = content_rect(r, zf);
             let ca_clip = intersect(ca, full);
-            let sid = inst_surface.get(&id).map(|s| s.lock().unwrap().id);
+            let sid = node_surface.get(&id).map(|s| s.lock().unwrap().id);
             if let Some(sid) = sid {
                 if let Some(&(tex, _, _)) = self.views.get(&sid) {
-                    quads.push(Quad {
-                        dst: ca,
-                        uv: [0.0, 0.0, 1.0, 1.0],
-                        color: [1.0, 1.0, 1.0, 1.0],
+                    quads.push(Quad::tex(
+                        ca,
+                        [0.0, 0.0, 1.0, 1.0],
+                        [1.0, 1.0, 1.0, 1.0],
                         tex,
-                        clip: ca_clip,
-                    });
+                        ca_clip,
+                    ));
                 }
-            } else if let Some(inst) = inst_by_id.get(&id) {
-                let bytes = inst.console.contents();
+            } else if let Some(node) = node_by_id.get(&id) {
+                let bytes = node.console.contents();
                 let txt = String::from_utf8_lossy(&bytes);
                 let line_h = gfx.fonts.line_height() as f32;
                 let rows = ((size[1] - TITLE_H - BORDER) / line_h).max(1.0) as usize;
@@ -749,12 +991,54 @@ impl App {
                     );
                 }
             }
+
+            // Connection port on the right edge.
+            let pp = port_pos(r);
+            let pr = PORT_R * zf;
+            quads.push(Quad::solid(
+                white,
+                [pp[0] - pr, pp[1] - pr, pp[0] + pr, pp[1] + pr],
+                PORT_COL,
+                full,
+            ));
+        }
+
+        // The wire being dragged out of a port toward the cursor.
+        if let Some(d) = &self.drag {
+            if matches!(d.mode, DragMode::Connect) {
+                let from = port_pos(self.rect_of(d.id));
+                quads.push(Quad::line(
+                    white,
+                    from,
+                    mp,
+                    2.5,
+                    [0.80, 0.85, 1.0, 1.0],
+                    full,
+                ));
+            }
         }
 
         quads.push(Quad::solid(white, [0.0, 0.0, fb[0], MENU_H], MENU_BG, full));
         if self.menu_open || contains(apps_rect, mp) {
             quads.push(Quad::solid(white, apps_rect, MENU_HOVER, full));
         }
+        // "+ File" button.
+        if contains(file_btn, mp) {
+            quads.push(Quad::solid(white, file_btn, MENU_HOVER, full));
+        }
+        self.text_cache.draw(
+            &mut quads,
+            &mut gfx.renderer,
+            &gfx.fonts,
+            &gfx.device,
+            &gfx.queue,
+            "+ File",
+            file_btn[0] + PAD,
+            (MENU_H - gfx.fonts.line_height() as f32) * 0.5,
+            1.0,
+            TEXT,
+            full,
+        );
         self.text_cache.draw(
             &mut quads,
             &mut gfx.renderer,
@@ -852,14 +1136,14 @@ impl App {
         gfx.queue.submit([encoder.finish()]);
         frame.present();
 
-        // ---- quit closed instances ----
+        // ---- quit closed nodes ----
         for id in &to_close {
-            if let Some(inst) = inst_by_id.get(id) {
-                inst.kill.store(true, Ordering::Relaxed);
+            if let Some(node) = node_by_id.get(id) {
+                node.kill.store(true, Ordering::Relaxed);
             }
             self.registry.lock().unwrap().retain(|s| {
                 let mut g = s.lock().unwrap();
-                if g.instance_id != *id {
+                if g.node_id != *id {
                     return true;
                 }
                 g.closed = true;
@@ -869,7 +1153,9 @@ impl App {
                 }
                 false
             });
-            self.instance_reg.lock().unwrap().retain(|x| x.id != *id);
+            self.node_reg.lock().unwrap().retain(|x| x.id != *id);
+            // A closed app drops its connections (its filesystem is gone).
+            self.connections.retain(|&(_, app)| app != *id);
             self.win_pos.remove(id);
             self.win_size.remove(id);
             self.z.retain(|x| x != id);
@@ -886,22 +1172,22 @@ impl App {
         if !self.persist_session {
             return;
         }
-        let windows = self
-            .instance_reg
+        let session_nodes = self
+            .node_reg
             .lock()
             .unwrap()
             .iter()
-            .filter_map(|inst| {
-                Some(crate::session::SessionWindow {
-                    path: inst.path.clone(),
-                    pos: *self.win_pos.get(&inst.id)?,
-                    size: *self.win_size.get(&inst.id)?,
+            .filter_map(|node| {
+                Some(crate::session::SessionNode {
+                    path: node.path.clone(),
+                    pos: *self.win_pos.get(&node.id)?,
+                    size: *self.win_size.get(&node.id)?,
                 })
             })
             .collect();
         let saved = crate::session::Session {
             camera: (self.cam.pan[0], self.cam.pan[1], self.cam.zoom),
-            windows,
+            nodes: session_nodes,
         };
         if let Err(e) = saved.save() {
             eprintln!("failed to save session: {e}");

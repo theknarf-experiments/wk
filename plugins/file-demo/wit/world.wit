@@ -1,0 +1,7 @@
+package wk:file-demo;
+
+/// Isolated by default: it can only see a file node once you wire one into it.
+/// Connect the same file node to two instances and they talk through it.
+world file-demo {
+    export run: func();
+}
