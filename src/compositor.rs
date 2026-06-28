@@ -520,6 +520,8 @@ impl App {
                 }) {
                     self.z.retain(|&x| x != id);
                     self.z.push(id);
+                    // Clicking anywhere on a window activates it (header included).
+                    self.kbd_focus = Some(id);
                     let r = win_rect(self.cam, self.win_pos[&id], self.win_size[&id]);
                     if contains(close_btn(r, zf), mp) {
                         to_close.push(id);
@@ -537,14 +539,14 @@ impl App {
                             mode: DragMode::Move,
                             grab: [mc[0] - p[0], mc[1] - p[1]],
                         });
-                    } else {
-                        self.kbd_focus = Some(id);
                     }
                     consumed = true;
                 }
             }
             if !consumed {
+                // Clicked empty canvas: dismiss the menu and unfocus the app.
                 self.menu_open = false;
+                self.kbd_focus = None;
             }
         }
 
