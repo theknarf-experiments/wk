@@ -141,6 +141,27 @@ fn ease(current: f32, target: f32) -> f32 {
     }
 }
 
+/// Push window chrome (padding, spacing, border, rounding) scaled by `zoom`, so
+/// an app window's frame zooms uniformly with its contents rather than staying a
+/// fixed pixel size. Combined with `set_window_font_scale` (title/text) and the
+/// window's zoomed outer size, this gives a true visual zoom. The returned
+/// tokens pop the styles when dropped, so keep them alive across the window.
+fn push_zoom_chrome<'ui>(
+    ui: &'ui imgui::Ui,
+    base: &imgui::Style,
+    zoom: f32,
+) -> [imgui::StyleStackToken<'ui>; 5] {
+    use imgui::StyleVar::*;
+    let s2 = |v: [f32; 2]| [v[0] * zoom, v[1] * zoom];
+    [
+        ui.push_style_var(WindowPadding(s2(base.window_padding))),
+        ui.push_style_var(FramePadding(s2(base.frame_padding))),
+        ui.push_style_var(ItemSpacing(s2(base.item_spacing))),
+        ui.push_style_var(WindowBorderSize(base.window_border_size * zoom)),
+        ui.push_style_var(WindowRounding(base.window_rounding * zoom)),
+    ]
+}
+
 /// Derive a display name for a plugin from its file stem.
 fn plugin_name(path: &Path) -> String {
     path.file_stem()
@@ -238,6 +259,7 @@ fn placement(
 fn console_window(
     ui: &imgui::Ui,
     inst: &SharedInstance,
+    base_style: &imgui::Style,
     last_win: &mut HashMap<String, WinScreen>,
     cam: &Camera,
     prev_cam: &Camera,
@@ -260,6 +282,7 @@ fn console_window(
         pos: p.default_pos,
         size: p.default_size,
     };
+    let _chrome = push_zoom_chrome(ui, base_style, cam.zoom);
     let mut win = ui
         .window(title)
         .opened(&mut open)
@@ -560,6 +583,9 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
 
         let ui = imgui.frame();
         {
+            // Base style, scaled per app window by the zoom level.
+            let base_style = ui.clone_style();
+
             // Top bar: launch an instance of any project plugin (apps can have
             // multiple instances).
             ui.main_menu_bar(|| {
@@ -585,7 +611,7 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
                     .collect();
 
                 if inst_surfaces.is_empty() {
-                    if !console_window(ui, inst, &mut last_win, &cam, &prev_cam, idx) {
+                    if !console_window(ui, inst, &base_style, &mut last_win, &cam, &prev_cam, idx) {
                         to_close.push(inst.clone());
                     }
                     continue;
@@ -610,6 +636,7 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
                         pos: p.default_pos,
                         size: p.default_size,
                     };
+                    let _chrome = push_zoom_chrome(ui, &base_style, cam.zoom);
                     let mut win = ui
                         .window(format!("{title}##{sid}"))
                         .opened(&mut open)
@@ -621,20 +648,27 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
                     if let Some(fs) = p.force_size {
                         win = win.size(fs, Condition::Always);
                     }
+                    let zoom = cam.zoom;
                     win.build(|| {
+                        ui.set_window_font_scale(zoom);
                         input.focused = ui.is_window_focused();
 
-                        // The client renders at the window's on-screen pixel
-                        // size, so zooming in gives a sharper surface.
+                        // Zoom is purely visual: the client keeps rendering at
+                        // its canvas-space resolution (zoom-independent) and we
+                        // display that texture scaled to fill the zoomed window.
                         let avail = ui.content_region_avail();
-                        input.resize = Some((clamp_size(avail[0]), clamp_size(avail[1])));
+                        input.resize =
+                            Some((clamp_size(avail[0] / zoom), clamp_size(avail[1] / zoom)));
 
                         let origin = ui.cursor_screen_pos();
                         imgui::Image::new(tex, avail).build(ui);
                         if ui.is_item_hovered() {
                             let mouse = ui.io().mouse_pos;
-                            let local =
-                                ((mouse[0] - origin[0]) as f64, (mouse[1] - origin[1]) as f64);
+                            // Screen offset -> client pixel (texture is scaled by zoom).
+                            let local = (
+                                (mouse[0] - origin[0]) as f64 / zoom as f64,
+                                (mouse[1] - origin[1]) as f64 / zoom as f64,
+                            );
                             input.moved = Some(local);
                             if ui.is_mouse_clicked(MouseButton::Left) {
                                 input.down.push(local);
