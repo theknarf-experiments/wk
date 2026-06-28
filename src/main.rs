@@ -1,10 +1,10 @@
 mod compositor;
 mod host_shell;
-mod imguirenderer;
-mod imguisdlhelper;
 mod plugin;
 mod project;
+mod render2d;
 mod session;
+mod text;
 mod vfs;
 
 use clap::CommandFactory;

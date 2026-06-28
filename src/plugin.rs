@@ -47,8 +47,6 @@ pub struct VirtualSurface {
     pub id: u64,
     /// The instance that created this surface (its window belongs to it).
     pub instance_id: u64,
-    /// Display name of the plugin instance that owns this surface.
-    pub title: String,
     pub width: u32,
     pub height: u32,
     /// Latest painted RGBA8 pixels (`width * height * 4`).
@@ -84,11 +82,10 @@ impl std::fmt::Display for SurfaceClosed {
 impl std::error::Error for SurfaceClosed {}
 
 impl VirtualSurface {
-    fn new(instance_id: u64, title: String, width: u32, height: u32) -> Self {
+    fn new(instance_id: u64, width: u32, height: u32) -> Self {
         Self {
             id: NEXT_SURFACE_ID.fetch_add(1, Ordering::Relaxed),
             instance_id,
-            title,
             width,
             height,
             pixels: vec![0; (width * height * 4) as usize],
@@ -230,8 +227,6 @@ pub struct HostState {
     registry: SurfaceRegistry,
     /// The instance this store belongs to; tags the surfaces it creates.
     instance_id: u64,
-    /// Display name for the surfaces this client creates.
-    plugin_name: String,
     /// This instance's private in-memory filesystem.
     pub(crate) fs: crate::vfs::SharedFs,
     /// Set by the compositor to stop this instance; observed by blocking host
@@ -326,7 +321,6 @@ impl wasi::surface::surface::HostSurface for HostState {
         let height = desc.height.unwrap_or(256);
         let shared = Arc::new(Mutex::new(VirtualSurface::new(
             self.instance_id,
-            self.plugin_name.clone(),
             width,
             height,
         )));
@@ -640,7 +634,6 @@ impl PluginHost {
             table: ResourceTable::new(),
             registry: surfaces,
             instance_id: id,
-            plugin_name: name.to_string(),
             fs: crate::vfs::new_instance_fs(&self.shared_fs),
             kill: kill.clone(),
             gpu: Arc::clone(&self.gpu),

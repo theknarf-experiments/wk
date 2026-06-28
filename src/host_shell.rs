@@ -1,15 +1,16 @@
-//! Shared host setup: an SDL3 window + wgpu device/surface + dear imgui and the
-//! custom imgui renderer. The plugin compositor builds its run loop on top of a
-//! `HostShell`.
-
-use std::time::Instant;
+//! Shared host setup: an SDL3 window + wgpu device/surface + the 2D quad
+//! renderer and text fonts. The plugin compositor builds its run loop on top of
+//! a `HostShell`.
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use sdl3::video::Window;
 use sdl3::{EventPump, Sdl};
 
-use crate::imguirenderer::{Renderer, RendererConfig};
-use crate::imguisdlhelper::ImguiSdl2;
+use crate::render2d::Renderer;
+use crate::text::Fonts;
+
+/// Base font size in pixels for host UI text.
+pub const FONT_PX: f32 = 15.0;
 
 /// Everything needed to drive a frame loop. Callers typically destructure this
 /// into locals and run their own loop (see `compositor`).
@@ -23,10 +24,8 @@ pub struct HostShell {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub surface_desc: wgpu::SurfaceConfiguration,
-    pub imgui: imgui::Context,
     pub renderer: Renderer,
-    pub imgui_sdl2: ImguiSdl2,
-    pub last_frame: Instant,
+    pub fonts: Fonts,
 }
 
 impl HostShell {
@@ -84,30 +83,8 @@ impl HostShell {
         };
         surface.configure(&device, &surface_desc);
 
-        let mut imgui = imgui::Context::create();
-        imgui.set_ini_filename(None);
-
-        let hidpi_factor = 1.0;
-        let font_size = (13.0 * hidpi_factor) as f32;
-        imgui.io_mut().font_global_scale = (1.0 / hidpi_factor) as f32;
-        imgui
-            .fonts()
-            .add_font(&[imgui::FontSource::DefaultFontData {
-                config: Some(imgui::FontConfig {
-                    oversample_h: 1,
-                    pixel_snap_h: true,
-                    size_pixels: font_size,
-                    ..Default::default()
-                }),
-            }]);
-
-        let renderer_config = RendererConfig {
-            texture_format: surface_desc.format,
-            ..Default::default()
-        };
-        let renderer = Renderer::new(&mut imgui, &device, &queue, renderer_config);
-
-        let imgui_sdl2 = ImguiSdl2::new(&mut imgui, &window, &sdl);
+        let renderer = Renderer::new(&device, &queue, surface_desc.format);
+        let fonts = Fonts::new(FONT_PX)?;
         let event_pump = sdl.event_pump().map_err(|e| e.to_string())?;
 
         Ok(Self {
@@ -118,10 +95,8 @@ impl HostShell {
             device,
             queue,
             surface_desc,
-            imgui,
             renderer,
-            imgui_sdl2,
-            last_frame: Instant::now(),
+            fonts,
         })
     }
 }
