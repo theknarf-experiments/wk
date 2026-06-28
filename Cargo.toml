@@ -19,3 +19,4 @@ wasi-webgpu-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime" }
 wasi-graphics-context-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime" }
 wgpu-core = "29"
 wgpu-types = "29"
+web-audio-api = "1.6.0"

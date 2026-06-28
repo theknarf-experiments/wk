@@ -1,3 +1,4 @@
+mod audio;
 mod compositor;
 mod host_shell;
 mod plugin;

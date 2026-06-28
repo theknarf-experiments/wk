@@ -602,6 +602,7 @@ impl PluginHost {
         // own in-memory filesystem in its place.
         crate::vfs::add_wasi_except_fs(&mut linker)?;
         crate::vfs::add_to_linker(&mut linker)?;
+        crate::audio::add_to_linker(&mut linker)?;
         wasi::surface::surface::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
         wasi::graphics_context::graphics_context::add_to_linker::<_, HasSelf<_>>(
             &mut linker,

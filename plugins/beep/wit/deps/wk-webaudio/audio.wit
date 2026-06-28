@@ -1,0 +1,32 @@
+package wk:webaudio;
+
+interface audio {
+    enum oscillator-type {
+        sine,
+        square,
+        sawtooth,
+        triangle,
+    }
+
+    resource context {
+        constructor();
+        sample-rate: func() -> f32;
+        current-time: func() -> f64;
+        create-oscillator: func() -> oscillator;
+        create-gain: func() -> gain;
+    }
+
+    resource oscillator {
+        set-type: func(ty: oscillator-type);
+        set-frequency: func(hz: f32);
+        connect: func(dst: borrow<gain>);
+        connect-destination: func();
+        start: func(when: f64);
+        stop: func(when: f64);
+    }
+
+    resource gain {
+        set-gain: func(value: f32);
+        connect-destination: func();
+    }
+}

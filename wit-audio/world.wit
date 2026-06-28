@@ -1,0 +1,51 @@
+package wk:webaudio;
+
+/// A minimal subset of the W3C Web Audio API, implemented by wk on top of
+/// web-audio-api-rs — so a plugin makes sound the same way a web app would
+/// (the audio analogue of how wk implements wasi:webgpu for graphics).
+interface audio {
+    enum oscillator-type {
+        sine,
+        square,
+        sawtooth,
+        triangle,
+    }
+
+    /// An audio graph wired to the output device. One per plugin, like a web
+    /// page's AudioContext.
+    resource context {
+        constructor();
+        /// The output sample rate, in Hz.
+        sample-rate: func() -> f32;
+        /// The audio clock, in seconds.
+        current-time: func() -> f64;
+        create-oscillator: func() -> oscillator;
+        create-gain: func() -> gain;
+    }
+
+    /// A periodic-waveform source.
+    resource oscillator {
+        set-type: func(ty: oscillator-type);
+        set-frequency: func(hz: f32);
+        /// Route this oscillator into a gain node.
+        connect: func(dst: borrow<gain>);
+        /// Route this oscillator straight to the speakers.
+        connect-destination: func();
+        /// Begin playback at `when` seconds on the context clock (0 = now).
+        start: func(when: f64);
+        /// Stop playback at `when` seconds (0 = now).
+        stop: func(when: f64);
+    }
+
+    /// A volume node.
+    resource gain {
+        set-gain: func(value: f32);
+        /// Route this gain to the speakers.
+        connect-destination: func();
+    }
+}
+
+/// The host side: wk implements (imports) the audio interface for plugins.
+world audio-host {
+    import audio;
+}

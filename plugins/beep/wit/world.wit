@@ -1,0 +1,7 @@
+package wk:beep;
+
+/// Plays a short tone through wk's Web Audio host.
+world beep {
+    import wk:webaudio/audio;
+    export run: func();
+}
