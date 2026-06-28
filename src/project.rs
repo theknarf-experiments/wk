@@ -262,6 +262,21 @@ pub fn add(target: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Publish a local plugin to an OCI registry as a Wasm OCI Artifact. `plugin` is
+/// a dependency name (resolved to its local wasm) or a `.wasm` path; `reference`
+/// is the target, e.g. `localhost:5000/triangle:1.0`.
+pub fn publish(plugin: String, reference: String) -> Result<(), String> {
+    let path = Project::load()
+        .ok()
+        .and_then(|p| p.dependencies.into_iter().find(|d| d.name == plugin))
+        .map(|d| d.local_path())
+        .unwrap_or_else(|| PathBuf::from(&plugin));
+    let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    crate::oci::push(&reference, &bytes)?;
+    println!("published {} -> oci://{reference}", path.display());
+    Ok(())
+}
+
 /// Print the project's dependencies.
 pub fn list() -> Result<(), String> {
     let project = Project::load()?;

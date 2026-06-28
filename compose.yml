@@ -1,0 +1,20 @@
+# A local OCI registry for testing wk's package-manager path end to end.
+#
+#   docker compose up -d
+#   # publish a built plugin, then depend on it from the registry:
+#   wk publish triangle localhost:5001/triangle:1.0
+#   wk add oci://localhost:5001/triangle:1.0
+#   wk run
+#
+# Plain-HTTP registry on :5001 (5000 is taken by macOS AirPlay Receiver); wk
+# talks HTTP to localhost registries.
+services:
+  registry:
+    image: registry:2
+    ports:
+      - "5001:5000"
+    volumes:
+      - registry-data:/var/lib/registry
+
+volumes:
+  registry-data:

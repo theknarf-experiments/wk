@@ -38,6 +38,14 @@ enum Commands {
         target: String,
     },
 
+    /// Publish a plugin to an OCI registry as a Wasm OCI Artifact
+    Publish {
+        /// Dependency name or local `.wasm` path
+        plugin: String,
+        /// Target OCI reference, e.g. localhost:5000/triangle:1.0
+        reference: String,
+    },
+
     /// List the project's dependencies
     List,
 
@@ -62,6 +70,9 @@ fn main() -> Result<(), String> {
     match &cli.command {
         Some(Commands::Init { name }) => project::init(name.clone()),
         Some(Commands::Add { target }) => project::add(target.clone()),
+        Some(Commands::Publish { plugin, reference }) => {
+            project::publish(plugin.clone(), reference.clone())
+        }
         Some(Commands::List) => project::list(),
         Some(Commands::Remove { plugin }) => project::remove(plugin.clone()),
         // `wk run [paths...]` runs the project (or the given ad-hoc paths).

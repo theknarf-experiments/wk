@@ -9,12 +9,26 @@
 
 use std::path::PathBuf;
 
-use oci_client::client::ClientConfig;
+use oci_client::client::{ClientConfig, ClientProtocol, Config, ImageLayer};
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 
 /// The Wasm OCI Artifact layer media type.
 const WASM_LAYER: &str = "application/wasm";
+/// The Wasm OCI Artifact config media type, and a minimal config body.
+const WASM_CONFIG: &str = "application/vnd.wasm.config.v0+json";
+const WASM_CONFIG_BODY: &str = r#"{"architecture":"wasm","os":"wasi"}"#;
+
+/// A client for `image`'s registry. A `localhost` registry is served over plain
+/// HTTP (the common local-testing setup, e.g. `registry:2` in compose.yml).
+fn client_for(image: &Reference) -> Client {
+    let registry = image.registry().to_string();
+    let mut config = ClientConfig::default();
+    if registry.starts_with("localhost") || registry.starts_with("127.0.0.1") {
+        config.protocol = ClientProtocol::HttpsExcept(vec![registry]);
+    }
+    Client::new(config)
+}
 
 fn cache_dir() -> PathBuf {
     std::env::var_os("XDG_CACHE_HOME")
@@ -67,7 +81,7 @@ pub fn pull(reference: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("tokio runtime: {e}"))?;
 
     rt.block_on(async {
-        let client = Client::new(ClientConfig::default());
+        let client = client_for(&image);
         let data = client
             .pull(&image, &RegistryAuth::Anonymous, vec![WASM_LAYER])
             .await
@@ -78,6 +92,41 @@ pub fn pull(reference: &str) -> Result<Vec<u8>, String> {
             .next()
             .ok_or_else(|| format!("{reference}: artifact has no {WASM_LAYER} layer"))?;
         Ok(layer.data.to_vec())
+    })
+}
+
+/// Push `wasm` to `reference` as a Wasm OCI Artifact (anonymously). Blocking.
+pub fn push(reference: &str, wasm: &[u8]) -> Result<(), String> {
+    let image: Reference = reference
+        .parse()
+        .map_err(|e| format!("invalid OCI reference {reference:?}: {e}"))?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+
+    rt.block_on(async {
+        let client = client_for(&image);
+        let layer = ImageLayer::new(wasm.to_vec(), WASM_LAYER.to_string(), None);
+        let config = Config::new(
+            WASM_CONFIG_BODY.as_bytes().to_vec(),
+            WASM_CONFIG.to_string(),
+            None,
+        );
+        // `manifest: None` lets oci-client build the OCI manifest from the
+        // config + layer (digests and sizes filled in).
+        client
+            .push(
+                &image,
+                std::slice::from_ref(&layer),
+                config,
+                &RegistryAuth::Anonymous,
+                None,
+            )
+            .await
+            .map_err(|e| format!("failed to push {reference}: {e}"))?;
+        Ok(())
     })
 }
 
