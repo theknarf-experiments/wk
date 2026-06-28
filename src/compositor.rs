@@ -55,6 +55,81 @@ const BODY: [f32; 4] = [0.10, 0.10, 0.13, 1.0];
 const BORDER_COL: [f32; 4] = [0.32, 0.33, 0.38, 1.0];
 const TEXT: [f32; 4] = [0.90, 0.90, 0.93, 1.0];
 const CLOSE_HOT: [f32; 4] = [0.80, 0.30, 0.30, 1.0];
+/// Terminal grid background.
+const TERM_BG: [f32; 4] = [0.063, 0.063, 0.086, 1.0];
+
+/// Convert an 8-bit RGB triple to a normalized opaque colour.
+fn rgba(c: [u8; 3]) -> [f32; 4] {
+    [
+        c[0] as f32 / 255.0,
+        c[1] as f32 / 255.0,
+        c[2] as f32 / 255.0,
+        1.0,
+    ]
+}
+
+/// Encode a key press as the bytes a terminal app expects on stdin. `text` is
+/// winit's resolved character(s) for the key (handles shift/layout).
+fn encode_term_key(code: KeyCode, text: Option<&str>, mods: ModifiersState) -> Option<Vec<u8>> {
+    use KeyCode as C;
+    // Ctrl+letter -> control byte (Ctrl-A = 0x01 ... Ctrl-Z = 0x1a).
+    if mods.control_key() {
+        if let Some(n) = letter_index(code) {
+            return Some(vec![n + 1]);
+        }
+    }
+    Some(match code {
+        C::Enter | C::NumpadEnter => vec![b'\r'],
+        C::Backspace => vec![0x7f],
+        C::Tab => vec![b'\t'],
+        C::Escape => vec![0x1b],
+        C::ArrowUp => vec![0x1b, b'[', b'A'],
+        C::ArrowDown => vec![0x1b, b'[', b'B'],
+        C::ArrowRight => vec![0x1b, b'[', b'C'],
+        C::ArrowLeft => vec![0x1b, b'[', b'D'],
+        C::Home => vec![0x1b, b'[', b'H'],
+        C::End => vec![0x1b, b'[', b'F'],
+        _ => match text {
+            Some(t) if !t.is_empty() => t.as_bytes().to_vec(),
+            _ => return None,
+        },
+    })
+}
+
+/// 0-based letter index (A=0 .. Z=25) for a key code, else `None`.
+fn letter_index(code: KeyCode) -> Option<u8> {
+    use KeyCode as C;
+    let n = match code {
+        C::KeyA => 0,
+        C::KeyB => 1,
+        C::KeyC => 2,
+        C::KeyD => 3,
+        C::KeyE => 4,
+        C::KeyF => 5,
+        C::KeyG => 6,
+        C::KeyH => 7,
+        C::KeyI => 8,
+        C::KeyJ => 9,
+        C::KeyK => 10,
+        C::KeyL => 11,
+        C::KeyM => 12,
+        C::KeyN => 13,
+        C::KeyO => 14,
+        C::KeyP => 15,
+        C::KeyQ => 16,
+        C::KeyR => 17,
+        C::KeyS => 18,
+        C::KeyT => 19,
+        C::KeyU => 20,
+        C::KeyV => 21,
+        C::KeyW => 22,
+        C::KeyX => 23,
+        C::KeyY => 24,
+        C::KeyZ => 25,
+        _ => return None,
+    };
+    Some(n)
+}
 
 /// Map a winit physical key to the wasi-gfx W3C `key` code.
 fn map_key(code: KeyCode) -> Option<Key> {
@@ -316,6 +391,8 @@ struct App {
 
     views: HashMap<u64, (TextureId, u32, u32)>,
     text_cache: TextCache,
+    /// VT terminal per non-graphical node, fed from its stdout.
+    terminals: HashMap<u64, crate::terminal::Terminal>,
 
     cam: Camera,
     pan_target: [f32; 2],
@@ -349,6 +426,8 @@ struct App {
     zoom_factor: f32,
     zoom_focus: [f32; 2],
     key_events: Vec<(KeyEvent, bool)>,
+    /// Keyboard encoded as terminal input bytes for the focused terminal node.
+    term_input: Vec<u8>,
     should_exit: bool,
 }
 
@@ -367,6 +446,7 @@ impl App {
             next_node_id: 0,
             views: HashMap::new(),
             text_cache: TextCache::default(),
+            terminals: HashMap::new(),
             cam: Camera {
                 pan: [0.0, 0.0],
                 zoom: 1.0,
@@ -391,6 +471,7 @@ impl App {
             zoom_factor: 1.0,
             zoom_focus: [0.0, 0.0],
             key_events: Vec::new(),
+            term_input: Vec::new(),
             should_exit: false,
         };
         app.restore_session();
@@ -670,6 +751,23 @@ impl App {
             .map(|s| (s.lock().unwrap().node_id, s.clone()))
             .collect();
 
+        // ---- feed terminal nodes (those without a surface) ----
+        for node in &nodes {
+            if node_surface.contains_key(&node.id) {
+                continue;
+            }
+            let bytes = node.term_io.drain_out();
+            let term = self
+                .terminals
+                .entry(node.id)
+                .or_insert_with(|| crate::terminal::Terminal::new(node.term_io.clone()));
+            if !bytes.is_empty() {
+                term.feed(&bytes);
+            }
+        }
+        self.terminals
+            .retain(|id, _| node_by_id.contains_key(id) && !node_surface.contains_key(id));
+
         // ---- interaction ----
         let mut to_close: Vec<u64> = Vec::new();
         let menu_w = MENU_H + gfx.fonts.measure("Apps") as f32 + PAD;
@@ -832,7 +930,8 @@ impl App {
             }
         }
 
-        // Keyboard to the focused window's surface.
+        // Keyboard to the focused window: a graphical node's surface gets
+        // wasi-gfx key events; a terminal node gets the encoded input bytes.
         if let Some(fid) = self.kbd_focus {
             if let Some(surf) = node_surface.get(&fid) {
                 let mut s = surf.lock().unwrap();
@@ -843,9 +942,14 @@ impl App {
                         s.key_up.push_back(ev.clone());
                     }
                 }
+            } else if !self.term_input.is_empty() {
+                if let Some(node) = node_by_id.get(&fid) {
+                    node.term_io.feed_in(&self.term_input);
+                }
             }
         }
         self.key_events.clear();
+        self.term_input.clear();
 
         // ---- drive surfaces ----
         for shared in &surfaces {
@@ -1070,28 +1174,57 @@ impl App {
                         ca_clip,
                     ));
                 }
-            } else if let Some(node) = node_by_id.get(&id) {
-                let bytes = node.console.contents();
-                let txt = String::from_utf8_lossy(&bytes);
-                let line_h = gfx.fonts.line_height() as f32;
-                let rows = ((size[1] - TITLE_H - BORDER) / line_h).max(1.0) as usize;
-                let lines: Vec<&str> = txt.lines().collect();
-                let start = lines.len().saturating_sub(rows);
-                for (i, line) in lines[start..].iter().enumerate() {
-                    let ly = ca[1] + i as f32 * line_h * zf;
-                    self.text_cache.draw(
-                        &mut quads,
-                        &mut gfx.renderer,
-                        &gfx.fonts,
-                        &gfx.device,
-                        &gfx.queue,
-                        line,
-                        ca[0] + 3.0 * zf,
-                        ly,
-                        zf,
-                        TEXT,
+            } else if let Some((cells, cursor)) =
+                self.terminals.get(&id).map(|t| (t.cells(), t.cursor()))
+            {
+                // Render the VT cell grid, scaled uniformly to fit the content.
+                let cols = crate::terminal::COLS as f32;
+                let rows = crate::terminal::ROWS as f32;
+                let bw = (gfx.fonts.measure("M") as f32).max(1.0);
+                let bh = (gfx.fonts.line_height() as f32).max(1.0);
+                let scale = ((ca[2] - ca[0]) / (cols * bw))
+                    .min((ca[3] - ca[1]) / (rows * bh))
+                    .max(0.01);
+                let cw = bw * scale;
+                let chh = bh * scale;
+                quads.push(Quad::solid(white, ca, TERM_BG, ca_clip));
+                for cell in &cells {
+                    let cx = ca[0] + cell.col as f32 * cw;
+                    let cy = ca[1] + cell.row as f32 * chh;
+                    if let Some(bg) = cell.bg {
+                        quads.push(Quad::solid(
+                            white,
+                            [cx, cy, cx + cw, cy + chh],
+                            rgba(bg),
+                            ca_clip,
+                        ));
+                    }
+                    if cell.ch != ' ' {
+                        let mut buf = [0u8; 4];
+                        self.text_cache.draw(
+                            &mut quads,
+                            &mut gfx.renderer,
+                            &gfx.fonts,
+                            &gfx.device,
+                            &gfx.queue,
+                            cell.ch.encode_utf8(&mut buf),
+                            cx,
+                            cy,
+                            scale,
+                            rgba(cell.fg),
+                            ca_clip,
+                        );
+                    }
+                }
+                if let Some((ccol, crow)) = cursor {
+                    let cx = ca[0] + ccol as f32 * cw;
+                    let cy = ca[1] + crow as f32 * chh;
+                    quads.push(Quad::solid(
+                        white,
+                        [cx, cy, cx + cw, cy + chh],
+                        [0.85, 0.85, 0.9, 0.45],
                         ca_clip,
-                    );
+                    ));
                 }
             }
 
@@ -1243,7 +1376,11 @@ impl App {
         for id in &to_close {
             if let Some(node) = node_by_id.get(id) {
                 node.kill.store(true, Ordering::Relaxed);
+                // Close stdin so a terminal guest blocked on a read unblocks and
+                // its thread can exit (it isn't running wasm for the epoch to trap).
+                node.term_io.close();
             }
+            self.terminals.remove(id);
             self.registry.lock().unwrap().retain(|s| {
                 let mut g = s.lock().unwrap();
                 if g.node_id != *id {
@@ -1373,13 +1510,19 @@ impl ApplicationHandler for App {
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
-                    if code == KeyCode::Escape && event.state == ElementState::Pressed {
+                    let pressed = event.state == ElementState::Pressed;
+                    // Escape quits wk only when nothing is focused; otherwise it
+                    // belongs to the focused app/terminal (vim lives on Escape).
+                    if code == KeyCode::Escape && pressed && self.kbd_focus.is_none() {
                         self.should_exit = true;
                     }
-                    self.key_events.push((
-                        key_event(code, self.mods),
-                        event.state == ElementState::Pressed,
-                    ));
+                    if pressed {
+                        if let Some(bytes) = encode_term_key(code, event.text.as_deref(), self.mods)
+                        {
+                            self.term_input.extend(bytes);
+                        }
+                    }
+                    self.key_events.push((key_event(code, self.mods), pressed));
                 }
             }
             _ => {}

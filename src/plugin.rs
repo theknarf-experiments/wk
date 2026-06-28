@@ -18,7 +18,6 @@ use std::task::{Context as TaskContext, Poll, Waker};
 
 use wasmtime::component::{Component, HasSelf, Linker, Resource, ResourceTable};
 use wasmtime::{Config, Engine, Result, Store, UpdateDeadline};
-use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 use wasmtime_wasi::p2::{subscribe, DynPollable, Pollable};
 use wasmtime_wasi::{async_trait, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
@@ -122,8 +121,10 @@ pub struct Node {
     pub id: u64,
     /// The dependency name this node was launched from.
     pub name: String,
-    /// Captured stdout+stderr, rendered in the node's console window.
-    pub console: MemoryOutputPipe,
+    /// The node's terminal stdio: its stdout feeds the compositor's VT parser,
+    /// its stdin is fed from the keyboard. Non-graphical nodes render as a
+    /// terminal window.
+    pub term_io: crate::terminal::SharedTermIo,
     /// This node's in-memory filesystem, so the compositor can mount connected
     /// file nodes into it.
     pub fs: crate::vfs::SharedFs,
@@ -633,16 +634,15 @@ impl PluginHost {
         wasi::frame_buffer::frame_buffer::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
         wasi_webgpu_wasmtime::add_to_linker(&mut linker)?;
 
-        // ~1 MiB of scrollback; the guest traps if it overruns this (rare).
-        let console = MemoryOutputPipe::new(1 << 20);
         let finished = Arc::new(AtomicBool::new(false));
         let kill = Arc::new(AtomicBool::new(false));
         let fs = crate::vfs::new_fs();
         let midi_in = crate::midi::new_inbox();
+        let term_io = crate::terminal::TermIo::new();
         nodes.lock().unwrap().push(Arc::new(Node {
             id,
             name: name.to_string(),
-            console: console.clone(),
+            term_io: term_io.clone(),
             fs: fs.clone(),
             midi_in: midi_in.clone(),
             finished: finished.clone(),
@@ -652,8 +652,12 @@ impl PluginHost {
         let component = Component::from_file(&self.engine, path)?;
         let state = HostState {
             ctx: WasiCtxBuilder::new()
-                .stdout(console.clone())
-                .stderr(console)
+                .stdout(crate::terminal::stdout(&term_io))
+                .stderr(crate::terminal::stdout(&term_io))
+                .stdin(crate::terminal::stdin(&term_io))
+                .env("TERM", "xterm-256color")
+                .env("COLUMNS", crate::terminal::COLS.to_string())
+                .env("LINES", crate::terminal::ROWS.to_string())
                 .build(),
             table: ResourceTable::new(),
             registry: surfaces,

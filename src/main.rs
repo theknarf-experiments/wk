@@ -6,6 +6,7 @@ mod plugin;
 mod project;
 mod render2d;
 mod session;
+mod terminal;
 mod text;
 mod vfs;
 

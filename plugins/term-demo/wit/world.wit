@@ -1,0 +1,9 @@
+package wk:term-demo;
+
+/// A tiny terminal app: it prints an ANSI banner and an interactive prompt,
+/// echoing what you type (with colours, backspace and Enter handling) through
+/// plain stdio. Proves wk's terminal node end-to-end (stdout -> VT grid, and
+/// keyboard -> stdin) without any wk-specific interface.
+world term-demo {
+    export run: func();
+}
