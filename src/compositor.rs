@@ -23,6 +23,11 @@ use crate::plugin::{
 /// Target frame time (~60 fps).
 const FRAME: Duration = Duration::from_nanos(1_000_000_000 / 60);
 
+/// Canvas pixels panned per unit of scroll wheel.
+const SCROLL_PAN_SPEED: f32 = 30.0;
+/// Zoom multiplier per unit of zoom-scroll.
+const ZOOM_STEP: f32 = 1.1;
+
 /// Map an SDL physical key to the wasi-gfx W3C `key` code. Returns `None` for
 /// keys we don't translate (the client still gets the event, just `key: none`).
 fn map_key(sc: Scancode) -> Option<Key> {
@@ -129,10 +134,94 @@ fn plugin_name(path: &Path) -> String {
         .unwrap_or_else(|| "plugin".to_string())
 }
 
+/// The infinite-canvas camera: app windows live in canvas space and are mapped
+/// to screen space by panning (scroll) and zooming (Cmd/Ctrl + scroll). The top
+/// menu bar is drawn in screen space and so stays fixed.
+#[derive(Clone, Copy)]
+struct Camera {
+    pan: [f32; 2],
+    zoom: f32,
+}
+
+impl Camera {
+    fn to_screen(self, p: [f32; 2]) -> [f32; 2] {
+        [
+            self.pan[0] + p[0] * self.zoom,
+            self.pan[1] + p[1] * self.zoom,
+        ]
+    }
+    fn to_canvas(self, p: [f32; 2]) -> [f32; 2] {
+        [
+            (p[0] - self.pan[0]) / self.zoom,
+            (p[1] - self.pan[1]) / self.zoom,
+        ]
+    }
+    /// Zoom by `factor` while keeping the canvas point under `focus` (screen
+    /// pixels) fixed, so zooming homes in on the cursor.
+    fn zoom_at(&mut self, factor: f32, focus: [f32; 2]) {
+        let anchor = self.to_canvas(focus);
+        self.zoom = (self.zoom * factor).clamp(0.2, 8.0);
+        self.pan = [
+            focus[0] - anchor[0] * self.zoom,
+            focus[1] - anchor[1] * self.zoom,
+        ];
+    }
+}
+
+/// A window's position and size in canvas space, kept independent of pan/zoom
+/// so the user can drag/resize it (captured back from imgui each frame).
+#[derive(Clone, Copy)]
+struct WinState {
+    pos: [f32; 2],
+    size: [f32; 2],
+}
+
+/// Look up (or spawn, cascaded) a window's canvas rect, returning its current
+/// screen position and size for this frame's camera.
+fn window_screen_rect(
+    win_state: &mut HashMap<String, WinState>,
+    key: &str,
+    default_size: [f32; 2],
+    spawn_idx: usize,
+    cam: &Camera,
+) -> ([f32; 2], [f32; 2]) {
+    let st = *win_state.entry(key.to_string()).or_insert_with(|| {
+        let step = (spawn_idx % 8) as f32 * 28.0;
+        WinState {
+            pos: [40.0 + step, 56.0 + step],
+            size: default_size,
+        }
+    });
+    (
+        cam.to_screen(st.pos),
+        [st.size[0] * cam.zoom, st.size[1] * cam.zoom],
+    )
+}
+
+/// Record where the user dragged/resized a window to, back in canvas space.
+fn capture_window(
+    win_state: &mut HashMap<String, WinState>,
+    key: &str,
+    screen_pos: [f32; 2],
+    screen_size: [f32; 2],
+    cam: &Camera,
+) {
+    if let Some(st) = win_state.get_mut(key) {
+        st.pos = cam.to_canvas(screen_pos);
+        st.size = [screen_size[0] / cam.zoom, screen_size[1] / cam.zoom];
+    }
+}
+
 /// Draw the console window for a non-graphical instance: its captured
-/// stdout/stderr in a scrolling region. Returns `false` if its close box was
-/// clicked this frame.
-fn console_window(ui: &imgui::Ui, inst: &SharedInstance) -> bool {
+/// stdout/stderr in a scrolling region, placed on the canvas. Returns `false`
+/// if its close box was clicked this frame.
+fn console_window(
+    ui: &imgui::Ui,
+    inst: &SharedInstance,
+    win_state: &mut HashMap<String, WinState>,
+    cam: &Camera,
+    spawn_idx: usize,
+) -> bool {
     let finished = inst.finished.load(Ordering::Relaxed);
     let title = if finished {
         format!("{} (exited)##inst{}", inst.name, inst.id)
@@ -142,11 +231,18 @@ fn console_window(ui: &imgui::Ui, inst: &SharedInstance) -> bool {
     let bytes = inst.console.contents();
     let text = String::from_utf8_lossy(&bytes);
 
+    let key = format!("console:{}", inst.id);
+    let (pos, size) = window_screen_rect(win_state, &key, [460.0, 280.0], spawn_idx, cam);
+
     let mut open = true;
+    let mut cur_pos = pos;
+    let mut cur_size = size;
     ui.window(title)
         .opened(&mut open)
-        .size([460.0, 280.0], Condition::FirstUseEver)
+        .position(pos, Condition::Always)
+        .size(size, Condition::Always)
         .build(|| {
+            ui.set_window_font_scale(cam.zoom);
             ui.child_window("##console")
                 .horizontal_scrollbar(true)
                 .build(|| {
@@ -157,7 +253,10 @@ fn console_window(ui: &imgui::Ui, inst: &SharedInstance) -> bool {
                         ui.set_scroll_here_y_with_ratio(1.0);
                     }
                 });
+            cur_pos = ui.window_pos();
+            cur_size = ui.window_size();
         });
+    capture_window(win_state, &key, cur_pos, cur_size, cam);
     open
 }
 
@@ -234,6 +333,12 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
     let mut views: HashMap<u64, SurfaceView> = HashMap::new();
     // Input over each surface's window, collected last frame.
     let mut inputs: HashMap<u64, SurfaceInput> = HashMap::new();
+    // Infinite-canvas camera and each window's canvas-space rect.
+    let mut cam = Camera {
+        pan: [0.0, 0.0],
+        zoom: 1.0,
+    };
+    let mut win_state: HashMap<String, WinState> = HashMap::new();
 
     'running: loop {
         // Advance the epoch so any killed instance traps and ends this frame.
@@ -241,9 +346,42 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
 
         // Key events captured this frame, delivered to the focused client below.
         let mut key_events: Vec<(KeyEvent, bool)> = Vec::new();
+        // Canvas pan/zoom requested by scroll / Cmd-Ctrl+scroll this frame.
+        let mut pan_delta = [0.0f32, 0.0];
+        let mut zoom_step = 0.0f32;
+        let mut zoom_focus = [0.0f32, 0.0];
+
+        // Whether a zoom modifier (Cmd or Ctrl) is held: turns scroll into zoom.
+        let zoom_mod = {
+            let ks = event_pump.keyboard_state();
+            ks.is_scancode_pressed(Scancode::LGui)
+                || ks.is_scancode_pressed(Scancode::RGui)
+                || ks.is_scancode_pressed(Scancode::LCtrl)
+                || ks.is_scancode_pressed(Scancode::RCtrl)
+        };
 
         for event in event_pump.poll_iter() {
             imgui_sdl2.handle_event(&mut imgui, &event);
+
+            // Scroll pans the canvas; with the zoom modifier it zooms instead.
+            // (SDL3 doesn't surface native trackpad pinch, so Cmd/Ctrl+scroll is
+            // the zoom gesture.)
+            if let Event::MouseWheel {
+                x,
+                y,
+                mouse_x,
+                mouse_y,
+                ..
+            } = event
+            {
+                if zoom_mod {
+                    zoom_step += y;
+                    zoom_focus = [mouse_x, mouse_y];
+                } else {
+                    pan_delta[0] += x * SCROLL_PAN_SPEED;
+                    pan_delta[1] += y * SCROLL_PAN_SPEED;
+                }
+            }
 
             // Capture keyboard regardless of imgui's own handling.
             match &event {
@@ -281,7 +419,17 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
             }
         }
 
+        // Apply this frame's pan/zoom to the canvas camera.
+        cam.pan[0] += pan_delta[0];
+        cam.pan[1] += pan_delta[1];
+        if zoom_step != 0.0 {
+            cam.zoom_at(ZOOM_STEP.powf(zoom_step), zoom_focus);
+        }
+
         imgui_sdl2.prepare_frame(imgui.io_mut(), &window, &event_pump.mouse_state());
+        // Scroll drives the canvas, not imgui's own window scrolling.
+        imgui.io_mut().mouse_wheel = 0.0;
+        imgui.io_mut().mouse_wheel_h = 0.0;
 
         let now = Instant::now();
         imgui.io_mut().delta_time = (now - last_frame).as_secs_f32();
@@ -378,17 +526,19 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
             });
 
             inputs.clear();
-            // Every instance gets a window: its surface(s) if it created any,
-            // otherwise a console showing its captured stdout/stderr. Closing
-            // any of an instance's windows quits the whole instance.
-            for inst in &instances {
+            // Every instance gets a window on the canvas: its surface(s) if it
+            // created any, otherwise a console showing its captured
+            // stdout/stderr. Each window is positioned and sized through the
+            // camera (so it pans/zooms), and any drag/resize is captured back
+            // into canvas space. Closing any window quits the whole instance.
+            for (idx, inst) in instances.iter().enumerate() {
                 let inst_surfaces: Vec<&SharedSurface> = surfaces
                     .iter()
                     .filter(|s| s.lock().unwrap().instance_id == inst.id)
                     .collect();
 
                 if inst_surfaces.is_empty() {
-                    if !console_window(ui, inst) {
+                    if !console_window(ui, inst, &mut win_state, &cam, idx) {
                         to_close.push(inst.clone());
                     }
                     continue;
@@ -402,21 +552,29 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
                     let Some(view) = views.get(&sid) else {
                         continue;
                     };
-                    let (tex, w, h) = (view.texture, view.width as f32, view.height as f32);
+                    let tex = view.texture;
+                    let key = format!("surf:{sid}");
+                    let default = [view.width as f32 + 16.0, view.height as f32 + 36.0];
+                    let (pos, size) = window_screen_rect(&mut win_state, &key, default, idx, &cam);
+
                     let mut input = SurfaceInput::default();
                     let mut open = true;
+                    let mut cur_pos = pos;
+                    let mut cur_size = size;
                     ui.window(format!("{title}##{sid}"))
                         .opened(&mut open)
-                        .size([w + 16.0, h + 36.0], Condition::FirstUseEver)
+                        .position(pos, Condition::Always)
+                        .size(size, Condition::Always)
                         .build(|| {
                             input.focused = ui.is_window_focused();
 
-                            // Resize the client to fill the window's content area.
+                            // The client renders at the window's on-screen pixel
+                            // size, so zooming in gives a sharper surface.
                             let avail = ui.content_region_avail();
                             input.resize = Some((clamp_size(avail[0]), clamp_size(avail[1])));
 
                             let origin = ui.cursor_screen_pos();
-                            imgui::Image::new(tex, [w, h]).build(ui);
+                            imgui::Image::new(tex, avail).build(ui);
                             if ui.is_item_hovered() {
                                 let mouse = ui.io().mouse_pos;
                                 let local =
@@ -429,7 +587,10 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
                                     input.up.push(local);
                                 }
                             }
+                            cur_pos = ui.window_pos();
+                            cur_size = ui.window_size();
                         });
+                    capture_window(&mut win_state, &key, cur_pos, cur_size, &cam);
                     if !open {
                         to_close.push(inst.clone());
                     }
@@ -489,6 +650,7 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
         // free their textures, and drop the instance.
         for inst in &to_close {
             inst.kill.store(true, Ordering::Relaxed);
+            win_state.remove(&format!("console:{}", inst.id));
             registry.lock().unwrap().retain(|s| {
                 let mut g = s.lock().unwrap();
                 if g.instance_id != inst.id {
@@ -500,6 +662,7 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
                     renderer.textures.remove(v.texture);
                 }
                 inputs.remove(&g.id);
+                win_state.remove(&format!("surf:{}", g.id));
                 false
             });
             instance_reg
