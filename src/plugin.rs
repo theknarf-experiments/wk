@@ -131,6 +131,10 @@ pub struct Node {
     /// This node's MIDI input queue, so the compositor can wire a MIDI source's
     /// output to it.
     pub midi_in: crate::midi::SharedInbox,
+    /// If this node is a `wasi:http` server (exports `incoming-handler`), the
+    /// component path to serve when it's wired to a HostPort. Such nodes don't
+    /// run a `run` loop; they're served on demand.
+    pub http_path: Option<std::path::PathBuf>,
     /// Set by the guest thread when its `run` returns (it exited on its own).
     pub finished: Arc<AtomicBool>,
     /// Kill switch: set by the compositor to stop a still-running node.
@@ -584,6 +588,14 @@ fn component_is_command(component: &Component, engine: &Engine) -> bool {
         .any(|(name, _)| name == "wasi:cli/run" || name.starts_with("wasi:cli/run@"))
 }
 
+/// Whether a component is a `wasi:http` server (exports `incoming-handler`).
+fn component_is_proxy(component: &Component, engine: &Engine) -> bool {
+    component
+        .component_type()
+        .exports(engine)
+        .any(|(name, _)| name.starts_with("wasi:http/incoming-handler"))
+}
+
 /// Add the standard `wasi:random` interfaces, backed by this store's own RNG.
 /// (We replicate wasmtime-wasi's linker setup without its filesystem, so its
 /// `add_to_linker_async` — which would also add the cap-std fs — can't be used;
@@ -628,19 +640,8 @@ impl PluginHost {
         self.engine.increment_epoch();
     }
 
-    /// Load a client component and run its `run` export on a dedicated thread,
-    /// registering it as a `Node` under the compositor-assigned `id`. Surfaces
-    /// it creates appear in `surfaces` (tagged with the node id); its
-    /// stdout/stderr are captured for the node's console window.
-    pub fn spawn(
-        &self,
-        path: &Path,
-        name: &str,
-        id: u64,
-        args: &[String],
-        surfaces: SurfaceRegistry,
-        nodes: NodeRegistry,
-    ) -> Result<()> {
+    /// Build a linker with every interface wk provides to a guest.
+    fn build_linker(&self) -> Result<Linker<HostState>> {
         let mut linker: Linker<HostState> = Linker::new(&self.engine);
         // Provide every wasmtime-wasi interface except its filesystem, then our
         // own in-memory filesystem in its place.
@@ -659,12 +660,92 @@ impl PluginHost {
         )?;
         wasi::frame_buffer::frame_buffer::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
         wasi_webgpu_wasmtime::add_to_linker(&mut linker)?;
+        Ok(linker)
+    }
+
+    /// Serve a `wasi:http/incoming-handler` component on `127.0.0.1:port`,
+    /// dispatching each request to a fresh isolated store. `term_io` receives the
+    /// guest's stdout/stderr (the HostPort/node case); `None` inherits stdio (the
+    /// throwaway CLI case). Blocks until `kill` is set.
+    pub fn serve(
+        &self,
+        path: &Path,
+        port: u16,
+        term_io: Option<crate::terminal::SharedTermIo>,
+        kill: Arc<AtomicBool>,
+    ) -> Result<()> {
+        let component = Component::from_file(&self.engine, path)?;
+        let linker = self.build_linker()?;
+        let pre =
+            wasmtime_wasi_http::p2::bindings::ProxyPre::new(linker.instantiate_pre(&component)?)?;
+        // One isolated container filesystem shared across this server's requests.
+        let fs = crate::vfs::new_fs();
+        let midi_in = crate::midi::new_inbox();
+        let midi = self.midi.clone();
+        let gpu = self.gpu.clone();
+        let make_state = move || HostState {
+            ctx: {
+                let mut b = WasiCtxBuilder::new();
+                b.arg("http");
+                match &term_io {
+                    Some(io) => {
+                        b.stdout(crate::terminal::stdout(io))
+                            .stderr(crate::terminal::stdout(io));
+                    }
+                    None => {
+                        b.inherit_stdout().inherit_stderr();
+                    }
+                }
+                b.build()
+            },
+            table: ResourceTable::new(),
+            registry: Arc::new(Mutex::new(Vec::new())),
+            node_id: 0,
+            fs: fs.clone(),
+            midi_in: midi_in.clone(),
+            midi_router: midi.clone(),
+            random_ctx: wasmtime_wasi::random::WasiRandomCtx::default(),
+            http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
+            gpu: gpu.clone(),
+        };
+        let engine = self.engine.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = crate::http::serve(engine, pre, make_state, port, kill) {
+                eprintln!("http server error: {e:#}");
+            }
+        });
+        Ok(())
+    }
+
+    /// Load a client component and run its `run` export on a dedicated thread,
+    /// registering it as a `Node` under the compositor-assigned `id`. Surfaces
+    /// it creates appear in `surfaces` (tagged with the node id); its
+    /// stdout/stderr are captured for the node's console window.
+    pub fn spawn(
+        &self,
+        path: &Path,
+        name: &str,
+        id: u64,
+        args: &[String],
+        surfaces: SurfaceRegistry,
+        nodes: NodeRegistry,
+    ) -> Result<()> {
+        let linker = self.build_linker()?;
 
         let finished = Arc::new(AtomicBool::new(false));
         let kill = Arc::new(AtomicBool::new(false));
         let fs = crate::vfs::new_fs();
         let midi_in = crate::midi::new_inbox();
         let term_io = crate::terminal::TermIo::new();
+
+        let component = Component::from_file(&self.engine, path)?;
+        // A `wasi:http` server (exports incoming-handler) doesn't run a `run`
+        // loop — it's served on demand when wired to a HostPort.
+        let is_http = component_is_proxy(&component, &self.engine);
+        // A standard `wasi:cli/command` (any `fn main` recompiled to wasm) is run
+        // through its `wasi:cli/run` export; a wk-world guest through its `run`.
+        let is_command = component_is_command(&component, &self.engine);
+
         nodes.lock().unwrap().push(Arc::new(Node {
             id,
             name: name.to_string(),
@@ -673,12 +754,13 @@ impl PluginHost {
             midi_in: midi_in.clone(),
             finished: finished.clone(),
             kill: kill.clone(),
+            http_path: is_http.then(|| path.to_path_buf()),
         }));
 
-        let component = Component::from_file(&self.engine, path)?;
-        // A standard `wasi:cli/command` (any `fn main` recompiled to wasm) is run
-        // through its `wasi:cli/run` export; a wk-world guest through its `run`.
-        let is_command = component_is_command(&component, &self.engine);
+        if is_http {
+            // Registered as a node; nothing runs until it's exposed on a HostPort.
+            return Ok(());
+        }
         // argv[0] is the program name, then the configured args (e.g. a filename).
         let mut argv = vec![name.to_string()];
         argv.extend(args.iter().cloned());

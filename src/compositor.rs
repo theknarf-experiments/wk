@@ -363,6 +363,10 @@ const FILE_H: f32 = 44.0;
 const FILE_BG: [f32; 4] = [0.20, 0.17, 0.10, 1.0];
 const FILE_BORDER: [f32; 4] = [0.55, 0.45, 0.25, 1.0];
 const PORT_COL: [f32; 4] = [0.70, 0.72, 0.80, 1.0];
+/// HostPort node colours and wire (exposes a wasi:http node to localhost).
+const HOSTPORT_BG: [f32; 4] = [0.10, 0.18, 0.20, 1.0];
+const HOSTPORT_BORDER: [f32; 4] = [0.30, 0.62, 0.66, 1.0];
+const HOSTPORT_WIRE: [f32; 4] = [0.40, 0.78, 0.82, 1.0];
 const WIRE_COL: [f32; 4] = [0.55, 0.60, 0.72, 1.0];
 /// MIDI connection wires get a distinct (teal/green) colour.
 const MIDI_WIRE_COL: [f32; 4] = [0.35, 0.78, 0.62, 1.0];
@@ -412,7 +416,13 @@ struct App {
     /// MIDI connections wiring one app node's output to another's input,
     /// as (source node id, destination node id).
     midi_links: Vec<(u64, u64)>,
+    /// HostPort nodes (canvas node id -> localhost port). Wiring a wasi:http
+    /// node to one exposes it on that port.
+    host_ports: HashMap<u64, u16>,
+    /// Active servers: http node id -> (HostPort id, kill switch).
+    serves: HashMap<u64, (u64, Arc<std::sync::atomic::AtomicBool>)>,
     next_node_id: u64,
+    next_port: u16,
     file_seq: u32,
 
     // Input state, fed by winit events between frames.
@@ -462,6 +472,9 @@ impl App {
             file_nodes: HashMap::new(),
             connections: Vec::new(),
             midi_links: Vec::new(),
+            host_ports: HashMap::new(),
+            serves: HashMap::new(),
+            next_port: 8080,
             file_seq: 0,
             mouse: [0.0, 0.0],
             lmb: false,
@@ -568,6 +581,25 @@ impl App {
             self.midi_links.push((src, dst));
         }
 
+        // HostPort nodes: recreate at their saved positions and ports.
+        for hp in &saved.host_ports {
+            max_id = max_id.max(hp.id);
+            if let Ok(port) = hp.name.parse::<u16>() {
+                self.next_port = self.next_port.max(port + 1);
+                self.win_pos.insert(hp.id, hp.pos);
+                self.win_size.insert(hp.id, hp.size);
+                self.z.push(hp.id);
+                self.host_ports.insert(hp.id, port);
+            }
+        }
+
+        // Re-establish serve wiring (starts the servers again).
+        for &(http_id, hostport_id) in &saved.serves {
+            if self.app_node(http_id).is_some() && self.host_ports.contains_key(&hostport_id) {
+                self.toggle_serve(http_id, hostport_id);
+            }
+        }
+
         self.next_node_id = max_id + 1;
     }
 
@@ -626,19 +658,85 @@ impl App {
             .cloned()
     }
 
-    /// Toggle a connection between two nodes. A file⇄app pair makes a file
-    /// connection (mounting the shared file into the app); an app→app pair makes
-    /// a MIDI connection (wiring `a`'s MIDI output into `b`'s input).
+    /// Create a HostPort node on the canvas (auto-assigned localhost port).
+    fn add_host_port(&mut self) {
+        let id = self.alloc_id();
+        let port = self.next_port;
+        self.next_port = self.next_port.wrapping_add(1).max(8080);
+        let step = (self.host_ports.len() % 8) as f32 * 24.0;
+        let pos = self.cam.to_canvas([320.0 + step, 160.0 + step]);
+        self.win_pos.insert(id, pos);
+        self.win_size.insert(id, [FILE_W, FILE_H]);
+        self.z.push(id);
+        self.host_ports.insert(id, port);
+    }
+
+    /// Toggle a connection between two nodes, by the node kinds: file⇄app mounts
+    /// the file; http-app⇄HostPort exposes the server on localhost; app⇄app wires
+    /// MIDI.
     fn connect_toggle(&mut self, a: u64, b: u64) {
-        match (
+        let (af, bf) = (
             self.file_nodes.contains_key(&a),
             self.file_nodes.contains_key(&b),
-        ) {
-            (true, false) => self.toggle_file(a, b),
-            (false, true) => self.toggle_file(b, a),
-            (false, false) => self.toggle_midi(a, b),
-            (true, true) => {}
+        );
+        let (ap, bp) = (
+            self.host_ports.contains_key(&a),
+            self.host_ports.contains_key(&b),
+        );
+        match (af, bf, ap, bp) {
+            (true, false, _, _) => self.toggle_file(a, b),
+            (false, true, _, _) => self.toggle_file(b, a),
+            (_, _, true, false) => self.toggle_serve(b, a),
+            (_, _, false, true) => self.toggle_serve(a, b),
+            (false, false, false, false) => self.toggle_midi(a, b),
+            _ => {}
         }
+    }
+
+    /// Wire (or unwire) a wasi:http node to a HostPort: start (or stop) serving
+    /// it on `127.0.0.1:<port>`.
+    fn toggle_serve(&mut self, http_id: u64, hostport_id: u64) {
+        if let Some((_, kill)) = self.serves.remove(&http_id) {
+            kill.store(true, Ordering::Relaxed);
+            return;
+        }
+        let Some(node) = self.app_node(http_id) else {
+            return;
+        };
+        let Some(path) = node.http_path.clone() else {
+            return; // not a wasi:http server node
+        };
+        let Some(&port) = self.host_ports.get(&hostport_id) else {
+            return;
+        };
+        let kill = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Err(e) = self
+            .host
+            .serve(&path, port, Some(node.term_io.clone()), kill.clone())
+        {
+            eprintln!("failed to serve {} on :{port}: {e:#}", node.name);
+            return;
+        }
+        self.serves.insert(http_id, (hostport_id, kill));
+    }
+
+    /// Remove a HostPort node, stopping any server bound through it.
+    fn remove_host_port(&mut self, id: u64) {
+        self.host_ports.remove(&id);
+        let bound: Vec<u64> = self
+            .serves
+            .iter()
+            .filter(|(_, (hp, _))| *hp == id)
+            .map(|(&http, _)| http)
+            .collect();
+        for http in bound {
+            if let Some((_, kill)) = self.serves.remove(&http) {
+                kill.store(true, Ordering::Relaxed);
+            }
+        }
+        self.win_pos.remove(&id);
+        self.win_size.remove(&id);
+        self.z.retain(|&x| x != id);
     }
 
     /// Wire (or unwire) file node `file_id` into app node `app_id`'s filesystem.
@@ -744,8 +842,11 @@ impl App {
                 self.z.push(node.id);
             }
         }
-        self.z
-            .retain(|id| node_by_id.contains_key(id) || self.file_nodes.contains_key(id));
+        self.z.retain(|id| {
+            node_by_id.contains_key(id)
+                || self.file_nodes.contains_key(id)
+                || self.host_ports.contains_key(id)
+        });
 
         let surfaces: Vec<SharedSurface> = self.registry.lock().unwrap().clone();
         let node_surface: HashMap<u64, SharedSurface> = surfaces
@@ -783,6 +884,8 @@ impl App {
 
         let file_btn_w = gfx.fonts.measure("+ File") as f32 + 2.0 * PAD;
         let file_btn = [menu_w, 0.0, menu_w + file_btn_w, MENU_H];
+        let port_btn_w = gfx.fonts.measure("+ Port") as f32 + 2.0 * PAD;
+        let port_btn = [file_btn[2], 0.0, file_btn[2] + port_btn_w, MENU_H];
 
         // Continue an in-progress drag (move / resize / connect).
         if let Some(d) = self.drag.take() {
@@ -827,6 +930,10 @@ impl App {
                 self.add_file_node();
                 self.menu_open = false;
                 consumed = true;
+            } else if contains(port_btn, mp) {
+                self.add_host_port();
+                self.menu_open = false;
+                consumed = true;
             } else if self.menu_open {
                 for (i, dep) in self.available.iter().enumerate() {
                     let r = [
@@ -853,6 +960,7 @@ impl App {
                     self.z.push(id);
                     let r = self.rect_of(id);
                     let is_file = self.file_nodes.contains_key(&id);
+                    let is_port = self.host_ports.contains_key(&id);
                     if near(mp, port_pos(r), PORT_R * zf + 3.0) {
                         // Drag a connection wire out of the port.
                         self.drag = Some(Drag {
@@ -860,9 +968,14 @@ impl App {
                             mode: DragMode::Connect,
                             grab: [0.0, 0.0],
                         });
-                    } else if is_file {
+                    } else if is_file || is_port {
+                        // Canvas widget nodes (file / HostPort): close or move.
                         if contains(close_btn(r, zf), mp) {
-                            self.remove_file_node(id);
+                            if is_file {
+                                self.remove_file_node(id);
+                            } else {
+                                self.remove_host_port(id);
+                            }
                         } else {
                             let mc = self.cam.to_canvas(mp);
                             let p = self.win_pos[&id];
@@ -1036,6 +1149,21 @@ impl App {
                 ));
             }
         }
+        // HostPort serve wires (wasi:http node -> exposed localhost port).
+        for (&http, &(hostport, _)) in &self.serves {
+            if self.win_pos.contains_key(&http) && self.win_pos.contains_key(&hostport) {
+                let a = center(self.rect_of(http));
+                let b = center(self.rect_of(hostport));
+                quads.push(Quad::line(
+                    white,
+                    a,
+                    b,
+                    (2.0 * zf).max(1.5),
+                    HOSTPORT_WIRE,
+                    full,
+                ));
+            }
+        }
 
         for &id in &self.z {
             let pos = self.win_pos[&id];
@@ -1083,6 +1211,81 @@ impl App {
                     r[1] + (PAD + lh) * zf,
                     zf * 0.85,
                     [0.65, 0.6, 0.5, 1.0],
+                    clip,
+                );
+                let cb = close_btn(r, zf);
+                if contains(cb, mp) {
+                    quads.push(Quad::solid(white, cb, CLOSE_HOT, clip));
+                }
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    "x",
+                    cb[0] + (cb[2] - cb[0]) * 0.28,
+                    cb[1] + (cb[3] - cb[1]) * 0.05,
+                    zf * 0.8,
+                    TEXT,
+                    clip,
+                );
+                let pp = port_pos(r);
+                let pr = PORT_R * zf;
+                quads.push(Quad::solid(
+                    white,
+                    [pp[0] - pr, pp[1] - pr, pp[0] + pr, pp[1] + pr],
+                    PORT_COL,
+                    full,
+                ));
+                continue;
+            }
+
+            // A HostPort node: a labelled box exposing a wasi:http node to a
+            // localhost port when wired.
+            if let Some(&port) = self.host_ports.get(&id) {
+                let serving = self.serves.values().any(|(hp, _)| *hp == id);
+                quads.push(Quad::solid(white, r, HOSTPORT_BORDER, clip));
+                let body = [
+                    r[0] + BORDER * zf,
+                    r[1] + BORDER * zf,
+                    r[2] - BORDER * zf,
+                    r[3] - BORDER * zf,
+                ];
+                quads.push(Quad::solid(white, body, HOSTPORT_BG, clip));
+                let lh = gfx.fonts.line_height() as f32;
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    &format!("HostPort :{port}"),
+                    r[0] + PAD * zf,
+                    r[1] + PAD * zf,
+                    zf,
+                    TEXT,
+                    clip,
+                );
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    if serving {
+                        "localhost ●"
+                    } else {
+                        "drag a wasi:http node here"
+                    },
+                    r[0] + PAD * zf,
+                    r[1] + (PAD + lh) * zf,
+                    zf * 0.7,
+                    if serving {
+                        [0.4, 0.85, 0.5, 1.0]
+                    } else {
+                        [0.55, 0.7, 0.72, 1.0]
+                    },
                     clip,
                 );
                 let cb = close_btn(r, zf);
@@ -1284,6 +1487,23 @@ impl App {
             TEXT,
             full,
         );
+        // "+ Port" button.
+        if contains(port_btn, mp) {
+            quads.push(Quad::solid(white, port_btn, MENU_HOVER, full));
+        }
+        self.text_cache.draw(
+            &mut quads,
+            &mut gfx.renderer,
+            &gfx.fonts,
+            &gfx.device,
+            &gfx.queue,
+            "+ Port",
+            port_btn[0] + PAD,
+            (MENU_H - gfx.fonts.line_height() as f32) * 0.5,
+            1.0,
+            TEXT,
+            full,
+        );
         self.text_cache.draw(
             &mut quads,
             &mut gfx.renderer,
@@ -1408,6 +1628,10 @@ impl App {
             self.connections.retain(|&(_, app)| app != *id);
             self.host.midi().lock().unwrap().remove_node(*id);
             self.midi_links.retain(|&(s, d)| s != *id && d != *id);
+            // Stop any wasi:http server this node was running.
+            if let Some((_, kill)) = self.serves.remove(id) {
+                kill.store(true, Ordering::Relaxed);
+            }
             self.win_pos.remove(id);
             self.win_size.remove(id);
             self.z.retain(|x| x != id);
@@ -1450,12 +1674,31 @@ impl App {
                 })
             })
             .collect();
+        let host_ports = self
+            .host_ports
+            .iter()
+            .filter_map(|(&id, &port)| {
+                Some(crate::session::SessionNode {
+                    name: port.to_string(),
+                    id,
+                    pos: *self.win_pos.get(&id)?,
+                    size: *self.win_size.get(&id)?,
+                })
+            })
+            .collect();
+        let serves = self
+            .serves
+            .iter()
+            .map(|(&http, &(hostport, _))| (http, hostport))
+            .collect();
         let saved = crate::session::Session {
             camera: (self.cam.pan[0], self.cam.pan[1], self.cam.zoom),
             nodes,
             files,
+            host_ports,
             connections: self.connections.clone(),
             midi: self.midi_links.clone(),
+            serves,
         };
         if let Err(e) = saved.save() {
             eprintln!("failed to save session: {e}");

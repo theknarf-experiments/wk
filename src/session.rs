@@ -9,6 +9,8 @@
 //! file "chan" 2 { pos 400 120; size 130 44 }
 //! connection 2 1
 //! midi 3 4
+//! hostport "8080" 5 { pos 600 100; size 130 44 }
+//! serve 1 5
 //! ```
 
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
@@ -30,10 +32,14 @@ pub struct Session {
     pub camera: (f32, f32, f32),
     pub nodes: Vec<SessionNode>,
     pub files: Vec<SessionNode>,
+    /// HostPort nodes; `name` holds the port number as a string.
+    pub host_ports: Vec<SessionNode>,
     /// File connections as (file id, app node id).
     pub connections: Vec<(u64, u64)>,
     /// MIDI connections as (source node id, destination node id).
     pub midi: Vec<(u64, u64)>,
+    /// Serve wiring as (wasi:http node id, HostPort id).
+    pub serves: Vec<(u64, u64)>,
 }
 
 fn num(v: &KdlValue) -> Option<f32> {
@@ -105,14 +111,18 @@ impl Session {
 
         let mut nodes = Vec::new();
         let mut files = Vec::new();
+        let mut host_ports = Vec::new();
         let mut connections = Vec::new();
         let mut midi = Vec::new();
+        let mut serves = Vec::new();
         for n in doc.nodes() {
             match n.name().value() {
                 "node" => nodes.extend(parse_placed(n)),
                 "file" => files.extend(parse_placed(n)),
+                "hostport" => host_ports.extend(parse_placed(n)),
                 "connection" => connections.extend(pair(n)),
                 "midi" => midi.extend(pair(n)),
+                "serve" => serves.extend(pair(n)),
                 _ => {}
             }
         }
@@ -121,8 +131,10 @@ impl Session {
             camera,
             nodes,
             files,
+            host_ports,
             connections,
             midi,
+            serves,
         })
     }
 
@@ -146,11 +158,17 @@ impl Session {
         for f in &self.files {
             doc.nodes_mut().push(placed_kdl("file", f));
         }
+        for hp in &self.host_ports {
+            doc.nodes_mut().push(placed_kdl("hostport", hp));
+        }
         for &(file, node) in &self.connections {
             doc.nodes_mut().push(pair_kdl("connection", file, node));
         }
         for &(src, dst) in &self.midi {
             doc.nodes_mut().push(pair_kdl("midi", src, dst));
+        }
+        for &(http, hostport) in &self.serves {
+            doc.nodes_mut().push(pair_kdl("serve", http, hostport));
         }
 
         doc.autoformat();
@@ -194,8 +212,15 @@ mod tests {
                 pos: [200.0, 120.0],
                 size: [130.0, 44.0],
             }],
+            host_ports: vec![SessionNode {
+                name: "8080".into(),
+                id: 5,
+                pos: [600.0, 100.0],
+                size: [130.0, 44.0],
+            }],
             connections: vec![(2, 1)],
             midi: vec![(3, 4)],
+            serves: vec![(1, 5)],
         };
 
         let back = Session::from_kdl(&s.to_kdl()).expect("parses");
@@ -205,7 +230,11 @@ mod tests {
         assert_eq!(back.nodes[0].id, 1);
         assert_eq!(back.files.len(), 1);
         assert_eq!(back.files[0].name, "chan");
+        assert_eq!(back.host_ports.len(), 1);
+        assert_eq!(back.host_ports[0].name, "8080");
+        assert_eq!(back.host_ports[0].id, 5);
         assert_eq!(back.connections, vec![(2, 1)]);
         assert_eq!(back.midi, vec![(3, 4)]);
+        assert_eq!(back.serves, vec![(1, 5)]);
     }
 }
