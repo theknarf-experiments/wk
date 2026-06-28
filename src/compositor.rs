@@ -25,6 +25,9 @@ const FRAME: Duration = Duration::from_nanos(1_000_000_000 / 60);
 
 /// Canvas pixels panned per unit of scroll wheel.
 const SCROLL_PAN_SPEED: f32 = 30.0;
+/// Fraction of the remaining pan distance covered each frame (0..1); lower is
+/// smoother but laggier.
+const PAN_SMOOTH: f32 = 0.3;
 /// Zoom multiplier per unit of zoom-scroll.
 const ZOOM_STEP: f32 = 1.1;
 
@@ -125,6 +128,17 @@ struct SurfaceInput {
 /// Clamp a requested surface size to something sane.
 fn clamp_size(v: f32) -> u32 {
     (v.max(16.0) as u32).min(4096)
+}
+
+/// Move `current` a fraction `PAN_SMOOTH` of the way toward `target`, snapping
+/// once within half a pixel so panning glides smoothly and then settles.
+fn ease(current: f32, target: f32) -> f32 {
+    let diff = target - current;
+    if diff.abs() < 0.5 {
+        target
+    } else {
+        current + diff * PAN_SMOOTH
+    }
 }
 
 /// Derive a display name for a plugin from its file stem.
@@ -333,11 +347,14 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
     let mut views: HashMap<u64, SurfaceView> = HashMap::new();
     // Input over each surface's window, collected last frame.
     let mut inputs: HashMap<u64, SurfaceInput> = HashMap::new();
-    // Infinite-canvas camera and each window's canvas-space rect.
+    // Infinite-canvas camera and each window's canvas-space rect. `pan_target`
+    // is where scrolling wants the camera; `cam.pan` eases toward it each frame
+    // so panning glides instead of jumping per scroll event.
     let mut cam = Camera {
         pan: [0.0, 0.0],
         zoom: 1.0,
     };
+    let mut pan_target = [0.0f32, 0.0];
     let mut win_state: HashMap<String, WinState> = HashMap::new();
 
     'running: loop {
@@ -419,12 +436,18 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
             }
         }
 
-        // Apply this frame's pan/zoom to the canvas camera.
-        cam.pan[0] += pan_delta[0];
-        cam.pan[1] += pan_delta[1];
+        // Apply this frame's pan/zoom to the canvas camera. Zoom is immediate
+        // (and re-anchors the pan target); panning eases toward its target.
         if zoom_step != 0.0 {
             cam.zoom_at(ZOOM_STEP.powf(zoom_step), zoom_focus);
+            pan_target = cam.pan;
         }
+        pan_target[0] += pan_delta[0];
+        pan_target[1] += pan_delta[1];
+        cam.pan = [
+            ease(cam.pan[0], pan_target[0]),
+            ease(cam.pan[1], pan_target[1]),
+        ];
 
         imgui_sdl2.prepare_frame(imgui.io_mut(), &window, &event_pump.mouse_state());
         // Scroll drives the canvas, not imgui's own window scrolling.
