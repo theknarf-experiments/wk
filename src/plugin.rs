@@ -647,6 +647,15 @@ impl PluginHost {
         // own in-memory filesystem in its place.
         crate::vfs::add_wasi_except_fs(&mut linker)?;
         add_random(&mut linker)?;
+        // WASI 0.3 (`@0.3.0`) interfaces — cli, clocks, filesystem, random,
+        // sockets — built on the Component Model's native async (no `wasi:io`).
+        // Added alongside the 0.2 set above (different version namespaces, no
+        // clash) so a guest compiled against either WASI generation runs. p3 in
+        // wasmtime-wasi is still experimental; it reuses our existing `WasiCtx`
+        // (`HostState: WasiView`), so it's purely additive. Note: 0.3 guests get
+        // wasmtime's real (sandboxed, no-preopen) filesystem here rather than our
+        // in-memory vfs, which is 0.2-only — fine until a 0.3 guest needs files.
+        wasmtime_wasi::p3::add_to_linker(&mut linker)?;
         // Only the wasi:http interfaces (outgoing-handler + types); the rest of
         // the wasi world is already linked above.
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
@@ -835,5 +844,32 @@ impl PluginHost {
             }
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// wk is a WASI 0.3 host: the standard `@0.3.0` interfaces link onto a
+    /// `Linker<HostState>` (proving `HostState: WasiView` satisfies p3), and the
+    /// 0.2 and 0.3 generations coexist in one linker without a name clash.
+    #[test]
+    fn host_links_wasi_0_3_alongside_0_2() {
+        let mut config = Config::new();
+        config.wasm_component_model(true);
+        let engine = Engine::new(&config).expect("engine");
+        let mut linker: Linker<HostState> = Linker::new(&engine);
+        crate::vfs::add_wasi_except_fs(&mut linker).expect("wasi 0.2 (minus fs) links");
+        wasmtime_wasi::p3::add_to_linker(&mut linker).expect("wasi 0.3 links");
+    }
+
+    /// The full host linker — every wk interface (wasi-gfx, audio, midi, the 0.2
+    /// http/vfs/random set) plus the WASI 0.3 set — composes without a name
+    /// clash. Guards against a future interface overlapping an existing one.
+    #[test]
+    fn full_host_linker_builds() {
+        let host = PluginHost::new().expect("host");
+        host.build_linker().expect("full linker builds");
     }
 }
