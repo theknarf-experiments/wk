@@ -5,8 +5,10 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context as TaskContext, Poll, Waker};
+use std::time::Duration;
 
 use wasmtime::component::{HasData, Linker, Resource, ResourceTable};
 use wasmtime::Result;
@@ -136,20 +138,30 @@ fn socket_write(sock: &Socket, to: usize, data: &[u8]) {
 
 /// Block the calling thread until endpoint `ep` has bytes to read or its peer
 /// closes, then return up to `len` bytes (and whether EOF was reached). This is
-/// the blocking-read syscall behaviour for a socket file.
-fn socket_read_blocking(sock: &Socket, ep: usize, len: usize) -> (Vec<u8>, bool) {
+/// the blocking-read syscall behaviour for a socket file. Returns `None` if the
+/// instance was killed while blocked, so the caller can unwind the guest. The
+/// timed wait lets the kill flag be observed even with no socket activity.
+fn socket_read_blocking(
+    sock: &Socket,
+    ep: usize,
+    len: usize,
+    kill: &AtomicBool,
+) -> Option<(Vec<u8>, bool)> {
     let (lock, cvar) = &**sock;
     let mut c = lock.lock().unwrap();
     loop {
+        if kill.load(Ordering::Relaxed) {
+            return None;
+        }
         let q = &mut c.queues[ep];
         if !q.is_empty() {
             let n = len.min(q.len());
-            return (q.drain(..n).collect(), false);
+            return Some((q.drain(..n).collect(), false));
         }
         if c.closed[1 - ep] {
-            return (Vec::new(), true);
+            return Some((Vec::new(), true));
         }
-        c = cvar.wait(c).unwrap();
+        c = cvar.wait_timeout(c, Duration::from_millis(100)).unwrap().0;
     }
 }
 
@@ -568,7 +580,11 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
                 None => return err(ErrorCode::NoEntry),
             }
         };
-        Ok(Ok(socket_read_blocking(&sock, endpoint, len as usize)))
+        match socket_read_blocking(&sock, endpoint, len as usize, &self.kill) {
+            Some(result) => Ok(Ok(result)),
+            // Killed while blocked: trap to unwind and end the instance.
+            None => Err(wasmtime::Error::msg("instance killed")),
+        }
     }
 
     fn write(
@@ -1077,10 +1093,31 @@ mod tests {
         });
 
         // This blocks until the writer thread delivers.
-        let (data, eof) = socket_read_blocking(&sock, a, 64);
+        let kill = AtomicBool::new(false);
+        let (data, eof) = socket_read_blocking(&sock, a, 64, &kill).expect("not killed");
         handle.join().unwrap();
         assert_eq!(&data, b"delivered");
         assert!(!eof);
         let _ = b;
+    }
+
+    /// A blocking read with no peer unwinds (returns None) once killed, instead
+    /// of hanging forever — this is how the compositor quits a stuck instance.
+    #[test]
+    fn socket_blocking_read_unblocks_on_kill() {
+        let sock = new_socket();
+        let a = socket_connect(&sock);
+        let kill = Arc::new(AtomicBool::new(false));
+
+        let killer = kill.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            killer.store(true, Ordering::Relaxed);
+        });
+
+        // No peer ever writes; only the kill flag releases this read.
+        let result = socket_read_blocking(&sock, a, 64, &kill);
+        handle.join().unwrap();
+        assert!(result.is_none(), "killed read returns None");
     }
 }

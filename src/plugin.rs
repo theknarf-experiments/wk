@@ -12,12 +12,13 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll, Waker};
 
 use wasmtime::component::{Component, HasSelf, Linker, Resource, ResourceTable};
-use wasmtime::{Config, Engine, Result, Store};
+use wasmtime::{Config, Engine, Result, Store, UpdateDeadline};
+use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 use wasmtime_wasi::p2::{subscribe, DynPollable, Pollable};
 use wasmtime_wasi::{async_trait, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
@@ -44,6 +45,8 @@ pub use wasi::surface::surface::{Key, KeyEvent, PointerEvent, ResizeEvent};
 pub struct VirtualSurface {
     /// Stable unique id, used by the compositor to track this surface.
     pub id: u64,
+    /// The instance that created this surface (its window belongs to it).
+    pub instance_id: u64,
     /// Display name of the plugin instance that owns this surface.
     pub title: String,
     pub width: u32,
@@ -81,9 +84,10 @@ impl std::fmt::Display for SurfaceClosed {
 impl std::error::Error for SurfaceClosed {}
 
 impl VirtualSurface {
-    fn new(title: String, width: u32, height: u32) -> Self {
+    fn new(instance_id: u64, title: String, width: u32, height: u32) -> Self {
         Self {
             id: NEXT_SURFACE_ID.fetch_add(1, Ordering::Relaxed),
+            instance_id,
             title,
             width,
             height,
@@ -111,6 +115,26 @@ impl VirtualSurface {
 pub type SharedSurface = Arc<Mutex<VirtualSurface>>;
 /// All virtual surfaces created by clients, shared with the compositor thread.
 pub type SurfaceRegistry = Arc<Mutex<Vec<SharedSurface>>>;
+
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
+
+/// A launched plugin instance. Every instance gets a window in the compositor —
+/// its surface if it created one, otherwise a console showing this captured
+/// output — so nothing ever runs invisibly or un-quittably.
+pub struct Instance {
+    pub id: u64,
+    pub name: String,
+    /// Captured stdout+stderr, rendered in the instance's console window.
+    pub console: MemoryOutputPipe,
+    /// Set by the guest thread when its `run` returns (it exited on its own).
+    pub finished: Arc<AtomicBool>,
+    /// Kill switch: set by the compositor to stop a still-running instance.
+    pub kill: Arc<AtomicBool>,
+}
+
+pub type SharedInstance = Arc<Instance>;
+/// All launched instances, shared with the compositor thread.
+pub type InstanceRegistry = Arc<Mutex<Vec<SharedInstance>>>;
 
 // ---- resource representations stored in the wasmtime ResourceTable ----
 
@@ -200,10 +224,15 @@ pub struct HostState {
     ctx: WasiCtx,
     table: ResourceTable,
     registry: SurfaceRegistry,
+    /// The instance this store belongs to; tags the surfaces it creates.
+    instance_id: u64,
     /// Display name for the surfaces this client creates.
     plugin_name: String,
     /// This instance's private in-memory filesystem.
     pub(crate) fs: crate::vfs::SharedFs,
+    /// Set by the compositor to stop this instance; observed by blocking host
+    /// calls (e.g. a socket read) so they unwind instead of hanging forever.
+    pub(crate) kill: Arc<AtomicBool>,
     /// Shared wgpu-core instance backing the wasi:webgpu host.
     gpu: Arc<wgpu_core::global::Global>,
 }
@@ -292,6 +321,7 @@ impl wasi::surface::surface::HostSurface for HostState {
         let width = desc.width.unwrap_or(256);
         let height = desc.height.unwrap_or(256);
         let shared = Arc::new(Mutex::new(VirtualSurface::new(
+            self.instance_id,
             self.plugin_name.clone(),
             width,
             height,
@@ -542,6 +572,9 @@ impl PluginHost {
     pub fn new() -> Result<Self> {
         let mut config = Config::new();
         config.wasm_component_model(true);
+        // Lets the compositor stop a runaway instance: increment_epoch() each
+        // frame trips the per-store deadline callback, which traps on `kill`.
+        config.epoch_interruption(true);
         Ok(Self {
             engine: Engine::new(&config)?,
             gpu: new_gpu_instance(),
@@ -549,10 +582,22 @@ impl PluginHost {
         })
     }
 
-    /// Load a client component and run its `run` export on a dedicated thread.
-    /// Surfaces the client creates appear in `registry` for the compositor,
-    /// labelled with `name`.
-    pub fn spawn(&self, path: &Path, name: &str, registry: SurfaceRegistry) -> Result<()> {
+    /// Advance the epoch so every running instance re-checks its kill switch.
+    pub fn tick_epoch(&self) {
+        self.engine.increment_epoch();
+    }
+
+    /// Load a client component and run its `run` export on a dedicated thread,
+    /// registering it as an `Instance`. Surfaces it creates appear in `surfaces`
+    /// (tagged with the instance id); its stdout/stderr are captured for the
+    /// instance's console window.
+    pub fn spawn(
+        &self,
+        path: &Path,
+        name: &str,
+        surfaces: SurfaceRegistry,
+        instances: InstanceRegistry,
+    ) -> Result<()> {
         let mut linker: Linker<HostState> = Linker::new(&self.engine);
         // Provide every wasmtime-wasi interface except its filesystem, then our
         // own in-memory filesystem in its place.
@@ -566,16 +611,44 @@ impl PluginHost {
         wasi::frame_buffer::frame_buffer::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
         wasi_webgpu_wasmtime::add_to_linker(&mut linker)?;
 
+        let id = NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
+        // ~1 MiB of scrollback; the guest traps if it overruns this (rare).
+        let console = MemoryOutputPipe::new(1 << 20);
+        let finished = Arc::new(AtomicBool::new(false));
+        let kill = Arc::new(AtomicBool::new(false));
+        instances.lock().unwrap().push(Arc::new(Instance {
+            id,
+            name: name.to_string(),
+            console: console.clone(),
+            finished: finished.clone(),
+            kill: kill.clone(),
+        }));
+
         let component = Component::from_file(&self.engine, path)?;
         let state = HostState {
-            ctx: WasiCtxBuilder::new().inherit_stdio().build(),
+            ctx: WasiCtxBuilder::new()
+                .stdout(console.clone())
+                .stderr(console)
+                .build(),
             table: ResourceTable::new(),
-            registry,
+            registry: surfaces,
+            instance_id: id,
             plugin_name: name.to_string(),
             fs: crate::vfs::new_instance_fs(&self.shared_fs),
+            kill: kill.clone(),
             gpu: Arc::clone(&self.gpu),
         };
         let mut store = Store::new(&self.engine, state);
+        // Trap the instance once it has been killed; otherwise keep running.
+        store.set_epoch_deadline(1);
+        let kill_cb = kill.clone();
+        store.epoch_deadline_callback(move |_| {
+            if kill_cb.load(Ordering::Relaxed) {
+                Ok(UpdateDeadline::Interrupt)
+            } else {
+                Ok(UpdateDeadline::Continue(1))
+            }
+        });
 
         std::thread::spawn(move || {
             let result: Result<()> = pollster::block_on(async move {
@@ -583,11 +656,14 @@ impl PluginHost {
                     Compositor::instantiate_async(&mut store, &component, &linker).await?;
                 compositor.call_run(&mut store).await
             });
+            finished.store(true, Ordering::Relaxed);
             match result {
-                // A clean close (the compositor closed the surface): exit quietly.
+                Ok(()) => {}
+                // A clean close (surface closed, or the kill switch tripped):
+                // exit quietly.
+                Err(_) if kill.load(Ordering::Relaxed) => {}
                 Err(e) if e.downcast_ref::<SurfaceClosed>().is_some() => {}
                 Err(e) => eprintln!("plugin client exited with error: {e:#}"),
-                Ok(()) => {}
             }
         });
         Ok(())

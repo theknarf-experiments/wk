@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,7 +16,8 @@ use sdl3::keyboard::{Keycode, Mod, Scancode};
 use crate::host_shell::HostShell;
 use crate::imguirenderer::{Renderer, Texture, TextureConfig};
 use crate::plugin::{
-    Key, KeyEvent, PluginHost, PointerEvent, ResizeEvent, SharedSurface, SurfaceRegistry,
+    InstanceRegistry, Key, KeyEvent, PluginHost, PointerEvent, ResizeEvent, SharedInstance,
+    SharedSurface, SurfaceRegistry,
 };
 
 /// Target frame time (~60 fps).
@@ -127,6 +129,38 @@ fn plugin_name(path: &Path) -> String {
         .unwrap_or_else(|| "plugin".to_string())
 }
 
+/// Draw the console window for a non-graphical instance: its captured
+/// stdout/stderr in a scrolling region. Returns `false` if its close box was
+/// clicked this frame.
+fn console_window(ui: &imgui::Ui, inst: &SharedInstance) -> bool {
+    let finished = inst.finished.load(Ordering::Relaxed);
+    let title = if finished {
+        format!("{} (exited)##inst{}", inst.name, inst.id)
+    } else {
+        format!("{}##inst{}", inst.name, inst.id)
+    };
+    let bytes = inst.console.contents();
+    let text = String::from_utf8_lossy(&bytes);
+
+    let mut open = true;
+    ui.window(title)
+        .opened(&mut open)
+        .size([460.0, 280.0], Condition::FirstUseEver)
+        .build(|| {
+            ui.child_window("##console")
+                .horizontal_scrollbar(true)
+                .build(|| {
+                    let at_bottom = ui.scroll_y() >= ui.scroll_max_y();
+                    ui.text_wrapped(text.as_ref());
+                    // Keep following the tail unless the user scrolled up.
+                    if at_bottom {
+                        ui.set_scroll_here_y_with_ratio(1.0);
+                    }
+                });
+        });
+    open
+}
+
 /// Return the `TextureId` for surface `sid` at size `w`x`h`, (re)creating the
 /// backing wgpu texture when it is missing or the size changed.
 fn surface_texture(
@@ -173,6 +207,7 @@ fn surface_texture(
 pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
     let host = PluginHost::new().map_err(|e| format!("{e:#}"))?;
     let registry: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
+    let instance_reg: InstanceRegistry = Arc::new(Mutex::new(Vec::new()));
 
     // The project's plugins become launchable "apps" (named by file stem). The
     // workspace starts empty; instances are launched from the top bar.
@@ -201,6 +236,9 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
     let mut inputs: HashMap<u64, SurfaceInput> = HashMap::new();
 
     'running: loop {
+        // Advance the epoch so any killed instance traps and ends this frame.
+        host.tick_epoch();
+
         // Key events captured this frame, delivered to the focused client below.
         let mut key_events: Vec<(KeyEvent, bool)> = Vec::new();
 
@@ -319,9 +357,11 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
             }
         };
 
-        // Apps the user clicked to launch, and surfaces whose window was closed.
+        // Apps the user clicked to launch, and instances whose window was closed.
         let mut to_launch: Vec<(String, PathBuf)> = Vec::new();
-        let mut to_close: Vec<SharedSurface> = Vec::new();
+        let mut to_close: Vec<SharedInstance> = Vec::new();
+        // Snapshot of launched instances (cheap Arc clones).
+        let instances: Vec<SharedInstance> = instance_reg.lock().unwrap().clone();
 
         let ui = imgui.frame();
         {
@@ -338,52 +378,69 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
             });
 
             inputs.clear();
-            for shared in &surfaces {
-                let (sid, title) = {
-                    let s = shared.lock().unwrap();
-                    (s.id, s.title.clone())
-                };
-                let Some(view) = views.get(&sid) else {
+            // Every instance gets a window: its surface(s) if it created any,
+            // otherwise a console showing its captured stdout/stderr. Closing
+            // any of an instance's windows quits the whole instance.
+            for inst in &instances {
+                let inst_surfaces: Vec<&SharedSurface> = surfaces
+                    .iter()
+                    .filter(|s| s.lock().unwrap().instance_id == inst.id)
+                    .collect();
+
+                if inst_surfaces.is_empty() {
+                    if !console_window(ui, inst) {
+                        to_close.push(inst.clone());
+                    }
                     continue;
-                };
-                let (tex, w, h) = (view.texture, view.width as f32, view.height as f32);
-                let mut input = SurfaceInput::default();
-                let mut open = true;
-                ui.window(format!("{title}##{sid}"))
-                    .opened(&mut open)
-                    .size([w + 16.0, h + 36.0], Condition::FirstUseEver)
-                    .build(|| {
-                        input.focused = ui.is_window_focused();
-
-                        // Resize the client to fill the window's content area.
-                        let avail = ui.content_region_avail();
-                        input.resize = Some((clamp_size(avail[0]), clamp_size(avail[1])));
-
-                        let origin = ui.cursor_screen_pos();
-                        imgui::Image::new(tex, [w, h]).build(ui);
-                        if ui.is_item_hovered() {
-                            let mouse = ui.io().mouse_pos;
-                            let local =
-                                ((mouse[0] - origin[0]) as f64, (mouse[1] - origin[1]) as f64);
-                            input.moved = Some(local);
-                            if ui.is_mouse_clicked(MouseButton::Left) {
-                                input.down.push(local);
-                            }
-                            if ui.is_mouse_released(MouseButton::Left) {
-                                input.up.push(local);
-                            }
-                        }
-                    });
-                if !open {
-                    to_close.push(shared.clone());
                 }
-                inputs.insert(sid, input);
+
+                for shared in inst_surfaces {
+                    let (sid, title) = {
+                        let s = shared.lock().unwrap();
+                        (s.id, s.title.clone())
+                    };
+                    let Some(view) = views.get(&sid) else {
+                        continue;
+                    };
+                    let (tex, w, h) = (view.texture, view.width as f32, view.height as f32);
+                    let mut input = SurfaceInput::default();
+                    let mut open = true;
+                    ui.window(format!("{title}##{sid}"))
+                        .opened(&mut open)
+                        .size([w + 16.0, h + 36.0], Condition::FirstUseEver)
+                        .build(|| {
+                            input.focused = ui.is_window_focused();
+
+                            // Resize the client to fill the window's content area.
+                            let avail = ui.content_region_avail();
+                            input.resize = Some((clamp_size(avail[0]), clamp_size(avail[1])));
+
+                            let origin = ui.cursor_screen_pos();
+                            imgui::Image::new(tex, [w, h]).build(ui);
+                            if ui.is_item_hovered() {
+                                let mouse = ui.io().mouse_pos;
+                                let local =
+                                    ((mouse[0] - origin[0]) as f64, (mouse[1] - origin[1]) as f64);
+                                input.moved = Some(local);
+                                if ui.is_mouse_clicked(MouseButton::Left) {
+                                    input.down.push(local);
+                                }
+                                if ui.is_mouse_released(MouseButton::Left) {
+                                    input.up.push(local);
+                                }
+                            }
+                        });
+                    if !open {
+                        to_close.push(inst.clone());
+                    }
+                    inputs.insert(sid, input);
+                }
             }
         }
 
         // Launch any apps clicked in the top bar (a fresh instance each click).
         for (name, path) in &to_launch {
-            if let Err(e) = host.spawn(path, name, registry.clone()) {
+            if let Err(e) = host.spawn(path, name, registry.clone(), instance_reg.clone()) {
                 eprintln!("failed to launch {name}: {e:#}");
             }
         }
@@ -425,22 +482,30 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
         queue.submit([encoder.finish()]);
         frame.present();
 
-        // Close dismissed windows AFTER rendering: this frame's draw data still
-        // references their textures, so freeing them earlier panics the renderer.
-        // Trap the client (ending its thread), drop it from the registry, and
-        // free its texture.
-        for shared in &to_close {
-            let sid = {
-                let mut s = shared.lock().unwrap();
-                s.closed = true;
-                s.wake();
-                s.id
-            };
-            registry.lock().unwrap().retain(|x| !Arc::ptr_eq(x, shared));
-            if let Some(v) = views.remove(&sid) {
-                renderer.textures.remove(v.texture);
-            }
-            inputs.remove(&sid);
+        // Quit closed instances AFTER rendering: this frame's draw data still
+        // references their textures, so freeing them earlier panics the
+        // renderer. Trip the kill switch (epoch-traps a busy guest and unwinds a
+        // blocked one), close any surfaces (trapping a frame-blocked guest),
+        // free their textures, and drop the instance.
+        for inst in &to_close {
+            inst.kill.store(true, Ordering::Relaxed);
+            registry.lock().unwrap().retain(|s| {
+                let mut g = s.lock().unwrap();
+                if g.instance_id != inst.id {
+                    return true;
+                }
+                g.closed = true;
+                g.wake();
+                if let Some(v) = views.remove(&g.id) {
+                    renderer.textures.remove(v.texture);
+                }
+                inputs.remove(&g.id);
+                false
+            });
+            instance_reg
+                .lock()
+                .unwrap()
+                .retain(|x| !Arc::ptr_eq(x, inst));
         }
 
         std::thread::sleep(FRAME);
