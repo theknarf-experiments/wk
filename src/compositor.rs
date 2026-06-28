@@ -378,7 +378,7 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
                     zoom_step += y;
                     zoom_focus = [mouse_x, mouse_y];
                 } else {
-                    pan_delta[0] += x * SCROLL_PAN_SPEED;
+                    pan_delta[0] -= x * SCROLL_PAN_SPEED;
                     pan_delta[1] += y * SCROLL_PAN_SPEED;
                 }
             }
