@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+ARGS=()
+for arg in "$@"; do
+    if [ -e "$arg" ]; then
+        ARGS+=("$(cd "$(dirname "$arg")" && echo "$(pwd)/$(basename "$arg")")")
+    else
+        ARGS+=("$arg")
+    fi
+done
+cd "$SCRIPT_DIR"
+exec cargo run -q -- "${ARGS[@]}"
