@@ -662,10 +662,13 @@ pub fn run(plugins: &[PathBuf]) -> Result<(), String> {
             // Keep the Apps menu bar on top of the (raisable) app windows: when
             // no mouse button is held we re-focus it to the front, which also
             // brings it to the top of the draw order. We skip this while the
-            // mouse is down so clicking/dragging a window isn't disturbed.
-            if !ui.is_any_mouse_down() {
-                // SAFETY: focusing an existing window by its imgui name; the
-                // main menu bar always uses this name.
+            // mouse is down (so clicking/dragging a window isn't disturbed) and
+            // while a popup/menu is open (else re-focusing would close it).
+            // SAFETY: querying/focusing existing windows by imgui name; the main
+            // menu bar always uses this name.
+            let any_popup = imgui::sys::ImGuiPopupFlags_AnyPopup as imgui::sys::ImGuiPopupFlags;
+            let popup_open = unsafe { imgui::sys::igIsPopupOpen(std::ptr::null(), any_popup) };
+            if !ui.is_any_mouse_down() && !popup_open {
                 unsafe { imgui::sys::igSetWindowFocus_Str(c"##MainMenuBar".as_ptr()) };
             }
 
