@@ -645,7 +645,14 @@ impl PluginHost {
         });
 
         std::thread::spawn(move || {
-            let result: Result<()> = pollster::block_on(async move {
+            // Drive the guest on a Tokio current-thread runtime (not pollster):
+            // wasmtime-wasi's monotonic clock / timers need a Tokio reactor, so a
+            // guest that sleeps would otherwise panic.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("tokio runtime");
+            let result: Result<()> = rt.block_on(async move {
                 let compositor =
                     Compositor::instantiate_async(&mut store, &component, &linker).await?;
                 compositor.call_run(&mut store).await
