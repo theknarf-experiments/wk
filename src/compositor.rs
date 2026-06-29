@@ -226,13 +226,18 @@ impl Camera {
     }
     fn zoom_at(&mut self, factor: f32, focus: [f32; 2]) {
         let anchor = self.to_canvas(focus);
-        self.zoom = (self.zoom * factor).clamp(0.2, 8.0);
+        self.zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
         self.pan = [
             focus[0] - anchor[0] * self.zoom,
             focus[1] - anchor[1] * self.zoom,
         ];
     }
 }
+
+/// Zoom limits and the fixed presets offered by the corner zoom menu.
+const ZOOM_MIN: f32 = 0.2;
+const ZOOM_MAX: f32 = 2.0;
+const ZOOM_PRESETS: [f32; 4] = [2.0, 1.5, 1.0, 0.5];
 
 fn ease(current: f32, target: f32) -> f32 {
     let d = target - current;
@@ -527,6 +532,8 @@ struct App {
     /// selected wire.
     del_wire: bool,
     menu_open: bool,
+    /// Whether the corner zoom button's preset menu is open.
+    zoom_menu_open: bool,
     pending_layout: HashMap<u64, ([f32; 2], [f32; 2])>,
 
     // File nodes (canvas-owned shared files) and the connections wiring them
@@ -591,6 +598,7 @@ impl App {
             wire_sel: None,
             del_wire: false,
             menu_open: false,
+            zoom_menu_open: false,
             pending_layout: HashMap::new(),
             file_nodes: HashMap::new(),
             connections: Vec::new(),
@@ -629,7 +637,7 @@ impl App {
             return;
         };
         self.cam.pan = [saved.camera.0, saved.camera.1];
-        self.cam.zoom = saved.camera.2;
+        self.cam.zoom = saved.camera.2.clamp(ZOOM_MIN, ZOOM_MAX);
         self.pan_target = self.cam.pan;
 
         let mut max_id = 0;
@@ -1126,6 +1134,15 @@ impl App {
         let port_btn_w = gfx.fonts.measure("+ Port") as f32 + 2.0 * PAD;
         let port_btn = [hfile_btn[2], 0.0, hfile_btn[2] + port_btn_w, MENU_H];
 
+        // Corner zoom button (bottom-left) and the preset items stacked above it.
+        let zoom_btn_w = gfx.fonts.measure("200%") as f32 + 3.0 * PAD;
+        let zoom_btn = [0.0, fb[1] - MENU_H, zoom_btn_w, fb[1]];
+        let zoom_item = |i: usize| -> [f32; 4] {
+            let top = fb[1] - MENU_H - ZOOM_PRESETS.len() as f32 * MENU_H;
+            let y0 = top + i as f32 * MENU_H;
+            [0.0, y0, zoom_btn_w, y0 + MENU_H]
+        };
+
         // Continue an in-progress drag (move / resize / connect).
         if let Some(d) = self.drag.take() {
             match d.mode {
@@ -1165,7 +1182,30 @@ impl App {
             // Any fresh click clears the wire selection; a click that lands on a
             // wire (empty-canvas branch below) re-selects it.
             self.wire_sel = None;
-            if contains(apps_rect, mp) {
+            // Corner zoom menu (drawn on top) takes clicks first.
+            if self.zoom_menu_open {
+                let mut hit = false;
+                for (i, &z) in ZOOM_PRESETS.iter().enumerate() {
+                    if contains(zoom_item(i), mp) {
+                        // Jump to the preset zoom, anchored at the screen centre.
+                        self.cam
+                            .zoom_at(z / self.cam.zoom, [fb[0] * 0.5, fb[1] * 0.5]);
+                        self.pan_target = self.cam.pan;
+                        hit = true;
+                        break;
+                    }
+                }
+                self.zoom_menu_open = false;
+                if hit || contains(zoom_btn, mp) {
+                    consumed = true;
+                }
+            } else if contains(zoom_btn, mp) {
+                self.zoom_menu_open = true;
+                consumed = true;
+            }
+            if consumed {
+                // handled by the zoom menu
+            } else if contains(apps_rect, mp) {
                 self.menu_open = !self.menu_open;
                 consumed = true;
             } else if contains(vfile_btn, mp) {
@@ -1832,6 +1872,41 @@ impl App {
                 );
             }
         }
+        // Corner zoom button + its preset menu (bottom-left). Clicking the button
+        // opens the menu; clicking a preset jumps the zoom (handy for 100%).
+        let lh = gfx.fonts.line_height() as f32;
+        if self.zoom_menu_open {
+            for (i, &z) in ZOOM_PRESETS.iter().enumerate() {
+                let r = zoom_item(i);
+                let bg = if contains(r, mp) {
+                    MENU_HOVER
+                } else if (z - self.cam.zoom).abs() < 0.001 {
+                    TITLE_FOCUS
+                } else {
+                    MENU_BG
+                };
+                quads.push(Quad::solid(white, r, bg, full));
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    &format!("{:.0}%", z * 100.0),
+                    r[0] + PAD,
+                    r[1] + (MENU_H - lh) * 0.5,
+                    1.0,
+                    TEXT,
+                    full,
+                );
+            }
+        }
+        let zoom_bg = if contains(zoom_btn, mp) || self.zoom_menu_open {
+            MENU_HOVER
+        } else {
+            MENU_BG
+        };
+        quads.push(Quad::solid(white, zoom_btn, zoom_bg, full));
         self.text_cache.draw(
             &mut quads,
             &mut gfx.renderer,
@@ -1839,10 +1914,10 @@ impl App {
             &gfx.device,
             &gfx.queue,
             &format!("{:.0}%", self.cam.zoom * 100.0),
-            8.0,
-            fb[1] - gfx.fonts.line_height() as f32 - 6.0,
+            zoom_btn[0] + PAD,
+            zoom_btn[1] + (MENU_H - lh) * 0.5,
             1.0,
-            [1.0, 1.0, 1.0, 0.6],
+            TEXT,
             full,
         );
 
