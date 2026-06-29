@@ -62,5 +62,10 @@ wk.session.kdl
 plugins/kilo/kilo.wasm
 plugins/kilo/kilo.core.wasm
 
+# lua build artifacts (source fetched by build.sh, component built from it)
+plugins/lua/lua-5.4.7/
+plugins/lua/lua.wasm
+plugins/lua/lua.core.wasm
+
 # stray literal-tilde dir from tools that mis-expand $HOME
 /~/

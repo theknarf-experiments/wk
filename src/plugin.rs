@@ -626,6 +626,12 @@ impl PluginHost {
     pub fn new() -> Result<Self> {
         let mut config = Config::new();
         config.wasm_component_model(true);
+        // The WebAssembly exception-handling proposal (new `exnref` model), so
+        // guests that use setjmp/longjmp run: wasi-sdk lowers setjmp to wasm EH,
+        // and with LTO + `-mllvm -wasm-use-legacy-eh=false` it emits the exnref
+        // form cranelift supports. This unlocks interpreters (Lua) and the whole
+        // error-recovery class of recompiled C/C++.
+        config.wasm_exceptions(true);
         // Lets the compositor stop a runaway node: increment_epoch() each frame
         // trips the per-store deadline callback, which traps on `kill`.
         config.epoch_interruption(true);

@@ -10,5 +10,6 @@ dependencies {
     kilo "plugins/kilo/kilo.wasm" {
         args "welcome.txt"
     }
+    lua "plugins/lua/lua.wasm"
     http_hello "oci://ghcr.io/bytecodealliance/sample-wasi-http-rust/sample-wasi-http-rust:latest"
 }
