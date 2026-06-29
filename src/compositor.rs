@@ -284,6 +284,16 @@ fn resize_grip(r: [f32; 4], z: f32) -> [f32; 4] {
     let g = 16.0 * z;
     [r[2] - g, r[3] - g, r[2], r[3]]
 }
+/// The "−" and "+" port-step buttons on a HostPort node (bottom-right).
+fn port_step_btns(r: [f32; 4], z: f32) -> ([f32; 4], [f32; 4]) {
+    let s = 14.0 * z;
+    let gap = 3.0 * z;
+    let y0 = r[3] - s - 4.0 * z;
+    let px = r[2] - 4.0 * z;
+    let plus = [px - s, y0, px, y0 + s];
+    let minus = [px - 2.0 * s - gap, y0, px - s - gap, y0 + s];
+    (minus, plus)
+}
 fn content_rect(r: [f32; 4], z: f32) -> [f32; 4] {
     [
         r[0] + BORDER * z,
@@ -770,13 +780,11 @@ impl App {
         // HostPort nodes: recreate at their saved positions and ports.
         for hp in &saved.host_ports {
             max_id = max_id.max(hp.id);
-            if let Ok(port) = hp.name.parse::<u16>() {
-                self.next_port = self.next_port.max(port + 1);
-                self.win_pos.insert(hp.id, hp.pos);
-                self.win_size.insert(hp.id, hp.size);
-                self.z.push(hp.id);
-                self.host_ports.insert(hp.id, port);
-            }
+            self.next_port = self.next_port.max(hp.port.saturating_add(1));
+            self.win_pos.insert(hp.id, hp.pos);
+            self.win_size.insert(hp.id, hp.size);
+            self.z.push(hp.id);
+            self.host_ports.insert(hp.id, hp.port);
         }
 
         // Re-establish serve wiring (starts the servers again).
@@ -962,6 +970,32 @@ impl App {
         self.win_pos.remove(&id);
         self.win_size.remove(&id);
         self.z.retain(|&x| x != id);
+    }
+
+    /// Change a HostPort's localhost port by `delta` (clamped to 1..=65535). Any
+    /// server currently bound through it is stopped — re-wire the wasi:http node
+    /// to it to serve on the new port (avoids restarting on every nudge).
+    fn change_port(&mut self, id: u64, delta: i32) {
+        let Some(&cur) = self.host_ports.get(&id) else {
+            return;
+        };
+        let new = (cur as i32 + delta).clamp(1, 65535) as u16;
+        if new == cur {
+            return;
+        }
+        let bound: Vec<u64> = self
+            .serves
+            .iter()
+            .filter(|(_, (hp, _))| *hp == id)
+            .map(|(&http, _)| http)
+            .collect();
+        for http in bound {
+            if let Some((_, kill)) = self.serves.remove(&http) {
+                kill.store(true, Ordering::Relaxed);
+            }
+        }
+        self.host_ports.insert(id, new);
+        self.next_port = self.next_port.max(new.saturating_add(1));
     }
 
     /// Wire (or unwire) file node `file_id` into app node `app_id`'s filesystem.
@@ -1441,13 +1475,19 @@ impl App {
                             grab: [0.0, 0.0],
                         });
                     } else if is_file || is_port {
-                        // Canvas widget nodes (file / HostPort): close or move.
+                        // Canvas widget nodes (file / HostPort): close, adjust
+                        // port (HostPort −/+ buttons), or move.
+                        let (minus, plus) = port_step_btns(r, zf);
                         if contains(close_btn(r, zf), mp) {
                             if is_file {
                                 self.remove_file_node(id);
                             } else {
                                 self.remove_host_port(id);
                             }
+                        } else if is_port && contains(plus, mp) {
+                            self.change_port(id, 1);
+                        } else if is_port && contains(minus, mp) {
+                            self.change_port(id, -1);
                         } else {
                             let mc = self.cam.to_canvas(mp);
                             let p = self.win_pos[&id];
@@ -1775,11 +1815,7 @@ impl App {
                     &gfx.fonts,
                     &gfx.device,
                     &gfx.queue,
-                    if serving {
-                        "localhost ●"
-                    } else {
-                        "drag a wasi:http node here"
-                    },
+                    if serving { "live ●" } else { "idle" },
                     r[0] + PAD * zf,
                     r[1] + (PAD + lh) * zf,
                     zf * 0.7,
@@ -1807,6 +1843,29 @@ impl App {
                     TEXT,
                     clip,
                 );
+                // Port −/+ buttons (also: scroll over the node to change fast).
+                let (minus, plus) = port_step_btns(r, zf);
+                for (b, label) in [(minus, "-"), (plus, "+")] {
+                    quads.push(Quad::solid(
+                        white,
+                        b,
+                        if contains(b, mp) { MENU_HOVER } else { TITLE },
+                        clip,
+                    ));
+                    self.text_cache.draw(
+                        &mut quads,
+                        &mut gfx.renderer,
+                        &gfx.fonts,
+                        &gfx.device,
+                        &gfx.queue,
+                        label,
+                        b[0] + (b[2] - b[0]) * 0.3,
+                        b[1] + (b[3] - b[1]) * 0.02,
+                        zf * 0.8,
+                        TEXT,
+                        clip,
+                    );
+                }
                 let pp = port_pos(r);
                 let pr = PORT_R * zf;
                 quads.push(Quad::solid(
@@ -2317,12 +2376,11 @@ impl App {
             .host_ports
             .iter()
             .filter_map(|(&id, &port)| {
-                Some(crate::session::SessionNode {
-                    name: port.to_string(),
+                Some(crate::session::SessionPort {
                     id,
+                    port,
                     pos: *self.win_pos.get(&id)?,
                     size: *self.win_size.get(&id)?,
-                    options: Vec::new(),
                 })
             })
             .collect();
@@ -2407,6 +2465,21 @@ impl ApplicationHandler for App {
                     let max = Self::palette_max_scroll(self.palette_filtered().len());
                     self.palette_scroll = (self.palette_scroll - dy).clamp(0.0, max);
                     return;
+                }
+                // Scrolling over a HostPort node adjusts its port (scroll up =
+                // higher), rather than panning the canvas.
+                if let Some(id) = self.topmost_under(self.mouse) {
+                    if self.host_ports.contains_key(&id) {
+                        let step = if dy > 0.0 {
+                            dy.ceil() as i32
+                        } else if dy < 0.0 {
+                            dy.floor() as i32
+                        } else {
+                            0
+                        };
+                        self.change_port(id, step);
+                        return;
+                    }
                 }
                 if self.mods.control_key() || self.mods.super_key() {
                     self.zoom_factor *= ZOOM_STEP.powf(dy);

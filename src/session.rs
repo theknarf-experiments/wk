@@ -10,7 +10,7 @@
 //! hostfile "notes.txt" 6 { pos 400 200; size 130 44 }
 //! connection 2 1
 //! midi 3 4
-//! hostport "8080" 5 { pos 600 100; size 130 44 }
+//! hostport 5 { port 8080; pos 600 100; size 130 44 }
 //! serve 1 5
 //! ```
 
@@ -27,8 +27,16 @@ pub struct SessionNode {
     pub pos: [f32; 2],
     pub size: [f32; 2],
     /// App-node option values (e.g. knob settings), persisted positionally.
-    /// Empty for file/hostport nodes (and app nodes that report none).
+    /// Empty for file nodes (and app nodes that report none).
     pub options: Vec<f32>,
+}
+
+/// A HostPort node: a localhost port plus its canvas placement.
+pub struct SessionPort {
+    pub id: u64,
+    pub port: u16,
+    pub pos: [f32; 2],
+    pub size: [f32; 2],
 }
 
 pub struct Session {
@@ -39,8 +47,8 @@ pub struct Session {
     pub virtual_files: Vec<SessionNode>,
     /// HostMappedFile nodes; `name` holds the host file path.
     pub host_files: Vec<SessionNode>,
-    /// HostPort nodes; `name` holds the port number as a string.
-    pub host_ports: Vec<SessionNode>,
+    /// HostPort nodes (localhost port + canvas placement).
+    pub host_ports: Vec<SessionPort>,
     /// File connections as (file id, app node id).
     pub connections: Vec<(u64, u64)>,
     /// MIDI connections as (source node id, destination node id).
@@ -77,6 +85,34 @@ fn parse_placed(n: &KdlNode) -> Option<SessionNode> {
         size: [size.get(0).and_then(num)?, size.get(1).and_then(num)?],
         options,
     })
+}
+
+/// Parse a `hostport <id> { port <p>; pos x y; size w h }` entry.
+fn parse_hostport(n: &KdlNode) -> Option<SessionPort> {
+    let id = uint(n.get(0)?)?;
+    let ch = n.children()?;
+    let port = ch.get("port").and_then(|p| p.get(0)).and_then(uint)? as u16;
+    let pos = ch.get("pos")?;
+    let size = ch.get("size")?;
+    Some(SessionPort {
+        id,
+        port,
+        pos: [pos.get(0).and_then(num)?, pos.get(1).and_then(num)?],
+        size: [size.get(0).and_then(num)?, size.get(1).and_then(num)?],
+    })
+}
+
+fn hostport_kdl(p: &SessionPort) -> KdlNode {
+    let mut node = KdlNode::new("hostport");
+    node.push(KdlEntry::new(p.id as i128));
+    let mut ch = KdlDocument::new();
+    let mut port = KdlNode::new("port");
+    port.push(KdlEntry::new(p.port as i128));
+    ch.nodes_mut().push(port);
+    ch.nodes_mut().push(node2("pos", p.pos[0], p.pos[1]));
+    ch.nodes_mut().push(node2("size", p.size[0], p.size[1]));
+    node.set_children(ch);
+    node
 }
 
 fn placed_kdl(kind: &str, n: &SessionNode) -> KdlNode {
@@ -140,7 +176,7 @@ impl Session {
                 "node" => nodes.extend(parse_placed(n)),
                 "virtualfile" => virtual_files.extend(parse_placed(n)),
                 "hostfile" => host_files.extend(parse_placed(n)),
-                "hostport" => host_ports.extend(parse_placed(n)),
+                "hostport" => host_ports.extend(parse_hostport(n)),
                 "connection" => connections.extend(pair(n)),
                 "midi" => midi.extend(pair(n)),
                 "serve" => serves.extend(pair(n)),
@@ -184,7 +220,7 @@ impl Session {
             doc.nodes_mut().push(placed_kdl("hostfile", f));
         }
         for hp in &self.host_ports {
-            doc.nodes_mut().push(placed_kdl("hostport", hp));
+            doc.nodes_mut().push(hostport_kdl(hp));
         }
         for &(file, node) in &self.connections {
             doc.nodes_mut().push(pair_kdl("connection", file, node));
@@ -246,12 +282,11 @@ mod tests {
                 size: [130.0, 44.0],
                 options: Vec::new(),
             }],
-            host_ports: vec![SessionNode {
-                name: "8080".into(),
+            host_ports: vec![SessionPort {
                 id: 5,
+                port: 8080,
                 pos: [600.0, 100.0],
                 size: [130.0, 44.0],
-                options: Vec::new(),
             }],
             connections: vec![(2, 1)],
             midi: vec![(3, 4)],
@@ -271,7 +306,7 @@ mod tests {
         assert_eq!(back.host_files[0].name, "notes.txt");
         assert_eq!(back.host_files[0].id, 6);
         assert_eq!(back.host_ports.len(), 1);
-        assert_eq!(back.host_ports[0].name, "8080");
+        assert_eq!(back.host_ports[0].port, 8080);
         assert_eq!(back.host_ports[0].id, 5);
         assert_eq!(back.connections, vec![(2, 1)]);
         assert_eq!(back.midi, vec![(3, 4)]);
