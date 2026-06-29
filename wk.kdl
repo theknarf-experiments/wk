@@ -14,6 +14,7 @@ dependencies {
     sqlite "plugins/sqlite/sqlite3.wasm"
     fetch "plugins/fetch/fetch.wasm" {
         args "example.com" "80"
+        network
     }
     http_hello "oci://ghcr.io/bytecodealliance/sample-wasi-http-rust/sample-wasi-http-rust:latest"
 }

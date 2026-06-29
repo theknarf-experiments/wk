@@ -706,6 +706,7 @@ impl App {
                 self.registry.clone(),
                 self.node_reg.clone(),
                 n.options.clone(),
+                dep.network,
             ) {
                 Ok(()) => {
                     self.pending_layout.insert(n.id, (n.pos, n.size));
@@ -807,6 +808,7 @@ impl App {
             self.registry.clone(),
             self.node_reg.clone(),
             Vec::new(),
+            dep.network,
         ) {
             eprintln!("failed to launch {}: {e:#}", dep.name);
         }

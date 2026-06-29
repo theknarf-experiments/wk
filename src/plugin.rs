@@ -754,6 +754,7 @@ impl PluginHost {
         surfaces: SurfaceRegistry,
         nodes: NodeRegistry,
         initial_options: Vec<f32>,
+        allow_network: bool,
     ) -> Result<()> {
         let linker = self.build_linker()?;
 
@@ -793,21 +794,23 @@ impl PluginHost {
         // argv[0] is the program name, then the configured args (e.g. a filename).
         let mut argv = vec![name.to_string()];
         argv.extend(args.iter().cloned());
+        let mut ctx_builder = WasiCtxBuilder::new();
+        ctx_builder
+            .stdout(crate::terminal::stdout(&term_io))
+            .stderr(crate::terminal::stdout(&term_io))
+            .stdin(crate::terminal::stdin(&term_io))
+            .args(&argv)
+            .env("TERM", "xterm-256color")
+            .env("COLUMNS", crate::terminal::COLS.to_string())
+            .env("LINES", crate::terminal::ROWS.to_string());
+        // Nodes are isolated by default; only grant outbound TCP/UDP + DNS when
+        // the dependency opted in (wk.kdl `network`). Otherwise the guest has no
+        // network capability at all.
+        if allow_network {
+            ctx_builder.inherit_network().allow_ip_name_lookup(true);
+        }
         let state = HostState {
-            ctx: WasiCtxBuilder::new()
-                .stdout(crate::terminal::stdout(&term_io))
-                .stderr(crate::terminal::stdout(&term_io))
-                .stdin(crate::terminal::stdin(&term_io))
-                .args(&argv)
-                .env("TERM", "xterm-256color")
-                .env("COLUMNS", crate::terminal::COLS.to_string())
-                .env("LINES", crate::terminal::ROWS.to_string())
-                // Allow outbound TCP/UDP + DNS so recompiled networked apps work.
-                // (Network access is currently granted to every node; a per-node
-                // permission gate, like file connections, is a follow-up.)
-                .inherit_network()
-                .allow_ip_name_lookup(true)
-                .build(),
+            ctx: ctx_builder.build(),
             table: ResourceTable::new(),
             registry: surfaces,
             node_id: id,
