@@ -3,6 +3,11 @@ mod compositor;
 mod host_shell;
 mod http;
 mod midi;
+// The userspace network fabric. Proven by its own tests; the runtime consumer
+// (wk's own wasi:sockets impl over these per-node smoltcp stacks) is the next
+// slice, which will wire it into `spawn` and drop this `cfg(test)` gate.
+#[cfg(test)]
+mod netstack;
 mod oci;
 mod options;
 mod plugin;
