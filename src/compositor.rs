@@ -439,6 +439,34 @@ fn host_file_name(path: &std::path::Path) -> String {
         .unwrap_or_else(|| "hostfile".to_string())
 }
 
+/// Append a small arrowhead at the midpoint of `a`->`b` pointing toward `b`, so
+/// a connection wire shows its direction (which node is the source). Connections
+/// are directional — MIDI and serve only flow source->destination — and a plain
+/// line hides that, so a backwards wire looks identical to a working one.
+fn arrow_head(
+    quads: &mut Vec<Quad>,
+    white: TextureId,
+    a: [f32; 2],
+    b: [f32; 2],
+    size: f32,
+    color: [f32; 4],
+    clip: [f32; 4],
+) {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let len = (dx * dx + dy * dy).sqrt().max(0.001);
+    let (ux, uy) = (dx / len, dy / len); // unit a->b
+    let (px, py) = (-uy, ux); // perpendicular
+    let m = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
+    let tip = [m[0] + ux * size, m[1] + uy * size];
+    let back = [m[0] - ux * size * 0.5, m[1] - uy * size * 0.5];
+    let wing = size * 0.8;
+    let left = [back[0] + px * wing, back[1] + py * wing];
+    let right = [back[0] - px * wing, back[1] - py * wing];
+    let th = (size * 0.5).max(1.5);
+    quads.push(Quad::line(white, tip, left, th, color, clip));
+    quads.push(Quad::line(white, tip, right, th, color, clip));
+}
+
 /// The compositor application: owns all state. winit drives it via
 /// `ApplicationHandler`; the per-frame work happens in `frame`.
 struct App {
@@ -1244,7 +1272,8 @@ impl App {
                 quads.push(Quad::line(white, a, b, (2.0 * zf).max(1.5), WIRE_COL, full));
             }
         }
-        // MIDI connection wires (source -> destination), in a distinct colour.
+        // MIDI connection wires (source -> destination), in a distinct colour,
+        // with an arrowhead so the direction (which node drives which) is clear.
         for &(src, dst) in &self.midi_links {
             if self.win_pos.contains_key(&src) && self.win_pos.contains_key(&dst) {
                 let a = center(self.rect_of(src));
@@ -1257,6 +1286,15 @@ impl App {
                     MIDI_WIRE_COL,
                     full,
                 ));
+                arrow_head(
+                    &mut quads,
+                    white,
+                    a,
+                    b,
+                    (7.0 * zf).max(5.0),
+                    MIDI_WIRE_COL,
+                    full,
+                );
             }
         }
         // HostPort serve wires (wasi:http node -> exposed localhost port).
@@ -1272,6 +1310,15 @@ impl App {
                     HOSTPORT_WIRE,
                     full,
                 ));
+                arrow_head(
+                    &mut quads,
+                    white,
+                    a,
+                    b,
+                    (7.0 * zf).max(5.0),
+                    HOSTPORT_WIRE,
+                    full,
+                );
             }
         }
 
