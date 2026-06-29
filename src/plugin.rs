@@ -156,11 +156,12 @@ pub struct Node {
 }
 
 /// What [`PluginHost::run_node`] needs to (re)start a node's guest. Held on the
-/// `Node` so the compositor can run an idle node or re-run a finished one.
+/// `Node` so the compositor can run an idle node or re-run a finished one. The
+/// launch args aren't here — the compositor owns them (editable per node) and
+/// passes them to `run_node`.
 #[derive(Clone)]
 pub struct NodeLaunch {
     pub path: std::path::PathBuf,
-    pub args: Vec<String>,
     pub is_command: bool,
     pub surfaces: SurfaceRegistry,
 }
@@ -836,7 +837,6 @@ impl PluginHost {
             http_path: is_http.then(|| path.to_path_buf()),
             launch: (!is_http).then(|| NodeLaunch {
                 path: path.to_path_buf(),
-                args: args.to_vec(),
                 is_command,
                 surfaces,
             }),
@@ -850,7 +850,7 @@ impl PluginHost {
         // Networked nodes start idle so they can be wired before running; the
         // compositor runs them on demand. Everything else runs right away.
         if node.net_stack.is_none() {
-            self.run_node(&node)?;
+            self.run_node(&node, args)?;
         }
         Ok(())
     }
@@ -859,7 +859,9 @@ impl PluginHost {
     /// persistent state (filesystem, options, terminal, and — crucially — its
     /// fabric stack, so any network wiring already applied stays in effect).
     /// No-op if the node is already running or isn't runnable (an HTTP server).
-    pub fn run_node(&self, node: &SharedNode) -> Result<()> {
+    /// `args` are the launch args (argv after the program name) — the compositor
+    /// passes the node's current, possibly-edited args.
+    pub fn run_node(&self, node: &SharedNode, args: &[String]) -> Result<()> {
         let Some(launch) = node.launch.clone() else {
             return Ok(());
         };
@@ -881,7 +883,7 @@ impl PluginHost {
 
         // argv[0] is the program name, then the configured args (e.g. a filename).
         let mut argv = vec![node.name.clone()];
-        argv.extend(launch.args.iter().cloned());
+        argv.extend(args.iter().cloned());
         let mut ctx_builder = WasiCtxBuilder::new();
         ctx_builder
             .stdout(crate::terminal::stdout(&node.term_io))

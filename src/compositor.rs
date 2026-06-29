@@ -570,6 +570,12 @@ struct App {
     win_size: HashMap<u64, [f32; 2]>,
     z: Vec<u64>,
     kbd_focus: Option<u64>,
+    /// Per-node launch args (argv after the program name), seeded from the
+    /// dependency default and editable on idle nodes. Passed to `run_node` and
+    /// persisted in the session.
+    node_args: std::collections::HashMap<u64, Vec<String>>,
+    /// When editing an idle node's args: its id and the in-progress text.
+    editing_args: Option<(u64, String)>,
     drag: Option<Drag>,
     /// The connection wire currently selected (click to select, Delete to remove).
     wire_sel: Option<Wire>,
@@ -657,6 +663,8 @@ impl App {
             win_size: HashMap::new(),
             z: Vec::new(),
             kbd_focus: None,
+            node_args: HashMap::new(),
+            editing_args: None,
             drag: None,
             wire_sel: None,
             del_wire: false,
@@ -724,17 +732,25 @@ impl App {
                 );
                 continue;
             };
+            // Use the node's saved (possibly-edited) args, falling back to the
+            // dependency default.
+            let args = if n.args.is_empty() {
+                dep.args.clone()
+            } else {
+                n.args.clone()
+            };
             match self.host.spawn(
                 &dep.local_path(),
                 &dep.name,
                 n.id,
-                &dep.args,
+                &args,
                 self.registry.clone(),
                 self.node_reg.clone(),
                 n.options.clone(),
             ) {
                 Ok(()) => {
                     self.pending_layout.insert(n.id, (n.pos, n.size));
+                    self.node_args.insert(n.id, args);
                 }
                 Err(e) => eprintln!("failed to restore {}: {e:#}", dep.name),
             }
@@ -853,7 +869,9 @@ impl App {
             Vec::new(),
         ) {
             eprintln!("failed to launch {}: {e:#}", dep.name);
+            return;
         }
+        self.node_args.insert(id, dep.args.clone());
     }
 
     fn rect_of(&self, id: u64) -> [f32; 4] {
@@ -936,15 +954,30 @@ impl App {
             .cloned()
     }
 
-    /// (Re)run an idle or exited node's guest. Its network wiring is already on
-    /// its fabric stack, so a networked client started here resolves/connects
-    /// with whatever Network/Gateway it's wired to.
+    /// (Re)run an idle or exited node's guest with its current args. Its network
+    /// wiring is already on its fabric stack, so a networked client started here
+    /// resolves/connects with whatever Network/Gateway it's wired to.
     fn run_node(&mut self, id: u64) {
+        // Commit any in-progress args edit for this node first.
+        if let Some((eid, text)) = self.editing_args.take() {
+            if eid == id {
+                self.set_node_args(id, &text);
+            } else {
+                self.editing_args = Some((eid, text));
+            }
+        }
         if let Some(node) = self.app_node(id) {
-            if let Err(e) = self.host.run_node(&node) {
+            let args = self.node_args.get(&id).cloned().unwrap_or_default();
+            if let Err(e) = self.host.run_node(&node, &args) {
                 eprintln!("failed to run {}: {e:#}", node.name);
             }
         }
+    }
+
+    /// Parse a whitespace-separated args string into the node's launch args.
+    fn set_node_args(&mut self, id: u64, text: &str) {
+        let args = text.split_whitespace().map(str::to_string).collect();
+        self.node_args.insert(id, args);
     }
 
     /// Create a HostPort node on the canvas (auto-assigned localhost port).
@@ -1317,6 +1350,31 @@ impl App {
         }
     }
 
+    /// Handle a key press while editing an idle node's launch args.
+    fn editing_args_key(&mut self, code: KeyCode, text: Option<&str>) {
+        match code {
+            KeyCode::Escape => self.editing_args = None,
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                // Commit the edit and run the node (run_node commits + launches).
+                if let Some((id, _)) = self.editing_args {
+                    self.run_node(id);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some((_, s)) = self.editing_args.as_mut() {
+                    s.pop();
+                }
+            }
+            _ => {
+                if let (Some((_, s)), Some(t)) = (self.editing_args.as_mut(), text) {
+                    for ch in t.chars().filter(|c| !c.is_control()) {
+                        s.push(ch);
+                    }
+                }
+            }
+        }
+    }
+
     /// Handle a key press while the command palette is open.
     fn palette_key(&mut self, code: KeyCode, text: Option<&str>) {
         let len = self.palette_filtered().len();
@@ -1671,12 +1729,14 @@ impl App {
                         } else if idle && contains(run_btn(r, zf), mp) {
                             self.run_node(id);
                         } else if contains(resize_grip(r, zf), mp) {
+                            self.editing_args = None;
                             self.drag = Some(Drag {
                                 id,
                                 mode: DragMode::Resize,
                                 grab: [0.0, 0.0],
                             });
                         } else if contains(title_bar(r, zf), mp) {
+                            self.editing_args = None;
                             let mc = self.cam.to_canvas(mp);
                             let p = self.win_pos[&id];
                             self.drag = Some(Drag {
@@ -1684,6 +1744,15 @@ impl App {
                                 mode: DragMode::Move,
                                 grab: [mc[0] - p[0], mc[1] - p[1]],
                             });
+                        } else if idle && contains(content_rect(r, zf), mp) {
+                            // Click an idle node's body to edit its launch args.
+                            let cur = self
+                                .node_args
+                                .get(&id)
+                                .cloned()
+                                .unwrap_or_default()
+                                .join(" ");
+                            self.editing_args = Some((id, cur));
                         }
                     }
                     consumed = true;
@@ -1694,6 +1763,7 @@ impl App {
                 // can be deleted), else dismiss the menu and unfocus the app.
                 self.menu_open = false;
                 self.kbd_focus = None;
+                self.editing_args = None;
                 self.wire_sel = self.wire_at(mp);
             }
         }
@@ -2278,6 +2348,54 @@ impl App {
                 }
             }
 
+            // Idle node: show its (editable) launch args in the body.
+            if node_idle {
+                let editing = matches!(&self.editing_args, Some((eid, _)) if *eid == id);
+                let line = match &self.editing_args {
+                    Some((eid, s)) if *eid == id => format!("args: {s}_"),
+                    _ => format!(
+                        "args: {}",
+                        self.node_args
+                            .get(&id)
+                            .cloned()
+                            .unwrap_or_default()
+                            .join(" ")
+                    ),
+                };
+                let lh = gfx.fonts.line_height() as f32 * zf;
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    &line,
+                    ca[0] + PAD * zf,
+                    ca[1] + PAD * zf,
+                    zf,
+                    TEXT,
+                    ca_clip,
+                );
+                let hint = if editing {
+                    "Enter to run, Esc to cancel"
+                } else {
+                    "click to edit args, > to run"
+                };
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    hint,
+                    ca[0] + PAD * zf,
+                    ca[1] + PAD * zf + lh * 1.4,
+                    zf * 0.8,
+                    PORT_COL,
+                    ca_clip,
+                );
+            }
+
             // Connection port on the right edge.
             let pp = port_pos(r);
             let pr = PORT_R * zf;
@@ -2594,6 +2712,10 @@ impl App {
             }
             self.win_pos.remove(id);
             self.win_size.remove(id);
+            self.node_args.remove(id);
+            if matches!(self.editing_args, Some((eid, _)) if eid == *id) {
+                self.editing_args = None;
+            }
             self.z.retain(|x| x != id);
             if self.kbd_focus == Some(*id) {
                 self.kbd_focus = None;
@@ -2621,6 +2743,7 @@ impl App {
                     size: *self.win_size.get(&node.id)?,
                     // The guest's latest reported knob/option values.
                     options: node.options.lock().unwrap().clone(),
+                    args: self.node_args.get(&node.id).cloned().unwrap_or_default(),
                 })
             })
             .collect();
@@ -2636,6 +2759,7 @@ impl App {
                     pos: *self.win_pos.get(&id)?,
                     size: *self.win_size.get(&id)?,
                     options: Vec::new(),
+                    args: Vec::new(),
                 }),
                 FileNode::HostMapped(_) => None,
             })
@@ -2650,6 +2774,7 @@ impl App {
                     pos: *self.win_pos.get(&id)?,
                     size: *self.win_size.get(&id)?,
                     options: Vec::new(),
+                    args: Vec::new(),
                 }),
                 FileNode::Virtual(_) => None,
             })
@@ -2811,6 +2936,13 @@ impl ApplicationHandler for App {
                     if self.palette_open {
                         if pressed {
                             self.palette_key(code, event.text.as_deref());
+                        }
+                        return;
+                    }
+                    // While editing a node's args, keystrokes edit that text.
+                    if self.editing_args.is_some() {
+                        if pressed {
+                            self.editing_args_key(code, event.text.as_deref());
                         }
                         return;
                     }

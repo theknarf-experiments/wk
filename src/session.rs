@@ -32,6 +32,9 @@ pub struct SessionNode {
     /// App-node option values (e.g. knob settings), persisted positionally.
     /// Empty for file nodes (and app nodes that report none).
     pub options: Vec<f32>,
+    /// App-node launch args (e.g. a client's target host/port), editable in the
+    /// GUI. Empty for file nodes and nodes left at their dependency default.
+    pub args: Vec<String>,
 }
 
 /// A HostPort node: a localhost port plus its canvas placement.
@@ -93,12 +96,22 @@ fn parse_placed(n: &KdlNode) -> Option<SessionNode> {
         .get("options")
         .map(|o| o.entries().iter().filter_map(|e| num(e.value())).collect())
         .unwrap_or_default();
+    let args = ch
+        .get("args")
+        .map(|a| {
+            a.entries()
+                .iter()
+                .filter_map(|e| e.value().as_string().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
     Some(SessionNode {
         name,
         id,
         pos: [pos.get(0).and_then(num)?, pos.get(1).and_then(num)?],
         size: [size.get(0).and_then(num)?, size.get(1).and_then(num)?],
         options,
+        args,
     })
 }
 
@@ -167,6 +180,13 @@ fn placed_kdl(kind: &str, n: &SessionNode) -> KdlNode {
             opts.push(KdlEntry::new(v as f64));
         }
         ch.nodes_mut().push(opts);
+    }
+    if !n.args.is_empty() {
+        let mut args = KdlNode::new("args");
+        for a in &n.args {
+            args.push(KdlEntry::new(a.clone()));
+        }
+        ch.nodes_mut().push(args);
     }
     node.set_children(ch);
     node
@@ -319,6 +339,7 @@ mod tests {
                 pos: [40.0, 56.0],
                 size: [360.0, 260.0],
                 options: vec![8.0, 0.6, 0.0, 1.0],
+                args: vec!["netserve".into(), "80".into()],
             }],
             virtual_files: vec![SessionNode {
                 name: "chan".into(),
@@ -326,6 +347,7 @@ mod tests {
                 pos: [200.0, 120.0],
                 size: [130.0, 44.0],
                 options: Vec::new(),
+                args: Vec::new(),
             }],
             host_files: vec![SessionNode {
                 name: "notes.txt".into(),
@@ -333,6 +355,7 @@ mod tests {
                 pos: [200.0, 200.0],
                 size: [130.0, 44.0],
                 options: Vec::new(),
+                args: Vec::new(),
             }],
             host_ports: vec![SessionPort {
                 id: 5,
@@ -366,7 +389,12 @@ mod tests {
         assert_eq!(back.nodes[0].name, "file_demo");
         assert_eq!(back.nodes[0].id, 1);
         assert_eq!(back.nodes[0].options, vec![8.0, 0.6, 0.0, 1.0]);
+        assert_eq!(
+            back.nodes[0].args,
+            vec!["netserve".to_string(), "80".into()]
+        );
         assert!(back.virtual_files[0].options.is_empty());
+        assert!(back.virtual_files[0].args.is_empty());
         assert_eq!(back.virtual_files.len(), 1);
         assert_eq!(back.virtual_files[0].name, "chan");
         assert_eq!(back.host_files.len(), 1);
