@@ -302,7 +302,8 @@ fn read_at(data: &[u8], offset: u64, len: u64) -> (Vec<u8>, bool) {
 pub fn add_wasi_except_fs<T: WasiView + 'static>(l: &mut Linker<T>) -> Result<()> {
     use wasmtime_wasi::cli::{WasiCli, WasiCliView};
     use wasmtime_wasi::clocks::{WasiClocks, WasiClocksView};
-    use wasmtime_wasi::p2::bindings::{cli, clocks};
+    use wasmtime_wasi::p2::bindings::{cli, clocks, sockets};
+    use wasmtime_wasi::sockets::{WasiSockets, WasiSocketsView};
 
     struct HasIo;
     impl HasData for HasIo {
@@ -326,6 +327,19 @@ pub fn add_wasi_except_fs<T: WasiView + 'static>(l: &mut Linker<T>) -> Result<()
     cli::terminal_stdin::add_to_linker::<T, WasiCli>(l, T::cli)?;
     cli::terminal_stdout::add_to_linker::<T, WasiCli>(l, T::cli)?;
     cli::terminal_stderr::add_to_linker::<T, WasiCli>(l, T::cli)?;
+
+    // wasi:sockets — outbound TCP/UDP + DNS, so recompiled networked C programs
+    // (BSD sockets via wasi-libc) work. Whether a guest may actually reach the
+    // network is gated by its `WasiCtx` (see the spawn-time network config), not
+    // by linking. The async tcp/udp variants match our async guest driver.
+    let net_opts = sockets::network::LinkOptions::default();
+    sockets::tcp::add_to_linker::<T, WasiSockets>(l, T::sockets)?;
+    sockets::udp::add_to_linker::<T, WasiSockets>(l, T::sockets)?;
+    sockets::tcp_create_socket::add_to_linker::<T, WasiSockets>(l, T::sockets)?;
+    sockets::udp_create_socket::add_to_linker::<T, WasiSockets>(l, T::sockets)?;
+    sockets::instance_network::add_to_linker::<T, WasiSockets>(l, T::sockets)?;
+    sockets::network::add_to_linker::<T, WasiSockets>(l, &net_opts, T::sockets)?;
+    sockets::ip_name_lookup::add_to_linker::<T, WasiSockets>(l, T::sockets)?;
     Ok(())
 }
 

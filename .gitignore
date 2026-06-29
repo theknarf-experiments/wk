@@ -72,5 +72,8 @@ plugins/sqlite/sqlite-amalgamation-*/
 plugins/sqlite/sqlite3.wasm
 plugins/sqlite/sqlite3.core.wasm
 
+# fetch (networked C client) build artifact
+plugins/fetch/fetch.wasm
+
 # stray literal-tilde dir from tools that mis-expand $HOME
 /~/

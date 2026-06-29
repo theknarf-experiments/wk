@@ -802,6 +802,11 @@ impl PluginHost {
                 .env("TERM", "xterm-256color")
                 .env("COLUMNS", crate::terminal::COLS.to_string())
                 .env("LINES", crate::terminal::ROWS.to_string())
+                // Allow outbound TCP/UDP + DNS so recompiled networked apps work.
+                // (Network access is currently granted to every node; a per-node
+                // permission gate, like file connections, is a follow-up.)
+                .inherit_network()
+                .allow_ip_name_lookup(true)
                 .build(),
             table: ResourceTable::new(),
             registry: surfaces,
