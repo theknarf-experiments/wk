@@ -11,5 +11,6 @@ dependencies {
         args "welcome.txt"
     }
     lua "plugins/lua/lua.wasm"
+    sqlite "plugins/sqlite/sqlite3.wasm"
     http_hello "oci://ghcr.io/bytecodealliance/sample-wasi-http-rust/sample-wasi-http-rust:latest"
 }

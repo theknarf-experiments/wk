@@ -67,5 +67,10 @@ plugins/lua/lua-5.4.7/
 plugins/lua/lua.wasm
 plugins/lua/lua.core.wasm
 
+# sqlite build artifacts (amalgamation fetched by build.sh, component built from it)
+plugins/sqlite/sqlite-amalgamation-*/
+plugins/sqlite/sqlite3.wasm
+plugins/sqlite/sqlite3.core.wasm
+
 # stray literal-tilde dir from tools that mis-expand $HOME
 /~/
