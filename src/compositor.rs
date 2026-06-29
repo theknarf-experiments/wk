@@ -384,6 +384,7 @@ enum PaletteCmd {
     AddVirtualFile,
     AddHostFile,
     AddPort,
+    AddNetwork,
     /// Jump the camera to this zoom factor.
     Zoom(f32),
     Quit,
@@ -462,6 +463,10 @@ const HOSTPORT_WIRE: [f32; 4] = [0.40, 0.78, 0.82, 1.0];
 const WIRE_COL: [f32; 4] = [0.55, 0.60, 0.72, 1.0];
 /// MIDI connection wires get a distinct (teal/green) colour.
 const MIDI_WIRE_COL: [f32; 4] = [0.35, 0.78, 0.62, 1.0];
+/// Network node colours and membership wire (a virtual network / Docker bridge).
+const NET_BG: [f32; 4] = [0.14, 0.12, 0.20, 1.0];
+const NET_BORDER: [f32; 4] = [0.50, 0.40, 0.72, 1.0];
+const NET_WIRE_COL: [f32; 4] = [0.62, 0.50, 0.86, 1.0];
 /// A selected wire is drawn thicker in this highlight colour.
 const WIRE_SEL_COL: [f32; 4] = [1.0, 0.85, 0.4, 1.0];
 
@@ -588,6 +593,11 @@ struct App {
     host_ports: HashMap<u64, u16>,
     /// Active servers: http node id -> (HostPort id, kill switch).
     serves: HashMap<u64, (u64, Arc<std::sync::atomic::AtomicBool>)>,
+    /// Network nodes — each is an isolated virtual network (Docker-bridge); app
+    /// nodes wired to one share that network. The set holds their canvas ids.
+    net_nodes: std::collections::HashSet<u64>,
+    /// Network membership wires, as (app node id, Network node id).
+    net_links: Vec<(u64, u64)>,
     next_node_id: u64,
     next_port: u16,
     file_seq: u32,
@@ -650,6 +660,8 @@ impl App {
             connections: Vec::new(),
             midi_links: Vec::new(),
             host_ports: HashMap::new(),
+            net_nodes: std::collections::HashSet::new(),
+            net_links: Vec::new(),
             serves: HashMap::new(),
             next_port: 8080,
             file_seq: 0,
@@ -904,26 +916,88 @@ impl App {
         self.host_ports.insert(id, port);
     }
 
+    /// Create a Network node on the canvas — an isolated virtual network that
+    /// app nodes wire into to reach each other.
+    fn add_net_node(&mut self) {
+        let id = self.alloc_id();
+        let pos = self.view_center([FILE_W, FILE_H], self.net_nodes.len());
+        self.win_pos.insert(id, pos);
+        self.win_size.insert(id, [FILE_W, FILE_H]);
+        self.z.push(id);
+        self.net_nodes.insert(id);
+    }
+
     /// Toggle a connection between two nodes, by the node kinds: file⇄app mounts
-    /// the file; http-app⇄HostPort exposes the server on localhost; app⇄app wires
-    /// MIDI.
+    /// the file; http-app⇄HostPort serves on localhost; app⇄Network joins the
+    /// network; app⇄app wires MIDI.
     fn connect_toggle(&mut self, a: u64, b: u64) {
-        let (af, bf) = (
-            self.file_nodes.contains_key(&a),
-            self.file_nodes.contains_key(&b),
-        );
-        let (ap, bp) = (
-            self.host_ports.contains_key(&a),
-            self.host_ports.contains_key(&b),
-        );
-        match (af, bf, ap, bp) {
-            (true, false, _, _) => self.toggle_file(a, b),
-            (false, true, _, _) => self.toggle_file(b, a),
-            (_, _, true, false) => self.toggle_serve(b, a),
-            (_, _, false, true) => self.toggle_serve(a, b),
-            (false, false, false, false) => self.toggle_midi(a, b),
-            _ => {}
+        let af = self.file_nodes.contains_key(&a);
+        let bf = self.file_nodes.contains_key(&b);
+        let ap = self.host_ports.contains_key(&a);
+        let bp = self.host_ports.contains_key(&b);
+        let an = self.net_nodes.contains(&a);
+        let bn = self.net_nodes.contains(&b);
+        if af && !bf {
+            self.toggle_file(a, b);
+        } else if bf && !af {
+            self.toggle_file(b, a);
+        } else if ap && !bp {
+            self.toggle_serve(b, a);
+        } else if bp && !ap {
+            self.toggle_serve(a, b);
+        } else if an && !bn {
+            self.toggle_net(b, a);
+        } else if bn && !an {
+            self.toggle_net(a, b);
+        } else if !af && !bf && !ap && !bp && !an && !bn {
+            self.toggle_midi(a, b);
         }
+    }
+
+    /// Set an app node's virtual network (on its fabric stack). `net` is a
+    /// Network node's id to join it, or the app's own id to isolate it.
+    fn set_node_net(&self, app_id: u64, net: u64) {
+        if let Some(node) = self.app_node(app_id) {
+            if let Some(stack) = &node.net_stack {
+                stack.lock().unwrap().net = net;
+            }
+        }
+    }
+
+    /// Wire (or unwire) app node `app_id` onto Network node `net_id`. An app is
+    /// on one network at a time; unwiring returns it to its own isolated net.
+    fn toggle_net(&mut self, app_id: u64, net_id: u64) {
+        if let Some(pos) = self
+            .net_links
+            .iter()
+            .position(|&(a, n)| a == app_id && n == net_id)
+        {
+            self.net_links.remove(pos);
+            self.set_node_net(app_id, app_id); // back to isolated
+        } else {
+            // One network per app: drop any existing membership first.
+            self.net_links.retain(|&(a, _)| a != app_id);
+            self.net_links.push((app_id, net_id));
+            self.set_node_net(app_id, net_id);
+        }
+    }
+
+    /// Remove a Network node, returning its members to isolation.
+    fn remove_net_node(&mut self, id: u64) {
+        self.net_nodes.remove(&id);
+        let members: Vec<u64> = self
+            .net_links
+            .iter()
+            .filter(|&&(_, n)| n == id)
+            .map(|&(a, _)| a)
+            .collect();
+        for app in members {
+            self.set_node_net(app, app);
+        }
+        self.net_links.retain(|&(_, n)| n != id);
+        self.win_pos.remove(&id);
+        self.win_size.remove(&id);
+        self.z.retain(|&x| x != id);
     }
 
     /// Wire (or unwire) a wasi:http node to a HostPort: start (or stop) serving
@@ -1136,6 +1210,7 @@ impl App {
         v.push(("Add Virtual File".into(), PaletteCmd::AddVirtualFile));
         v.push(("Add Host File".into(), PaletteCmd::AddHostFile));
         v.push(("Add Port".into(), PaletteCmd::AddPort));
+        v.push(("Add Network".into(), PaletteCmd::AddNetwork));
         for &z in &ZOOM_PRESETS {
             v.push((format!("Zoom {:.0}%", z * 100.0), PaletteCmd::Zoom(z)));
         }
@@ -1221,6 +1296,7 @@ impl App {
             PaletteCmd::AddVirtualFile => self.add_virtual_file(),
             PaletteCmd::AddHostFile => self.add_host_mapped_file(),
             PaletteCmd::AddPort => self.add_host_port(),
+            PaletteCmd::AddNetwork => self.add_net_node(),
             PaletteCmd::Zoom(z) => {
                 self.cam
                     .zoom_at(z / self.cam.zoom, [fb[0] * 0.5, fb[1] * 0.5]);
@@ -1300,6 +1376,7 @@ impl App {
             node_by_id.contains_key(id)
                 || self.file_nodes.contains_key(id)
                 || self.host_ports.contains_key(id)
+                || self.net_nodes.contains(id)
         });
 
         let surfaces: Vec<SharedSurface> = self.registry.lock().unwrap().clone();
@@ -1473,6 +1550,7 @@ impl App {
                     let r = self.rect_of(id);
                     let is_file = self.file_nodes.contains_key(&id);
                     let is_port = self.host_ports.contains_key(&id);
+                    let is_net = self.net_nodes.contains(&id);
                     if near(mp, port_pos(r), PORT_R * zf + 3.0) {
                         // Drag a connection wire out of the port.
                         self.drag = Some(Drag {
@@ -1480,15 +1558,17 @@ impl App {
                             mode: DragMode::Connect,
                             grab: [0.0, 0.0],
                         });
-                    } else if is_file || is_port {
-                        // Canvas widget nodes (file / HostPort): close, adjust
-                        // port (HostPort −/+ buttons), or move.
+                    } else if is_file || is_port || is_net {
+                        // Canvas widget nodes (file / HostPort / Network): close,
+                        // adjust port (HostPort −/+ buttons), or move.
                         let (minus, plus) = port_step_btns(r, zf);
                         if contains(close_btn(r, zf), mp) {
                             if is_file {
                                 self.remove_file_node(id);
-                            } else {
+                            } else if is_port {
                                 self.remove_host_port(id);
+                            } else {
+                                self.remove_net_node(id);
                             }
                         } else if is_port && contains(plus, mp) {
                             self.change_port(id, 1);
@@ -1699,6 +1779,14 @@ impl App {
                 arrow_head(&mut quads, white, a, b, (7.0 * zf).max(5.0), col, full);
             }
         }
+        // Network membership wires (app node — Network node).
+        for &(app, net) in &self.net_links {
+            if self.win_pos.contains_key(&app) && self.win_pos.contains_key(&net) {
+                let a = center(self.rect_of(app));
+                let b = center(self.rect_of(net));
+                quads.push(Quad::line(white, a, b, wire_w(false), NET_WIRE_COL, full));
+            }
+        }
 
         for &id in &self.z {
             let pos = self.win_pos[&id];
@@ -1872,6 +1960,73 @@ impl App {
                         clip,
                     );
                 }
+                let pp = port_pos(r);
+                let pr = PORT_R * zf;
+                quads.push(Quad::solid(
+                    white,
+                    [pp[0] - pr, pp[1] - pr, pp[0] + pr, pp[1] + pr],
+                    PORT_COL,
+                    full,
+                ));
+                continue;
+            }
+
+            // A Network node: an isolated virtual network; wired app nodes share
+            // it. Shows how many members are on it.
+            if self.net_nodes.contains(&id) {
+                let members = self.net_links.iter().filter(|&&(_, n)| n == id).count();
+                quads.push(Quad::solid(white, r, NET_BORDER, clip));
+                let body = [
+                    r[0] + BORDER * zf,
+                    r[1] + BORDER * zf,
+                    r[2] - BORDER * zf,
+                    r[3] - BORDER * zf,
+                ];
+                quads.push(Quad::solid(white, body, NET_BG, clip));
+                let lh = gfx.fonts.line_height() as f32;
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    "Network",
+                    r[0] + PAD * zf,
+                    r[1] + PAD * zf,
+                    zf,
+                    TEXT,
+                    clip,
+                );
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    &format!("{members} node(s)"),
+                    r[0] + PAD * zf,
+                    r[1] + (PAD + lh) * zf,
+                    zf * 0.7,
+                    [0.72, 0.62, 0.9, 1.0],
+                    clip,
+                );
+                let cb = close_btn(r, zf);
+                if contains(cb, mp) {
+                    quads.push(Quad::solid(white, cb, CLOSE_HOT, clip));
+                }
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    "x",
+                    cb[0] + (cb[2] - cb[0]) * 0.28,
+                    cb[1] + (cb[3] - cb[1]) * 0.05,
+                    zf * 0.8,
+                    TEXT,
+                    clip,
+                );
                 let pp = port_pos(r);
                 let pr = PORT_R * zf;
                 quads.push(Quad::solid(
@@ -2310,6 +2465,7 @@ impl App {
             // A closed app drops its connections (its filesystem is gone) and
             // any MIDI links it took part in.
             self.connections.retain(|&(_, app)| app != *id);
+            self.net_links.retain(|&(app, _)| app != *id);
             self.host.midi().lock().unwrap().remove_node(*id);
             self.midi_links.retain(|&(s, d)| s != *id && d != *id);
             // Stop any wasi:http server this node was running.

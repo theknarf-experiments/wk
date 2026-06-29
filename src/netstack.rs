@@ -312,4 +312,59 @@ mod tests {
         }
         assert_eq!(&got, b"hello wk net");
     }
+
+    /// Nodes on DIFFERENT virtual networks can't reach each other, even at the
+    /// same address — the isolation boundary (off-network packets are dropped).
+    #[test]
+    fn different_networks_are_isolated() {
+        let server_ip = Ipv4Address::new(10, 0, 0, 2);
+        let hub = NetHub::new();
+        let client = hub.attach(1, Ipv4Address::new(10, 0, 0, 1)); // net 1
+        let server = hub.attach(2, server_ip); // net 2 — isolated
+
+        let server_h = {
+            let mut g = server.lock().unwrap();
+            let h = g.sockets.add(tcp_socket());
+            g.sockets.get_mut::<tcp::Socket>(h).listen(80).unwrap();
+            h
+        };
+        let client_h = {
+            let mut g = client.lock().unwrap();
+            let h = g.sockets.add(tcp_socket());
+            let NodeStack { iface, sockets, .. } = &mut *g;
+            sockets
+                .get_mut::<tcp::Socket>(h)
+                .connect(iface.context(), (server_ip, 80), 49152)
+                .unwrap();
+            h
+        };
+
+        for _ in 0..200 {
+            hub.step();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The connection never establishes and the server never leaves Listen.
+        let cstate = client
+            .lock()
+            .unwrap()
+            .sockets
+            .get::<tcp::Socket>(client_h)
+            .state();
+        let sstate = server
+            .lock()
+            .unwrap()
+            .sockets
+            .get::<tcp::Socket>(server_h)
+            .state();
+        assert_ne!(
+            cstate,
+            tcp::State::Established,
+            "client on net 1 must not connect to a server on net 2 (was {cstate:?})"
+        );
+        assert_eq!(
+            sstate,
+            tcp::State::Listen,
+            "server on net 2 must not see the net-1 client (was {sstate:?})"
+        );
+    }
 }

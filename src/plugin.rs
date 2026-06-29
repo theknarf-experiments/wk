@@ -134,6 +134,10 @@ pub struct Node {
     /// This node's option values (e.g. knob settings) reported by the guest, so
     /// the compositor can persist them to the session and seed them on restore.
     pub options: crate::options::SharedOptions,
+    /// This node's network stack on the fabric (`Some` if it imports
+    /// wasi:sockets), so the compositor can change which virtual network it's on
+    /// by wiring it to a Network node.
+    pub net_stack: Option<crate::netstack::SharedStack>,
     /// If this node is a `wasi:http` server (exports `incoming-handler`), the
     /// component path to serve when it's wired to a HostPort. Such nodes don't
     /// run a `run` loop; they're served on demand.
@@ -793,6 +797,17 @@ impl PluginHost {
         // through its `wasi:cli/run` export; a wk-world guest through its `run`.
         let is_command = component_is_command(&component, &self.engine);
 
+        // A node that imports wasi:sockets gets a NIC on the fabric. By default
+        // it's alone on its own virtual network (net id = node id) — isolated,
+        // can't reach anyone — until the compositor wires it to a Network node.
+        let net = if !is_http && component_imports_sockets(&component, &self.engine) {
+            let ip = smoltcp::wire::Ipv4Address::new(10, 0, 0, (2 + (id % 250)) as u8);
+            let stack = self.hub.attach(id, ip);
+            Some(crate::sockets::NetCtx::new(stack, ip))
+        } else {
+            None
+        };
+
         nodes.lock().unwrap().push(Arc::new(Node {
             id,
             name: name.to_string(),
@@ -800,6 +815,7 @@ impl PluginHost {
             fs: fs.clone(),
             midi_in: midi_in.clone(),
             options: options.clone(),
+            net_stack: net.as_ref().map(|n| n.stack.clone()),
             finished: finished.clone(),
             kill: kill.clone(),
             http_path: is_http.then(|| path.to_path_buf()),
@@ -821,16 +837,6 @@ impl PluginHost {
             .env("TERM", "xterm-256color")
             .env("COLUMNS", crate::terminal::COLS.to_string())
             .env("LINES", crate::terminal::ROWS.to_string());
-        // A node that imports wasi:sockets gets a NIC on the userspace fabric.
-        // (For now every such node shares one virtual network with a distinct
-        // IP; isolating them per canvas wiring is the next slice.)
-        let net = if component_imports_sockets(&component, &self.engine) {
-            let ip = smoltcp::wire::Ipv4Address::new(10, 0, 0, (2 + (id % 250)) as u8);
-            let stack = self.hub.attach(0, ip);
-            Some(crate::sockets::NetCtx::new(stack, ip))
-        } else {
-            None
-        };
         let state = HostState {
             ctx: ctx_builder.build(),
             table: ResourceTable::new(),
