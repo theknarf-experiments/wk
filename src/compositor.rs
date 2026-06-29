@@ -280,6 +280,14 @@ fn close_btn(r: [f32; 4], z: f32) -> [f32; 4] {
     let y0 = r[1] + 4.0 * z;
     [x1 - s, y0, x1, y0 + s]
 }
+/// The Run/▶ button, just left of the close button. Shown only on an idle or
+/// exited node so it can be (re)started after wiring.
+fn run_btn(r: [f32; 4], z: f32) -> [f32; 4] {
+    let cb = close_btn(r, z);
+    let w = cb[2] - cb[0];
+    let gap = 4.0 * z;
+    [cb[0] - w - gap, cb[1], cb[0] - gap, cb[3]]
+}
 fn resize_grip(r: [f32; 4], z: f32) -> [f32; 4] {
     let g = 16.0 * z;
     [r[2] - g, r[3] - g, r[2], r[3]]
@@ -926,6 +934,17 @@ impl App {
             .iter()
             .find(|n| n.id == id)
             .cloned()
+    }
+
+    /// (Re)run an idle or exited node's guest. Its network wiring is already on
+    /// its fabric stack, so a networked client started here resolves/connects
+    /// with whatever Network/Gateway it's wired to.
+    fn run_node(&mut self, id: u64) {
+        if let Some(node) = self.app_node(id) {
+            if let Err(e) = self.host.run_node(&node) {
+                eprintln!("failed to run {}: {e:#}", node.name);
+            }
+        }
     }
 
     /// Create a HostPort node on the canvas (auto-assigned localhost port).
@@ -1643,8 +1662,14 @@ impl App {
                     } else {
                         // App node: clicking anywhere activates it.
                         self.kbd_focus = Some(id);
+                        let idle = self
+                            .app_node(id)
+                            .map(|n| !n.running.load(Ordering::Relaxed) && n.launch.is_some())
+                            .unwrap_or(false);
                         if contains(close_btn(r, zf), mp) {
                             to_close.push(id);
+                        } else if idle && contains(run_btn(r, zf), mp) {
+                            self.run_node(id);
                         } else if contains(resize_grip(r, zf), mp) {
                             self.drag = Some(Drag {
                                 id,
@@ -2117,9 +2142,17 @@ impl App {
                 clip,
             ));
 
+            let mut node_idle = false;
             if let Some(node) = node_by_id.get(&id) {
-                let label = if node.finished.load(Ordering::Relaxed) {
+                let running = node.running.load(Ordering::Relaxed);
+                let runnable = node.launch.is_some();
+                node_idle = !running && runnable;
+                let label = if running {
+                    node.name.clone()
+                } else if node.finished.load(Ordering::Relaxed) {
                     format!("{} (exited)", node.name)
+                } else if runnable {
+                    format!("{} (idle)", node.name)
                 } else {
                     node.name.clone()
                 };
@@ -2156,6 +2189,27 @@ impl App {
                 TEXT,
                 clip,
             );
+
+            // Run/▶ button for an idle or exited node (start or re-start it).
+            if node_idle {
+                let rb = run_btn(r, zf);
+                if contains(rb, mp) {
+                    quads.push(Quad::solid(white, rb, TITLE_FOCUS, clip));
+                }
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    ">",
+                    rb[0] + (rb[2] - rb[0]) * 0.30,
+                    rb[1] + (rb[3] - rb[1]) * 0.05,
+                    zf * 0.8,
+                    TEXT,
+                    clip,
+                );
+            }
 
             let ca = content_rect(r, zf);
             let ca_clip = intersect(ca, full);

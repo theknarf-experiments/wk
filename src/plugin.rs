@@ -144,8 +144,25 @@ pub struct Node {
     pub http_path: Option<std::path::PathBuf>,
     /// Set by the guest thread when its `run` returns (it exited on its own).
     pub finished: Arc<AtomicBool>,
+    /// True while a guest thread is live. A networked node is created idle
+    /// (`false`) and run on demand; it flips back to `false` when the guest
+    /// exits, so the compositor can offer a Run/re-run affordance.
+    pub running: Arc<AtomicBool>,
     /// Kill switch: set by the compositor to stop a still-running node.
     pub kill: Arc<AtomicBool>,
+    /// Path + args to (re)launch this node's guest on demand. `None` for HTTP
+    /// server nodes (served per-request) which never run a `run` loop.
+    pub launch: Option<NodeLaunch>,
+}
+
+/// What [`PluginHost::run_node`] needs to (re)start a node's guest. Held on the
+/// `Node` so the compositor can run an idle node or re-run a finished one.
+#[derive(Clone)]
+pub struct NodeLaunch {
+    pub path: std::path::PathBuf,
+    pub args: Vec<String>,
+    pub is_command: bool,
+    pub surfaces: SurfaceRegistry,
 }
 
 pub type SharedNode = Arc<Node>;
@@ -768,10 +785,12 @@ impl PluginHost {
         Ok(())
     }
 
-    /// Load a client component and run its `run` export on a dedicated thread,
-    /// registering it as a `Node` under the compositor-assigned `id`. Surfaces
-    /// it creates appear in `surfaces` (tagged with the node id); its
-    /// stdout/stderr are captured for the node's console window.
+    /// Load a client component and register it as a `Node` under the
+    /// compositor-assigned `id`. Most nodes start running immediately; a
+    /// **networked** node (imports wasi:sockets) is registered *idle* and run on
+    /// demand via [`run_node`](Self::run_node), so it can be wired onto a
+    /// Network/Gateway before its guest does any name resolution or connecting.
+    /// Surfaces it creates appear in `surfaces`; its stdio feeds the node window.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         &self,
@@ -783,17 +802,6 @@ impl PluginHost {
         nodes: NodeRegistry,
         initial_options: Vec<f32>,
     ) -> Result<()> {
-        let linker = self.build_linker()?;
-
-        let finished = Arc::new(AtomicBool::new(false));
-        let kill = Arc::new(AtomicBool::new(false));
-        let fs = crate::vfs::new_fs();
-        let midi_in = crate::midi::new_inbox();
-        // Seeded with any saved values; the guest reads them via `load` at start
-        // and overwrites with its current values via `store`.
-        let options = crate::options::new_options(initial_options);
-        let term_io = crate::terminal::TermIo::new();
-
         let component = Component::from_file(&self.engine, path)?;
         // A `wasi:http` server (exports incoming-handler) doesn't run a `run`
         // loop — it's served on demand when wired to a HostPort.
@@ -805,39 +813,80 @@ impl PluginHost {
         // A node that imports wasi:sockets gets a NIC on the fabric. By default
         // it's alone on its own virtual network (net id = node id) — isolated,
         // can't reach anyone — until the compositor wires it to a Network node.
-        let net = if !is_http && component_imports_sockets(&component, &self.engine) {
+        let net_stack = if !is_http && component_imports_sockets(&component, &self.engine) {
             let ip = smoltcp::wire::Ipv4Address::new(10, 0, 0, (2 + (id % 250)) as u8);
-            let stack = self.hub.attach(id, ip, name);
-            Some(crate::sockets::NetCtx::new(stack, ip, self.hub.clone()))
+            Some(self.hub.attach(id, ip, name))
         } else {
             None
         };
 
-        nodes.lock().unwrap().push(Arc::new(Node {
+        let node = Arc::new(Node {
             id,
             name: name.to_string(),
-            term_io: term_io.clone(),
-            fs: fs.clone(),
-            midi_in: midi_in.clone(),
-            options: options.clone(),
-            net_stack: net.as_ref().map(|n| n.stack.clone()),
-            finished: finished.clone(),
-            kill: kill.clone(),
+            term_io: crate::terminal::TermIo::new(),
+            fs: crate::vfs::new_fs(),
+            midi_in: crate::midi::new_inbox(),
+            // Seeded with any saved values; the guest reads them via `load` at
+            // start and overwrites with its current values via `store`.
+            options: crate::options::new_options(initial_options),
+            net_stack,
+            finished: Arc::new(AtomicBool::new(false)),
+            running: Arc::new(AtomicBool::new(false)),
+            kill: Arc::new(AtomicBool::new(false)),
             http_path: is_http.then(|| path.to_path_buf()),
-        }));
+            launch: (!is_http).then(|| NodeLaunch {
+                path: path.to_path_buf(),
+                args: args.to_vec(),
+                is_command,
+                surfaces,
+            }),
+        });
+        nodes.lock().unwrap().push(node.clone());
 
         if is_http {
             // Registered as a node; nothing runs until it's exposed on a HostPort.
             return Ok(());
         }
+        // Networked nodes start idle so they can be wired before running; the
+        // compositor runs them on demand. Everything else runs right away.
+        if node.net_stack.is_none() {
+            self.run_node(&node)?;
+        }
+        Ok(())
+    }
+
+    /// (Re)start a registered node's guest on a fresh store, reusing its
+    /// persistent state (filesystem, options, terminal, and — crucially — its
+    /// fabric stack, so any network wiring already applied stays in effect).
+    /// No-op if the node is already running or isn't runnable (an HTTP server).
+    pub fn run_node(&self, node: &SharedNode) -> Result<()> {
+        let Some(launch) = node.launch.clone() else {
+            return Ok(());
+        };
+        if node.running.swap(true, Ordering::Relaxed) {
+            return Ok(()); // already running
+        }
+        node.finished.store(false, Ordering::Relaxed);
+        node.kill.store(false, Ordering::Relaxed);
+
+        let linker = self.build_linker()?;
+        let component = Component::from_file(&self.engine, &launch.path)?;
+
+        // Rebuild the fabric socket context from the node's existing stack so
+        // re-runs keep the same address and network membership.
+        let net = node.net_stack.as_ref().map(|stack| {
+            let ip = stack.lock().unwrap().ip;
+            crate::sockets::NetCtx::new(stack.clone(), ip, self.hub.clone())
+        });
+
         // argv[0] is the program name, then the configured args (e.g. a filename).
-        let mut argv = vec![name.to_string()];
-        argv.extend(args.iter().cloned());
+        let mut argv = vec![node.name.clone()];
+        argv.extend(launch.args.iter().cloned());
         let mut ctx_builder = WasiCtxBuilder::new();
         ctx_builder
-            .stdout(crate::terminal::stdout(&term_io))
-            .stderr(crate::terminal::stdout(&term_io))
-            .stdin(crate::terminal::stdin(&term_io))
+            .stdout(crate::terminal::stdout(&node.term_io))
+            .stderr(crate::terminal::stdout(&node.term_io))
+            .stdin(crate::terminal::stdin(&node.term_io))
             .args(&argv)
             .env("TERM", "xterm-256color")
             .env("COLUMNS", crate::terminal::COLS.to_string())
@@ -845,12 +894,12 @@ impl PluginHost {
         let state = HostState {
             ctx: ctx_builder.build(),
             table: ResourceTable::new(),
-            registry: surfaces,
-            node_id: id,
-            fs,
-            midi_in,
+            registry: launch.surfaces,
+            node_id: node.id,
+            fs: node.fs.clone(),
+            midi_in: node.midi_in.clone(),
             midi_router: self.midi.clone(),
-            options,
+            options: node.options.clone(),
             net,
             random_ctx: wasmtime_wasi::random::WasiRandomCtx::default(),
             http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
@@ -859,7 +908,7 @@ impl PluginHost {
         let mut store = Store::new(&self.engine, state);
         // Trap the instance once it has been killed; otherwise keep running.
         store.set_epoch_deadline(1);
-        let kill_cb = kill.clone();
+        let kill_cb = node.kill.clone();
         store.epoch_deadline_callback(move |_| {
             if kill_cb.load(Ordering::Relaxed) {
                 Ok(UpdateDeadline::Interrupt)
@@ -868,6 +917,10 @@ impl PluginHost {
             }
         });
 
+        let is_command = launch.is_command;
+        let finished = node.finished.clone();
+        let running = node.running.clone();
+        let kill = node.kill.clone();
         std::thread::spawn(move || {
             // Drive the guest on a Tokio current-thread runtime (not pollster):
             // wasmtime-wasi's monotonic clock / timers need a Tokio reactor, so a
@@ -897,6 +950,7 @@ impl PluginHost {
                 }
             });
             finished.store(true, Ordering::Relaxed);
+            running.store(false, Ordering::Relaxed);
             match result {
                 Ok(()) => {}
                 // A clean close (surface closed, or the kill switch tripped):
