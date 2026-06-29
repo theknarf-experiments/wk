@@ -4,6 +4,7 @@ dependencies {
     paint "plugins/paint/target/wasm32-wasip1/debug/paint.wasm"
     file_demo "plugins/file-demo/target/wasm32-wasip1/debug/file_demo.wasm"
     piano "plugins/piano/target/wasm32-wasip1/debug/piano.wasm"
+    arp "plugins/arp/target/wasm32-wasip1/debug/arp.wasm"
     synth "plugins/synth/target/wasm32-wasip1/debug/synth.wasm"
     wsh "plugins/wsh/target/wasm32-wasip1/debug/wsh.wasm"
     kilo "plugins/kilo/kilo.wasm" {

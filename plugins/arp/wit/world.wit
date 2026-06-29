@@ -1,0 +1,17 @@
+package wk:arp;
+
+/// A MIDI arpeggiator. It receives note-on/off on a wk:midi input port (wire a
+/// keyboard plugin to it), tracks which notes are held, and emits them one at a
+/// time out of a wk:midi output port — cycling through the held chord at a set
+/// rate so a single sustained chord becomes a rolling arpeggio. Wire its output
+/// to a synth. The surface shows the held notes and a moving playhead, with
+/// knobs for rate, gate length, direction and octave span. Combines wasi-gfx
+/// (UI) with wk:midi (note transport in and out).
+world arp {
+    import wasi:surface/surface@0.0.1;
+    import wasi:graphics-context/graphics-context@0.0.1;
+    import wasi:frame-buffer/frame-buffer@0.0.1;
+    import wk:midi/midi;
+
+    export run: func();
+}
