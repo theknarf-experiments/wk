@@ -4,20 +4,21 @@
 //! socket on the node's stack; the hub thread routes its packets to peers on the
 //! same virtual network. A node with no network attached can't reach anything.
 //!
-//! TCP (connect/bind/listen/accept + streams) is implemented; UDP is stubbed. A
-//! node wired to a Gateway node gets host access: off-fabric connections are
-//! bridged to real host sockets and names resolve via the host resolver;
-//! otherwise only fabric peers and numeric addresses are reachable.
+//! TCP (connect/bind/listen/accept + streams) and UDP (bind/stream/send/receive
+//! datagrams) are both implemented over the node's smoltcp stack. A node wired to
+//! a Gateway node gets host access: off-fabric connections are bridged to real
+//! host sockets and names resolve via the host resolver; otherwise only fabric
+//! peers and numeric addresses are reachable.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
 
 use smoltcp::iface::SocketHandle;
-use smoltcp::socket::tcp;
+use smoltcp::socket::{tcp, udp};
 use smoltcp::wire::Ipv4Address;
 use wasmtime::component::{HasData, Linker, Resource};
-use wasmtime::{bail, Result};
+use wasmtime::Result;
 use wasmtime_wasi::p2::{subscribe, DynPollable, Pollable};
 use wasmtime_wasi_io::async_trait;
 use wasmtime_wasi_io::bytes::Bytes;
@@ -53,6 +54,9 @@ use wasi::sockets::network::{
 use wasi::sockets::tcp::ShutdownType;
 
 const TCP_BUF: usize = 64 * 1024;
+const UDP_BUF: usize = 64 * 1024;
+/// Number of datagram slots in a UDP socket's packet ring buffers.
+const UDP_SLOTS: usize = 64;
 
 /// Per-node socket context held in `HostState`: the node's smoltcp stack, its
 /// address, and the next ephemeral local port to hand out.
@@ -203,9 +207,27 @@ fn host_pump(mut stream: std::net::TcpStream, incoming: SharedPipe, outgoing: Sh
     }
 }
 
-/// UDP isn't implemented yet; the resource exists only so the world links.
-pub struct UdpSock;
-pub struct Datagrams;
+/// A UDP socket: a smoltcp udp socket handle in the node's set, plus the bits
+/// wasi's bind/stream dance needs.
+pub struct UdpSock {
+    handle: SocketHandle,
+    family: IpAddressFamily,
+    /// Port set by `start-bind` / chosen at `finish-bind`.
+    bound_port: u16,
+    local: Option<Ipv4SocketAddress>,
+    /// Default peer set by the most recent `stream` call (POSIX "connected").
+    remote: Option<Ipv4SocketAddress>,
+    bound: bool,
+}
+
+/// An incoming or outgoing datagram stream over a node's UDP socket. For an
+/// outgoing stream `remote` is the default destination; for an incoming stream
+/// it filters received datagrams to that peer (per the wasi `stream` contract).
+pub struct Datagrams {
+    stack: SharedStack,
+    handle: SocketHandle,
+    remote: Option<Ipv4SocketAddress>,
+}
 
 /// A name-resolution result stream (numeric literals only for now).
 pub struct ResolveStream {
@@ -307,6 +329,48 @@ impl Future for WantReady {
             g.park(cx.waker().clone());
             Poll::Pending
         }
+    }
+}
+
+/// Ready when a UDP socket can send (`send`) or has a datagram queued (`!send`).
+struct UdpReady {
+    stack: SharedStack,
+    handle: SocketHandle,
+    send: bool,
+}
+impl Future for UdpReady {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
+        let mut g = self.stack.lock().unwrap();
+        let s = g.sockets.get::<udp::Socket>(self.handle);
+        let ready = if self.send {
+            s.can_send()
+        } else {
+            s.can_recv()
+        };
+        if ready {
+            Poll::Ready(())
+        } else {
+            g.park(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+struct UdpStreamPollable {
+    stack: SharedStack,
+    handle: SocketHandle,
+    send: bool,
+}
+#[async_trait]
+impl Pollable for UdpStreamPollable {
+    async fn ready(&mut self) {
+        UdpReady {
+            stack: self.stack.clone(),
+            handle: self.handle,
+            send: self.send,
+        }
+        .await
     }
 }
 
@@ -1026,14 +1090,38 @@ impl wasi::sockets::ip_name_lookup::HostResolveAddressStream for HostState {
     }
 }
 
-// ---- UDP: not implemented (the world links; calls fail/trap) ----
+// ---- UDP over smoltcp (same fabric routing as TCP) ----
+
+fn udp_packet_buffer() -> udp::PacketBuffer<'static> {
+    udp::PacketBuffer::new(
+        vec![udp::PacketMetadata::EMPTY; UDP_SLOTS],
+        vec![0u8; UDP_BUF],
+    )
+}
 
 impl wasi::sockets::udp_create_socket::Host for HostState {
     fn create_udp_socket(
         &mut self,
-        _family: IpAddressFamily,
+        family: IpAddressFamily,
     ) -> Result<std::result::Result<Resource<UdpSock>, ErrorCode>> {
-        Ok(Err(ErrorCode::NotSupported))
+        if matches!(family, IpAddressFamily::Ipv6) {
+            return Ok(Err(ErrorCode::NotSupported));
+        }
+        let Some(stack) = self.stack() else {
+            return Ok(Err(ErrorCode::AccessDenied));
+        };
+        let handle = {
+            let sock = udp::Socket::new(udp_packet_buffer(), udp_packet_buffer());
+            stack.lock().unwrap().sockets.add(sock)
+        };
+        Ok(Ok(self.table().push(UdpSock {
+            handle,
+            family,
+            bound_port: 0,
+            local: None,
+            remote: None,
+            bound: false,
+        })?))
     }
 }
 
@@ -1042,78 +1130,167 @@ impl wasi::sockets::udp::Host for HostState {}
 impl wasi::sockets::udp::HostUdpSocket for HostState {
     fn start_bind(
         &mut self,
-        _: Resource<UdpSock>,
-        _: Resource<Net>,
-        _: IpSocketAddress,
+        this: Resource<UdpSock>,
+        _network: Resource<Net>,
+        local_address: IpSocketAddress,
     ) -> Result<std::result::Result<(), ErrorCode>> {
-        Ok(Err(ErrorCode::NotSupported))
+        let IpSocketAddress::Ipv4(a) = local_address else {
+            return Ok(Err(ErrorCode::NotSupported));
+        };
+        let s = self.table().get_mut(&this)?;
+        if s.bound {
+            return Ok(Err(ErrorCode::InvalidState));
+        }
+        s.bound_port = a.port;
+        s.local = Some(a);
+        Ok(Ok(()))
     }
-    fn finish_bind(&mut self, _: Resource<UdpSock>) -> Result<std::result::Result<(), ErrorCode>> {
-        Ok(Err(ErrorCode::NotSupported))
+    fn finish_bind(
+        &mut self,
+        this: Resource<UdpSock>,
+    ) -> Result<std::result::Result<(), ErrorCode>> {
+        let Some(stack) = self.stack() else {
+            return Ok(Err(ErrorCode::AccessDenied));
+        };
+        let local_ip = self.net.as_ref().unwrap().ip;
+        let (handle, mut port, already) = {
+            let s = self.table().get(&this)?;
+            (s.handle, s.bound_port, s.bound)
+        };
+        if already {
+            return Ok(Err(ErrorCode::InvalidState));
+        }
+        if port == 0 {
+            let ctx = self.net.as_mut().unwrap();
+            port = ctx.next_port;
+            ctx.next_port = ctx.next_port.checked_add(1).unwrap_or(49152);
+        }
+        {
+            let mut g = stack.lock().unwrap();
+            if g.sockets.get_mut::<udp::Socket>(handle).bind(port).is_err() {
+                return Ok(Err(ErrorCode::AddressInUse));
+            }
+        }
+        let s = self.table().get_mut(&this)?;
+        s.bound = true;
+        s.bound_port = port;
+        s.local = Some(Ipv4SocketAddress {
+            port,
+            address: ipv4(local_ip),
+        });
+        Ok(Ok(()))
     }
     fn stream(
         &mut self,
-        _: Resource<UdpSock>,
-        _: Option<IpSocketAddress>,
+        this: Resource<UdpSock>,
+        remote_address: Option<IpSocketAddress>,
     ) -> Result<std::result::Result<(Resource<Datagrams>, Resource<Datagrams>), ErrorCode>> {
-        Ok(Err(ErrorCode::NotSupported))
+        let Some(stack) = self.stack() else {
+            return Ok(Err(ErrorCode::AccessDenied));
+        };
+        let (handle, bound) = {
+            let s = self.table().get(&this)?;
+            (s.handle, s.bound)
+        };
+        if !bound {
+            return Ok(Err(ErrorCode::InvalidState));
+        }
+        let remote = match remote_address {
+            Some(IpSocketAddress::Ipv4(a)) => Some(a),
+            Some(IpSocketAddress::Ipv6(_)) => return Ok(Err(ErrorCode::InvalidArgument)),
+            None => None,
+        };
+        self.table().get_mut(&this)?.remote = remote;
+        let incoming = self.table().push(Datagrams {
+            stack: stack.clone(),
+            handle,
+            remote,
+        })?;
+        let outgoing = self.table().push(Datagrams {
+            stack,
+            handle,
+            remote,
+        })?;
+        Ok(Ok((incoming, outgoing)))
     }
     fn local_address(
         &mut self,
-        _: Resource<UdpSock>,
+        this: Resource<UdpSock>,
     ) -> Result<std::result::Result<IpSocketAddress, ErrorCode>> {
-        Ok(Err(ErrorCode::NotSupported))
+        match self.table().get(&this)?.local {
+            Some(a) => Ok(Ok(IpSocketAddress::Ipv4(a))),
+            None => Ok(Err(ErrorCode::InvalidState)),
+        }
     }
     fn remote_address(
         &mut self,
-        _: Resource<UdpSock>,
+        this: Resource<UdpSock>,
     ) -> Result<std::result::Result<IpSocketAddress, ErrorCode>> {
-        Ok(Err(ErrorCode::NotSupported))
+        match self.table().get(&this)?.remote {
+            Some(a) => Ok(Ok(IpSocketAddress::Ipv4(a))),
+            None => Ok(Err(ErrorCode::InvalidState)),
+        }
     }
-    fn address_family(&mut self, _: Resource<UdpSock>) -> Result<IpAddressFamily> {
-        Ok(IpAddressFamily::Ipv4)
+    fn address_family(&mut self, this: Resource<UdpSock>) -> Result<IpAddressFamily> {
+        Ok(self.table().get(&this)?.family)
     }
     fn unicast_hop_limit(
         &mut self,
         _: Resource<UdpSock>,
     ) -> Result<std::result::Result<u8, ErrorCode>> {
-        Ok(Err(ErrorCode::NotSupported))
+        Ok(Ok(64))
     }
     fn set_unicast_hop_limit(
         &mut self,
         _: Resource<UdpSock>,
-        _: u8,
+        value: u8,
     ) -> Result<std::result::Result<(), ErrorCode>> {
-        Ok(Err(ErrorCode::NotSupported))
+        if value == 0 {
+            return Ok(Err(ErrorCode::InvalidArgument));
+        }
+        Ok(Ok(()))
     }
     fn receive_buffer_size(
         &mut self,
         _: Resource<UdpSock>,
     ) -> Result<std::result::Result<u64, ErrorCode>> {
-        Ok(Err(ErrorCode::NotSupported))
+        Ok(Ok(UDP_BUF as u64))
     }
     fn set_receive_buffer_size(
         &mut self,
         _: Resource<UdpSock>,
-        _: u64,
+        value: u64,
     ) -> Result<std::result::Result<(), ErrorCode>> {
-        Ok(Err(ErrorCode::NotSupported))
+        if value == 0 {
+            return Ok(Err(ErrorCode::InvalidArgument));
+        }
+        Ok(Ok(()))
     }
     fn send_buffer_size(
         &mut self,
         _: Resource<UdpSock>,
     ) -> Result<std::result::Result<u64, ErrorCode>> {
-        Ok(Err(ErrorCode::NotSupported))
+        Ok(Ok(UDP_BUF as u64))
     }
     fn set_send_buffer_size(
         &mut self,
         _: Resource<UdpSock>,
-        _: u64,
+        value: u64,
     ) -> Result<std::result::Result<(), ErrorCode>> {
-        Ok(Err(ErrorCode::NotSupported))
+        if value == 0 {
+            return Ok(Err(ErrorCode::InvalidArgument));
+        }
+        Ok(Ok(()))
     }
-    fn subscribe(&mut self, _: Resource<UdpSock>) -> Result<Resource<DynPollable>> {
-        bail!("wk: udp not supported")
+    fn subscribe(&mut self, this: Resource<UdpSock>) -> Result<Resource<DynPollable>> {
+        let stack = self.stack().expect("socket exists => has a stack");
+        let handle = self.table().get(&this)?.handle;
+        let p = self.table().push(UdpStreamPollable {
+            stack,
+            handle,
+            send: true,
+        })?;
+        subscribe(self.table(), p)
     }
     fn drop(&mut self, rep: Resource<UdpSock>) -> Result<()> {
         self.table().delete(rep)?;
@@ -1124,13 +1301,56 @@ impl wasi::sockets::udp::HostUdpSocket for HostState {
 impl wasi::sockets::udp::HostIncomingDatagramStream for HostState {
     fn receive(
         &mut self,
-        _: Resource<Datagrams>,
-        _: u64,
+        this: Resource<Datagrams>,
+        max_results: u64,
     ) -> Result<std::result::Result<Vec<wasi::sockets::udp::IncomingDatagram>, ErrorCode>> {
-        Ok(Err(ErrorCode::NotSupported))
+        let (stack, handle, filter) = {
+            let d = self.table().get(&this)?;
+            (d.stack.clone(), d.handle, d.remote)
+        };
+        let mut out = Vec::new();
+        let mut g = stack.lock().unwrap();
+        let s = g.sockets.get_mut::<udp::Socket>(handle);
+        while (out.len() as u64) < max_results {
+            let (data, src) = match s.recv() {
+                Ok((data, meta)) => {
+                    let smoltcp::wire::IpAddress::Ipv4(v4) = meta.endpoint.addr else {
+                        continue;
+                    };
+                    (
+                        data.to_vec(),
+                        Ipv4SocketAddress {
+                            port: meta.endpoint.port,
+                            address: ipv4(v4),
+                        },
+                    )
+                }
+                Err(_) => break, // receive buffer exhausted
+            };
+            // A stream bound to a specific peer only yields that peer's datagrams.
+            if let Some(f) = filter {
+                if f.address != src.address || f.port != src.port {
+                    continue;
+                }
+            }
+            out.push(wasi::sockets::udp::IncomingDatagram {
+                data,
+                remote_address: IpSocketAddress::Ipv4(src),
+            });
+        }
+        Ok(Ok(out))
     }
-    fn subscribe(&mut self, _: Resource<Datagrams>) -> Result<Resource<DynPollable>> {
-        bail!("wk: udp not supported")
+    fn subscribe(&mut self, this: Resource<Datagrams>) -> Result<Resource<DynPollable>> {
+        let (stack, handle) = {
+            let d = self.table().get(&this)?;
+            (d.stack.clone(), d.handle)
+        };
+        let p = self.table().push(UdpStreamPollable {
+            stack,
+            handle,
+            send: false,
+        })?;
+        subscribe(self.table(), p)
     }
     fn drop(&mut self, rep: Resource<Datagrams>) -> Result<()> {
         self.table().delete(rep)?;
@@ -1141,19 +1361,66 @@ impl wasi::sockets::udp::HostIncomingDatagramStream for HostState {
 impl wasi::sockets::udp::HostOutgoingDatagramStream for HostState {
     fn check_send(
         &mut self,
-        _: Resource<Datagrams>,
+        this: Resource<Datagrams>,
     ) -> Result<std::result::Result<u64, ErrorCode>> {
-        Ok(Err(ErrorCode::NotSupported))
+        let (stack, handle) = {
+            let d = self.table().get(&this)?;
+            (d.stack.clone(), d.handle)
+        };
+        let g = stack.lock().unwrap();
+        let can = g.sockets.get::<udp::Socket>(handle).can_send();
+        Ok(Ok(if can { UDP_SLOTS as u64 } else { 0 }))
     }
     fn send(
         &mut self,
-        _: Resource<Datagrams>,
-        _: Vec<wasi::sockets::udp::OutgoingDatagram>,
+        this: Resource<Datagrams>,
+        datagrams: Vec<wasi::sockets::udp::OutgoingDatagram>,
     ) -> Result<std::result::Result<u64, ErrorCode>> {
-        Ok(Err(ErrorCode::NotSupported))
+        let (stack, handle, default_remote) = {
+            let d = self.table().get(&this)?;
+            (d.stack.clone(), d.handle, d.remote)
+        };
+        let mut g = stack.lock().unwrap();
+        let s = g.sockets.get_mut::<udp::Socket>(handle);
+        let mut sent = 0u64;
+        for dg in datagrams {
+            let dest = match dg.remote_address {
+                Some(IpSocketAddress::Ipv4(a)) => a,
+                Some(IpSocketAddress::Ipv6(_)) => {
+                    if sent == 0 {
+                        return Ok(Err(ErrorCode::InvalidArgument));
+                    }
+                    break;
+                }
+                None => match default_remote {
+                    Some(a) => a,
+                    None => {
+                        if sent == 0 {
+                            return Ok(Err(ErrorCode::InvalidArgument));
+                        }
+                        break;
+                    }
+                },
+            };
+            let endpoint = (to_ipv4(dest.address), dest.port);
+            if s.send_slice(&dg.data, endpoint).is_err() {
+                break; // send buffer full: stop, report what we queued
+            }
+            sent += 1;
+        }
+        Ok(Ok(sent))
     }
-    fn subscribe(&mut self, _: Resource<Datagrams>) -> Result<Resource<DynPollable>> {
-        bail!("wk: udp not supported")
+    fn subscribe(&mut self, this: Resource<Datagrams>) -> Result<Resource<DynPollable>> {
+        let (stack, handle) = {
+            let d = self.table().get(&this)?;
+            (d.stack.clone(), d.handle)
+        };
+        let p = self.table().push(UdpStreamPollable {
+            stack,
+            handle,
+            send: true,
+        })?;
+        subscribe(self.table(), p)
     }
     fn drop(&mut self, rep: Resource<Datagrams>) -> Result<()> {
         self.table().delete(rep)?;

@@ -80,3 +80,6 @@ plugins/fetch/fetch.wasm
 
 # netserve (TCP server example) build artifact
 plugins/netserve/netserve.wasm
+
+# udpecho (UDP echo example) build artifact
+plugins/udpecho/udpecho.wasm

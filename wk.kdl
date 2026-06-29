@@ -18,5 +18,8 @@ dependencies {
     netserve "plugins/netserve/netserve.wasm" {
         args "80"
     }
+    udpecho "plugins/udpecho/udpecho.wasm" {
+        args "server" "4242"
+    }
     http_hello "oci://ghcr.io/bytecodealliance/sample-wasi-http-rust/sample-wasi-http-rust:latest"
 }

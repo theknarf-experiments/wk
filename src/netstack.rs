@@ -274,13 +274,69 @@ impl Drop for NetHub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smoltcp::socket::tcp;
+    use smoltcp::socket::{tcp, udp};
 
     fn tcp_socket() -> tcp::Socket<'static> {
         tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0u8; 4096]),
             tcp::SocketBuffer::new(vec![0u8; 4096]),
         )
+    }
+
+    fn udp_socket() -> udp::Socket<'static> {
+        let buf = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 4096]);
+        udp::Socket::new(buf(), buf())
+    }
+
+    /// Two nodes on the same virtual network exchange a UDP datagram via the hub
+    /// — UDP rides the same packet routing as TCP.
+    #[test]
+    fn same_network_nodes_talk_udp() {
+        let server_ip = Ipv4Address::new(10, 0, 0, 2);
+        let client_ip = Ipv4Address::new(10, 0, 0, 1);
+        let hub = NetHub::new();
+        let client = hub.attach(1, client_ip, "client");
+        let server = hub.attach(1, server_ip, "server");
+
+        let server_h = {
+            let mut g = server.lock().unwrap();
+            let h = g.sockets.add(udp_socket());
+            g.sockets.get_mut::<udp::Socket>(h).bind(4242).unwrap();
+            h
+        };
+        let client_h = {
+            let mut g = client.lock().unwrap();
+            let h = g.sockets.add(udp_socket());
+            g.sockets.get_mut::<udp::Socket>(h).bind(49152).unwrap();
+            h
+        };
+
+        let mut sent = false;
+        let mut got: Vec<u8> = Vec::new();
+        for _ in 0..500 {
+            hub.step();
+            {
+                let mut g = client.lock().unwrap();
+                let cs = g.sockets.get_mut::<udp::Socket>(client_h);
+                if cs.can_send() && !sent {
+                    cs.send_slice(b"hello udp", (server_ip, 4242)).unwrap();
+                    sent = true;
+                }
+            }
+            {
+                let mut g = server.lock().unwrap();
+                let ss = g.sockets.get_mut::<udp::Socket>(server_h);
+                if let Ok((data, meta)) = ss.recv() {
+                    got.extend_from_slice(data);
+                    assert_eq!(meta.endpoint.port, 49152);
+                }
+            }
+            if got.len() >= 9 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(&got, b"hello udp");
     }
 
     /// Two nodes on the same virtual network exchange a TCP stream, driven by the
