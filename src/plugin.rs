@@ -666,6 +666,11 @@ impl PluginHost {
         self.midi.clone()
     }
 
+    /// Detach a closed node's network stack from the fabric hub.
+    pub fn detach_net(&self, stack: &crate::netstack::SharedStack) {
+        self.hub.detach(stack);
+    }
+
     /// Advance the epoch so every running node re-checks its kill switch.
     pub fn tick_epoch(&self) {
         self.engine.increment_epoch();

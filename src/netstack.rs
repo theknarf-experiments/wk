@@ -176,6 +176,15 @@ impl NetHub {
         stack
     }
 
+    /// Remove a node's stack from the hub (on node close), so the driver stops
+    /// polling it.
+    pub fn detach(&self, stack: &SharedStack) {
+        self.stacks
+            .lock()
+            .unwrap()
+            .retain(|s| !Arc::ptr_eq(s, stack));
+    }
+
     /// One driver step: poll every stack, route packets between same-network
     /// peers, poll again to deliver, and wake parked pollables. Exposed for
     /// tests; the hub thread calls it in a loop.

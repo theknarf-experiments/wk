@@ -374,6 +374,8 @@ enum Wire {
     Midi(u64, u64),
     /// A wasi:http node served on a HostPort node.
     Serve(u64, u64),
+    /// An app node's membership of a Network/Gateway node (app, net).
+    Net(u64, u64),
 }
 
 /// An action runnable from the Cmd/Ctrl+K command palette.
@@ -1168,6 +1170,7 @@ impl App {
             Wire::File(f, a) => (f, a),
             Wire::Midi(s, d) => (s, d),
             Wire::Serve(h, hp) => (h, hp),
+            Wire::Net(app, net) => (app, net),
         };
         if self.win_pos.contains_key(&a) && self.win_pos.contains_key(&b) {
             Some((center(self.rect_of(a)), center(self.rect_of(b))))
@@ -1182,6 +1185,7 @@ impl App {
             Wire::File(f, a) => self.connections.contains(&(f, a)),
             Wire::Midi(s, d) => self.midi_links.contains(&(s, d)),
             Wire::Serve(h, hp) => self.serves.get(&h).map(|(p, _)| *p) == Some(hp),
+            Wire::Net(app, net) => self.net_links.contains(&(app, net)),
         }
     }
 
@@ -1192,7 +1196,8 @@ impl App {
             .iter()
             .map(|&(f, a)| Wire::File(f, a))
             .chain(self.midi_links.iter().map(|&(s, d)| Wire::Midi(s, d)))
-            .chain(self.serves.iter().map(|(&h, &(hp, _))| Wire::Serve(h, hp)));
+            .chain(self.serves.iter().map(|(&h, &(hp, _))| Wire::Serve(h, hp)))
+            .chain(self.net_links.iter().map(|&(a, n)| Wire::Net(a, n)));
         let mut best: Option<(f32, Wire)> = None;
         for w in all {
             if let Some((a, b)) = self.wire_endpoints(w) {
@@ -1221,6 +1226,11 @@ impl App {
             Wire::Serve(h, hp) => {
                 if self.serves.contains_key(&h) {
                     self.toggle_serve(h, hp);
+                }
+            }
+            Wire::Net(app, net) => {
+                if self.net_links.contains(&(app, net)) {
+                    self.toggle_net(app, net);
                 }
             }
         }
@@ -1810,10 +1820,10 @@ impl App {
         }
         // Network membership wires (app node — Network node).
         for &(app, net) in &self.net_links {
-            if self.win_pos.contains_key(&app) && self.win_pos.contains_key(&net) {
-                let a = center(self.rect_of(app));
-                let b = center(self.rect_of(net));
-                quads.push(Quad::line(white, a, b, wire_w(false), NET_WIRE_COL, full));
+            if let Some((a, b)) = self.wire_endpoints(Wire::Net(app, net)) {
+                let sel = self.wire_sel == Some(Wire::Net(app, net));
+                let col = if sel { WIRE_SEL_COL } else { NET_WIRE_COL };
+                quads.push(Quad::line(white, a, b, wire_w(sel), col, full));
             }
         }
 
@@ -2481,6 +2491,10 @@ impl App {
                 // Close stdin so a terminal guest blocked on a read unblocks and
                 // its thread can exit (it isn't running wasm for the epoch to trap).
                 node.term_io.close();
+                // Detach its network stack from the fabric hub (no leak).
+                if let Some(stack) = &node.net_stack {
+                    self.host.detach_net(stack);
+                }
             }
             self.terminals.remove(id);
             self.registry.lock().unwrap().retain(|s| {
