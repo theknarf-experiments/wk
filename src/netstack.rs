@@ -1,31 +1,28 @@
 //! wk's userspace network fabric.
 //!
-//! The vision: wk owns the network the way it owns the filesystem (the vfs).
-//! Each networked node gets a virtual NIC on a wk-managed network and its
-//! `wasi:sockets` activity terminates in a wk-owned smoltcp stack that emits
-//! real IP packets. wk then *routes those packets per the canvas graph* — so
-//! wired nodes can reach each other (Docker-bridge style) while unwired nodes
-//! see nothing, traffic can be sent out to the host only through an explicit
-//! gateway, and packets can be transparently rerouted through middlebox nodes
-//! (a VPN, a proxy, a firewall) with zero changes to the wasm client. Because we
-//! move *packets*, a "VPN node" can just sit in the path and work.
-//!
-//! This module is the foundation: the virtual NIC (a smoltcp [`phy::Device`])
-//! and the [`Fabric`] switch that routes IPv4 packets between NICs by
-//! destination address. Higher layers (our own `wasi:sockets` host impl, the
-//! per-node stacks, canvas wiring, gateway, middleboxes) build on this.
+//! wk owns the network the way it owns the filesystem (the vfs). Each networked
+//! node gets a virtual NIC + its own smoltcp stack; its `wasi:sockets` activity
+//! (see [`crate::sockets`]) terminates there and emits real IP packets. A single
+//! background hub thread drives every node's stack and routes packets between
+//! nodes **on the same virtual network** — so wired nodes reach each other
+//! (Docker-bridge style) and unwired nodes (alone on their own network) see
+//! nothing. Because we move *packets*, traffic can later be rerouted through
+//! middlebox nodes (a VPN/proxy) transparently to the wasm client.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Waker;
+use std::time::Duration;
 
+use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{self, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
-use smoltcp::wire::{Ipv4Address, Ipv4Packet};
+use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv4Packet};
 
 /// One raw IP packet on the fabric (Medium::Ip — no Ethernet header).
 pub type Frame = Vec<u8>;
 
-/// A shared frame queue between a NIC and the fabric.
 type Queue = Arc<Mutex<VecDeque<Frame>>>;
 
 fn queue() -> Queue {
@@ -33,13 +30,28 @@ fn queue() -> Queue {
 }
 
 /// A node's virtual network interface: a smoltcp device whose transmitted
-/// packets go to the fabric (`tx`) and whose received packets come from it
-/// (`rx`). The matching ends live in the [`Fabric`].
+/// packets queue in `tx` (drained + routed by the hub) and whose received
+/// packets come from `rx` (filled by the hub).
 pub struct VirtualNic {
-    /// Packets the fabric has delivered to this node, awaiting `receive`.
     rx: Queue,
-    /// Packets this node has transmitted, awaiting routing by the fabric.
     tx: Queue,
+}
+
+impl VirtualNic {
+    fn new() -> Self {
+        VirtualNic {
+            rx: queue(),
+            tx: queue(),
+        }
+    }
+    /// Take everything this NIC has transmitted (for the hub to route).
+    fn drain_tx(&self) -> Vec<Frame> {
+        self.tx.lock().unwrap().drain(..).collect()
+    }
+    /// Deliver a frame to this NIC's receive queue.
+    fn deliver(&self, frame: Frame) {
+        self.rx.lock().unwrap().push_back(frame);
+    }
 }
 
 impl Device for VirtualNic {
@@ -50,7 +62,6 @@ impl Device for VirtualNic {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
         caps.max_transmission_unit = 65535;
-        // A virtual link can't corrupt bits, so don't spend cycles on checksums.
         caps.checksum = ChecksumCapabilities::ignored();
         caps
     }
@@ -75,7 +86,6 @@ impl Device for VirtualNic {
 pub struct RxToken {
     frame: Frame,
 }
-
 impl phy::RxToken for RxToken {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
         f(&self.frame)
@@ -85,7 +95,6 @@ impl phy::RxToken for RxToken {
 pub struct TxToken {
     tx: Queue,
 }
-
 impl phy::TxToken for TxToken {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         let mut buf = vec![0u8; len];
@@ -95,79 +104,152 @@ impl phy::TxToken for TxToken {
     }
 }
 
-/// A port on the fabric: a node's address and the two queues connecting it.
-struct Port {
-    addr: Ipv4Address,
-    /// Fabric -> node (this NIC's `rx`).
-    to_node: Queue,
-    /// Node -> fabric (this NIC's `tx`).
-    from_node: Queue,
+/// One node's network stack: its interface, sockets, and NIC, plus the virtual
+/// network it's on and its address. Shared between the guest's thread (which
+/// does socket operations via [`crate::sockets`]) and the hub thread (which
+/// polls it and routes its packets).
+pub struct NodeStack {
+    pub iface: Interface,
+    pub sockets: SocketSet<'static>,
+    pub device: VirtualNic,
+    /// Virtual network id — nodes sharing it can reach each other.
+    pub net: u64,
+    pub ip: Ipv4Address,
+    /// Wakers parked on this stack's pollables; woken each hub tick so guest
+    /// socket pollables re-check readiness.
+    wakers: Vec<Waker>,
 }
 
-/// A wk-managed virtual network: a switch that routes IPv4 packets between the
-/// NICs attached to it, by destination address (a packet to an address with no
-/// port on this fabric is dropped). This is one isolated network segment — only
-/// nodes attached here can reach each other.
-#[derive(Default)]
-pub struct Fabric {
-    ports: Vec<Port>,
-}
-
-impl Fabric {
-    pub fn new() -> Self {
-        Fabric::default()
+impl NodeStack {
+    /// Park a waker to be woken on the next hub tick (state may have changed).
+    pub fn park(&mut self, w: Waker) {
+        self.wakers.push(w);
     }
+}
 
-    /// Attach a node at `addr`, returning the NIC it should drive its smoltcp
-    /// interface with.
-    pub fn attach(&mut self, addr: Ipv4Address) -> VirtualNic {
-        let rx = queue();
-        let tx = queue();
-        self.ports.push(Port {
-            addr,
-            to_node: rx.clone(),
-            from_node: tx.clone(),
+pub type SharedStack = Arc<Mutex<NodeStack>>;
+
+/// The network hub: owns every node stack and drives them on a background
+/// thread, routing packets between same-network nodes.
+pub struct NetHub {
+    stacks: Mutex<Vec<SharedStack>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl NetHub {
+    /// Create the hub and start its driver thread.
+    pub fn new() -> Arc<NetHub> {
+        let hub = Arc::new(NetHub {
+            stacks: Mutex::new(Vec::new()),
+            stop: Arc::new(AtomicBool::new(false)),
         });
-        VirtualNic { rx, tx }
+        let driver = hub.clone();
+        std::thread::Builder::new()
+            .name("wk-net-hub".into())
+            .spawn(move || driver.run())
+            .expect("spawn net hub");
+        hub
     }
 
-    /// Move every transmitted packet to its destination node's receive queue.
-    /// Packets addressed off-fabric (no matching port) are dropped — that's the
-    /// isolation boundary; reaching elsewhere requires an explicit gateway.
-    pub fn route(&self) {
-        // Collect first so we don't hold a queue lock while taking another.
-        let mut pending: Vec<Frame> = Vec::new();
-        for port in &self.ports {
-            let mut out = port.from_node.lock().unwrap();
-            pending.extend(out.drain(..));
+    /// Attach a node to virtual network `net` at address `ip`, returning its
+    /// stack (to drive via wasi:sockets).
+    pub fn attach(&self, net: u64, ip: Ipv4Address) -> SharedStack {
+        let mut device = VirtualNic::new();
+        let config = Config::new(HardwareAddress::Ip);
+        let mut iface = Interface::new(config, &mut device, Instant::now());
+        iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(ip.into(), 24));
+        });
+        let stack = Arc::new(Mutex::new(NodeStack {
+            iface,
+            sockets: SocketSet::new(Vec::new()),
+            device,
+            net,
+            ip,
+            wakers: Vec::new(),
+        }));
+        self.stacks.lock().unwrap().push(stack.clone());
+        stack
+    }
+
+    /// One driver step: poll every stack, route packets between same-network
+    /// peers, poll again to deliver, and wake parked pollables. Exposed for
+    /// tests; the hub thread calls it in a loop.
+    pub fn step(&self) {
+        let stacks: Vec<SharedStack> = self.stacks.lock().unwrap().clone();
+        let now = Instant::now();
+
+        // Phase 1: poll each stack and collect what it transmitted, tagged with
+        // the sender's network so we only route within a network.
+        let mut outbound: Vec<(u64, Frame)> = Vec::new();
+        // Snapshot (net, ip, stack) for delivery lookup.
+        let mut routes: Vec<(u64, Ipv4Address, SharedStack)> = Vec::new();
+        for s in &stacks {
+            let mut g = s.lock().unwrap();
+            let NodeStack {
+                iface,
+                sockets,
+                device,
+                net,
+                ip,
+                ..
+            } = &mut *g;
+            iface.poll(now, device, sockets);
+            let net = *net;
+            let ip = *ip;
+            for frame in device.drain_tx() {
+                outbound.push((net, frame));
+            }
+            routes.push((net, ip, s.clone()));
         }
-        for frame in pending {
+
+        // Phase 2: deliver each frame to the same-network node owning the dest IP.
+        for (net, frame) in outbound {
             let Ok(pkt) = Ipv4Packet::new_checked(&frame[..]) else {
                 continue;
             };
             let dst = pkt.dst_addr();
-            if let Some(port) = self.ports.iter().find(|p| p.addr == dst) {
-                port.to_node.lock().unwrap().push_back(frame);
+            if let Some((_, _, stack)) = routes.iter().find(|(n, ip, _)| *n == net && *ip == dst) {
+                stack.lock().unwrap().device.deliver(frame);
+            }
+            // Off-network / unknown dest: dropped (the isolation boundary).
+        }
+
+        // Phase 3: poll again so delivered frames are processed now, and wake
+        // pollables so guest socket operations re-check.
+        for s in &stacks {
+            let mut g = s.lock().unwrap();
+            let NodeStack {
+                iface,
+                sockets,
+                device,
+                ..
+            } = &mut *g;
+            iface.poll(now, device, sockets);
+            for w in g.wakers.drain(..) {
+                w.wake();
             }
         }
+    }
+
+    fn run(self: Arc<Self>) {
+        while !self.stop.load(Ordering::Relaxed) {
+            self.step();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+impl Drop for NetHub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smoltcp::iface::{Config, Interface, SocketSet};
     use smoltcp::socket::tcp;
-    use smoltcp::wire::{HardwareAddress, IpCidr};
-
-    fn iface_for(nic: &mut VirtualNic, addr: Ipv4Address) -> Interface {
-        let config = Config::new(HardwareAddress::Ip);
-        let mut iface = Interface::new(config, nic, Instant::ZERO);
-        iface.update_ip_addrs(|addrs| {
-            addrs.push(IpCidr::new(addr.into(), 24)).unwrap();
-        });
-        iface
-    }
 
     fn tcp_socket() -> tcp::Socket<'static> {
         tcp::Socket::new(
@@ -176,55 +258,58 @@ mod tests {
         )
     }
 
-    /// Two independent smoltcp stacks on one fabric exchange a TCP stream — the
-    /// whole foundation (virtual NIC + switch routing) end to end.
+    /// Two nodes on the same virtual network exchange a TCP stream, driven by the
+    /// hub's `step` — exercises the NIC, the per-network routing, and the stacks.
     #[test]
-    fn two_nodes_talk_tcp_over_the_fabric() {
+    fn same_network_nodes_talk_tcp() {
         let server_ip = Ipv4Address::new(10, 0, 0, 2);
-        let mut fabric = Fabric::new();
-        let mut client_nic = fabric.attach(Ipv4Address::new(10, 0, 0, 1));
-        let mut server_nic = fabric.attach(server_ip);
-        let mut client_if = iface_for(&mut client_nic, Ipv4Address::new(10, 0, 0, 1));
-        let mut server_if = iface_for(&mut server_nic, server_ip);
+        let hub = NetHub::new();
+        let client = hub.attach(1, Ipv4Address::new(10, 0, 0, 1));
+        let server = hub.attach(1, server_ip);
 
-        let mut client_socks = SocketSet::new(vec![]);
-        let mut server_socks = SocketSet::new(vec![]);
-        let server_h = server_socks.add(tcp_socket());
-        server_socks
-            .get_mut::<tcp::Socket>(server_h)
-            .listen(80)
-            .unwrap();
-        let client_h = client_socks.add(tcp_socket());
-        client_socks
-            .get_mut::<tcp::Socket>(client_h)
-            .connect(client_if.context(), (server_ip, 80), 49152)
-            .unwrap();
+        let server_h = {
+            let mut g = server.lock().unwrap();
+            let h = g.sockets.add(tcp_socket());
+            g.sockets.get_mut::<tcp::Socket>(h).listen(80).unwrap();
+            h
+        };
+        let client_h = {
+            let mut g = client.lock().unwrap();
+            let h = g.sockets.add(tcp_socket());
+            let NodeStack { iface, sockets, .. } = &mut *g;
+            sockets
+                .get_mut::<tcp::Socket>(h)
+                .connect(iface.context(), (server_ip, 80), 49152)
+                .unwrap();
+            h
+        };
 
-        let mut clock = 0i64;
         let mut sent = false;
         let mut got: Vec<u8> = Vec::new();
-        for _ in 0..2000 {
-            let t = Instant::from_millis(clock);
-            client_if.poll(t, &mut client_nic, &mut client_socks);
-            server_if.poll(t, &mut server_nic, &mut server_socks);
-            fabric.route();
-
-            let cs = client_socks.get_mut::<tcp::Socket>(client_h);
-            if cs.can_send() && !sent {
-                cs.send_slice(b"hello wk net").unwrap();
-                sent = true;
+        for _ in 0..500 {
+            hub.step();
+            {
+                let mut g = client.lock().unwrap();
+                let cs = g.sockets.get_mut::<tcp::Socket>(client_h);
+                if cs.can_send() && !sent {
+                    cs.send_slice(b"hello wk net").unwrap();
+                    sent = true;
+                }
             }
-            let ss = server_socks.get_mut::<tcp::Socket>(server_h);
-            if ss.can_recv() {
-                let mut buf = [0u8; 64];
-                let n = ss.recv_slice(&mut buf).unwrap();
-                got.extend_from_slice(&buf[..n]);
+            {
+                let mut g = server.lock().unwrap();
+                let ss = g.sockets.get_mut::<tcp::Socket>(server_h);
+                if ss.can_recv() {
+                    let mut buf = [0u8; 64];
+                    let n = ss.recv_slice(&mut buf).unwrap();
+                    got.extend_from_slice(&buf[..n]);
+                }
             }
             if got.len() >= 12 {
                 break;
             }
-            clock += 5;
+            std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(&got, b"hello wk net", "server received the client's bytes");
+        assert_eq!(&got, b"hello wk net");
     }
 }

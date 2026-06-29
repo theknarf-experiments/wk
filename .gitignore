@@ -77,3 +77,6 @@ plugins/fetch/fetch.wasm
 
 # stray literal-tilde dir from tools that mis-expand $HOME
 /~/
+
+# netserve (TCP server example) build artifact
+plugins/netserve/netserve.wasm

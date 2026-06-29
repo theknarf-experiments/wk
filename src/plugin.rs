@@ -248,6 +248,9 @@ pub struct HostState {
     /// This node's option values, shared with its `Node` so the compositor can
     /// read (to save) and seed (to restore) them.
     pub(crate) options: crate::options::SharedOptions,
+    /// This node's network context (smoltcp stack on the fabric) — `Some` only
+    /// for nodes that import wasi:sockets. Backs wk's own wasi:sockets impl.
+    pub(crate) net: Option<crate::sockets::NetCtx>,
     /// This store's RNG, backing the standard `wasi:random` interface (needed by
     /// e.g. a guest's `HashMap`).
     random_ctx: wasmtime_wasi::random::WasiRandomCtx,
@@ -594,6 +597,15 @@ fn component_is_command(component: &Component, engine: &Engine) -> bool {
         .any(|(name, _)| name == "wasi:cli/run" || name.starts_with("wasi:cli/run@"))
 }
 
+/// Whether a component imports `wasi:sockets` — i.e. it does networking and so
+/// needs a NIC on the fabric.
+fn component_imports_sockets(component: &Component, engine: &Engine) -> bool {
+    component
+        .component_type()
+        .imports(engine)
+        .any(|(name, _)| name.starts_with("wasi:sockets/"))
+}
+
 /// Whether a component is a `wasi:http` server (exports `incoming-handler`).
 fn component_is_proxy(component: &Component, engine: &Engine) -> bool {
     component
@@ -620,6 +632,8 @@ pub struct PluginHost {
     engine: Engine,
     gpu: Arc<wgpu_core::global::Global>,
     midi: crate::midi::Router,
+    /// The userspace network fabric driving every networked node's stack.
+    hub: Arc<crate::netstack::NetHub>,
 }
 
 impl PluginHost {
@@ -639,6 +653,7 @@ impl PluginHost {
             engine: Engine::new(&config)?,
             gpu: new_gpu_instance(),
             midi: crate::midi::new_router(),
+            hub: crate::netstack::NetHub::new(),
         })
     }
 
@@ -659,6 +674,9 @@ impl PluginHost {
         // own in-memory filesystem in its place.
         crate::vfs::add_wasi_except_fs(&mut linker)?;
         add_random(&mut linker)?;
+        // wk's own wasi:sockets over the userspace network fabric (smoltcp), so
+        // networked guests' BSD sockets are routed by wk, not the host OS.
+        crate::sockets::add_to_linker(&mut linker)?;
         // WASI 0.3 (`@0.3.0`) interfaces — cli, clocks, filesystem, random,
         // sockets — built on the Component Model's native async (no `wasi:io`).
         // Added alongside the 0.2 set above (different version namespaces, no
@@ -727,6 +745,7 @@ impl PluginHost {
             midi_in: midi_in.clone(),
             midi_router: midi.clone(),
             options: crate::options::new_options(Vec::new()),
+            net: None,
             random_ctx: wasmtime_wasi::random::WasiRandomCtx::default(),
             http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
             gpu: gpu.clone(),
@@ -754,7 +773,6 @@ impl PluginHost {
         surfaces: SurfaceRegistry,
         nodes: NodeRegistry,
         initial_options: Vec<f32>,
-        allow_network: bool,
     ) -> Result<()> {
         let linker = self.build_linker()?;
 
@@ -803,12 +821,16 @@ impl PluginHost {
             .env("TERM", "xterm-256color")
             .env("COLUMNS", crate::terminal::COLS.to_string())
             .env("LINES", crate::terminal::ROWS.to_string());
-        // Nodes are isolated by default; only grant outbound TCP/UDP + DNS when
-        // the dependency opted in (wk.kdl `network`). Otherwise the guest has no
-        // network capability at all.
-        if allow_network {
-            ctx_builder.inherit_network().allow_ip_name_lookup(true);
-        }
+        // A node that imports wasi:sockets gets a NIC on the userspace fabric.
+        // (For now every such node shares one virtual network with a distinct
+        // IP; isolating them per canvas wiring is the next slice.)
+        let net = if component_imports_sockets(&component, &self.engine) {
+            let ip = smoltcp::wire::Ipv4Address::new(10, 0, 0, (2 + (id % 250)) as u8);
+            let stack = self.hub.attach(0, ip);
+            Some(crate::sockets::NetCtx::new(stack, ip))
+        } else {
+            None
+        };
         let state = HostState {
             ctx: ctx_builder.build(),
             table: ResourceTable::new(),
@@ -818,6 +840,7 @@ impl PluginHost {
             midi_in,
             midi_router: self.midi.clone(),
             options,
+            net,
             random_ctx: wasmtime_wasi::random::WasiRandomCtx::default(),
             http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
             gpu: Arc::clone(&self.gpu),

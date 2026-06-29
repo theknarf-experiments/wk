@@ -78,10 +78,6 @@ pub struct Dependency {
     /// Command-line arguments passed to the plugin (after argv[0] = name), e.g.
     /// a filename for an editor. Set in wk.kdl as `name "path" { args "..." }`.
     pub args: Vec<String>,
-    /// Whether this plugin is granted outbound network (wasi:sockets). Off by
-    /// default — nodes are isolated unless wk.kdl declares `network` in the
-    /// dependency's block.
-    pub network: bool,
 }
 
 impl Dependency {
@@ -94,7 +90,6 @@ impl Dependency {
             name,
             source: Source::Path(source),
             args: Vec::new(),
-            network: false,
         }
     }
 
@@ -151,12 +146,10 @@ impl Project {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        let network = n.children().and_then(|ch| ch.get("network")).is_some();
                         Some(Dependency {
                             name,
                             source: Source::parse(source),
                             args,
-                            network,
                         })
                     })
                     .collect()
@@ -179,18 +172,13 @@ impl Project {
         for dep in &self.dependencies {
             let mut node = KdlNode::new(dep.name.clone());
             node.push(KdlEntry::new(dep.source.to_kdl()));
-            let mut sub = KdlDocument::new();
             if !dep.args.is_empty() {
+                let mut sub = KdlDocument::new();
                 let mut args_node = KdlNode::new("args");
                 for a in &dep.args {
                     args_node.push(KdlEntry::new(a.clone()));
                 }
                 sub.nodes_mut().push(args_node);
-            }
-            if dep.network {
-                sub.nodes_mut().push(KdlNode::new("network"));
-            }
-            if !sub.nodes().is_empty() {
                 node.set_children(sub);
             }
             children.nodes_mut().push(node);
@@ -265,7 +253,6 @@ pub fn add(target: String) -> Result<(), String> {
         name: name.clone(),
         source,
         args: Vec::new(),
-        network: false,
     };
     if project.add_dependency(dep)? {
         println!("added dependency: {name}");

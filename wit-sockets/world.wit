@@ -1,0 +1,13 @@
+package wk:sockhost;
+
+/// The host side of wasi:sockets: wk implements these so plugins get BSD-style
+/// sockets backed by wk's userspace network fabric (smoltcp), not the host OS.
+world sockets-host {
+    import wasi:sockets/network@0.2.12;
+    import wasi:sockets/instance-network@0.2.12;
+    import wasi:sockets/ip-name-lookup@0.2.12;
+    import wasi:sockets/tcp@0.2.12;
+    import wasi:sockets/tcp-create-socket@0.2.12;
+    import wasi:sockets/udp@0.2.12;
+    import wasi:sockets/udp-create-socket@0.2.12;
+}
