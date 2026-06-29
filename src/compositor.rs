@@ -366,6 +366,22 @@ enum Wire {
     Serve(u64, u64),
 }
 
+/// An action runnable from the Cmd/Ctrl+K command palette.
+#[derive(Clone, Copy)]
+enum PaletteCmd {
+    /// Launch the dependency at this index in `available`.
+    Launch(usize),
+    AddVirtualFile,
+    AddHostFile,
+    AddPort,
+    /// Jump the camera to this zoom factor.
+    Zoom(f32),
+    Quit,
+}
+
+/// Most filtered command-palette rows shown at once.
+const PALETTE_MAX: usize = 9;
+
 /// An in-memory canvas file node: a named shared buffer you wire into app
 /// nodes. Its bytes are ephemeral shared state connected apps read and write.
 struct VirtualFile {
@@ -534,6 +550,14 @@ struct App {
     menu_open: bool,
     /// Whether the corner zoom button's preset menu is open.
     zoom_menu_open: bool,
+    /// Command palette (Cmd/Ctrl+K) state: open, the typed filter, and the
+    /// highlighted row. `palette_run` is set when a command is chosen and
+    /// executed in `frame`; `request_exit` quits wk on the next loop.
+    palette_open: bool,
+    palette_query: String,
+    palette_sel: usize,
+    palette_run: Option<PaletteCmd>,
+    request_exit: bool,
     pending_layout: HashMap<u64, ([f32; 2], [f32; 2])>,
 
     // File nodes (canvas-owned shared files) and the connections wiring them
@@ -599,6 +623,11 @@ impl App {
             del_wire: false,
             menu_open: false,
             zoom_menu_open: false,
+            palette_open: false,
+            palette_query: String::new(),
+            palette_sel: 0,
+            palette_run: None,
+            request_exit: false,
             pending_layout: HashMap::new(),
             file_nodes: HashMap::new(),
             connections: Vec::new(),
@@ -1041,6 +1070,100 @@ impl App {
         }
     }
 
+    /// All command-palette entries (label + action) for the current state.
+    fn palette_all(&self) -> Vec<(String, PaletteCmd)> {
+        let mut v: Vec<(String, PaletteCmd)> = self
+            .available
+            .iter()
+            .enumerate()
+            .map(|(i, dep)| (format!("Launch {}", dep.name), PaletteCmd::Launch(i)))
+            .collect();
+        v.push(("Add Virtual File".into(), PaletteCmd::AddVirtualFile));
+        v.push(("Add Host File".into(), PaletteCmd::AddHostFile));
+        v.push(("Add Port".into(), PaletteCmd::AddPort));
+        for &z in &ZOOM_PRESETS {
+            v.push((format!("Zoom {:.0}%", z * 100.0), PaletteCmd::Zoom(z)));
+        }
+        v.push(("Quit wk".into(), PaletteCmd::Quit));
+        v
+    }
+
+    /// Palette entries matching the current query (case-insensitive substring).
+    fn palette_filtered(&self) -> Vec<(String, PaletteCmd)> {
+        let q = self.palette_query.to_lowercase();
+        self.palette_all()
+            .into_iter()
+            .filter(|(label, _)| q.is_empty() || label.to_lowercase().contains(&q))
+            .collect()
+    }
+
+    /// Handle a key press while the command palette is open.
+    fn palette_key(&mut self, code: KeyCode, text: Option<&str>) {
+        // Navigate/select only within the visible rows.
+        let len = self.palette_filtered().len().min(PALETTE_MAX);
+        match code {
+            KeyCode::Escape => {
+                self.palette_open = false;
+                self.palette_query.clear();
+            }
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                self.palette_run = self
+                    .palette_filtered()
+                    .get(self.palette_sel)
+                    .map(|(_, c)| *c);
+                self.palette_open = false;
+                self.palette_query.clear();
+            }
+            KeyCode::ArrowDown => {
+                if len > 0 {
+                    self.palette_sel = (self.palette_sel + 1).min(len - 1);
+                }
+            }
+            KeyCode::ArrowUp => self.palette_sel = self.palette_sel.saturating_sub(1),
+            KeyCode::Backspace => {
+                self.palette_query.pop();
+                self.palette_sel = 0;
+            }
+            _ => {
+                if let Some(t) = text {
+                    for ch in t.chars().filter(|c| !c.is_control()) {
+                        self.palette_query.push(ch);
+                    }
+                    self.palette_sel = 0;
+                }
+            }
+        }
+    }
+
+    /// Execute a palette command (from `frame`, where the screen size is known).
+    fn run_palette(&mut self, cmd: PaletteCmd, fb: [f32; 2]) {
+        match cmd {
+            PaletteCmd::Launch(i) => {
+                if let Some(dep) = self.available.get(i).cloned() {
+                    self.launch(&dep);
+                }
+            }
+            PaletteCmd::AddVirtualFile => self.add_virtual_file(),
+            PaletteCmd::AddHostFile => self.add_host_mapped_file(),
+            PaletteCmd::AddPort => self.add_host_port(),
+            PaletteCmd::Zoom(z) => {
+                self.cam
+                    .zoom_at(z / self.cam.zoom, [fb[0] * 0.5, fb[1] * 0.5]);
+                self.pan_target = self.cam.pan;
+            }
+            PaletteCmd::Quit => self.request_exit = true,
+        }
+    }
+
+    /// Panel/query/row rects for the command palette at screen size `fb`.
+    fn palette_layout(fb: [f32; 2]) -> (f32, f32, f32, f32) {
+        let w = (fb[0] * 0.5).clamp(320.0, 560.0);
+        let x = (fb[0] - w) * 0.5;
+        let y = (fb[1] * 0.16).max(40.0);
+        let row_h = MENU_H + 4.0;
+        (x, y, w, row_h)
+    }
+
     /// One compositor frame: update from input, drive surfaces, render.
     fn frame(&mut self) {
         let Some(mut gfx) = self.gfx.take() else {
@@ -1182,8 +1305,23 @@ impl App {
             // Any fresh click clears the wire selection; a click that lands on a
             // wire (empty-canvas branch below) re-selects it.
             self.wire_sel = None;
+            // The command palette is modal: click a row to run it, click
+            // anywhere else to dismiss it.
+            if self.palette_open {
+                let (px, py, pw, row_h) = Self::palette_layout(fb);
+                for (i, (_, cmd)) in self.palette_filtered().iter().take(PALETTE_MAX).enumerate() {
+                    let y0 = py + (i as f32 + 1.0) * row_h;
+                    if contains([px, y0, px + pw, y0 + row_h], mp) {
+                        self.palette_run = Some(*cmd);
+                        break;
+                    }
+                }
+                self.palette_open = false;
+                self.palette_query.clear();
+                consumed = true;
+            }
             // Corner zoom menu (drawn on top) takes clicks first.
-            if self.zoom_menu_open {
+            if !consumed && self.zoom_menu_open {
                 let mut hit = false;
                 for (i, &z) in ZOOM_PRESETS.iter().enumerate() {
                     if contains(zoom_item(i), mp) {
@@ -1199,7 +1337,7 @@ impl App {
                 if hit || contains(zoom_btn, mp) {
                     consumed = true;
                 }
-            } else if contains(zoom_btn, mp) {
+            } else if !consumed && contains(zoom_btn, mp) {
                 self.zoom_menu_open = true;
                 consumed = true;
             }
@@ -1304,6 +1442,12 @@ impl App {
             }
         }
 
+        // Run a command chosen from the palette (executed here so screen size
+        // is known for zoom).
+        if let Some(cmd) = self.palette_run.take() {
+            self.run_palette(cmd, fb);
+        }
+
         // Delete the selected wire on Delete/Backspace.
         if self.del_wire {
             self.del_wire = false;
@@ -1318,8 +1462,9 @@ impl App {
             }
         }
 
-        // Route pointer to the surface under the cursor.
-        if self.drag.is_none() && mp[1] >= MENU_H {
+        // Route pointer to the surface under the cursor (not while the modal
+        // command palette is open).
+        if self.drag.is_none() && !self.palette_open && mp[1] >= MENU_H {
             if let Some(&id) = self.z.iter().rev().find(|&&id| {
                 contains(
                     win_rect(self.cam, self.win_pos[&id], self.win_size[&id]),
@@ -1921,6 +2066,69 @@ impl App {
             full,
         );
 
+        // Command palette (Cmd/Ctrl+K): dim the canvas, then a centred panel with
+        // the typed query and the filtered commands (selected row highlighted).
+        if self.palette_open {
+            quads.push(Quad::solid(white, full, [0.0, 0.0, 0.0, 0.45], full));
+            let (px, py, pw, row_h) = Self::palette_layout(fb);
+            let filtered = self.palette_filtered();
+            let rows = filtered.len().min(PALETTE_MAX);
+            let panel = [px, py, px + pw, py + (rows as f32 + 1.0) * row_h];
+            quads.push(Quad::solid(white, panel, BORDER_COL, full));
+            let inset = [
+                panel[0] + 1.0,
+                panel[1] + 1.0,
+                panel[2] - 1.0,
+                panel[3] - 1.0,
+            ];
+            quads.push(Quad::solid(white, inset, BODY, full));
+            // Query row.
+            let q = if self.palette_query.is_empty() {
+                "Type a command…".to_string()
+            } else {
+                self.palette_query.clone()
+            };
+            let q_col = if self.palette_query.is_empty() {
+                [0.5, 0.5, 0.56, 1.0]
+            } else {
+                TEXT
+            };
+            self.text_cache.draw(
+                &mut quads,
+                &mut gfx.renderer,
+                &gfx.fonts,
+                &gfx.device,
+                &gfx.queue,
+                &q,
+                px + PAD,
+                py + (row_h - lh) * 0.5,
+                1.0,
+                q_col,
+                full,
+            );
+            for (i, (label, _)) in filtered.iter().take(PALETTE_MAX).enumerate() {
+                let y0 = py + (i as f32 + 1.0) * row_h;
+                let r = [px, y0, px + pw, y0 + row_h];
+                let hot = contains(r, mp);
+                if i == self.palette_sel || hot {
+                    quads.push(Quad::solid(white, r, TITLE_FOCUS, full));
+                }
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    label,
+                    px + PAD,
+                    y0 + (row_h - lh) * 0.5,
+                    1.0,
+                    TEXT,
+                    full,
+                );
+            }
+        }
+
         // ---- render ----
         let frame = match gfx.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
@@ -2106,7 +2314,12 @@ impl ApplicationHandler for App {
     /// runs *inside* winit's handler (set for the whole pump). Rendering in the
     /// outer loop instead left a window where the handler was unset and a
     /// quit/close event would log "no handler was set".
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // A palette "Quit" command asks to exit on the next loop.
+        if self.request_exit {
+            event_loop.exit();
+            return;
+        }
         if self.gfx.is_some() {
             self.frame();
         }
@@ -2156,6 +2369,24 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let pressed = event.state == ElementState::Pressed;
+                    // Cmd/Ctrl+K toggles the command palette.
+                    if pressed
+                        && !event.repeat
+                        && (self.mods.super_key() || self.mods.control_key())
+                        && code == KeyCode::KeyK
+                    {
+                        self.palette_open = !self.palette_open;
+                        self.palette_query.clear();
+                        self.palette_sel = 0;
+                        return;
+                    }
+                    // While the palette is open it captures all keystrokes.
+                    if self.palette_open {
+                        if pressed {
+                            self.palette_key(code, event.text.as_deref());
+                        }
+                        return;
+                    }
                     // Escape quits wk only when nothing is focused; otherwise it
                     // belongs to the focused app/terminal (vim lives on Escape).
                     if code == KeyCode::Escape && pressed && self.kbd_focus.is_none() {
