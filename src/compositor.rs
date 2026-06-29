@@ -385,6 +385,7 @@ enum PaletteCmd {
     AddHostFile,
     AddPort,
     AddNetwork,
+    AddGateway,
     /// Jump the camera to this zoom factor.
     Zoom(f32),
     Quit,
@@ -596,6 +597,8 @@ struct App {
     /// Network nodes — each is an isolated virtual network (Docker-bridge); app
     /// nodes wired to one share that network. The set holds their canvas ids.
     net_nodes: std::collections::HashSet<u64>,
+    /// Which Network nodes are also Gateways (grant members host-network access).
+    gateways: std::collections::HashSet<u64>,
     /// Network membership wires, as (app node id, Network node id).
     net_links: Vec<(u64, u64)>,
     next_node_id: u64,
@@ -661,6 +664,7 @@ impl App {
             midi_links: Vec::new(),
             host_ports: HashMap::new(),
             net_nodes: std::collections::HashSet::new(),
+            gateways: std::collections::HashSet::new(),
             net_links: Vec::new(),
             serves: HashMap::new(),
             next_port: 8080,
@@ -927,6 +931,24 @@ impl App {
         self.net_nodes.insert(id);
     }
 
+    /// Create a Gateway node — a network whose members also get host-network
+    /// access (real sockets + DNS) for off-fabric destinations.
+    fn add_gateway_node(&mut self) {
+        self.add_net_node();
+        if let Some(&id) = self.z.last() {
+            self.gateways.insert(id);
+        }
+    }
+
+    /// Grant/revoke a node's host-network access (on its fabric stack).
+    fn set_host_access(&self, app_id: u64, allow: bool) {
+        if let Some(node) = self.app_node(app_id) {
+            if let Some(stack) = &node.net_stack {
+                stack.lock().unwrap().host_access = allow;
+            }
+        }
+    }
+
     /// Toggle a connection between two nodes, by the node kinds: file⇄app mounts
     /// the file; http-app⇄HostPort serves on localhost; app⇄Network joins the
     /// network; app⇄app wires MIDI.
@@ -974,17 +996,21 @@ impl App {
         {
             self.net_links.remove(pos);
             self.set_node_net(app_id, app_id); // back to isolated
+            self.set_host_access(app_id, false);
         } else {
             // One network per app: drop any existing membership first.
             self.net_links.retain(|&(a, _)| a != app_id);
             self.net_links.push((app_id, net_id));
             self.set_node_net(app_id, net_id);
+            // Joining a Gateway also grants host-network access.
+            self.set_host_access(app_id, self.gateways.contains(&net_id));
         }
     }
 
-    /// Remove a Network node, returning its members to isolation.
+    /// Remove a Network/Gateway node, returning its members to isolation.
     fn remove_net_node(&mut self, id: u64) {
         self.net_nodes.remove(&id);
+        self.gateways.remove(&id);
         let members: Vec<u64> = self
             .net_links
             .iter()
@@ -993,6 +1019,7 @@ impl App {
             .collect();
         for app in members {
             self.set_node_net(app, app);
+            self.set_host_access(app, false);
         }
         self.net_links.retain(|&(_, n)| n != id);
         self.win_pos.remove(&id);
@@ -1211,6 +1238,7 @@ impl App {
         v.push(("Add Host File".into(), PaletteCmd::AddHostFile));
         v.push(("Add Port".into(), PaletteCmd::AddPort));
         v.push(("Add Network".into(), PaletteCmd::AddNetwork));
+        v.push(("Add Gateway".into(), PaletteCmd::AddGateway));
         for &z in &ZOOM_PRESETS {
             v.push((format!("Zoom {:.0}%", z * 100.0), PaletteCmd::Zoom(z)));
         }
@@ -1297,6 +1325,7 @@ impl App {
             PaletteCmd::AddHostFile => self.add_host_mapped_file(),
             PaletteCmd::AddPort => self.add_host_port(),
             PaletteCmd::AddNetwork => self.add_net_node(),
+            PaletteCmd::AddGateway => self.add_gateway_node(),
             PaletteCmd::Zoom(z) => {
                 self.cam
                     .zoom_at(z / self.cam.zoom, [fb[0] * 0.5, fb[1] * 0.5]);
@@ -1975,6 +2004,7 @@ impl App {
             // it. Shows how many members are on it.
             if self.net_nodes.contains(&id) {
                 let members = self.net_links.iter().filter(|&&(_, n)| n == id).count();
+                let is_gw = self.gateways.contains(&id);
                 quads.push(Quad::solid(white, r, NET_BORDER, clip));
                 let body = [
                     r[0] + BORDER * zf,
@@ -1990,7 +2020,7 @@ impl App {
                     &gfx.fonts,
                     &gfx.device,
                     &gfx.queue,
-                    "Network",
+                    if is_gw { "Gateway" } else { "Network" },
                     r[0] + PAD * zf,
                     r[1] + PAD * zf,
                     zf,
@@ -2003,7 +2033,11 @@ impl App {
                     &gfx.fonts,
                     &gfx.device,
                     &gfx.queue,
-                    &format!("{members} node(s)"),
+                    &if is_gw {
+                        format!("host • {members}")
+                    } else {
+                        format!("{members} node(s)")
+                    },
                     r[0] + PAD * zf,
                     r[1] + (PAD + lh) * zf,
                     zf * 0.7,

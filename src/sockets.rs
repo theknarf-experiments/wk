@@ -4,8 +4,10 @@
 //! socket on the node's stack; the hub thread routes its packets to peers on the
 //! same virtual network. A node with no network attached can't reach anything.
 //!
-//! TCP (connect/bind/listen/accept + streams) is implemented; UDP is stubbed; DNS
-//! resolves numeric IPv4 literals only (a gateway resolver is a later slice).
+//! TCP (connect/bind/listen/accept + streams) is implemented; UDP is stubbed. A
+//! node wired to a Gateway node gets host access: off-fabric connections are
+//! bridged to real host sockets and names resolve via the host resolver;
+//! otherwise only fabric peers and numeric addresses are reachable.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -86,6 +88,112 @@ pub struct TcpSock {
     local: Option<Ipv4SocketAddress>,
     remote: Option<Ipv4SocketAddress>,
     listening: bool,
+    /// Set when the socket connects off-fabric through a host gateway; its bytes
+    /// flow over a real host socket instead of smoltcp.
+    host: Option<HostConn>,
+}
+
+// ---- host gateway: bridge an off-fabric connection to a real host socket ----
+
+#[derive(Default)]
+struct Pipe {
+    buf: std::collections::VecDeque<u8>,
+    closed: bool,
+    wakers: Vec<std::task::Waker>,
+}
+type SharedPipe = std::sync::Arc<std::sync::Mutex<Pipe>>;
+
+fn wake_pipe(p: &SharedPipe) {
+    for w in p.lock().unwrap().wakers.drain(..) {
+        w.wake();
+    }
+}
+
+/// A connection to the real host network, bridged to the guest's byte streams by
+/// a per-connection thread. Created only for nodes wired to a Gateway node.
+struct HostConn {
+    incoming: SharedPipe, // host -> guest
+    outgoing: SharedPipe, // guest -> host
+    connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl HostConn {
+    fn connect(ip: Ipv4Address, port: u16) -> HostConn {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let incoming: SharedPipe = Default::default();
+        let outgoing: SharedPipe = Default::default();
+        let connected = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(AtomicBool::new(false));
+        let (inc, out, conn, fail) = (
+            incoming.clone(),
+            outgoing.clone(),
+            connected.clone(),
+            failed.clone(),
+        );
+        let addr = std::net::SocketAddr::from((ip.octets(), port));
+        std::thread::spawn(move || {
+            match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(10)) {
+                Ok(stream) => {
+                    conn.store(true, std::sync::atomic::Ordering::Relaxed);
+                    wake_pipe(&inc);
+                    host_pump(stream, inc, out);
+                }
+                Err(_) => {
+                    fail.store(true, std::sync::atomic::Ordering::Relaxed);
+                    wake_pipe(&inc);
+                }
+            }
+        });
+        HostConn {
+            incoming,
+            outgoing,
+            connected,
+            failed,
+        }
+    }
+}
+
+/// Pump bytes between a real host socket and the guest pipes until either side
+/// closes. A short read timeout lets one thread service both directions.
+fn host_pump(mut stream: std::net::TcpStream, incoming: SharedPipe, outgoing: SharedPipe) {
+    use std::io::{Read, Write};
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(10)));
+    let mut tmp = [0u8; 16 * 1024];
+    loop {
+        match stream.read(&mut tmp) {
+            Ok(0) => {
+                incoming.lock().unwrap().closed = true;
+                wake_pipe(&incoming);
+                break;
+            }
+            Ok(n) => {
+                incoming.lock().unwrap().buf.extend(&tmp[..n]);
+                wake_pipe(&incoming);
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => {
+                incoming.lock().unwrap().closed = true;
+                wake_pipe(&incoming);
+                break;
+            }
+        }
+        let (out, guest_closed) = {
+            let mut g = outgoing.lock().unwrap();
+            (g.buf.drain(..).collect::<Vec<u8>>(), g.closed)
+        };
+        if !out.is_empty() && stream.write_all(&out).is_err() {
+            incoming.lock().unwrap().closed = true;
+            wake_pipe(&incoming);
+            break;
+        }
+        if guest_closed {
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    }
 }
 
 /// UDP isn't implemented yet; the resource exists only so the world links.
@@ -276,6 +384,116 @@ impl OutputStream for TcpOutput {
     }
 }
 
+// ---- host gateway byte streams + pollables ----
+
+/// Ready when a pipe has data or is closed.
+struct PipeReady {
+    pipe: SharedPipe,
+}
+impl Future for PipeReady {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
+        let mut p = self.pipe.lock().unwrap();
+        if !p.buf.is_empty() || p.closed {
+            Poll::Ready(())
+        } else {
+            p.wakers.push(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+/// Ready when a host connect attempt has settled (connected or failed).
+struct ConnReady {
+    pipe: SharedPipe,
+    connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl Future for ConnReady {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
+        use std::sync::atomic::Ordering;
+        if self.connected.load(Ordering::Relaxed) || self.failed.load(Ordering::Relaxed) {
+            Poll::Ready(())
+        } else {
+            self.pipe.lock().unwrap().wakers.push(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+struct HostInput {
+    pipe: SharedPipe,
+}
+#[async_trait]
+impl Pollable for HostInput {
+    async fn ready(&mut self) {
+        PipeReady {
+            pipe: self.pipe.clone(),
+        }
+        .await
+    }
+}
+impl InputStream for HostInput {
+    fn read(&mut self, size: usize) -> StreamResult<Bytes> {
+        let mut p = self.pipe.lock().unwrap();
+        if p.buf.is_empty() {
+            return if p.closed {
+                Err(StreamError::Closed)
+            } else {
+                Ok(Bytes::new())
+            };
+        }
+        let n = size.min(p.buf.len());
+        let bytes: Vec<u8> = p.buf.drain(..n).collect();
+        Ok(Bytes::from(bytes))
+    }
+}
+
+struct HostOutput {
+    pipe: SharedPipe,
+}
+#[async_trait]
+impl Pollable for HostOutput {
+    async fn ready(&mut self) {} // always writable (buffered)
+}
+impl OutputStream for HostOutput {
+    fn check_write(&mut self) -> StreamResult<usize> {
+        Ok(64 * 1024)
+    }
+    fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
+        self.pipe.lock().unwrap().buf.extend(bytes.iter());
+        Ok(())
+    }
+    fn flush(&mut self) -> StreamResult<()> {
+        Ok(())
+    }
+}
+
+/// A pollable for a host-gateway socket: ready once the connect settles.
+struct HostEventPollable {
+    pipe: SharedPipe,
+    connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+#[async_trait]
+impl Pollable for HostEventPollable {
+    async fn ready(&mut self) {
+        ConnReady {
+            pipe: self.pipe.clone(),
+            connected: self.connected.clone(),
+            failed: self.failed.clone(),
+        }
+        .await
+    }
+}
+
+/// Is `ip` on the virtual fabric subnet (10.0.0.0/24) rather than the host net?
+fn on_fabric(ip: Ipv4Address) -> bool {
+    let o = ip.octets();
+    o[0] == 10 && o[1] == 0 && o[2] == 0
+}
+
 // ---- interface impls ----
 
 impl wasi::sockets::network::Host for HostState {
@@ -324,6 +542,7 @@ impl wasi::sockets::tcp_create_socket::Host for HostState {
             local: None,
             remote: None,
             listening: false,
+            host: None,
         })?))
     }
 }
@@ -364,6 +583,19 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
         let Some(stack) = self.stack() else {
             return Ok(Err(ErrorCode::AccessDenied));
         };
+        let remote_ip = to_ipv4(rem.address);
+        // Off-fabric destination: bridge to the real host network, but only if
+        // this node is wired to a Gateway (host access granted).
+        if !on_fabric(remote_ip) {
+            if !stack.lock().unwrap().host_access {
+                return Ok(Err(ErrorCode::AccessDenied));
+            }
+            let conn = HostConn::connect(remote_ip, rem.port);
+            let s = self.table().get_mut(&this)?;
+            s.host = Some(conn);
+            s.remote = Some(rem);
+            return Ok(Ok(()));
+        }
         let local_ip = self.net.as_ref().unwrap().ip;
         let lport = {
             let ctx = self.net.as_mut().unwrap();
@@ -395,6 +627,32 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
         this: Resource<TcpSock>,
     ) -> Result<std::result::Result<(Resource<DynInputStream>, Resource<DynOutputStream>), ErrorCode>>
     {
+        // Host-gateway connection?
+        let host = {
+            let s = self.table().get(&this)?;
+            s.host.as_ref().map(|h| {
+                (
+                    h.incoming.clone(),
+                    h.outgoing.clone(),
+                    h.connected.clone(),
+                    h.failed.clone(),
+                )
+            })
+        };
+        if let Some((inc, out, connected, failed)) = host {
+            use std::sync::atomic::Ordering;
+            if failed.load(Ordering::Relaxed) {
+                return Ok(Err(ErrorCode::ConnectionRefused));
+            }
+            if !connected.load(Ordering::Relaxed) {
+                return Ok(Err(ErrorCode::WouldBlock));
+            }
+            let input: DynInputStream = Box::new(HostInput { pipe: inc });
+            let output: DynOutputStream = Box::new(HostOutput { pipe: out });
+            let i = self.table().push(input)?;
+            let o = self.table().push(output)?;
+            return Ok(Ok((i, o)));
+        }
         let Some(stack) = self.stack() else {
             return Ok(Err(ErrorCode::AccessDenied));
         };
@@ -504,6 +762,7 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
             local: None,
             remote: None,
             listening: false,
+            host: None,
         })?;
         let input: DynInputStream = Box::new(TcpInput {
             stack: stack.clone(),
@@ -544,6 +803,21 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
     }
 
     fn subscribe(&mut self, this: Resource<TcpSock>) -> Result<Resource<DynPollable>> {
+        // Host-gateway socket: readiness tracks the host connect.
+        let host = {
+            let s = self.table().get(&this)?;
+            s.host
+                .as_ref()
+                .map(|h| (h.incoming.clone(), h.connected.clone(), h.failed.clone()))
+        };
+        if let Some((pipe, connected, failed)) = host {
+            let p = self.table().push(HostEventPollable {
+                pipe,
+                connected,
+                failed,
+            })?;
+            return subscribe(self.table(), p);
+        }
         let stack = self.stack().expect("socket exists => has a stack");
         let handle = self.table().get(&this)?.handle;
         let p = self.table().push(SockPollable {
@@ -696,8 +970,25 @@ impl wasi::sockets::ip_name_lookup::Host for HostState {
         if let Ok(v4) = name.parse::<std::net::Ipv4Addr>() {
             let o = v4.octets();
             addrs.push_back(IpAddress::Ipv4((o[0], o[1], o[2], o[3])));
+        } else if self
+            .net
+            .as_ref()
+            .is_some_and(|n| n.stack.lock().unwrap().host_access)
+        {
+            // Gatewayed node: resolve real names via the host resolver.
+            match std::net::ToSocketAddrs::to_socket_addrs(&(name.as_str(), 0)) {
+                Ok(iter) => {
+                    for sa in iter {
+                        if let std::net::IpAddr::V4(v4) = sa.ip() {
+                            let o = v4.octets();
+                            addrs.push_back(IpAddress::Ipv4((o[0], o[1], o[2], o[3])));
+                        }
+                    }
+                }
+                Err(_) => return Ok(Err(ErrorCode::NameUnresolvable)),
+            }
         } else {
-            // No resolver on the fabric yet — only numeric addresses work.
+            // No gateway: only numeric addresses resolve on the fabric.
             return Ok(Err(ErrorCode::NameUnresolvable));
         }
         Ok(Ok(self.table().push(ResolveStream { addrs })?))

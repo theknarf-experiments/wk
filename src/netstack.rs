@@ -115,6 +115,9 @@ pub struct NodeStack {
     /// Virtual network id — nodes sharing it can reach each other.
     pub net: u64,
     pub ip: Ipv4Address,
+    /// Whether this node may reach the real host network (set when wired to a
+    /// Gateway node). Off-fabric connections are bridged to host sockets.
+    pub host_access: bool,
     /// Wakers parked on this stack's pollables; woken each hub tick so guest
     /// socket pollables re-check readiness.
     wakers: Vec<Waker>,
@@ -166,6 +169,7 @@ impl NetHub {
             device,
             net,
             ip,
+            host_access: false,
             wakers: Vec::new(),
         }));
         self.stacks.lock().unwrap().push(stack.clone());
