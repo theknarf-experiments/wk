@@ -349,6 +349,18 @@ struct Drag {
     grab: [f32; 2],
 }
 
+/// A connection wire on the canvas, identified by its endpoints so it can be
+/// selected (click) and deleted (Delete/Backspace).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wire {
+    /// A file node (`file_id`) mounted into an app node (`app_id`).
+    File(u64, u64),
+    /// A MIDI link from source node to destination node.
+    Midi(u64, u64),
+    /// A wasi:http node served on a HostPort node.
+    Serve(u64, u64),
+}
+
 /// An in-memory canvas file node: a named shared buffer you wire into app
 /// nodes. Its bytes are ephemeral shared state connected apps read and write.
 struct VirtualFile {
@@ -419,6 +431,8 @@ const HOSTPORT_WIRE: [f32; 4] = [0.40, 0.78, 0.82, 1.0];
 const WIRE_COL: [f32; 4] = [0.55, 0.60, 0.72, 1.0];
 /// MIDI connection wires get a distinct (teal/green) colour.
 const MIDI_WIRE_COL: [f32; 4] = [0.35, 0.78, 0.62, 1.0];
+/// A selected wire is drawn thicker in this highlight colour.
+const WIRE_SEL_COL: [f32; 4] = [1.0, 0.85, 0.4, 1.0];
 
 /// The connection port sits at the right edge, vertically centred.
 fn port_pos(r: [f32; 4]) -> [f32; 2] {
@@ -431,6 +445,24 @@ fn near(a: [f32; 2], b: [f32; 2], radius: f32) -> bool {
     let (dx, dy) = (a[0] - b[0], a[1] - b[1]);
     dx * dx + dy * dy <= radius * radius
 }
+
+/// Distance from point `p` to the line segment `a`-`b`.
+fn dist_to_segment(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
+    let (abx, aby) = (b[0] - a[0], b[1] - a[1]);
+    let (apx, apy) = (p[0] - a[0], p[1] - a[1]);
+    let len2 = abx * abx + aby * aby;
+    let t = if len2 > 0.0 {
+        ((apx * abx + apy * aby) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let (cx, cy) = (a[0] + abx * t, a[1] + aby * t);
+    let (dx, dy) = (p[0] - cx, p[1] - cy);
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// How close (screen px) a click must be to a wire to select it.
+const WIRE_PICK: f32 = 6.0;
 
 /// The in-app mount name for a host-mapped file: the path's base name.
 fn host_file_name(path: &std::path::Path) -> String {
@@ -489,6 +521,11 @@ struct App {
     z: Vec<u64>,
     kbd_focus: Option<u64>,
     drag: Option<Drag>,
+    /// The connection wire currently selected (click to select, Delete to remove).
+    wire_sel: Option<Wire>,
+    /// Set when Delete/Backspace is pressed; consumed in `frame` to drop the
+    /// selected wire.
+    del_wire: bool,
     menu_open: bool,
     pending_layout: HashMap<u64, ([f32; 2], [f32; 2])>,
 
@@ -551,6 +588,8 @@ impl App {
             z: Vec::new(),
             kbd_focus: None,
             drag: None,
+            wire_sel: None,
+            del_wire: false,
             menu_open: false,
             pending_layout: HashMap::new(),
             file_nodes: HashMap::new(),
@@ -928,6 +967,70 @@ impl App {
         self.z.retain(|&x| x != id);
     }
 
+    /// The screen-space endpoints of a wire (both nodes must still be placed).
+    fn wire_endpoints(&self, w: Wire) -> Option<([f32; 2], [f32; 2])> {
+        let (a, b) = match w {
+            Wire::File(f, a) => (f, a),
+            Wire::Midi(s, d) => (s, d),
+            Wire::Serve(h, hp) => (h, hp),
+        };
+        if self.win_pos.contains_key(&a) && self.win_pos.contains_key(&b) {
+            Some((center(self.rect_of(a)), center(self.rect_of(b))))
+        } else {
+            None
+        }
+    }
+
+    /// Whether the wire still connects two live nodes.
+    fn wire_exists(&self, w: Wire) -> bool {
+        match w {
+            Wire::File(f, a) => self.connections.contains(&(f, a)),
+            Wire::Midi(s, d) => self.midi_links.contains(&(s, d)),
+            Wire::Serve(h, hp) => self.serves.get(&h).map(|(p, _)| *p) == Some(hp),
+        }
+    }
+
+    /// The connection wire nearest to `mp` within the pick radius, if any.
+    fn wire_at(&self, mp: [f32; 2]) -> Option<Wire> {
+        let all = self
+            .connections
+            .iter()
+            .map(|&(f, a)| Wire::File(f, a))
+            .chain(self.midi_links.iter().map(|&(s, d)| Wire::Midi(s, d)))
+            .chain(self.serves.iter().map(|(&h, &(hp, _))| Wire::Serve(h, hp)));
+        let mut best: Option<(f32, Wire)> = None;
+        for w in all {
+            if let Some((a, b)) = self.wire_endpoints(w) {
+                let d = dist_to_segment(mp, a, b);
+                if d <= WIRE_PICK && best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                    best = Some((d, w));
+                }
+            }
+        }
+        best.map(|(_, w)| w)
+    }
+
+    /// Remove the given connection (the same effect as toggling it off).
+    fn disconnect_wire(&mut self, w: Wire) {
+        match w {
+            Wire::File(f, a) => {
+                if self.connections.contains(&(f, a)) {
+                    self.toggle_file(f, a);
+                }
+            }
+            Wire::Midi(s, d) => {
+                if self.midi_links.contains(&(s, d)) {
+                    self.toggle_midi(s, d);
+                }
+            }
+            Wire::Serve(h, hp) => {
+                if self.serves.contains_key(&h) {
+                    self.toggle_serve(h, hp);
+                }
+            }
+        }
+    }
+
     /// One compositor frame: update from input, drive surfaces, render.
     fn frame(&mut self) {
         let Some(mut gfx) = self.gfx.take() else {
@@ -1057,6 +1160,9 @@ impl App {
 
         if down_edge && self.drag.is_none() {
             let mut consumed = false;
+            // Any fresh click clears the wire selection; a click that lands on a
+            // wire (empty-canvas branch below) re-selects it.
+            self.wire_sel = None;
             if contains(apps_rect, mp) {
                 self.menu_open = !self.menu_open;
                 consumed = true;
@@ -1148,9 +1254,25 @@ impl App {
                 }
             }
             if !consumed {
-                // Clicked empty canvas: dismiss the menu and unfocus the app.
+                // Clicked empty canvas: select a wire under the cursor (so it
+                // can be deleted), else dismiss the menu and unfocus the app.
                 self.menu_open = false;
                 self.kbd_focus = None;
+                self.wire_sel = self.wire_at(mp);
+            }
+        }
+
+        // Delete the selected wire on Delete/Backspace.
+        if self.del_wire {
+            self.del_wire = false;
+            if let Some(w) = self.wire_sel.take() {
+                self.disconnect_wire(w);
+            }
+        }
+        // Drop a stale selection (its node was closed/removed).
+        if let Some(w) = self.wire_sel {
+            if !self.wire_exists(w) {
+                self.wire_sel = None;
             }
         }
 
@@ -1264,61 +1386,36 @@ impl App {
         let full = [0.0, 0.0, fb[0], fb[1]];
         let mut quads: Vec<Quad> = Vec::new();
 
-        // Connection wires, under the nodes.
+        // Connection wires, under the nodes. The selected wire is drawn thicker
+        // in the highlight colour. MIDI/serve wires also get a direction arrow.
+        let wire_w = |sel: bool| {
+            if sel {
+                (3.5 * zf).max(2.5)
+            } else {
+                (2.0 * zf).max(1.5)
+            }
+        };
         for &(file_id, app_id) in &self.connections {
-            if self.win_pos.contains_key(&file_id) && self.win_pos.contains_key(&app_id) {
-                let a = center(self.rect_of(file_id));
-                let b = center(self.rect_of(app_id));
-                quads.push(Quad::line(white, a, b, (2.0 * zf).max(1.5), WIRE_COL, full));
+            if let Some((a, b)) = self.wire_endpoints(Wire::File(file_id, app_id)) {
+                let sel = self.wire_sel == Some(Wire::File(file_id, app_id));
+                let col = if sel { WIRE_SEL_COL } else { WIRE_COL };
+                quads.push(Quad::line(white, a, b, wire_w(sel), col, full));
             }
         }
-        // MIDI connection wires (source -> destination), in a distinct colour,
-        // with an arrowhead so the direction (which node drives which) is clear.
         for &(src, dst) in &self.midi_links {
-            if self.win_pos.contains_key(&src) && self.win_pos.contains_key(&dst) {
-                let a = center(self.rect_of(src));
-                let b = center(self.rect_of(dst));
-                quads.push(Quad::line(
-                    white,
-                    a,
-                    b,
-                    (2.0 * zf).max(1.5),
-                    MIDI_WIRE_COL,
-                    full,
-                ));
-                arrow_head(
-                    &mut quads,
-                    white,
-                    a,
-                    b,
-                    (7.0 * zf).max(5.0),
-                    MIDI_WIRE_COL,
-                    full,
-                );
+            if let Some((a, b)) = self.wire_endpoints(Wire::Midi(src, dst)) {
+                let sel = self.wire_sel == Some(Wire::Midi(src, dst));
+                let col = if sel { WIRE_SEL_COL } else { MIDI_WIRE_COL };
+                quads.push(Quad::line(white, a, b, wire_w(sel), col, full));
+                arrow_head(&mut quads, white, a, b, (7.0 * zf).max(5.0), col, full);
             }
         }
-        // HostPort serve wires (wasi:http node -> exposed localhost port).
         for (&http, &(hostport, _)) in &self.serves {
-            if self.win_pos.contains_key(&http) && self.win_pos.contains_key(&hostport) {
-                let a = center(self.rect_of(http));
-                let b = center(self.rect_of(hostport));
-                quads.push(Quad::line(
-                    white,
-                    a,
-                    b,
-                    (2.0 * zf).max(1.5),
-                    HOSTPORT_WIRE,
-                    full,
-                ));
-                arrow_head(
-                    &mut quads,
-                    white,
-                    a,
-                    b,
-                    (7.0 * zf).max(5.0),
-                    HOSTPORT_WIRE,
-                    full,
-                );
+            if let Some((a, b)) = self.wire_endpoints(Wire::Serve(http, hostport)) {
+                let sel = self.wire_sel == Some(Wire::Serve(http, hostport));
+                let col = if sel { WIRE_SEL_COL } else { HOSTPORT_WIRE };
+                quads.push(Quad::line(white, a, b, wire_w(sel), col, full));
+                arrow_head(&mut quads, white, a, b, (7.0 * zf).max(5.0), col, full);
             }
         }
 
@@ -1981,6 +2078,15 @@ impl ApplicationHandler for App {
                     // belongs to the focused app/terminal (vim lives on Escape).
                     if code == KeyCode::Escape && pressed && self.kbd_focus.is_none() {
                         el.exit();
+                    }
+                    // Delete/Backspace removes the selected wire (when no app is
+                    // focused, so a focused terminal still gets Backspace).
+                    if pressed
+                        && self.wire_sel.is_some()
+                        && self.kbd_focus.is_none()
+                        && matches!(code, KeyCode::Delete | KeyCode::Backspace)
+                    {
+                        self.del_wire = true;
                     }
                     if pressed {
                         if let Some(bytes) = encode_term_key(code, event.text.as_deref(), self.mods)
