@@ -973,8 +973,8 @@ impl App {
     }
 
     /// Change a HostPort's localhost port by `delta` (clamped to 1..=65535). Any
-    /// server currently bound through it is stopped — re-wire the wasi:http node
-    /// to it to serve on the new port (avoids restarting on every nudge).
+    /// server currently bound through it is live-rebound to the new port (stopped
+    /// and restarted) so the connection keeps working without re-wiring.
     fn change_port(&mut self, id: u64, delta: i32) {
         let Some(&cur) = self.host_ports.get(&id) else {
             return;
@@ -983,6 +983,11 @@ impl App {
         if new == cur {
             return;
         }
+        self.host_ports.insert(id, new);
+        self.next_port = self.next_port.max(new.saturating_add(1));
+        // Live-rebind: restart each server bound through this HostPort on the new
+        // port. The old server releases its (different) old port as it winds down,
+        // so the fresh bind doesn't conflict.
         let bound: Vec<u64> = self
             .serves
             .iter()
@@ -993,9 +998,10 @@ impl App {
             if let Some((_, kill)) = self.serves.remove(&http) {
                 kill.store(true, Ordering::Relaxed);
             }
+            // `serves` no longer holds `http`, so this starts a fresh server,
+            // reading the just-updated port.
+            self.toggle_serve(http, id);
         }
-        self.host_ports.insert(id, new);
-        self.next_port = self.next_port.max(new.saturating_add(1));
     }
 
     /// Wire (or unwire) file node `file_id` into app node `app_id`'s filesystem.
