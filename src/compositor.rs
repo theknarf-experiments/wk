@@ -556,6 +556,8 @@ struct App {
     palette_open: bool,
     palette_query: String,
     palette_sel: usize,
+    /// First visible row (fractional, so trackpad pixel-scroll accumulates).
+    palette_scroll: f32,
     palette_run: Option<PaletteCmd>,
     request_exit: bool,
     pending_layout: HashMap<u64, ([f32; 2], [f32; 2])>,
@@ -626,6 +628,7 @@ impl App {
             palette_open: false,
             palette_query: String::new(),
             palette_sel: 0,
+            palette_scroll: 0.0,
             palette_run: None,
             request_exit: false,
             pending_layout: HashMap::new(),
@@ -1076,7 +1079,7 @@ impl App {
             .available
             .iter()
             .enumerate()
-            .map(|(i, dep)| (format!("Launch {}", dep.name), PaletteCmd::Launch(i)))
+            .map(|(i, dep)| (format!("Add {}", dep.name), PaletteCmd::Launch(i)))
             .collect();
         v.push(("Add Virtual File".into(), PaletteCmd::AddVirtualFile));
         v.push(("Add Host File".into(), PaletteCmd::AddHostFile));
@@ -1097,10 +1100,24 @@ impl App {
             .collect()
     }
 
+    /// Largest valid scroll offset for `len` filtered rows.
+    fn palette_max_scroll(len: usize) -> f32 {
+        len.saturating_sub(PALETTE_MAX) as f32
+    }
+
+    /// Scroll so the selected row is within the visible window.
+    fn palette_scroll_to_sel(&mut self) {
+        let top = self.palette_scroll.round() as usize;
+        if self.palette_sel < top {
+            self.palette_scroll = self.palette_sel as f32;
+        } else if self.palette_sel >= top + PALETTE_MAX {
+            self.palette_scroll = (self.palette_sel + 1 - PALETTE_MAX) as f32;
+        }
+    }
+
     /// Handle a key press while the command palette is open.
     fn palette_key(&mut self, code: KeyCode, text: Option<&str>) {
-        // Navigate/select only within the visible rows.
-        let len = self.palette_filtered().len().min(PALETTE_MAX);
+        let len = self.palette_filtered().len();
         match code {
             KeyCode::Escape => {
                 self.palette_open = false;
@@ -1117,12 +1134,17 @@ impl App {
             KeyCode::ArrowDown => {
                 if len > 0 {
                     self.palette_sel = (self.palette_sel + 1).min(len - 1);
+                    self.palette_scroll_to_sel();
                 }
             }
-            KeyCode::ArrowUp => self.palette_sel = self.palette_sel.saturating_sub(1),
+            KeyCode::ArrowUp => {
+                self.palette_sel = self.palette_sel.saturating_sub(1);
+                self.palette_scroll_to_sel();
+            }
             KeyCode::Backspace => {
                 self.palette_query.pop();
                 self.palette_sel = 0;
+                self.palette_scroll = 0.0;
             }
             _ => {
                 if let Some(t) = text {
@@ -1130,6 +1152,7 @@ impl App {
                         self.palette_query.push(ch);
                     }
                     self.palette_sel = 0;
+                    self.palette_scroll = 0.0;
                 }
             }
         }
@@ -1241,7 +1264,7 @@ impl App {
 
         // ---- interaction ----
         let mut to_close: Vec<u64> = Vec::new();
-        let menu_w = MENU_H + gfx.fonts.measure("Apps") as f32 + PAD;
+        let menu_w = MENU_H + gfx.fonts.measure("Add Node") as f32 + PAD;
         let apps_rect = [0.0, 0.0, menu_w, MENU_H];
         let item_w = self
             .available
@@ -1309,7 +1332,9 @@ impl App {
             // anywhere else to dismiss it.
             if self.palette_open {
                 let (px, py, pw, row_h) = Self::palette_layout(fb);
-                for (i, (_, cmd)) in self.palette_filtered().iter().take(PALETTE_MAX).enumerate() {
+                let filtered = self.palette_filtered();
+                let start = (self.palette_scroll.round() as usize).min(filtered.len());
+                for (i, (_, cmd)) in filtered.iter().skip(start).take(PALETTE_MAX).enumerate() {
                     let y0 = py + (i as f32 + 1.0) * row_h;
                     if contains([px, y0, px + pw, y0 + row_h], mp) {
                         self.palette_run = Some(*cmd);
@@ -1981,7 +2006,7 @@ impl App {
             &gfx.fonts,
             &gfx.device,
             &gfx.queue,
-            "Apps",
+            "Add Node",
             PAD,
             (MENU_H - gfx.fonts.line_height() as f32) * 0.5,
             1.0,
@@ -2106,11 +2131,13 @@ impl App {
                 q_col,
                 full,
             );
-            for (i, (label, _)) in filtered.iter().take(PALETTE_MAX).enumerate() {
+            let start = (self.palette_scroll.round() as usize).min(filtered.len());
+            for (i, (label, _)) in filtered.iter().skip(start).take(PALETTE_MAX).enumerate() {
+                let row = start + i;
                 let y0 = py + (i as f32 + 1.0) * row_h;
                 let r = [px, y0, px + pw, y0 + row_h];
                 let hot = contains(r, mp);
-                if i == self.palette_sel || hot {
+                if row == self.palette_sel || hot {
                     quads.push(Quad::solid(white, r, TITLE_FOCUS, full));
                 }
                 self.text_cache.draw(
@@ -2351,6 +2378,13 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(x, y) => (x, y),
                     MouseScrollDelta::PixelDelta(p) => (p.x as f32 / 50.0, p.y as f32 / 50.0),
                 };
+                // While the palette is open, the wheel scrolls its list instead
+                // of panning the canvas.
+                if self.palette_open {
+                    let max = Self::palette_max_scroll(self.palette_filtered().len());
+                    self.palette_scroll = (self.palette_scroll - dy).clamp(0.0, max);
+                    return;
+                }
                 if self.mods.control_key() || self.mods.super_key() {
                     self.zoom_factor *= ZOOM_STEP.powf(dy);
                     self.zoom_focus = self.mouse;
@@ -2378,6 +2412,7 @@ impl ApplicationHandler for App {
                         self.palette_open = !self.palette_open;
                         self.palette_query.clear();
                         self.palette_sel = 0;
+                        self.palette_scroll = 0.0;
                         return;
                     }
                     // While the palette is open it captures all keystrokes.
