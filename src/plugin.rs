@@ -807,8 +807,8 @@ impl PluginHost {
         // can't reach anyone — until the compositor wires it to a Network node.
         let net = if !is_http && component_imports_sockets(&component, &self.engine) {
             let ip = smoltcp::wire::Ipv4Address::new(10, 0, 0, (2 + (id % 250)) as u8);
-            let stack = self.hub.attach(id, ip);
-            Some(crate::sockets::NetCtx::new(stack, ip))
+            let stack = self.hub.attach(id, ip, name);
+            Some(crate::sockets::NetCtx::new(stack, ip, self.hub.clone()))
         } else {
             None
         };

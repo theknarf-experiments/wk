@@ -115,6 +115,8 @@ pub struct NodeStack {
     /// Virtual network id — nodes sharing it can reach each other.
     pub net: u64,
     pub ip: Ipv4Address,
+    /// The node's name, so peers on the same network can resolve it by name.
+    pub name: String,
     /// Whether this node may reach the real host network (set when wired to a
     /// Gateway node). Off-fabric connections are bridged to host sockets.
     pub host_access: bool,
@@ -154,9 +156,18 @@ impl NetHub {
         hub
     }
 
-    /// Attach a node to virtual network `net` at address `ip`, returning its
-    /// stack (to drive via wasi:sockets).
-    pub fn attach(&self, net: u64, ip: Ipv4Address) -> SharedStack {
+    /// Resolve a node `name` to its address on virtual network `net` (fabric
+    /// DNS) — the first other node with that name on the same network.
+    pub fn resolve(&self, net: u64, name: &str) -> Option<Ipv4Address> {
+        self.stacks.lock().unwrap().iter().find_map(|s| {
+            let g = s.lock().unwrap();
+            (g.net == net && g.name == name).then_some(g.ip)
+        })
+    }
+
+    /// Attach a node named `name` to virtual network `net` at address `ip`,
+    /// returning its stack (to drive via wasi:sockets).
+    pub fn attach(&self, net: u64, ip: Ipv4Address, name: &str) -> SharedStack {
         let mut device = VirtualNic::new();
         let config = Config::new(HardwareAddress::Ip);
         let mut iface = Interface::new(config, &mut device, Instant::now());
@@ -169,6 +180,7 @@ impl NetHub {
             device,
             net,
             ip,
+            name: name.to_string(),
             host_access: false,
             wakers: Vec::new(),
         }));
@@ -277,8 +289,8 @@ mod tests {
     fn same_network_nodes_talk_tcp() {
         let server_ip = Ipv4Address::new(10, 0, 0, 2);
         let hub = NetHub::new();
-        let client = hub.attach(1, Ipv4Address::new(10, 0, 0, 1));
-        let server = hub.attach(1, server_ip);
+        let client = hub.attach(1, Ipv4Address::new(10, 0, 0, 1), "client");
+        let server = hub.attach(1, server_ip, "server");
 
         let server_h = {
             let mut g = server.lock().unwrap();
@@ -332,8 +344,8 @@ mod tests {
     fn different_networks_are_isolated() {
         let server_ip = Ipv4Address::new(10, 0, 0, 2);
         let hub = NetHub::new();
-        let client = hub.attach(1, Ipv4Address::new(10, 0, 0, 1)); // net 1
-        let server = hub.attach(2, server_ip); // net 2 — isolated
+        let client = hub.attach(1, Ipv4Address::new(10, 0, 0, 1), "client"); // net 1
+        let server = hub.attach(2, server_ip, "server"); // net 2 — isolated
 
         let server_h = {
             let mut g = server.lock().unwrap();

@@ -60,14 +60,21 @@ pub struct NetCtx {
     pub stack: SharedStack,
     pub ip: Ipv4Address,
     pub next_port: u16,
+    /// The fabric hub, for resolving peer node names on this node's network.
+    pub hub: std::sync::Arc<crate::netstack::NetHub>,
 }
 
 impl NetCtx {
-    pub fn new(stack: SharedStack, ip: Ipv4Address) -> Self {
+    pub fn new(
+        stack: SharedStack,
+        ip: Ipv4Address,
+        hub: std::sync::Arc<crate::netstack::NetHub>,
+    ) -> Self {
         NetCtx {
             stack,
             ip,
             next_port: 49152,
+            hub,
         }
     }
 }
@@ -969,6 +976,13 @@ impl wasi::sockets::ip_name_lookup::Host for HostState {
         let mut addrs = std::collections::VecDeque::new();
         if let Ok(v4) = name.parse::<std::net::Ipv4Addr>() {
             let o = v4.octets();
+            addrs.push_back(IpAddress::Ipv4((o[0], o[1], o[2], o[3])));
+        } else if let Some(ip) = self.net.as_ref().and_then(|n| {
+            let net = n.stack.lock().unwrap().net;
+            n.hub.resolve(net, &name)
+        }) {
+            // A peer node on this node's virtual network, resolved by name.
+            let o = ip.octets();
             addrs.push_back(IpAddress::Ipv4((o[0], o[1], o[2], o[3])));
         } else if self
             .net
