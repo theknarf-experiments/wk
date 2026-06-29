@@ -5,7 +5,7 @@
 //!
 //! ```kdl
 //! camera { pan 0 0; zoom 1 }
-//! node "file_demo" 1 { pos 19 88; size 360 260 }
+//! node "synth" 1 { pos 19 88; size 360 260; options 0.3 2.0 0.0 1800.0 3.0 0.02 0.35 }
 //! virtualfile "chan" 2 { pos 400 120; size 130 44 }
 //! hostfile "notes.txt" 6 { pos 400 200; size 130 44 }
 //! connection 2 1
@@ -26,6 +26,9 @@ pub struct SessionNode {
     pub id: u64,
     pub pos: [f32; 2],
     pub size: [f32; 2],
+    /// App-node option values (e.g. knob settings), persisted positionally.
+    /// Empty for file/hostport nodes (and app nodes that report none).
+    pub options: Vec<f32>,
 }
 
 pub struct Session {
@@ -63,11 +66,16 @@ fn parse_placed(n: &KdlNode) -> Option<SessionNode> {
     let ch = n.children()?;
     let pos = ch.get("pos")?;
     let size = ch.get("size")?;
+    let options = ch
+        .get("options")
+        .map(|o| o.entries().iter().filter_map(|e| num(e.value())).collect())
+        .unwrap_or_default();
     Some(SessionNode {
         name,
         id,
         pos: [pos.get(0).and_then(num)?, pos.get(1).and_then(num)?],
         size: [size.get(0).and_then(num)?, size.get(1).and_then(num)?],
+        options,
     })
 }
 
@@ -78,6 +86,13 @@ fn placed_kdl(kind: &str, n: &SessionNode) -> KdlNode {
     let mut ch = KdlDocument::new();
     ch.nodes_mut().push(node2("pos", n.pos[0], n.pos[1]));
     ch.nodes_mut().push(node2("size", n.size[0], n.size[1]));
+    if !n.options.is_empty() {
+        let mut opts = KdlNode::new("options");
+        for &v in &n.options {
+            opts.push(KdlEntry::new(v as f64));
+        }
+        ch.nodes_mut().push(opts);
+    }
     node.set_children(ch);
     node
 }
@@ -215,24 +230,28 @@ mod tests {
                 id: 1,
                 pos: [40.0, 56.0],
                 size: [360.0, 260.0],
+                options: vec![8.0, 0.6, 0.0, 1.0],
             }],
             virtual_files: vec![SessionNode {
                 name: "chan".into(),
                 id: 2,
                 pos: [200.0, 120.0],
                 size: [130.0, 44.0],
+                options: Vec::new(),
             }],
             host_files: vec![SessionNode {
                 name: "notes.txt".into(),
                 id: 6,
                 pos: [200.0, 200.0],
                 size: [130.0, 44.0],
+                options: Vec::new(),
             }],
             host_ports: vec![SessionNode {
                 name: "8080".into(),
                 id: 5,
                 pos: [600.0, 100.0],
                 size: [130.0, 44.0],
+                options: Vec::new(),
             }],
             connections: vec![(2, 1)],
             midi: vec![(3, 4)],
@@ -244,6 +263,8 @@ mod tests {
         assert_eq!(back.nodes.len(), 1);
         assert_eq!(back.nodes[0].name, "file_demo");
         assert_eq!(back.nodes[0].id, 1);
+        assert_eq!(back.nodes[0].options, vec![8.0, 0.6, 0.0, 1.0]);
+        assert!(back.virtual_files[0].options.is_empty());
         assert_eq!(back.virtual_files.len(), 1);
         assert_eq!(back.virtual_files[0].name, "chan");
         assert_eq!(back.host_files.len(), 1);

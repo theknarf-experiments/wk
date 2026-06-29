@@ -1,0 +1,22 @@
+package wk:options;
+
+/// Per-node persisted options: a node (e.g. a synth or arpeggiator) reports its
+/// current option values — typically knob settings — via `store`, and reads back
+/// any saved values via `load`. The compositor keeps the latest stored values
+/// for each node and writes them to the workspace session, so relaunching a node
+/// restores its knobs. Values are a flat list the node interprets positionally;
+/// the host treats them as opaque floats.
+interface options {
+    /// This node's saved option values (empty if none were saved). A node calls
+    /// this once at startup and applies the values to its controls.
+    load: func() -> list<f32>;
+
+    /// Replace this node's option values; the host persists them to the session.
+    /// A node calls this whenever its options change.
+    store: func(values: list<f32>);
+}
+
+/// The host side: wk implements (imports) the options interface for plugins.
+world options-host {
+    import options;
+}

@@ -10,6 +10,7 @@ world synth {
     import wasi:frame-buffer/frame-buffer@0.0.1;
     import wk:midi/midi;
     import wk:webaudio/audio;
+    import wk:options/options;
 
     export run: func();
 }

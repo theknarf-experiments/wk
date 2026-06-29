@@ -21,3 +21,4 @@ package = "wk:synth"
 "wasi:io" = { path = "wit/deps/wasi-io" }
 "wk:midi" = { path = "wit/deps/wk-midi" }
 "wk:webaudio" = { path = "wit/deps/wk-webaudio" }
+"wk:options" = { path = "wit/deps/wk-options" }

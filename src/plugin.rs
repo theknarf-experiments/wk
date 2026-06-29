@@ -131,6 +131,9 @@ pub struct Node {
     /// This node's MIDI input queue, so the compositor can wire a MIDI source's
     /// output to it.
     pub midi_in: crate::midi::SharedInbox,
+    /// This node's option values (e.g. knob settings) reported by the guest, so
+    /// the compositor can persist them to the session and seed them on restore.
+    pub options: crate::options::SharedOptions,
     /// If this node is a `wasi:http` server (exports `incoming-handler`), the
     /// component path to serve when it's wired to a HostPort. Such nodes don't
     /// run a `run` loop; they're served on demand.
@@ -242,6 +245,9 @@ pub struct HostState {
     pub(crate) midi_in: crate::midi::SharedInbox,
     /// Shared MIDI router; this node's `output` ports send through it.
     pub(crate) midi_router: crate::midi::Router,
+    /// This node's option values, shared with its `Node` so the compositor can
+    /// read (to save) and seed (to restore) them.
+    pub(crate) options: crate::options::SharedOptions,
     /// This store's RNG, backing the standard `wasi:random` interface (needed by
     /// e.g. a guest's `HashMap`).
     random_ctx: wasmtime_wasi::random::WasiRandomCtx,
@@ -662,6 +668,7 @@ impl PluginHost {
         crate::vfs::add_to_linker(&mut linker)?;
         crate::audio::add_to_linker(&mut linker)?;
         crate::midi::add_to_linker(&mut linker)?;
+        crate::options::add_to_linker(&mut linker)?;
         wasi::surface::surface::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
         wasi::graphics_context::graphics_context::add_to_linker::<_, HasSelf<_>>(
             &mut linker,
@@ -713,6 +720,7 @@ impl PluginHost {
             fs: fs.clone(),
             midi_in: midi_in.clone(),
             midi_router: midi.clone(),
+            options: crate::options::new_options(Vec::new()),
             random_ctx: wasmtime_wasi::random::WasiRandomCtx::default(),
             http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
             gpu: gpu.clone(),
@@ -730,6 +738,7 @@ impl PluginHost {
     /// registering it as a `Node` under the compositor-assigned `id`. Surfaces
     /// it creates appear in `surfaces` (tagged with the node id); its
     /// stdout/stderr are captured for the node's console window.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         &self,
         path: &Path,
@@ -738,6 +747,7 @@ impl PluginHost {
         args: &[String],
         surfaces: SurfaceRegistry,
         nodes: NodeRegistry,
+        initial_options: Vec<f32>,
     ) -> Result<()> {
         let linker = self.build_linker()?;
 
@@ -745,6 +755,9 @@ impl PluginHost {
         let kill = Arc::new(AtomicBool::new(false));
         let fs = crate::vfs::new_fs();
         let midi_in = crate::midi::new_inbox();
+        // Seeded with any saved values; the guest reads them via `load` at start
+        // and overwrites with its current values via `store`.
+        let options = crate::options::new_options(initial_options);
         let term_io = crate::terminal::TermIo::new();
 
         let component = Component::from_file(&self.engine, path)?;
@@ -761,6 +774,7 @@ impl PluginHost {
             term_io: term_io.clone(),
             fs: fs.clone(),
             midi_in: midi_in.clone(),
+            options: options.clone(),
             finished: finished.clone(),
             kill: kill.clone(),
             http_path: is_http.then(|| path.to_path_buf()),
@@ -789,6 +803,7 @@ impl PluginHost {
             fs,
             midi_in,
             midi_router: self.midi.clone(),
+            options,
             random_ctx: wasmtime_wasi::random::WasiRandomCtx::default(),
             http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
             gpu: Arc::clone(&self.gpu),

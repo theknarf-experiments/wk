@@ -246,6 +246,20 @@ impl Synth {
         });
     }
 
+    /// Apply host-saved option values (knob settings) if they match our layout.
+    fn apply_options(&mut self, vals: &[f32]) {
+        if vals.len() == NUM_KNOBS {
+            for (k, &v) in self.knobs.iter_mut().zip(vals) {
+                k.value = v.clamp(k.min, k.max);
+            }
+        }
+    }
+
+    /// The current knob values, in knob order, to persist via the host.
+    fn options(&self) -> Vec<f32> {
+        self.knobs.iter().map(|k| k.value).collect()
+    }
+
     /// Re-apply live-tweakable knob values to every sounding voice.
     fn apply_knobs(&mut self) {
         let wave = osc_type(self.knobs[WAVE].value);
@@ -425,6 +439,8 @@ impl Guest for Component {
         let input = Input::new();
 
         let mut synth = Synth::new();
+        // Restore knob settings saved by the host (no-op on a fresh launch).
+        synth.apply_options(&bindings::wk::options::options::load());
         // Knob drag state (across frames): which knob, and the drag anchor.
         let mut grab: Option<usize> = None;
         let mut start_y = 0.0f32;
@@ -477,6 +493,9 @@ impl Guest for Component {
             while surface.get_pointer_up().is_some() {
                 grab = None;
             }
+
+            // Persist the current knob settings (the host saves them per node).
+            bindings::wk::options::options::store(&synth.options());
 
             // Paint the panel: background, then each knob with its label.
             let buffer = Buffer::from_graphics_buffer(ctx.get_current_buffer());

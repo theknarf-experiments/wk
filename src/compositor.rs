@@ -651,6 +651,7 @@ impl App {
                 &dep.args,
                 self.registry.clone(),
                 self.node_reg.clone(),
+                n.options.clone(),
             ) {
                 Ok(()) => {
                     self.pending_layout.insert(n.id, (n.pos, n.size));
@@ -753,6 +754,7 @@ impl App {
             &dep.args,
             self.registry.clone(),
             self.node_reg.clone(),
+            Vec::new(),
         ) {
             eprintln!("failed to launch {}: {e:#}", dep.name);
         }
@@ -1943,6 +1945,8 @@ impl App {
                     id: node.id,
                     pos: *self.win_pos.get(&node.id)?,
                     size: *self.win_size.get(&node.id)?,
+                    // The guest's latest reported knob/option values.
+                    options: node.options.lock().unwrap().clone(),
                 })
             })
             .collect();
@@ -1957,6 +1961,7 @@ impl App {
                     id,
                     pos: *self.win_pos.get(&id)?,
                     size: *self.win_size.get(&id)?,
+                    options: Vec::new(),
                 }),
                 FileNode::HostMapped(_) => None,
             })
@@ -1970,6 +1975,7 @@ impl App {
                     id,
                     pos: *self.win_pos.get(&id)?,
                     size: *self.win_size.get(&id)?,
+                    options: Vec::new(),
                 }),
                 FileNode::Virtual(_) => None,
             })
@@ -1983,6 +1989,7 @@ impl App {
                     id,
                     pos: *self.win_pos.get(&id)?,
                     size: *self.win_size.get(&id)?,
+                    options: Vec::new(),
                 })
             })
             .collect();

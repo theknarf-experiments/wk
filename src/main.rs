@@ -4,6 +4,7 @@ mod host_shell;
 mod http;
 mod midi;
 mod oci;
+mod options;
 mod plugin;
 mod project;
 mod render2d;
