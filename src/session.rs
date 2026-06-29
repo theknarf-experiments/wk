@@ -12,6 +12,9 @@
 //! midi 3 4
 //! hostport 5 { port 8080; pos 600 100; size 130 44 }
 //! serve 1 5
+//! network 7 { pos 700 100; size 130 44 }
+//! gateway 8 { pos 700 200; size 130 44 }
+//! netlink 1 7
 //! ```
 
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
@@ -39,6 +42,14 @@ pub struct SessionPort {
     pub size: [f32; 2],
 }
 
+/// A Network (or Gateway) node and its canvas placement.
+pub struct SessionNet {
+    pub id: u64,
+    pub gateway: bool,
+    pub pos: [f32; 2],
+    pub size: [f32; 2],
+}
+
 pub struct Session {
     /// Canvas camera: pan x, pan y, zoom.
     pub camera: (f32, f32, f32),
@@ -55,6 +66,10 @@ pub struct Session {
     pub midi: Vec<(u64, u64)>,
     /// Serve wiring as (wasi:http node id, HostPort id).
     pub serves: Vec<(u64, u64)>,
+    /// Network/Gateway nodes.
+    pub nets: Vec<SessionNet>,
+    /// Network membership wiring as (app node id, Network/Gateway node id).
+    pub net_links: Vec<(u64, u64)>,
 }
 
 fn num(v: &KdlValue) -> Option<f32> {
@@ -115,6 +130,30 @@ fn hostport_kdl(p: &SessionPort) -> KdlNode {
     node
 }
 
+/// Parse a `network`/`gateway <id> { pos x y; size w h }` entry.
+fn parse_net(n: &KdlNode, gateway: bool) -> Option<SessionNet> {
+    let id = uint(n.get(0)?)?;
+    let ch = n.children()?;
+    let pos = ch.get("pos")?;
+    let size = ch.get("size")?;
+    Some(SessionNet {
+        id,
+        gateway,
+        pos: [pos.get(0).and_then(num)?, pos.get(1).and_then(num)?],
+        size: [size.get(0).and_then(num)?, size.get(1).and_then(num)?],
+    })
+}
+
+fn net_kdl(n: &SessionNet) -> KdlNode {
+    let mut node = KdlNode::new(if n.gateway { "gateway" } else { "network" });
+    node.push(KdlEntry::new(n.id as i128));
+    let mut ch = KdlDocument::new();
+    ch.nodes_mut().push(node2("pos", n.pos[0], n.pos[1]));
+    ch.nodes_mut().push(node2("size", n.size[0], n.size[1]));
+    node.set_children(ch);
+    node
+}
+
 fn placed_kdl(kind: &str, n: &SessionNode) -> KdlNode {
     let mut node = KdlNode::new(kind);
     node.push(KdlEntry::new(n.name.clone()));
@@ -171,6 +210,8 @@ impl Session {
         let mut connections = Vec::new();
         let mut midi = Vec::new();
         let mut serves = Vec::new();
+        let mut nets = Vec::new();
+        let mut net_links = Vec::new();
         for n in doc.nodes() {
             match n.name().value() {
                 "node" => nodes.extend(parse_placed(n)),
@@ -180,6 +221,9 @@ impl Session {
                 "connection" => connections.extend(pair(n)),
                 "midi" => midi.extend(pair(n)),
                 "serve" => serves.extend(pair(n)),
+                "network" => nets.extend(parse_net(n, false)),
+                "gateway" => nets.extend(parse_net(n, true)),
+                "netlink" => net_links.extend(pair(n)),
                 _ => {}
             }
         }
@@ -193,6 +237,8 @@ impl Session {
             connections,
             midi,
             serves,
+            nets,
+            net_links,
         })
     }
 
@@ -230,6 +276,12 @@ impl Session {
         }
         for &(http, hostport) in &self.serves {
             doc.nodes_mut().push(pair_kdl("serve", http, hostport));
+        }
+        for n in &self.nets {
+            doc.nodes_mut().push(net_kdl(n));
+        }
+        for &(app, net) in &self.net_links {
+            doc.nodes_mut().push(pair_kdl("netlink", app, net));
         }
 
         doc.autoformat();
@@ -291,6 +343,21 @@ mod tests {
             connections: vec![(2, 1)],
             midi: vec![(3, 4)],
             serves: vec![(1, 5)],
+            nets: vec![
+                SessionNet {
+                    id: 7,
+                    gateway: false,
+                    pos: [700.0, 100.0],
+                    size: [130.0, 44.0],
+                },
+                SessionNet {
+                    id: 8,
+                    gateway: true,
+                    pos: [700.0, 200.0],
+                    size: [130.0, 44.0],
+                },
+            ],
+            net_links: vec![(1, 7)],
         };
 
         let back = Session::from_kdl(&s.to_kdl()).expect("parses");
@@ -311,5 +378,11 @@ mod tests {
         assert_eq!(back.connections, vec![(2, 1)]);
         assert_eq!(back.midi, vec![(3, 4)]);
         assert_eq!(back.serves, vec![(1, 5)]);
+        assert_eq!(back.nets.len(), 2);
+        assert_eq!(back.nets[0].id, 7);
+        assert!(!back.nets[0].gateway);
+        assert_eq!(back.nets[1].id, 8);
+        assert!(back.nets[1].gateway);
+        assert_eq!(back.net_links, vec![(1, 7)]);
     }
 }

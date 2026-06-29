@@ -812,6 +812,24 @@ impl App {
             }
         }
 
+        // Network/Gateway nodes: recreate at their saved spots.
+        for net in &saved.nets {
+            max_id = max_id.max(net.id);
+            self.win_pos.insert(net.id, net.pos);
+            self.win_size.insert(net.id, net.size);
+            self.z.push(net.id);
+            self.net_nodes.insert(net.id);
+            if net.gateway {
+                self.gateways.insert(net.id);
+            }
+        }
+        // Re-wire network membership (rejoins the network + grants host access).
+        for &(app_id, net_id) in &saved.net_links {
+            if self.app_node(app_id).is_some() && self.net_nodes.contains(&net_id) {
+                self.toggle_net(app_id, net_id);
+            }
+        }
+
         self.next_node_id = max_id + 1;
     }
 
@@ -2599,6 +2617,18 @@ impl App {
             .iter()
             .map(|(&http, &(hostport, _))| (http, hostport))
             .collect();
+        let nets = self
+            .net_nodes
+            .iter()
+            .filter_map(|&id| {
+                Some(crate::session::SessionNet {
+                    id,
+                    gateway: self.gateways.contains(&id),
+                    pos: *self.win_pos.get(&id)?,
+                    size: *self.win_size.get(&id)?,
+                })
+            })
+            .collect();
         let saved = crate::session::Session {
             camera: (self.cam.pan[0], self.cam.pan[1], self.cam.zoom),
             nodes,
@@ -2608,6 +2638,8 @@ impl App {
             connections: self.connections.clone(),
             midi: self.midi_links.clone(),
             serves,
+            nets,
+            net_links: self.net_links.clone(),
         };
         if let Err(e) = saved.save() {
             eprintln!("failed to save session: {e}");
