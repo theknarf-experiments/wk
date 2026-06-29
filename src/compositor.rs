@@ -537,6 +537,9 @@ struct App {
 
     cam: Camera,
     pan_target: [f32; 2],
+    /// Last known viewport size in screen px (updated each frame), so newly
+    /// added nodes can be placed at the centre of the current view.
+    viewport: [f32; 2],
     win_pos: HashMap<u64, [f32; 2]>,
     win_size: HashMap<u64, [f32; 2]>,
     z: Vec<u64>,
@@ -616,6 +619,7 @@ impl App {
                 zoom: 1.0,
             },
             pan_target: [0.0, 0.0],
+            viewport: [1280.0, 800.0],
             win_pos: HashMap::new(),
             win_size: HashMap::new(),
             z: Vec::new(),
@@ -855,10 +859,19 @@ impl App {
             .insert(id, FileNode::HostMapped(HostMappedFile { name, path }));
     }
 
-    /// A cascading canvas position for a newly added file node.
+    /// A canvas position that centres a node of `size` in the current view, with
+    /// a small cascade (by `n`) so successively added nodes don't fully overlap.
+    fn view_center(&self, size: [f32; 2], n: usize) -> [f32; 2] {
+        let c = self
+            .cam
+            .to_canvas([self.viewport[0] * 0.5, self.viewport[1] * 0.5]);
+        let step = (n % 8) as f32 * 24.0;
+        [c[0] - size[0] * 0.5 + step, c[1] - size[1] * 0.5 + step]
+    }
+
+    /// A centred, cascading canvas position for a newly added file node.
     fn next_file_pos(&self) -> [f32; 2] {
-        let step = (self.file_nodes.len() % 8) as f32 * 24.0;
-        self.cam.to_canvas([240.0 + step, 120.0 + step])
+        self.view_center([FILE_W, FILE_H], self.file_nodes.len())
     }
 
     /// The live app node with id `id`, if it is an app (not a file) node.
@@ -876,8 +889,7 @@ impl App {
         let id = self.alloc_id();
         let port = self.next_port;
         self.next_port = self.next_port.wrapping_add(1).max(8080);
-        let step = (self.host_ports.len() % 8) as f32 * 24.0;
-        let pos = self.cam.to_canvas([320.0 + step, 160.0 + step]);
+        let pos = self.view_center([FILE_W, FILE_H], self.host_ports.len());
         self.win_pos.insert(id, pos);
         self.win_size.insert(id, [FILE_W, FILE_H]);
         self.z.push(id);
@@ -1217,16 +1229,27 @@ impl App {
             gfx.surface_desc.width as f32,
             gfx.surface_desc.height as f32,
         ];
+        // Remember the viewport so newly added nodes land in the current view.
+        self.viewport = fb;
 
         // ---- sync windows with the node registry ----
         let nodes: Vec<SharedNode> = self.node_reg.lock().unwrap().clone();
         let node_by_id: HashMap<u64, SharedNode> =
             nodes.iter().map(|i| (i.id, i.clone())).collect();
+        // A freshly launched app node (no saved layout) appears centred in view.
+        let app_center = self.cam.to_canvas([fb[0] * 0.5, fb[1] * 0.5]);
         for node in &nodes {
             if let std::collections::hash_map::Entry::Vacant(slot) = self.win_pos.entry(node.id) {
                 let (pos, size) = self.pending_layout.remove(&node.id).unwrap_or_else(|| {
                     let step = (self.z.len() % 8) as f32 * 28.0;
-                    ([40.0 + step, 56.0 + step], [360.0, 260.0])
+                    let size = [360.0, 260.0];
+                    (
+                        [
+                            app_center[0] - size[0] * 0.5 + step,
+                            app_center[1] - size[1] * 0.5 + step,
+                        ],
+                        size,
+                    )
                 });
                 slot.insert(pos);
                 self.win_size.insert(node.id, size);
