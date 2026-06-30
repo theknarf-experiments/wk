@@ -288,6 +288,13 @@ fn run_btn(r: [f32; 4], z: f32) -> [f32; 4] {
     let gap = 4.0 * z;
     [cb[0] - w - gap, cb[1], cb[0] - gap, cb[3]]
 }
+/// The editable launch-args bar along the bottom of an idle node's body (a
+/// one-line input strip, so it doesn't paint over the node's output above).
+fn args_bar(r: [f32; 4], z: f32) -> [f32; 4] {
+    let ca = content_rect(r, z);
+    let h = (TITLE_H * z).min((ca[3] - ca[1]).max(0.0));
+    [ca[0], ca[3] - h, ca[2], ca[3]]
+}
 fn resize_grip(r: [f32; 4], z: f32) -> [f32; 4] {
     let g = 16.0 * z;
     [r[2] - g, r[3] - g, r[2], r[3]]
@@ -1744,8 +1751,8 @@ impl App {
                                 mode: DragMode::Move,
                                 grab: [mc[0] - p[0], mc[1] - p[1]],
                             });
-                        } else if idle && contains(content_rect(r, zf), mp) {
-                            // Click an idle node's body to edit its launch args.
+                        } else if idle && contains(args_bar(r, zf), mp) {
+                            // Click the args bar of an idle node to edit them.
                             let cur = self
                                 .node_args
                                 .get(&id)
@@ -2348,13 +2355,22 @@ impl App {
                 }
             }
 
-            // Idle node: show its (editable) launch args in the body.
+            // Idle node: a one-line, editable launch-args bar along the bottom
+            // (so it doesn't cover the node's output/scrollback above).
             if node_idle {
                 let editing = matches!(&self.editing_args, Some((eid, _)) if *eid == id);
+                let bar = args_bar(r, zf);
+                let bar_clip = intersect(bar, full);
+                quads.push(Quad::solid(
+                    white,
+                    bar,
+                    if editing { TITLE_FOCUS } else { TITLE },
+                    bar_clip,
+                ));
                 let line = match &self.editing_args {
                     Some((eid, s)) if *eid == id => format!("args: {s}_"),
                     _ => format!(
-                        "args: {}",
+                        "args: {}  (click to edit, > to run)",
                         self.node_args
                             .get(&id)
                             .cloned()
@@ -2363,6 +2379,7 @@ impl App {
                     ),
                 };
                 let lh = gfx.fonts.line_height() as f32 * zf;
+                let ty = bar[1] + ((bar[3] - bar[1]) - lh) * 0.5;
                 self.text_cache.draw(
                     &mut quads,
                     &mut gfx.renderer,
@@ -2370,29 +2387,11 @@ impl App {
                     &gfx.device,
                     &gfx.queue,
                     &line,
-                    ca[0] + PAD * zf,
-                    ca[1] + PAD * zf,
+                    bar[0] + PAD * zf,
+                    ty,
                     zf,
                     TEXT,
-                    ca_clip,
-                );
-                let hint = if editing {
-                    "Enter to run, Esc to cancel"
-                } else {
-                    "click to edit args, > to run"
-                };
-                self.text_cache.draw(
-                    &mut quads,
-                    &mut gfx.renderer,
-                    &gfx.fonts,
-                    &gfx.device,
-                    &gfx.queue,
-                    hint,
-                    ca[0] + PAD * zf,
-                    ca[1] + PAD * zf + lh * 1.4,
-                    zf * 0.8,
-                    PORT_COL,
-                    ca_clip,
+                    bar_clip,
                 );
             }
 
