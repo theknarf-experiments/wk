@@ -83,3 +83,6 @@ plugins/netserve/netserve.wasm
 
 # udpecho (UDP echo example) build artifact
 plugins/udpecho/udpecho.wasm
+
+# echo6 (IPv6 echo example) build artifact
+plugins/echo6/echo6.wasm

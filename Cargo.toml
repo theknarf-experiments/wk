@@ -23,7 +23,7 @@ wgpu-types = "29"
 web-audio-api = "1.6.0"
 alacritty_terminal = "0.26.0"
 oci-client = { version = "0.17.0", default-features = false, features = ["rustls-tls"] }
-wasmtime-wasi-http = "46"
+wasmtime-wasi-http = { version = "46", features = ["p3"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"

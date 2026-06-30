@@ -21,5 +21,8 @@ dependencies {
     udpecho "plugins/udpecho/udpecho.wasm" {
         args "server" "4242"
     }
+    echo6 "plugins/echo6/echo6.wasm" {
+        args "server" "80"
+    }
     http_hello "oci://ghcr.io/bytecodealliance/sample-wasi-http-rust/sample-wasi-http-rust:latest"
 }

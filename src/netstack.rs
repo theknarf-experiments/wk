@@ -9,16 +9,20 @@
 //! nothing. Because we move *packets*, traffic can later be rerouted through
 //! middlebox nodes (a VPN/proxy) transparently to the wasm client.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 use std::time::Duration;
 
-use smoltcp::iface::{Config, Interface, SocketSet};
+use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
+use smoltcp::socket::tcp::{Socket as TcpSocket, State as TcpState};
+use smoltcp::socket::udp::Socket as UdpSocket;
 use smoltcp::time::Instant;
-use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv4Packet};
+use smoltcp::wire::{
+    HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Packet, Ipv6Address, Ipv6Packet,
+};
 
 /// One raw IP packet on the fabric (Medium::Ip — no Ethernet header).
 pub type Frame = Vec<u8>;
@@ -115,20 +119,80 @@ pub struct NodeStack {
     /// Virtual network id — nodes sharing it can reach each other.
     pub net: u64,
     pub ip: Ipv4Address,
+    /// The node's fabric IPv6 address (ULA `fd00::/64`), assigned alongside its
+    /// IPv4 so guests can use AF_INET6 sockets on the same fabric.
+    pub ip6: Ipv6Address,
     /// The node's name, so peers on the same network can resolve it by name.
     pub name: String,
     /// Whether this node may reach the real host network (set when wired to a
     /// Gateway node). Off-fabric connections are bridged to host sockets.
     pub host_access: bool,
+    /// Handles of sockets still owned by a live wasi resource. When the owner
+    /// drops, the handle leaves this set (so derived streams/pollables that
+    /// outlive it see it as closed instead of touching a freed handle) and moves
+    /// to `closing` to be reaped once it has drained.
+    live: HashSet<SocketHandle>,
+    /// Sockets whose owner has dropped, awaiting a graceful flush before removal
+    /// (TX data + FIN sent). Each carries a tick budget so a stuck socket is
+    /// still eventually reaped.
+    closing: Vec<(SocketHandle, SockKind, u32)>,
     /// Wakers parked on this stack's pollables; woken each hub tick so guest
     /// socket pollables re-check readiness.
     wakers: Vec<Waker>,
 }
 
+/// Which smoltcp socket flavour a handle is, so the hub knows how to tell when
+/// it has finished draining before reaping it.
+#[derive(Clone, Copy)]
+pub enum SockKind {
+    Tcp,
+    Udp,
+}
+
+/// Ticks (~1ms each) to let a closing socket flush before forcing removal.
+const CLOSE_TICKS: u32 = 5000;
+
 impl NodeStack {
     /// Park a waker to be woken on the next hub tick (state may have changed).
     pub fn park(&mut self, w: Waker) {
         self.wakers.push(w);
+    }
+
+    /// Record a freshly added socket handle as live (owned by a wasi resource).
+    pub fn track(&mut self, h: SocketHandle) {
+        self.live.insert(h);
+    }
+
+    /// Is `h` still a live socket (owned, not yet closing/reaped)?
+    pub fn is_live(&self, h: SocketHandle) -> bool {
+        self.live.contains(&h)
+    }
+
+    /// The owning resource dropped: stop treating the handle as live and queue it
+    /// for reaping once it has drained (the caller closes a TCP socket first).
+    pub fn begin_close(&mut self, h: SocketHandle, kind: SockKind) {
+        if self.live.remove(&h) {
+            self.closing.push((h, kind, CLOSE_TICKS));
+        }
+    }
+
+    /// Reap closing sockets that have finished draining (TCP fully `Closed`, UDP
+    /// send queue empty) or run out their tick budget. Called by the hub.
+    fn reap_closing(&mut self) {
+        let sockets = &mut self.sockets;
+        self.closing.retain_mut(|(h, kind, ticks)| {
+            *ticks = ticks.saturating_sub(1);
+            let drained = match kind {
+                SockKind::Tcp => sockets.get::<TcpSocket>(*h).state() == TcpState::Closed,
+                SockKind::Udp => sockets.get::<UdpSocket>(*h).send_queue() == 0,
+            };
+            if drained || *ticks == 0 {
+                sockets.remove(*h);
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 
@@ -156,8 +220,8 @@ impl NetHub {
         hub
     }
 
-    /// Resolve a node `name` to its address on virtual network `net` (fabric
-    /// DNS) — the first other node with that name on the same network.
+    /// Resolve a node `name` to its IPv4 address on virtual network `net`
+    /// (fabric DNS) — the first other node with that name on the same network.
     pub fn resolve(&self, net: u64, name: &str) -> Option<Ipv4Address> {
         self.stacks.lock().unwrap().iter().find_map(|s| {
             let g = s.lock().unwrap();
@@ -165,14 +229,30 @@ impl NetHub {
         })
     }
 
+    /// Like [`resolve`](Self::resolve) but returns the node's fabric IPv6 address.
+    pub fn resolve6(&self, net: u64, name: &str) -> Option<Ipv6Address> {
+        self.stacks.lock().unwrap().iter().find_map(|s| {
+            let g = s.lock().unwrap();
+            (g.net == net && g.name == name).then_some(g.ip6)
+        })
+    }
+
+    /// The fabric IPv6 address for a node, derived from its IPv4 host octet so
+    /// the two stay in lock-step (`10.0.0.x` ↔ `fd00::x`).
+    fn ula(ip: Ipv4Address) -> Ipv6Address {
+        Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, ip.octets()[3] as u16)
+    }
+
     /// Attach a node named `name` to virtual network `net` at address `ip`,
     /// returning its stack (to drive via wasi:sockets).
     pub fn attach(&self, net: u64, ip: Ipv4Address, name: &str) -> SharedStack {
+        let ip6 = Self::ula(ip);
         let mut device = VirtualNic::new();
         let config = Config::new(HardwareAddress::Ip);
         let mut iface = Interface::new(config, &mut device, Instant::now());
         iface.update_ip_addrs(|addrs| {
             let _ = addrs.push(IpCidr::new(ip.into(), 24));
+            let _ = addrs.push(IpCidr::new(ip6.into(), 64));
         });
         let stack = Arc::new(Mutex::new(NodeStack {
             iface,
@@ -180,8 +260,11 @@ impl NetHub {
             device,
             net,
             ip,
+            ip6,
             name: name.to_string(),
             host_access: false,
+            live: HashSet::new(),
+            closing: Vec::new(),
             wakers: Vec::new(),
         }));
         self.stacks.lock().unwrap().push(stack.clone());
@@ -207,8 +290,8 @@ impl NetHub {
         // Phase 1: poll each stack and collect what it transmitted, tagged with
         // the sender's network so we only route within a network.
         let mut outbound: Vec<(u64, Frame)> = Vec::new();
-        // Snapshot (net, ip, stack) for delivery lookup.
-        let mut routes: Vec<(u64, Ipv4Address, SharedStack)> = Vec::new();
+        // Snapshot (net, v4, v6, stack) for delivery lookup.
+        let mut routes: Vec<(u64, Ipv4Address, Ipv6Address, SharedStack)> = Vec::new();
         for s in &stacks {
             let mut g = s.lock().unwrap();
             let NodeStack {
@@ -217,31 +300,43 @@ impl NetHub {
                 device,
                 net,
                 ip,
+                ip6,
                 ..
             } = &mut *g;
             iface.poll(now, device, sockets);
             let net = *net;
             let ip = *ip;
+            let ip6 = *ip6;
             for frame in device.drain_tx() {
                 outbound.push((net, frame));
             }
-            routes.push((net, ip, s.clone()));
+            routes.push((net, ip, ip6, s.clone()));
         }
 
         // Phase 2: deliver each frame to the same-network node owning the dest IP.
+        // The IP version is in the first nibble (4 or 6); parse the dst either way.
         for (net, frame) in outbound {
-            let Ok(pkt) = Ipv4Packet::new_checked(&frame[..]) else {
-                continue;
+            let dst: IpAddress = match frame.first().map(|b| b >> 4) {
+                Some(4) => match Ipv4Packet::new_checked(&frame[..]) {
+                    Ok(p) => p.dst_addr().into(),
+                    Err(_) => continue,
+                },
+                Some(6) => match Ipv6Packet::new_checked(&frame[..]) {
+                    Ok(p) => p.dst_addr().into(),
+                    Err(_) => continue,
+                },
+                _ => continue,
             };
-            let dst = pkt.dst_addr();
-            if let Some((_, _, stack)) = routes.iter().find(|(n, ip, _)| *n == net && *ip == dst) {
+            if let Some((_, _, _, stack)) = routes.iter().find(|(n, v4, v6, _)| {
+                *n == net && (dst == IpAddress::Ipv4(*v4) || dst == IpAddress::Ipv6(*v6))
+            }) {
                 stack.lock().unwrap().device.deliver(frame);
             }
             // Off-network / unknown dest: dropped (the isolation boundary).
         }
 
-        // Phase 3: poll again so delivered frames are processed now, and wake
-        // pollables so guest socket operations re-check.
+        // Phase 3: poll again so delivered frames are processed now, reap any
+        // drained closing sockets, and wake pollables so guests re-check.
         for s in &stacks {
             let mut g = s.lock().unwrap();
             let NodeStack {
@@ -251,6 +346,7 @@ impl NetHub {
                 ..
             } = &mut *g;
             iface.poll(now, device, sockets);
+            g.reap_closing();
             for w in g.wakers.drain(..) {
                 w.wake();
             }
@@ -286,6 +382,62 @@ mod tests {
     fn udp_socket() -> udp::Socket<'static> {
         let buf = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 4096]);
         udp::Socket::new(buf(), buf())
+    }
+
+    /// Two nodes on the same network exchange a TCP stream over **IPv6** — the
+    /// hub routes the fabric ULA (`fd00::/64`) addresses just like IPv4.
+    #[test]
+    fn same_network_nodes_talk_tcp_ipv6() {
+        let hub = NetHub::new();
+        let client = hub.attach(1, Ipv4Address::new(10, 0, 0, 1), "client");
+        let server = hub.attach(1, Ipv4Address::new(10, 0, 0, 2), "server");
+        let server_ip6 = server.lock().unwrap().ip6;
+
+        let server_h = {
+            let mut g = server.lock().unwrap();
+            let h = g.sockets.add(tcp_socket());
+            g.sockets.get_mut::<tcp::Socket>(h).listen(80).unwrap();
+            h
+        };
+        let client_h = {
+            let mut g = client.lock().unwrap();
+            let h = g.sockets.add(tcp_socket());
+            let NodeStack { iface, sockets, .. } = &mut *g;
+            sockets
+                .get_mut::<tcp::Socket>(h)
+                .connect(iface.context(), (server_ip6, 80), 49152)
+                .unwrap();
+            h
+        };
+
+        let mut sent = false;
+        let mut got: Vec<u8> = Vec::new();
+        for _ in 0..500 {
+            hub.step();
+
+            {
+                let mut g = client.lock().unwrap();
+                let cs = g.sockets.get_mut::<tcp::Socket>(client_h);
+                if cs.can_send() && !sent {
+                    cs.send_slice(b"hello v6 net").unwrap();
+                    sent = true;
+                }
+            }
+            {
+                let mut g = server.lock().unwrap();
+                let ss = g.sockets.get_mut::<tcp::Socket>(server_h);
+                if ss.can_recv() {
+                    let mut buf = [0u8; 64];
+                    let n = ss.recv_slice(&mut buf).unwrap();
+                    got.extend_from_slice(&buf[..n]);
+                }
+            }
+            if got.len() >= 12 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(&got, b"hello v6 net");
     }
 
     /// Two nodes on the same virtual network exchange a UDP datagram via the hub

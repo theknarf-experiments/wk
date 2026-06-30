@@ -293,6 +293,16 @@ impl wasmtime_wasi_http::p2::WasiHttpView for HostState {
     }
 }
 
+impl wasmtime_wasi_http::p3::WasiHttpView for HostState {
+    fn http(&mut self) -> wasmtime_wasi_http::p3::WasiHttpCtxView<'_> {
+        wasmtime_wasi_http::p3::WasiHttpCtxView {
+            ctx: &mut self.http_ctx,
+            table: &mut self.table,
+            hooks: Default::default(),
+        }
+    }
+}
+
 impl WasiView for HostState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
@@ -716,6 +726,8 @@ impl PluginHost {
         // Only the wasi:http interfaces (outgoing-handler + types); the rest of
         // the wasi world is already linked above.
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
+        // WASI 0.3 http (`@0.3.0` client + types), alongside the 0.2 http above.
+        wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
         crate::vfs::add_to_linker(&mut linker)?;
         crate::audio::add_to_linker(&mut linker)?;
         crate::midi::add_to_linker(&mut linker)?;
@@ -876,10 +888,10 @@ impl PluginHost {
 
         // Rebuild the fabric socket context from the node's existing stack so
         // re-runs keep the same address and network membership.
-        let net = node.net_stack.as_ref().map(|stack| {
-            let ip = stack.lock().unwrap().ip;
-            crate::sockets::NetCtx::new(stack.clone(), ip, self.hub.clone())
-        });
+        let net = node
+            .net_stack
+            .as_ref()
+            .map(|stack| crate::sockets::NetCtx::new(stack.clone(), self.hub.clone()));
 
         // argv[0] is the program name, then the configured args (e.g. a filename).
         let mut argv = vec![node.name.clone()];

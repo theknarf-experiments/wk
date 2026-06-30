@@ -5,10 +5,12 @@
 //! same virtual network. A node with no network attached can't reach anything.
 //!
 //! TCP (connect/bind/listen/accept + streams) and UDP (bind/stream/send/receive
-//! datagrams) are both implemented over the node's smoltcp stack. A node wired to
-//! a Gateway node gets host access: off-fabric connections are bridged to real
-//! host sockets and names resolve via the host resolver; otherwise only fabric
-//! peers and numeric addresses are reachable.
+//! datagrams) are both implemented over the node's smoltcp stack, dual-stack
+//! (IPv4 `10.0.0.0/24` + IPv6 ULA `fd00::/64`). A node wired to a Gateway node
+//! gets host access: off-fabric connections are bridged to real host sockets and
+//! names resolve via the host resolver; otherwise only fabric peers and numeric
+//! addresses are reachable. Sockets are reaped (removed from the node's set) once
+//! their wasi resource drops and the connection drains, via the hub.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -49,7 +51,7 @@ wasmtime::component::bindgen!({
 });
 
 use wasi::sockets::network::{
-    ErrorCode, IpAddress, IpAddressFamily, IpSocketAddress, Ipv4SocketAddress,
+    ErrorCode, IpAddress, IpAddressFamily, IpSocketAddress, Ipv4SocketAddress, Ipv6SocketAddress,
 };
 use wasi::sockets::tcp::ShutdownType;
 
@@ -62,21 +64,15 @@ const UDP_SLOTS: usize = 64;
 /// address, and the next ephemeral local port to hand out.
 pub struct NetCtx {
     pub stack: SharedStack,
-    pub ip: Ipv4Address,
     pub next_port: u16,
     /// The fabric hub, for resolving peer node names on this node's network.
     pub hub: std::sync::Arc<crate::netstack::NetHub>,
 }
 
 impl NetCtx {
-    pub fn new(
-        stack: SharedStack,
-        ip: Ipv4Address,
-        hub: std::sync::Arc<crate::netstack::NetHub>,
-    ) -> Self {
+    pub fn new(stack: SharedStack, hub: std::sync::Arc<crate::netstack::NetHub>) -> Self {
         NetCtx {
             stack,
-            ip,
             next_port: 49152,
             hub,
         }
@@ -96,8 +92,8 @@ pub struct TcpSock {
     family: IpAddressFamily,
     /// Port set by `start-bind`, used by `start-listen`.
     bound_port: u16,
-    local: Option<Ipv4SocketAddress>,
-    remote: Option<Ipv4SocketAddress>,
+    local: Option<IpSocketAddress>,
+    remote: Option<IpSocketAddress>,
     listening: bool,
     /// Set when the socket connects off-fabric through a host gateway; its bytes
     /// flow over a real host socket instead of smoltcp.
@@ -130,7 +126,7 @@ struct HostConn {
 }
 
 impl HostConn {
-    fn connect(ip: Ipv4Address, port: u16) -> HostConn {
+    fn connect(ip: smoltcp::wire::IpAddress, port: u16) -> HostConn {
         use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
         let incoming: SharedPipe = Default::default();
@@ -143,7 +139,10 @@ impl HostConn {
             connected.clone(),
             failed.clone(),
         );
-        let addr = std::net::SocketAddr::from((ip.octets(), port));
+        let addr = match ip {
+            smoltcp::wire::IpAddress::Ipv4(v4) => std::net::SocketAddr::from((v4.octets(), port)),
+            smoltcp::wire::IpAddress::Ipv6(v6) => std::net::SocketAddr::from((v6.octets(), port)),
+        };
         std::thread::spawn(move || {
             match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(10)) {
                 Ok(stream) => {
@@ -214,9 +213,9 @@ pub struct UdpSock {
     family: IpAddressFamily,
     /// Port set by `start-bind` / chosen at `finish-bind`.
     bound_port: u16,
-    local: Option<Ipv4SocketAddress>,
+    local: Option<IpSocketAddress>,
     /// Default peer set by the most recent `stream` call (POSIX "connected").
-    remote: Option<Ipv4SocketAddress>,
+    remote: Option<IpSocketAddress>,
     bound: bool,
 }
 
@@ -226,7 +225,7 @@ pub struct UdpSock {
 pub struct Datagrams {
     stack: SharedStack,
     handle: SocketHandle,
-    remote: Option<Ipv4SocketAddress>,
+    remote: Option<IpSocketAddress>,
 }
 
 /// A name-resolution result stream (numeric literals only for now).
@@ -243,6 +242,46 @@ fn ipv4(addr: Ipv4Address) -> (u8, u8, u8, u8) {
 
 fn to_ipv4(a: (u8, u8, u8, u8)) -> Ipv4Address {
     Ipv4Address::new(a.0, a.1, a.2, a.3)
+}
+
+/// A wasi socket address (v4 or v6) -> a smoltcp address + port.
+fn to_smol(a: IpSocketAddress) -> (smoltcp::wire::IpAddress, u16) {
+    match a {
+        IpSocketAddress::Ipv4(s) => (to_ipv4(s.address).into(), s.port),
+        IpSocketAddress::Ipv6(s) => {
+            let g = s.address;
+            let v6 = std::net::Ipv6Addr::new(g.0, g.1, g.2, g.3, g.4, g.5, g.6, g.7);
+            (v6.into(), s.port)
+        }
+    }
+}
+
+/// A smoltcp address + port -> a wasi socket address.
+fn from_smol(ip: smoltcp::wire::IpAddress, port: u16) -> IpSocketAddress {
+    match ip {
+        smoltcp::wire::IpAddress::Ipv4(v4) => IpSocketAddress::Ipv4(Ipv4SocketAddress {
+            port,
+            address: ipv4(v4),
+        }),
+        smoltcp::wire::IpAddress::Ipv6(v6) => {
+            let s = v6.segments();
+            IpSocketAddress::Ipv6(Ipv6SocketAddress {
+                port,
+                flow_info: 0,
+                address: (s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]),
+                scope_id: 0,
+            })
+        }
+    }
+}
+
+/// This node's own fabric address in the family of `remote` (v4 or v6).
+fn local_ip_for(stack: &SharedStack, remote: smoltcp::wire::IpAddress) -> smoltcp::wire::IpAddress {
+    let g = stack.lock().unwrap();
+    match remote {
+        smoltcp::wire::IpAddress::Ipv4(_) => g.ip.into(),
+        smoltcp::wire::IpAddress::Ipv6(_) => g.ip6.into(),
+    }
 }
 
 impl HostState {
@@ -309,10 +348,15 @@ impl Future for WantReady {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
         let mut g = self.stack.lock().unwrap();
+        let handle = match self.want {
+            Want::Event(h) | Want::Read(h) | Want::Write(h) => h,
+        };
+        // The socket was reaped (its owner dropped): resolve so the awaiter
+        // unblocks and the following operation sees the closed socket.
+        if !g.is_live(handle) {
+            return Poll::Ready(());
+        }
         let ready = {
-            let handle = match self.want {
-                Want::Event(h) | Want::Read(h) | Want::Write(h) => h,
-            };
             let s = g.sockets.get::<tcp::Socket>(handle);
             match self.want {
                 Want::Event(_) => !matches!(
@@ -342,6 +386,9 @@ impl Future for UdpReady {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
         let mut g = self.stack.lock().unwrap();
+        if !g.is_live(self.handle) {
+            return Poll::Ready(());
+        }
         let s = g.sockets.get::<udp::Socket>(self.handle);
         let ready = if self.send {
             s.can_send()
@@ -402,6 +449,9 @@ impl Pollable for TcpInput {
 impl InputStream for TcpInput {
     fn read(&mut self, size: usize) -> StreamResult<Bytes> {
         let mut g = self.stack.lock().unwrap();
+        if !g.is_live(self.handle) {
+            return Err(StreamError::Closed);
+        }
         let s = g.sockets.get_mut::<tcp::Socket>(self.handle);
         if s.can_recv() {
             let mut buf = vec![0u8; size.min(TCP_BUF)];
@@ -435,6 +485,9 @@ impl Pollable for TcpOutput {
 impl OutputStream for TcpOutput {
     fn check_write(&mut self) -> StreamResult<usize> {
         let mut g = self.stack.lock().unwrap();
+        if !g.is_live(self.handle) {
+            return Err(StreamError::Closed);
+        }
         let s = g.sockets.get_mut::<tcp::Socket>(self.handle);
         if !s.may_send() {
             return Err(StreamError::Closed);
@@ -446,6 +499,9 @@ impl OutputStream for TcpOutput {
             return Ok(());
         }
         let mut g = self.stack.lock().unwrap();
+        if !g.is_live(self.handle) {
+            return Err(StreamError::Closed);
+        }
         let s = g.sockets.get_mut::<tcp::Socket>(self.handle);
         s.send_slice(&bytes).map_err(|_| StreamError::Closed)?;
         Ok(())
@@ -559,10 +615,16 @@ impl Pollable for HostEventPollable {
     }
 }
 
-/// Is `ip` on the virtual fabric subnet (10.0.0.0/24) rather than the host net?
-fn on_fabric(ip: Ipv4Address) -> bool {
-    let o = ip.octets();
-    o[0] == 10 && o[1] == 0 && o[2] == 0
+/// Is `ip` on the virtual fabric (IPv4 `10.0.0.0/24` or IPv6 ULA `fd00::/8`)
+/// rather than the host network?
+fn on_fabric(ip: smoltcp::wire::IpAddress) -> bool {
+    match ip {
+        smoltcp::wire::IpAddress::Ipv4(v4) => {
+            let o = v4.octets();
+            o[0] == 10 && o[1] == 0 && o[2] == 0
+        }
+        smoltcp::wire::IpAddress::Ipv6(v6) => v6.octets()[0] == 0xfd,
+    }
 }
 
 // ---- interface impls ----
@@ -593,9 +655,6 @@ impl wasi::sockets::tcp_create_socket::Host for HostState {
         &mut self,
         family: IpAddressFamily,
     ) -> Result<std::result::Result<Resource<TcpSock>, ErrorCode>> {
-        if matches!(family, IpAddressFamily::Ipv6) {
-            return Ok(Err(ErrorCode::NotSupported));
-        }
         let Some(stack) = self.stack() else {
             return Ok(Err(ErrorCode::AccessDenied));
         };
@@ -604,7 +663,10 @@ impl wasi::sockets::tcp_create_socket::Host for HostState {
                 tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
                 tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
             );
-            stack.lock().unwrap().sockets.add(sock)
+            let mut g = stack.lock().unwrap();
+            let h = g.sockets.add(sock);
+            g.track(h);
+            h
         };
         Ok(Ok(self.table().push(TcpSock {
             handle,
@@ -627,12 +689,10 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
         _network: Resource<Net>,
         local_address: IpSocketAddress,
     ) -> Result<std::result::Result<(), ErrorCode>> {
-        let IpSocketAddress::Ipv4(a) = local_address else {
-            return Ok(Err(ErrorCode::NotSupported));
-        };
+        let (_, port) = to_smol(local_address);
         let s = self.table().get_mut(&this)?;
-        s.bound_port = a.port;
-        s.local = Some(a);
+        s.bound_port = port;
+        s.local = Some(local_address);
         Ok(Ok(()))
     }
     fn finish_bind(
@@ -648,26 +708,23 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
         _network: Resource<Net>,
         remote_address: IpSocketAddress,
     ) -> Result<std::result::Result<(), ErrorCode>> {
-        let IpSocketAddress::Ipv4(rem) = remote_address else {
-            return Ok(Err(ErrorCode::NotSupported));
-        };
         let Some(stack) = self.stack() else {
             return Ok(Err(ErrorCode::AccessDenied));
         };
-        let remote_ip = to_ipv4(rem.address);
+        let (remote_ip, remote_port) = to_smol(remote_address);
         // Off-fabric destination: bridge to the real host network, but only if
         // this node is wired to a Gateway (host access granted).
         if !on_fabric(remote_ip) {
             if !stack.lock().unwrap().host_access {
                 return Ok(Err(ErrorCode::AccessDenied));
             }
-            let conn = HostConn::connect(remote_ip, rem.port);
+            let conn = HostConn::connect(remote_ip, remote_port);
             let s = self.table().get_mut(&this)?;
             s.host = Some(conn);
-            s.remote = Some(rem);
+            s.remote = Some(remote_address);
             return Ok(Ok(()));
         }
-        let local_ip = self.net.as_ref().unwrap().ip;
+        let local_ip = local_ip_for(&stack, remote_ip);
         let lport = {
             let ctx = self.net.as_mut().unwrap();
             let p = ctx.next_port;
@@ -679,18 +736,15 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
             let mut g = stack.lock().unwrap();
             let NodeStack { iface, sockets, .. } = &mut *g;
             let s = sockets.get_mut::<tcp::Socket>(handle);
-            if s.connect(iface.context(), (to_ipv4(rem.address), rem.port), lport)
+            if s.connect(iface.context(), (remote_ip, remote_port), lport)
                 .is_err()
             {
                 return Ok(Err(ErrorCode::InvalidState));
             }
         }
         let s = self.table().get_mut(&this)?;
-        s.remote = Some(rem);
-        s.local = Some(Ipv4SocketAddress {
-            port: lport,
-            address: ipv4(local_ip),
-        });
+        s.remote = Some(remote_address);
+        s.local = Some(from_smol(local_ip, lport));
         Ok(Ok(()))
     }
     fn finish_connect(
@@ -815,6 +869,7 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
                 tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
             );
             let new_listen = g.sockets.add(fresh);
+            g.track(new_listen);
             if g.sockets
                 .get_mut::<tcp::Socket>(new_listen)
                 .listen(port)
@@ -853,7 +908,7 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
         this: Resource<TcpSock>,
     ) -> Result<std::result::Result<IpSocketAddress, ErrorCode>> {
         match self.table().get(&this)?.local {
-            Some(a) => Ok(Ok(IpSocketAddress::Ipv4(a))),
+            Some(a) => Ok(Ok(a)),
             None => Ok(Err(ErrorCode::InvalidState)),
         }
     }
@@ -862,7 +917,7 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
         this: Resource<TcpSock>,
     ) -> Result<std::result::Result<IpSocketAddress, ErrorCode>> {
         match self.table().get(&this)?.remote {
-            Some(a) => Ok(Ok(IpSocketAddress::Ipv4(a))),
+            Some(a) => Ok(Ok(a)),
             None => Ok(Err(ErrorCode::InvalidState)),
         }
     }
@@ -916,16 +971,19 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
     }
 
     fn drop(&mut self, rep: Resource<TcpSock>) -> Result<()> {
-        // Close the smoltcp socket but leave it in the set (handles held by any
-        // still-live streams stay valid; reaping closed sockets is future work).
+        // Reap the smoltcp socket: close it (best-effort FIN) and remove it from
+        // the set so its buffers are freed — a long-lived node opening many
+        // connections would otherwise leak a socket per connection. The guest is
+        // done with it (its byte streams do no I/O after the socket is dropped).
         if let Some(stack) = self.stack() {
             let handle = self.table().get(&rep)?.handle;
-            stack
-                .lock()
-                .unwrap()
-                .sockets
-                .get_mut::<tcp::Socket>(handle)
-                .close();
+            let mut g = stack.lock().unwrap();
+            // Queue a graceful FIN, then hand the socket to the hub to reap once
+            // its pending data and FIN have flushed.
+            if g.is_live(handle) {
+                g.sockets.get_mut::<tcp::Socket>(handle).close();
+            }
+            g.begin_close(handle, crate::netstack::SockKind::Tcp);
         }
         self.table().delete(rep)?;
         Ok(())
@@ -1038,28 +1096,48 @@ impl wasi::sockets::ip_name_lookup::Host for HostState {
         name: String,
     ) -> Result<std::result::Result<Resource<ResolveStream>, ErrorCode>> {
         let mut addrs = std::collections::VecDeque::new();
-        if let Ok(v4) = name.parse::<std::net::Ipv4Addr>() {
+        let push_v4 = |addrs: &mut std::collections::VecDeque<IpAddress>,
+                       v4: std::net::Ipv4Addr| {
             let o = v4.octets();
             addrs.push_back(IpAddress::Ipv4((o[0], o[1], o[2], o[3])));
-        } else if let Some(ip) = self.net.as_ref().and_then(|n| {
-            let net = n.stack.lock().unwrap().net;
-            n.hub.resolve(net, &name)
-        }) {
-            // A peer node on this node's virtual network, resolved by name.
-            let o = ip.octets();
-            addrs.push_back(IpAddress::Ipv4((o[0], o[1], o[2], o[3])));
+        };
+        let push_v6 = |addrs: &mut std::collections::VecDeque<IpAddress>,
+                       v6: std::net::Ipv6Addr| {
+            let s = v6.segments();
+            addrs.push_back(IpAddress::Ipv6((
+                s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+            )));
+        };
+        if let Ok(v4) = name.parse::<std::net::Ipv4Addr>() {
+            push_v4(&mut addrs, v4);
+        } else if let Ok(v6) = name.parse::<std::net::Ipv6Addr>() {
+            push_v6(&mut addrs, v6);
+        } else if let Some((net, hub)) = self
+            .net
+            .as_ref()
+            .map(|n| (n.stack.lock().unwrap().net, n.hub.clone()))
+            .filter(|(net, hub)| hub.resolve(*net, &name).is_some())
+        {
+            // A peer node on this node's virtual network, resolved by name —
+            // offer both its IPv6 and IPv4 fabric addresses.
+            if let Some(v6) = hub.resolve6(net, &name) {
+                push_v6(&mut addrs, v6);
+            }
+            if let Some(v4) = hub.resolve(net, &name) {
+                push_v4(&mut addrs, v4);
+            }
         } else if self
             .net
             .as_ref()
             .is_some_and(|n| n.stack.lock().unwrap().host_access)
         {
-            // Gatewayed node: resolve real names via the host resolver.
+            // Gatewayed node: resolve real names via the host resolver (v4 + v6).
             match std::net::ToSocketAddrs::to_socket_addrs(&(name.as_str(), 0)) {
                 Ok(iter) => {
                     for sa in iter {
-                        if let std::net::IpAddr::V4(v4) = sa.ip() {
-                            let o = v4.octets();
-                            addrs.push_back(IpAddress::Ipv4((o[0], o[1], o[2], o[3])));
+                        match sa.ip() {
+                            std::net::IpAddr::V4(v4) => push_v4(&mut addrs, v4),
+                            std::net::IpAddr::V6(v6) => push_v6(&mut addrs, v6),
                         }
                     }
                 }
@@ -1104,15 +1182,15 @@ impl wasi::sockets::udp_create_socket::Host for HostState {
         &mut self,
         family: IpAddressFamily,
     ) -> Result<std::result::Result<Resource<UdpSock>, ErrorCode>> {
-        if matches!(family, IpAddressFamily::Ipv6) {
-            return Ok(Err(ErrorCode::NotSupported));
-        }
         let Some(stack) = self.stack() else {
             return Ok(Err(ErrorCode::AccessDenied));
         };
         let handle = {
             let sock = udp::Socket::new(udp_packet_buffer(), udp_packet_buffer());
-            stack.lock().unwrap().sockets.add(sock)
+            let mut g = stack.lock().unwrap();
+            let h = g.sockets.add(sock);
+            g.track(h);
+            h
         };
         Ok(Ok(self.table().push(UdpSock {
             handle,
@@ -1134,15 +1212,13 @@ impl wasi::sockets::udp::HostUdpSocket for HostState {
         _network: Resource<Net>,
         local_address: IpSocketAddress,
     ) -> Result<std::result::Result<(), ErrorCode>> {
-        let IpSocketAddress::Ipv4(a) = local_address else {
-            return Ok(Err(ErrorCode::NotSupported));
-        };
+        let (_, port) = to_smol(local_address);
         let s = self.table().get_mut(&this)?;
         if s.bound {
             return Ok(Err(ErrorCode::InvalidState));
         }
-        s.bound_port = a.port;
-        s.local = Some(a);
+        s.bound_port = port;
+        s.local = Some(local_address);
         Ok(Ok(()))
     }
     fn finish_bind(
@@ -1152,10 +1228,14 @@ impl wasi::sockets::udp::HostUdpSocket for HostState {
         let Some(stack) = self.stack() else {
             return Ok(Err(ErrorCode::AccessDenied));
         };
-        let local_ip = self.net.as_ref().unwrap().ip;
-        let (handle, mut port, already) = {
+        // The bound family follows the address given to start-bind (default v4).
+        let (handle, mut port, already, family) = {
             let s = self.table().get(&this)?;
-            (s.handle, s.bound_port, s.bound)
+            let family = match s.local {
+                Some(IpSocketAddress::Ipv6(_)) => IpAddressFamily::Ipv6,
+                _ => IpAddressFamily::Ipv4,
+            };
+            (s.handle, s.bound_port, s.bound, family)
         };
         if already {
             return Ok(Err(ErrorCode::InvalidState));
@@ -1171,13 +1251,17 @@ impl wasi::sockets::udp::HostUdpSocket for HostState {
                 return Ok(Err(ErrorCode::AddressInUse));
             }
         }
+        let local_ip: smoltcp::wire::IpAddress = {
+            let g = stack.lock().unwrap();
+            match family {
+                IpAddressFamily::Ipv6 => g.ip6.into(),
+                IpAddressFamily::Ipv4 => g.ip.into(),
+            }
+        };
         let s = self.table().get_mut(&this)?;
         s.bound = true;
         s.bound_port = port;
-        s.local = Some(Ipv4SocketAddress {
-            port,
-            address: ipv4(local_ip),
-        });
+        s.local = Some(from_smol(local_ip, port));
         Ok(Ok(()))
     }
     fn stream(
@@ -1195,11 +1279,7 @@ impl wasi::sockets::udp::HostUdpSocket for HostState {
         if !bound {
             return Ok(Err(ErrorCode::InvalidState));
         }
-        let remote = match remote_address {
-            Some(IpSocketAddress::Ipv4(a)) => Some(a),
-            Some(IpSocketAddress::Ipv6(_)) => return Ok(Err(ErrorCode::InvalidArgument)),
-            None => None,
-        };
+        let remote = remote_address;
         self.table().get_mut(&this)?.remote = remote;
         let incoming = self.table().push(Datagrams {
             stack: stack.clone(),
@@ -1218,7 +1298,7 @@ impl wasi::sockets::udp::HostUdpSocket for HostState {
         this: Resource<UdpSock>,
     ) -> Result<std::result::Result<IpSocketAddress, ErrorCode>> {
         match self.table().get(&this)?.local {
-            Some(a) => Ok(Ok(IpSocketAddress::Ipv4(a))),
+            Some(a) => Ok(Ok(a)),
             None => Ok(Err(ErrorCode::InvalidState)),
         }
     }
@@ -1227,7 +1307,7 @@ impl wasi::sockets::udp::HostUdpSocket for HostState {
         this: Resource<UdpSock>,
     ) -> Result<std::result::Result<IpSocketAddress, ErrorCode>> {
         match self.table().get(&this)?.remote {
-            Some(a) => Ok(Ok(IpSocketAddress::Ipv4(a))),
+            Some(a) => Ok(Ok(a)),
             None => Ok(Err(ErrorCode::InvalidState)),
         }
     }
@@ -1293,6 +1373,15 @@ impl wasi::sockets::udp::HostUdpSocket for HostState {
         subscribe(self.table(), p)
     }
     fn drop(&mut self, rep: Resource<UdpSock>) -> Result<()> {
+        // Reap the smoltcp socket so its buffers are freed (the datagram streams
+        // only reference this handle and do no I/O once the socket is dropped).
+        if let Some(stack) = self.stack() {
+            let handle = self.table().get(&rep)?.handle;
+            stack
+                .lock()
+                .unwrap()
+                .begin_close(handle, crate::netstack::SockKind::Udp);
+        }
         self.table().delete(rep)?;
         Ok(())
     }
@@ -1310,32 +1399,27 @@ impl wasi::sockets::udp::HostIncomingDatagramStream for HostState {
         };
         let mut out = Vec::new();
         let mut g = stack.lock().unwrap();
+        if !g.is_live(handle) {
+            return Ok(Ok(out));
+        }
         let s = g.sockets.get_mut::<udp::Socket>(handle);
         while (out.len() as u64) < max_results {
             let (data, src) = match s.recv() {
-                Ok((data, meta)) => {
-                    let smoltcp::wire::IpAddress::Ipv4(v4) = meta.endpoint.addr else {
-                        continue;
-                    };
-                    (
-                        data.to_vec(),
-                        Ipv4SocketAddress {
-                            port: meta.endpoint.port,
-                            address: ipv4(v4),
-                        },
-                    )
-                }
+                Ok((data, meta)) => (
+                    data.to_vec(),
+                    from_smol(meta.endpoint.addr, meta.endpoint.port),
+                ),
                 Err(_) => break, // receive buffer exhausted
             };
             // A stream bound to a specific peer only yields that peer's datagrams.
             if let Some(f) = filter {
-                if f.address != src.address || f.port != src.port {
+                if to_smol(f) != to_smol(src) {
                     continue;
                 }
             }
             out.push(wasi::sockets::udp::IncomingDatagram {
                 data,
-                remote_address: IpSocketAddress::Ipv4(src),
+                remote_address: src,
             });
         }
         Ok(Ok(out))
@@ -1368,6 +1452,9 @@ impl wasi::sockets::udp::HostOutgoingDatagramStream for HostState {
             (d.stack.clone(), d.handle)
         };
         let g = stack.lock().unwrap();
+        if !g.is_live(handle) {
+            return Ok(Ok(0));
+        }
         let can = g.sockets.get::<udp::Socket>(handle).can_send();
         Ok(Ok(if can { UDP_SLOTS as u64 } else { 0 }))
     }
@@ -1381,29 +1468,24 @@ impl wasi::sockets::udp::HostOutgoingDatagramStream for HostState {
             (d.stack.clone(), d.handle, d.remote)
         };
         let mut g = stack.lock().unwrap();
+        if !g.is_live(handle) {
+            return Ok(Ok(0));
+        }
         let s = g.sockets.get_mut::<udp::Socket>(handle);
         let mut sent = 0u64;
         for dg in datagrams {
-            let dest = match dg.remote_address {
-                Some(IpSocketAddress::Ipv4(a)) => a,
-                Some(IpSocketAddress::Ipv6(_)) => {
+            // Per-datagram destination, or the stream's default peer.
+            let dest = match dg.remote_address.or(default_remote) {
+                Some(a) => a,
+                None => {
                     if sent == 0 {
                         return Ok(Err(ErrorCode::InvalidArgument));
                     }
                     break;
                 }
-                None => match default_remote {
-                    Some(a) => a,
-                    None => {
-                        if sent == 0 {
-                            return Ok(Err(ErrorCode::InvalidArgument));
-                        }
-                        break;
-                    }
-                },
             };
-            let endpoint = (to_ipv4(dest.address), dest.port);
-            if s.send_slice(&dg.data, endpoint).is_err() {
+            let (ip, port) = to_smol(dest);
+            if s.send_slice(&dg.data, (ip, port)).is_err() {
                 break; // send buffer full: stop, report what we queued
             }
             sent += 1;
