@@ -589,7 +589,6 @@ struct App {
     /// Set when Delete/Backspace is pressed; consumed in `frame` to drop the
     /// selected wire.
     del_wire: bool,
-    menu_open: bool,
     /// Whether the corner zoom button's preset menu is open.
     zoom_menu_open: bool,
     /// Command palette (Cmd/Ctrl+K) state: open, the typed filter, and the
@@ -675,7 +674,6 @@ impl App {
             drag: None,
             wire_sel: None,
             del_wire: false,
-            menu_open: false,
             zoom_menu_open: false,
             palette_open: false,
             palette_query: String::new(),
@@ -1545,21 +1543,6 @@ impl App {
 
         // ---- interaction ----
         let mut to_close: Vec<u64> = Vec::new();
-        let menu_w = MENU_H + gfx.fonts.measure("Add Node") as f32 + PAD;
-        let apps_rect = [0.0, 0.0, menu_w, MENU_H];
-        let item_w = self
-            .available
-            .iter()
-            .map(|d| gfx.fonts.measure(&d.name) as f32)
-            .fold(120.0, f32::max)
-            + 2.0 * PAD;
-
-        let vfile_btn_w = gfx.fonts.measure("+ Virtual File") as f32 + 2.0 * PAD;
-        let vfile_btn = [menu_w, 0.0, menu_w + vfile_btn_w, MENU_H];
-        let hfile_btn_w = gfx.fonts.measure("+ Host File") as f32 + 2.0 * PAD;
-        let hfile_btn = [vfile_btn[2], 0.0, vfile_btn[2] + hfile_btn_w, MENU_H];
-        let port_btn_w = gfx.fonts.measure("+ Port") as f32 + 2.0 * PAD;
-        let port_btn = [hfile_btn[2], 0.0, hfile_btn[2] + port_btn_w, MENU_H];
 
         // Corner zoom button (bottom-left) and the preset items stacked above it.
         let zoom_btn_w = gfx.fonts.measure("200%") as f32 + 3.0 * PAD;
@@ -1569,6 +1552,10 @@ impl App {
             let y0 = top + i as f32 * MENU_H;
             [0.0, y0, zoom_btn_w, y0 + MENU_H]
         };
+        // Corner add/command button (bottom-right) that opens the Cmd/Ctrl+K
+        // palette — the single entry point for adding nodes and other commands.
+        let menu_btn_w = gfx.fonts.measure("+ Add  (Cmd+K)") as f32 + 2.0 * PAD;
+        let menu_btn = [fb[0] - menu_btn_w, fb[1] - MENU_H, fb[0], fb[1]];
 
         // Continue an in-progress drag (move / resize / connect).
         if let Some(d) = self.drag.take() {
@@ -1649,40 +1636,13 @@ impl App {
             }
             if consumed {
                 // handled by the zoom menu
-            } else if contains(apps_rect, mp) {
-                self.menu_open = !self.menu_open;
+            } else if contains(menu_btn, mp) {
+                // Open the command palette (same as Cmd/Ctrl+K).
+                self.palette_open = true;
+                self.palette_query.clear();
+                self.palette_sel = 0;
+                self.palette_scroll = 0.0;
                 consumed = true;
-            } else if contains(vfile_btn, mp) {
-                self.add_virtual_file();
-                self.menu_open = false;
-                consumed = true;
-            } else if contains(hfile_btn, mp) {
-                self.add_host_mapped_file();
-                self.menu_open = false;
-                consumed = true;
-            } else if contains(port_btn, mp) {
-                self.add_host_port();
-                self.menu_open = false;
-                consumed = true;
-            } else if self.menu_open {
-                for (i, dep) in self.available.iter().enumerate() {
-                    let r = [
-                        0.0,
-                        MENU_H + i as f32 * MENU_H,
-                        item_w,
-                        MENU_H + (i + 1) as f32 * MENU_H,
-                    ];
-                    if contains(r, mp) {
-                        let dep = dep.clone();
-                        self.launch(&dep);
-                        self.menu_open = false;
-                        consumed = true;
-                        break;
-                    }
-                }
-                if !consumed {
-                    self.menu_open = false;
-                }
             }
             if !consumed {
                 if let Some(id) = self.topmost_under(mp) {
@@ -1767,8 +1727,7 @@ impl App {
             }
             if !consumed {
                 // Clicked empty canvas: select a wire under the cursor (so it
-                // can be deleted), else dismiss the menu and unfocus the app.
-                self.menu_open = false;
+                // can be deleted), else unfocus the app.
                 self.kbd_focus = None;
                 self.editing_args = None;
                 self.wire_sel = self.wire_at(mp);
@@ -1797,7 +1756,7 @@ impl App {
 
         // Route pointer to the surface under the cursor (not while the modal
         // command palette is open).
-        if self.drag.is_none() && !self.palette_open && mp[1] >= MENU_H {
+        if self.drag.is_none() && !self.palette_open {
             if let Some(&id) = self.z.iter().rev().find(|&&id| {
                 contains(
                     win_rect(self.cam, self.win_pos[&id], self.win_size[&id]),
@@ -2421,103 +2380,26 @@ impl App {
             }
         }
 
-        quads.push(Quad::solid(white, [0.0, 0.0, fb[0], MENU_H], MENU_BG, full));
-        if self.menu_open || contains(apps_rect, mp) {
-            quads.push(Quad::solid(white, apps_rect, MENU_HOVER, full));
-        }
-        // "+ Virtual File" button.
-        if contains(vfile_btn, mp) {
-            quads.push(Quad::solid(white, vfile_btn, MENU_HOVER, full));
-        }
+        // Corner add/command button (bottom-right): opens the Cmd/Ctrl+K palette.
+        let menu_bg = if contains(menu_btn, mp) {
+            MENU_HOVER
+        } else {
+            MENU_BG
+        };
+        quads.push(Quad::solid(white, menu_btn, menu_bg, full));
         self.text_cache.draw(
             &mut quads,
             &mut gfx.renderer,
             &gfx.fonts,
             &gfx.device,
             &gfx.queue,
-            "+ Virtual File",
-            vfile_btn[0] + PAD,
-            (MENU_H - gfx.fonts.line_height() as f32) * 0.5,
+            "+ Add  (Cmd+K)",
+            menu_btn[0] + PAD,
+            menu_btn[1] + (MENU_H - gfx.fonts.line_height() as f32) * 0.5,
             1.0,
             TEXT,
             full,
         );
-        // "+ Host File" button.
-        if contains(hfile_btn, mp) {
-            quads.push(Quad::solid(white, hfile_btn, MENU_HOVER, full));
-        }
-        self.text_cache.draw(
-            &mut quads,
-            &mut gfx.renderer,
-            &gfx.fonts,
-            &gfx.device,
-            &gfx.queue,
-            "+ Host File",
-            hfile_btn[0] + PAD,
-            (MENU_H - gfx.fonts.line_height() as f32) * 0.5,
-            1.0,
-            TEXT,
-            full,
-        );
-        // "+ Port" button.
-        if contains(port_btn, mp) {
-            quads.push(Quad::solid(white, port_btn, MENU_HOVER, full));
-        }
-        self.text_cache.draw(
-            &mut quads,
-            &mut gfx.renderer,
-            &gfx.fonts,
-            &gfx.device,
-            &gfx.queue,
-            "+ Port",
-            port_btn[0] + PAD,
-            (MENU_H - gfx.fonts.line_height() as f32) * 0.5,
-            1.0,
-            TEXT,
-            full,
-        );
-        self.text_cache.draw(
-            &mut quads,
-            &mut gfx.renderer,
-            &gfx.fonts,
-            &gfx.device,
-            &gfx.queue,
-            "Add Node",
-            PAD,
-            (MENU_H - gfx.fonts.line_height() as f32) * 0.5,
-            1.0,
-            TEXT,
-            full,
-        );
-        if self.menu_open {
-            for (i, dep) in self.available.iter().enumerate() {
-                let r = [
-                    0.0,
-                    MENU_H + i as f32 * MENU_H,
-                    item_w,
-                    MENU_H + (i + 1) as f32 * MENU_H,
-                ];
-                quads.push(Quad::solid(
-                    white,
-                    r,
-                    if contains(r, mp) { MENU_HOVER } else { MENU_BG },
-                    full,
-                ));
-                self.text_cache.draw(
-                    &mut quads,
-                    &mut gfx.renderer,
-                    &gfx.fonts,
-                    &gfx.device,
-                    &gfx.queue,
-                    &dep.name,
-                    PAD,
-                    r[1] + (MENU_H - gfx.fonts.line_height() as f32) * 0.5,
-                    1.0,
-                    TEXT,
-                    full,
-                );
-            }
-        }
         // Corner zoom button + its preset menu (bottom-left). Clicking the button
         // opens the menu; clicking a preset jumps the zoom (handy for 100%).
         let lh = gfx.fonts.line_height() as f32;
