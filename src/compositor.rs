@@ -1020,7 +1020,7 @@ impl App {
     /// Grant/revoke a node's host-network access (on its fabric stack).
     fn set_host_access(&self, app_id: u64, allow: bool) {
         if let Some(node) = self.app_node(app_id) {
-            if let Some(stack) = &node.net_stack {
+            if let Some(stack) = node.net_stack() {
                 stack.lock().unwrap().host_access = allow;
             }
         }
@@ -1055,9 +1055,26 @@ impl App {
 
     /// Set an app node's virtual network (on its fabric stack). `net` is a
     /// Network node's id to join it, or the app's own id to isolate it.
+    /// Ensure each wired node's fabric stack reflects its network membership.
+    /// Nodes compile asynchronously, so one wired before its stack existed (e.g.
+    /// on session restore) gets its membership applied here once it's ready.
+    fn sync_net_membership(&self, node_by_id: &HashMap<u64, SharedNode>) {
+        for &(app, net) in &self.net_links {
+            let Some(stack) = node_by_id.get(&app).and_then(|n| n.net_stack()) else {
+                continue;
+            };
+            let host = self.gateways.contains(&net);
+            let mut g = stack.lock().unwrap();
+            if g.net != net || g.host_access != host {
+                g.net = net;
+                g.host_access = host;
+            }
+        }
+    }
+
     fn set_node_net(&self, app_id: u64, net: u64) {
         if let Some(node) = self.app_node(app_id) {
-            if let Some(stack) = &node.net_stack {
+            if let Some(stack) = node.net_stack() {
                 stack.lock().unwrap().net = net;
             }
         }
@@ -1114,7 +1131,7 @@ impl App {
         let Some(node) = self.app_node(http_id) else {
             return;
         };
-        let Some(path) = node.http_path.clone() else {
+        let Some(path) = node.http_path() else {
             return; // not a wasi:http server node
         };
         let Some(&port) = self.host_ports.get(&hostport_id) else {
@@ -1517,6 +1534,10 @@ impl App {
                 || self.host_ports.contains_key(id)
                 || self.net_nodes.contains(id)
         });
+        // Apply network memberships to any node whose fabric stack has just become
+        // ready (nodes compile asynchronously, so a node wired at spawn/restore may
+        // not have had a stack yet). Idempotent and cheap.
+        self.sync_net_membership(&node_by_id);
 
         let surfaces: Vec<SharedSurface> = self.registry.lock().unwrap().clone();
         let node_surface: HashMap<u64, SharedSurface> = surfaces
@@ -1689,7 +1710,7 @@ impl App {
                         self.kbd_focus = Some(id);
                         let idle = self
                             .app_node(id)
-                            .map(|n| !n.running.load(Ordering::Relaxed) && n.launch.is_some())
+                            .map(|n| !n.running.load(Ordering::Relaxed) && n.is_runnable())
                             .unwrap_or(false);
                         if contains(close_btn(r, zf), mp) {
                             to_close.push(id);
@@ -2179,11 +2200,17 @@ impl App {
             ));
 
             let mut node_idle = false;
+            let mut node_loading = false;
             if let Some(node) = node_by_id.get(&id) {
                 let running = node.running.load(Ordering::Relaxed);
-                let runnable = node.launch.is_some();
-                node_idle = !running && runnable;
-                let label = if running {
+                let loading = node.is_loading();
+                node_loading = loading;
+                let runnable = node.is_runnable();
+                // Idle (offer Run/args) only once compiled and not running.
+                node_idle = !loading && !running && runnable;
+                let label = if loading {
+                    format!("{} (loading…)", node.name)
+                } else if running {
                     node.name.clone()
                 } else if node.finished.load(Ordering::Relaxed) {
                     format!("{} (exited)", node.name)
@@ -2249,6 +2276,25 @@ impl App {
 
             let ca = content_rect(r, zf);
             let ca_clip = intersect(ca, full);
+            // A node still compiling its wasm shows a centered loading message.
+            if node_loading {
+                let msg = "compiling…";
+                let lh = gfx.fonts.line_height() as f32 * zf;
+                let w = gfx.fonts.measure(msg) as f32 * zf;
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    msg,
+                    (ca[0] + ca[2]) * 0.5 - w * 0.5,
+                    (ca[1] + ca[3]) * 0.5 - lh * 0.5,
+                    zf,
+                    PORT_COL,
+                    ca_clip,
+                );
+            }
             let sid = node_surface.get(&id).map(|s| s.lock().unwrap().id);
             if let Some(sid) = sid {
                 if let Some(&(tex, _, _)) = self.views.get(&sid) {
@@ -2563,7 +2609,7 @@ impl App {
                 // its thread can exit (it isn't running wasm for the epoch to trap).
                 node.term_io.close();
                 // Detach its network stack from the fabric hub (no leak).
-                if let Some(stack) = &node.net_stack {
+                if let Some(stack) = &node.net_stack() {
                     self.host.detach_net(stack);
                 }
             }

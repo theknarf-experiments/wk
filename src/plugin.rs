@@ -13,7 +13,7 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context as TaskContext, Poll, Waker};
 
 use wasmtime::component::{Component, HasSelf, Linker, Resource, ResourceTable};
@@ -134,14 +134,6 @@ pub struct Node {
     /// This node's option values (e.g. knob settings) reported by the guest, so
     /// the compositor can persist them to the session and seed them on restore.
     pub options: crate::options::SharedOptions,
-    /// This node's network stack on the fabric (`Some` if it imports
-    /// wasi:sockets), so the compositor can change which virtual network it's on
-    /// by wiring it to a Network node.
-    pub net_stack: Option<crate::netstack::SharedStack>,
-    /// If this node is a `wasi:http` server (exports `incoming-handler`), the
-    /// component path to serve when it's wired to a HostPort. Such nodes don't
-    /// run a `run` loop; they're served on demand.
-    pub http_path: Option<std::path::PathBuf>,
     /// Set by the guest thread when its `run` returns (it exited on its own).
     pub finished: Arc<AtomicBool>,
     /// True while a guest thread is live. A networked node is created idle
@@ -150,20 +142,52 @@ pub struct Node {
     pub running: Arc<AtomicBool>,
     /// Kill switch: set by the compositor to stop a still-running node.
     pub kill: Arc<AtomicBool>,
-    /// Path + args to (re)launch this node's guest on demand. `None` for HTTP
-    /// server nodes (served per-request) which never run a `run` loop.
-    pub launch: Option<NodeLaunch>,
+    /// The compiled component and its wiring, filled in by the background compile
+    /// thread. `None` while the node is still compiling — the compositor shows a
+    /// loading state and holds off running/wiring until it's ready.
+    pub setup: OnceLock<NodeSetup>,
 }
 
-/// What [`PluginHost::run_node`] needs to (re)start a node's guest. Held on the
-/// `Node` so the compositor can run an idle node or re-run a finished one. The
-/// launch args aren't here — the compositor owns them (editable per node) and
-/// passes them to `run_node`.
-#[derive(Clone)]
-pub struct NodeLaunch {
-    pub path: std::path::PathBuf,
-    pub is_command: bool,
-    pub surfaces: SurfaceRegistry,
+/// A node's compiled component plus how to run and wire it — published once the
+/// background compile finishes.
+pub struct NodeSetup {
+    /// This node's network stack on the fabric (`Some` if it imports
+    /// wasi:sockets), so the compositor can move it between virtual networks.
+    pub net_stack: Option<crate::netstack::SharedStack>,
+    /// Set if this is a `wasi:http` server (exports `incoming-handler`): the
+    /// component path to serve when wired to a HostPort. Such nodes aren't run.
+    pub http_path: Option<std::path::PathBuf>,
+    /// Present for a runnable node (not an http server): the compiled component
+    /// and how to instantiate it, reused across runs.
+    pub run: Option<RunInfo>,
+}
+
+/// What [`PluginHost::run_node`] needs to (re)start a node's guest, reused across
+/// runs so re-running never recompiles.
+pub struct RunInfo {
+    component: Component,
+    is_command: bool,
+    surfaces: SurfaceRegistry,
+}
+
+impl Node {
+    /// Still compiling — no component yet.
+    pub fn is_loading(&self) -> bool {
+        self.setup.get().is_none()
+    }
+    /// This node's fabric stack, once ready (`None` while loading or if it has
+    /// no network).
+    pub fn net_stack(&self) -> Option<crate::netstack::SharedStack> {
+        self.setup.get().and_then(|s| s.net_stack.clone())
+    }
+    /// The component path to serve, if this is a ready http server node.
+    pub fn http_path(&self) -> Option<std::path::PathBuf> {
+        self.setup.get().and_then(|s| s.http_path.clone())
+    }
+    /// Ready and has a `run` loop (an idle/exited node the compositor can Run).
+    pub fn is_runnable(&self) -> bool {
+        self.setup.get().is_some_and(|s| s.run.is_some())
+    }
 }
 
 pub type SharedNode = Arc<Node>;
@@ -660,6 +684,7 @@ fn add_random(l: &mut Linker<HostState>) -> Result<()> {
 }
 
 /// Owns the wasmtime engine and spawns plugin clients on their own threads.
+#[derive(Clone)]
 pub struct PluginHost {
     engine: Engine,
     gpu: Arc<wgpu_core::global::Global>,
@@ -806,12 +831,14 @@ impl PluginHost {
         Ok(())
     }
 
-    /// Load a client component and register it as a `Node` under the
-    /// compositor-assigned `id`. Most nodes start running immediately; a
-    /// **networked** node (imports wasi:sockets) is registered *idle* and run on
-    /// demand via [`run_node`](Self::run_node), so it can be wired onto a
-    /// Network/Gateway before its guest does any name resolution or connecting.
-    /// Surfaces it creates appear in `surfaces`; its stdio feeds the node window.
+    /// Register a client as a `Node` under the compositor-assigned `id` and
+    /// return immediately — the component is compiled on a background thread so
+    /// the window (and other nodes) aren't blocked (Cranelift on a multi-MB debug
+    /// component takes hundreds of ms to seconds). Until it's ready the node is in
+    /// a *loading* state; once compiled the node's `setup` is published and, for a
+    /// non-networked non-http node, its guest starts. A **networked** node
+    /// (imports wasi:sockets) stays idle so it can be wired onto a Network/Gateway
+    /// before it runs; an **http** server node stays idle until served on a Port.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         &self,
@@ -823,24 +850,6 @@ impl PluginHost {
         nodes: NodeRegistry,
         initial_options: Vec<f32>,
     ) -> Result<()> {
-        let component = Component::from_file(&self.engine, path)?;
-        // A `wasi:http` server (exports incoming-handler) doesn't run a `run`
-        // loop — it's served on demand when wired to a HostPort.
-        let is_http = component_is_proxy(&component, &self.engine);
-        // A standard `wasi:cli/command` (any `fn main` recompiled to wasm) is run
-        // through its `wasi:cli/run` export; a wk-world guest through its `run`.
-        let is_command = component_is_command(&component, &self.engine);
-
-        // A node that imports wasi:sockets gets a NIC on the fabric. By default
-        // it's alone on its own virtual network (net id = node id) — isolated,
-        // can't reach anyone — until the compositor wires it to a Network node.
-        let net_stack = if !is_http && component_imports_sockets(&component, &self.engine) {
-            let ip = smoltcp::wire::Ipv4Address::new(10, 0, 0, (2 + (id % 250)) as u8);
-            Some(self.hub.attach(id, ip, name))
-        } else {
-            None
-        };
-
         let node = Arc::new(Node {
             id,
             name: name.to_string(),
@@ -850,27 +859,71 @@ impl PluginHost {
             // Seeded with any saved values; the guest reads them via `load` at
             // start and overwrites with its current values via `store`.
             options: crate::options::new_options(initial_options),
-            net_stack,
             finished: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(false)),
             kill: Arc::new(AtomicBool::new(false)),
-            http_path: is_http.then(|| path.to_path_buf()),
-            launch: (!is_http).then(|| NodeLaunch {
-                path: path.to_path_buf(),
-                is_command,
-                surfaces,
-            }),
+            setup: OnceLock::new(),
         });
         nodes.lock().unwrap().push(node.clone());
 
-        if is_http {
-            // Registered as a node; nothing runs until it's exposed on a HostPort.
-            return Ok(());
-        }
-        // Networked nodes start idle so they can be wired before running; the
-        // compositor runs them on demand. Everything else runs right away.
-        if node.net_stack.is_none() {
-            self.run_node(&node, args)?;
+        let host = self.clone();
+        let path = path.to_path_buf();
+        let name = name.to_string();
+        let args = args.to_vec();
+        std::thread::Builder::new()
+            .name(format!("wk-compile-{name}"))
+            .spawn(move || {
+                if let Err(e) = host.load_and_setup(&node, &path, &name, &args, surfaces) {
+                    eprintln!("failed to load plugin {name:?}: {e:#}");
+                }
+            })
+            .expect("spawn compile thread");
+        Ok(())
+    }
+
+    /// Background: compile the component, work out how to run/wire it, publish the
+    /// node's `setup`, then auto-start it unless it's networked or an http server.
+    fn load_and_setup(
+        &self,
+        node: &SharedNode,
+        path: &Path,
+        name: &str,
+        args: &[String],
+        surfaces: SurfaceRegistry,
+    ) -> Result<()> {
+        let component = Component::from_file(&self.engine, path)?;
+        // A `wasi:http` server (exports incoming-handler) doesn't run a `run`
+        // loop — it's served on demand when wired to a HostPort.
+        let is_http = component_is_proxy(&component, &self.engine);
+        // A standard `wasi:cli/command` (any `fn main` recompiled to wasm) is run
+        // through its `wasi:cli/run` export; a wk-world guest through its `run`.
+        let is_command = component_is_command(&component, &self.engine);
+        // A node that imports wasi:sockets gets a NIC on the fabric. By default
+        // it's alone on its own virtual network (net id = node id) — isolated —
+        // until the compositor wires it to a Network node.
+        let net_stack = if !is_http && component_imports_sockets(&component, &self.engine) {
+            let ip = smoltcp::wire::Ipv4Address::new(10, 0, 0, (2 + (node.id % 250)) as u8);
+            Some(self.hub.attach(node.id, ip, name))
+        } else {
+            None
+        };
+        let networked = net_stack.is_some();
+        let setup = NodeSetup {
+            net_stack,
+            http_path: is_http.then(|| path.to_path_buf()),
+            run: (!is_http).then(|| RunInfo {
+                component,
+                is_command,
+                surfaces,
+            }),
+        };
+        // Publish; the compositor now sees a ready node.
+        let _ = node.setup.set(setup);
+
+        // Networked nodes wait to be wired + Run; http nodes wait to be served.
+        // Everything else runs now (its component is already compiled).
+        if !is_http && !networked {
+            self.run_node(node, args)?;
         }
         Ok(())
     }
@@ -882,7 +935,8 @@ impl PluginHost {
     /// `args` are the launch args (argv after the program name) — the compositor
     /// passes the node's current, possibly-edited args.
     pub fn run_node(&self, node: &SharedNode, args: &[String]) -> Result<()> {
-        let Some(launch) = node.launch.clone() else {
+        // Still compiling, or an http server node — nothing to run.
+        let Some(run) = node.setup.get().and_then(|s| s.run.as_ref()) else {
             return Ok(());
         };
         if node.running.swap(true, Ordering::Relaxed) {
@@ -892,14 +946,14 @@ impl PluginHost {
         node.kill.store(false, Ordering::Relaxed);
 
         let linker = self.build_linker()?;
-        let component = Component::from_file(&self.engine, &launch.path)?;
+        // Reuse the already-compiled component (cheap Arc clone) — never recompile.
+        let component = run.component.clone();
 
         // Rebuild the fabric socket context from the node's existing stack so
         // re-runs keep the same address and network membership.
         let net = node
-            .net_stack
-            .as_ref()
-            .map(|stack| crate::sockets::NetCtx::new(stack.clone(), self.hub.clone()));
+            .net_stack()
+            .map(|stack| crate::sockets::NetCtx::new(stack, self.hub.clone()));
 
         // argv[0] is the program name, then the configured args (e.g. a filename).
         let mut argv = vec![node.name.clone()];
@@ -916,7 +970,7 @@ impl PluginHost {
         let state = HostState {
             ctx: ctx_builder.build(),
             table: ResourceTable::new(),
-            registry: launch.surfaces,
+            registry: run.surfaces.clone(),
             node_id: node.id,
             fs: node.fs.clone(),
             midi_in: node.midi_in.clone(),
@@ -939,7 +993,7 @@ impl PluginHost {
             }
         });
 
-        let is_command = launch.is_command;
+        let is_command = run.is_command;
         let finished = node.finished.clone();
         let running = node.running.clone();
         let kill = node.kill.clone();
