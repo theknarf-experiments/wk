@@ -775,6 +775,15 @@ impl Server {
         let Some(&port) = self.host_ports.get(&hostport_id) else {
             return;
         };
+        // All workspaces run at once, so another node may already be serving this
+        // localhost port. Refuse rather than let the OS bind fail silently.
+        if self.port_served_by_other(port, http_id) {
+            eprintln!(
+                "wk: localhost:{port} is already served; not binding {}",
+                node.name
+            );
+            return;
+        }
         let kill = Arc::new(AtomicBool::new(false));
         if let Err(e) = self
             .host
@@ -784,6 +793,13 @@ impl Server {
             return;
         }
         self.serves.insert(http_id, (hostport_id, kill));
+    }
+
+    /// Whether some *other* http node is already serving localhost `port`.
+    fn port_served_by_other(&self, port: u16, except_http: NodeId) -> bool {
+        self.serves
+            .iter()
+            .any(|(&http, &(hp, _))| http != except_http && self.host_ports.get(&hp) == Some(&port))
     }
 
     /// Remove a HostPort node, stopping any server bound through it.

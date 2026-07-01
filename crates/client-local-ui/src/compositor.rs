@@ -4,7 +4,7 @@
 //! hand as 2D quads via `render2d`; windowing/input is winit. The authoritative
 //! document lives in the server, reached through a `ServerHandle`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,6 +54,8 @@ const BODY: [f32; 4] = [0.10, 0.10, 0.13, 1.0];
 const BORDER_COL: [f32; 4] = [0.32, 0.33, 0.38, 1.0];
 const TEXT: [f32; 4] = [0.90, 0.90, 0.93, 1.0];
 const CLOSE_HOT: [f32; 4] = [0.80, 0.30, 0.30, 1.0];
+/// Warning tint (e.g. a HostPort whose localhost port collides with another).
+const WARN: [f32; 4] = [0.92, 0.45, 0.40, 1.0];
 const TERM_BG: [f32; 4] = [0.063, 0.063, 0.086, 1.0];
 /// Body fill in the workspace for a node popped out into its own window (behind
 /// the "detached" label).
@@ -574,6 +576,9 @@ struct App {
     active_ws: NodeId,
     /// All workspace ids (tabs), in order — for the tab bar.
     tabs: Vec<NodeId>,
+    /// Localhost ports claimed by more than one HostPort across all workspaces
+    /// (they can't all bind); flagged in the UI. Computed from the full view.
+    port_conflicts: HashSet<u16>,
     gfx: Option<Gfx>,
     /// Nodes currently popped out into their own OS window, keyed by node id.
     detached: HashMap<NodeId, Detached>,
@@ -640,6 +645,7 @@ impl App {
             view,
             active_ws,
             tabs,
+            port_conflicts: HashSet::new(),
             gfx: None,
             detached: HashMap::new(),
             pending_detach: Vec::new(),
@@ -1332,6 +1338,17 @@ impl App {
         if !self.tabs.contains(&self.active_ws) {
             self.active_ws = self.tabs.first().copied().unwrap_or(self.active_ws);
         }
+        // Ports claimed by more than one HostPort (across every workspace, since
+        // they all run) can't all bind — flag them.
+        let mut port_count: HashMap<u16, u32> = HashMap::new();
+        for &p in full.host_ports.values() {
+            *port_count.entry(p).or_default() += 1;
+        }
+        self.port_conflicts = port_count
+            .into_iter()
+            .filter(|&(_, c)| c > 1)
+            .map(|(p, _)| p)
+            .collect();
         self.view = full.for_workspace(self.active_ws);
 
         // Apply pan/zoom (zoom immediate, pan eased).
@@ -1877,6 +1894,7 @@ impl App {
             // localhost port when wired.
             if let Some(&port) = self.view.host_ports.get(&id) {
                 let serving = self.view.serves.values().any(|&hp| hp == id);
+                let conflict = self.port_conflicts.contains(&port);
                 quads.push(Quad::solid(white, r, HOSTPORT_BORDER, clip));
                 let body = [
                     r[0] + BORDER * zf,
@@ -1896,24 +1914,27 @@ impl App {
                     r[0] + PAD * zf,
                     r[1] + PAD * zf,
                     zf,
-                    TEXT,
+                    if conflict { WARN } else { TEXT },
                     clip,
                 );
+                let (status, status_col) = if conflict {
+                    ("port in use", WARN)
+                } else if serving {
+                    ("live ●", [0.4, 0.85, 0.5, 1.0])
+                } else {
+                    ("idle", [0.55, 0.7, 0.72, 1.0])
+                };
                 self.text_cache.draw(
                     &mut quads,
                     &mut gfx.renderer,
                     &gfx.fonts,
                     &gfx.device,
                     &gfx.queue,
-                    if serving { "live ●" } else { "idle" },
+                    status,
                     r[0] + PAD * zf,
                     r[1] + (PAD + lh) * zf,
                     zf * 0.7,
-                    if serving {
-                        [0.4, 0.85, 0.5, 1.0]
-                    } else {
-                        [0.55, 0.7, 0.72, 1.0]
-                    },
+                    status_col,
                     clip,
                 );
                 let cb = close_btn(r, zf);
