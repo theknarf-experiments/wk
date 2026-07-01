@@ -398,6 +398,8 @@ struct Drag {
 enum PaletteCmd {
     /// Launch the dependency at this index in `available`.
     Launch(usize),
+    /// Centre the camera on this node.
+    GoTo(NodeId),
     AddVirtualFile,
     AddHostFile,
     AddPort,
@@ -935,8 +937,32 @@ impl App {
         for &z in &ZOOM_PRESETS {
             v.push((format!("Zoom {:.0}%", z * 100.0), PaletteCmd::Zoom(z)));
         }
+        // Jump to any node in the active workspace (searchable by name).
+        for &id in &self.view.node_ids {
+            v.push((
+                format!("Go to {}", self.node_label(id)),
+                PaletteCmd::GoTo(id),
+            ));
+        }
         v.push(("Quit wk".into(), PaletteCmd::Quit));
         v
+    }
+
+    /// A short human label for a node (for palette search / "go to").
+    fn node_label(&self, id: NodeId) -> String {
+        if let Some(n) = self.view.app_node(id) {
+            n.name.clone()
+        } else if let Some(f) = self.view.file_nodes.get(&id) {
+            f.name.clone()
+        } else if let Some(&p) = self.view.host_ports.get(&id) {
+            format!("port :{p}")
+        } else if self.view.gateways.contains(&id) {
+            "gateway".into()
+        } else if self.view.net_nodes.contains(&id) {
+            "network".into()
+        } else {
+            "node".into()
+        }
     }
 
     /// Palette entries matching the current query (case-insensitive substring).
@@ -1038,6 +1064,15 @@ impl App {
             PaletteCmd::Launch(dep) => {
                 let pos = self.view_center([360.0, 260.0], 0);
                 self.conn.send(Command::Launch { dep, pos, ws });
+            }
+            PaletteCmd::GoTo(id) => {
+                if let (Some(&pos), Some(&size)) =
+                    (self.view.win_pos.get(&id), self.view.win_size.get(&id))
+                {
+                    let c = [pos[0] + size[0] * 0.5, pos[1] + size[1] * 0.5];
+                    let z = self.cam.zoom;
+                    self.pan_target = [fb[0] * 0.5 - c[0] * z, fb[1] * 0.5 - c[1] * z];
+                }
             }
             PaletteCmd::AddVirtualFile => {
                 let pos = self.next_file_pos();
