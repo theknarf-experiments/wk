@@ -32,6 +32,11 @@ use std::path::{Path, PathBuf};
 /// `.wk` workspaces can coexist in one directory.
 pub const DEFAULT_WORKSPACE: &str = "workspace.wk";
 
+/// Written as the first line of every `.wk` file so editors highlight it as KDL
+/// despite the custom extension. `//` is a KDL comment, so it round-trips
+/// harmlessly (the parser ignores it).
+const MODELINE: &str = "// vim: set filetype=kdl :";
+
 // ---- manifest: dependencies ----
 
 /// Where a dependency's wasm comes from.
@@ -357,7 +362,8 @@ impl Workspace {
         }
 
         doc.autoformat();
-        doc.to_string()
+        // Lead with a modeline so `.wk` files highlight as KDL in editors.
+        format!("{MODELINE}\n{doc}")
     }
 }
 
@@ -662,7 +668,10 @@ mod tests {
             net_links: vec![(1, 7)],
         };
 
-        let back = Workspace::from_kdl(&ws.to_kdl()).expect("parses");
+        let text = ws.to_kdl();
+        // First line is the editor modeline; it must not break parsing.
+        assert!(text.starts_with(MODELINE), "starts with the modeline");
+        let back = Workspace::from_kdl(&text).expect("parses (modeline ignored)");
         // Manifest.
         assert_eq!(back.dependencies.len(), 2);
         assert_eq!(back.dependencies[0].name, "triangle");

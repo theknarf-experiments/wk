@@ -1,3 +1,4 @@
+// vim: set filetype=kdl :
 dependencies {
     triangle "plugins/triangle/target/wasm32-wasip1/debug/triangle.wasm"
     paint "plugins/paint/target/wasm32-wasip1/debug/paint.wasm"
