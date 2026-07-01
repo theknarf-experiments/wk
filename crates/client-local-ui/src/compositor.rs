@@ -2616,12 +2616,10 @@ impl ApplicationHandler for App {
                         self.new_workspace();
                         return;
                     }
-                    // Cmd/Ctrl+Tab cycles tabs; add Shift to go backwards.
-                    if pressed
-                        && !event.repeat
-                        && (self.mods.super_key() || self.mods.control_key())
-                        && code == KeyCode::Tab
-                    {
+                    // Ctrl+Tab cycles tabs (Shift to go backwards). Not Cmd+Tab:
+                    // macOS reserves that for its app switcher, so it never
+                    // reaches the app; Ctrl+Tab is free on every platform.
+                    if pressed && !event.repeat && self.mods.control_key() && code == KeyCode::Tab {
                         self.cycle_tab(!self.mods.shift_key());
                         return;
                     }
