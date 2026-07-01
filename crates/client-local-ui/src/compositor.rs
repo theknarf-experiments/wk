@@ -556,8 +556,6 @@ struct App {
     conn: ServerHandle,
     /// The latest snapshot, refreshed at the top of each `frame`.
     view: View,
-    /// The camera last reported to the server, so we only resend on change.
-    sent_cam: (f32, f32, f32),
     gfx: Option<Gfx>,
     /// Nodes currently popped out into their own OS window, keyed by node id.
     detached: HashMap<NodeId, Detached>,
@@ -614,24 +612,22 @@ struct App {
 }
 
 impl App {
-    /// Build the window client for a connection to a running server, taking the
-    /// initial camera from the server's current view (the saved workspace view).
     fn new(conn: ServerHandle) -> Result<Self, String> {
         let view = conn.view();
-        let pan = [view.camera.0, view.camera.1];
-        let zoom = view.camera.2.clamp(ZOOM_MIN, ZOOM_MAX);
         Ok(App {
             conn,
             view,
-            sent_cam: (f32::NAN, f32::NAN, f32::NAN),
             gfx: None,
             detached: HashMap::new(),
             pending_detach: Vec::new(),
             views: HashMap::new(),
             text_cache: TextCache::default(),
             terminals: HashMap::new(),
-            cam: Camera { pan, zoom },
-            pan_target: pan,
+            cam: Camera {
+                pan: [0.0, 0.0],
+                zoom: 1.0,
+            },
+            pan_target: [0.0, 0.0],
             viewport: [1280.0, 800.0],
             z: Vec::new(),
             kbd_focus: None,
@@ -1212,18 +1208,6 @@ impl App {
         ];
         self.pan_delta = [0.0, 0.0];
         self.zoom_factor = 1.0;
-
-        // Report our view to the server (only on change) so it persists the
-        // latest camera when it saves. Camera is a per-client concept; the
-        // server just remembers the last one it was told.
-        let cam = (self.cam.pan[0], self.cam.pan[1], self.cam.zoom);
-        if cam != self.sent_cam {
-            self.sent_cam = cam;
-            self.conn.send(Command::SetCamera {
-                pan: self.cam.pan,
-                zoom: self.cam.zoom,
-            });
-        }
 
         let mp = self.mouse;
         let lmb = self.lmb;
@@ -2561,7 +2545,7 @@ impl wk_protocol::Client<ServerHandle> for WindowClient {
             }
         }
         // The server owns persistence; the window closing just detaches this
-        // client. The camera was already reported via `Command::SetCamera`.
+        // client.
         Ok(())
     }
 }

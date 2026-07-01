@@ -1,7 +1,7 @@
 //! The wk **workspace**: a `.wk` file (KDL syntax; `workspace.wk` by default,
 //! but several can share a directory) that holds everything about a project —
 //! both its *manifest* (the dependencies it can launch) and its *session* (the
-//! live canvas: camera, the nodes that were open and where, and the connections
+//! live canvas: the nodes that were open and where, and the connections
 //! wiring them). One file, one type, one reader and one writer — a `wk run`
 //! reopens exactly where you left off, and `wk add`/`wk remove` edit
 //! dependencies without disturbing the layout (it all round-trips through
@@ -12,7 +12,6 @@
 //!     triangle "plugins/triangle/.../triangle.wasm"
 //!     foo      "oci://ghcr.io/org/foo:1.0"
 //! }
-//! camera { pan 0 0; zoom 1 }
 //! node "synth" 1 { pos 19 88; size 360 260; options 0.3 2.0 0.0 1800.0 }
 //! virtualfile "chan" 2 { pos 400 120; size 130 44 }
 //! hostfile "notes.txt" 6 { pos 400 200; size 130 44 }
@@ -148,8 +147,6 @@ pub struct NetState {
 /// The whole workspace: the manifest (dependencies) and the session (the canvas).
 pub struct Workspace {
     pub dependencies: Vec<Dependency>,
-    /// Canvas camera: pan x, pan y, zoom.
-    pub camera: (f32, f32, f32),
     pub nodes: Vec<NodeState>,
     /// In-memory VirtualFile nodes; `name` holds the mount name.
     pub virtual_files: Vec<NodeState>,
@@ -174,7 +171,6 @@ impl Workspace {
     pub fn empty() -> Self {
         Workspace {
             dependencies: Vec::new(),
-            camera: (0.0, 0.0, 1.0),
             nodes: Vec::new(),
             virtual_files: Vec::new(),
             host_files: Vec::new(),
@@ -237,19 +233,6 @@ impl Workspace {
             })
             .unwrap_or_default();
 
-        let mut camera = (0.0, 0.0, 1.0);
-        if let Some(cam) = doc.get("camera").and_then(|n| n.children()) {
-            if let Some(pan) = cam.get("pan") {
-                if let (Some(x), Some(y)) = (pan.get(0).and_then(num), pan.get(1).and_then(num)) {
-                    camera.0 = x;
-                    camera.1 = y;
-                }
-            }
-            if let Some(z) = cam.get("zoom").and_then(|n| n.get(0)).and_then(num) {
-                camera.2 = z;
-            }
-        }
-
         let pair = |n: &KdlNode| match (n.get(0).and_then(node_id), n.get(1).and_then(node_id)) {
             (Some(a), Some(b)) => Some((a, b)),
             _ => None,
@@ -282,7 +265,6 @@ impl Workspace {
 
         Ok(Workspace {
             dependencies,
-            camera,
             nodes,
             virtual_files,
             host_files,
@@ -317,18 +299,6 @@ impl Workspace {
         }
         deps.set_children(children);
         doc.nodes_mut().push(deps);
-
-        // Session.
-        let mut cam = KdlNode::new("camera");
-        let mut cam_ch = KdlDocument::new();
-        cam_ch
-            .nodes_mut()
-            .push(node2("pan", self.camera.0, self.camera.1));
-        let mut zoom = KdlNode::new("zoom");
-        zoom.push(KdlEntry::new(self.camera.2 as f64));
-        cam_ch.nodes_mut().push(zoom);
-        cam.set_children(cam_ch);
-        doc.nodes_mut().push(cam);
 
         for n in &self.nodes {
             doc.nodes_mut().push(placed_kdl("node", n));
@@ -625,7 +595,6 @@ mod tests {
                     args: vec!["example.com".into(), "80".into()],
                 },
             ],
-            camera: (12.5, -40.0, 1.5),
             nodes: vec![NodeState {
                 name: "synth".into(),
                 id: synth,
@@ -686,7 +655,6 @@ mod tests {
         assert_eq!(back.dependencies[1].args, vec!["example.com", "80"]);
         assert!(matches!(back.dependencies[1].source, Source::Oci(_)));
         // Session.
-        assert_eq!(back.camera, ws.camera);
         assert_eq!(back.nodes.len(), 1);
         assert_eq!(back.nodes[0].name, "synth");
         assert_eq!(back.nodes[0].options, vec![8.0, 0.6, 0.0, 1.0]);

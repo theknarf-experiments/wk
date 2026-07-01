@@ -168,7 +168,5 @@ fn serve(
         }
         thread::sleep(STEP);
     }
-    let s = server.lock().unwrap();
-    let cam = s.camera;
-    s.save(cam);
+    server.lock().unwrap().save();
 }

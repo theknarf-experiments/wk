@@ -100,7 +100,6 @@ pub struct View {
     pub node_args: HashMap<NodeId, Vec<String>>,
     /// The workspace's launchable dependencies (for the command palette).
     pub available: Vec<Dependency>,
-    pub camera: (f32, f32, f32),
     pub nodes: Vec<SharedNode>,
     pub surfaces: Vec<SharedSurface>,
 }
@@ -140,9 +139,6 @@ pub struct Server {
     pub available: Vec<Dependency>,
     /// The `.wk` file this workspace loads from and saves back to.
     workspace_path: PathBuf,
-    /// Persisted camera (pan x, pan y, zoom) — the client reads it as its initial
-    /// view and writes its current view back on save.
-    pub camera: (f32, f32, f32),
 
     /// Node positions/sizes, keyed by node id (shared canvas geometry).
     pub win_pos: HashMap<NodeId, [f32; 2]>,
@@ -183,7 +179,6 @@ impl Server {
             node_reg: Arc::new(Mutex::new(Vec::new())),
             available: ws.dependencies.clone(),
             workspace_path: path,
-            camera: ws.camera,
             win_pos: HashMap::new(),
             win_size: HashMap::new(),
             node_args: HashMap::new(),
@@ -761,8 +756,7 @@ impl Server {
     }
 
     /// Snapshot the document into a [`Workspace`] and write it back to disk.
-    /// `camera` is the client's current view (persisted for next open).
-    pub fn save(&self, camera: (f32, f32, f32)) {
+    pub fn save(&self) {
         let nodes = self
             .node_reg
             .lock()
@@ -840,7 +834,6 @@ impl Server {
             .collect();
         let ws = Workspace {
             dependencies: self.available.clone(),
-            camera,
             nodes,
             virtual_files,
             host_files,
@@ -890,7 +883,6 @@ impl Server {
             Command::RunNode { id } => self.run_node(id),
             Command::SetNodeArgs { id, args } => self.set_node_args(id, &args),
             Command::ChangePort { id, delta } => self.change_port(id, delta),
-            Command::SetCamera { pan, zoom } => self.camera = (pan[0], pan[1], zoom),
         }
     }
 
@@ -934,7 +926,6 @@ impl Server {
             serves,
             node_args: self.node_args.clone(),
             available: self.available.clone(),
-            camera: self.camera,
             nodes,
             surfaces,
         }

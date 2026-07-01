@@ -44,7 +44,7 @@ pub enum Operation {
     Wire,
     /// Run/configure a node (run, set args, change a port).
     Control,
-    /// Reposition the canvas or a node (move, resize, camera). Cosmetic layout.
+    /// Reposition or resize a node. Cosmetic layout.
     Arrange,
 }
 
@@ -101,10 +101,6 @@ pub enum Command {
     SetNodeArgs { id: NodeId, args: String },
     /// Nudge a HostPort's localhost port by `delta`.
     ChangePort { id: NodeId, delta: i32 },
-    /// Report a client's current view so the server persists it on save. The
-    /// camera is a per-client concept; the server just remembers the latest it
-    /// was told (there is only one persisted view in the workspace file).
-    SetCamera { pan: [f32; 2], zoom: f32 },
 }
 
 impl Command {
@@ -122,9 +118,7 @@ impl Command {
             Command::RunNode { .. } | Command::SetNodeArgs { .. } | Command::ChangePort { .. } => {
                 Operation::Control
             }
-            Command::MoveNode { .. } | Command::ResizeNode { .. } | Command::SetCamera { .. } => {
-                Operation::Arrange
-            }
+            Command::MoveNode { .. } | Command::ResizeNode { .. } => Operation::Arrange,
         }
     }
 }
