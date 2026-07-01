@@ -21,9 +21,9 @@ use crate::plugin::{
     Key, KeyEvent, NodeRegistry, PluginHost, PointerEvent, ResizeEvent, SharedNode, SharedSurface,
     SurfaceRegistry,
 };
-use crate::project::Dependency;
 use crate::render2d::{Quad, Renderer, TextureId};
 use crate::text::Fonts;
+use crate::workspace::{Dependency, Workspace};
 
 /// Target frame time (~60 fps).
 const FRAME: Duration = Duration::from_nanos(1_000_000_000 / 60);
@@ -605,7 +605,10 @@ fn draw_connection(
 /// `ApplicationHandler`; the per-frame work happens in `frame`.
 struct App {
     gfx: Option<Gfx>,
-    persist_session: bool,
+    /// Whether to save the canvas back to `wk.kdl` on exit (false for ad-hoc runs).
+    persist: bool,
+    /// The workspace name, preserved when saving.
+    workspace_name: String,
     host: PluginHost,
     registry: SurfaceRegistry,
     node_reg: NodeRegistry,
@@ -692,17 +695,18 @@ struct App {
 }
 
 impl App {
-    fn new(plugins: &[Dependency], persist_session: bool) -> Result<Self, String> {
+    fn new(ws: &Workspace, persist: bool) -> Result<Self, String> {
         let host = PluginHost::new().map_err(|e| format!("{e:#}"))?;
         let registry: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
         let node_reg: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
         let mut app = App {
             gfx: None,
-            persist_session,
+            persist,
+            workspace_name: ws.name.clone(),
             host,
             registry,
             node_reg,
-            available: plugins.to_vec(),
+            available: ws.dependencies.clone(),
             next_node_id: 0,
             views: HashMap::new(),
             text_cache: TextCache::default(),
@@ -751,7 +755,7 @@ impl App {
             key_events: Vec::new(),
             term_input: Vec::new(),
         };
-        app.restore_session();
+        app.restore(ws);
         Ok(app)
     }
 
@@ -762,13 +766,9 @@ impl App {
         id
     }
 
-    fn restore_session(&mut self) {
-        if !self.persist_session {
-            return;
-        }
-        let Some(saved) = crate::session::Session::load() else {
-            return;
-        };
+    /// Recreate the saved canvas (nodes, files, connections, camera) from the
+    /// loaded workspace.
+    fn restore(&mut self, saved: &Workspace) {
         self.cam.pan = [saved.camera.0, saved.camera.1];
         self.cam.zoom = saved.camera.2.clamp(ZOOM_MIN, ZOOM_MAX);
         self.pan_target = self.cam.pan;
@@ -780,7 +780,7 @@ impl App {
             max_id = max_id.max(n.id);
             let Some(dep) = self.available.iter().find(|d| d.name == n.name).cloned() else {
                 eprintln!(
-                    "session references unknown dependency {:?}; skipping",
+                    "workspace references unknown dependency {:?}; skipping",
                     n.name
                 );
                 continue;
@@ -2709,8 +2709,9 @@ impl App {
         self.gfx = Some(gfx);
     }
 
-    fn save_session(&self) {
-        if !self.persist_session {
+    /// Write the whole workspace (dependencies + current canvas) back to wk.kdl.
+    fn save_workspace(&self) {
+        if !self.persist {
             return;
         }
         let nodes = self
@@ -2719,7 +2720,7 @@ impl App {
             .unwrap()
             .iter()
             .filter_map(|node| {
-                Some(crate::session::SessionNode {
+                Some(crate::workspace::NodeState {
                     name: node.name.clone(),
                     id: node.id,
                     pos: *self.win_pos.get(&node.id)?,
@@ -2736,7 +2737,7 @@ impl App {
             .file_nodes
             .iter()
             .filter_map(|(&id, f)| match f {
-                FileNode::Virtual(v) => Some(crate::session::SessionNode {
+                FileNode::Virtual(v) => Some(crate::workspace::NodeState {
                     name: v.name.clone(),
                     id,
                     pos: *self.win_pos.get(&id)?,
@@ -2751,7 +2752,7 @@ impl App {
             .file_nodes
             .iter()
             .filter_map(|(&id, f)| match f {
-                FileNode::HostMapped(h) => Some(crate::session::SessionNode {
+                FileNode::HostMapped(h) => Some(crate::workspace::NodeState {
                     name: h.path.to_string_lossy().into_owned(),
                     id,
                     pos: *self.win_pos.get(&id)?,
@@ -2766,7 +2767,7 @@ impl App {
             .host_ports
             .iter()
             .filter_map(|(&id, &port)| {
-                Some(crate::session::SessionPort {
+                Some(crate::workspace::PortState {
                     id,
                     port,
                     pos: *self.win_pos.get(&id)?,
@@ -2783,7 +2784,7 @@ impl App {
             .net_nodes
             .iter()
             .filter_map(|&id| {
-                Some(crate::session::SessionNet {
+                Some(crate::workspace::NetState {
                     id,
                     gateway: self.gateways.contains(&id),
                     pos: *self.win_pos.get(&id)?,
@@ -2791,7 +2792,9 @@ impl App {
                 })
             })
             .collect();
-        let saved = crate::session::Session {
+        let ws = Workspace {
+            name: self.workspace_name.clone(),
+            dependencies: self.available.clone(),
             camera: (self.cam.pan[0], self.cam.pan[1], self.cam.zoom),
             nodes,
             virtual_files,
@@ -2803,8 +2806,8 @@ impl App {
             nets,
             net_links: self.net_links.clone(),
         };
-        if let Err(e) = saved.save() {
-            eprintln!("failed to save session: {e}");
+        if let Err(e) = ws.save() {
+            eprintln!("failed to save workspace: {e}");
         }
     }
 }
@@ -2957,9 +2960,9 @@ impl ApplicationHandler for App {
     }
 }
 
-pub fn run(plugins: &[Dependency], persist_session: bool) -> Result<(), String> {
+pub fn run(ws: Workspace, persist: bool) -> Result<(), String> {
     let mut event_loop = EventLoop::builder().build().map_err(|e| e.to_string())?;
-    let mut app = App::new(plugins, persist_session)?;
+    let mut app = App::new(&ws, persist)?;
     loop {
         // Pump (and render, via `about_to_wait`) with the handler set the whole
         // time, blocking up to a frame for events — this paces ~60fps when idle
@@ -2969,6 +2972,6 @@ pub fn run(plugins: &[Dependency], persist_session: bool) -> Result<(), String> 
             break;
         }
     }
-    app.save_session();
+    app.save_workspace();
     Ok(())
 }

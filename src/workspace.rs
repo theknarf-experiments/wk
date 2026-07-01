@@ -1,0 +1,747 @@
+//! The wk **workspace**: a single `wk.kdl` file in the working directory that
+//! holds everything about a project — both its *manifest* (a name and the
+//! dependencies it can launch) and its *session* (the live canvas: camera, the
+//! nodes that were open and where, and the connections wiring them). One file,
+//! one type, one reader and one writer — a `wk run` reopens exactly where you
+//! left off, and `wk add`/`wk remove` edit dependencies without disturbing the
+//! layout (it all round-trips through [`Workspace`]).
+//!
+//! ```kdl
+//! name "my-workspace"
+//! dependencies {
+//!     triangle "plugins/triangle/.../triangle.wasm"
+//!     foo      "oci://ghcr.io/org/foo:1.0"
+//! }
+//! camera { pan 0 0; zoom 1 }
+//! node "synth" 1 { pos 19 88; size 360 260; options 0.3 2.0 0.0 1800.0 }
+//! virtualfile "chan" 2 { pos 400 120; size 130 44 }
+//! hostfile "notes.txt" 6 { pos 400 200; size 130 44 }
+//! connection 2 1
+//! midi 3 4
+//! hostport 5 { port 8080; pos 600 100; size 130 44 }
+//! serve 1 5
+//! network 7 { pos 700 100; size 130 44 }
+//! gateway 8 { pos 700 200; size 130 44 }
+//! netlink 1 7
+//! ```
+
+use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
+use std::path::{Path, PathBuf};
+
+/// The workspace file, looked up in the current directory.
+pub const WORKSPACE: &str = "wk.kdl";
+
+// ---- manifest: dependencies ----
+
+/// Where a dependency's wasm comes from.
+#[derive(Debug, Clone)]
+pub enum Source {
+    /// A local `.wasm` file.
+    Path(PathBuf),
+    /// An OCI registry reference (e.g. `ghcr.io/org/name:1.0`), pulled + cached.
+    Oci(String),
+}
+
+impl Source {
+    /// Parse the string form stored in wk.kdl (an `oci://` prefix means OCI).
+    pub fn parse(s: &str) -> Self {
+        match s.strip_prefix("oci://") {
+            Some(reference) => Source::Oci(reference.to_string()),
+            None => Source::Path(PathBuf::from(s)),
+        }
+    }
+
+    /// The string written back to wk.kdl.
+    pub fn to_kdl(&self) -> String {
+        match self {
+            Source::Path(p) => p.to_string_lossy().into_owned(),
+            Source::Oci(reference) => format!("oci://{reference}"),
+        }
+    }
+
+    /// The local path to load the wasm from. For OCI this is the cache location
+    /// (which [`Source::ensure`] populates); it may not exist until then.
+    pub fn local_path(&self) -> PathBuf {
+        match self {
+            Source::Path(p) => p.clone(),
+            Source::Oci(reference) => crate::oci::cache_path(reference),
+        }
+    }
+
+    /// Make the wasm available locally: pull + cache an OCI artifact if it isn't
+    /// already cached. A no-op for local paths.
+    pub fn ensure(&self) -> Result<(), String> {
+        if let Source::Oci(reference) = self {
+            let path = crate::oci::cache_path(reference);
+            if !path.exists() {
+                println!("pulling {reference} ...");
+                let bytes = crate::oci::pull(reference)?;
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One workspace dependency: a short name resolving to a plugin source.
+#[derive(Debug, Clone)]
+pub struct Dependency {
+    pub name: String,
+    pub source: Source,
+    /// Command-line arguments passed to the plugin (after argv[0] = name), e.g.
+    /// a filename for an editor. Set in wk.kdl as `name "path" { args "..." }`.
+    pub args: Vec<String>,
+}
+
+impl Dependency {
+    pub fn from_path(source: PathBuf) -> Self {
+        let name = source
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "plugin".to_string());
+        Dependency {
+            name,
+            source: Source::Path(source),
+            args: Vec::new(),
+        }
+    }
+
+    /// The local path to load this dependency's wasm from.
+    pub fn local_path(&self) -> PathBuf {
+        self.source.local_path()
+    }
+
+    /// Pull + cache the dependency if it's an OCI artifact not yet local.
+    pub fn ensure(&self) -> Result<(), String> {
+        self.source.ensure()
+    }
+}
+
+// ---- session: placed nodes on the canvas ----
+
+/// A placed node: an app instance (`node`) or a file node (`virtualfile`/
+/// `hostfile`).
+pub struct NodeState {
+    /// Dependency name (for app nodes) or file name (for file nodes).
+    pub name: String,
+    pub id: u64,
+    pub pos: [f32; 2],
+    pub size: [f32; 2],
+    /// App-node option values (e.g. knob settings), persisted positionally.
+    /// Empty for file nodes (and app nodes that report none).
+    pub options: Vec<f32>,
+    /// App-node launch args (e.g. a client's target host/port), editable in the
+    /// GUI. Empty for file nodes and nodes left at their dependency default.
+    pub args: Vec<String>,
+}
+
+/// A HostPort node: a localhost port plus its canvas placement.
+pub struct PortState {
+    pub id: u64,
+    pub port: u16,
+    pub pos: [f32; 2],
+    pub size: [f32; 2],
+}
+
+/// A Network (or Gateway) node and its canvas placement.
+pub struct NetState {
+    pub id: u64,
+    pub gateway: bool,
+    pub pos: [f32; 2],
+    pub size: [f32; 2],
+}
+
+/// The whole workspace: manifest (name + dependencies) and session (the canvas).
+pub struct Workspace {
+    pub name: String,
+    pub dependencies: Vec<Dependency>,
+    /// Canvas camera: pan x, pan y, zoom.
+    pub camera: (f32, f32, f32),
+    pub nodes: Vec<NodeState>,
+    /// In-memory VirtualFile nodes; `name` holds the mount name.
+    pub virtual_files: Vec<NodeState>,
+    /// HostMappedFile nodes; `name` holds the host file path.
+    pub host_files: Vec<NodeState>,
+    /// HostPort nodes (localhost port + canvas placement).
+    pub host_ports: Vec<PortState>,
+    /// File connections as (file id, app node id).
+    pub connections: Vec<(u64, u64)>,
+    /// MIDI connections as (source node id, destination node id).
+    pub midi: Vec<(u64, u64)>,
+    /// Serve wiring as (wasi:http node id, HostPort id).
+    pub serves: Vec<(u64, u64)>,
+    /// Network/Gateway nodes.
+    pub nets: Vec<NetState>,
+    /// Network membership wiring as (app node id, Network/Gateway node id).
+    pub net_links: Vec<(u64, u64)>,
+}
+
+impl Workspace {
+    /// An empty workspace with the given name (no dependencies, blank canvas).
+    pub fn with_name(name: String) -> Self {
+        Workspace {
+            name,
+            dependencies: Vec::new(),
+            camera: (0.0, 0.0, 1.0),
+            nodes: Vec::new(),
+            virtual_files: Vec::new(),
+            host_files: Vec::new(),
+            host_ports: Vec::new(),
+            connections: Vec::new(),
+            midi: Vec::new(),
+            serves: Vec::new(),
+            nets: Vec::new(),
+            net_links: Vec::new(),
+        }
+    }
+
+    /// An ad-hoc workspace for `wk run <paths...>`: dependencies straight from
+    /// local `.wasm` paths, a blank canvas (this run isn't persisted).
+    pub fn from_paths(paths: &[PathBuf]) -> Self {
+        let mut ws = Workspace::with_name("wk".to_string());
+        ws.dependencies = paths.iter().cloned().map(Dependency::from_path).collect();
+        ws
+    }
+
+    /// Load the workspace from `wk.kdl` in the current directory.
+    pub fn load() -> Result<Self, String> {
+        let text = std::fs::read_to_string(WORKSPACE)
+            .map_err(|e| format!("no {WORKSPACE} in this directory ({e}); run `wk init` first"))?;
+        Self::from_kdl(&text)
+    }
+
+    /// Write the whole workspace back to `wk.kdl`.
+    pub fn save(&self) -> Result<(), String> {
+        std::fs::write(WORKSPACE, self.to_kdl())
+            .map_err(|e| format!("failed to write {WORKSPACE}: {e}"))
+    }
+
+    /// Add a dependency (idempotent by name), persisting the workspace. Returns
+    /// `true` if newly added.
+    pub fn add_dependency(&mut self, dep: Dependency) -> Result<bool, String> {
+        if self.dependencies.iter().any(|d| d.name == dep.name) {
+            return Ok(false);
+        }
+        self.dependencies.push(dep);
+        self.save()?;
+        Ok(true)
+    }
+
+    /// Remove a dependency by name, persisting the workspace. Returns how many
+    /// were removed.
+    pub fn remove_dependency(&mut self, name: &str) -> Result<usize, String> {
+        let before = self.dependencies.len();
+        self.dependencies.retain(|d| d.name != name);
+        let removed = before - self.dependencies.len();
+        if removed > 0 {
+            self.save()?;
+        }
+        Ok(removed)
+    }
+
+    fn from_kdl(text: &str) -> Result<Self, String> {
+        let doc: KdlDocument = text
+            .parse()
+            .map_err(|e| format!("failed to parse {WORKSPACE}: {e}"))?;
+
+        let name = doc
+            .get("name")
+            .and_then(|n| n.get(0))
+            .and_then(|v| v.as_string())
+            .unwrap_or("wk-workspace")
+            .to_string();
+
+        let dependencies = doc
+            .get("dependencies")
+            .and_then(|n| n.children())
+            .map(|ch| {
+                ch.nodes()
+                    .iter()
+                    .filter_map(|n| {
+                        // Tolerate an npm-style trailing colon on the name.
+                        let name = n.name().value().trim_end_matches(':').to_string();
+                        let source = n.get(0).and_then(|v| v.as_string())?;
+                        let args = n
+                            .children()
+                            .and_then(|ch| ch.get("args"))
+                            .map(|a| {
+                                a.entries()
+                                    .iter()
+                                    .filter_map(|e| e.value().as_string().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        Some(Dependency {
+                            name,
+                            source: Source::parse(source),
+                            args,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut camera = (0.0, 0.0, 1.0);
+        if let Some(cam) = doc.get("camera").and_then(|n| n.children()) {
+            if let Some(pan) = cam.get("pan") {
+                if let (Some(x), Some(y)) = (pan.get(0).and_then(num), pan.get(1).and_then(num)) {
+                    camera.0 = x;
+                    camera.1 = y;
+                }
+            }
+            if let Some(z) = cam.get("zoom").and_then(|n| n.get(0)).and_then(num) {
+                camera.2 = z;
+            }
+        }
+
+        let pair = |n: &KdlNode| match (n.get(0).and_then(uint), n.get(1).and_then(uint)) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
+        };
+
+        let mut nodes = Vec::new();
+        let mut virtual_files = Vec::new();
+        let mut host_files = Vec::new();
+        let mut host_ports = Vec::new();
+        let mut connections = Vec::new();
+        let mut midi = Vec::new();
+        let mut serves = Vec::new();
+        let mut nets = Vec::new();
+        let mut net_links = Vec::new();
+        for n in doc.nodes() {
+            match n.name().value() {
+                "node" => nodes.extend(parse_placed(n)),
+                "virtualfile" => virtual_files.extend(parse_placed(n)),
+                "hostfile" => host_files.extend(parse_placed(n)),
+                "hostport" => host_ports.extend(parse_hostport(n)),
+                "connection" => connections.extend(pair(n)),
+                "midi" => midi.extend(pair(n)),
+                "serve" => serves.extend(pair(n)),
+                "network" => nets.extend(parse_net(n, false)),
+                "gateway" => nets.extend(parse_net(n, true)),
+                "netlink" => net_links.extend(pair(n)),
+                _ => {} // name / dependencies / unknown
+            }
+        }
+
+        Ok(Workspace {
+            name,
+            dependencies,
+            camera,
+            nodes,
+            virtual_files,
+            host_files,
+            host_ports,
+            connections,
+            midi,
+            serves,
+            nets,
+            net_links,
+        })
+    }
+
+    fn to_kdl(&self) -> String {
+        let mut doc = KdlDocument::new();
+
+        // Manifest.
+        let mut name_node = KdlNode::new("name");
+        name_node.push(KdlEntry::new(self.name.clone()));
+        doc.nodes_mut().push(name_node);
+
+        let mut deps = KdlNode::new("dependencies");
+        let mut children = KdlDocument::new();
+        for dep in &self.dependencies {
+            let mut node = KdlNode::new(dep.name.clone());
+            node.push(KdlEntry::new(dep.source.to_kdl()));
+            if !dep.args.is_empty() {
+                let mut sub = KdlDocument::new();
+                let mut args_node = KdlNode::new("args");
+                for a in &dep.args {
+                    args_node.push(KdlEntry::new(a.clone()));
+                }
+                sub.nodes_mut().push(args_node);
+                node.set_children(sub);
+            }
+            children.nodes_mut().push(node);
+        }
+        deps.set_children(children);
+        doc.nodes_mut().push(deps);
+
+        // Session.
+        let mut cam = KdlNode::new("camera");
+        let mut cam_ch = KdlDocument::new();
+        cam_ch
+            .nodes_mut()
+            .push(node2("pan", self.camera.0, self.camera.1));
+        let mut zoom = KdlNode::new("zoom");
+        zoom.push(KdlEntry::new(self.camera.2 as f64));
+        cam_ch.nodes_mut().push(zoom);
+        cam.set_children(cam_ch);
+        doc.nodes_mut().push(cam);
+
+        for n in &self.nodes {
+            doc.nodes_mut().push(placed_kdl("node", n));
+        }
+        for f in &self.virtual_files {
+            doc.nodes_mut().push(placed_kdl("virtualfile", f));
+        }
+        for f in &self.host_files {
+            doc.nodes_mut().push(placed_kdl("hostfile", f));
+        }
+        for hp in &self.host_ports {
+            doc.nodes_mut().push(hostport_kdl(hp));
+        }
+        for &(file, node) in &self.connections {
+            doc.nodes_mut().push(pair_kdl("connection", file, node));
+        }
+        for &(src, dst) in &self.midi {
+            doc.nodes_mut().push(pair_kdl("midi", src, dst));
+        }
+        for &(http, hostport) in &self.serves {
+            doc.nodes_mut().push(pair_kdl("serve", http, hostport));
+        }
+        for n in &self.nets {
+            doc.nodes_mut().push(net_kdl(n));
+        }
+        for &(app, net) in &self.net_links {
+            doc.nodes_mut().push(pair_kdl("netlink", app, net));
+        }
+
+        doc.autoformat();
+        doc.to_string()
+    }
+}
+
+// ---- KDL parse/write helpers ----
+
+fn num(v: &KdlValue) -> Option<f32> {
+    v.as_float()
+        .map(|f| f as f32)
+        .or_else(|| v.as_integer().map(|i| i as f32))
+}
+
+fn uint(v: &KdlValue) -> Option<u64> {
+    v.as_integer().map(|i| i as u64)
+}
+
+/// Parse a `node`/`virtualfile`/`hostfile` entry: `<kind> "<name>" <id> { ... }`.
+fn parse_placed(n: &KdlNode) -> Option<NodeState> {
+    let name = n.get(0)?.as_string()?.to_string();
+    let id = uint(n.get(1)?)?;
+    let ch = n.children()?;
+    let pos = ch.get("pos")?;
+    let size = ch.get("size")?;
+    let options = ch
+        .get("options")
+        .map(|o| o.entries().iter().filter_map(|e| num(e.value())).collect())
+        .unwrap_or_default();
+    let args = ch
+        .get("args")
+        .map(|a| {
+            a.entries()
+                .iter()
+                .filter_map(|e| e.value().as_string().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(NodeState {
+        name,
+        id,
+        pos: [pos.get(0).and_then(num)?, pos.get(1).and_then(num)?],
+        size: [size.get(0).and_then(num)?, size.get(1).and_then(num)?],
+        options,
+        args,
+    })
+}
+
+/// Parse a `hostport <id> { port <p>; pos x y; size w h }` entry.
+fn parse_hostport(n: &KdlNode) -> Option<PortState> {
+    let id = uint(n.get(0)?)?;
+    let ch = n.children()?;
+    let port = ch.get("port").and_then(|p| p.get(0)).and_then(uint)? as u16;
+    let pos = ch.get("pos")?;
+    let size = ch.get("size")?;
+    Some(PortState {
+        id,
+        port,
+        pos: [pos.get(0).and_then(num)?, pos.get(1).and_then(num)?],
+        size: [size.get(0).and_then(num)?, size.get(1).and_then(num)?],
+    })
+}
+
+fn hostport_kdl(p: &PortState) -> KdlNode {
+    let mut node = KdlNode::new("hostport");
+    node.push(KdlEntry::new(p.id as i128));
+    let mut ch = KdlDocument::new();
+    let mut port = KdlNode::new("port");
+    port.push(KdlEntry::new(p.port as i128));
+    ch.nodes_mut().push(port);
+    ch.nodes_mut().push(node2("pos", p.pos[0], p.pos[1]));
+    ch.nodes_mut().push(node2("size", p.size[0], p.size[1]));
+    node.set_children(ch);
+    node
+}
+
+/// Parse a `network`/`gateway <id> { pos x y; size w h }` entry.
+fn parse_net(n: &KdlNode, gateway: bool) -> Option<NetState> {
+    let id = uint(n.get(0)?)?;
+    let ch = n.children()?;
+    let pos = ch.get("pos")?;
+    let size = ch.get("size")?;
+    Some(NetState {
+        id,
+        gateway,
+        pos: [pos.get(0).and_then(num)?, pos.get(1).and_then(num)?],
+        size: [size.get(0).and_then(num)?, size.get(1).and_then(num)?],
+    })
+}
+
+fn net_kdl(n: &NetState) -> KdlNode {
+    let mut node = KdlNode::new(if n.gateway { "gateway" } else { "network" });
+    node.push(KdlEntry::new(n.id as i128));
+    let mut ch = KdlDocument::new();
+    ch.nodes_mut().push(node2("pos", n.pos[0], n.pos[1]));
+    ch.nodes_mut().push(node2("size", n.size[0], n.size[1]));
+    node.set_children(ch);
+    node
+}
+
+fn placed_kdl(kind: &str, n: &NodeState) -> KdlNode {
+    let mut node = KdlNode::new(kind);
+    node.push(KdlEntry::new(n.name.clone()));
+    node.push(KdlEntry::new(n.id as i128));
+    let mut ch = KdlDocument::new();
+    ch.nodes_mut().push(node2("pos", n.pos[0], n.pos[1]));
+    ch.nodes_mut().push(node2("size", n.size[0], n.size[1]));
+    if !n.options.is_empty() {
+        let mut opts = KdlNode::new("options");
+        for &v in &n.options {
+            opts.push(KdlEntry::new(v as f64));
+        }
+        ch.nodes_mut().push(opts);
+    }
+    if !n.args.is_empty() {
+        let mut args = KdlNode::new("args");
+        for a in &n.args {
+            args.push(KdlEntry::new(a.clone()));
+        }
+        ch.nodes_mut().push(args);
+    }
+    node.set_children(ch);
+    node
+}
+
+/// A KDL node `name a b` with two float args.
+fn node2(name: &str, a: f32, b: f32) -> KdlNode {
+    let mut n = KdlNode::new(name);
+    n.push(KdlEntry::new(a as f64));
+    n.push(KdlEntry::new(b as f64));
+    n
+}
+
+/// A KDL node `name a b` with two integer-id args.
+fn pair_kdl(name: &str, a: u64, b: u64) -> KdlNode {
+    let mut n = KdlNode::new(name);
+    n.push(KdlEntry::new(a as i128));
+    n.push(KdlEntry::new(b as i128));
+    n
+}
+
+// ---- CLI commands ----
+
+/// Create a new `wk.kdl` in the current directory. Errors if one exists.
+pub fn init(name: Option<String>) -> Result<(), String> {
+    if Path::new(WORKSPACE).exists() {
+        return Err(format!("{WORKSPACE} already exists"));
+    }
+    let name = name.unwrap_or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "wk-workspace".to_string())
+    });
+    Workspace::with_name(name).save()?;
+    println!("created {WORKSPACE}");
+    Ok(())
+}
+
+/// Add a plugin to the workspace as a dependency. `target` is a local `.wasm`
+/// path or an `oci://<ref>` registry reference; the name is its file stem or the
+/// OCI repository's last segment. An OCI artifact is pulled now to validate it.
+pub fn add(target: String) -> Result<(), String> {
+    let mut ws = Workspace::load()?;
+    let source = Source::parse(&target);
+    let name = match &source {
+        Source::Path(p) => p
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "plugin".to_string()),
+        Source::Oci(reference) => crate::oci::name_for(reference),
+    };
+    source.ensure()?;
+    let dep = Dependency {
+        name: name.clone(),
+        source,
+        args: Vec::new(),
+    };
+    if ws.add_dependency(dep)? {
+        println!("added dependency: {name}");
+    } else {
+        println!("dependency already in workspace: {name}");
+    }
+    Ok(())
+}
+
+/// Publish a local plugin to an OCI registry as a Wasm OCI Artifact. `plugin` is
+/// a dependency name (resolved to its local wasm) or a `.wasm` path; `reference`
+/// is the target, e.g. `localhost:5000/triangle:1.0`.
+pub fn publish(plugin: String, reference: String) -> Result<(), String> {
+    let path = Workspace::load()
+        .ok()
+        .and_then(|w| w.dependencies.into_iter().find(|d| d.name == plugin))
+        .map(|d| d.local_path())
+        .unwrap_or_else(|| PathBuf::from(&plugin));
+    let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    crate::oci::push(&reference, &bytes)?;
+    println!("published {} -> oci://{reference}", path.display());
+    Ok(())
+}
+
+/// Print the workspace's dependencies.
+pub fn list() -> Result<(), String> {
+    let ws = Workspace::load()?;
+    println!("{}", ws.name);
+    if ws.dependencies.is_empty() {
+        println!("  (no dependencies; add one with `wk add <path>`)");
+    }
+    for dep in &ws.dependencies {
+        println!("  {}  {}", dep.name, dep.source.to_kdl());
+    }
+    Ok(())
+}
+
+/// Remove a dependency from the workspace by name.
+pub fn remove(name: String) -> Result<(), String> {
+    let mut ws = Workspace::load()?;
+    match ws.remove_dependency(&name)? {
+        0 => println!("no dependency named {name:?}"),
+        n => println!("removed {n} dependency named {name:?}"),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_parse_and_roundtrip() {
+        match Source::parse("oci://ghcr.io/org/foo:1.0") {
+            Source::Oci(r) => assert_eq!(r, "ghcr.io/org/foo:1.0"),
+            other => panic!("expected oci, got {other:?}"),
+        }
+        assert!(matches!(Source::parse("plugins/x.wasm"), Source::Path(_)));
+        assert_eq!(
+            Source::Oci("ghcr.io/o/f:1".into()).to_kdl(),
+            "oci://ghcr.io/o/f:1"
+        );
+        assert_eq!(Source::Path("a/b.wasm".into()).to_kdl(), "a/b.wasm");
+    }
+
+    #[test]
+    fn workspace_kdl_round_trips() {
+        let ws = Workspace {
+            name: "demo".into(),
+            dependencies: vec![
+                Dependency {
+                    name: "triangle".into(),
+                    source: Source::Path("plugins/triangle.wasm".into()),
+                    args: Vec::new(),
+                },
+                Dependency {
+                    name: "fetch".into(),
+                    source: Source::Oci("ghcr.io/o/fetch:1".into()),
+                    args: vec!["example.com".into(), "80".into()],
+                },
+            ],
+            camera: (12.5, -40.0, 1.5),
+            nodes: vec![NodeState {
+                name: "synth".into(),
+                id: 1,
+                pos: [40.0, 56.0],
+                size: [360.0, 260.0],
+                options: vec![8.0, 0.6, 0.0, 1.0],
+                args: vec!["netserve".into(), "80".into()],
+            }],
+            virtual_files: vec![NodeState {
+                name: "chan".into(),
+                id: 2,
+                pos: [200.0, 120.0],
+                size: [130.0, 44.0],
+                options: Vec::new(),
+                args: Vec::new(),
+            }],
+            host_files: vec![NodeState {
+                name: "notes.txt".into(),
+                id: 6,
+                pos: [200.0, 200.0],
+                size: [130.0, 44.0],
+                options: Vec::new(),
+                args: Vec::new(),
+            }],
+            host_ports: vec![PortState {
+                id: 5,
+                port: 8080,
+                pos: [600.0, 100.0],
+                size: [130.0, 44.0],
+            }],
+            connections: vec![(2, 1)],
+            midi: vec![(3, 4)],
+            serves: vec![(1, 5)],
+            nets: vec![
+                NetState {
+                    id: 7,
+                    gateway: false,
+                    pos: [700.0, 100.0],
+                    size: [130.0, 44.0],
+                },
+                NetState {
+                    id: 8,
+                    gateway: true,
+                    pos: [700.0, 200.0],
+                    size: [130.0, 44.0],
+                },
+            ],
+            net_links: vec![(1, 7)],
+        };
+
+        let back = Workspace::from_kdl(&ws.to_kdl()).expect("parses");
+        // Manifest.
+        assert_eq!(back.name, "demo");
+        assert_eq!(back.dependencies.len(), 2);
+        assert_eq!(back.dependencies[0].name, "triangle");
+        assert_eq!(back.dependencies[1].args, vec!["example.com", "80"]);
+        assert!(matches!(back.dependencies[1].source, Source::Oci(_)));
+        // Session.
+        assert_eq!(back.camera, ws.camera);
+        assert_eq!(back.nodes.len(), 1);
+        assert_eq!(back.nodes[0].name, "synth");
+        assert_eq!(back.nodes[0].options, vec![8.0, 0.6, 0.0, 1.0]);
+        assert_eq!(
+            back.nodes[0].args,
+            vec!["netserve".to_string(), "80".into()]
+        );
+        assert!(back.virtual_files[0].options.is_empty());
+        assert_eq!(back.host_files[0].name, "notes.txt");
+        assert_eq!(back.host_ports[0].port, 8080);
+        assert_eq!(back.connections, vec![(2, 1)]);
+        assert_eq!(back.midi, vec![(3, 4)]);
+        assert_eq!(back.serves, vec![(1, 5)]);
+        assert_eq!(back.nets.len(), 2);
+        assert!(back.nets[1].gateway);
+        assert_eq!(back.net_links, vec![(1, 7)]);
+    }
+}

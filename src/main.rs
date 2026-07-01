@@ -8,13 +8,12 @@ mod netstack;
 mod oci;
 mod options;
 mod plugin;
-mod project;
 mod render2d;
-mod session;
 mod sockets;
 mod terminal;
 mod text;
 mod vfs;
+mod workspace;
 
 use clap::CommandFactory;
 use clap::Parser;
@@ -73,14 +72,14 @@ fn main() -> Result<(), String> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Some(Commands::Init { name }) => project::init(name.clone()),
-        Some(Commands::Add { target }) => project::add(target.clone()),
+        Some(Commands::Init { name }) => workspace::init(name.clone()),
+        Some(Commands::Add { target }) => workspace::add(target.clone()),
         Some(Commands::Publish { plugin, reference }) => {
-            project::publish(plugin.clone(), reference.clone())
+            workspace::publish(plugin.clone(), reference.clone())
         }
-        Some(Commands::List) => project::list(),
-        Some(Commands::Remove { plugin }) => project::remove(plugin.clone()),
-        // `wk run [paths...]` runs the project (or the given ad-hoc paths).
+        Some(Commands::List) => workspace::list(),
+        Some(Commands::Remove { plugin }) => workspace::remove(plugin.clone()),
+        // `wk run [paths...]` opens the workspace (or the given ad-hoc paths).
         Some(Commands::Run { plugins }) => run(plugins),
         // Bare `wk` shows help.
         None => {
@@ -90,24 +89,20 @@ fn main() -> Result<(), String> {
     }
 }
 
-/// Run the project's dependencies, or the given ad-hoc `.wasm` paths.
+/// Open the workspace (or an ad-hoc set of `.wasm` paths).
 fn run(plugins: &[PathBuf]) -> Result<(), String> {
-    // Project mode (no explicit paths) persists the workspace session.
-    let project_mode = plugins.is_empty();
-    let deps = if project_mode {
-        project::Project::load()?.dependencies
+    // Workspace mode (no explicit paths) persists the canvas; ad-hoc mode doesn't.
+    let workspace_mode = plugins.is_empty();
+    let ws = if workspace_mode {
+        workspace::Workspace::load()?
     } else {
-        plugins
-            .iter()
-            .cloned()
-            .map(project::Dependency::from_path)
-            .collect()
+        workspace::Workspace::from_paths(plugins)
     };
     // Pull any OCI-artifact dependencies into the local cache before launching.
-    for dep in &deps {
+    for dep in &ws.dependencies {
         if let Err(e) = dep.ensure() {
             eprintln!("warning: dependency {:?} unavailable: {e}", dep.name);
         }
     }
-    compositor::run(&deps, project_mode)
+    compositor::run(ws, workspace_mode)
 }
