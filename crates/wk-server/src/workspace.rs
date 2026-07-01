@@ -38,8 +38,6 @@ pub const DEFAULT_WORKSPACE: &str = "workspace.wk";
 /// harmlessly (the parser ignores it).
 const MODELINE: &str = "// vim: set filetype=kdl :";
 
-// ---- manifest: dependencies ----
-
 /// Where a dependency's wasm comes from.
 #[derive(Debug, Clone)]
 pub enum Source {
@@ -114,8 +112,6 @@ impl Dependency {
         self.source.ensure()
     }
 }
-
-// ---- session: placed nodes on the canvas ----
 
 /// A placed node: an app instance (`node`) or a file node (`virtualfile`/
 /// `hostfile`).
@@ -368,8 +364,6 @@ impl Workspace {
     }
 }
 
-// ---- KDL parse/write helpers ----
-
 fn num(v: &KdlValue) -> Option<f32> {
     v.as_float()
         .map(|f| f as f32)
@@ -507,8 +501,6 @@ fn pair_kdl(name: &str, a: NodeId, b: NodeId) -> KdlNode {
     n.push(KdlEntry::new(b.to_string()));
     n
 }
-
-// ---- CLI commands (each operates on the given workspace file) ----
 
 /// Create a new empty workspace at `path`. Errors if one exists.
 pub fn init(path: &Path) -> Result<(), String> {

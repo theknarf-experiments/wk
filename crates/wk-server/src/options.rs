@@ -1,7 +1,7 @@
 //! Host side of per-node options: a node reports its option values (e.g. a
 //! synth's knob settings) via `store`, and reads back saved values via `load`.
-//! The compositor persists them to the workspace session, so relaunching a node
-//! restores its knobs. The host treats the values as an opaque flat list of
+//! The server persists them to the workspace, so relaunching a node restores its
+//! knobs. The host treats the values as an opaque flat list of
 //! floats; the node interprets them positionally.
 
 use std::sync::{Arc, Mutex};
@@ -18,7 +18,7 @@ wasmtime::component::bindgen!({
     require_store_data_send: true,
 });
 
-/// A node's option values (knob settings), shared with the compositor so it can
+/// A node's option values (knob settings), shared with the server so it can
 /// seed saved values on launch and read the current values to persist.
 pub type SharedOptions = Arc<Mutex<Vec<f32>>>;
 

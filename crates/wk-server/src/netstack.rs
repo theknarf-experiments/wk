@@ -7,7 +7,7 @@
 //! nodes **on the same virtual network** — so wired nodes reach each other
 //! (Docker-bridge style) and unwired nodes (alone on their own network) see
 //! nothing. Because we move *packets*, traffic can later be rerouted through
-//! middlebox nodes (a VPN/proxy) transparently to the wasm client.
+//! middlebox nodes (a VPN/proxy) transparently to the guest.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,7 +53,6 @@ impl VirtualNic {
     fn drain_tx(&self) -> Vec<Frame> {
         self.tx.lock().unwrap().drain(..).collect()
     }
-    /// Deliver a frame to this NIC's receive queue.
     fn deliver(&self, frame: Frame) {
         self.rx.lock().unwrap().push_back(frame);
     }

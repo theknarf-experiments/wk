@@ -5,9 +5,9 @@
 //!   mutations a client may ask the server to perform. In single-player these
 //!   are applied in-process; the same enum is what a networked client would
 //!   serialize over a socket.
-//! - [`Client`] is the driver contract: a client owns its own loop, deciding how
-//!   input arrives, whether to render, and when to stop — then drives a server
-//!   (whatever concrete type `S` is) to completion.
+//! - [`Client`] is the front-end contract: a client owns its own loop (how input
+//!   arrives, whether to render, when to stop) and attaches to a server through a
+//!   connection handle, but never owns or drives the server itself.
 //!
 //! This crate deliberately has no knowledge of the server's internals: it never
 //! names the concrete `Server`, only the messages that cross the boundary and

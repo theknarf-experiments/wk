@@ -1,5 +1,3 @@
-// The backend lives in the `wk-server` crate; bring its workspace/file-format
-// helpers into scope under the familiar `workspace::` path used by the CLI.
 use client_local_ui::WindowClient;
 use wk_protocol::Client;
 use wk_server::runtime::ServerRuntime;
@@ -79,9 +77,7 @@ fn main() -> Result<(), String> {
         }
         Some(Commands::List) => workspace::list(file),
         Some(Commands::Remove { plugin }) => workspace::remove(plugin.clone(), file),
-        // `wk run [-f name.wk] [--headless]` opens the workspace.
         Some(Commands::Run { headless }) => run(file, *headless),
-        // Bare `wk` shows help.
         None => {
             Cli::command().print_help().map_err(|e| e.to_string())?;
             Ok(())

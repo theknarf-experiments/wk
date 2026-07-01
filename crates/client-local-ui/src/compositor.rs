@@ -1,8 +1,8 @@
-//! The wk compositor: spawns self-driving wasi-gfx clients and composites the
-//! surfaces they paint into draggable windows on an infinite canvas, routing
-//! input back to the focused client. wk is "the OS + compositor"; the client
-//! thinks it owns its window. The whole UI (windows, menu, text) is drawn by
-//! hand as 2D quads via `render2d`; windowing/input is winit.
+//! The wk compositor: the GUI window client. It composites the surfaces its
+//! nodes paint into draggable windows on an infinite canvas and routes input
+//! back to the focused node. The whole UI (windows, menu, text) is drawn by
+//! hand as 2D quads via `render2d`; windowing/input is winit. The authoritative
+//! document lives in the server, reached through a `ServerHandle`.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -25,13 +25,10 @@ use wk_server::runtime::ServerHandle;
 use wk_server::server::{View, FILE_H, FILE_W};
 use wk_server::terminal::CellView;
 
-/// Target frame time (~60 fps).
 const FRAME: Duration = Duration::from_nanos(1_000_000_000 / 60);
-/// Canvas pixels panned per unit of scroll wheel.
 const SCROLL_PAN_SPEED: f32 = 30.0;
 /// Fraction of the remaining pan distance covered each frame.
 const PAN_SMOOTH: f32 = 0.3;
-/// Zoom multiplier per unit of zoom-scroll.
 const ZOOM_STEP: f32 = 1.1;
 
 /// Window title-bar height and border thickness, in canvas pixels.
@@ -55,13 +52,11 @@ const BODY: [f32; 4] = [0.10, 0.10, 0.13, 1.0];
 const BORDER_COL: [f32; 4] = [0.32, 0.33, 0.38, 1.0];
 const TEXT: [f32; 4] = [0.90, 0.90, 0.93, 1.0];
 const CLOSE_HOT: [f32; 4] = [0.80, 0.30, 0.30, 1.0];
-/// Terminal grid background.
 const TERM_BG: [f32; 4] = [0.063, 0.063, 0.086, 1.0];
-/// Body fill shown in the workspace for a node that is popped out into its own
-/// window (hatched-looking dim panel behind the "detached" label).
+/// Body fill in the workspace for a node popped out into its own window (behind
+/// the "detached" label).
 const DETACHED_BG: [f32; 4] = [0.10, 0.11, 0.14, 1.0];
 
-/// Convert an 8-bit RGB triple to a normalized opaque colour.
 fn rgba(c: [u8; 3]) -> [f32; 4] {
     [
         c[0] as f32 / 255.0,
@@ -99,7 +94,6 @@ fn encode_term_key(code: KeyCode, text: Option<&str>, mods: ModifiersState) -> O
     })
 }
 
-/// 0-based letter index (A=0 .. Z=25) for a key code, else `None`.
 fn letter_index(code: KeyCode) -> Option<u8> {
     use KeyCode as C;
     let n = match code {
@@ -390,7 +384,6 @@ struct Drag {
     grab: [f32; 2],
 }
 
-/// A connection wire on the canvas, identified by its endpoints so it can be
 /// An action runnable from the Cmd/Ctrl+K command palette.
 #[derive(Clone, Copy)]
 enum PaletteCmd {
@@ -471,7 +464,6 @@ fn near(a: [f32; 2], b: [f32; 2], radius: f32) -> bool {
     dx * dx + dy * dy <= radius * radius
 }
 
-/// Distance from point `p` to the line segment `a`-`b`.
 fn dist_to_segment(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
     let (abx, aby) = (b[0] - a[0], b[1] - a[1]);
     let (apx, apy) = (p[0] - a[0], p[1] - a[1]);
@@ -538,10 +530,6 @@ fn draw_connection(
     }
 }
 
-/// The compositor's **window client**: the GUI front-end attached to a running
-/// server. winit drives it via `ApplicationHandler`; the per-frame work happens
-/// in `frame`. Everything here is client-local view/input state — the
-/// authoritative document lives in the server, reached only through `conn`.
 /// A node popped out into its own OS window. Purely client-local view state:
 /// neither the detached flag nor this window's size is ever sent to the server
 /// or written to the workspace, so a restart brings every node back into the
@@ -598,7 +586,6 @@ struct App {
     /// Set when Delete/Backspace is pressed; consumed in `frame` to drop the
     /// selected wire.
     del_wire: bool,
-    /// Whether the corner zoom button's preset menu is open.
     zoom_menu_open: bool,
     /// Command palette (Cmd/Ctrl+K) state: open, the typed filter, and the
     /// highlighted row. `palette_run` is set when a command is chosen and
@@ -2118,7 +2105,6 @@ impl App {
                 );
             }
 
-            // Input (left) + output (right) connection ports.
             draw_ports(&mut quads, gfx.renderer.circle, r, zf, mp, full);
         }
 

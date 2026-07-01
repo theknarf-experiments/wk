@@ -95,10 +95,10 @@ async fn dispatch(
     req: Request<hyper::body::Incoming>,
 ) -> Result<Response<HyperOutgoingBody>> {
     let mut store = Store::new(&engine, make_state());
-    // The engine has epoch interruption on (the compositor uses it to kill
-    // runaway nodes); request handlers run to completion, so push the deadline
-    // far out. (It's relative to the current epoch — `u64::MAX` would overflow
-    // once the compositor has ticked the epoch.)
+    // The engine has epoch interruption on (the server uses it to kill runaway
+    // nodes); request handlers run to completion, so push the deadline far out.
+    // (It's relative to the current epoch — `u64::MAX` would overflow once the
+    // server has ticked the epoch.)
     store.set_epoch_deadline(1 << 60);
     // Convert the incoming body's error type to wasi:http's ErrorCode.
     let req = req.map(|b| {

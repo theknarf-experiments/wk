@@ -1,12 +1,12 @@
 //! Terminal nodes: wk runs a non-graphical wasm guest with its stdio wired to a
 //! VT terminal. The guest's stdout/stderr is parsed by `alacritty_terminal` into
-//! a cell grid the compositor renders, and keyboard input is delivered to the
+//! a cell grid the client renders, and keyboard input is delivered to the
 //! guest's stdin — so a recompiled CLI/TUI app (one day, vim) runs in a window.
 //!
 //! The guest writes ANSI like it would to any TTY (isatty is true, $TERM is set,
 //! $COLUMNS/$LINES report the grid). There's no OS pty: stdout is a shared byte
-//! queue the compositor drains into the parser, and stdin is a shared queue the
-//! compositor fills from the keyboard (the parser also writes here for terminal
+//! queue the client drains into the parser, and stdin is a shared queue the
+//! client fills from the keyboard (the parser also writes here for terminal
 //! replies, e.g. cursor-position reports).
 
 use std::collections::VecDeque;
@@ -36,16 +36,14 @@ pub const ROWS: usize = 24;
 const FG: [u8; 3] = [198, 200, 205];
 const BG: [u8; 3] = [16, 16, 22];
 
-// ---- shared stdio between the guest thread and the compositor ----
-
 struct InpState {
     buf: VecDeque<u8>,
     waker: Option<Waker>,
     closed: bool,
 }
 
-/// The guest's stdio, shared between its thread and the compositor. `out` is
-/// stdout/stderr (guest → compositor), `inp` is stdin (compositor → guest).
+/// The guest's stdio, shared between its thread and the client. `out` is
+/// stdout/stderr (guest → client), `inp` is stdin (client → guest).
 pub struct TermIo {
     out: Mutex<VecDeque<u8>>,
     inp: Mutex<InpState>,
@@ -193,8 +191,6 @@ impl Future for InReady {
     }
 }
 
-// ---- the VT engine ----
-
 /// Pushes terminal replies (e.g. cursor-position reports) back to guest stdin.
 struct EventProxy(SharedTermIo);
 impl EventListener for EventProxy {
@@ -220,7 +216,7 @@ impl Dimensions for GridSize {
 }
 
 /// One rendered cell: position, glyph, and resolved colours (`bg = None` means
-/// the default terminal background, which the compositor needn't fill).
+/// the default terminal background, which the client needn't fill).
 pub struct CellView {
     pub col: u16,
     pub row: u16,

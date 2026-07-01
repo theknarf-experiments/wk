@@ -1,5 +1,5 @@
 //! Host side of wk's MIDI transport: plugins send/receive raw MIDI messages
-//! through `output`/`input` ports, and the compositor wires a source node's
+//! through `output`/`input` ports, and the server wires a source node's
 //! output to the inputs of the nodes it is connected to (a "midi" connection on
 //! the canvas). A keyboard plugin can thus drive a separate synth plugin — the
 //! same split as real MIDI gear joined by a cable.
@@ -50,7 +50,7 @@ pub fn new_inbox() -> SharedInbox {
 }
 
 /// Routes MIDI from each source node to the inboxes of the nodes it is wired to.
-/// Owned by `PluginHost`; the compositor edits it as connections are made and
+/// Owned by `PluginHost`; the server edits it as connections are made and
 /// broken, and guest `output.send` calls read it.
 #[derive(Default)]
 pub struct Routes {

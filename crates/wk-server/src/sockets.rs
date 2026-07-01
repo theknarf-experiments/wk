@@ -1,16 +1,11 @@
 //! wk's own `wasi:sockets` host implementation, backed by per-node smoltcp
-//! stacks on the [`crate::netstack`] fabric (not the host OS). A recompiled C
-//! program's BSD socket calls (via wasi-libc → wasi:sockets) drive a smoltcp
-//! socket on the node's stack; the hub thread routes its packets to peers on the
-//! same virtual network. A node with no network attached can't reach anything.
-//!
-//! TCP (connect/bind/listen/accept + streams) and UDP (bind/stream/send/receive
-//! datagrams) are both implemented over the node's smoltcp stack, dual-stack
-//! (IPv4 `10.0.0.0/24` + IPv6 ULA `fd00::/64`). A node wired to a Gateway node
-//! gets host access: off-fabric connections are bridged to real host sockets and
-//! names resolve via the host resolver; otherwise only fabric peers and numeric
-//! addresses are reachable. Sockets are reaped (removed from the node's set) once
-//! their wasi resource drops and the connection drains, via the hub.
+//! stacks on the [`crate::netstack`] fabric (not the host OS): a guest's BSD
+//! socket calls drive a smoltcp socket on the node's stack, which the hub routes
+//! to peers on the same virtual network. TCP and UDP are both implemented,
+//! dual-stack (IPv4 `10.0.0.0/24` + IPv6 ULA `fd00::/64`). A node wired to a
+//! Gateway gets host access: off-fabric connections bridge to real host sockets
+//! and names resolve via the host resolver; otherwise only fabric peers and
+//! numeric addresses are reachable.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -79,8 +74,6 @@ impl NetCtx {
     }
 }
 
-// ---- resources ----
-
 /// The `network` resource — an opaque capability handle; the actual stack lives
 /// in `HostState`.
 pub struct Net;
@@ -99,8 +92,6 @@ pub struct TcpSock {
     /// flow over a real host socket instead of smoltcp.
     host: Option<HostConn>,
 }
-
-// ---- host gateway: bridge an off-fabric connection to a real host socket ----
 
 #[derive(Default)]
 struct Pipe {
@@ -228,12 +219,9 @@ pub struct Datagrams {
     remote: Option<IpSocketAddress>,
 }
 
-/// A name-resolution result stream (numeric literals only for now).
 pub struct ResolveStream {
     addrs: std::collections::VecDeque<IpAddress>,
 }
-
-// ---- helpers ----
 
 fn ipv4(addr: Ipv4Address) -> (u8, u8, u8, u8) {
     let o = addr.octets();
@@ -291,8 +279,6 @@ impl HostState {
     }
 }
 
-// ---- linker ----
-
 struct HasSock;
 impl HasData for HasSock {
     type Data<'a> = &'a mut HostState;
@@ -309,8 +295,6 @@ pub fn add_to_linker(l: &mut Linker<HostState>) -> Result<()> {
     wasi::sockets::udp_create_socket::add_to_linker::<_, HasSock>(l, |s| s)?;
     Ok(())
 }
-
-// ---- pollables ----
 
 /// What a socket pollable is waiting for.
 #[derive(Clone, Copy)]
@@ -421,14 +405,12 @@ impl Pollable for UdpStreamPollable {
     }
 }
 
-/// A pollable that's always ready (used for the numeric DNS stream).
+/// A pollable that's always ready (used for the DNS resolve stream).
 struct ReadyNow;
 #[async_trait]
 impl Pollable for ReadyNow {
     async fn ready(&mut self) {}
 }
-
-// ---- TCP byte streams over a smoltcp socket ----
 
 struct TcpInput {
     stack: SharedStack,
@@ -510,8 +492,6 @@ impl OutputStream for TcpOutput {
         Ok(())
     }
 }
-
-// ---- host gateway byte streams + pollables ----
 
 /// Ready when a pipe has data or is closed.
 struct PipeReady {
@@ -626,8 +606,6 @@ fn on_fabric(ip: smoltcp::wire::IpAddress) -> bool {
         smoltcp::wire::IpAddress::Ipv6(v6) => v6.octets()[0] == 0xfd,
     }
 }
-
-// ---- interface impls ----
 
 impl wasi::sockets::network::Host for HostState {
     fn network_error_code(
@@ -1087,8 +1065,6 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
     }
 }
 
-// ---- ip-name-lookup (numeric literals only) ----
-
 impl wasi::sockets::ip_name_lookup::Host for HostState {
     fn resolve_addresses(
         &mut self,
@@ -1167,8 +1143,6 @@ impl wasi::sockets::ip_name_lookup::HostResolveAddressStream for HostState {
         Ok(())
     }
 }
-
-// ---- UDP over smoltcp (same fabric routing as TCP) ----
 
 fn udp_packet_buffer() -> udp::PacketBuffer<'static> {
     udp::PacketBuffer::new(

@@ -1,6 +1,5 @@
 //! A small 2D quad renderer over wgpu: the host draws everything (plugin
 //! surfaces, window chrome, text) as textured, colored, alpha-blended quads.
-//! Replaces the dear-imgui renderer; the shader (pos/uv/color) is the same.
 
 use std::collections::HashMap;
 use std::mem::size_of;

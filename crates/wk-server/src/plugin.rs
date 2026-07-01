@@ -1,12 +1,8 @@
-//! Host side of the wk plugin system: the compositor implements the standard
-//! wasi-gfx interfaces (`wasi:surface`, `wasi:graphics-context`,
-//! `wasi:frame-buffer`) over a *virtual surface* and drives a self-driving
-//! client's `run` loop.
-//!
-//! Each client runs on its own thread with its own wasmtime `Store`; the
-//! compositor (main thread) shares per-surface state via `SurfaceRegistry`. The
-//! client blocks on its surface frame event; the host signals one frame per
-//! compositor frame and reads back the pixels the client paints.
+//! Host side of the wk plugin system: wk implements the standard wasi-gfx
+//! interfaces (`wasi:surface`, `wasi:graphics-context`, `wasi:frame-buffer`)
+//! over a *virtual surface* and drives a guest's `run` loop. Each guest runs on
+//! its own thread with its own wasmtime `Store`; the host signals one frame at a
+//! time and reads back the pixels the guest paints.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -40,21 +36,17 @@ use wasi::surface::surface::{CreateDesc, FrameEvent};
 pub use wasi::surface::surface::{Key, KeyEvent, PointerEvent, ResizeEvent};
 use wk_protocol::NodeId;
 
-/// Shared state of one virtual surface, touched by both the client thread (via
-/// the host interface impls) and the compositor thread.
 pub struct VirtualSurface {
-    /// Stable unique id, used by the compositor to track this surface.
     pub id: u64,
-    /// The instance that created this surface (its window belongs to it).
     pub node_id: NodeId,
     pub width: u32,
     pub height: u32,
     /// Latest painted RGBA8 pixels (`width * height * 4`).
     pub pixels: Vec<u8>,
-    /// Set by the compositor once per frame; consumed by the frame pollable.
+    /// Set by the server once per frame; consumed by the frame pollable.
     pub frame_ready: bool,
-    /// Set by the compositor to close this instance: the client traps on its
-    /// next `get_frame` and its thread exits.
+    /// Set by the server to close this instance: the guest traps on its next
+    /// `get_frame` and its thread exits.
     pub closed: bool,
     pub resize: Option<ResizeEvent>,
     pub pointer_move: VecDeque<PointerEvent>,
@@ -68,8 +60,8 @@ pub struct VirtualSurface {
 
 static NEXT_SURFACE_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Error a closed surface returns to unwind and end its client cleanly. The
-/// driver recognises it and exits the client thread without logging an error.
+/// Error a closed surface returns to unwind and end its guest cleanly. The
+/// driver recognises it and exits the guest thread without logging an error.
 #[derive(Debug)]
 struct SurfaceClosed;
 
@@ -101,7 +93,6 @@ impl VirtualSurface {
         }
     }
 
-    /// Wake every pollable parked on this surface so they re-check readiness.
     pub fn wake(&mut self) {
         for w in self.wakers.drain(..) {
             w.wake();
@@ -110,42 +101,34 @@ impl VirtualSurface {
 }
 
 pub type SharedSurface = Arc<Mutex<VirtualSurface>>;
-/// All virtual surfaces created by clients, shared with the compositor thread.
 pub type SurfaceRegistry = Arc<Mutex<Vec<SharedSurface>>>;
 
-/// A launched plugin instance. Every instance gets a window in the compositor —
-/// its surface if it created one, otherwise a console showing this captured
-/// output — so nothing ever runs invisibly or un-quittably.
+/// A launched plugin instance.
 pub struct Node {
-    /// Stable id, assigned by the compositor and persisted in the session so
-    /// connections can refer to this node across restarts.
+    /// Stable id, persisted in the workspace so connections can refer to this
+    /// node across restarts.
     pub id: NodeId,
-    /// The dependency name this node was launched from.
     pub name: String,
-    /// The node's terminal stdio: its stdout feeds the compositor's VT parser,
-    /// its stdin is fed from the keyboard. Non-graphical nodes render as a
-    /// terminal window.
     pub term_io: crate::terminal::SharedTermIo,
-    /// This node's in-memory filesystem, so the compositor can mount connected
-    /// file nodes into it.
+    /// This node's in-memory filesystem, so the server can mount connected file
+    /// nodes into it.
     pub fs: crate::vfs::SharedFs,
-    /// This node's MIDI input queue, so the compositor can wire a MIDI source's
+    /// This node's MIDI input queue, so the server can wire a MIDI source's
     /// output to it.
     pub midi_in: crate::midi::SharedInbox,
     /// This node's option values (e.g. knob settings) reported by the guest, so
-    /// the compositor can persist them to the session and seed them on restore.
+    /// the server can persist them to the workspace and seed them on restore.
     pub options: crate::options::SharedOptions,
     /// Set by the guest thread when its `run` returns (it exited on its own).
     pub finished: Arc<AtomicBool>,
     /// True while a guest thread is live. A networked node is created idle
     /// (`false`) and run on demand; it flips back to `false` when the guest
-    /// exits, so the compositor can offer a Run/re-run affordance.
+    /// exits.
     pub running: Arc<AtomicBool>,
-    /// Kill switch: set by the compositor to stop a still-running node.
+    /// Kill switch: set by the server to stop a still-running node.
     pub kill: Arc<AtomicBool>,
     /// The compiled component and its wiring, filled in by the background compile
-    /// thread. `None` while the node is still compiling — the compositor shows a
-    /// loading state and holds off running/wiring until it's ready.
+    /// thread. `None` while the node is still compiling.
     pub setup: OnceLock<NodeSetup>,
 }
 
@@ -153,7 +136,7 @@ pub struct Node {
 /// background compile finishes.
 pub struct NodeSetup {
     /// This node's network stack on the fabric (`Some` if it imports
-    /// wasi:sockets), so the compositor can move it between virtual networks.
+    /// wasi:sockets), so the server can move it between virtual networks.
     pub net_stack: Option<crate::netstack::SharedStack>,
     /// Set if this is a `wasi:http` server (exports `incoming-handler`): the
     /// component path to serve when wired to a HostPort. Such nodes aren't run.
@@ -172,30 +155,22 @@ pub struct RunInfo {
 }
 
 impl Node {
-    /// Still compiling — no component yet.
     pub fn is_loading(&self) -> bool {
         self.setup.get().is_none()
     }
-    /// This node's fabric stack, once ready (`None` while loading or if it has
-    /// no network).
     pub fn net_stack(&self) -> Option<crate::netstack::SharedStack> {
         self.setup.get().and_then(|s| s.net_stack.clone())
     }
-    /// The component path to serve, if this is a ready http server node.
     pub fn http_path(&self) -> Option<std::path::PathBuf> {
         self.setup.get().and_then(|s| s.http_path.clone())
     }
-    /// Ready and has a `run` loop (an idle/exited node the compositor can Run).
     pub fn is_runnable(&self) -> bool {
         self.setup.get().is_some_and(|s| s.run.is_some())
     }
 }
 
 pub type SharedNode = Arc<Node>;
-/// All launched app nodes, shared with the compositor thread.
 pub type NodeRegistry = Arc<Mutex<Vec<SharedNode>>>;
-
-// ---- resource representations stored in the wasmtime ResourceTable ----
 
 pub struct SurfaceState {
     shared: SharedSurface,
@@ -212,8 +187,6 @@ pub struct DeviceState {
 pub struct BufferState {
     shared: SharedSurface,
 }
-
-// ---- pollables ----
 
 #[derive(Clone, Copy)]
 enum PollKind {
@@ -255,8 +228,8 @@ impl Future for WaitCondition {
     fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
         let mut s = self.shared.lock().unwrap();
         let ready = match self.kind {
-            // A closed surface wakes the frame poll so the client proceeds to
-            // `get_frame`, which then traps and ends the client thread.
+            // A closed surface wakes the frame poll so the guest proceeds to
+            // `get_frame`, which then traps and ends the guest thread.
             PollKind::Frame => s.frame_ready || s.closed,
             PollKind::Resize => s.resize.is_some(),
             PollKind::PointerMove => !s.pointer_move.is_empty(),
@@ -277,8 +250,6 @@ impl Future for WaitCondition {
     }
 }
 
-// ---- per-store host state ----
-
 pub struct HostState {
     ctx: WasiCtx,
     table: ResourceTable,
@@ -286,14 +257,9 @@ pub struct HostState {
     /// The instance this store belongs to; tags the surfaces it creates and the
     /// MIDI it sends.
     pub(crate) node_id: NodeId,
-    /// This node's private in-memory filesystem.
     pub(crate) fs: crate::vfs::SharedFs,
-    /// This node's MIDI input queue (drained by its `input` ports).
     pub(crate) midi_in: crate::midi::SharedInbox,
-    /// Shared MIDI router; this node's `output` ports send through it.
     pub(crate) midi_router: crate::midi::Router,
-    /// This node's option values, shared with its `Node` so the compositor can
-    /// read (to save) and seed (to restore) them.
     pub(crate) options: crate::options::SharedOptions,
     /// This node's network context (smoltcp stack on the fabric) — `Some` only
     /// for nodes that import wasi:sockets. Backs wk's own wasi:sockets impl.
@@ -304,7 +270,6 @@ pub struct HostState {
     /// This store's `wasi:http` context (outbound requests, and serving when a
     /// node exports `wasi:http/incoming-handler`).
     http_ctx: wasmtime_wasi_http::WasiHttpCtx,
-    /// Shared wgpu-core instance backing the wasi:webgpu host.
     gpu: Arc<wgpu_core::global::Global>,
 }
 
@@ -368,7 +333,6 @@ impl wasi_webgpu_wasmtime::WasiWebGpuView for HostState {
     }
 }
 
-/// Create the shared wgpu-core instance used by the wasi:webgpu host.
 fn new_gpu_instance() -> Arc<wgpu_core::global::Global> {
     Arc::new(wgpu_core::global::Global::new(
         "wk-webgpu",
@@ -399,13 +363,9 @@ impl HostState {
     }
 }
 
-// ---- interface-level Host markers (no free functions) ----
-
 impl wasi::surface::surface::Host for HostState {}
 impl wasi::graphics_context::graphics_context::Host for HostState {}
 impl wasi::frame_buffer::frame_buffer::Host for HostState {}
-
-// ---- wasi:surface/surface.surface ----
 
 impl wasi::surface::surface::HostSurface for HostState {
     fn new(&mut self, desc: CreateDesc) -> Result<Resource<SurfaceState>> {
@@ -464,7 +424,7 @@ impl wasi::surface::surface::HostSurface for HostState {
     }
     fn get_frame(&mut self, self_: Resource<SurfaceState>) -> Result<Option<FrameEvent>> {
         if self.surface_shared(&self_)?.lock().unwrap().closed {
-            // Compositor closed this surface: trap to unwind and end the client.
+            // Server closed this surface: trap to unwind and end the guest.
             return Err(wasmtime::Error::new(SurfaceClosed));
         }
         Ok(Some(FrameEvent { nothing: false }))
@@ -548,8 +508,6 @@ impl wasi::surface::surface::HostSurface for HostState {
     }
 }
 
-// ---- wasi:graphics-context/graphics-context.{context, abstract-buffer} ----
-
 impl wasi::graphics_context::graphics_context::HostContext for HostState {
     fn new(&mut self) -> Result<Resource<ContextState>> {
         Ok(self.table.push(ContextState { connected: None })?)
@@ -570,7 +528,7 @@ impl wasi::graphics_context::graphics_context::HostContext for HostState {
 
     fn present(&mut self, _self_: Resource<ContextState>) -> Result<()> {
         // Decoupled compositing: the pixels were already written via the
-        // frame-buffer; the compositor reads the latest buffer each frame.
+        // frame-buffer; the server reads the latest buffer each frame.
         Ok(())
     }
 
@@ -586,8 +544,6 @@ impl wasi::graphics_context::graphics_context::HostAbstractBuffer for HostState 
         Ok(())
     }
 }
-
-// ---- wasi:frame-buffer/frame-buffer.{device, buffer} ----
 
 impl wasi::frame_buffer::frame_buffer::HostDevice for HostState {
     fn new(&mut self) -> Result<Resource<DeviceState>> {
@@ -643,8 +599,6 @@ impl wasi::frame_buffer::frame_buffer::HostBuffer for HostState {
     }
 }
 
-// ---- the driver ----
-
 /// Whether a component is a standard `wasi:cli/command` (exports `wasi:cli/run`)
 /// rather than a wk-world guest (which exports a bare `run`).
 fn component_is_command(component: &Component, engine: &Engine) -> bool {
@@ -690,7 +644,6 @@ pub struct PluginHost {
     engine: Engine,
     gpu: Arc<wgpu_core::global::Global>,
     midi: crate::midi::Router,
-    /// The userspace network fabric driving every networked node's stack.
     hub: Arc<crate::netstack::NetHub>,
 }
 
@@ -704,7 +657,7 @@ impl PluginHost {
         // form cranelift supports. This unlocks interpreters (Lua) and the whole
         // error-recovery class of recompiled C/C++.
         config.wasm_exceptions(true);
-        // Lets the compositor stop a runaway node: increment_epoch() each frame
+        // Lets the server stop a runaway node: increment_epoch() each frame
         // trips the per-store deadline callback, which traps on `kill`.
         config.epoch_interruption(true);
         // Persist compiled machine code to an on-disk cache so a plugin is only
@@ -725,12 +678,11 @@ impl PluginHost {
         })
     }
 
-    /// The shared MIDI router, so the compositor can wire MIDI connections.
+    /// The shared MIDI router, so the server can wire MIDI connections.
     pub fn midi(&self) -> crate::midi::Router {
         self.midi.clone()
     }
 
-    /// Detach a closed node's network stack from the fabric hub.
     pub fn detach_net(&self, stack: &crate::netstack::SharedStack) {
         self.hub.detach(stack);
     }
@@ -740,7 +692,6 @@ impl PluginHost {
         self.engine.increment_epoch();
     }
 
-    /// Build a linker with every interface wk provides to a guest.
     fn build_linker(&self) -> Result<Linker<HostState>> {
         let mut linker: Linker<HostState> = Linker::new(&self.engine);
         // Provide every wasmtime-wasi interface except its filesystem, then our
@@ -842,14 +793,14 @@ impl PluginHost {
         Ok(())
     }
 
-    /// Register a client as a `Node` under the compositor-assigned `id` and
-    /// return immediately — the component is compiled on a background thread so
-    /// the window (and other nodes) aren't blocked (Cranelift on a multi-MB debug
-    /// component takes hundreds of ms to seconds). Until it's ready the node is in
-    /// a *loading* state; once compiled the node's `setup` is published and, for a
-    /// non-networked non-http node, its guest starts. A **networked** node
-    /// (imports wasi:sockets) stays idle so it can be wired onto a Network/Gateway
-    /// before it runs; an **http** server node stays idle until served on a Port.
+    /// Register a plugin as a `Node` under `id` and return immediately — the
+    /// component is compiled on a background thread so other nodes aren't blocked
+    /// (Cranelift on a multi-MB debug component takes hundreds of ms to seconds).
+    /// Until it's ready the node is in a *loading* state; once compiled the node's
+    /// `setup` is published and, for a non-networked non-http node, its guest
+    /// starts. A **networked** node (imports wasi:sockets) stays idle so it can be
+    /// wired onto a Network/Gateway before it runs; an **http** server node stays
+    /// idle until served on a Port.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         &self,
@@ -911,7 +862,7 @@ impl PluginHost {
         let is_command = component_is_command(&component, &self.engine);
         // A node that imports wasi:sockets gets a NIC on the fabric. By default
         // it's alone on its own virtual network (net id = node id) — isolated —
-        // until the compositor wires it to a Network node.
+        // until the server wires it to a Network node.
         let net_stack = if !is_http && component_imports_sockets(&component, &self.engine) {
             let ip =
                 smoltcp::wire::Ipv4Address::new(10, 0, 0, (2 + (node.id.as_u128() % 250)) as u8);
@@ -929,7 +880,7 @@ impl PluginHost {
                 surfaces,
             }),
         };
-        // Publish; the compositor now sees a ready node.
+        // Publish; the server now sees a ready node.
         let _ = node.setup.set(setup);
 
         // Networked nodes wait to be wired + Run; http nodes wait to be served.
@@ -944,8 +895,7 @@ impl PluginHost {
     /// persistent state (filesystem, options, terminal, and — crucially — its
     /// fabric stack, so any network wiring already applied stays in effect).
     /// No-op if the node is already running or isn't runnable (an HTTP server).
-    /// `args` are the launch args (argv after the program name) — the compositor
-    /// passes the node's current, possibly-edited args.
+    /// `args` are the launch args (argv after the program name).
     pub fn run_node(&self, node: &SharedNode, args: &[String]) -> Result<()> {
         // Still compiling, or an http server node — nothing to run.
         let Some(run) = node.setup.get().and_then(|s| s.run.as_ref()) else {

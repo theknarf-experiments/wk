@@ -40,8 +40,6 @@ use wasi::filesystem::types::{
     MetadataHashValue, NewTimestamp, OpenFlags, PathFlags,
 };
 
-// ---- the in-memory tree ----
-
 /// The bytes of a canvas "file node", shared by every app it is connected to.
 pub type SharedFile = Arc<Mutex<Vec<u8>>>;
 
@@ -156,8 +154,6 @@ fn node_type(fs: &Fs, id: u64) -> DescriptorType {
         _ => DescriptorType::RegularFile,
     }
 }
-
-// ---- resources ----
 
 /// A descriptor handle: an open file or directory in some app node's `Fs`.
 pub struct Descriptor {
@@ -295,8 +291,6 @@ fn read_at(data: &[u8], offset: u64, len: u64) -> (Vec<u8>, bool) {
     (data[start..end].to_vec(), end >= data.len())
 }
 
-// ---- linker wiring ----
-
 /// Add every wasmtime-wasi interface our guests use *except* its (cap-std)
 /// filesystem, so we can provide our own in-memory filesystem instead.
 pub fn add_wasi_except_fs<T: WasiView + 'static>(l: &mut Linker<T>) -> Result<()> {
@@ -342,8 +336,6 @@ struct HasFs;
 impl HasData for HasFs {
     type Data<'a> = &'a mut HostState;
 }
-
-// ---- host impls ----
 
 /// `Ok(Err(code))` shorthand.
 fn err<T>(code: ErrorCode) -> Result<std::result::Result<T, ErrorCode>> {

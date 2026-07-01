@@ -1,11 +1,8 @@
 //! The wk **server**: the authoritative half of a running workspace. It owns the
 //! workspace file, the wasm runtime (`PluginHost` + the fabric + MIDI), and the
 //! *document* — every canvas node (app/file/port/network), where each sits, and
-//! all the wiring between them. Clients (the GUI window, a headless runner, a
-//! test harness, an MCP server, a network peer) drive it: they issue mutations
-//! and read its state to render. In single-player the client just holds the
-//! `Server` and calls it directly; the same surface is what a networked client
-//! would send over a socket.
+//! all the wiring between them. Clients drive it through a `ServerHandle`: they
+//! issue mutations and read its state to render.
 //!
 //! Camera/selection/palette/drag live in the *client*, not here. Node positions
 //! and sizes are the server's because they're shared across clients and saved to
@@ -34,7 +31,6 @@ pub struct VirtualFile {
 pub struct HostMappedFile {
     /// In-app mount name (the file's base name).
     pub name: String,
-    /// The real path on the host.
     pub path: PathBuf,
 }
 
@@ -360,8 +356,6 @@ impl Server {
             .cloned()
     }
 
-    // ---- node creation (positions come from the client's view) ----
-
     /// Launch a dependency as a new app node at `pos`.
     fn launch(&mut self, dep: &Dependency, pos: [f32; 2]) {
         let id = self.alloc_id();
@@ -437,8 +431,6 @@ impl Server {
         self.gateways.insert(id);
     }
 
-    // ---- running / args ----
-
     /// (Re)run an idle or exited node's guest with its current args.
     fn run_node(&mut self, id: NodeId) {
         if let Some(node) = self.app_node(id) {
@@ -454,8 +446,6 @@ impl Server {
         let args = text.split_whitespace().map(str::to_string).collect();
         self.node_args.insert(id, args);
     }
-
-    // ---- wiring ----
 
     /// Grant/revoke a node's host-network access (on its fabric stack).
     fn set_host_access(&self, app_id: NodeId, allow: bool) {
@@ -732,8 +722,6 @@ impl Server {
     fn set_node_size(&mut self, id: NodeId, size: [f32; 2]) {
         self.win_size.insert(id, size);
     }
-
-    // ---- lifecycle ----
 
     /// One server step: reconcile any wiring that was pending on a still-loading
     /// node. Cheap; a client calls it each frame, headless in its tick loop.
