@@ -9,6 +9,7 @@ mod oci;
 mod options;
 mod plugin;
 mod render2d;
+mod server;
 mod sockets;
 mod terminal;
 mod text;

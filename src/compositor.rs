@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use winit::application::ApplicationHandler;
@@ -17,13 +16,11 @@ use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
 use winit::window::WindowId;
 
 use crate::host_shell::Gfx;
-use crate::plugin::{
-    Key, KeyEvent, NodeRegistry, PluginHost, PointerEvent, ResizeEvent, SharedNode, SharedSurface,
-    SurfaceRegistry,
-};
+use crate::plugin::{Key, KeyEvent, PointerEvent, ResizeEvent, SharedNode, SharedSurface};
 use crate::render2d::{Quad, Renderer, TextureId};
+use crate::server::{FileNode, Server, Wire, FILE_H, FILE_W};
 use crate::text::Fonts;
-use crate::workspace::{Dependency, Workspace};
+use crate::workspace::Workspace;
 
 /// Target frame time (~60 fps).
 const FRAME: Duration = Duration::from_nanos(1_000_000_000 / 60);
@@ -380,19 +377,6 @@ struct Drag {
 }
 
 /// A connection wire on the canvas, identified by its endpoints so it can be
-/// selected (click) and deleted (Delete/Backspace).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Wire {
-    /// A file node (`file_id`) mounted into an app node (`app_id`).
-    File(u64, u64),
-    /// A MIDI link from source node to destination node.
-    Midi(u64, u64),
-    /// A wasi:http node served on a HostPort node.
-    Serve(u64, u64),
-    /// An app node's membership of a Network/Gateway node (app, net).
-    Net(u64, u64),
-}
-
 /// An action runnable from the Cmd/Ctrl+K command palette.
 #[derive(Clone, Copy)]
 enum PaletteCmd {
@@ -411,62 +395,8 @@ enum PaletteCmd {
 /// Most filtered command-palette rows shown at once.
 const PALETTE_MAX: usize = 9;
 
-/// An in-memory canvas file node: a named shared buffer you wire into app
-/// nodes. Its bytes are ephemeral shared state connected apps read and write.
-struct VirtualFile {
-    name: String,
-    data: crate::vfs::SharedFile,
-}
-
-/// A canvas file node backed by a real file on the host disk. Wiring it into an
-/// app maps the actual path into that app at `/name`, so reads and writes
-/// persist to disk and are visible outside wk.
-struct HostMappedFile {
-    /// In-app mount name (the file's base name).
-    name: String,
-    /// The real path on the host.
-    path: std::path::PathBuf,
-}
-
-/// A canvas file node, wired into app nodes as a shared file `/name`. Either an
-/// in-memory `VirtualFile` or a disk-backed `HostMappedFile`.
-enum FileNode {
-    Virtual(VirtualFile),
-    HostMapped(HostMappedFile),
-}
-
-impl FileNode {
-    /// The in-app file name this node mounts as.
-    fn name(&self) -> &str {
-        match self {
-            FileNode::Virtual(f) => &f.name,
-            FileNode::HostMapped(f) => &f.name,
-        }
-    }
-
-    /// Current size in bytes (in-memory length, or the host file's size).
-    fn size(&self) -> usize {
-        match self {
-            FileNode::Virtual(f) => f.data.lock().unwrap().len(),
-            FileNode::HostMapped(f) => {
-                std::fs::metadata(&f.path).map(|m| m.len()).unwrap_or(0) as usize
-            }
-        }
-    }
-
-    /// Mount this file into app filesystem `fs` (by kind).
-    fn mount(&self, fs: &crate::vfs::SharedFs) {
-        match self {
-            FileNode::Virtual(f) => crate::vfs::mount_file(fs, &f.name, f.data.clone()),
-            FileNode::HostMapped(f) => crate::vfs::mount_host_file(fs, &f.name, f.path.clone()),
-        }
-    }
-}
-
-/// Connection port radius and file-node default size, in canvas pixels.
+/// Connection port radius, in canvas pixels.
 const PORT_R: f32 = 6.0;
-const FILE_W: f32 = 130.0;
-const FILE_H: f32 = 44.0;
 const FILE_BG: [f32; 4] = [0.20, 0.17, 0.10, 1.0];
 const FILE_BORDER: [f32; 4] = [0.55, 0.45, 0.25, 1.0];
 /// HostMappedFile nodes are tinted (blue/grey) to distinguish disk-backed files
@@ -545,13 +475,6 @@ fn dist_to_segment(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
 /// How close (screen px) a click must be to a wire to select it.
 const WIRE_PICK: f32 = 6.0;
 
-/// The in-app mount name for a host-mapped file: the path's base name.
-fn host_file_name(path: &std::path::Path) -> String {
-    path.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "hostfile".to_string())
-}
-
 /// The curved arrow (perfect-arrows) for a connection from output port `a` to
 /// input port `b`. Shared by drawing and hit-testing so they agree.
 fn connection_arrow(a: [f32; 2], b: [f32; 2], zf: f32) -> crate::arrows::Arrow {
@@ -601,16 +524,14 @@ fn draw_connection(
     }
 }
 
-/// The compositor application: owns all state. winit drives it via
-/// `ApplicationHandler`; the per-frame work happens in `frame`.
+/// The compositor's **window client**: the GUI front-end that drives a [`Server`]
+/// and renders its state. winit drives it via `ApplicationHandler`; the per-frame
+/// work happens in `frame`. Everything here is client-local view/input state —
+/// the authoritative document (nodes, wiring, positions) lives in `server`.
 struct App {
+    /// The authoritative running workspace this client drives.
+    server: Server,
     gfx: Option<Gfx>,
-    /// The `.wk` file this workspace loads from and saves back to.
-    workspace_path: std::path::PathBuf,
-    host: PluginHost,
-    registry: SurfaceRegistry,
-    node_reg: NodeRegistry,
-    available: Vec<Dependency>,
 
     views: HashMap<u64, (TextureId, u32, u32)>,
     text_cache: TextCache,
@@ -622,14 +543,9 @@ struct App {
     /// Last known viewport size in screen px (updated each frame), so newly
     /// added nodes can be placed at the centre of the current view.
     viewport: [f32; 2],
-    win_pos: HashMap<u64, [f32; 2]>,
-    win_size: HashMap<u64, [f32; 2]>,
+    /// This client's stacking order (which node draws/hit-tests on top).
     z: Vec<u64>,
     kbd_focus: Option<u64>,
-    /// Per-node launch args (argv after the program name), seeded from the
-    /// dependency default and editable on idle nodes. Passed to `run_node` and
-    /// persisted in the session.
-    node_args: std::collections::HashMap<u64, Vec<String>>,
     /// When editing an idle node's args: its id and the in-progress text.
     editing_args: Option<(u64, String)>,
     drag: Option<Drag>,
@@ -650,32 +566,6 @@ struct App {
     palette_scroll: f32,
     palette_run: Option<PaletteCmd>,
     request_exit: bool,
-    pending_layout: HashMap<u64, ([f32; 2], [f32; 2])>,
-
-    // File nodes (canvas-owned shared files) and the connections wiring them
-    // into app nodes. App and file nodes draw from one id space (`next_node_id`)
-    // and share `win_pos`/`win_size`/`z`.
-    file_nodes: HashMap<u64, FileNode>,
-    connections: Vec<(u64, u64)>,
-    /// MIDI connections wiring one app node's output to another's input,
-    /// as (source node id, destination node id).
-    midi_links: Vec<(u64, u64)>,
-    /// HostPort nodes (canvas node id -> localhost port). Wiring a wasi:http
-    /// node to one exposes it on that port.
-    host_ports: HashMap<u64, u16>,
-    /// Active servers: http node id -> (HostPort id, kill switch).
-    serves: HashMap<u64, (u64, Arc<std::sync::atomic::AtomicBool>)>,
-    /// Network nodes — each is an isolated virtual network (Docker-bridge); app
-    /// nodes wired to one share that network. The set holds their canvas ids.
-    net_nodes: std::collections::HashSet<u64>,
-    /// Which Network nodes are also Gateways (grant members host-network access).
-    gateways: std::collections::HashSet<u64>,
-    /// Network membership wires, as (app node id, Network node id).
-    net_links: Vec<(u64, u64)>,
-    next_node_id: u64,
-    next_port: u16,
-    file_seq: u32,
-    host_seq: u32,
 
     // Input state, fed by winit events between frames.
     mouse: [f32; 2],
@@ -693,32 +583,22 @@ struct App {
 }
 
 impl App {
-    fn new(ws: &Workspace, path: std::path::PathBuf) -> Result<Self, String> {
-        let host = PluginHost::new().map_err(|e| format!("{e:#}"))?;
-        let registry: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
-        let node_reg: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
-        let mut app = App {
+    /// Build the window client for an already-instantiated [`Server`], taking its
+    /// initial camera from the saved workspace view.
+    fn new(server: Server) -> Result<Self, String> {
+        let pan = [server.camera.0, server.camera.1];
+        let zoom = server.camera.2.clamp(ZOOM_MIN, ZOOM_MAX);
+        Ok(App {
+            server,
             gfx: None,
-            workspace_path: path,
-            host,
-            registry,
-            node_reg,
-            available: ws.dependencies.clone(),
-            next_node_id: 0,
             views: HashMap::new(),
             text_cache: TextCache::default(),
             terminals: HashMap::new(),
-            cam: Camera {
-                pan: [0.0, 0.0],
-                zoom: 1.0,
-            },
-            pan_target: [0.0, 0.0],
+            cam: Camera { pan, zoom },
+            pan_target: pan,
             viewport: [1280.0, 800.0],
-            win_pos: HashMap::new(),
-            win_size: HashMap::new(),
             z: Vec::new(),
             kbd_focus: None,
-            node_args: HashMap::new(),
             editing_args: None,
             drag: None,
             wire_sel: None,
@@ -730,18 +610,6 @@ impl App {
             palette_scroll: 0.0,
             palette_run: None,
             request_exit: false,
-            pending_layout: HashMap::new(),
-            file_nodes: HashMap::new(),
-            connections: Vec::new(),
-            midi_links: Vec::new(),
-            host_ports: HashMap::new(),
-            net_nodes: std::collections::HashSet::new(),
-            gateways: std::collections::HashSet::new(),
-            net_links: Vec::new(),
-            serves: HashMap::new(),
-            next_port: 8080,
-            file_seq: 0,
-            host_seq: 0,
             mouse: [0.0, 0.0],
             lmb: false,
             prev_lmb: false,
@@ -751,181 +619,15 @@ impl App {
             zoom_focus: [0.0, 0.0],
             key_events: Vec::new(),
             term_input: Vec::new(),
-        };
-        app.restore(ws);
-        Ok(app)
-    }
-
-    /// Allocate the next stable node id (shared by app and file nodes).
-    fn alloc_id(&mut self) -> u64 {
-        let id = self.next_node_id;
-        self.next_node_id += 1;
-        id
-    }
-
-    /// Recreate the saved canvas (nodes, files, connections, camera) from the
-    /// loaded workspace.
-    fn restore(&mut self, saved: &Workspace) {
-        self.cam.pan = [saved.camera.0, saved.camera.1];
-        self.cam.zoom = saved.camera.2.clamp(ZOOM_MIN, ZOOM_MAX);
-        self.pan_target = self.cam.pan;
-
-        let mut max_id = 0;
-
-        // App nodes: resolve the dependency by name, spawn with the saved id.
-        for n in &saved.nodes {
-            max_id = max_id.max(n.id);
-            let Some(dep) = self.available.iter().find(|d| d.name == n.name).cloned() else {
-                eprintln!(
-                    "workspace references unknown dependency {:?}; skipping",
-                    n.name
-                );
-                continue;
-            };
-            // Use the node's saved (possibly-edited) args, falling back to the
-            // dependency default.
-            let args = if n.args.is_empty() {
-                dep.args.clone()
-            } else {
-                n.args.clone()
-            };
-            match self.host.spawn(
-                &dep.local_path(),
-                &dep.name,
-                n.id,
-                &args,
-                self.registry.clone(),
-                self.node_reg.clone(),
-                n.options.clone(),
-            ) {
-                Ok(()) => {
-                    self.pending_layout.insert(n.id, (n.pos, n.size));
-                    self.node_args.insert(n.id, args);
-                }
-                Err(e) => eprintln!("failed to restore {}: {e:#}", dep.name),
-            }
-        }
-
-        // VirtualFile nodes: recreate empty shared buffers at their saved spots.
-        for f in &saved.virtual_files {
-            max_id = max_id.max(f.id);
-            self.win_pos.insert(f.id, f.pos);
-            self.win_size.insert(f.id, f.size);
-            self.z.push(f.id);
-            if let Some(num) = f
-                .name
-                .strip_prefix("file")
-                .and_then(|s| s.parse::<u32>().ok())
-            {
-                self.file_seq = self.file_seq.max(num);
-            }
-            self.file_nodes.insert(
-                f.id,
-                FileNode::Virtual(VirtualFile {
-                    name: f.name.clone(),
-                    data: Arc::new(Mutex::new(Vec::new())),
-                }),
-            );
-        }
-
-        // HostMappedFile nodes: re-map their saved host paths (name = path).
-        for f in &saved.host_files {
-            max_id = max_id.max(f.id);
-            self.win_pos.insert(f.id, f.pos);
-            self.win_size.insert(f.id, f.size);
-            self.z.push(f.id);
-            let path = std::path::PathBuf::from(&f.name);
-            let name = host_file_name(&path);
-            if let Some(num) = name
-                .strip_prefix("host")
-                .and_then(|s| s.parse::<u32>().ok())
-            {
-                self.host_seq = self.host_seq.max(num);
-            }
-            self.file_nodes
-                .insert(f.id, FileNode::HostMapped(HostMappedFile { name, path }));
-        }
-
-        // Re-wire file connections: mount each file into its connected app's fs.
-        for &(file_id, app_id) in &saved.connections {
-            let (Some(file), Some(app)) = (self.file_nodes.get(&file_id), self.app_node(app_id))
-            else {
-                continue;
-            };
-            file.mount(&app.fs);
-            self.connections.push((file_id, app_id));
-        }
-
-        // Re-wire MIDI connections through the router.
-        for &(src, dst) in &saved.midi {
-            let (Some(_), Some(dst_node)) = (self.app_node(src), self.app_node(dst)) else {
-                continue;
-            };
-            self.host
-                .midi()
-                .lock()
-                .unwrap()
-                .connect(src, dst, dst_node.midi_in.clone());
-            self.midi_links.push((src, dst));
-        }
-
-        // HostPort nodes: recreate at their saved positions and ports.
-        for hp in &saved.host_ports {
-            max_id = max_id.max(hp.id);
-            self.next_port = self.next_port.max(hp.port.saturating_add(1));
-            self.win_pos.insert(hp.id, hp.pos);
-            self.win_size.insert(hp.id, hp.size);
-            self.z.push(hp.id);
-            self.host_ports.insert(hp.id, hp.port);
-        }
-
-        // Re-establish serve wiring (starts the servers again).
-        for &(http_id, hostport_id) in &saved.serves {
-            if self.app_node(http_id).is_some() && self.host_ports.contains_key(&hostport_id) {
-                self.toggle_serve(http_id, hostport_id);
-            }
-        }
-
-        // Network/Gateway nodes: recreate at their saved spots.
-        for net in &saved.nets {
-            max_id = max_id.max(net.id);
-            self.win_pos.insert(net.id, net.pos);
-            self.win_size.insert(net.id, net.size);
-            self.z.push(net.id);
-            self.net_nodes.insert(net.id);
-            if net.gateway {
-                self.gateways.insert(net.id);
-            }
-        }
-        // Re-wire network membership (rejoins the network + grants host access).
-        for &(app_id, net_id) in &saved.net_links {
-            if self.app_node(app_id).is_some() && self.net_nodes.contains(&net_id) {
-                self.toggle_net(app_id, net_id);
-            }
-        }
-
-        self.next_node_id = max_id + 1;
-    }
-
-    fn launch(&mut self, dep: &Dependency) {
-        let id = self.alloc_id();
-        if let Err(e) = self.host.spawn(
-            &dep.local_path(),
-            &dep.name,
-            id,
-            &dep.args,
-            self.registry.clone(),
-            self.node_reg.clone(),
-            Vec::new(),
-        ) {
-            eprintln!("failed to launch {}: {e:#}", dep.name);
-            return;
-        }
-        self.node_args.insert(id, dep.args.clone());
+        })
     }
 
     fn rect_of(&self, id: u64) -> [f32; 4] {
-        win_rect(self.cam, self.win_pos[&id], self.win_size[&id])
+        win_rect(
+            self.cam,
+            self.server.win_pos[&id],
+            self.server.win_size[&id],
+        )
     }
 
     /// The topmost canvas node (app or file) under `mp`, if any.
@@ -958,48 +660,6 @@ impl App {
             .find(|&id| near(mp, port_in(self.rect_of(id)), PORT_R * zf + 3.0))
     }
 
-    /// Create a new, empty in-memory VirtualFile node on the canvas.
-    fn add_virtual_file(&mut self) {
-        self.file_seq += 1;
-        let id = self.alloc_id();
-        let pos = self.next_file_pos();
-        self.win_pos.insert(id, pos);
-        self.win_size.insert(id, [FILE_W, FILE_H]);
-        self.z.push(id);
-        self.file_nodes.insert(
-            id,
-            FileNode::Virtual(VirtualFile {
-                name: format!("file{}", self.file_seq),
-                data: Arc::new(Mutex::new(Vec::new())),
-            }),
-        );
-    }
-
-    /// Create a HostMappedFile node backed by a fresh host file in the working
-    /// directory (`host<n>`). The path persists in the session; the file is
-    /// created on disk so connected apps read/write a real file.
-    fn add_host_mapped_file(&mut self) {
-        self.host_seq += 1;
-        let id = self.alloc_id();
-        let name = format!("host{}", self.host_seq);
-        let path = std::path::PathBuf::from(&name);
-        // Touch the file so it exists (and shows 0 B) before anything writes it.
-        if let Err(e) = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-        {
-            eprintln!("failed to create host file {}: {e}", path.display());
-        }
-        let pos = self.next_file_pos();
-        self.win_pos.insert(id, pos);
-        self.win_size.insert(id, [FILE_W, FILE_H]);
-        self.z.push(id);
-        self.file_nodes
-            .insert(id, FileNode::HostMapped(HostMappedFile { name, path }));
-    }
-
     /// A canvas position that centres a node of `size` in the current view, with
     /// a small cascade (by `n`) so successively added nodes don't fully overlap.
     fn view_center(&self, size: [f32; 2], n: usize) -> [f32; 2] {
@@ -1012,314 +672,25 @@ impl App {
 
     /// A centred, cascading canvas position for a newly added file node.
     fn next_file_pos(&self) -> [f32; 2] {
-        self.view_center([FILE_W, FILE_H], self.file_nodes.len())
+        self.view_center([FILE_W, FILE_H], self.server.file_nodes.len())
     }
 
     /// The live app node with id `id`, if it is an app (not a file) node.
     fn app_node(&self, id: u64) -> Option<SharedNode> {
-        self.node_reg
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|n| n.id == id)
-            .cloned()
+        self.server.app_node(id)
     }
 
-    /// (Re)run an idle or exited node's guest with its current args. Its network
-    /// wiring is already on its fabric stack, so a networked client started here
-    /// resolves/connects with whatever Network/Gateway it's wired to.
+    /// (Re)run an idle or exited node's guest. Commits any in-progress args edit
+    /// for this node first, then asks the server to start it.
     fn run_node(&mut self, id: u64) {
-        // Commit any in-progress args edit for this node first.
         if let Some((eid, text)) = self.editing_args.take() {
             if eid == id {
-                self.set_node_args(id, &text);
+                self.server.set_node_args(id, &text);
             } else {
                 self.editing_args = Some((eid, text));
             }
         }
-        if let Some(node) = self.app_node(id) {
-            let args = self.node_args.get(&id).cloned().unwrap_or_default();
-            if let Err(e) = self.host.run_node(&node, &args) {
-                eprintln!("failed to run {}: {e:#}", node.name);
-            }
-        }
-    }
-
-    /// Parse a whitespace-separated args string into the node's launch args.
-    fn set_node_args(&mut self, id: u64, text: &str) {
-        let args = text.split_whitespace().map(str::to_string).collect();
-        self.node_args.insert(id, args);
-    }
-
-    /// Create a HostPort node on the canvas (auto-assigned localhost port).
-    fn add_host_port(&mut self) {
-        let id = self.alloc_id();
-        let port = self.next_port;
-        self.next_port = self.next_port.wrapping_add(1).max(8080);
-        let pos = self.view_center([FILE_W, FILE_H], self.host_ports.len());
-        self.win_pos.insert(id, pos);
-        self.win_size.insert(id, [FILE_W, FILE_H]);
-        self.z.push(id);
-        self.host_ports.insert(id, port);
-    }
-
-    /// Create a Network node on the canvas — an isolated virtual network that
-    /// app nodes wire into to reach each other.
-    fn add_net_node(&mut self) {
-        let id = self.alloc_id();
-        let pos = self.view_center([FILE_W, FILE_H], self.net_nodes.len());
-        self.win_pos.insert(id, pos);
-        self.win_size.insert(id, [FILE_W, FILE_H]);
-        self.z.push(id);
-        self.net_nodes.insert(id);
-    }
-
-    /// Create a Gateway node — a network whose members also get host-network
-    /// access (real sockets + DNS) for off-fabric destinations.
-    fn add_gateway_node(&mut self) {
-        self.add_net_node();
-        if let Some(&id) = self.z.last() {
-            self.gateways.insert(id);
-        }
-    }
-
-    /// Grant/revoke a node's host-network access (on its fabric stack).
-    fn set_host_access(&self, app_id: u64, allow: bool) {
-        if let Some(node) = self.app_node(app_id) {
-            if let Some(stack) = node.net_stack() {
-                stack.lock().unwrap().host_access = allow;
-            }
-        }
-    }
-
-    /// Toggle a connection between two nodes, by the node kinds: file⇄app mounts
-    /// the file; http-app⇄HostPort serves on localhost; app⇄Network joins the
-    /// network; app⇄app wires MIDI.
-    fn connect_toggle(&mut self, a: u64, b: u64) {
-        let af = self.file_nodes.contains_key(&a);
-        let bf = self.file_nodes.contains_key(&b);
-        let ap = self.host_ports.contains_key(&a);
-        let bp = self.host_ports.contains_key(&b);
-        let an = self.net_nodes.contains(&a);
-        let bn = self.net_nodes.contains(&b);
-        if af && !bf {
-            self.toggle_file(a, b);
-        } else if bf && !af {
-            self.toggle_file(b, a);
-        } else if ap && !bp {
-            self.toggle_serve(b, a);
-        } else if bp && !ap {
-            self.toggle_serve(a, b);
-        } else if an && !bn {
-            self.toggle_net(b, a);
-        } else if bn && !an {
-            self.toggle_net(a, b);
-        } else if !af && !bf && !ap && !bp && !an && !bn {
-            self.toggle_midi(a, b);
-        }
-    }
-
-    /// Set an app node's virtual network (on its fabric stack). `net` is a
-    /// Network node's id to join it, or the app's own id to isolate it.
-    /// Ensure each wired node's fabric stack reflects its network membership.
-    /// Nodes compile asynchronously, so one wired before its stack existed (e.g.
-    /// on session restore) gets its membership applied here once it's ready.
-    fn sync_net_membership(&self, node_by_id: &HashMap<u64, SharedNode>) {
-        for &(app, net) in &self.net_links {
-            let Some(stack) = node_by_id.get(&app).and_then(|n| n.net_stack()) else {
-                continue;
-            };
-            let host = self.gateways.contains(&net);
-            let mut g = stack.lock().unwrap();
-            if g.net != net || g.host_access != host {
-                g.net = net;
-                g.host_access = host;
-            }
-        }
-    }
-
-    fn set_node_net(&self, app_id: u64, net: u64) {
-        if let Some(node) = self.app_node(app_id) {
-            if let Some(stack) = node.net_stack() {
-                stack.lock().unwrap().net = net;
-            }
-        }
-    }
-
-    /// Wire (or unwire) app node `app_id` onto Network node `net_id`. An app is
-    /// on one network at a time; unwiring returns it to its own isolated net.
-    fn toggle_net(&mut self, app_id: u64, net_id: u64) {
-        if let Some(pos) = self
-            .net_links
-            .iter()
-            .position(|&(a, n)| a == app_id && n == net_id)
-        {
-            self.net_links.remove(pos);
-            self.set_node_net(app_id, app_id); // back to isolated
-            self.set_host_access(app_id, false);
-        } else {
-            // One network per app: drop any existing membership first.
-            self.net_links.retain(|&(a, _)| a != app_id);
-            self.net_links.push((app_id, net_id));
-            self.set_node_net(app_id, net_id);
-            // Joining a Gateway also grants host-network access.
-            self.set_host_access(app_id, self.gateways.contains(&net_id));
-        }
-    }
-
-    /// Remove a Network/Gateway node, returning its members to isolation.
-    fn remove_net_node(&mut self, id: u64) {
-        self.net_nodes.remove(&id);
-        self.gateways.remove(&id);
-        let members: Vec<u64> = self
-            .net_links
-            .iter()
-            .filter(|&&(_, n)| n == id)
-            .map(|&(a, _)| a)
-            .collect();
-        for app in members {
-            self.set_node_net(app, app);
-            self.set_host_access(app, false);
-        }
-        self.net_links.retain(|&(_, n)| n != id);
-        self.win_pos.remove(&id);
-        self.win_size.remove(&id);
-        self.z.retain(|&x| x != id);
-    }
-
-    /// Wire (or unwire) a wasi:http node to a HostPort: start (or stop) serving
-    /// it on `127.0.0.1:<port>`.
-    fn toggle_serve(&mut self, http_id: u64, hostport_id: u64) {
-        if let Some((_, kill)) = self.serves.remove(&http_id) {
-            kill.store(true, Ordering::Relaxed);
-            return;
-        }
-        let Some(node) = self.app_node(http_id) else {
-            return;
-        };
-        let Some(path) = node.http_path() else {
-            return; // not a wasi:http server node
-        };
-        let Some(&port) = self.host_ports.get(&hostport_id) else {
-            return;
-        };
-        let kill = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        if let Err(e) = self
-            .host
-            .serve(&path, port, Some(node.term_io.clone()), kill.clone())
-        {
-            eprintln!("failed to serve {} on :{port}: {e:#}", node.name);
-            return;
-        }
-        self.serves.insert(http_id, (hostport_id, kill));
-    }
-
-    /// Remove a HostPort node, stopping any server bound through it.
-    fn remove_host_port(&mut self, id: u64) {
-        self.host_ports.remove(&id);
-        let bound: Vec<u64> = self
-            .serves
-            .iter()
-            .filter(|(_, (hp, _))| *hp == id)
-            .map(|(&http, _)| http)
-            .collect();
-        for http in bound {
-            if let Some((_, kill)) = self.serves.remove(&http) {
-                kill.store(true, Ordering::Relaxed);
-            }
-        }
-        self.win_pos.remove(&id);
-        self.win_size.remove(&id);
-        self.z.retain(|&x| x != id);
-    }
-
-    /// Change a HostPort's localhost port by `delta` (clamped to 1..=65535). Any
-    /// server currently bound through it is live-rebound to the new port (stopped
-    /// and restarted) so the connection keeps working without re-wiring.
-    fn change_port(&mut self, id: u64, delta: i32) {
-        let Some(&cur) = self.host_ports.get(&id) else {
-            return;
-        };
-        let new = (cur as i32 + delta).clamp(1, 65535) as u16;
-        if new == cur {
-            return;
-        }
-        self.host_ports.insert(id, new);
-        self.next_port = self.next_port.max(new.saturating_add(1));
-        // Live-rebind: restart each server bound through this HostPort on the new
-        // port. The old server releases its (different) old port as it winds down,
-        // so the fresh bind doesn't conflict.
-        let bound: Vec<u64> = self
-            .serves
-            .iter()
-            .filter(|(_, (hp, _))| *hp == id)
-            .map(|(&http, _)| http)
-            .collect();
-        for http in bound {
-            if let Some((_, kill)) = self.serves.remove(&http) {
-                kill.store(true, Ordering::Relaxed);
-            }
-            // `serves` no longer holds `http`, so this starts a fresh server,
-            // reading the just-updated port.
-            self.toggle_serve(http, id);
-        }
-    }
-
-    /// Wire (or unwire) file node `file_id` into app node `app_id`'s filesystem.
-    fn toggle_file(&mut self, file_id: u64, app_id: u64) {
-        let Some(app) = self.app_node(app_id) else {
-            return;
-        };
-        let file = &self.file_nodes[&file_id];
-        if let Some(pos) = self
-            .connections
-            .iter()
-            .position(|&(f, a)| f == file_id && a == app_id)
-        {
-            crate::vfs::unmount_file(&app.fs, file.name());
-            self.connections.remove(pos);
-        } else {
-            file.mount(&app.fs);
-            self.connections.push((file_id, app_id));
-        }
-    }
-
-    /// Wire (or unwire) app node `src`'s MIDI output into app node `dst`'s input.
-    fn toggle_midi(&mut self, src: u64, dst: u64) {
-        let (Some(_src), Some(dst_node)) = (self.app_node(src), self.app_node(dst)) else {
-            return;
-        };
-        let router = self.host.midi();
-        let mut routes = router.lock().unwrap();
-        if let Some(pos) = self
-            .midi_links
-            .iter()
-            .position(|&(s, d)| s == src && d == dst)
-        {
-            routes.disconnect(src, dst);
-            self.midi_links.remove(pos);
-        } else {
-            routes.connect(src, dst, dst_node.midi_in.clone());
-            self.midi_links.push((src, dst));
-        }
-    }
-
-    /// Remove a file node, unmounting it from every app it was connected to.
-    fn remove_file_node(&mut self, id: u64) {
-        let Some(file) = self.file_nodes.remove(&id) else {
-            return;
-        };
-        let nodes = self.node_reg.lock().unwrap().clone();
-        for &(f, a) in self.connections.iter().filter(|&&(f, _)| f == id) {
-            let _ = f;
-            if let Some(app) = nodes.iter().find(|n| n.id == a) {
-                crate::vfs::unmount_file(&app.fs, file.name());
-            }
-        }
-        self.connections.retain(|&(f, _)| f != id);
-        self.win_pos.remove(&id);
-        self.win_size.remove(&id);
-        self.z.retain(|&x| x != id);
+        self.server.run_node(id);
     }
 
     /// The screen-space endpoints of a wire (both nodes must still be placed).
@@ -1330,7 +701,7 @@ impl App {
             Wire::Serve(h, hp) => (h, hp),
             Wire::Net(app, net) => (app, net),
         };
-        if self.win_pos.contains_key(&a) && self.win_pos.contains_key(&b) {
+        if self.server.win_pos.contains_key(&a) && self.server.win_pos.contains_key(&b) {
             // Source's output port (right) to target's input port (left), so the
             // wire flows left-to-right and lines up with the visible dots.
             Some((port_out(self.rect_of(a)), port_in(self.rect_of(b))))
@@ -1339,26 +710,17 @@ impl App {
         }
     }
 
-    /// Whether the wire still connects two live nodes.
-    fn wire_exists(&self, w: Wire) -> bool {
-        match w {
-            Wire::File(f, a) => self.connections.contains(&(f, a)),
-            Wire::Midi(s, d) => self.midi_links.contains(&(s, d)),
-            Wire::Serve(h, hp) => self.serves.get(&h).map(|(p, _)| *p) == Some(hp),
-            Wire::Net(app, net) => self.net_links.contains(&(app, net)),
-        }
-    }
-
     /// The connection wire nearest to `mp` within the pick radius, if any. Picks
     /// against the drawn curve, not the straight chord, so clicks land on the arc.
     fn wire_at(&self, mp: [f32; 2], zf: f32) -> Option<Wire> {
-        let all = self
+        let s = &self.server;
+        let all = s
             .connections
             .iter()
             .map(|&(f, a)| Wire::File(f, a))
-            .chain(self.midi_links.iter().map(|&(s, d)| Wire::Midi(s, d)))
-            .chain(self.serves.iter().map(|(&h, &(hp, _))| Wire::Serve(h, hp)))
-            .chain(self.net_links.iter().map(|&(a, n)| Wire::Net(a, n)));
+            .chain(s.midi_links.iter().map(|&(s, d)| Wire::Midi(s, d)))
+            .chain(s.serves.iter().map(|(&h, &(hp, _))| Wire::Serve(h, hp)))
+            .chain(s.net_links.iter().map(|&(a, n)| Wire::Net(a, n)));
         let mut best: Option<(f32, Wire)> = None;
         for w in all {
             if let Some((a, b)) = self.wire_endpoints(w) {
@@ -1376,35 +738,10 @@ impl App {
         best.map(|(_, w)| w)
     }
 
-    /// Remove the given connection (the same effect as toggling it off).
-    fn disconnect_wire(&mut self, w: Wire) {
-        match w {
-            Wire::File(f, a) => {
-                if self.connections.contains(&(f, a)) {
-                    self.toggle_file(f, a);
-                }
-            }
-            Wire::Midi(s, d) => {
-                if self.midi_links.contains(&(s, d)) {
-                    self.toggle_midi(s, d);
-                }
-            }
-            Wire::Serve(h, hp) => {
-                if self.serves.contains_key(&h) {
-                    self.toggle_serve(h, hp);
-                }
-            }
-            Wire::Net(app, net) => {
-                if self.net_links.contains(&(app, net)) {
-                    self.toggle_net(app, net);
-                }
-            }
-        }
-    }
-
     /// All command-palette entries (label + action) for the current state.
     fn palette_all(&self) -> Vec<(String, PaletteCmd)> {
         let mut v: Vec<(String, PaletteCmd)> = self
+            .server
             .available
             .iter()
             .enumerate()
@@ -1518,15 +855,31 @@ impl App {
     fn run_palette(&mut self, cmd: PaletteCmd, fb: [f32; 2]) {
         match cmd {
             PaletteCmd::Launch(i) => {
-                if let Some(dep) = self.available.get(i).cloned() {
-                    self.launch(&dep);
+                if let Some(dep) = self.server.available.get(i).cloned() {
+                    let pos = self.view_center([360.0, 260.0], 0);
+                    self.server.launch(&dep, pos);
                 }
             }
-            PaletteCmd::AddVirtualFile => self.add_virtual_file(),
-            PaletteCmd::AddHostFile => self.add_host_mapped_file(),
-            PaletteCmd::AddPort => self.add_host_port(),
-            PaletteCmd::AddNetwork => self.add_net_node(),
-            PaletteCmd::AddGateway => self.add_gateway_node(),
+            PaletteCmd::AddVirtualFile => {
+                let pos = self.next_file_pos();
+                self.server.add_virtual_file(pos);
+            }
+            PaletteCmd::AddHostFile => {
+                let pos = self.next_file_pos();
+                self.server.add_host_mapped_file(pos);
+            }
+            PaletteCmd::AddPort => {
+                let pos = self.view_center([FILE_W, FILE_H], self.server.host_ports.len());
+                self.server.add_host_port(pos);
+            }
+            PaletteCmd::AddNetwork => {
+                let pos = self.view_center([FILE_W, FILE_H], self.server.net_nodes.len());
+                self.server.add_net_node(pos);
+            }
+            PaletteCmd::AddGateway => {
+                let pos = self.view_center([FILE_W, FILE_H], self.server.net_nodes.len());
+                self.server.add_gateway_node(pos);
+            }
             PaletteCmd::Zoom(z) => {
                 self.cam
                     .zoom_at(z / self.cam.zoom, [fb[0] * 0.5, fb[1] * 0.5]);
@@ -1550,7 +903,7 @@ impl App {
         let Some(mut gfx) = self.gfx.take() else {
             return;
         };
-        self.host.tick_epoch();
+        self.server.host.tick_epoch();
 
         // Apply pan/zoom (zoom immediate, pan eased).
         if (self.zoom_factor - 1.0).abs() > f32::EPSILON {
@@ -1578,42 +931,26 @@ impl App {
         // Remember the viewport so newly added nodes land in the current view.
         self.viewport = fb;
 
-        // ---- sync windows with the node registry ----
-        let nodes: Vec<SharedNode> = self.node_reg.lock().unwrap().clone();
+        // Server-side per-frame work: reconcile any network wiring that was
+        // pending on a node that has only just finished compiling.
+        self.server.tick();
+
+        // ---- reconcile the stacking order with the server's live node set ----
+        // Positions are assigned by the server when a node is created, so here the
+        // client only tracks draw order: new nodes go on top, gone ones drop out.
+        let nodes: Vec<SharedNode> = self.server.node_reg.lock().unwrap().clone();
         let node_by_id: HashMap<u64, SharedNode> =
             nodes.iter().map(|i| (i.id, i.clone())).collect();
-        // A freshly launched app node (no saved layout) appears centred in view.
-        let app_center = self.cam.to_canvas([fb[0] * 0.5, fb[1] * 0.5]);
-        for node in &nodes {
-            if let std::collections::hash_map::Entry::Vacant(slot) = self.win_pos.entry(node.id) {
-                let (pos, size) = self.pending_layout.remove(&node.id).unwrap_or_else(|| {
-                    let step = (self.z.len() % 8) as f32 * 28.0;
-                    let size = [360.0, 260.0];
-                    (
-                        [
-                            app_center[0] - size[0] * 0.5 + step,
-                            app_center[1] - size[1] * 0.5 + step,
-                        ],
-                        size,
-                    )
-                });
-                slot.insert(pos);
-                self.win_size.insert(node.id, size);
-                self.z.push(node.id);
+        let ids = self.server.node_ids();
+        let live: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        for &id in &ids {
+            if !self.z.contains(&id) {
+                self.z.push(id);
             }
         }
-        self.z.retain(|id| {
-            node_by_id.contains_key(id)
-                || self.file_nodes.contains_key(id)
-                || self.host_ports.contains_key(id)
-                || self.net_nodes.contains(id)
-        });
-        // Apply network memberships to any node whose fabric stack has just become
-        // ready (nodes compile asynchronously, so a node wired at spawn/restore may
-        // not have had a stack yet). Idempotent and cheap.
-        self.sync_net_membership(&node_by_id);
+        self.z.retain(|id| live.contains(id));
 
-        let surfaces: Vec<SharedSurface> = self.registry.lock().unwrap().clone();
+        let surfaces: Vec<SharedSurface> = self.server.registry.lock().unwrap().clone();
         let node_surface: HashMap<u64, SharedSurface> = surfaces
             .iter()
             .map(|s| (s.lock().unwrap().node_id, s.clone()))
@@ -1657,14 +994,14 @@ impl App {
             match d.mode {
                 DragMode::Move if lmb => {
                     let mc = self.cam.to_canvas(mp);
-                    self.win_pos
-                        .insert(d.id, [mc[0] - d.grab[0], mc[1] - d.grab[1]]);
+                    self.server
+                        .set_node_pos(d.id, [mc[0] - d.grab[0], mc[1] - d.grab[1]]);
                     self.drag = Some(d);
                 }
                 DragMode::Resize if lmb => {
-                    let p = self.win_pos[&d.id];
+                    let p = self.server.win_pos[&d.id];
                     let mc = self.cam.to_canvas(mp);
-                    self.win_size.insert(
+                    self.server.set_node_size(
                         d.id,
                         [
                             (mc[0] - p[0]).max(100.0),
@@ -1682,7 +1019,7 @@ impl App {
                         .or_else(|| self.topmost_under(mp))
                     {
                         if target != d.id {
-                            self.connect_toggle(d.id, target);
+                            self.server.connect_toggle(d.id, target);
                         }
                     }
                 }
@@ -1763,28 +1100,28 @@ impl App {
                     self.z.retain(|&x| x != id);
                     self.z.push(id);
                     let r = self.rect_of(id);
-                    let is_file = self.file_nodes.contains_key(&id);
-                    let is_port = self.host_ports.contains_key(&id);
-                    let is_net = self.net_nodes.contains(&id);
+                    let is_file = self.server.file_nodes.contains_key(&id);
+                    let is_port = self.server.host_ports.contains_key(&id);
+                    let is_net = self.server.net_nodes.contains(&id);
                     if is_file || is_port || is_net {
                         // Canvas widget nodes (file / HostPort / Network): close,
                         // adjust port (HostPort −/+ buttons), or move.
                         let (minus, plus) = port_step_btns(r, zf);
                         if contains(close_btn(r, zf), mp) {
                             if is_file {
-                                self.remove_file_node(id);
+                                self.server.remove_file_node(id);
                             } else if is_port {
-                                self.remove_host_port(id);
+                                self.server.remove_host_port(id);
                             } else {
-                                self.remove_net_node(id);
+                                self.server.remove_net_node(id);
                             }
                         } else if is_port && contains(plus, mp) {
-                            self.change_port(id, 1);
+                            self.server.change_port(id, 1);
                         } else if is_port && contains(minus, mp) {
-                            self.change_port(id, -1);
+                            self.server.change_port(id, -1);
                         } else {
                             let mc = self.cam.to_canvas(mp);
-                            let p = self.win_pos[&id];
+                            let p = self.server.win_pos[&id];
                             self.drag = Some(Drag {
                                 id,
                                 mode: DragMode::Move,
@@ -1812,7 +1149,7 @@ impl App {
                         } else if contains(title_bar(r, zf), mp) {
                             self.editing_args = None;
                             let mc = self.cam.to_canvas(mp);
-                            let p = self.win_pos[&id];
+                            let p = self.server.win_pos[&id];
                             self.drag = Some(Drag {
                                 id,
                                 mode: DragMode::Move,
@@ -1821,6 +1158,7 @@ impl App {
                         } else if idle && contains(args_bar(r, zf), mp) {
                             // Click the args bar of an idle node to edit them.
                             let cur = self
+                                .server
                                 .node_args
                                 .get(&id)
                                 .cloned()
@@ -1851,12 +1189,12 @@ impl App {
         if self.del_wire {
             self.del_wire = false;
             if let Some(w) = self.wire_sel.take() {
-                self.disconnect_wire(w);
+                self.server.disconnect_wire(w);
             }
         }
         // Drop a stale selection (its node was closed/removed).
         if let Some(w) = self.wire_sel {
-            if !self.wire_exists(w) {
+            if !self.server.wire_exists(w) {
                 self.wire_sel = None;
             }
         }
@@ -1866,11 +1204,19 @@ impl App {
         if self.drag.is_none() && !self.palette_open {
             if let Some(&id) = self.z.iter().rev().find(|&&id| {
                 contains(
-                    win_rect(self.cam, self.win_pos[&id], self.win_size[&id]),
+                    win_rect(
+                        self.cam,
+                        self.server.win_pos[&id],
+                        self.server.win_size[&id],
+                    ),
                     mp,
                 )
             }) {
-                let r = win_rect(self.cam, self.win_pos[&id], self.win_size[&id]);
+                let r = win_rect(
+                    self.cam,
+                    self.server.win_pos[&id],
+                    self.server.win_size[&id],
+                );
                 let ca = content_rect(r, zf);
                 if contains(ca, mp) {
                     if let Some(surf) = node_surface.get(&id) {
@@ -1923,7 +1269,7 @@ impl App {
         for shared in &surfaces {
             let (sid, w, h, pixels) = {
                 let mut s = shared.lock().unwrap();
-                if let Some(size) = self.win_size.get(&s.node_id) {
+                if let Some(size) = self.server.win_size.get(&s.node_id) {
                     let cw = (size[0] - 2.0 * BORDER).max(16.0) as u32;
                     let ch = (size[1] - TITLE_H - BORDER).max(16.0) as u32;
                     if cw != s.width || ch != s.height {
@@ -1975,21 +1321,21 @@ impl App {
         // Connection wires, under the nodes: curved arrows from a source's output
         // port to a target's input port. The selected wire is drawn thicker in the
         // highlight colour.
-        for &(file_id, app_id) in &self.connections {
+        for &(file_id, app_id) in &self.server.connections {
             if let Some((a, b)) = self.wire_endpoints(Wire::File(file_id, app_id)) {
                 let sel = self.wire_sel == Some(Wire::File(file_id, app_id));
                 let col = if sel { WIRE_SEL_COL } else { WIRE_COL };
                 draw_connection(&mut quads, white, a, b, sel, col, zf, full);
             }
         }
-        for &(src, dst) in &self.midi_links {
+        for &(src, dst) in &self.server.midi_links {
             if let Some((a, b)) = self.wire_endpoints(Wire::Midi(src, dst)) {
                 let sel = self.wire_sel == Some(Wire::Midi(src, dst));
                 let col = if sel { WIRE_SEL_COL } else { MIDI_WIRE_COL };
                 draw_connection(&mut quads, white, a, b, sel, col, zf, full);
             }
         }
-        for (&http, &(hostport, _)) in &self.serves {
+        for (&http, &(hostport, _)) in &self.server.serves {
             if let Some((a, b)) = self.wire_endpoints(Wire::Serve(http, hostport)) {
                 let sel = self.wire_sel == Some(Wire::Serve(http, hostport));
                 let col = if sel { WIRE_SEL_COL } else { HOSTPORT_WIRE };
@@ -1997,7 +1343,7 @@ impl App {
             }
         }
         // Network membership wires (app node — Network node).
-        for &(app, net) in &self.net_links {
+        for &(app, net) in &self.server.net_links {
             if let Some((a, b)) = self.wire_endpoints(Wire::Net(app, net)) {
                 let sel = self.wire_sel == Some(Wire::Net(app, net));
                 let col = if sel { WIRE_SEL_COL } else { NET_WIRE_COL };
@@ -2006,8 +1352,8 @@ impl App {
         }
 
         for &id in &self.z {
-            let pos = self.win_pos[&id];
-            let size = self.win_size[&id];
+            let pos = self.server.win_pos[&id];
+            let size = self.server.win_size[&id];
             let r = win_rect(self.cam, pos, size);
             if r[2] < 0.0 || r[0] > fb[0] || r[3] < 0.0 || r[1] > fb[1] {
                 continue;
@@ -2015,7 +1361,7 @@ impl App {
             let clip = intersect(r, full);
 
             // A file node renders as a small labelled box with a port.
-            if let Some(file) = self.file_nodes.get(&id) {
+            if let Some(file) = self.server.file_nodes.get(&id) {
                 let name = file.name().to_string();
                 let bytes = file.size();
                 let host = matches!(file, FileNode::HostMapped(_));
@@ -2089,8 +1435,8 @@ impl App {
 
             // A HostPort node: a labelled box exposing a wasi:http node to a
             // localhost port when wired.
-            if let Some(&port) = self.host_ports.get(&id) {
-                let serving = self.serves.values().any(|(hp, _)| *hp == id);
+            if let Some(&port) = self.server.host_ports.get(&id) {
+                let serving = self.server.serves.values().any(|(hp, _)| *hp == id);
                 quads.push(Quad::solid(white, r, HOSTPORT_BORDER, clip));
                 let body = [
                     r[0] + BORDER * zf,
@@ -2176,9 +1522,14 @@ impl App {
 
             // A Network node: an isolated virtual network; wired app nodes share
             // it. Shows how many members are on it.
-            if self.net_nodes.contains(&id) {
-                let members = self.net_links.iter().filter(|&&(_, n)| n == id).count();
-                let is_gw = self.gateways.contains(&id);
+            if self.server.net_nodes.contains(&id) {
+                let members = self
+                    .server
+                    .net_links
+                    .iter()
+                    .filter(|&&(_, n)| n == id)
+                    .count();
+                let is_gw = self.server.gateways.contains(&id);
                 quads.push(Quad::solid(white, r, NET_BORDER, clip));
                 let body = [
                     r[0] + BORDER * zf,
@@ -2433,7 +1784,8 @@ impl App {
                     Some((eid, s)) if *eid == id => format!("args: {s}_"),
                     _ => format!(
                         "args: {}  (click to edit, > to run)",
-                        self.node_args
+                        self.server
+                            .node_args
                             .get(&id)
                             .cloned()
                             .unwrap_or_default()
@@ -2656,47 +2008,21 @@ impl App {
 
         // ---- quit closed nodes ----
         for id in &to_close {
-            if let Some(node) = node_by_id.get(id) {
-                node.kill.store(true, Ordering::Relaxed);
-                // Close stdin so a terminal guest blocked on a read unblocks and
-                // its thread can exit (it isn't running wasm for the epoch to trap).
-                node.term_io.close();
-                // Detach its network stack from the fabric hub (no leak).
-                if let Some(stack) = &node.net_stack() {
-                    self.host.detach_net(stack);
-                }
-            }
-            self.terminals.remove(id);
-            self.registry.lock().unwrap().retain(|s| {
-                let mut g = s.lock().unwrap();
-                if g.node_id != *id {
-                    return true;
-                }
-                g.closed = true;
-                g.wake();
-                if let Some((tex, _, _)) = self.views.remove(&g.id) {
+            // Drop the closed node's rendered surface texture (client-owned).
+            if let Some(surf) = node_surface.get(id) {
+                let sid = surf.lock().unwrap().id;
+                if let Some((tex, _, _)) = self.views.remove(&sid) {
                     gfx.renderer.remove_texture(tex);
                 }
-                false
-            });
-            self.node_reg.lock().unwrap().retain(|x| x.id != *id);
-            // A closed app drops its connections (its filesystem is gone) and
-            // any MIDI links it took part in.
-            self.connections.retain(|&(_, app)| app != *id);
-            self.net_links.retain(|&(app, _)| app != *id);
-            self.host.midi().lock().unwrap().remove_node(*id);
-            self.midi_links.retain(|&(s, d)| s != *id && d != *id);
-            // Stop any wasi:http server this node was running.
-            if let Some((_, kill)) = self.serves.remove(id) {
-                kill.store(true, Ordering::Relaxed);
             }
-            self.win_pos.remove(id);
-            self.win_size.remove(id);
-            self.node_args.remove(id);
+            // Server: kill the node and drop all document state referencing it.
+            self.server.close_node(*id);
+            // Client-local cleanup.
+            self.terminals.remove(id);
+            self.z.retain(|x| x != id);
             if matches!(self.editing_args, Some((eid, _)) if eid == *id) {
                 self.editing_args = None;
             }
-            self.z.retain(|x| x != id);
             if self.kbd_focus == Some(*id) {
                 self.kbd_focus = None;
             }
@@ -2704,104 +2030,6 @@ impl App {
 
         self.prev_lmb = lmb;
         self.gfx = Some(gfx);
-    }
-
-    /// Write the whole workspace (dependencies + current canvas) back to the workspace file.
-    fn save_workspace(&self) {
-        let nodes = self
-            .node_reg
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|node| {
-                Some(crate::workspace::NodeState {
-                    name: node.name.clone(),
-                    id: node.id,
-                    pos: *self.win_pos.get(&node.id)?,
-                    size: *self.win_size.get(&node.id)?,
-                    // The guest's latest reported knob/option values.
-                    options: node.options.lock().unwrap().clone(),
-                    args: self.node_args.get(&node.id).cloned().unwrap_or_default(),
-                })
-            })
-            .collect();
-        // VirtualFiles save by mount name; HostMappedFiles save by host path
-        // (so the real file is re-mapped on restore).
-        let virtual_files = self
-            .file_nodes
-            .iter()
-            .filter_map(|(&id, f)| match f {
-                FileNode::Virtual(v) => Some(crate::workspace::NodeState {
-                    name: v.name.clone(),
-                    id,
-                    pos: *self.win_pos.get(&id)?,
-                    size: *self.win_size.get(&id)?,
-                    options: Vec::new(),
-                    args: Vec::new(),
-                }),
-                FileNode::HostMapped(_) => None,
-            })
-            .collect();
-        let host_files = self
-            .file_nodes
-            .iter()
-            .filter_map(|(&id, f)| match f {
-                FileNode::HostMapped(h) => Some(crate::workspace::NodeState {
-                    name: h.path.to_string_lossy().into_owned(),
-                    id,
-                    pos: *self.win_pos.get(&id)?,
-                    size: *self.win_size.get(&id)?,
-                    options: Vec::new(),
-                    args: Vec::new(),
-                }),
-                FileNode::Virtual(_) => None,
-            })
-            .collect();
-        let host_ports = self
-            .host_ports
-            .iter()
-            .filter_map(|(&id, &port)| {
-                Some(crate::workspace::PortState {
-                    id,
-                    port,
-                    pos: *self.win_pos.get(&id)?,
-                    size: *self.win_size.get(&id)?,
-                })
-            })
-            .collect();
-        let serves = self
-            .serves
-            .iter()
-            .map(|(&http, &(hostport, _))| (http, hostport))
-            .collect();
-        let nets = self
-            .net_nodes
-            .iter()
-            .filter_map(|&id| {
-                Some(crate::workspace::NetState {
-                    id,
-                    gateway: self.gateways.contains(&id),
-                    pos: *self.win_pos.get(&id)?,
-                    size: *self.win_size.get(&id)?,
-                })
-            })
-            .collect();
-        let ws = Workspace {
-            dependencies: self.available.clone(),
-            camera: (self.cam.pan[0], self.cam.pan[1], self.cam.zoom),
-            nodes,
-            virtual_files,
-            host_files,
-            host_ports,
-            connections: self.connections.clone(),
-            midi: self.midi_links.clone(),
-            serves,
-            nets,
-            net_links: self.net_links.clone(),
-        };
-        if let Err(e) = ws.save(&self.workspace_path) {
-            eprintln!("failed to save workspace: {e}");
-        }
     }
 }
 
@@ -2869,7 +2097,7 @@ impl ApplicationHandler for App {
                 // Scrolling over a HostPort node adjusts its port (scroll up =
                 // higher), rather than panning the canvas.
                 if let Some(id) = self.topmost_under(self.mouse) {
-                    if self.host_ports.contains_key(&id) {
+                    if self.server.host_ports.contains_key(&id) {
                         let step = if dy > 0.0 {
                             dy.ceil() as i32
                         } else if dy < 0.0 {
@@ -2877,7 +2105,7 @@ impl ApplicationHandler for App {
                         } else {
                             0
                         };
-                        self.change_port(id, step);
+                        self.server.change_port(id, step);
                         return;
                     }
                 }
@@ -2954,8 +2182,9 @@ impl ApplicationHandler for App {
 }
 
 pub fn run(ws: Workspace, path: std::path::PathBuf) -> Result<(), String> {
+    let server = Server::new(&ws, path)?;
     let mut event_loop = EventLoop::builder().build().map_err(|e| e.to_string())?;
-    let mut app = App::new(&ws, path)?;
+    let mut app = App::new(server)?;
     loop {
         // Pump (and render, via `about_to_wait`) with the handler set the whole
         // time, blocking up to a frame for events — this paces ~60fps when idle
@@ -2965,6 +2194,7 @@ pub fn run(ws: Workspace, path: std::path::PathBuf) -> Result<(), String> {
             break;
         }
     }
-    app.save_workspace();
+    let cam = (app.cam.pan[0], app.cam.pan[1], app.cam.zoom);
+    app.server.save(cam);
     Ok(())
 }
