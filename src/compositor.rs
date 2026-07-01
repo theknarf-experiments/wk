@@ -492,9 +492,6 @@ const WIRE_SEL_COL: [f32; 4] = [1.0, 0.85, 0.4, 1.0];
 fn port_pos(r: [f32; 4]) -> [f32; 2] {
     [r[2], (r[1] + r[3]) * 0.5]
 }
-fn center(r: [f32; 4]) -> [f32; 2] {
-    [(r[0] + r[2]) * 0.5, (r[1] + r[3]) * 0.5]
-}
 fn near(a: [f32; 2], b: [f32; 2], radius: f32) -> bool {
     let (dx, dy) = (a[0] - b[0], a[1] - b[1]);
     dx * dx + dy * dy <= radius * radius
@@ -1276,7 +1273,9 @@ impl App {
             Wire::Net(app, net) => (app, net),
         };
         if self.win_pos.contains_key(&a) && self.win_pos.contains_key(&b) {
-            Some((center(self.rect_of(a)), center(self.rect_of(b))))
+            // Attach to the nodes' ports (the visible dots), not their centres, so
+            // a wire visibly runs port-to-port and matches the drag preview.
+            Some((port_pos(self.rect_of(a)), port_pos(self.rect_of(b))))
         } else {
             None
         }
