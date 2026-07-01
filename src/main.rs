@@ -1,5 +1,6 @@
 mod arrows;
 mod audio;
+mod client;
 mod compositor;
 mod host_shell;
 mod http;
@@ -68,7 +69,12 @@ enum Commands {
     },
 
     /// Open a workspace (default workspace.wk)
-    Run,
+    Run {
+        /// Run without a window: load and run the workspace, keep the guests
+        /// alive, and exit on Ctrl-C. No rendering or OS input.
+        #[arg(long)]
+        headless: bool,
+    },
 }
 
 fn main() -> Result<(), String> {
@@ -85,8 +91,8 @@ fn main() -> Result<(), String> {
         }
         Some(Commands::List) => workspace::list(file),
         Some(Commands::Remove { plugin }) => workspace::remove(plugin.clone(), file),
-        // `wk run [-f name.wk]` opens the workspace.
-        Some(Commands::Run) => run(file),
+        // `wk run [-f name.wk] [--headless]` opens the workspace.
+        Some(Commands::Run { headless }) => run(file, *headless),
         // Bare `wk` shows help.
         None => {
             Cli::command().print_help().map_err(|e| e.to_string())?;
@@ -95,8 +101,8 @@ fn main() -> Result<(), String> {
     }
 }
 
-/// Open the given `.wk` workspace.
-fn run(file: &Path) -> Result<(), String> {
+/// Open the given `.wk` workspace with a window, or headless.
+fn run(file: &Path, headless: bool) -> Result<(), String> {
     let ws = workspace::Workspace::load(file)?;
     // Pull any OCI-artifact dependencies into the local cache before launching.
     for dep in &ws.dependencies {
@@ -104,5 +110,12 @@ fn run(file: &Path) -> Result<(), String> {
             eprintln!("warning: dependency {:?} unavailable: {e}", dep.name);
         }
     }
-    compositor::run(ws, file.to_path_buf())
+    // Build the authoritative half, then hand it to whichever client drives it.
+    let server = server::Server::new(&ws, file.to_path_buf())?;
+    let client: Box<dyn client::Client> = if headless {
+        Box::new(client::HeadlessClient)
+    } else {
+        Box::new(compositor::WindowClient)
+    };
+    client.run(server)
 }
