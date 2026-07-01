@@ -9,7 +9,6 @@ mod netstack;
 mod oci;
 mod options;
 mod plugin;
-mod protocol;
 mod render2d;
 mod server;
 mod sockets;
@@ -112,7 +111,7 @@ fn run(file: &Path, headless: bool) -> Result<(), String> {
     }
     // Build the authoritative half, then hand it to whichever client drives it.
     let server = server::Server::new(&ws, file.to_path_buf())?;
-    let client: Box<dyn client::Client> = if headless {
+    let client: Box<dyn wk_protocol::Client<server::Server>> = if headless {
         Box::new(client::HeadlessClient)
     } else {
         Box::new(compositor::WindowClient)

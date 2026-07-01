@@ -1,9 +1,17 @@
+[workspace]
+# The root `wk` binary is a member automatically; `crates/` holds the shared
+# pieces. `plugins/` are independent cargo-component crates built on their own.
+members = ["crates/*"]
+exclude = ["plugins"]
+resolver = "2"
+
 [package]
 name = "wk"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+wk-protocol = { path = "crates/wk-protocol" }
 wgpu = "29.0.3"
 env_logger = "0.11.11"
 pollster = "0.4.0"

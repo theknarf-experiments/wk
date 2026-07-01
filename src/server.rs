@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::plugin::{NodeRegistry, PluginHost, SharedNode, SurfaceRegistry};
-use crate::protocol::{Command, Wire};
 use crate::workspace::{Dependency, NetState, NodeState, PortState, Workspace};
+use wk_protocol::{Command, Wire};
 
 /// Default canvas size of a file / port / network node, in canvas pixels.
 pub const FILE_W: f32 = 130.0;

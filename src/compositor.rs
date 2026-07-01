@@ -17,10 +17,10 @@ use winit::window::WindowId;
 
 use crate::host_shell::Gfx;
 use crate::plugin::{Key, KeyEvent, PointerEvent, ResizeEvent, SharedNode, SharedSurface};
-use crate::protocol::{Command, Wire};
 use crate::render2d::{Quad, Renderer, TextureId};
 use crate::server::{FileNode, Server, FILE_H, FILE_W};
 use crate::text::Fonts;
+use wk_protocol::{Command, Wire};
 
 /// Target frame time (~60 fps).
 const FRAME: Duration = Duration::from_nanos(1_000_000_000 / 60);
@@ -2173,10 +2173,10 @@ impl ApplicationHandler for App {
 
 /// The single-player front-end: a wgpu window driven by winit. It owns all the
 /// view/input state ([`App`]) and forwards mutations to the server as
-/// [`Command`]s. See [`crate::client::Client`].
+/// [`Command`]s. See [`wk_protocol::Client`].
 pub struct WindowClient;
 
-impl crate::client::Client for WindowClient {
+impl wk_protocol::Client<Server> for WindowClient {
     fn run(self: Box<Self>, server: Server) -> Result<(), String> {
         let mut event_loop = EventLoop::builder().build().map_err(|e| e.to_string())?;
         let mut app = App::new(server)?;

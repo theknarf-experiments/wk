@@ -1,8 +1,18 @@
-//! The client → server protocol: the vocabulary a client uses to drive a
-//! [`crate::server::Server`]. In single-player these are applied in-process via
-//! [`crate::server::Server::apply`]; the same enum is what a networked client
-//! would serialize over a socket. Positions come *from* the client (it knows its
-//! camera) so the server never needs a view.
+//! The contract between a wk **client** and **server**, isolated in its own
+//! crate so the seam is explicit and free of any implementation detail.
+//!
+//! - [`Command`] (+ [`Wire`]) is the client → server vocabulary: the set of
+//!   mutations a client may ask the server to perform. In single-player these
+//!   are applied in-process; the same enum is what a networked client would
+//!   serialize over a socket.
+//! - [`Client`] is the driver contract: a client owns its own loop, deciding how
+//!   input arrives, whether to render, and when to stop — then drives a server
+//!   (whatever concrete type `S` is) to completion.
+//!
+//! This crate deliberately has no knowledge of the server's internals: it never
+//! names the concrete `Server`, only the messages that cross the boundary and
+//! the trait a front-end plugs into. That keeps it trivially reusable by future
+//! test-runners, MCP bridges, and networked front-ends.
 
 /// A connection wire, identified by the two node ids it joins (by kind).
 #[derive(Clone, Copy, PartialEq)]
@@ -17,7 +27,8 @@ pub enum Wire {
     Net(u64, u64),
 }
 
-/// A mutation a client asks the server to perform.
+/// A mutation a client asks the server to perform. Positions come *from* the
+/// client (it knows its camera) so the server never needs a view.
 pub enum Command {
     /// Launch the dependency at index `dep` (in the workspace's list) at `pos`.
     Launch { dep: usize, pos: [f32; 2] },
@@ -47,4 +58,15 @@ pub enum Command {
     SetNodeArgs { id: u64, args: String },
     /// Nudge a HostPort's localhost port by `delta`.
     ChangePort { id: u64, delta: i32 },
+}
+
+/// A driver over a server `S`. `run` takes ownership of the loop and the server,
+/// returning when the client decides to exit (window closed, signal, etc.).
+///
+/// The trait is generic over the concrete server type rather than naming it, so
+/// this crate stays free of the server's internals while a front-end can still
+/// reach whatever API that server exposes. Boxed-`self` so a caller can pick a
+/// client at runtime behind `dyn Client<S>`.
+pub trait Client<S> {
+    fn run(self: Box<Self>, server: S) -> Result<(), String>;
 }

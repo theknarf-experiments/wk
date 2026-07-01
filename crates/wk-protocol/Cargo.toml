@@ -1,0 +1,7 @@
+[package]
+name = "wk-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "The client <-> server contract for wk: the Command vocabulary and the Client trait, with no dependency on the concrete server."
+
+[dependencies]
