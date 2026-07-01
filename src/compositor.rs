@@ -474,6 +474,8 @@ const FILE_BORDER: [f32; 4] = [0.55, 0.45, 0.25, 1.0];
 const HOSTFILE_BG: [f32; 4] = [0.10, 0.14, 0.22, 1.0];
 const HOSTFILE_BORDER: [f32; 4] = [0.30, 0.45, 0.65, 1.0];
 const PORT_COL: [f32; 4] = [0.70, 0.72, 0.80, 1.0];
+/// Input-port (left, target) dot — dimmer than the output port you drag from.
+const PORT_IN_COL: [f32; 4] = [0.42, 0.44, 0.52, 1.0];
 /// HostPort node colours and wire (exposes a wasi:http node to localhost).
 const HOSTPORT_BG: [f32; 4] = [0.10, 0.18, 0.20, 1.0];
 const HOSTPORT_BORDER: [f32; 4] = [0.30, 0.62, 0.66, 1.0];
@@ -488,9 +490,21 @@ const NET_WIRE_COL: [f32; 4] = [0.62, 0.50, 0.86, 1.0];
 /// A selected wire is drawn thicker in this highlight colour.
 const WIRE_SEL_COL: [f32; 4] = [1.0, 0.85, 0.4, 1.0];
 
-/// The connection port sits at the right edge, vertically centred.
-fn port_pos(r: [f32; 4]) -> [f32; 2] {
+/// The **output** port (a node as a source), on the right edge, vertically
+/// centred — drag a wire out of here.
+fn port_out(r: [f32; 4]) -> [f32; 2] {
     [r[2], (r[1] + r[3]) * 0.5]
+}
+/// The **input** port (a node as a target), on the left edge — drop a wire here.
+fn port_in(r: [f32; 4]) -> [f32; 2] {
+    [r[0], (r[1] + r[3]) * 0.5]
+}
+/// Draw a node's input (left) and output (right) connection ports as dots. The
+/// output is brighter (you drag from it); the input is dimmer (you drop onto it).
+fn draw_ports(quads: &mut Vec<Quad>, circle: TextureId, r: [f32; 4], zf: f32, clip: [f32; 4]) {
+    let pr = PORT_R * zf;
+    quads.push(Quad::disc(circle, port_in(r), pr, PORT_IN_COL, clip));
+    quads.push(Quad::disc(circle, port_out(r), pr, PORT_COL, clip));
 }
 fn near(a: [f32; 2], b: [f32; 2], radius: f32) -> bool {
     let (dx, dy) = (a[0] - b[0], a[1] - b[1]);
@@ -889,15 +903,25 @@ impl App {
             .find(|&id| contains(self.rect_of(id), mp))
     }
 
-    /// The topmost node whose connection port is under `mp`. The port sits on the
-    /// right edge, so its outer half is outside the node rect — hit-test it
-    /// separately (the whole circle is clickable, not just the overlapping half).
-    fn port_under(&self, mp: [f32; 2], zf: f32) -> Option<u64> {
+    /// The topmost node whose **output** port (right edge) is under `mp` — where a
+    /// wire is dragged out. Ports sit on the node edge, so half the circle is
+    /// outside the rect; hit-test the whole disc separately.
+    fn output_port_under(&self, mp: [f32; 2], zf: f32) -> Option<u64> {
         self.z
             .iter()
             .rev()
             .copied()
-            .find(|&id| near(mp, port_pos(self.rect_of(id)), PORT_R * zf + 3.0))
+            .find(|&id| near(mp, port_out(self.rect_of(id)), PORT_R * zf + 3.0))
+    }
+
+    /// The topmost node whose **input** port (left edge) is under `mp` — where a
+    /// dragged wire is dropped.
+    fn input_port_under(&self, mp: [f32; 2], zf: f32) -> Option<u64> {
+        self.z
+            .iter()
+            .rev()
+            .copied()
+            .find(|&id| near(mp, port_in(self.rect_of(id)), PORT_R * zf + 3.0))
     }
 
     /// Create a new, empty in-memory VirtualFile node on the canvas.
@@ -1273,9 +1297,9 @@ impl App {
             Wire::Net(app, net) => (app, net),
         };
         if self.win_pos.contains_key(&a) && self.win_pos.contains_key(&b) {
-            // Attach to the nodes' ports (the visible dots), not their centres, so
-            // a wire visibly runs port-to-port and matches the drag preview.
-            Some((port_pos(self.rect_of(a)), port_pos(self.rect_of(b))))
+            // Source's output port (right) to target's input port (left), so the
+            // wire flows left-to-right and lines up with the visible dots.
+            Some((port_out(self.rect_of(a)), port_in(self.rect_of(b))))
         } else {
             None
         }
@@ -1610,10 +1634,12 @@ impl App {
                     self.drag = Some(d);
                 }
                 DragMode::Connect if lmb => self.drag = Some(d),
-                // Released: a connect drag wires to the node under the cursor (or
-                // on its port, so you can drop onto either node's port too).
+                // Released: wire to the target node — its input port (left), or
+                // anywhere on its body for convenience.
                 DragMode::Connect => {
-                    if let Some(target) = self.topmost_under(mp).or_else(|| self.port_under(mp, zf))
+                    if let Some(target) = self
+                        .input_port_under(mp, zf)
+                        .or_else(|| self.topmost_under(mp))
                     {
                         if target != d.id {
                             self.connect_toggle(d.id, target);
@@ -1677,11 +1703,11 @@ impl App {
                 self.palette_scroll = 0.0;
                 consumed = true;
             }
-            // Dragging a wire out of a node's connection port. Checked before the
-            // node-body hit-test so the port's outer half (past the right edge) is
-            // grabbable too.
+            // Dragging a wire out of a node's output port (right edge). Checked
+            // before the node-body hit-test so the port's outer half (past the
+            // edge) is grabbable too.
             if !consumed {
-                if let Some(id) = self.port_under(mp, zf) {
+                if let Some(id) = self.output_port_under(mp, zf) {
                     self.z.retain(|&x| x != id);
                     self.z.push(id);
                     self.drag = Some(Drag {
@@ -2025,9 +2051,7 @@ impl App {
                     TEXT,
                     clip,
                 );
-                let pp = port_pos(r);
-                let pr = PORT_R * zf;
-                quads.push(Quad::disc(gfx.renderer.circle, pp, pr, PORT_COL, full));
+                draw_ports(&mut quads, gfx.renderer.circle, r, zf, full);
                 continue;
             }
 
@@ -2114,9 +2138,7 @@ impl App {
                         clip,
                     );
                 }
-                let pp = port_pos(r);
-                let pr = PORT_R * zf;
-                quads.push(Quad::disc(gfx.renderer.circle, pp, pr, PORT_COL, full));
+                draw_ports(&mut quads, gfx.renderer.circle, r, zf, full);
                 continue;
             }
 
@@ -2181,9 +2203,7 @@ impl App {
                     TEXT,
                     clip,
                 );
-                let pp = port_pos(r);
-                let pr = PORT_R * zf;
-                quads.push(Quad::disc(gfx.renderer.circle, pp, pr, PORT_COL, full));
+                draw_ports(&mut quads, gfx.renderer.circle, r, zf, full);
                 continue;
             }
 
@@ -2405,16 +2425,14 @@ impl App {
                 );
             }
 
-            // Connection port on the right edge.
-            let pp = port_pos(r);
-            let pr = PORT_R * zf;
-            quads.push(Quad::disc(gfx.renderer.circle, pp, pr, PORT_COL, full));
+            // Input (left) + output (right) connection ports.
+            draw_ports(&mut quads, gfx.renderer.circle, r, zf, full);
         }
 
-        // The wire being dragged out of a port toward the cursor.
+        // The wire being dragged out of an output port toward the cursor.
         if let Some(d) = &self.drag {
             if matches!(d.mode, DragMode::Connect) {
-                let from = port_pos(self.rect_of(d.id));
+                let from = port_out(self.rect_of(d.id));
                 quads.push(Quad::line(
                     white,
                     from,
