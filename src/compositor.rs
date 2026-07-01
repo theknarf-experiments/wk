@@ -552,32 +552,53 @@ fn host_file_name(path: &std::path::Path) -> String {
         .unwrap_or_else(|| "hostfile".to_string())
 }
 
-/// Append a small arrowhead at the midpoint of `a`->`b` pointing toward `b`, so
-/// a connection wire shows its direction (which node is the source). Connections
-/// are directional — MIDI and serve only flow source->destination — and a plain
-/// line hides that, so a backwards wire looks identical to a working one.
-fn arrow_head(
+/// The curved arrow (perfect-arrows) for a connection from output port `a` to
+/// input port `b`. Shared by drawing and hit-testing so they agree.
+fn connection_arrow(a: [f32; 2], b: [f32; 2], zf: f32) -> crate::arrows::Arrow {
+    let opts = crate::arrows::ArrowOptions {
+        // End the curve a touch before the input port so the arrowhead sits there.
+        pad_end: (6.0 * zf).max(4.0),
+        ..Default::default()
+    };
+    crate::arrows::get_arrow(a[0], a[1], b[0], b[1], &opts)
+}
+
+/// Draw a connection as a curved arrow with a head at the target end, so a wire
+/// looks smooth and shows its direction (source output -> target input).
+#[allow(clippy::too_many_arguments)]
+fn draw_connection(
     quads: &mut Vec<Quad>,
     white: TextureId,
     a: [f32; 2],
     b: [f32; 2],
-    size: f32,
+    sel: bool,
     color: [f32; 4],
+    zf: f32,
     clip: [f32; 4],
 ) {
-    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-    let len = (dx * dx + dy * dy).sqrt().max(0.001);
-    let (ux, uy) = (dx / len, dy / len); // unit a->b
-    let (px, py) = (-uy, ux); // perpendicular
-    let m = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
-    let tip = [m[0] + ux * size, m[1] + uy * size];
-    let back = [m[0] - ux * size * 0.5, m[1] - uy * size * 0.5];
-    let wing = size * 0.8;
-    let left = [back[0] + px * wing, back[1] + py * wing];
-    let right = [back[0] - px * wing, back[1] - py * wing];
-    let th = (size * 0.5).max(1.5);
-    quads.push(Quad::line(white, tip, left, th, color, clip));
-    quads.push(Quad::line(white, tip, right, th, color, clip));
+    let th = if sel {
+        (3.5 * zf).max(2.5)
+    } else {
+        (2.0 * zf).max(1.5)
+    };
+    let arrow = connection_arrow(a, b, zf);
+    // The curved shaft, tessellated into short segments.
+    let pts = crate::arrows::polyline(&arrow, 24);
+    for s in pts.windows(2) {
+        quads.push(Quad::line(white, s[0], s[1], th, color, clip));
+    }
+    // Arrowhead at the end, pointing along the arrival angle.
+    let size = (7.0 * zf).max(5.0);
+    let end = [arrow.end.0, arrow.end.1];
+    let ang = arrow.end_angle;
+    let spread = 0.5;
+    for wing in [
+        ang + std::f32::consts::PI - spread,
+        ang + std::f32::consts::PI + spread,
+    ] {
+        let p = [end[0] + wing.cos() * size, end[1] + wing.sin() * size];
+        quads.push(Quad::line(white, end, p, th.max(1.5), color, clip));
+    }
 }
 
 /// The compositor application: owns all state. winit drives it via
@@ -1331,8 +1352,9 @@ impl App {
         }
     }
 
-    /// The connection wire nearest to `mp` within the pick radius, if any.
-    fn wire_at(&self, mp: [f32; 2]) -> Option<Wire> {
+    /// The connection wire nearest to `mp` within the pick radius, if any. Picks
+    /// against the drawn curve, not the straight chord, so clicks land on the arc.
+    fn wire_at(&self, mp: [f32; 2], zf: f32) -> Option<Wire> {
         let all = self
             .connections
             .iter()
@@ -1343,7 +1365,12 @@ impl App {
         let mut best: Option<(f32, Wire)> = None;
         for w in all {
             if let Some((a, b)) = self.wire_endpoints(w) {
-                let d = dist_to_segment(mp, a, b);
+                let arrow = connection_arrow(a, b, zf);
+                let pts = crate::arrows::polyline(&arrow, 24);
+                let d = pts
+                    .windows(2)
+                    .map(|s| dist_to_segment(mp, s[0], s[1]))
+                    .fold(f32::INFINITY, f32::min);
                 if d <= WIRE_PICK && best.map(|(bd, _)| d < bd).unwrap_or(true) {
                     best = Some((d, w));
                 }
@@ -1813,7 +1840,7 @@ impl App {
                 // can be deleted), else unfocus the app.
                 self.kbd_focus = None;
                 self.editing_args = None;
-                self.wire_sel = self.wire_at(mp);
+                self.wire_sel = self.wire_at(mp, zf);
             }
         }
 
@@ -1948,36 +1975,28 @@ impl App {
         let full = [0.0, 0.0, fb[0], fb[1]];
         let mut quads: Vec<Quad> = Vec::new();
 
-        // Connection wires, under the nodes. The selected wire is drawn thicker
-        // in the highlight colour. MIDI/serve wires also get a direction arrow.
-        let wire_w = |sel: bool| {
-            if sel {
-                (3.5 * zf).max(2.5)
-            } else {
-                (2.0 * zf).max(1.5)
-            }
-        };
+        // Connection wires, under the nodes: curved arrows from a source's output
+        // port to a target's input port. The selected wire is drawn thicker in the
+        // highlight colour.
         for &(file_id, app_id) in &self.connections {
             if let Some((a, b)) = self.wire_endpoints(Wire::File(file_id, app_id)) {
                 let sel = self.wire_sel == Some(Wire::File(file_id, app_id));
                 let col = if sel { WIRE_SEL_COL } else { WIRE_COL };
-                quads.push(Quad::line(white, a, b, wire_w(sel), col, full));
+                draw_connection(&mut quads, white, a, b, sel, col, zf, full);
             }
         }
         for &(src, dst) in &self.midi_links {
             if let Some((a, b)) = self.wire_endpoints(Wire::Midi(src, dst)) {
                 let sel = self.wire_sel == Some(Wire::Midi(src, dst));
                 let col = if sel { WIRE_SEL_COL } else { MIDI_WIRE_COL };
-                quads.push(Quad::line(white, a, b, wire_w(sel), col, full));
-                arrow_head(&mut quads, white, a, b, (7.0 * zf).max(5.0), col, full);
+                draw_connection(&mut quads, white, a, b, sel, col, zf, full);
             }
         }
         for (&http, &(hostport, _)) in &self.serves {
             if let Some((a, b)) = self.wire_endpoints(Wire::Serve(http, hostport)) {
                 let sel = self.wire_sel == Some(Wire::Serve(http, hostport));
                 let col = if sel { WIRE_SEL_COL } else { HOSTPORT_WIRE };
-                quads.push(Quad::line(white, a, b, wire_w(sel), col, full));
-                arrow_head(&mut quads, white, a, b, (7.0 * zf).max(5.0), col, full);
+                draw_connection(&mut quads, white, a, b, sel, col, zf, full);
             }
         }
         // Network membership wires (app node — Network node).
@@ -1985,7 +2004,7 @@ impl App {
             if let Some((a, b)) = self.wire_endpoints(Wire::Net(app, net)) {
                 let sel = self.wire_sel == Some(Wire::Net(app, net));
                 let col = if sel { WIRE_SEL_COL } else { NET_WIRE_COL };
-                quads.push(Quad::line(white, a, b, wire_w(sel), col, full));
+                draw_connection(&mut quads, white, a, b, sel, col, zf, full);
             }
         }
 
@@ -2445,18 +2464,21 @@ impl App {
             draw_ports(&mut quads, gfx.renderer.circle, r, zf, mp, full);
         }
 
-        // The wire being dragged out of an output port toward the cursor.
+        // The wire being dragged out of an output port toward the cursor — same
+        // curved arrow as a finished connection.
         if let Some(d) = &self.drag {
             if matches!(d.mode, DragMode::Connect) {
                 let from = port_out(self.rect_of(d.id));
-                quads.push(Quad::line(
+                draw_connection(
+                    &mut quads,
                     white,
                     from,
                     mp,
-                    2.5,
+                    false,
                     [0.80, 0.85, 1.0, 1.0],
+                    zf,
                     full,
-                ));
+                );
             }
         }
 

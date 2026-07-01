@@ -1,3 +1,4 @@
+mod arrows;
 mod audio;
 mod compositor;
 mod host_shell;
