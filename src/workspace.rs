@@ -1,10 +1,11 @@
-//! The wk **workspace**: a single `wk.kdl` file in the working directory that
-//! holds everything about a project — both its *manifest* (the dependencies it
-//! can launch) and its *session* (the live canvas: camera, the nodes that were
-//! open and where, and the connections wiring them). One file, one type, one
-//! reader and one writer — a `wk run` reopens exactly where you left off, and
-//! `wk add`/`wk remove` edit dependencies without disturbing the layout (it all
-//! round-trips through [`Workspace`]).
+//! The wk **workspace**: a `.wk` file (KDL syntax; `workspace.wk` by default,
+//! but several can share a directory) that holds everything about a project —
+//! both its *manifest* (the dependencies it can launch) and its *session* (the
+//! live canvas: camera, the nodes that were open and where, and the connections
+//! wiring them). One file, one type, one reader and one writer — a `wk run`
+//! reopens exactly where you left off, and `wk add`/`wk remove` edit
+//! dependencies without disturbing the layout (it all round-trips through
+//! [`Workspace`]).
 //!
 //! ```kdl
 //! dependencies {
@@ -27,8 +28,9 @@
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
 use std::path::{Path, PathBuf};
 
-/// The workspace file, looked up in the current directory.
-pub const WORKSPACE: &str = "wk.kdl";
+/// The default workspace file when none is named on the command line. Several
+/// `.wk` workspaces can coexist in one directory.
+pub const DEFAULT_WORKSPACE: &str = "workspace.wk";
 
 // ---- manifest: dependencies ----
 
@@ -42,7 +44,7 @@ pub enum Source {
 }
 
 impl Source {
-    /// Parse the string form stored in wk.kdl (an `oci://` prefix means OCI).
+    /// Parse the string form stored in the workspace file (an `oci://` prefix means OCI).
     pub fn parse(s: &str) -> Self {
         match s.strip_prefix("oci://") {
             Some(reference) => Source::Oci(reference.to_string()),
@@ -50,7 +52,7 @@ impl Source {
         }
     }
 
-    /// The string written back to wk.kdl.
+    /// The string written back to the workspace file.
     pub fn to_kdl(&self) -> String {
         match self {
             Source::Path(p) => p.to_string_lossy().into_owned(),
@@ -91,7 +93,7 @@ pub struct Dependency {
     pub name: String,
     pub source: Source,
     /// Command-line arguments passed to the plugin (after argv[0] = name), e.g.
-    /// a filename for an editor. Set in wk.kdl as `name "path" { args "..." }`.
+    /// a filename for an editor. Set in the workspace file as `name "path" { args "..." }`.
     pub args: Vec<String>,
 }
 
@@ -183,46 +185,25 @@ impl Workspace {
         }
     }
 
-    /// Load the workspace from `wk.kdl` in the current directory.
-    pub fn load() -> Result<Self, String> {
-        let text = std::fs::read_to_string(WORKSPACE)
-            .map_err(|e| format!("no {WORKSPACE} in this directory ({e}); run `wk init` first"))?;
-        Self::from_kdl(&text)
+    /// Load a workspace from the given `.wk` file.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            format!(
+                "no {} in this directory ({e}); create one with `wk init`",
+                path.display()
+            )
+        })?;
+        Self::from_kdl(&text).map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    /// Write the whole workspace back to `wk.kdl`.
-    pub fn save(&self) -> Result<(), String> {
-        std::fs::write(WORKSPACE, self.to_kdl())
-            .map_err(|e| format!("failed to write {WORKSPACE}: {e}"))
-    }
-
-    /// Add a dependency (idempotent by name), persisting the workspace. Returns
-    /// `true` if newly added.
-    pub fn add_dependency(&mut self, dep: Dependency) -> Result<bool, String> {
-        if self.dependencies.iter().any(|d| d.name == dep.name) {
-            return Ok(false);
-        }
-        self.dependencies.push(dep);
-        self.save()?;
-        Ok(true)
-    }
-
-    /// Remove a dependency by name, persisting the workspace. Returns how many
-    /// were removed.
-    pub fn remove_dependency(&mut self, name: &str) -> Result<usize, String> {
-        let before = self.dependencies.len();
-        self.dependencies.retain(|d| d.name != name);
-        let removed = before - self.dependencies.len();
-        if removed > 0 {
-            self.save()?;
-        }
-        Ok(removed)
+    /// Write the whole workspace to the given `.wk` file.
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        std::fs::write(path, self.to_kdl())
+            .map_err(|e| format!("failed to write {}: {e}", path.display()))
     }
 
     fn from_kdl(text: &str) -> Result<Self, String> {
-        let doc: KdlDocument = text
-            .parse()
-            .map_err(|e| format!("failed to parse {WORKSPACE}: {e}"))?;
+        let doc: KdlDocument = text.parse().map_err(|e| format!("parse error: {e}"))?;
 
         let dependencies = doc
             .get("dependencies")
@@ -515,23 +496,23 @@ fn pair_kdl(name: &str, a: u64, b: u64) -> KdlNode {
     n
 }
 
-// ---- CLI commands ----
+// ---- CLI commands (each operates on the given workspace file) ----
 
-/// Create a new empty `wk.kdl` in the current directory. Errors if one exists.
-pub fn init() -> Result<(), String> {
-    if Path::new(WORKSPACE).exists() {
-        return Err(format!("{WORKSPACE} already exists"));
+/// Create a new empty workspace at `path`. Errors if one exists.
+pub fn init(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        return Err(format!("{} already exists", path.display()));
     }
-    Workspace::empty().save()?;
-    println!("created {WORKSPACE}");
+    Workspace::empty().save(path)?;
+    println!("created {}", path.display());
     Ok(())
 }
 
 /// Add a plugin to the workspace as a dependency. `target` is a local `.wasm`
 /// path or an `oci://<ref>` registry reference; the name is its file stem or the
 /// OCI repository's last segment. An OCI artifact is pulled now to validate it.
-pub fn add(target: String) -> Result<(), String> {
-    let mut ws = Workspace::load()?;
+pub fn add(target: String, path: &Path) -> Result<(), String> {
+    let mut ws = Workspace::load(path)?;
     let source = Source::parse(&target);
     let name = match &source {
         Source::Path(p) => p
@@ -541,37 +522,38 @@ pub fn add(target: String) -> Result<(), String> {
         Source::Oci(reference) => crate::oci::name_for(reference),
     };
     source.ensure()?;
-    let dep = Dependency {
+    if ws.dependencies.iter().any(|d| d.name == name) {
+        println!("dependency already in workspace: {name}");
+        return Ok(());
+    }
+    ws.dependencies.push(Dependency {
         name: name.clone(),
         source,
         args: Vec::new(),
-    };
-    if ws.add_dependency(dep)? {
-        println!("added dependency: {name}");
-    } else {
-        println!("dependency already in workspace: {name}");
-    }
+    });
+    ws.save(path)?;
+    println!("added dependency: {name}");
     Ok(())
 }
 
 /// Publish a local plugin to an OCI registry as a Wasm OCI Artifact. `plugin` is
 /// a dependency name (resolved to its local wasm) or a `.wasm` path; `reference`
 /// is the target, e.g. `localhost:5000/triangle:1.0`.
-pub fn publish(plugin: String, reference: String) -> Result<(), String> {
-    let path = Workspace::load()
+pub fn publish(plugin: String, reference: String, path: &Path) -> Result<(), String> {
+    let wasm = Workspace::load(path)
         .ok()
         .and_then(|w| w.dependencies.into_iter().find(|d| d.name == plugin))
         .map(|d| d.local_path())
         .unwrap_or_else(|| PathBuf::from(&plugin));
-    let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let bytes = std::fs::read(&wasm).map_err(|e| format!("reading {}: {e}", wasm.display()))?;
     crate::oci::push(&reference, &bytes)?;
-    println!("published {} -> oci://{reference}", path.display());
+    println!("published {} -> oci://{reference}", wasm.display());
     Ok(())
 }
 
 /// Print the workspace's dependencies.
-pub fn list() -> Result<(), String> {
-    let ws = Workspace::load()?;
+pub fn list(path: &Path) -> Result<(), String> {
+    let ws = Workspace::load(path)?;
     if ws.dependencies.is_empty() {
         println!("(no dependencies; add one with `wk add <path>`)");
     }
@@ -582,11 +564,16 @@ pub fn list() -> Result<(), String> {
 }
 
 /// Remove a dependency from the workspace by name.
-pub fn remove(name: String) -> Result<(), String> {
-    let mut ws = Workspace::load()?;
-    match ws.remove_dependency(&name)? {
+pub fn remove(name: String, path: &Path) -> Result<(), String> {
+    let mut ws = Workspace::load(path)?;
+    let before = ws.dependencies.len();
+    ws.dependencies.retain(|d| d.name != name);
+    match before - ws.dependencies.len() {
         0 => println!("no dependency named {name:?}"),
-        n => println!("removed {n} dependency named {name:?}"),
+        n => {
+            ws.save(path)?;
+            println!("removed {n} dependency named {name:?}");
+        }
     }
     Ok(())
 }

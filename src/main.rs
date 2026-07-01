@@ -18,6 +18,7 @@ mod workspace;
 use clap::CommandFactory;
 use clap::Parser;
 use clap::Subcommand;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -25,11 +26,20 @@ use clap::Subcommand;
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+    /// Workspace file to operate on (several `.wk` workspaces can share a
+    /// directory). Defaults to `workspace.wk`.
+    #[arg(
+        short,
+        long,
+        global = true,
+        default_value = workspace::DEFAULT_WORKSPACE
+    )]
+    file: PathBuf,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize a new wk workspace (creates wk.kdl)
+    /// Initialize a new wk workspace (creates workspace.wk)
     Init,
 
     /// Add a plugin to the workspace as a named dependency
@@ -55,7 +65,7 @@ enum Commands {
         plugin: String,
     },
 
-    /// Open the workspace (`wk.kdl`) in this directory
+    /// Open a workspace (default workspace.wk)
     Run,
 }
 
@@ -64,16 +74,17 @@ fn main() -> Result<(), String> {
 
     let cli = Cli::parse();
 
+    let file = &cli.file;
     match &cli.command {
-        Some(Commands::Init) => workspace::init(),
-        Some(Commands::Add { target }) => workspace::add(target.clone()),
+        Some(Commands::Init) => workspace::init(file),
+        Some(Commands::Add { target }) => workspace::add(target.clone(), file),
         Some(Commands::Publish { plugin, reference }) => {
-            workspace::publish(plugin.clone(), reference.clone())
+            workspace::publish(plugin.clone(), reference.clone(), file)
         }
-        Some(Commands::List) => workspace::list(),
-        Some(Commands::Remove { plugin }) => workspace::remove(plugin.clone()),
-        // `wk run` opens the workspace in the current directory.
-        Some(Commands::Run) => run(),
+        Some(Commands::List) => workspace::list(file),
+        Some(Commands::Remove { plugin }) => workspace::remove(plugin.clone(), file),
+        // `wk run [-f name.wk]` opens the workspace.
+        Some(Commands::Run) => run(file),
         // Bare `wk` shows help.
         None => {
             Cli::command().print_help().map_err(|e| e.to_string())?;
@@ -82,14 +93,14 @@ fn main() -> Result<(), String> {
     }
 }
 
-/// Open the workspace (`wk.kdl`) in the current directory.
-fn run() -> Result<(), String> {
-    let ws = workspace::Workspace::load()?;
+/// Open the given `.wk` workspace.
+fn run(file: &Path) -> Result<(), String> {
+    let ws = workspace::Workspace::load(file)?;
     // Pull any OCI-artifact dependencies into the local cache before launching.
     for dep in &ws.dependencies {
         if let Err(e) = dep.ensure() {
             eprintln!("warning: dependency {:?} unavailable: {e}", dep.name);
         }
     }
-    compositor::run(ws)
+    compositor::run(ws, file.to_path_buf())
 }

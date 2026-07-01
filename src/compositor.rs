@@ -605,6 +605,8 @@ fn draw_connection(
 /// `ApplicationHandler`; the per-frame work happens in `frame`.
 struct App {
     gfx: Option<Gfx>,
+    /// The `.wk` file this workspace loads from and saves back to.
+    workspace_path: std::path::PathBuf,
     host: PluginHost,
     registry: SurfaceRegistry,
     node_reg: NodeRegistry,
@@ -691,12 +693,13 @@ struct App {
 }
 
 impl App {
-    fn new(ws: &Workspace) -> Result<Self, String> {
+    fn new(ws: &Workspace, path: std::path::PathBuf) -> Result<Self, String> {
         let host = PluginHost::new().map_err(|e| format!("{e:#}"))?;
         let registry: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
         let node_reg: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
         let mut app = App {
             gfx: None,
+            workspace_path: path,
             host,
             registry,
             node_reg,
@@ -2703,7 +2706,7 @@ impl App {
         self.gfx = Some(gfx);
     }
 
-    /// Write the whole workspace (dependencies + current canvas) back to wk.kdl.
+    /// Write the whole workspace (dependencies + current canvas) back to the workspace file.
     fn save_workspace(&self) {
         let nodes = self
             .node_reg
@@ -2796,7 +2799,7 @@ impl App {
             nets,
             net_links: self.net_links.clone(),
         };
-        if let Err(e) = ws.save() {
+        if let Err(e) = ws.save(&self.workspace_path) {
             eprintln!("failed to save workspace: {e}");
         }
     }
@@ -2950,9 +2953,9 @@ impl ApplicationHandler for App {
     }
 }
 
-pub fn run(ws: Workspace) -> Result<(), String> {
+pub fn run(ws: Workspace, path: std::path::PathBuf) -> Result<(), String> {
     let mut event_loop = EventLoop::builder().build().map_err(|e| e.to_string())?;
-    let mut app = App::new(&ws)?;
+    let mut app = App::new(&ws, path)?;
     loop {
         // Pump (and render, via `about_to_wait`) with the handler set the whole
         // time, blocking up to a frame for events — this paces ~60fps when idle

@@ -1,7 +1,7 @@
 //! Pulling wasm plugins from OCI registries as **Wasm OCI Artifacts** (the
 //! CNCF/Bytecode-Alliance format: a config of `application/vnd.wasm.config.v0+json`
 //! and a single `application/wasm` layer holding the component). This is wk's
-//! package-manager path — a dependency in `wk.kdl` can be `oci://<ref>` instead
+//! package-manager path — a dependency in the workspace file can be `oci://<ref>` instead
 //! of a local path, e.g. `oci://ghcr.io/org/name:1.0`.
 //!
 //! Pulled artifacts are cached by reference under `~/.cache/wk/oci/`, so `wk run`
