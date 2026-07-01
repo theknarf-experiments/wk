@@ -1150,6 +1150,13 @@ impl App {
         self.tabs.retain(|&t| t != id);
     }
 
+    /// Duplicate the focused node, else the one under the cursor.
+    fn duplicate_focused(&mut self) {
+        if let Some(id) = self.kbd_focus.or_else(|| self.topmost_under(self.mouse)) {
+            self.conn.send(Command::DuplicateNode { id });
+        }
+    }
+
     /// The tab rectangles (one per workspace, in order) and the trailing "+"
     /// button rect. Tabs are labelled by their 1-based position and carry a
     /// close box (see [`tab_close_btn`]).
@@ -2723,6 +2730,15 @@ impl ApplicationHandler for App {
                         && code == KeyCode::KeyW
                     {
                         self.close_workspace(self.active_ws);
+                        return;
+                    }
+                    // Cmd/Ctrl+D duplicates the focused / hovered node.
+                    if pressed
+                        && !event.repeat
+                        && (self.mods.super_key() || self.mods.control_key())
+                        && code == KeyCode::KeyD
+                    {
+                        self.duplicate_focused();
                         return;
                     }
                     // While the palette is open it captures all keystrokes.

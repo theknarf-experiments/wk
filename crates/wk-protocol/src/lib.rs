@@ -95,6 +95,9 @@ pub enum Command {
     /// Delete a workspace and every node in it. Ignored for the last workspace
     /// (a document always keeps at least one).
     RemoveWorkspace { id: NodeId },
+    /// Duplicate a node in place (same workspace, offset position). App nodes
+    /// keep their current args and knob settings; wiring is not copied.
+    DuplicateNode { id: NodeId },
     /// Remove any node (app/file/port/network) by id.
     RemoveNode { id: NodeId },
     /// Move a node to a new canvas position.
@@ -123,7 +126,8 @@ impl Command {
             | Command::AddPort { .. }
             | Command::AddNetwork { .. }
             | Command::AddGateway { .. }
-            | Command::AddWorkspace { .. } => Operation::Create,
+            | Command::AddWorkspace { .. }
+            | Command::DuplicateNode { .. } => Operation::Create,
             Command::RemoveNode { .. } | Command::RemoveWorkspace { .. } => Operation::Remove,
             Command::Connect { .. } | Command::Disconnect { .. } => Operation::Wire,
             Command::RunNode { .. } | Command::SetNodeArgs { .. } | Command::ChangePort { .. } => {

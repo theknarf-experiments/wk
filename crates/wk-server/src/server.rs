@@ -549,6 +549,67 @@ impl Server {
         }
     }
 
+    /// Duplicate a node into the same workspace at an offset. App nodes are
+    /// relaunched with their current args + knob settings; wiring isn't copied.
+    fn duplicate(&mut self, id: NodeId) {
+        let Some(ws) = self.node_ws.get(&id).copied() else {
+            return;
+        };
+        let Some(pos) = self.win_pos.get(&id).copied() else {
+            return;
+        };
+        let off = [pos[0] + 40.0, pos[1] + 40.0];
+
+        if let Some(node) = self.app_node(id) {
+            let Some(dep) = self.available.iter().find(|d| d.name == node.name).cloned() else {
+                return;
+            };
+            let args = self
+                .node_args
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| dep.args.clone());
+            let options = node.options.lock().unwrap().clone();
+            let size = self.win_size.get(&id).copied().unwrap_or([360.0, 260.0]);
+            let new_id = self.alloc_id();
+            if let Err(e) = self.host.spawn(
+                &dep.local_path(),
+                &dep.name,
+                new_id,
+                &args,
+                self.registry.clone(),
+                self.node_reg.clone(),
+                options,
+            ) {
+                eprintln!("failed to duplicate {}: {e:#}", dep.name);
+                return;
+            }
+            self.place(new_id, off, size);
+            self.node_args.insert(new_id, args);
+            self.node_ws.insert(new_id, ws);
+            return;
+        }
+
+        match self
+            .file_nodes
+            .get(&id)
+            .map(|f| matches!(f, FileNode::Virtual(_)))
+        {
+            Some(true) => return self.add_virtual_file(off, ws),
+            Some(false) => return self.add_host_mapped_file(off, ws),
+            None => {}
+        }
+        if self.host_ports.contains_key(&id) {
+            self.add_host_port(off, ws);
+        } else if self.net_nodes.contains(&id) {
+            if self.gateways.contains(&id) {
+                self.add_gateway_node(off, ws);
+            } else {
+                self.add_net_node(off, ws);
+            }
+        }
+    }
+
     /// Remove a node by kind (app/file/port/network).
     fn remove_any(&mut self, id: NodeId) {
         if self.file_nodes.contains_key(&id) {
@@ -1046,6 +1107,7 @@ impl Server {
             Command::AddGateway { pos, ws } => self.add_gateway_node(pos, ws),
             Command::AddWorkspace { id } => self.add_workspace(id),
             Command::RemoveWorkspace { id } => self.remove_workspace(id),
+            Command::DuplicateNode { id } => self.duplicate(id),
             Command::RemoveNode { id } => self.remove_any(id),
             Command::MoveNode { id, pos } => self.set_node_pos(id, pos),
             Command::ResizeNode { id, size } => self.set_node_size(id, size),
