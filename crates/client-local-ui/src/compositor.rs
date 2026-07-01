@@ -19,7 +19,7 @@ use winit::window::{Window, WindowId};
 use crate::host_shell::Gfx;
 use crate::render2d::{Quad, Renderer, TextureId};
 use crate::text::Fonts;
-use wk_protocol::{Command, NodeId, Wire};
+use wk_protocol::{Command, NodeId, NodeKind, NodePatch, Resource, ResourceRef, Wire};
 use wk_server::plugin::{Key, KeyEvent, PointerEvent, ResizeEvent, SharedNode, SharedSurface};
 use wk_server::runtime::ServerHandle;
 use wk_server::server::{View, FILE_H, FILE_W};
@@ -742,12 +742,18 @@ impl App {
     fn run_node(&mut self, id: NodeId) {
         if let Some((eid, text)) = self.editing_args.take() {
             if eid == id {
-                self.conn.send(Command::SetNodeArgs { id, args: text });
+                self.conn.send(Command::Update {
+                    id,
+                    patch: NodePatch {
+                        args: Some(text),
+                        ..Default::default()
+                    },
+                });
             } else {
                 self.editing_args = Some((eid, text));
             }
         }
-        self.conn.send(Command::RunNode { id });
+        self.conn.send(Command::Run(id));
     }
 
     /// Toggle a node between attached and popped-out into its own OS window.
@@ -889,6 +895,34 @@ impl App {
         } else {
             None
         }
+    }
+
+    /// The wire (of any kind, either direction) already joining two nodes.
+    fn wire_between(&self, a: NodeId, b: NodeId) -> Option<Wire> {
+        let s = &self.view;
+        let pair = |x: NodeId, y: NodeId| (x == a && y == b) || (x == b && y == a);
+        s.connections
+            .iter()
+            .find(|&&(f, n)| pair(f, n))
+            .map(|&(f, n)| Wire::File(f, n))
+            .or_else(|| {
+                s.midi_links
+                    .iter()
+                    .find(|&&(x, y)| pair(x, y))
+                    .map(|&(x, y)| Wire::Midi(x, y))
+            })
+            .or_else(|| {
+                s.serves
+                    .iter()
+                    .find(|(&h, &hp)| pair(h, hp))
+                    .map(|(&h, &hp)| Wire::Serve(h, hp))
+            })
+            .or_else(|| {
+                s.net_links
+                    .iter()
+                    .find(|&&(x, y)| pair(x, y))
+                    .map(|&(x, y)| Wire::Net(x, y))
+            })
     }
 
     /// The connection wire nearest to `mp` within the pick radius, if any. Picks
@@ -1069,7 +1103,11 @@ impl App {
         match cmd {
             PaletteCmd::Launch(dep) => {
                 let pos = self.view_center([360.0, 260.0], 0);
-                self.conn.send(Command::Launch { dep, pos, ws });
+                self.conn.send(Command::Create(Resource::Node {
+                    kind: NodeKind::App { dep },
+                    pos,
+                    ws,
+                }));
             }
             PaletteCmd::GoTo(id) => {
                 if let (Some(&pos), Some(&size)) =
@@ -1082,23 +1120,43 @@ impl App {
             }
             PaletteCmd::AddVirtualFile => {
                 let pos = self.next_file_pos();
-                self.conn.send(Command::AddVirtualFile { pos, ws });
+                self.conn.send(Command::Create(Resource::Node {
+                    kind: NodeKind::VirtualFile,
+                    pos,
+                    ws,
+                }));
             }
             PaletteCmd::AddHostFile => {
                 let pos = self.next_file_pos();
-                self.conn.send(Command::AddHostFile { pos, ws });
+                self.conn.send(Command::Create(Resource::Node {
+                    kind: NodeKind::HostFile,
+                    pos,
+                    ws,
+                }));
             }
             PaletteCmd::AddPort => {
                 let pos = self.view_center([FILE_W, FILE_H], self.view.host_ports.len());
-                self.conn.send(Command::AddPort { pos, ws });
+                self.conn.send(Command::Create(Resource::Node {
+                    kind: NodeKind::Port,
+                    pos,
+                    ws,
+                }));
             }
             PaletteCmd::AddNetwork => {
                 let pos = self.view_center([FILE_W, FILE_H], self.view.net_nodes.len());
-                self.conn.send(Command::AddNetwork { pos, ws });
+                self.conn.send(Command::Create(Resource::Node {
+                    kind: NodeKind::Network,
+                    pos,
+                    ws,
+                }));
             }
             PaletteCmd::AddGateway => {
                 let pos = self.view_center([FILE_W, FILE_H], self.view.net_nodes.len());
-                self.conn.send(Command::AddGateway { pos, ws });
+                self.conn.send(Command::Create(Resource::Node {
+                    kind: NodeKind::Gateway,
+                    pos,
+                    ws,
+                }));
             }
             PaletteCmd::NewWorkspace => self.new_workspace(),
             PaletteCmd::CloseWorkspace => self.close_workspace(self.active_ws),
@@ -1115,7 +1173,7 @@ impl App {
     /// mints the id so it can switch locally; the server just records the tab.
     fn new_workspace(&mut self) {
         let id = NodeId::new();
-        self.conn.send(Command::AddWorkspace { id });
+        self.conn.send(Command::Create(Resource::Workspace { id }));
         self.active_ws = id;
     }
 
@@ -1152,14 +1210,14 @@ impl App {
                 self.tabs[1]
             };
         }
-        self.conn.send(Command::RemoveWorkspace { id });
+        self.conn.send(Command::Delete(ResourceRef::Workspace(id)));
         self.tabs.retain(|&t| t != id);
     }
 
     /// Duplicate the focused node, else the one under the cursor.
     fn duplicate_focused(&mut self) {
         if let Some(id) = self.kbd_focus.or_else(|| self.topmost_under(self.mouse)) {
-            self.conn.send(Command::DuplicateNode { id });
+            self.conn.send(Command::Duplicate(id));
         }
     }
 
@@ -1437,7 +1495,13 @@ impl App {
                 DragMode::Move if lmb => {
                     let mc = self.cam.to_canvas(mp);
                     let pos = [mc[0] - d.grab[0], mc[1] - d.grab[1]];
-                    self.conn.send(Command::MoveNode { id: d.id, pos });
+                    self.conn.send(Command::Update {
+                        id: d.id,
+                        patch: NodePatch {
+                            pos: Some(pos),
+                            ..Default::default()
+                        },
+                    });
                     self.drag = Some(d);
                 }
                 DragMode::Resize if lmb => {
@@ -1447,19 +1511,32 @@ impl App {
                         (mc[0] - p[0]).max(100.0),
                         (mc[1] - p[1]).max(TITLE_H + 40.0),
                     ];
-                    self.conn.send(Command::ResizeNode { id: d.id, size });
+                    self.conn.send(Command::Update {
+                        id: d.id,
+                        patch: NodePatch {
+                            size: Some(size),
+                            ..Default::default()
+                        },
+                    });
                     self.drag = Some(d);
                 }
                 DragMode::Connect if lmb => self.drag = Some(d),
                 // Released: wire to the target node — its input port (left), or
-                // anywhere on its body for convenience.
+                // anywhere on its body for convenience. Dragging over an existing
+                // wire removes it (the client decides create vs delete; the
+                // server's create never disconnects).
                 DragMode::Connect => {
                     if let Some(target) = self
                         .input_port_under(mp, zf)
                         .or_else(|| self.topmost_under(mp))
                     {
                         if target != d.id {
-                            self.conn.send(Command::Connect { a: d.id, b: target });
+                            match self.wire_between(d.id, target) {
+                                Some(w) => self.conn.send(Command::Delete(ResourceRef::Wire(w))),
+                                None => self
+                                    .conn
+                                    .send(Command::Create(Resource::Wire { a: d.id, b: target })),
+                            }
                         }
                     }
                 }
@@ -1564,11 +1641,23 @@ impl App {
                         // adjust port (HostPort −/+ buttons), or move.
                         let (minus, plus) = port_step_btns(r, zf);
                         if contains(close_btn(r, zf), mp) {
-                            self.conn.send(Command::RemoveNode { id });
+                            self.conn.send(Command::Delete(ResourceRef::Node(id)));
                         } else if is_port && contains(plus, mp) {
-                            self.conn.send(Command::ChangePort { id, delta: 1 });
+                            self.conn.send(Command::Update {
+                                id,
+                                patch: NodePatch {
+                                    port_delta: Some(1),
+                                    ..Default::default()
+                                },
+                            });
                         } else if is_port && contains(minus, mp) {
-                            self.conn.send(Command::ChangePort { id, delta: -1 });
+                            self.conn.send(Command::Update {
+                                id,
+                                patch: NodePatch {
+                                    port_delta: Some(-1),
+                                    ..Default::default()
+                                },
+                            });
                         } else {
                             let mc = self.cam.to_canvas(mp);
                             let p = self.view.win_pos[&id];
@@ -1641,7 +1730,7 @@ impl App {
         if self.del_wire {
             self.del_wire = false;
             if let Some(w) = self.wire_sel.take() {
-                self.conn.send(Command::Disconnect { wire: w });
+                self.conn.send(Command::Delete(ResourceRef::Wire(w)));
             }
         }
         // Drop a stale selection (its node was closed/removed).
@@ -2540,7 +2629,7 @@ impl App {
                 }
             }
             // Server: kill the node and drop all document state referencing it.
-            self.conn.send(Command::RemoveNode { id: *id });
+            self.conn.send(Command::Delete(ResourceRef::Node(*id)));
             // Client-local cleanup.
             self.terminals.remove(id);
             self.detached.remove(id);
@@ -2694,7 +2783,13 @@ impl ApplicationHandler for App {
                         } else {
                             0
                         };
-                        self.conn.send(Command::ChangePort { id, delta: step });
+                        self.conn.send(Command::Update {
+                            id,
+                            patch: NodePatch {
+                                port_delta: Some(step),
+                                ..Default::default()
+                            },
+                        });
                         return;
                     }
                 }

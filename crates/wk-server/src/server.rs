@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::plugin::{NodeRegistry, PluginHost, SharedNode, SharedSurface, SurfaceRegistry};
 use crate::workspace::{Dependency, Document, NetState, NodeState, PortState, Workspace};
-use wk_protocol::{Command, NodeId, Wire};
+use wk_protocol::{Command, NodeId, NodeKind, Resource, ResourceRef, Wire};
 
 /// Default canvas size of a file / port / network node, in canvas pixels.
 pub const FILE_W: f32 = 130.0;
@@ -1182,14 +1182,8 @@ impl Server {
     /// where the mutation is undoable. The single entry point for mutations.
     pub fn apply(&mut self, cmd: Command) {
         match &cmd {
-            // Creates: run, then record removal of whatever new node appeared.
-            Command::Launch { .. }
-            | Command::AddVirtualFile { .. }
-            | Command::AddHostFile { .. }
-            | Command::AddPort { .. }
-            | Command::AddNetwork { .. }
-            | Command::AddGateway { .. }
-            | Command::DuplicateNode { .. } => {
+            // Node creates: run, then record removal of whatever node appeared.
+            Command::Create(Resource::Node { .. }) | Command::Duplicate(_) => {
                 let before: HashSet<NodeId> = self.node_ws.keys().copied().collect();
                 self.dispatch(cmd);
                 let created: Vec<NodeId> = self
@@ -1203,37 +1197,50 @@ impl Server {
                 }
                 return;
             }
-            Command::RemoveNode { id } => {
+            Command::Create(Resource::Wire { a, b }) => {
+                // Only record when the create will actually connect.
+                if !self.wired(*a, *b) {
+                    self.record(Undo::Wire(*a, *b));
+                }
+            }
+            Command::Create(Resource::Workspace { id }) => {
+                if !self.workspaces.contains(id) {
+                    self.record(Undo::DropWorkspace(*id));
+                }
+            }
+            Command::Update { id, patch } => {
+                if patch.pos.is_some() {
+                    if let Some(&p) = self.win_pos.get(id) {
+                        self.record(Undo::Pos(*id, p));
+                    }
+                }
+                if patch.size.is_some() {
+                    if let Some(&s) = self.win_size.get(id) {
+                        self.record(Undo::Size(*id, s));
+                    }
+                }
+                if patch.args.is_some() {
+                    let old = self.node_args.get(id).cloned().unwrap_or_default();
+                    self.record(Undo::Args(*id, old));
+                }
+                if patch.port_delta.is_some() {
+                    if let Some(&p) = self.host_ports.get(id) {
+                        self.record(Undo::Port(*id, p));
+                    }
+                }
+            }
+            Command::Delete(ResourceRef::Node(id)) => {
                 if let Some(s) = self.snapshot(*id) {
                     self.record(Undo::Recreate(Box::new(s)));
                 }
             }
-            Command::MoveNode { id, .. } => {
-                if let Some(&p) = self.win_pos.get(id) {
-                    self.record(Undo::Pos(*id, p));
+            Command::Delete(ResourceRef::Wire(w)) => {
+                if self.wire_exists(*w) {
+                    let (a, b) = wire_ends(*w);
+                    self.record(Undo::Wire(a, b));
                 }
             }
-            Command::ResizeNode { id, .. } => {
-                if let Some(&s) = self.win_size.get(id) {
-                    self.record(Undo::Size(*id, s));
-                }
-            }
-            Command::SetNodeArgs { id, .. } => {
-                let old = self.node_args.get(id).cloned().unwrap_or_default();
-                self.record(Undo::Args(*id, old));
-            }
-            Command::ChangePort { id, .. } => {
-                if let Some(&p) = self.host_ports.get(id) {
-                    self.record(Undo::Port(*id, p));
-                }
-            }
-            Command::Connect { a, b } => self.record(Undo::Wire(*a, *b)),
-            Command::Disconnect { wire } => {
-                let (a, b) = wire_ends(*wire);
-                self.record(Undo::Wire(a, b));
-            }
-            Command::AddWorkspace { id } => self.record(Undo::DropWorkspace(*id)),
-            Command::RemoveWorkspace { id } => {
+            Command::Delete(ResourceRef::Workspace(id)) => {
                 if self.workspaces.len() > 1 && self.workspaces.contains(id) {
                     if let Some(s) = self.snapshot_workspace(*id) {
                         self.record(Undo::RecreateWorkspace(Box::new(s)));
@@ -1241,7 +1248,7 @@ impl Server {
                 }
             }
             // Not undoable: run and undo itself.
-            Command::RunNode { .. } | Command::Undo => {}
+            Command::Run(_) | Command::Undo => {}
         }
         self.dispatch(cmd);
     }
@@ -1249,29 +1256,47 @@ impl Server {
     /// Perform a command's mutation (no undo recording).
     fn dispatch(&mut self, cmd: Command) {
         match cmd {
-            Command::Launch { dep, pos, ws } => {
-                if let Some(dep) = self.available.get(dep).cloned() {
-                    self.launch(&dep, pos, ws);
+            Command::Create(Resource::Node { kind, pos, ws }) => match kind {
+                NodeKind::App { dep } => {
+                    if let Some(dep) = self.available.get(dep).cloned() {
+                        self.launch(&dep, pos, ws);
+                    }
+                }
+                NodeKind::VirtualFile => self.add_virtual_file(pos, ws),
+                NodeKind::HostFile => self.add_host_mapped_file(pos, ws),
+                NodeKind::Port => self.add_host_port(pos, ws),
+                NodeKind::Network => {
+                    self.add_net_node(pos, ws);
+                }
+                NodeKind::Gateway => self.add_gateway_node(pos, ws),
+            },
+            // Create is create only: a wire that already exists is left alone
+            // (removal is Delete, so a create-only token can never disconnect).
+            Command::Create(Resource::Wire { a, b }) => {
+                if !self.wired(a, b) {
+                    self.connect_toggle(a, b);
                 }
             }
-            Command::AddVirtualFile { pos, ws } => self.add_virtual_file(pos, ws),
-            Command::AddHostFile { pos, ws } => self.add_host_mapped_file(pos, ws),
-            Command::AddPort { pos, ws } => self.add_host_port(pos, ws),
-            Command::AddNetwork { pos, ws } => {
-                self.add_net_node(pos, ws);
+            Command::Create(Resource::Workspace { id }) => self.add_workspace(id),
+            Command::Update { id, patch } => {
+                if let Some(pos) = patch.pos {
+                    self.set_node_pos(id, pos);
+                }
+                if let Some(size) = patch.size {
+                    self.set_node_size(id, size);
+                }
+                if let Some(args) = patch.args {
+                    self.set_node_args(id, &args);
+                }
+                if let Some(delta) = patch.port_delta {
+                    self.change_port(id, delta);
+                }
             }
-            Command::AddGateway { pos, ws } => self.add_gateway_node(pos, ws),
-            Command::AddWorkspace { id } => self.add_workspace(id),
-            Command::RemoveWorkspace { id } => self.remove_workspace(id),
-            Command::DuplicateNode { id } => self.duplicate(id),
-            Command::RemoveNode { id } => self.remove_any(id),
-            Command::MoveNode { id, pos } => self.set_node_pos(id, pos),
-            Command::ResizeNode { id, size } => self.set_node_size(id, size),
-            Command::Connect { a, b } => self.connect_toggle(a, b),
-            Command::Disconnect { wire } => self.disconnect_wire(wire),
-            Command::RunNode { id } => self.run_node(id),
-            Command::SetNodeArgs { id, args } => self.set_node_args(id, &args),
-            Command::ChangePort { id, delta } => self.change_port(id, delta),
+            Command::Delete(ResourceRef::Node(id)) => self.remove_any(id),
+            Command::Delete(ResourceRef::Wire(w)) => self.disconnect_wire(w),
+            Command::Delete(ResourceRef::Workspace(id)) => self.remove_workspace(id),
+            Command::Run(id) => self.run_node(id),
+            Command::Duplicate(id) => self.duplicate(id),
             Command::Undo => {
                 if let Some(u) = self.undo.pop() {
                     self.apply_undo(u);

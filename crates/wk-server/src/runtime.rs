@@ -155,10 +155,11 @@ fn serve(
         {
             let mut s = server.lock().unwrap();
             while let Ok((token, cmd)) = rx.try_recv() {
-                if auth::authorize(public_key, &token, cmd.operation()) {
+                let (resource, action) = cmd.required();
+                if auth::authorize(public_key, &token, resource, action) {
                     s.apply(cmd);
                 } else {
-                    eprintln!("wk: rejected unauthorized command ({:?})", cmd.operation());
+                    eprintln!("wk: rejected unauthorized command ({resource:?} {action:?})");
                 }
             }
             // Advance the epoch so any runaway guest re-checks its kill switch,

@@ -1,9 +1,9 @@
 //! The wk **token service**: the minting authority in the three-way auth split.
 //! It owns the root signing keypair, hands out its [`PublicKey`] (which the
 //! server uses to verify), and mints [Biscuit](https://www.biscuitsec.org/)
-//! tokens granting a set of [`Operation`]s. It never verifies commands and never
-//! runs the workspace — that is the server's job — and it is the only component
-//! that holds a private key.
+//! tokens granting `right(resource, action)` pairs. It never verifies commands
+//! and never runs the workspace — that is the server's job — and it is the only
+//! component that holds a private key.
 //!
 //! Locally the CLI creates one service, gives the server a copy of its public
 //! key, mints a token, and hands that token to the client. When wk grows real
@@ -13,7 +13,7 @@
 use biscuit_auth::{Biscuit, KeyPair};
 
 pub use biscuit_auth::PublicKey;
-pub use wk_protocol::Operation;
+pub use wk_protocol::{Action, ResourceKind};
 
 /// The token-issuing authority. Holds the root keypair; mints tokens.
 pub struct TokenService {
@@ -35,14 +35,15 @@ impl TokenService {
         self.root.public()
     }
 
-    /// Mint a token granting exactly `rights`, serialized for transport. This is
-    /// the credential a client stores and presents with every command.
-    pub fn mint(&self, rights: &[Operation]) -> Result<Vec<u8>, String> {
+    /// Mint a token granting exactly the given `right(resource, action)` pairs,
+    /// serialized for transport. This is the credential a client stores and
+    /// presents with every command.
+    pub fn mint(&self, rights: &[(ResourceKind, Action)]) -> Result<Vec<u8>, String> {
         let mut builder = Biscuit::builder();
-        for r in rights {
-            // `r.as_str()` comes from a fixed enum, so there is no injection risk.
+        for (res, act) in rights {
+            // Both strs come from fixed enums, so there is no injection risk.
             builder = builder
-                .fact(format!(r#"right("{}")"#, r.as_str()).as_str())
+                .fact(format!(r#"right("{}", "{}")"#, res.as_str(), act.as_str()).as_str())
                 .map_err(|e| format!("biscuit fact: {e}"))?;
         }
         let token = builder
@@ -53,10 +54,14 @@ impl TokenService {
             .map_err(|e| format!("biscuit serialize: {e}"))
     }
 
-    /// Mint a full-authority token (every [`Operation`]) — what the trusted local
-    /// client is handed.
+    /// Mint a full-authority token (every action on every resource) — what the
+    /// trusted local client is handed.
     pub fn mint_admin(&self) -> Result<Vec<u8>, String> {
-        self.mint(&Operation::ALL)
+        let all: Vec<(ResourceKind, Action)> = ResourceKind::ALL
+            .iter()
+            .flat_map(|&r| Action::ALL.iter().map(move |&a| (r, a)))
+            .collect();
+        self.mint(&all)
     }
 }
 
@@ -73,7 +78,12 @@ mod tests {
     #[test]
     fn minted_token_verifies_against_the_public_key() {
         let svc = TokenService::new();
-        let token = svc.mint(&[Operation::Create, Operation::Wire]).unwrap();
+        let token = svc
+            .mint(&[
+                (ResourceKind::Node, Action::Create),
+                (ResourceKind::Wire, Action::Create),
+            ])
+            .unwrap();
         // The server side verifies by deserializing with the public key.
         assert!(Biscuit::from(&token, svc.public_key()).is_ok());
     }

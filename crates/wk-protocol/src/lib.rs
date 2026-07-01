@@ -30,114 +30,180 @@ pub enum Wire {
     Net(NodeId, NodeId),
 }
 
-/// The capability a [`Command`] requires. A client's token grants some set of
-/// these; the server authorizes each command against the token that carried it.
-/// Kept crypto-free here so both sides agree on the taxonomy; the server maps
-/// each to a Biscuit `right(..)` fact.
+/// The kinds of resource a [`Command`] acts on. Together with an [`Action`] this
+/// is the unit of authorization: a token grants `right(resource, action)` pairs
+/// (Biscuit facts) and the server checks each command against them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Operation {
-    /// Create a node of any kind (launch an app, add a file/port/network).
-    Create,
-    /// Remove a node.
-    Remove,
-    /// Add or remove a connection between nodes.
+pub enum ResourceKind {
+    /// A workspace tab.
+    Workspace,
+    /// A canvas node (app/file/port/network).
+    Node,
+    /// A connection between two nodes.
     Wire,
-    /// Run/configure a node (run, set args, change a port).
-    Control,
-    /// Reposition or resize a node. Cosmetic layout.
-    Arrange,
+    /// The document as a whole (reads, undo).
+    Document,
 }
 
-impl Operation {
-    /// The stable name used in the Biscuit `right(..)` fact and policy.
+impl ResourceKind {
+    /// The stable name used in the Biscuit `right(resource, action)` fact.
     pub fn as_str(self) -> &'static str {
         match self {
-            Operation::Create => "create",
-            Operation::Remove => "remove",
-            Operation::Wire => "wire",
-            Operation::Control => "control",
-            Operation::Arrange => "arrange",
+            ResourceKind::Workspace => "workspace",
+            ResourceKind::Node => "node",
+            ResourceKind::Wire => "wire",
+            ResourceKind::Document => "document",
         }
     }
 
-    /// Every operation, for minting a full-authority token.
-    pub const ALL: [Operation; 5] = [
-        Operation::Create,
-        Operation::Remove,
-        Operation::Wire,
-        Operation::Control,
-        Operation::Arrange,
+    pub const ALL: [ResourceKind; 4] = [
+        ResourceKind::Workspace,
+        ResourceKind::Node,
+        ResourceKind::Wire,
+        ResourceKind::Document,
     ];
 }
 
-/// A mutation a client asks the server to perform. Positions come *from* the
-/// client (it knows its camera) so the server never needs a view.
-pub enum Command {
-    /// Launch the dependency at index `dep` at `pos` in workspace `ws`.
-    Launch {
-        dep: usize,
+/// What a [`Command`] does to a resource: CRUD verbs plus the two actions that
+/// were never CRUD — `Arrange` (cosmetic layout: move/resize, so a layout-only
+/// client can tidy the canvas without being able to reconfigure nodes) and
+/// `Run` (start a node's guest).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Action {
+    Create,
+    Read,
+    Update,
+    Delete,
+    /// Reposition or resize — cosmetic layout, weaker than `Update`.
+    Arrange,
+    /// (Re)start a node's guest.
+    Run,
+}
+
+impl Action {
+    /// The stable name used in the Biscuit `right(resource, action)` fact.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Action::Create => "create",
+            Action::Read => "read",
+            Action::Update => "update",
+            Action::Delete => "delete",
+            Action::Arrange => "arrange",
+            Action::Run => "run",
+        }
+    }
+
+    pub const ALL: [Action; 6] = [
+        Action::Create,
+        Action::Read,
+        Action::Update,
+        Action::Delete,
+        Action::Arrange,
+        Action::Run,
+    ];
+}
+
+/// What kind of node to create (the create payload for [`Resource::Node`]).
+pub enum NodeKind {
+    /// Launch the dependency at this index in the document's list.
+    App { dep: usize },
+    /// An in-memory shared file.
+    VirtualFile,
+    /// A disk-backed file.
+    HostFile,
+    /// A localhost HostPort.
+    Port,
+    /// An isolated virtual network.
+    Network,
+    /// A network whose members get host access.
+    Gateway,
+}
+
+/// A resource to create.
+pub enum Resource {
+    /// A node of `kind` at `pos` in workspace `ws`. Positions come *from* the
+    /// client (it knows its camera) so the server never needs a view.
+    Node {
+        kind: NodeKind,
         pos: [f32; 2],
         ws: NodeId,
     },
-    /// Create an in-memory shared file node at `pos` in workspace `ws`.
-    AddVirtualFile { pos: [f32; 2], ws: NodeId },
-    /// Create a disk-backed file node at `pos` in workspace `ws`.
-    AddHostFile { pos: [f32; 2], ws: NodeId },
-    /// Create a HostPort node at `pos` in workspace `ws`.
-    AddPort { pos: [f32; 2], ws: NodeId },
-    /// Create a Network node at `pos` in workspace `ws`.
-    AddNetwork { pos: [f32; 2], ws: NodeId },
-    /// Create a Gateway node at `pos` in workspace `ws`.
-    AddGateway { pos: [f32; 2], ws: NodeId },
-    /// Create a new (empty) workspace with the given client-minted id. The client
-    /// mints the id so it can switch its own view to the new tab immediately.
-    AddWorkspace { id: NodeId },
-    /// Delete a workspace and every node in it. Ignored for the last workspace
-    /// (a document always keeps at least one).
-    RemoveWorkspace { id: NodeId },
+    /// A connection between two nodes (the kind is inferred from them). No-op if
+    /// they are already wired — removal is [`ResourceRef::Wire`] + Delete, never
+    /// a side effect of create.
+    Wire { a: NodeId, b: NodeId },
+    /// A new (empty) workspace with a client-minted id, so the client can switch
+    /// its own view to the new tab immediately.
+    Workspace { id: NodeId },
+}
+
+/// A reference to an existing resource (for deletes).
+pub enum ResourceRef {
+    Node(NodeId),
+    Wire(Wire),
+    /// Deleting a workspace removes every node in it. Ignored for the last
+    /// workspace (a document always keeps at least one).
+    Workspace(NodeId),
+}
+
+/// A partial update to a node; only the present fields change.
+#[derive(Default)]
+pub struct NodePatch {
+    /// Move to a new canvas position (requires only `Arrange`).
+    pub pos: Option<[f32; 2]>,
+    /// Resize (requires only `Arrange`).
+    pub size: Option<[f32; 2]>,
+    /// Set launch args from a whitespace-separated string (requires `Update`).
+    pub args: Option<String>,
+    /// Nudge a HostPort's localhost port by this delta (requires `Update`).
+    pub port_delta: Option<i32>,
+}
+
+/// A mutation a client asks the server to perform: create/update/delete on a
+/// resource, plus the non-CRUD actions (run, duplicate, undo).
+pub enum Command {
+    Create(Resource),
+    Update {
+        id: NodeId,
+        patch: NodePatch,
+    },
+    Delete(ResourceRef),
+    /// (Re)run an idle/exited app node's guest.
+    Run(NodeId),
     /// Duplicate a node in place (same workspace, offset position). App nodes
     /// keep their current args and knob settings; wiring is not copied.
-    DuplicateNode { id: NodeId },
-    /// Remove any node (app/file/port/network) by id.
-    RemoveNode { id: NodeId },
-    /// Move a node to a new canvas position.
-    MoveNode { id: NodeId, pos: [f32; 2] },
-    /// Resize a node.
-    ResizeNode { id: NodeId, size: [f32; 2] },
-    /// Toggle a connection between two nodes (the kind is inferred from them).
-    Connect { a: NodeId, b: NodeId },
-    /// Remove a specific connection.
-    Disconnect { wire: Wire },
-    /// (Re)run an idle/exited app node's guest.
-    RunNode { id: NodeId },
-    /// Set a node's launch args from a whitespace-separated string.
-    SetNodeArgs { id: NodeId, args: String },
-    /// Nudge a HostPort's localhost port by `delta`.
-    ChangePort { id: NodeId, delta: i32 },
-    /// Undo the last undoable mutation (move/resize/wire/args/port/create/delete).
+    Duplicate(NodeId),
+    /// Undo the last undoable mutation.
     Undo,
 }
 
 impl Command {
-    /// The capability a client must hold for the server to apply this command.
-    pub fn operation(&self) -> Operation {
+    /// The `right(resource, action)` a client's token must grant for the server
+    /// to apply this command.
+    pub fn required(&self) -> (ResourceKind, Action) {
         match self {
-            Command::Launch { .. }
-            | Command::AddVirtualFile { .. }
-            | Command::AddHostFile { .. }
-            | Command::AddPort { .. }
-            | Command::AddNetwork { .. }
-            | Command::AddGateway { .. }
-            | Command::AddWorkspace { .. }
-            | Command::DuplicateNode { .. } => Operation::Create,
-            Command::RemoveNode { .. } | Command::RemoveWorkspace { .. } => Operation::Remove,
-            Command::Connect { .. } | Command::Disconnect { .. } => Operation::Wire,
-            Command::RunNode { .. } | Command::SetNodeArgs { .. } | Command::ChangePort { .. } => {
-                Operation::Control
+            Command::Create(Resource::Node { .. }) => (ResourceKind::Node, Action::Create),
+            Command::Create(Resource::Wire { .. }) => (ResourceKind::Wire, Action::Create),
+            Command::Create(Resource::Workspace { .. }) => {
+                (ResourceKind::Workspace, Action::Create)
             }
-            Command::MoveNode { .. } | Command::ResizeNode { .. } => Operation::Arrange,
-            // Undo can restore or remove anything it previously recorded.
-            Command::Undo => Operation::Create,
+            // A patch touching args/port reconfigures the node; pos/size alone
+            // is cosmetic layout.
+            Command::Update { patch, .. } => {
+                if patch.args.is_some() || patch.port_delta.is_some() {
+                    (ResourceKind::Node, Action::Update)
+                } else {
+                    (ResourceKind::Node, Action::Arrange)
+                }
+            }
+            Command::Delete(ResourceRef::Node(_)) => (ResourceKind::Node, Action::Delete),
+            Command::Delete(ResourceRef::Wire(_)) => (ResourceKind::Wire, Action::Delete),
+            Command::Delete(ResourceRef::Workspace(_)) => (ResourceKind::Workspace, Action::Delete),
+            Command::Run(_) => (ResourceKind::Node, Action::Run),
+            Command::Duplicate(_) => (ResourceKind::Node, Action::Create),
+            // Undo can restore or remove anything it previously recorded, so it
+            // needs document-wide write authority.
+            Command::Undo => (ResourceKind::Document, Action::Update),
         }
     }
 }
