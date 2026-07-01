@@ -19,7 +19,7 @@ use winit::window::{Window, WindowId};
 use crate::host_shell::Gfx;
 use crate::render2d::{Quad, Renderer, TextureId};
 use crate::text::Fonts;
-use wk_protocol::{Command, Wire};
+use wk_protocol::{Command, NodeId, Wire};
 use wk_server::plugin::{Key, KeyEvent, PointerEvent, ResizeEvent, SharedNode, SharedSurface};
 use wk_server::runtime::ServerHandle;
 use wk_server::server::{View, FILE_H, FILE_W};
@@ -385,7 +385,7 @@ enum DragMode {
     Connect,
 }
 struct Drag {
-    id: u64,
+    id: NodeId,
     mode: DragMode,
     grab: [f32; 2],
 }
@@ -572,15 +572,15 @@ struct App {
     sent_cam: (f32, f32, f32),
     gfx: Option<Gfx>,
     /// Nodes currently popped out into their own OS window, keyed by node id.
-    detached: HashMap<u64, Detached>,
+    detached: HashMap<NodeId, Detached>,
     /// Detach requests awaiting window creation (needs the `ActiveEventLoop`,
     /// which `frame` doesn't have; drained in `about_to_wait`).
-    pending_detach: Vec<u64>,
+    pending_detach: Vec<NodeId>,
 
     views: HashMap<u64, (TextureId, u32, u32)>,
     text_cache: TextCache,
     /// VT terminal per non-graphical node, fed from its stdout.
-    terminals: HashMap<u64, wk_server::terminal::Terminal>,
+    terminals: HashMap<NodeId, wk_server::terminal::Terminal>,
 
     cam: Camera,
     pan_target: [f32; 2],
@@ -588,10 +588,10 @@ struct App {
     /// added nodes can be placed at the centre of the current view.
     viewport: [f32; 2],
     /// This client's stacking order (which node draws/hit-tests on top).
-    z: Vec<u64>,
-    kbd_focus: Option<u64>,
+    z: Vec<NodeId>,
+    kbd_focus: Option<NodeId>,
     /// When editing an idle node's args: its id and the in-progress text.
-    editing_args: Option<(u64, String)>,
+    editing_args: Option<(NodeId, String)>,
     drag: Option<Drag>,
     /// The connection wire currently selected (click to select, Delete to remove).
     wire_sel: Option<Wire>,
@@ -671,12 +671,12 @@ impl App {
         })
     }
 
-    fn rect_of(&self, id: u64) -> [f32; 4] {
+    fn rect_of(&self, id: NodeId) -> [f32; 4] {
         win_rect(self.cam, self.view.win_pos[&id], self.view.win_size[&id])
     }
 
     /// The topmost canvas node (app or file) under `mp`, if any.
-    fn topmost_under(&self, mp: [f32; 2]) -> Option<u64> {
+    fn topmost_under(&self, mp: [f32; 2]) -> Option<NodeId> {
         self.z
             .iter()
             .rev()
@@ -687,7 +687,7 @@ impl App {
     /// The topmost node whose **output** port (right edge) is under `mp` — where a
     /// wire is dragged out. Ports sit on the node edge, so half the circle is
     /// outside the rect; hit-test the whole disc separately.
-    fn output_port_under(&self, mp: [f32; 2], zf: f32) -> Option<u64> {
+    fn output_port_under(&self, mp: [f32; 2], zf: f32) -> Option<NodeId> {
         self.z
             .iter()
             .rev()
@@ -697,7 +697,7 @@ impl App {
 
     /// The topmost node whose **input** port (left edge) is under `mp` — where a
     /// dragged wire is dropped.
-    fn input_port_under(&self, mp: [f32; 2], zf: f32) -> Option<u64> {
+    fn input_port_under(&self, mp: [f32; 2], zf: f32) -> Option<NodeId> {
         self.z
             .iter()
             .rev()
@@ -721,13 +721,13 @@ impl App {
     }
 
     /// The live app node with id `id`, if it is an app (not a file) node.
-    fn app_node(&self, id: u64) -> Option<SharedNode> {
+    fn app_node(&self, id: NodeId) -> Option<SharedNode> {
         self.view.app_node(id)
     }
 
     /// (Re)run an idle or exited node's guest. Commits any in-progress args edit
     /// for this node first, then asks the server to start it.
-    fn run_node(&mut self, id: u64) {
+    fn run_node(&mut self, id: NodeId) {
         if let Some((eid, text)) = self.editing_args.take() {
             if eid == id {
                 self.conn.send(Command::SetNodeArgs { id, args: text });
@@ -742,7 +742,7 @@ impl App {
     /// Reattaching just drops the window here (the surface reverts to its
     /// in-workspace size next frame); detaching is deferred to `about_to_wait`,
     /// which has the `ActiveEventLoop` needed to create a window.
-    fn toggle_detach(&mut self, id: u64) {
+    fn toggle_detach(&mut self, id: NodeId) {
         if self.detached.remove(&id).is_none() && !self.pending_detach.contains(&id) {
             self.pending_detach.push(id);
         }
@@ -755,7 +755,7 @@ impl App {
             return;
         }
         // Resolve each request's initial window size + title before borrowing gfx.
-        let reqs: Vec<(u64, [u32; 2], String)> = std::mem::take(&mut self.pending_detach)
+        let reqs: Vec<(NodeId, [u32; 2], String)> = std::mem::take(&mut self.pending_detach)
             .into_iter()
             .filter(|id| !self.detached.contains_key(id))
             .map(|id| {
@@ -1132,8 +1132,8 @@ impl App {
     fn render_detached(
         &mut self,
         gfx: &mut Gfx,
-        id: u64,
-        node_surface: &HashMap<u64, SharedSurface>,
+        id: NodeId,
+        node_surface: &HashMap<NodeId, SharedSurface>,
     ) {
         let Some(size) = self.detached.get(&id).map(|d| d.size) else {
             return;
@@ -1254,10 +1254,10 @@ impl App {
         // Positions are assigned by the server when a node is created, so here the
         // client only tracks draw order: new nodes go on top, gone ones drop out.
         let nodes: Vec<SharedNode> = self.view.nodes.clone();
-        let node_by_id: HashMap<u64, SharedNode> =
+        let node_by_id: HashMap<NodeId, SharedNode> =
             nodes.iter().map(|i| (i.id, i.clone())).collect();
         let ids = self.view.node_ids.clone();
-        let live: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        let live: std::collections::HashSet<NodeId> = ids.iter().copied().collect();
         for &id in &ids {
             if !self.z.contains(&id) {
                 self.z.push(id);
@@ -1266,7 +1266,7 @@ impl App {
         self.z.retain(|id| live.contains(id));
 
         let surfaces: Vec<SharedSurface> = self.view.surfaces.clone();
-        let node_surface: HashMap<u64, SharedSurface> = surfaces
+        let node_surface: HashMap<NodeId, SharedSurface> = surfaces
             .iter()
             .map(|s| (s.lock().unwrap().node_id, s.clone()))
             .collect();
@@ -1289,7 +1289,7 @@ impl App {
             .retain(|id, _| node_by_id.contains_key(id) && !node_surface.contains_key(id));
 
         // ---- interaction ----
-        let mut to_close: Vec<u64> = Vec::new();
+        let mut to_close: Vec<NodeId> = Vec::new();
 
         // Corner zoom button (bottom-left) and the preset items stacked above it.
         let zoom_btn_w = gfx.fonts.measure("200%") as f32 + 3.0 * PAD;
@@ -2342,7 +2342,7 @@ impl App {
         // Drop windows for nodes that vanished (closed elsewhere), then forward
         // each window's queued input to its node and render its own window.
         self.detached.retain(|id, _| node_by_id.contains_key(id));
-        let det_ids: Vec<u64> = self.detached.keys().copied().collect();
+        let det_ids: Vec<NodeId> = self.detached.keys().copied().collect();
         for id in det_ids {
             let (mouse, lmb_d, prev_d, keys, term_in) = {
                 let det = self.detached.get_mut(&id).unwrap();

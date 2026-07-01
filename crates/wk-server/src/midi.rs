@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use wk_protocol::NodeId;
 
 use wasmtime::component::{HasData, Linker, Resource};
 use wasmtime::Result;
@@ -54,32 +55,32 @@ pub fn new_inbox() -> SharedInbox {
 #[derive(Default)]
 pub struct Routes {
     /// Source node id -> connected (destination id, destination inbox).
-    links: HashMap<u64, Vec<(u64, SharedInbox)>>,
+    links: HashMap<NodeId, Vec<(NodeId, SharedInbox)>>,
 }
 
 impl Routes {
-    pub fn connect(&mut self, src: u64, dst: u64, inbox: SharedInbox) {
+    pub fn connect(&mut self, src: NodeId, dst: NodeId, inbox: SharedInbox) {
         let v = self.links.entry(src).or_default();
         if !v.iter().any(|(id, _)| *id == dst) {
             v.push((dst, inbox));
         }
     }
 
-    pub fn disconnect(&mut self, src: u64, dst: u64) {
+    pub fn disconnect(&mut self, src: NodeId, dst: NodeId) {
         if let Some(v) = self.links.get_mut(&src) {
             v.retain(|(id, _)| *id != dst);
         }
     }
 
     /// Drop a node entirely, as a source and as any destination.
-    pub fn remove_node(&mut self, id: u64) {
+    pub fn remove_node(&mut self, id: NodeId) {
         self.links.remove(&id);
         for v in self.links.values_mut() {
             v.retain(|(d, _)| *d != id);
         }
     }
 
-    fn send(&self, src: u64, msg: &Message) {
+    fn send(&self, src: NodeId, msg: &Message) {
         if let Some(v) = self.links.get(&src) {
             for (_, inbox) in v {
                 inbox.lock().unwrap().push(msg.clone());
@@ -160,27 +161,28 @@ mod tests {
         let mut routes = Routes::default();
         let to_synth = new_inbox();
         let unrelated = new_inbox();
+        let (kbd, synth) = (NodeId::nil(), NodeId::new());
 
-        // Wire keyboard (1) -> synth (2); leave node 3 unconnected.
-        routes.connect(1, 2, to_synth.clone());
-        routes.send(1, &vec![0x90, 60, 100]);
+        // Wire keyboard -> synth; leave the unrelated node unconnected.
+        routes.connect(kbd, synth, to_synth.clone());
+        routes.send(kbd, &vec![0x90, 60, 100]);
         assert_eq!(len(&to_synth), 1, "connected destination receives");
         assert_eq!(len(&unrelated), 0, "unconnected node receives nothing");
 
         // Idempotent connect doesn't duplicate delivery.
-        routes.connect(1, 2, to_synth.clone());
-        routes.send(1, &vec![0x80, 60, 0]);
+        routes.connect(kbd, synth, to_synth.clone());
+        routes.send(kbd, &vec![0x80, 60, 0]);
         assert_eq!(len(&to_synth), 2);
 
         // Disconnecting stops delivery.
-        routes.disconnect(1, 2);
-        routes.send(1, &vec![0x90, 62, 100]);
+        routes.disconnect(kbd, synth);
+        routes.send(kbd, &vec![0x90, 62, 100]);
         assert_eq!(len(&to_synth), 2);
 
         // Removing the source node also stops delivery.
-        routes.connect(1, 2, to_synth.clone());
-        routes.remove_node(1);
-        routes.send(1, &vec![0x90, 64, 100]);
+        routes.connect(kbd, synth, to_synth.clone());
+        routes.remove_node(kbd);
+        routes.send(kbd, &vec![0x90, 64, 100]);
         assert_eq!(len(&to_synth), 2);
     }
 }

@@ -27,6 +27,7 @@
 
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
 use std::path::{Path, PathBuf};
+use wk_protocol::NodeId;
 
 /// The default workspace file when none is named on the command line. Several
 /// `.wk` workspaces can coexist in one directory.
@@ -121,7 +122,7 @@ impl Dependency {
 pub struct NodeState {
     /// Dependency name (for app nodes) or file name (for file nodes).
     pub name: String,
-    pub id: u64,
+    pub id: NodeId,
     pub pos: [f32; 2],
     pub size: [f32; 2],
     /// App-node option values (e.g. knob settings), persisted positionally.
@@ -134,7 +135,7 @@ pub struct NodeState {
 
 /// A HostPort node: a localhost port plus its canvas placement.
 pub struct PortState {
-    pub id: u64,
+    pub id: NodeId,
     pub port: u16,
     pub pos: [f32; 2],
     pub size: [f32; 2],
@@ -142,7 +143,7 @@ pub struct PortState {
 
 /// A Network (or Gateway) node and its canvas placement.
 pub struct NetState {
-    pub id: u64,
+    pub id: NodeId,
     pub gateway: bool,
     pub pos: [f32; 2],
     pub size: [f32; 2],
@@ -161,15 +162,15 @@ pub struct Workspace {
     /// HostPort nodes (localhost port + canvas placement).
     pub host_ports: Vec<PortState>,
     /// File connections as (file id, app node id).
-    pub connections: Vec<(u64, u64)>,
+    pub connections: Vec<(NodeId, NodeId)>,
     /// MIDI connections as (source node id, destination node id).
-    pub midi: Vec<(u64, u64)>,
+    pub midi: Vec<(NodeId, NodeId)>,
     /// Serve wiring as (wasi:http node id, HostPort id).
-    pub serves: Vec<(u64, u64)>,
+    pub serves: Vec<(NodeId, NodeId)>,
     /// Network/Gateway nodes.
     pub nets: Vec<NetState>,
     /// Network membership wiring as (app node id, Network/Gateway node id).
-    pub net_links: Vec<(u64, u64)>,
+    pub net_links: Vec<(NodeId, NodeId)>,
 }
 
 impl Workspace {
@@ -253,7 +254,7 @@ impl Workspace {
             }
         }
 
-        let pair = |n: &KdlNode| match (n.get(0).and_then(uint), n.get(1).and_then(uint)) {
+        let pair = |n: &KdlNode| match (n.get(0).and_then(node_id), n.get(1).and_then(node_id)) {
             (Some(a), Some(b)) => Some((a, b)),
             _ => None,
         };
@@ -379,10 +380,22 @@ fn uint(v: &KdlValue) -> Option<u64> {
     v.as_integer().map(|i| i as u64)
 }
 
+/// Parse a node id: the Crockford base32 string form, or — for backward
+/// compatibility with pre-UUID workspaces — a bare integer, mapped 1:1 so old
+/// ids (and the connections that reference them) still load, then re-save as
+/// base32.
+fn node_id(v: &KdlValue) -> Option<NodeId> {
+    if let Some(s) = v.as_string() {
+        s.parse().ok()
+    } else {
+        v.as_integer().map(|i| NodeId::from_u128(i as u128))
+    }
+}
+
 /// Parse a `node`/`virtualfile`/`hostfile` entry: `<kind> "<name>" <id> { ... }`.
 fn parse_placed(n: &KdlNode) -> Option<NodeState> {
     let name = n.get(0)?.as_string()?.to_string();
-    let id = uint(n.get(1)?)?;
+    let id = node_id(n.get(1)?)?;
     let ch = n.children()?;
     let pos = ch.get("pos")?;
     let size = ch.get("size")?;
@@ -411,7 +424,7 @@ fn parse_placed(n: &KdlNode) -> Option<NodeState> {
 
 /// Parse a `hostport <id> { port <p>; pos x y; size w h }` entry.
 fn parse_hostport(n: &KdlNode) -> Option<PortState> {
-    let id = uint(n.get(0)?)?;
+    let id = node_id(n.get(0)?)?;
     let ch = n.children()?;
     let port = ch.get("port").and_then(|p| p.get(0)).and_then(uint)? as u16;
     let pos = ch.get("pos")?;
@@ -426,7 +439,7 @@ fn parse_hostport(n: &KdlNode) -> Option<PortState> {
 
 fn hostport_kdl(p: &PortState) -> KdlNode {
     let mut node = KdlNode::new("hostport");
-    node.push(KdlEntry::new(p.id as i128));
+    node.push(KdlEntry::new(p.id.to_string()));
     let mut ch = KdlDocument::new();
     let mut port = KdlNode::new("port");
     port.push(KdlEntry::new(p.port as i128));
@@ -439,7 +452,7 @@ fn hostport_kdl(p: &PortState) -> KdlNode {
 
 /// Parse a `network`/`gateway <id> { pos x y; size w h }` entry.
 fn parse_net(n: &KdlNode, gateway: bool) -> Option<NetState> {
-    let id = uint(n.get(0)?)?;
+    let id = node_id(n.get(0)?)?;
     let ch = n.children()?;
     let pos = ch.get("pos")?;
     let size = ch.get("size")?;
@@ -453,7 +466,7 @@ fn parse_net(n: &KdlNode, gateway: bool) -> Option<NetState> {
 
 fn net_kdl(n: &NetState) -> KdlNode {
     let mut node = KdlNode::new(if n.gateway { "gateway" } else { "network" });
-    node.push(KdlEntry::new(n.id as i128));
+    node.push(KdlEntry::new(n.id.to_string()));
     let mut ch = KdlDocument::new();
     ch.nodes_mut().push(node2("pos", n.pos[0], n.pos[1]));
     ch.nodes_mut().push(node2("size", n.size[0], n.size[1]));
@@ -464,7 +477,7 @@ fn net_kdl(n: &NetState) -> KdlNode {
 fn placed_kdl(kind: &str, n: &NodeState) -> KdlNode {
     let mut node = KdlNode::new(kind);
     node.push(KdlEntry::new(n.name.clone()));
-    node.push(KdlEntry::new(n.id as i128));
+    node.push(KdlEntry::new(n.id.to_string()));
     let mut ch = KdlDocument::new();
     ch.nodes_mut().push(node2("pos", n.pos[0], n.pos[1]));
     ch.nodes_mut().push(node2("size", n.size[0], n.size[1]));
@@ -495,10 +508,10 @@ fn node2(name: &str, a: f32, b: f32) -> KdlNode {
 }
 
 /// A KDL node `name a b` with two integer-id args.
-fn pair_kdl(name: &str, a: u64, b: u64) -> KdlNode {
+fn pair_kdl(name: &str, a: NodeId, b: NodeId) -> KdlNode {
     let mut n = KdlNode::new(name);
-    n.push(KdlEntry::new(a as i128));
-    n.push(KdlEntry::new(b as i128));
+    n.push(KdlEntry::new(a.to_string()));
+    n.push(KdlEntry::new(b.to_string()));
     n
 }
 
@@ -604,6 +617,16 @@ mod tests {
 
     #[test]
     fn workspace_kdl_round_trips() {
+        let (synth, chan, msrc, mdst, port, notes, net, gw) = (
+            NodeId::new(),
+            NodeId::new(),
+            NodeId::new(),
+            NodeId::new(),
+            NodeId::new(),
+            NodeId::new(),
+            NodeId::new(),
+            NodeId::new(),
+        );
         let ws = Workspace {
             dependencies: vec![
                 Dependency {
@@ -620,7 +643,7 @@ mod tests {
             camera: (12.5, -40.0, 1.5),
             nodes: vec![NodeState {
                 name: "synth".into(),
-                id: 1,
+                id: synth,
                 pos: [40.0, 56.0],
                 size: [360.0, 260.0],
                 options: vec![8.0, 0.6, 0.0, 1.0],
@@ -628,7 +651,7 @@ mod tests {
             }],
             virtual_files: vec![NodeState {
                 name: "chan".into(),
-                id: 2,
+                id: chan,
                 pos: [200.0, 120.0],
                 size: [130.0, 44.0],
                 options: Vec::new(),
@@ -636,36 +659,36 @@ mod tests {
             }],
             host_files: vec![NodeState {
                 name: "notes.txt".into(),
-                id: 6,
+                id: notes,
                 pos: [200.0, 200.0],
                 size: [130.0, 44.0],
                 options: Vec::new(),
                 args: Vec::new(),
             }],
             host_ports: vec![PortState {
-                id: 5,
+                id: port,
                 port: 8080,
                 pos: [600.0, 100.0],
                 size: [130.0, 44.0],
             }],
-            connections: vec![(2, 1)],
-            midi: vec![(3, 4)],
-            serves: vec![(1, 5)],
+            connections: vec![(chan, synth)],
+            midi: vec![(msrc, mdst)],
+            serves: vec![(synth, port)],
             nets: vec![
                 NetState {
-                    id: 7,
+                    id: net,
                     gateway: false,
                     pos: [700.0, 100.0],
                     size: [130.0, 44.0],
                 },
                 NetState {
-                    id: 8,
+                    id: gw,
                     gateway: true,
                     pos: [700.0, 200.0],
                     size: [130.0, 44.0],
                 },
             ],
-            net_links: vec![(1, 7)],
+            net_links: vec![(synth, net)],
         };
 
         let text = ws.to_kdl();
@@ -689,11 +712,11 @@ mod tests {
         assert!(back.virtual_files[0].options.is_empty());
         assert_eq!(back.host_files[0].name, "notes.txt");
         assert_eq!(back.host_ports[0].port, 8080);
-        assert_eq!(back.connections, vec![(2, 1)]);
-        assert_eq!(back.midi, vec![(3, 4)]);
-        assert_eq!(back.serves, vec![(1, 5)]);
+        assert_eq!(back.connections, vec![(chan, synth)]);
+        assert_eq!(back.midi, vec![(msrc, mdst)]);
+        assert_eq!(back.serves, vec![(synth, port)]);
         assert_eq!(back.nets.len(), 2);
         assert!(back.nets[1].gateway);
-        assert_eq!(back.net_links, vec![(1, 7)]);
+        assert_eq!(back.net_links, vec![(synth, net)]);
     }
 }

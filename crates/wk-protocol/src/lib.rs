@@ -14,17 +14,20 @@
 //! the trait a front-end plugs into. That keeps it trivially reusable by future
 //! test-runners, MCP bridges, and networked front-ends.
 
+mod node_id;
+pub use node_id::NodeId;
+
 /// A connection wire, identified by the two node ids it joins (by kind).
 #[derive(Clone, Copy, PartialEq)]
 pub enum Wire {
     /// A file node (`file_id`) mounted into an app node (`app_id`).
-    File(u64, u64),
+    File(NodeId, NodeId),
     /// A MIDI link from source node to destination node.
-    Midi(u64, u64),
+    Midi(NodeId, NodeId),
     /// A wasi:http node served on a HostPort node.
-    Serve(u64, u64),
+    Serve(NodeId, NodeId),
     /// An app node's membership of a Network/Gateway node (app, net).
-    Net(u64, u64),
+    Net(NodeId, NodeId),
 }
 
 /// The capability a [`Command`] requires. A client's token grants some set of
@@ -83,21 +86,21 @@ pub enum Command {
     /// Create a Gateway node at `pos`.
     AddGateway { pos: [f32; 2] },
     /// Remove any node (app/file/port/network) by id.
-    RemoveNode { id: u64 },
+    RemoveNode { id: NodeId },
     /// Move a node to a new canvas position.
-    MoveNode { id: u64, pos: [f32; 2] },
+    MoveNode { id: NodeId, pos: [f32; 2] },
     /// Resize a node.
-    ResizeNode { id: u64, size: [f32; 2] },
+    ResizeNode { id: NodeId, size: [f32; 2] },
     /// Toggle a connection between two nodes (the kind is inferred from them).
-    Connect { a: u64, b: u64 },
+    Connect { a: NodeId, b: NodeId },
     /// Remove a specific connection.
     Disconnect { wire: Wire },
     /// (Re)run an idle/exited app node's guest.
-    RunNode { id: u64 },
+    RunNode { id: NodeId },
     /// Set a node's launch args from a whitespace-separated string.
-    SetNodeArgs { id: u64, args: String },
+    SetNodeArgs { id: NodeId, args: String },
     /// Nudge a HostPort's localhost port by `delta`.
-    ChangePort { id: u64, delta: i32 },
+    ChangePort { id: NodeId, delta: i32 },
     /// Report a client's current view so the server persists it on save. The
     /// camera is a per-client concept; the server just remembers the latest it
     /// was told (there is only one persisted view in the workspace file).

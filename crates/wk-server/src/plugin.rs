@@ -38,6 +38,7 @@ wasmtime::component::bindgen!({
 
 use wasi::surface::surface::{CreateDesc, FrameEvent};
 pub use wasi::surface::surface::{Key, KeyEvent, PointerEvent, ResizeEvent};
+use wk_protocol::NodeId;
 
 /// Shared state of one virtual surface, touched by both the client thread (via
 /// the host interface impls) and the compositor thread.
@@ -45,7 +46,7 @@ pub struct VirtualSurface {
     /// Stable unique id, used by the compositor to track this surface.
     pub id: u64,
     /// The instance that created this surface (its window belongs to it).
-    pub node_id: u64,
+    pub node_id: NodeId,
     pub width: u32,
     pub height: u32,
     /// Latest painted RGBA8 pixels (`width * height * 4`).
@@ -81,7 +82,7 @@ impl std::fmt::Display for SurfaceClosed {
 impl std::error::Error for SurfaceClosed {}
 
 impl VirtualSurface {
-    fn new(node_id: u64, width: u32, height: u32) -> Self {
+    fn new(node_id: NodeId, width: u32, height: u32) -> Self {
         Self {
             id: NEXT_SURFACE_ID.fetch_add(1, Ordering::Relaxed),
             node_id,
@@ -118,7 +119,7 @@ pub type SurfaceRegistry = Arc<Mutex<Vec<SharedSurface>>>;
 pub struct Node {
     /// Stable id, assigned by the compositor and persisted in the session so
     /// connections can refer to this node across restarts.
-    pub id: u64,
+    pub id: NodeId,
     /// The dependency name this node was launched from.
     pub name: String,
     /// The node's terminal stdio: its stdout feeds the compositor's VT parser,
@@ -284,7 +285,7 @@ pub struct HostState {
     registry: SurfaceRegistry,
     /// The instance this store belongs to; tags the surfaces it creates and the
     /// MIDI it sends.
-    pub(crate) node_id: u64,
+    pub(crate) node_id: NodeId,
     /// This node's private in-memory filesystem.
     pub(crate) fs: crate::vfs::SharedFs,
     /// This node's MIDI input queue (drained by its `input` ports).
@@ -822,7 +823,7 @@ impl PluginHost {
             },
             table: ResourceTable::new(),
             registry: Arc::new(Mutex::new(Vec::new())),
-            node_id: 0,
+            node_id: NodeId::nil(),
             fs: fs.clone(),
             midi_in: midi_in.clone(),
             midi_router: midi.clone(),
@@ -854,7 +855,7 @@ impl PluginHost {
         &self,
         path: &Path,
         name: &str,
-        id: u64,
+        id: NodeId,
         args: &[String],
         surfaces: SurfaceRegistry,
         nodes: NodeRegistry,
@@ -912,7 +913,8 @@ impl PluginHost {
         // it's alone on its own virtual network (net id = node id) — isolated —
         // until the compositor wires it to a Network node.
         let net_stack = if !is_http && component_imports_sockets(&component, &self.engine) {
-            let ip = smoltcp::wire::Ipv4Address::new(10, 0, 0, (2 + (node.id % 250)) as u8);
+            let ip =
+                smoltcp::wire::Ipv4Address::new(10, 0, 0, (2 + (node.id.as_u128() % 250)) as u8);
             Some(self.hub.attach(node.id, ip, name))
         } else {
             None

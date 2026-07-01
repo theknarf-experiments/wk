@@ -5,3 +5,4 @@ edition = "2021"
 description = "The client <-> server contract for wk: the Command vocabulary and the Client trait, with no dependency on the concrete server."
 
 [dependencies]
+uuid = { version = "1", features = ["v7"] }

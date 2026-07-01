@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 use std::time::Duration;
+use wk_protocol::NodeId;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
@@ -117,7 +118,7 @@ pub struct NodeStack {
     pub sockets: SocketSet<'static>,
     pub device: VirtualNic,
     /// Virtual network id — nodes sharing it can reach each other.
-    pub net: u64,
+    pub net: NodeId,
     pub ip: Ipv4Address,
     /// The node's fabric IPv6 address (ULA `fd00::/64`), assigned alongside its
     /// IPv4 so guests can use AF_INET6 sockets on the same fabric.
@@ -222,7 +223,7 @@ impl NetHub {
 
     /// Resolve a node `name` to its IPv4 address on virtual network `net`
     /// (fabric DNS) — the first other node with that name on the same network.
-    pub fn resolve(&self, net: u64, name: &str) -> Option<Ipv4Address> {
+    pub fn resolve(&self, net: NodeId, name: &str) -> Option<Ipv4Address> {
         self.stacks.lock().unwrap().iter().find_map(|s| {
             let g = s.lock().unwrap();
             (g.net == net && g.name == name).then_some(g.ip)
@@ -230,7 +231,7 @@ impl NetHub {
     }
 
     /// Like [`resolve`](Self::resolve) but returns the node's fabric IPv6 address.
-    pub fn resolve6(&self, net: u64, name: &str) -> Option<Ipv6Address> {
+    pub fn resolve6(&self, net: NodeId, name: &str) -> Option<Ipv6Address> {
         self.stacks.lock().unwrap().iter().find_map(|s| {
             let g = s.lock().unwrap();
             (g.net == net && g.name == name).then_some(g.ip6)
@@ -245,7 +246,7 @@ impl NetHub {
 
     /// Attach a node named `name` to virtual network `net` at address `ip`,
     /// returning its stack (to drive via wasi:sockets).
-    pub fn attach(&self, net: u64, ip: Ipv4Address, name: &str) -> SharedStack {
+    pub fn attach(&self, net: NodeId, ip: Ipv4Address, name: &str) -> SharedStack {
         let ip6 = Self::ula(ip);
         let mut device = VirtualNic::new();
         let config = Config::new(HardwareAddress::Ip);
@@ -289,9 +290,9 @@ impl NetHub {
 
         // Phase 1: poll each stack and collect what it transmitted, tagged with
         // the sender's network so we only route within a network.
-        let mut outbound: Vec<(u64, Frame)> = Vec::new();
+        let mut outbound: Vec<(NodeId, Frame)> = Vec::new();
         // Snapshot (net, v4, v6, stack) for delivery lookup.
-        let mut routes: Vec<(u64, Ipv4Address, Ipv6Address, SharedStack)> = Vec::new();
+        let mut routes: Vec<(NodeId, Ipv4Address, Ipv6Address, SharedStack)> = Vec::new();
         for s in &stacks {
             let mut g = s.lock().unwrap();
             let NodeStack {
@@ -389,8 +390,9 @@ mod tests {
     #[test]
     fn same_network_nodes_talk_tcp_ipv6() {
         let hub = NetHub::new();
-        let client = hub.attach(1, Ipv4Address::new(10, 0, 0, 1), "client");
-        let server = hub.attach(1, Ipv4Address::new(10, 0, 0, 2), "server");
+        let net = NodeId::nil();
+        let client = hub.attach(net, Ipv4Address::new(10, 0, 0, 1), "client");
+        let server = hub.attach(net, Ipv4Address::new(10, 0, 0, 2), "server");
         let server_ip6 = server.lock().unwrap().ip6;
 
         let server_h = {
@@ -447,8 +449,9 @@ mod tests {
         let server_ip = Ipv4Address::new(10, 0, 0, 2);
         let client_ip = Ipv4Address::new(10, 0, 0, 1);
         let hub = NetHub::new();
-        let client = hub.attach(1, client_ip, "client");
-        let server = hub.attach(1, server_ip, "server");
+        let net = NodeId::nil();
+        let client = hub.attach(net, client_ip, "client");
+        let server = hub.attach(net, server_ip, "server");
 
         let server_h = {
             let mut g = server.lock().unwrap();
@@ -497,8 +500,9 @@ mod tests {
     fn same_network_nodes_talk_tcp() {
         let server_ip = Ipv4Address::new(10, 0, 0, 2);
         let hub = NetHub::new();
-        let client = hub.attach(1, Ipv4Address::new(10, 0, 0, 1), "client");
-        let server = hub.attach(1, server_ip, "server");
+        let net = NodeId::nil();
+        let client = hub.attach(net, Ipv4Address::new(10, 0, 0, 1), "client");
+        let server = hub.attach(net, server_ip, "server");
 
         let server_h = {
             let mut g = server.lock().unwrap();
@@ -552,8 +556,10 @@ mod tests {
     fn different_networks_are_isolated() {
         let server_ip = Ipv4Address::new(10, 0, 0, 2);
         let hub = NetHub::new();
-        let client = hub.attach(1, Ipv4Address::new(10, 0, 0, 1), "client"); // net 1
-        let server = hub.attach(2, server_ip, "server"); // net 2 — isolated
+        let net = NodeId::nil();
+        let client = hub.attach(net, Ipv4Address::new(10, 0, 0, 1), "client"); // net 1
+        let net2 = NodeId::new();
+        let server = hub.attach(net2, server_ip, "server"); // net 2 — isolated
 
         let server_h = {
             let mut g = server.lock().unwrap();
