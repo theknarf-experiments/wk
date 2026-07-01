@@ -9,6 +9,7 @@
 //! past [`server::Server`]'s public surface into these internals.
 
 pub mod audio;
+pub mod auth;
 pub mod http;
 pub mod midi;
 pub mod netstack;

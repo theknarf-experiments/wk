@@ -16,6 +16,7 @@ edition = "2021"
 [dependencies]
 wk-protocol = { path = "crates/wk-protocol" }
 wk-server = { path = "crates/wk-server" }
+wk-token-service = { path = "crates/wk-token-service" }
 client-local-ui = { path = "crates/client-local-ui" }
 env_logger = "0.11.11"
 clap = { version = "4.6.1", features = ["derive"] }

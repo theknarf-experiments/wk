@@ -4,6 +4,7 @@ use client_local_ui::WindowClient;
 use wk_protocol::Client;
 use wk_server::runtime::ServerRuntime;
 use wk_server::workspace;
+use wk_token_service::TokenService;
 
 use clap::CommandFactory;
 use clap::Parser;
@@ -99,15 +100,23 @@ fn run(file: &Path, headless: bool) -> Result<(), String> {
             eprintln!("warning: dependency {:?} unavailable: {e}", dep.name);
         }
     }
-    // Start the server as an independent service. Clients attach via handles.
-    let runtime = ServerRuntime::spawn(&ws, file.to_path_buf())?;
+    // Three-way auth split, wired up locally:
+    //  1. the token service owns the signing keys and mints tokens;
+    //  2. the server gets a copy of the public key and only verifies;
+    //  3. the client is handed a minted token and bears it with every action.
+    let tokens = TokenService::new();
+    let runtime = ServerRuntime::spawn(&ws, file.to_path_buf(), tokens.public_key())?;
     if headless {
         // No client attached; run the server until Ctrl-C, then save + stop.
         runtime.block_until_ctrl_c();
         Ok(())
     } else {
-        // Attach the local UI client on this (main) thread — winit needs it.
-        let result = Box::new(WindowClient).run(runtime.handle());
+        // Mint a full-authority token for the trusted local client and attach it
+        // to the connection, then run the client on this (main) thread — winit
+        // needs it.
+        let token = tokens.mint_admin()?;
+        let conn = runtime.handle().with_token(token);
+        let result = Box::new(WindowClient).run(conn);
         // Window closed (or errored): stop the server, which persists the state.
         runtime.shutdown();
         result

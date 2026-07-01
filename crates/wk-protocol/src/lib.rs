@@ -27,6 +27,46 @@ pub enum Wire {
     Net(u64, u64),
 }
 
+/// The capability a [`Command`] requires. A client's token grants some set of
+/// these; the server authorizes each command against the token that carried it.
+/// Kept crypto-free here so both sides agree on the taxonomy; the server maps
+/// each to a Biscuit `right(..)` fact.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Operation {
+    /// Create a node of any kind (launch an app, add a file/port/network).
+    Create,
+    /// Remove a node.
+    Remove,
+    /// Add or remove a connection between nodes.
+    Wire,
+    /// Run/configure a node (run, set args, change a port).
+    Control,
+    /// Reposition the canvas or a node (move, resize, camera). Cosmetic layout.
+    Arrange,
+}
+
+impl Operation {
+    /// The stable name used in the Biscuit `right(..)` fact and policy.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Operation::Create => "create",
+            Operation::Remove => "remove",
+            Operation::Wire => "wire",
+            Operation::Control => "control",
+            Operation::Arrange => "arrange",
+        }
+    }
+
+    /// Every operation, for minting a full-authority token.
+    pub const ALL: [Operation; 5] = [
+        Operation::Create,
+        Operation::Remove,
+        Operation::Wire,
+        Operation::Control,
+        Operation::Arrange,
+    ];
+}
+
 /// A mutation a client asks the server to perform. Positions come *from* the
 /// client (it knows its camera) so the server never needs a view.
 pub enum Command {
@@ -62,6 +102,28 @@ pub enum Command {
     /// camera is a per-client concept; the server just remembers the latest it
     /// was told (there is only one persisted view in the workspace file).
     SetCamera { pan: [f32; 2], zoom: f32 },
+}
+
+impl Command {
+    /// The capability a client must hold for the server to apply this command.
+    pub fn operation(&self) -> Operation {
+        match self {
+            Command::Launch { .. }
+            | Command::AddVirtualFile { .. }
+            | Command::AddHostFile { .. }
+            | Command::AddPort { .. }
+            | Command::AddNetwork { .. }
+            | Command::AddGateway { .. } => Operation::Create,
+            Command::RemoveNode { .. } => Operation::Remove,
+            Command::Connect { .. } | Command::Disconnect { .. } => Operation::Wire,
+            Command::RunNode { .. } | Command::SetNodeArgs { .. } | Command::ChangePort { .. } => {
+                Operation::Control
+            }
+            Command::MoveNode { .. } | Command::ResizeNode { .. } | Command::SetCamera { .. } => {
+                Operation::Arrange
+            }
+        }
+    }
 }
 
 /// A client attached to a running server through a connection `C`. `run` owns

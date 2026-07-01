@@ -1,0 +1,9 @@
+[package]
+name = "wk-token-service"
+version = "0.1.0"
+edition = "2021"
+description = "The wk token service: owns the signing keys and mints Biscuit tokens granting wk operations. Independent of the server (which only verifies) and clients (which only bear tokens)."
+
+[dependencies]
+wk-protocol = { path = "../wk-protocol" }
+biscuit-auth = "6.0"
