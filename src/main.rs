@@ -1,12 +1,6 @@
-mod arrows;
-mod client;
-mod compositor;
-mod host_shell;
-mod render2d;
-mod text;
-
 // The backend lives in the `wk-server` crate; bring its workspace/file-format
 // helpers into scope under the familiar `workspace::` path used by the CLI.
+use client_local_ui::{HeadlessClient, WindowClient};
 use wk_server::workspace;
 
 use clap::CommandFactory;
@@ -104,9 +98,9 @@ fn run(file: &Path, headless: bool) -> Result<(), String> {
     // Build the authoritative half, then hand it to whichever client drives it.
     let server = wk_server::server::Server::new(&ws, file.to_path_buf())?;
     let client: Box<dyn wk_protocol::Client<wk_server::server::Server>> = if headless {
-        Box::new(client::HeadlessClient)
+        Box::new(HeadlessClient)
     } else {
-        Box::new(compositor::WindowClient)
+        Box::new(WindowClient)
     };
     client.run(server)
 }

@@ -1,0 +1,15 @@
+[package]
+name = "client-local-ui"
+version = "0.1.0"
+edition = "2021"
+description = "The wk local UI client: a wgpu/winit window that renders the workspace and drives the server, plus the windowless headless client."
+
+[dependencies]
+wk-protocol = { path = "../wk-protocol" }
+wk-server = { path = "../wk-server" }
+wgpu = "29.0.3"
+winit = "0.30"
+ab_glyph = "0.2"
+bytemuck = { version = "1.25.0", features = ["derive"] }
+pollster = "0.4.0"
+tokio = { version = "1", features = ["rt", "time", "signal", "macros"] }
