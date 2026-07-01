@@ -236,6 +236,18 @@ enum Undo {
     Uncreate(NodeId),
     /// Recreate a node that was removed, with its wiring.
     Recreate(Box<Snapshot>),
+    /// Remove a workspace tab that an add created.
+    DropWorkspace(NodeId),
+    /// Recreate a workspace that was removed, with all its nodes and wiring.
+    RecreateWorkspace(Box<WsSnapshot>),
+}
+
+/// Everything needed to bring a removed workspace tab back exactly as it was.
+struct WsSnapshot {
+    id: NodeId,
+    /// Position in the tab order to restore it at.
+    index: usize,
+    nodes: Vec<Snapshot>,
 }
 
 /// Everything needed to bring a removed node back exactly as it was.
@@ -1220,11 +1232,16 @@ impl Server {
                 let (a, b) = wire_ends(*wire);
                 self.record(Undo::Wire(a, b));
             }
-            // Not undoable: workspace tabs, run, and undo itself.
-            Command::AddWorkspace { .. }
-            | Command::RemoveWorkspace { .. }
-            | Command::RunNode { .. }
-            | Command::Undo => {}
+            Command::AddWorkspace { id } => self.record(Undo::DropWorkspace(*id)),
+            Command::RemoveWorkspace { id } => {
+                if self.workspaces.len() > 1 && self.workspaces.contains(id) {
+                    if let Some(s) = self.snapshot_workspace(*id) {
+                        self.record(Undo::RecreateWorkspace(Box::new(s)));
+                    }
+                }
+            }
+            // Not undoable: run and undo itself.
+            Command::RunNode { .. } | Command::Undo => {}
         }
         self.dispatch(cmd);
     }
@@ -1320,6 +1337,8 @@ impl Server {
                 }
             }
             Undo::Recreate(s) => self.recreate(*s),
+            Undo::DropWorkspace(id) => self.remove_workspace(id),
+            Undo::RecreateWorkspace(s) => self.recreate_workspace(*s),
         }
     }
 
@@ -1380,9 +1399,15 @@ impl Server {
 
     /// Bring a removed node back with the same id, then re-establish its wiring.
     fn recreate(&mut self, s: Snapshot) {
-        match s.kind {
+        self.recreate_node(&s);
+        self.rewire(&s.wires);
+    }
+
+    /// Bring a removed node back with the same id (no wiring yet).
+    fn recreate_node(&mut self, s: &Snapshot) {
+        match &s.kind {
             SnapKind::App { dep, args, options } => {
-                let Some(d) = self.available.iter().find(|x| x.name == dep).cloned() else {
+                let Some(d) = self.available.iter().find(|x| &x.name == dep).cloned() else {
                     return;
                 };
                 if self
@@ -1391,50 +1416,99 @@ impl Server {
                         &d.local_path(),
                         &d.name,
                         s.id,
-                        &args,
+                        args,
                         self.registry.clone(),
                         self.node_reg.clone(),
-                        options,
+                        options.clone(),
                     )
                     .is_err()
                 {
                     return;
                 }
                 self.place(s.id, s.pos, s.size);
-                self.node_args.insert(s.id, args);
+                self.node_args.insert(s.id, args.clone());
             }
             SnapKind::Virtual { name, data } => {
                 self.place(s.id, s.pos, s.size);
                 self.file_nodes.insert(
                     s.id,
                     FileNode::Virtual(VirtualFile {
-                        name,
-                        data: Arc::new(Mutex::new(data)),
+                        name: name.clone(),
+                        data: Arc::new(Mutex::new(data.clone())),
                     }),
                 );
             }
             SnapKind::HostFile { name, path } => {
                 self.place(s.id, s.pos, s.size);
-                self.file_nodes
-                    .insert(s.id, FileNode::HostMapped(HostMappedFile { name, path }));
+                self.file_nodes.insert(
+                    s.id,
+                    FileNode::HostMapped(HostMappedFile {
+                        name: name.clone(),
+                        path: path.clone(),
+                    }),
+                );
             }
             SnapKind::Port { port } => {
                 self.place(s.id, s.pos, s.size);
-                self.host_ports.insert(s.id, port);
+                self.host_ports.insert(s.id, *port);
             }
             SnapKind::Net { gateway } => {
                 self.place(s.id, s.pos, s.size);
                 self.net_nodes.insert(s.id);
-                if gateway {
+                if *gateway {
                     self.gateways.insert(s.id);
                 }
             }
         }
         self.node_ws.insert(s.id, s.ws);
-        for (a, b) in s.wires {
-            if self.node_exists(a) && self.node_exists(b) {
+    }
+
+    /// Whether two nodes are already joined by any connection.
+    fn wired(&self, a: NodeId, b: NodeId) -> bool {
+        let pair = |x: NodeId, y: NodeId| (x == a && y == b) || (x == b && y == a);
+        self.connections.iter().any(|&(x, y)| pair(x, y))
+            || self.midi_links.iter().any(|&(x, y)| pair(x, y))
+            || self.net_links.iter().any(|&(x, y)| pair(x, y))
+            || self.serves.iter().any(|(&h, &(hp, _))| pair(h, hp))
+    }
+
+    /// Re-establish connections between live nodes (idempotent, so a wire listed
+    /// twice isn't toggled back off).
+    fn rewire(&mut self, wires: &[(NodeId, NodeId)]) {
+        for &(a, b) in wires {
+            if self.node_exists(a) && self.node_exists(b) && !self.wired(a, b) {
                 self.connect_toggle(a, b);
             }
+        }
+    }
+
+    /// Capture a whole workspace tab (its position + every node) for undo.
+    fn snapshot_workspace(&self, ws: NodeId) -> Option<WsSnapshot> {
+        let index = self.workspaces.iter().position(|&w| w == ws)?;
+        let nodes = self
+            .node_ws
+            .iter()
+            .filter(|(_, &w)| w == ws)
+            .filter_map(|(&id, _)| self.snapshot(id))
+            .collect();
+        Some(WsSnapshot {
+            id: ws,
+            index,
+            nodes,
+        })
+    }
+
+    /// Bring a removed workspace back: its tab, all its nodes, then their wiring.
+    fn recreate_workspace(&mut self, s: WsSnapshot) {
+        if !self.workspaces.contains(&s.id) {
+            let i = s.index.min(self.workspaces.len());
+            self.workspaces.insert(i, s.id);
+        }
+        for node in &s.nodes {
+            self.recreate_node(node);
+        }
+        for node in &s.nodes {
+            self.rewire(&node.wires);
         }
     }
 
