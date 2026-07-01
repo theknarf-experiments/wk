@@ -17,8 +17,9 @@ use winit::window::WindowId;
 
 use crate::host_shell::Gfx;
 use crate::plugin::{Key, KeyEvent, PointerEvent, ResizeEvent, SharedNode, SharedSurface};
+use crate::protocol::{Command, Wire};
 use crate::render2d::{Quad, Renderer, TextureId};
-use crate::server::{FileNode, Server, Wire, FILE_H, FILE_W};
+use crate::server::{FileNode, Server, FILE_H, FILE_W};
 use crate::text::Fonts;
 use crate::workspace::Workspace;
 
@@ -685,12 +686,12 @@ impl App {
     fn run_node(&mut self, id: u64) {
         if let Some((eid, text)) = self.editing_args.take() {
             if eid == id {
-                self.server.set_node_args(id, &text);
+                self.server.apply(Command::SetNodeArgs { id, args: text });
             } else {
                 self.editing_args = Some((eid, text));
             }
         }
-        self.server.run_node(id);
+        self.server.apply(Command::RunNode { id });
     }
 
     /// The screen-space endpoints of a wire (both nodes must still be placed).
@@ -854,31 +855,29 @@ impl App {
     /// Execute a palette command (from `frame`, where the screen size is known).
     fn run_palette(&mut self, cmd: PaletteCmd, fb: [f32; 2]) {
         match cmd {
-            PaletteCmd::Launch(i) => {
-                if let Some(dep) = self.server.available.get(i).cloned() {
-                    let pos = self.view_center([360.0, 260.0], 0);
-                    self.server.launch(&dep, pos);
-                }
+            PaletteCmd::Launch(dep) => {
+                let pos = self.view_center([360.0, 260.0], 0);
+                self.server.apply(Command::Launch { dep, pos });
             }
             PaletteCmd::AddVirtualFile => {
                 let pos = self.next_file_pos();
-                self.server.add_virtual_file(pos);
+                self.server.apply(Command::AddVirtualFile { pos });
             }
             PaletteCmd::AddHostFile => {
                 let pos = self.next_file_pos();
-                self.server.add_host_mapped_file(pos);
+                self.server.apply(Command::AddHostFile { pos });
             }
             PaletteCmd::AddPort => {
                 let pos = self.view_center([FILE_W, FILE_H], self.server.host_ports.len());
-                self.server.add_host_port(pos);
+                self.server.apply(Command::AddPort { pos });
             }
             PaletteCmd::AddNetwork => {
                 let pos = self.view_center([FILE_W, FILE_H], self.server.net_nodes.len());
-                self.server.add_net_node(pos);
+                self.server.apply(Command::AddNetwork { pos });
             }
             PaletteCmd::AddGateway => {
                 let pos = self.view_center([FILE_W, FILE_H], self.server.net_nodes.len());
-                self.server.add_gateway_node(pos);
+                self.server.apply(Command::AddGateway { pos });
             }
             PaletteCmd::Zoom(z) => {
                 self.cam
@@ -994,20 +993,18 @@ impl App {
             match d.mode {
                 DragMode::Move if lmb => {
                     let mc = self.cam.to_canvas(mp);
-                    self.server
-                        .set_node_pos(d.id, [mc[0] - d.grab[0], mc[1] - d.grab[1]]);
+                    let pos = [mc[0] - d.grab[0], mc[1] - d.grab[1]];
+                    self.server.apply(Command::MoveNode { id: d.id, pos });
                     self.drag = Some(d);
                 }
                 DragMode::Resize if lmb => {
                     let p = self.server.win_pos[&d.id];
                     let mc = self.cam.to_canvas(mp);
-                    self.server.set_node_size(
-                        d.id,
-                        [
-                            (mc[0] - p[0]).max(100.0),
-                            (mc[1] - p[1]).max(TITLE_H + 40.0),
-                        ],
-                    );
+                    let size = [
+                        (mc[0] - p[0]).max(100.0),
+                        (mc[1] - p[1]).max(TITLE_H + 40.0),
+                    ];
+                    self.server.apply(Command::ResizeNode { id: d.id, size });
                     self.drag = Some(d);
                 }
                 DragMode::Connect if lmb => self.drag = Some(d),
@@ -1019,7 +1016,7 @@ impl App {
                         .or_else(|| self.topmost_under(mp))
                     {
                         if target != d.id {
-                            self.server.connect_toggle(d.id, target);
+                            self.server.apply(Command::Connect { a: d.id, b: target });
                         }
                     }
                 }
@@ -1108,17 +1105,11 @@ impl App {
                         // adjust port (HostPort −/+ buttons), or move.
                         let (minus, plus) = port_step_btns(r, zf);
                         if contains(close_btn(r, zf), mp) {
-                            if is_file {
-                                self.server.remove_file_node(id);
-                            } else if is_port {
-                                self.server.remove_host_port(id);
-                            } else {
-                                self.server.remove_net_node(id);
-                            }
+                            self.server.apply(Command::RemoveNode { id });
                         } else if is_port && contains(plus, mp) {
-                            self.server.change_port(id, 1);
+                            self.server.apply(Command::ChangePort { id, delta: 1 });
                         } else if is_port && contains(minus, mp) {
-                            self.server.change_port(id, -1);
+                            self.server.apply(Command::ChangePort { id, delta: -1 });
                         } else {
                             let mc = self.cam.to_canvas(mp);
                             let p = self.server.win_pos[&id];
@@ -1189,7 +1180,7 @@ impl App {
         if self.del_wire {
             self.del_wire = false;
             if let Some(w) = self.wire_sel.take() {
-                self.server.disconnect_wire(w);
+                self.server.apply(Command::Disconnect { wire: w });
             }
         }
         // Drop a stale selection (its node was closed/removed).
@@ -2016,7 +2007,7 @@ impl App {
                 }
             }
             // Server: kill the node and drop all document state referencing it.
-            self.server.close_node(*id);
+            self.server.apply(Command::RemoveNode { id: *id });
             // Client-local cleanup.
             self.terminals.remove(id);
             self.z.retain(|x| x != id);
@@ -2105,7 +2096,7 @@ impl ApplicationHandler for App {
                         } else {
                             0
                         };
-                        self.server.change_port(id, step);
+                        self.server.apply(Command::ChangePort { id, delta: step });
                         return;
                     }
                 }

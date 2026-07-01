@@ -8,6 +8,7 @@ mod netstack;
 mod oci;
 mod options;
 mod plugin;
+mod protocol;
 mod render2d;
 mod server;
 mod sockets;

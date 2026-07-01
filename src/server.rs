@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::plugin::{NodeRegistry, PluginHost, SharedNode, SurfaceRegistry};
+use crate::protocol::{Command, Wire};
 use crate::workspace::{Dependency, NetState, NodeState, PortState, Workspace};
 
 /// Default canvas size of a file / port / network node, in canvas pixels.
@@ -321,7 +322,7 @@ impl Server {
     // ---- node creation (positions come from the client's view) ----
 
     /// Launch a dependency as a new app node at `pos`.
-    pub fn launch(&mut self, dep: &Dependency, pos: [f32; 2]) {
+    fn launch(&mut self, dep: &Dependency, pos: [f32; 2]) {
         let id = self.alloc_id();
         if let Err(e) = self.host.spawn(
             &dep.local_path(),
@@ -340,7 +341,7 @@ impl Server {
     }
 
     /// Create a new, empty in-memory VirtualFile node at `pos`.
-    pub fn add_virtual_file(&mut self, pos: [f32; 2]) {
+    fn add_virtual_file(&mut self, pos: [f32; 2]) {
         self.file_seq += 1;
         let id = self.alloc_id();
         self.place(id, pos, [FILE_W, FILE_H]);
@@ -354,7 +355,7 @@ impl Server {
     }
 
     /// Create a HostMappedFile node backed by a fresh host file (`host<n>`).
-    pub fn add_host_mapped_file(&mut self, pos: [f32; 2]) {
+    fn add_host_mapped_file(&mut self, pos: [f32; 2]) {
         self.host_seq += 1;
         let id = self.alloc_id();
         let name = format!("host{}", self.host_seq);
@@ -373,7 +374,7 @@ impl Server {
     }
 
     /// Create a HostPort node at `pos` (auto-assigned localhost port).
-    pub fn add_host_port(&mut self, pos: [f32; 2]) {
+    fn add_host_port(&mut self, pos: [f32; 2]) {
         let id = self.alloc_id();
         let port = self.next_port;
         self.next_port = self.next_port.wrapping_add(1).max(8080);
@@ -382,7 +383,7 @@ impl Server {
     }
 
     /// Create a Network node at `pos`; returns its id.
-    pub fn add_net_node(&mut self, pos: [f32; 2]) -> u64 {
+    fn add_net_node(&mut self, pos: [f32; 2]) -> u64 {
         let id = self.alloc_id();
         self.place(id, pos, [FILE_W, FILE_H]);
         self.net_nodes.insert(id);
@@ -390,7 +391,7 @@ impl Server {
     }
 
     /// Create a Gateway node at `pos` (a Network whose members get host access).
-    pub fn add_gateway_node(&mut self, pos: [f32; 2]) {
+    fn add_gateway_node(&mut self, pos: [f32; 2]) {
         let id = self.add_net_node(pos);
         self.gateways.insert(id);
     }
@@ -398,7 +399,7 @@ impl Server {
     // ---- running / args ----
 
     /// (Re)run an idle or exited node's guest with its current args.
-    pub fn run_node(&mut self, id: u64) {
+    fn run_node(&mut self, id: u64) {
         if let Some(node) = self.app_node(id) {
             let args = self.node_args.get(&id).cloned().unwrap_or_default();
             if let Err(e) = self.host.run_node(&node, &args) {
@@ -408,7 +409,7 @@ impl Server {
     }
 
     /// Set a node's launch args from a whitespace-separated string.
-    pub fn set_node_args(&mut self, id: u64, text: &str) {
+    fn set_node_args(&mut self, id: u64, text: &str) {
         let args = text.split_whitespace().map(str::to_string).collect();
         self.node_args.insert(id, args);
     }
@@ -427,7 +428,7 @@ impl Server {
     /// Toggle a connection between two nodes by their kinds: file⇄app mounts the
     /// file; http-app⇄HostPort serves on localhost; app⇄Network joins the network;
     /// app⇄app wires MIDI.
-    pub fn connect_toggle(&mut self, a: u64, b: u64) {
+    fn connect_toggle(&mut self, a: u64, b: u64) {
         let af = self.file_nodes.contains_key(&a);
         let bf = self.file_nodes.contains_key(&b);
         let ap = self.host_ports.contains_key(&a);
@@ -501,7 +502,7 @@ impl Server {
     }
 
     /// Remove a Network/Gateway node, returning its members to isolation.
-    pub fn remove_net_node(&mut self, id: u64) {
+    fn remove_net_node(&mut self, id: u64) {
         self.net_nodes.remove(&id);
         self.gateways.remove(&id);
         let members: Vec<u64> = self
@@ -545,7 +546,7 @@ impl Server {
     }
 
     /// Remove a HostPort node, stopping any server bound through it.
-    pub fn remove_host_port(&mut self, id: u64) {
+    fn remove_host_port(&mut self, id: u64) {
         self.host_ports.remove(&id);
         let bound: Vec<u64> = self
             .serves
@@ -562,7 +563,7 @@ impl Server {
     }
 
     /// Change a HostPort's localhost port by `delta`, live-rebinding any server.
-    pub fn change_port(&mut self, id: u64, delta: i32) {
+    fn change_port(&mut self, id: u64, delta: i32) {
         let Some(&cur) = self.host_ports.get(&id) else {
             return;
         };
@@ -626,7 +627,7 @@ impl Server {
     }
 
     /// Remove a file node, unmounting it from every app it was connected to.
-    pub fn remove_file_node(&mut self, id: u64) {
+    fn remove_file_node(&mut self, id: u64) {
         let Some(file) = self.file_nodes.remove(&id) else {
             return;
         };
@@ -658,7 +659,7 @@ impl Server {
     }
 
     /// Remove the given connection (the same effect as toggling it off).
-    pub fn disconnect_wire(&mut self, w: Wire) {
+    fn disconnect_wire(&mut self, w: Wire) {
         match w {
             Wire::File(f, a) => {
                 if self.connections.contains(&(f, a)) {
@@ -684,10 +685,10 @@ impl Server {
     }
 
     /// Move / resize a node.
-    pub fn set_node_pos(&mut self, id: u64, pos: [f32; 2]) {
+    fn set_node_pos(&mut self, id: u64, pos: [f32; 2]) {
         self.win_pos.insert(id, pos);
     }
-    pub fn set_node_size(&mut self, id: u64, size: [f32; 2]) {
+    fn set_node_size(&mut self, id: u64, size: [f32; 2]) {
         self.win_size.insert(id, size);
     }
 
@@ -701,7 +702,7 @@ impl Server {
 
     /// Kill a node and drop everything referencing it (its wiring, geometry, and
     /// the wasm instance). Used when a client closes a node.
-    pub fn close_node(&mut self, id: u64) {
+    fn close_node(&mut self, id: u64) {
         if let Some(node) = self.app_node(id) {
             node.kill.store(true, Ordering::Relaxed);
             node.term_io.close();
@@ -825,13 +826,41 @@ impl Server {
             eprintln!("failed to save workspace: {e}");
         }
     }
-}
 
-/// A connection wire, identified by the two node ids it joins (by kind).
-#[derive(Clone, Copy, PartialEq)]
-pub enum Wire {
-    File(u64, u64),
-    Midi(u64, u64),
-    Serve(u64, u64),
-    Net(u64, u64),
+    /// Apply a client [`Command`]. The single entry point for mutations — the
+    /// same one a networked client's messages would flow through.
+    pub fn apply(&mut self, cmd: Command) {
+        match cmd {
+            Command::Launch { dep, pos } => {
+                if let Some(dep) = self.available.get(dep).cloned() {
+                    self.launch(&dep, pos);
+                }
+            }
+            Command::AddVirtualFile { pos } => self.add_virtual_file(pos),
+            Command::AddHostFile { pos } => self.add_host_mapped_file(pos),
+            Command::AddPort { pos } => self.add_host_port(pos),
+            Command::AddNetwork { pos } => {
+                self.add_net_node(pos);
+            }
+            Command::AddGateway { pos } => self.add_gateway_node(pos),
+            Command::RemoveNode { id } => {
+                if self.file_nodes.contains_key(&id) {
+                    self.remove_file_node(id);
+                } else if self.host_ports.contains_key(&id) {
+                    self.remove_host_port(id);
+                } else if self.net_nodes.contains(&id) {
+                    self.remove_net_node(id);
+                } else {
+                    self.close_node(id);
+                }
+            }
+            Command::MoveNode { id, pos } => self.set_node_pos(id, pos),
+            Command::ResizeNode { id, size } => self.set_node_size(id, size),
+            Command::Connect { a, b } => self.connect_toggle(a, b),
+            Command::Disconnect { wire } => self.disconnect_wire(wire),
+            Command::RunNode { id } => self.run_node(id),
+            Command::SetNodeArgs { id, args } => self.set_node_args(id, &args),
+            Command::ChangePort { id, delta } => self.change_port(id, delta),
+        }
+    }
 }
