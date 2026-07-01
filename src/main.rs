@@ -30,13 +30,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize a new wk project (creates wk.kdl)
-    Init {
-        /// Project name (defaults to the directory name)
-        name: Option<String>,
-    },
+    /// Initialize a new wk workspace (creates wk.kdl)
+    Init,
 
-    /// Add a plugin to the project as a named dependency
+    /// Add a plugin to the workspace as a named dependency
     Add {
         /// A local `.wasm` path, or an `oci://<ref>` registry artifact
         target: String,
@@ -72,7 +69,7 @@ fn main() -> Result<(), String> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Some(Commands::Init { name }) => workspace::init(name.clone()),
+        Some(Commands::Init) => workspace::init(),
         Some(Commands::Add { target }) => workspace::add(target.clone()),
         Some(Commands::Publish { plugin, reference }) => {
             workspace::publish(plugin.clone(), reference.clone())

@@ -1,13 +1,12 @@
 //! The wk **workspace**: a single `wk.kdl` file in the working directory that
-//! holds everything about a project — both its *manifest* (a name and the
-//! dependencies it can launch) and its *session* (the live canvas: camera, the
-//! nodes that were open and where, and the connections wiring them). One file,
-//! one type, one reader and one writer — a `wk run` reopens exactly where you
-//! left off, and `wk add`/`wk remove` edit dependencies without disturbing the
-//! layout (it all round-trips through [`Workspace`]).
+//! holds everything about a project — both its *manifest* (the dependencies it
+//! can launch) and its *session* (the live canvas: camera, the nodes that were
+//! open and where, and the connections wiring them). One file, one type, one
+//! reader and one writer — a `wk run` reopens exactly where you left off, and
+//! `wk add`/`wk remove` edit dependencies without disturbing the layout (it all
+//! round-trips through [`Workspace`]).
 //!
 //! ```kdl
-//! name "my-workspace"
 //! dependencies {
 //!     triangle "plugins/triangle/.../triangle.wasm"
 //!     foo      "oci://ghcr.io/org/foo:1.0"
@@ -154,9 +153,8 @@ pub struct NetState {
     pub size: [f32; 2],
 }
 
-/// The whole workspace: manifest (name + dependencies) and session (the canvas).
+/// The whole workspace: the manifest (dependencies) and the session (the canvas).
 pub struct Workspace {
-    pub name: String,
     pub dependencies: Vec<Dependency>,
     /// Canvas camera: pan x, pan y, zoom.
     pub camera: (f32, f32, f32),
@@ -180,10 +178,9 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// An empty workspace with the given name (no dependencies, blank canvas).
-    pub fn with_name(name: String) -> Self {
+    /// An empty workspace (no dependencies, blank canvas).
+    pub fn empty() -> Self {
         Workspace {
-            name,
             dependencies: Vec::new(),
             camera: (0.0, 0.0, 1.0),
             nodes: Vec::new(),
@@ -201,7 +198,7 @@ impl Workspace {
     /// An ad-hoc workspace for `wk run <paths...>`: dependencies straight from
     /// local `.wasm` paths, a blank canvas (this run isn't persisted).
     pub fn from_paths(paths: &[PathBuf]) -> Self {
-        let mut ws = Workspace::with_name("wk".to_string());
+        let mut ws = Workspace::empty();
         ws.dependencies = paths.iter().cloned().map(Dependency::from_path).collect();
         ws
     }
@@ -246,13 +243,6 @@ impl Workspace {
         let doc: KdlDocument = text
             .parse()
             .map_err(|e| format!("failed to parse {WORKSPACE}: {e}"))?;
-
-        let name = doc
-            .get("name")
-            .and_then(|n| n.get(0))
-            .and_then(|v| v.as_string())
-            .unwrap_or("wk-workspace")
-            .to_string();
 
         let dependencies = doc
             .get("dependencies")
@@ -323,12 +313,11 @@ impl Workspace {
                 "network" => nets.extend(parse_net(n, false)),
                 "gateway" => nets.extend(parse_net(n, true)),
                 "netlink" => net_links.extend(pair(n)),
-                _ => {} // name / dependencies / unknown
+                _ => {} // dependencies / unknown
             }
         }
 
         Ok(Workspace {
-            name,
             dependencies,
             camera,
             nodes,
@@ -347,10 +336,6 @@ impl Workspace {
         let mut doc = KdlDocument::new();
 
         // Manifest.
-        let mut name_node = KdlNode::new("name");
-        name_node.push(KdlEntry::new(self.name.clone()));
-        doc.nodes_mut().push(name_node);
-
         let mut deps = KdlNode::new("dependencies");
         let mut children = KdlDocument::new();
         for dep in &self.dependencies {
@@ -552,18 +537,12 @@ fn pair_kdl(name: &str, a: u64, b: u64) -> KdlNode {
 
 // ---- CLI commands ----
 
-/// Create a new `wk.kdl` in the current directory. Errors if one exists.
-pub fn init(name: Option<String>) -> Result<(), String> {
+/// Create a new empty `wk.kdl` in the current directory. Errors if one exists.
+pub fn init() -> Result<(), String> {
     if Path::new(WORKSPACE).exists() {
         return Err(format!("{WORKSPACE} already exists"));
     }
-    let name = name.unwrap_or_else(|| {
-        std::env::current_dir()
-            .ok()
-            .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| "wk-workspace".to_string())
-    });
-    Workspace::with_name(name).save()?;
+    Workspace::empty().save()?;
     println!("created {WORKSPACE}");
     Ok(())
 }
@@ -613,9 +592,8 @@ pub fn publish(plugin: String, reference: String) -> Result<(), String> {
 /// Print the workspace's dependencies.
 pub fn list() -> Result<(), String> {
     let ws = Workspace::load()?;
-    println!("{}", ws.name);
     if ws.dependencies.is_empty() {
-        println!("  (no dependencies; add one with `wk add <path>`)");
+        println!("(no dependencies; add one with `wk add <path>`)");
     }
     for dep in &ws.dependencies {
         println!("  {}  {}", dep.name, dep.source.to_kdl());
@@ -654,7 +632,6 @@ mod tests {
     #[test]
     fn workspace_kdl_round_trips() {
         let ws = Workspace {
-            name: "demo".into(),
             dependencies: vec![
                 Dependency {
                     name: "triangle".into(),
@@ -720,7 +697,6 @@ mod tests {
 
         let back = Workspace::from_kdl(&ws.to_kdl()).expect("parses");
         // Manifest.
-        assert_eq!(back.name, "demo");
         assert_eq!(back.dependencies.len(), 2);
         assert_eq!(back.dependencies[0].name, "triangle");
         assert_eq!(back.dependencies[1].args, vec!["example.com", "80"]);

@@ -607,8 +607,6 @@ struct App {
     gfx: Option<Gfx>,
     /// Whether to save the canvas back to `wk.kdl` on exit (false for ad-hoc runs).
     persist: bool,
-    /// The workspace name, preserved when saving.
-    workspace_name: String,
     host: PluginHost,
     registry: SurfaceRegistry,
     node_reg: NodeRegistry,
@@ -702,7 +700,6 @@ impl App {
         let mut app = App {
             gfx: None,
             persist,
-            workspace_name: ws.name.clone(),
             host,
             registry,
             node_reg,
@@ -2793,7 +2790,6 @@ impl App {
             })
             .collect();
         let ws = Workspace {
-            name: self.workspace_name.clone(),
             dependencies: self.available.clone(),
             camera: (self.cam.pan[0], self.cam.pan[1], self.cam.zoom),
             nodes,
