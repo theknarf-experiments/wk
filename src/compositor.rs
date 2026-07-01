@@ -476,6 +476,8 @@ const HOSTFILE_BORDER: [f32; 4] = [0.30, 0.45, 0.65, 1.0];
 const PORT_COL: [f32; 4] = [0.70, 0.72, 0.80, 1.0];
 /// Input-port (left, target) dot — dimmer than the output port you drag from.
 const PORT_IN_COL: [f32; 4] = [0.42, 0.44, 0.52, 1.0];
+/// A port lights up when the cursor is over it (hover / valid drop target).
+const PORT_HOT: [f32; 4] = [0.55, 0.80, 1.0, 1.0];
 /// HostPort node colours and wire (exposes a wasi:http node to localhost).
 const HOSTPORT_BG: [f32; 4] = [0.10, 0.18, 0.20, 1.0];
 const HOSTPORT_BORDER: [f32; 4] = [0.30, 0.62, 0.66, 1.0];
@@ -501,10 +503,24 @@ fn port_in(r: [f32; 4]) -> [f32; 2] {
 }
 /// Draw a node's input (left) and output (right) connection ports as dots. The
 /// output is brighter (you drag from it); the input is dimmer (you drop onto it).
-fn draw_ports(quads: &mut Vec<Quad>, circle: TextureId, r: [f32; 4], zf: f32, clip: [f32; 4]) {
+/// The port under the cursor `mp` lights up and grows a bit (hover feedback).
+fn draw_ports(
+    quads: &mut Vec<Quad>,
+    circle: TextureId,
+    r: [f32; 4],
+    zf: f32,
+    mp: [f32; 2],
+    clip: [f32; 4],
+) {
     let pr = PORT_R * zf;
-    quads.push(Quad::disc(circle, port_in(r), pr, PORT_IN_COL, clip));
-    quads.push(Quad::disc(circle, port_out(r), pr, PORT_COL, clip));
+    for (center, base) in [(port_in(r), PORT_IN_COL), (port_out(r), PORT_COL)] {
+        let (col, rad) = if near(mp, center, pr + 3.0) {
+            (PORT_HOT, pr * 1.4)
+        } else {
+            (base, pr)
+        };
+        quads.push(Quad::disc(circle, center, rad, col, clip));
+    }
 }
 fn near(a: [f32; 2], b: [f32; 2], radius: f32) -> bool {
     let (dx, dy) = (a[0] - b[0], a[1] - b[1]);
@@ -2051,7 +2067,7 @@ impl App {
                     TEXT,
                     clip,
                 );
-                draw_ports(&mut quads, gfx.renderer.circle, r, zf, full);
+                draw_ports(&mut quads, gfx.renderer.circle, r, zf, mp, full);
                 continue;
             }
 
@@ -2138,7 +2154,7 @@ impl App {
                         clip,
                     );
                 }
-                draw_ports(&mut quads, gfx.renderer.circle, r, zf, full);
+                draw_ports(&mut quads, gfx.renderer.circle, r, zf, mp, full);
                 continue;
             }
 
@@ -2203,7 +2219,7 @@ impl App {
                     TEXT,
                     clip,
                 );
-                draw_ports(&mut quads, gfx.renderer.circle, r, zf, full);
+                draw_ports(&mut quads, gfx.renderer.circle, r, zf, mp, full);
                 continue;
             }
 
@@ -2426,7 +2442,7 @@ impl App {
             }
 
             // Input (left) + output (right) connection ports.
-            draw_ports(&mut quads, gfx.renderer.circle, r, zf, full);
+            draw_ports(&mut quads, gfx.renderer.circle, r, zf, mp, full);
         }
 
         // The wire being dragged out of an output port toward the cursor.
