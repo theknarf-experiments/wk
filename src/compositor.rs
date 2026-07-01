@@ -892,6 +892,17 @@ impl App {
             .find(|&id| contains(self.rect_of(id), mp))
     }
 
+    /// The topmost node whose connection port is under `mp`. The port sits on the
+    /// right edge, so its outer half is outside the node rect — hit-test it
+    /// separately (the whole circle is clickable, not just the overlapping half).
+    fn port_under(&self, mp: [f32; 2], zf: f32) -> Option<u64> {
+        self.z
+            .iter()
+            .rev()
+            .copied()
+            .find(|&id| near(mp, port_pos(self.rect_of(id)), PORT_R * zf + 3.0))
+    }
+
     /// Create a new, empty in-memory VirtualFile node on the canvas.
     fn add_virtual_file(&mut self) {
         self.file_seq += 1;
@@ -1600,9 +1611,11 @@ impl App {
                     self.drag = Some(d);
                 }
                 DragMode::Connect if lmb => self.drag = Some(d),
-                // Released: a connect drag wires to the node under the cursor.
+                // Released: a connect drag wires to the node under the cursor (or
+                // on its port, so you can drop onto either node's port too).
                 DragMode::Connect => {
-                    if let Some(target) = self.topmost_under(mp) {
+                    if let Some(target) = self.topmost_under(mp).or_else(|| self.port_under(mp, zf))
+                    {
                         if target != d.id {
                             self.connect_toggle(d.id, target);
                         }
@@ -1665,6 +1678,21 @@ impl App {
                 self.palette_scroll = 0.0;
                 consumed = true;
             }
+            // Dragging a wire out of a node's connection port. Checked before the
+            // node-body hit-test so the port's outer half (past the right edge) is
+            // grabbable too.
+            if !consumed {
+                if let Some(id) = self.port_under(mp, zf) {
+                    self.z.retain(|&x| x != id);
+                    self.z.push(id);
+                    self.drag = Some(Drag {
+                        id,
+                        mode: DragMode::Connect,
+                        grab: [0.0, 0.0],
+                    });
+                    consumed = true;
+                }
+            }
             if !consumed {
                 if let Some(id) = self.topmost_under(mp) {
                     self.z.retain(|&x| x != id);
@@ -1673,14 +1701,7 @@ impl App {
                     let is_file = self.file_nodes.contains_key(&id);
                     let is_port = self.host_ports.contains_key(&id);
                     let is_net = self.net_nodes.contains(&id);
-                    if near(mp, port_pos(r), PORT_R * zf + 3.0) {
-                        // Drag a connection wire out of the port.
-                        self.drag = Some(Drag {
-                            id,
-                            mode: DragMode::Connect,
-                            grab: [0.0, 0.0],
-                        });
-                    } else if is_file || is_port || is_net {
+                    if is_file || is_port || is_net {
                         // Canvas widget nodes (file / HostPort / Network): close,
                         // adjust port (HostPort −/+ buttons), or move.
                         let (minus, plus) = port_step_btns(r, zf);
