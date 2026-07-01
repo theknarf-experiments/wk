@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use winit::application::ApplicationHandler;
@@ -13,7 +14,7 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
-use winit::window::WindowId;
+use winit::window::{Window, WindowId};
 
 use crate::host_shell::Gfx;
 use crate::render2d::{Quad, Renderer, TextureId};
@@ -22,6 +23,7 @@ use wk_protocol::{Command, Wire};
 use wk_server::plugin::{Key, KeyEvent, PointerEvent, ResizeEvent, SharedNode, SharedSurface};
 use wk_server::runtime::ServerHandle;
 use wk_server::server::{View, FILE_H, FILE_W};
+use wk_server::terminal::CellView;
 
 /// Target frame time (~60 fps).
 const FRAME: Duration = Duration::from_nanos(1_000_000_000 / 60);
@@ -55,6 +57,9 @@ const TEXT: [f32; 4] = [0.90, 0.90, 0.93, 1.0];
 const CLOSE_HOT: [f32; 4] = [0.80, 0.30, 0.30, 1.0];
 /// Terminal grid background.
 const TERM_BG: [f32; 4] = [0.063, 0.063, 0.086, 1.0];
+/// Body fill shown in the workspace for a node that is popped out into its own
+/// window (hatched-looking dim panel behind the "detached" label).
+const DETACHED_BG: [f32; 4] = [0.10, 0.11, 0.14, 1.0];
 
 /// Convert an 8-bit RGB triple to a normalized opaque colour.
 fn rgba(c: [u8; 3]) -> [f32; 4] {
@@ -278,13 +283,21 @@ fn close_btn(r: [f32; 4], z: f32) -> [f32; 4] {
     let y0 = r[1] + 4.0 * z;
     [x1 - s, y0, x1, y0 + s]
 }
-/// The Run/▶ button, just left of the close button. Shown only on an idle or
-/// exited node so it can be (re)started after wiring.
-fn run_btn(r: [f32; 4], z: f32) -> [f32; 4] {
+/// The detach button, just left of the close button. Pops the node out into its
+/// own OS window (and, when already detached, reattaches it). Shown on app nodes.
+fn detach_btn(r: [f32; 4], z: f32) -> [f32; 4] {
     let cb = close_btn(r, z);
     let w = cb[2] - cb[0];
     let gap = 4.0 * z;
     [cb[0] - w - gap, cb[1], cb[0] - gap, cb[3]]
+}
+/// The Run/▶ button, just left of the detach button. Shown only on an idle or
+/// exited node so it can be (re)started after wiring.
+fn run_btn(r: [f32; 4], z: f32) -> [f32; 4] {
+    let db = detach_btn(r, z);
+    let w = db[2] - db[0];
+    let gap = 4.0 * z;
+    [db[0] - w - gap, db[1], db[0] - gap, db[3]]
 }
 /// The editable launch-args bar along the bottom of an idle node's body (a
 /// one-line input strip, so it doesn't paint over the node's output above).
@@ -529,6 +542,26 @@ fn draw_connection(
 /// server. winit drives it via `ApplicationHandler`; the per-frame work happens
 /// in `frame`. Everything here is client-local view/input state — the
 /// authoritative document lives in the server, reached only through `conn`.
+/// A node popped out into its own OS window. Purely client-local view state:
+/// neither the detached flag nor this window's size is ever sent to the server
+/// or written to the workspace, so a restart brings every node back into the
+/// main window. A node is "detached" iff it has an entry in [`App::detached`].
+struct Detached {
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    /// The detached window's logical inner size — the node's render target while
+    /// detached (replacing its in-workspace content size). Never persisted.
+    size: [u32; 2],
+    // Per-window input, accumulated from winit events and forwarded to the node
+    // each frame (mirrors the main window's input handling).
+    mouse: [f32; 2],
+    lmb: bool,
+    prev_lmb: bool,
+    key_events: Vec<(KeyEvent, bool)>,
+    term_input: Vec<u8>,
+}
+
 struct App {
     /// This client's connection to the independently-running server: send
     /// [`Command`]s, read [`View`] snapshots.
@@ -538,6 +571,11 @@ struct App {
     /// The camera last reported to the server, so we only resend on change.
     sent_cam: (f32, f32, f32),
     gfx: Option<Gfx>,
+    /// Nodes currently popped out into their own OS window, keyed by node id.
+    detached: HashMap<u64, Detached>,
+    /// Detach requests awaiting window creation (needs the `ActiveEventLoop`,
+    /// which `frame` doesn't have; drained in `about_to_wait`).
+    pending_detach: Vec<u64>,
 
     views: HashMap<u64, (TextureId, u32, u32)>,
     text_cache: TextCache,
@@ -600,6 +638,8 @@ impl App {
             view,
             sent_cam: (f32::NAN, f32::NAN, f32::NAN),
             gfx: None,
+            detached: HashMap::new(),
+            pending_detach: Vec::new(),
             views: HashMap::new(),
             text_cache: TextCache::default(),
             terminals: HashMap::new(),
@@ -696,6 +736,130 @@ impl App {
             }
         }
         self.conn.send(Command::RunNode { id });
+    }
+
+    /// Toggle a node between attached and popped-out into its own OS window.
+    /// Reattaching just drops the window here (the surface reverts to its
+    /// in-workspace size next frame); detaching is deferred to `about_to_wait`,
+    /// which has the `ActiveEventLoop` needed to create a window.
+    fn toggle_detach(&mut self, id: u64) {
+        if self.detached.remove(&id).is_none() && !self.pending_detach.contains(&id) {
+            self.pending_detach.push(id);
+        }
+    }
+
+    /// Create OS windows for any queued detach requests. Called from
+    /// `about_to_wait` (has the event loop) before rendering.
+    fn create_pending_detached(&mut self, el: &ActiveEventLoop) {
+        if self.pending_detach.is_empty() {
+            return;
+        }
+        // Resolve each request's initial window size + title before borrowing gfx.
+        let reqs: Vec<(u64, [u32; 2], String)> = std::mem::take(&mut self.pending_detach)
+            .into_iter()
+            .filter(|id| !self.detached.contains_key(id))
+            .map(|id| {
+                let size = self
+                    .view
+                    .win_size
+                    .get(&id)
+                    .map(|s| {
+                        [
+                            (s[0] - 2.0 * BORDER).max(200.0) as u32,
+                            (s[1] - TITLE_H - BORDER).max(150.0) as u32,
+                        ]
+                    })
+                    .unwrap_or([480, 360]);
+                let title = self
+                    .app_node(id)
+                    .map(|n| n.name.clone())
+                    .unwrap_or_else(|| format!("node {id}"));
+                (id, size, title)
+            })
+            .collect();
+        let Some(gfx) = &self.gfx else { return };
+        for (id, size, title) in reqs {
+            match gfx.create_detached(el, &format!("{title} — wk (detached)"), size) {
+                Ok((window, surface, config)) => {
+                    let size = Gfx::logical_size(&window);
+                    self.detached.insert(
+                        id,
+                        Detached {
+                            window,
+                            surface,
+                            config,
+                            size,
+                            mouse: [0.0, 0.0],
+                            lmb: false,
+                            prev_lmb: false,
+                            key_events: Vec::new(),
+                            term_input: Vec::new(),
+                        },
+                    );
+                }
+                Err(e) => eprintln!("wk: failed to detach node {id}: {e}"),
+            }
+        }
+    }
+
+    /// Handle a winit event addressed to a detached node's window: close (which
+    /// reattaches the node), resize (updates the render target), or input (queued
+    /// and forwarded to the node in `frame`, like the main window).
+    fn detached_window_event(&mut self, wid: WindowId, event: WindowEvent) {
+        let Some(node_id) = self
+            .detached
+            .iter()
+            .find(|(_, d)| d.window.id() == wid)
+            .map(|(&k, _)| k)
+        else {
+            return;
+        };
+        match event {
+            // Closing a detached window brings the node back into the workspace.
+            WindowEvent::CloseRequested => {
+                self.detached.remove(&node_id);
+            }
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                if let (Some(gfx), Some(det)) = (self.gfx.as_ref(), self.detached.get_mut(&node_id))
+                {
+                    let size = Gfx::logical_size(&det.window);
+                    det.size = size;
+                    gfx.reconfigure(&det.surface, &mut det.config, size);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(det) = self.detached.get_mut(&node_id) {
+                    let scale = det.window.scale_factor();
+                    det.mouse = [(position.x / scale) as f32, (position.y / scale) as f32];
+                }
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                if let Some(det) = self.detached.get_mut(&node_id) {
+                    det.lmb = state == ElementState::Pressed;
+                }
+            }
+            WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    let pressed = event.state == ElementState::Pressed;
+                    let mods = self.mods;
+                    if let Some(det) = self.detached.get_mut(&node_id) {
+                        if pressed {
+                            if let Some(bytes) = encode_term_key(code, event.text.as_deref(), mods)
+                            {
+                                det.term_input.extend(bytes);
+                            }
+                        }
+                        det.key_events.push((key_event(code, mods), pressed));
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// The screen-space endpoints of a wire (both nodes must still be placed).
@@ -899,6 +1063,144 @@ impl App {
         let y = (fb[1] * 0.16).max(40.0);
         let row_h = MENU_H + 4.0;
         (x, y, w, row_h)
+    }
+
+    /// Draw a terminal cell grid, scaled uniformly to fit `area`, clipped to
+    /// `clip`. Shared by the in-workspace node body and its detached window.
+    fn draw_term_grid(
+        &mut self,
+        quads: &mut Vec<Quad>,
+        gfx: &mut Gfx,
+        cells: &[CellView],
+        cursor: Option<(usize, usize)>,
+        area: [f32; 4],
+        clip: [f32; 4],
+    ) {
+        let white = gfx.renderer.white;
+        let cols = wk_server::terminal::COLS as f32;
+        let rows = wk_server::terminal::ROWS as f32;
+        let bw = (gfx.fonts.measure("M") as f32).max(1.0);
+        let bh = (gfx.fonts.line_height() as f32).max(1.0);
+        let scale = ((area[2] - area[0]) / (cols * bw))
+            .min((area[3] - area[1]) / (rows * bh))
+            .max(0.01);
+        let cw = bw * scale;
+        let chh = bh * scale;
+        quads.push(Quad::solid(white, area, TERM_BG, clip));
+        for cell in cells {
+            let cx = area[0] + cell.col as f32 * cw;
+            let cy = area[1] + cell.row as f32 * chh;
+            if let Some(bg) = cell.bg {
+                quads.push(Quad::solid(
+                    white,
+                    [cx, cy, cx + cw, cy + chh],
+                    rgba(bg),
+                    clip,
+                ));
+            }
+            if cell.ch != ' ' {
+                let mut buf = [0u8; 4];
+                self.text_cache.draw(
+                    quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    cell.ch.encode_utf8(&mut buf),
+                    cx,
+                    cy,
+                    scale,
+                    rgba(cell.fg),
+                    clip,
+                );
+            }
+        }
+        if let Some((ccol, crow)) = cursor {
+            let cx = area[0] + ccol as f32 * cw;
+            let cy = area[1] + crow as f32 * chh;
+            quads.push(Quad::solid(
+                white,
+                [cx, cy, cx + cw, cy + chh],
+                [0.85, 0.85, 0.9, 0.45],
+                clip,
+            ));
+        }
+    }
+
+    /// Render one detached node into its own window: the node's live content
+    /// (graphical surface or terminal grid) filling the window.
+    fn render_detached(
+        &mut self,
+        gfx: &mut Gfx,
+        id: u64,
+        node_surface: &HashMap<u64, SharedSurface>,
+    ) {
+        let Some(size) = self.detached.get(&id).map(|d| d.size) else {
+            return;
+        };
+        let fb = [size[0] as f32, size[1] as f32];
+        let full = [0.0, 0.0, fb[0], fb[1]];
+        let white = gfx.renderer.white;
+        let mut quads: Vec<Quad> = Vec::new();
+
+        let sid = node_surface.get(&id).map(|s| s.lock().unwrap().id);
+        if let Some(sid) = sid {
+            if let Some(&(tex, _, _)) = self.views.get(&sid) {
+                quads.push(Quad::tex(
+                    full,
+                    [0.0, 0.0, 1.0, 1.0],
+                    [1.0, 1.0, 1.0, 1.0],
+                    tex,
+                    full,
+                ));
+            }
+        } else if let Some((cells, cursor)) =
+            self.terminals.get(&id).map(|t| (t.cells(), t.cursor()))
+        {
+            self.draw_term_grid(&mut quads, gfx, &cells, cursor, full, full);
+        } else {
+            quads.push(Quad::solid(white, full, DETACHED_BG, full));
+        }
+
+        let Some(det) = self.detached.get(&id) else {
+            return;
+        };
+        let frame = match det.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            _ => return,
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = gfx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("detached"),
+            });
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(CLEAR),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            gfx.renderer
+                .draw(&gfx.device, &gfx.queue, &mut rpass, fb, &quads);
+        }
+        gfx.queue.submit([encoder.finish()]);
+        det.window.pre_present_notify();
+        frame.present();
     }
 
     /// One compositor frame: update from input, drive surfaces, render.
@@ -1142,6 +1444,8 @@ impl App {
                             .unwrap_or(false);
                         if contains(close_btn(r, zf), mp) {
                             to_close.push(id);
+                        } else if contains(detach_btn(r, zf), mp) {
+                            self.toggle_detach(id);
                         } else if idle && contains(run_btn(r, zf), mp) {
                             self.run_node(id);
                         } else if contains(resize_grip(r, zf), mp) {
@@ -1266,9 +1570,19 @@ impl App {
         for shared in &surfaces {
             let (sid, w, h, pixels) = {
                 let mut s = shared.lock().unwrap();
-                if let Some(size) = self.view.win_size.get(&s.node_id) {
-                    let cw = (size[0] - 2.0 * BORDER).max(16.0) as u32;
-                    let ch = (size[1] - TITLE_H - BORDER).max(16.0) as u32;
+                // A detached node renders at its own window's size; an attached
+                // one at its in-workspace content size.
+                let target = if let Some(det) = self.detached.get(&s.node_id) {
+                    Some(det.size)
+                } else {
+                    self.view.win_size.get(&s.node_id).map(|size| {
+                        [
+                            (size[0] - 2.0 * BORDER).max(16.0) as u32,
+                            (size[1] - TITLE_H - BORDER).max(16.0) as u32,
+                        ]
+                    })
+                };
+                if let Some([cw, ch]) = target {
                     if cw != s.width || ch != s.height {
                         s.width = cw;
                         s.height = ch;
@@ -1348,7 +1662,10 @@ impl App {
             }
         }
 
-        for &id in &self.z {
+        // Clone the draw order so the body can call `&mut self` helpers (e.g.
+        // `draw_term_grid`) without holding a borrow of `self.z`.
+        let z_order = self.z.clone();
+        for &id in &z_order {
             let pos = self.view.win_pos[&id];
             let size = self.view.win_size[&id];
             let r = win_rect(self.cam, pos, size);
@@ -1658,6 +1975,30 @@ impl App {
                 clip,
             );
 
+            // Detach button: pop the node out into its own OS window (highlighted
+            // while detached). Drawn as a small "window" icon.
+            let db = detach_btn(r, zf);
+            let is_det = self.detached.contains_key(&id);
+            let panel = if focused { TITLE_FOCUS } else { TITLE };
+            if is_det || contains(db, mp) {
+                quads.push(Quad::solid(white, db, TITLE_FOCUS, clip));
+            }
+            let p = (db[2] - db[0]) * 0.24;
+            let outer = [db[0] + p, db[1] + p, db[2] - p, db[3] - p];
+            quads.push(Quad::solid(white, outer, TEXT, clip));
+            let t = (outer[2] - outer[0]) * 0.2;
+            let inner = [outer[0] + t, outer[1] + t * 1.9, outer[2] - t, outer[3] - t];
+            quads.push(Quad::solid(
+                white,
+                inner,
+                if is_det || contains(db, mp) {
+                    TITLE_FOCUS
+                } else {
+                    panel
+                },
+                clip,
+            ));
+
             // Run/▶ button for an idle or exited node (start or re-start it).
             if node_idle {
                 let rb = run_btn(r, zf);
@@ -1700,8 +2041,27 @@ impl App {
                     ca_clip,
                 );
             }
-            let sid = node_surface.get(&id).map(|s| s.lock().unwrap().id);
-            if let Some(sid) = sid {
+            if self.detached.contains_key(&id) {
+                // Popped out into its own OS window: the live content renders
+                // there; here we just show a "detached" placeholder in place.
+                quads.push(Quad::solid(white, ca, DETACHED_BG, ca_clip));
+                let msg = "detached";
+                let lh = gfx.fonts.line_height() as f32 * zf;
+                let w = gfx.fonts.measure(msg) as f32 * zf;
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    msg,
+                    (ca[0] + ca[2]) * 0.5 - w * 0.5,
+                    (ca[1] + ca[3]) * 0.5 - lh * 0.5,
+                    zf,
+                    PORT_COL,
+                    ca_clip,
+                );
+            } else if let Some(sid) = node_surface.get(&id).map(|s| s.lock().unwrap().id) {
                 if let Some(&(tex, _, _)) = self.views.get(&sid) {
                     quads.push(Quad::tex(
                         ca,
@@ -1714,55 +2074,7 @@ impl App {
             } else if let Some((cells, cursor)) =
                 self.terminals.get(&id).map(|t| (t.cells(), t.cursor()))
             {
-                // Render the VT cell grid, scaled uniformly to fit the content.
-                let cols = wk_server::terminal::COLS as f32;
-                let rows = wk_server::terminal::ROWS as f32;
-                let bw = (gfx.fonts.measure("M") as f32).max(1.0);
-                let bh = (gfx.fonts.line_height() as f32).max(1.0);
-                let scale = ((ca[2] - ca[0]) / (cols * bw))
-                    .min((ca[3] - ca[1]) / (rows * bh))
-                    .max(0.01);
-                let cw = bw * scale;
-                let chh = bh * scale;
-                quads.push(Quad::solid(white, ca, TERM_BG, ca_clip));
-                for cell in &cells {
-                    let cx = ca[0] + cell.col as f32 * cw;
-                    let cy = ca[1] + cell.row as f32 * chh;
-                    if let Some(bg) = cell.bg {
-                        quads.push(Quad::solid(
-                            white,
-                            [cx, cy, cx + cw, cy + chh],
-                            rgba(bg),
-                            ca_clip,
-                        ));
-                    }
-                    if cell.ch != ' ' {
-                        let mut buf = [0u8; 4];
-                        self.text_cache.draw(
-                            &mut quads,
-                            &mut gfx.renderer,
-                            &gfx.fonts,
-                            &gfx.device,
-                            &gfx.queue,
-                            cell.ch.encode_utf8(&mut buf),
-                            cx,
-                            cy,
-                            scale,
-                            rgba(cell.fg),
-                            ca_clip,
-                        );
-                    }
-                }
-                if let Some((ccol, crow)) = cursor {
-                    let cx = ca[0] + ccol as f32 * cw;
-                    let cy = ca[1] + crow as f32 * chh;
-                    quads.push(Quad::solid(
-                        white,
-                        [cx, cy, cx + cw, cy + chh],
-                        [0.85, 0.85, 0.9, 0.45],
-                        ca_clip,
-                    ));
-                }
+                self.draw_term_grid(&mut quads, &mut gfx, &cells, cursor, ca, ca_clip);
             }
 
             // Idle node: a one-line, editable launch-args bar along the bottom
@@ -2016,6 +2328,7 @@ impl App {
             self.conn.send(Command::RemoveNode { id: *id });
             // Client-local cleanup.
             self.terminals.remove(id);
+            self.detached.remove(id);
             self.z.retain(|x| x != id);
             if matches!(self.editing_args, Some((eid, _)) if eid == *id) {
                 self.editing_args = None;
@@ -2023,6 +2336,59 @@ impl App {
             if self.kbd_focus == Some(*id) {
                 self.kbd_focus = None;
             }
+        }
+
+        // ---- detached node windows ----
+        // Drop windows for nodes that vanished (closed elsewhere), then forward
+        // each window's queued input to its node and render its own window.
+        self.detached.retain(|id, _| node_by_id.contains_key(id));
+        let det_ids: Vec<u64> = self.detached.keys().copied().collect();
+        for id in det_ids {
+            let (mouse, lmb_d, prev_d, keys, term_in) = {
+                let det = self.detached.get_mut(&id).unwrap();
+                let out = (
+                    det.mouse,
+                    det.lmb,
+                    det.prev_lmb,
+                    std::mem::take(&mut det.key_events),
+                    std::mem::take(&mut det.term_input),
+                );
+                det.prev_lmb = det.lmb;
+                out
+            };
+            // Forward the detached window's input straight to the node — the
+            // window's size is the surface size, so coordinates map 1:1.
+            if let Some(surf) = node_surface.get(&id) {
+                let mut s = surf.lock().unwrap();
+                let local = PointerEvent {
+                    x: mouse[0] as f64,
+                    y: mouse[1] as f64,
+                };
+                s.pointer_move.push_back(local);
+                if lmb_d && !prev_d {
+                    s.pointer_down.push_back(local);
+                }
+                if !lmb_d && prev_d {
+                    s.pointer_up.push_back(local);
+                }
+                for (ev, down) in &keys {
+                    if *down {
+                        s.key_down.push_back(ev.clone());
+                    } else {
+                        s.key_up.push_back(ev.clone());
+                    }
+                }
+            } else if !term_in.is_empty() {
+                if let (Some(node), Some(term)) = (node_by_id.get(&id), self.terminals.get_mut(&id))
+                {
+                    if term.is_raw() {
+                        node.term_io.feed_in(&term_in);
+                    } else {
+                        term.key_input(&term_in, &node.term_io);
+                    }
+                }
+            }
+            self.render_detached(&mut gfx, id, &node_surface);
         }
 
         self.prev_lmb = lmb;
@@ -2054,11 +2420,22 @@ impl ApplicationHandler for App {
             return;
         }
         if self.gfx.is_some() {
+            self.create_pending_detached(event_loop);
             self.frame();
         }
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // Route events for a detached node's window to that node, not the canvas.
+        let is_main = self
+            .gfx
+            .as_ref()
+            .map(|g| g.window.id() == id)
+            .unwrap_or(true);
+        if !is_main {
+            self.detached_window_event(id, event);
+            return;
+        }
         let scale = self
             .gfx
             .as_ref()
