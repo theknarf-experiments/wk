@@ -706,6 +706,16 @@ impl PluginHost {
         // Lets the compositor stop a runaway node: increment_epoch() each frame
         // trips the per-store deadline callback, which traps on `kill`.
         config.epoch_interruption(true);
+        // Persist compiled machine code to an on-disk cache so a plugin is only
+        // Cranelift-compiled once ever — subsequent launches load the cached
+        // artifact (a debug sqlite drops from ~3s to milliseconds). Best-effort:
+        // if the cache can't be set up, we just compile every launch as before.
+        match wasmtime::Cache::from_file(None) {
+            Ok(cache) => {
+                config.cache(Some(cache));
+            }
+            Err(e) => eprintln!("wk: compile cache unavailable, compiling fresh: {e}"),
+        }
         Ok(Self {
             engine: Engine::new(&config)?,
             gpu: new_gpu_instance(),

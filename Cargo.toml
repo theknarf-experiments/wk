@@ -13,7 +13,7 @@ ab_glyph = "0.2"
 bytemuck = { version = "1.25.0", features = ["derive"] }
 clap = { version = "4.6.1", features = ["derive"] }
 kdl = "6"
-wasmtime = { version = "46", features = ["component-model", "async"] }
+wasmtime = { version = "46", features = ["component-model", "async", "cache"] }
 wasmtime-wasi = { version = "46", features = ["p3"] }
 wasmtime-wasi-io = "46"
 wasi-webgpu-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime" }
