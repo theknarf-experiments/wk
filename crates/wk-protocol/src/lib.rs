@@ -92,6 +92,9 @@ pub enum Command {
     /// Create a new (empty) workspace with the given client-minted id. The client
     /// mints the id so it can switch its own view to the new tab immediately.
     AddWorkspace { id: NodeId },
+    /// Delete a workspace and every node in it. Ignored for the last workspace
+    /// (a document always keeps at least one).
+    RemoveWorkspace { id: NodeId },
     /// Remove any node (app/file/port/network) by id.
     RemoveNode { id: NodeId },
     /// Move a node to a new canvas position.
@@ -121,7 +124,7 @@ impl Command {
             | Command::AddNetwork { .. }
             | Command::AddGateway { .. }
             | Command::AddWorkspace { .. } => Operation::Create,
-            Command::RemoveNode { .. } => Operation::Remove,
+            Command::RemoveNode { .. } | Command::RemoveWorkspace { .. } => Operation::Remove,
             Command::Connect { .. } | Command::Disconnect { .. } => Operation::Wire,
             Command::RunNode { .. } | Command::SetNodeArgs { .. } | Command::ChangePort { .. } => {
                 Operation::Control

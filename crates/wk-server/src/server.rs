@@ -549,6 +549,37 @@ impl Server {
         }
     }
 
+    /// Remove a node by kind (app/file/port/network).
+    fn remove_any(&mut self, id: NodeId) {
+        if self.file_nodes.contains_key(&id) {
+            self.remove_file_node(id);
+        } else if self.host_ports.contains_key(&id) {
+            self.remove_host_port(id);
+        } else if self.net_nodes.contains(&id) {
+            self.remove_net_node(id);
+        } else {
+            self.close_node(id);
+        }
+    }
+
+    /// Delete a workspace and every node in it. A no-op for the last workspace —
+    /// a document always keeps at least one.
+    fn remove_workspace(&mut self, id: NodeId) {
+        if self.workspaces.len() <= 1 || !self.workspaces.contains(&id) {
+            return;
+        }
+        let victims: Vec<NodeId> = self
+            .node_ws
+            .iter()
+            .filter(|(_, &ws)| ws == id)
+            .map(|(&n, _)| n)
+            .collect();
+        for n in victims {
+            self.remove_any(n);
+        }
+        self.workspaces.retain(|&w| w != id);
+    }
+
     /// (Re)run an idle or exited node's guest with its current args.
     fn run_node(&mut self, id: NodeId) {
         if let Some(node) = self.app_node(id) {
@@ -1014,17 +1045,8 @@ impl Server {
             }
             Command::AddGateway { pos, ws } => self.add_gateway_node(pos, ws),
             Command::AddWorkspace { id } => self.add_workspace(id),
-            Command::RemoveNode { id } => {
-                if self.file_nodes.contains_key(&id) {
-                    self.remove_file_node(id);
-                } else if self.host_ports.contains_key(&id) {
-                    self.remove_host_port(id);
-                } else if self.net_nodes.contains(&id) {
-                    self.remove_net_node(id);
-                } else {
-                    self.close_node(id);
-                }
-            }
+            Command::RemoveWorkspace { id } => self.remove_workspace(id),
+            Command::RemoveNode { id } => self.remove_any(id),
             Command::MoveNode { id, pos } => self.set_node_pos(id, pos),
             Command::ResizeNode { id, size } => self.set_node_size(id, size),
             Command::Connect { a, b } => self.connect_toggle(a, b),

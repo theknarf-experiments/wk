@@ -273,6 +273,13 @@ fn win_rect(cam: Camera, pos: [f32; 2], size: [f32; 2]) -> [f32; 4] {
 fn title_bar(r: [f32; 4], z: f32) -> [f32; 4] {
     [r[0], r[1], r[2], r[1] + TITLE_H * z]
 }
+/// The close box at the right of a workspace tab rect.
+fn tab_close_btn(r: [f32; 4]) -> [f32; 4] {
+    let s = (TAB_H - 12.0).max(8.0);
+    let x1 = r[2] - 5.0;
+    let y0 = (TAB_H - s) * 0.5;
+    [x1 - s, y0, x1, y0 + s]
+}
 fn close_btn(r: [f32; 4], z: f32) -> [f32; 4] {
     let s = (TITLE_H - 8.0) * z;
     let x1 = r[2] - 4.0 * z;
@@ -397,6 +404,7 @@ enum PaletteCmd {
     AddNetwork,
     AddGateway,
     NewWorkspace,
+    CloseWorkspace,
     /// Jump the camera to this zoom factor.
     Zoom(f32),
     Quit,
@@ -918,6 +926,12 @@ impl App {
         v.push(("Add Network".into(), PaletteCmd::AddNetwork));
         v.push(("Add Gateway".into(), PaletteCmd::AddGateway));
         v.push(("New Workspace  (Cmd+T)".into(), PaletteCmd::NewWorkspace));
+        if self.tabs.len() > 1 {
+            v.push((
+                "Close Workspace  (Cmd+W)".into(),
+                PaletteCmd::CloseWorkspace,
+            ));
+        }
         for &z in &ZOOM_PRESETS {
             v.push((format!("Zoom {:.0}%", z * 100.0), PaletteCmd::Zoom(z)));
         }
@@ -1046,6 +1060,7 @@ impl App {
                 self.conn.send(Command::AddGateway { pos, ws });
             }
             PaletteCmd::NewWorkspace => self.new_workspace(),
+            PaletteCmd::CloseWorkspace => self.close_workspace(self.active_ws),
             PaletteCmd::Zoom(z) => {
                 self.cam
                     .zoom_at(z / self.cam.zoom, [fb[0] * 0.5, fb[1] * 0.5]);
@@ -1082,13 +1097,33 @@ impl App {
         self.active_ws = self.tabs[j];
     }
 
+    /// Delete a workspace and all its nodes. Switches this client to a neighbour
+    /// first; never closes the last tab (the server refuses too).
+    fn close_workspace(&mut self, id: NodeId) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        if self.active_ws == id {
+            let i = self.tabs.iter().position(|&t| t == id).unwrap_or(0);
+            self.active_ws = if i > 0 {
+                self.tabs[i - 1]
+            } else {
+                self.tabs[1]
+            };
+        }
+        self.conn.send(Command::RemoveWorkspace { id });
+        self.tabs.retain(|&t| t != id);
+    }
+
     /// The tab rectangles (one per workspace, in order) and the trailing "+"
-    /// button rect. Tabs are labelled by their 1-based position.
+    /// button rect. Tabs are labelled by their 1-based position and carry a
+    /// close box (see [`tab_close_btn`]).
     fn tab_layout(&self, gfx: &Gfx) -> (Vec<(NodeId, [f32; 4])>, [f32; 4]) {
         let mut rects = Vec::with_capacity(self.tabs.len());
         let mut x = 0.0;
         for (i, &id) in self.tabs.iter().enumerate() {
-            let w = gfx.fonts.measure(&format!("{}", i + 1)) as f32 + 2.0 * PAD + 6.0;
+            let label = gfx.fonts.measure(&format!("{}", i + 1)) as f32;
+            let w = label + 2.0 * PAD + (TAB_H - 12.0).max(8.0) + 8.0;
             rects.push((id, [x, 0.0, x + w, TAB_H]));
             x += w;
         }
@@ -1426,14 +1461,19 @@ impl App {
                 self.palette_scroll = 0.0;
                 consumed = true;
             }
-            // Tab bar (top): click a tab to view it, or "+" to open a new one.
+            // Tab bar (top): click a tab to view it, its × to close it, or "+"
+            // to open a new one.
             if !consumed && self.tabs.len() > 1 {
                 let (rects, plus) = self.tab_layout(&gfx);
                 if contains(plus, mp) {
                     self.new_workspace();
                     consumed = true;
-                } else if let Some(&(id, _)) = rects.iter().find(|(_, r)| contains(*r, mp)) {
-                    self.active_ws = id;
+                } else if let Some(&(id, r)) = rects.iter().find(|(_, r)| contains(*r, mp)) {
+                    if contains(tab_close_btn(r), mp) {
+                        self.close_workspace(id);
+                    } else {
+                        self.active_ws = id;
+                    }
                     consumed = true;
                 }
             }
@@ -2266,7 +2306,6 @@ impl App {
                 };
                 quads.push(Quad::solid(white, r, bg, full));
                 let label = format!("{}", i + 1);
-                let tw = gfx.fonts.measure(&label) as f32;
                 self.text_cache.draw(
                     &mut quads,
                     &mut gfx.renderer,
@@ -2274,9 +2313,28 @@ impl App {
                     &gfx.device,
                     &gfx.queue,
                     &label,
-                    (r[0] + r[2]) * 0.5 - tw * 0.5,
+                    r[0] + PAD,
                     (TAB_H - lh) * 0.5,
                     1.0,
+                    TEXT,
+                    full,
+                );
+                // Close box (×) on the right of the tab.
+                let cb = tab_close_btn(r);
+                if contains(cb, mp) {
+                    quads.push(Quad::solid(white, cb, CLOSE_HOT, full));
+                }
+                let xw = gfx.fonts.measure("x") as f32 * 0.8;
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    "x",
+                    (cb[0] + cb[2]) * 0.5 - xw * 0.5,
+                    (TAB_H - lh * 0.8) * 0.5,
+                    0.8,
                     TEXT,
                     full,
                 );
@@ -2621,6 +2679,15 @@ impl ApplicationHandler for App {
                     // reaches the app; Ctrl+Tab is free on every platform.
                     if pressed && !event.repeat && self.mods.control_key() && code == KeyCode::Tab {
                         self.cycle_tab(!self.mods.shift_key());
+                        return;
+                    }
+                    // Cmd/Ctrl+W closes the current workspace tab.
+                    if pressed
+                        && !event.repeat
+                        && (self.mods.super_key() || self.mods.control_key())
+                        && code == KeyCode::KeyW
+                    {
+                        self.close_workspace(self.active_ws);
                         return;
                     }
                     // While the palette is open it captures all keystrokes.
