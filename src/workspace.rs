@@ -96,18 +96,6 @@ pub struct Dependency {
 }
 
 impl Dependency {
-    pub fn from_path(source: PathBuf) -> Self {
-        let name = source
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "plugin".to_string());
-        Dependency {
-            name,
-            source: Source::Path(source),
-            args: Vec::new(),
-        }
-    }
-
     /// The local path to load this dependency's wasm from.
     pub fn local_path(&self) -> PathBuf {
         self.source.local_path()
@@ -193,14 +181,6 @@ impl Workspace {
             nets: Vec::new(),
             net_links: Vec::new(),
         }
-    }
-
-    /// An ad-hoc workspace for `wk run <paths...>`: dependencies straight from
-    /// local `.wasm` paths, a blank canvas (this run isn't persisted).
-    pub fn from_paths(paths: &[PathBuf]) -> Self {
-        let mut ws = Workspace::empty();
-        ws.dependencies = paths.iter().cloned().map(Dependency::from_path).collect();
-        ws
     }
 
     /// Load the workspace from `wk.kdl` in the current directory.

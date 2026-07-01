@@ -605,8 +605,6 @@ fn draw_connection(
 /// `ApplicationHandler`; the per-frame work happens in `frame`.
 struct App {
     gfx: Option<Gfx>,
-    /// Whether to save the canvas back to `wk.kdl` on exit (false for ad-hoc runs).
-    persist: bool,
     host: PluginHost,
     registry: SurfaceRegistry,
     node_reg: NodeRegistry,
@@ -693,13 +691,12 @@ struct App {
 }
 
 impl App {
-    fn new(ws: &Workspace, persist: bool) -> Result<Self, String> {
+    fn new(ws: &Workspace) -> Result<Self, String> {
         let host = PluginHost::new().map_err(|e| format!("{e:#}"))?;
         let registry: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
         let node_reg: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
         let mut app = App {
             gfx: None,
-            persist,
             host,
             registry,
             node_reg,
@@ -2708,9 +2705,6 @@ impl App {
 
     /// Write the whole workspace (dependencies + current canvas) back to wk.kdl.
     fn save_workspace(&self) {
-        if !self.persist {
-            return;
-        }
         let nodes = self
             .node_reg
             .lock()
@@ -2956,9 +2950,9 @@ impl ApplicationHandler for App {
     }
 }
 
-pub fn run(ws: Workspace, persist: bool) -> Result<(), String> {
+pub fn run(ws: Workspace) -> Result<(), String> {
     let mut event_loop = EventLoop::builder().build().map_err(|e| e.to_string())?;
-    let mut app = App::new(&ws, persist)?;
+    let mut app = App::new(&ws)?;
     loop {
         // Pump (and render, via `about_to_wait`) with the handler set the whole
         // time, blocking up to a frame for events — this paces ~60fps when idle

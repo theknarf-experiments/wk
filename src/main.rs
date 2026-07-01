@@ -18,7 +18,6 @@ mod workspace;
 use clap::CommandFactory;
 use clap::Parser;
 use clap::Subcommand;
-use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -56,11 +55,8 @@ enum Commands {
         plugin: String,
     },
 
-    /// Run the project's dependencies, or explicit `.wasm` paths if given
-    Run {
-        /// Plugin `.wasm` paths; if omitted, the project's dependencies are used
-        plugins: Vec<PathBuf>,
-    },
+    /// Open the workspace (`wk.kdl`) in this directory
+    Run,
 }
 
 fn main() -> Result<(), String> {
@@ -76,8 +72,8 @@ fn main() -> Result<(), String> {
         }
         Some(Commands::List) => workspace::list(),
         Some(Commands::Remove { plugin }) => workspace::remove(plugin.clone()),
-        // `wk run [paths...]` opens the workspace (or the given ad-hoc paths).
-        Some(Commands::Run { plugins }) => run(plugins),
+        // `wk run` opens the workspace in the current directory.
+        Some(Commands::Run) => run(),
         // Bare `wk` shows help.
         None => {
             Cli::command().print_help().map_err(|e| e.to_string())?;
@@ -86,20 +82,14 @@ fn main() -> Result<(), String> {
     }
 }
 
-/// Open the workspace (or an ad-hoc set of `.wasm` paths).
-fn run(plugins: &[PathBuf]) -> Result<(), String> {
-    // Workspace mode (no explicit paths) persists the canvas; ad-hoc mode doesn't.
-    let workspace_mode = plugins.is_empty();
-    let ws = if workspace_mode {
-        workspace::Workspace::load()?
-    } else {
-        workspace::Workspace::from_paths(plugins)
-    };
+/// Open the workspace (`wk.kdl`) in the current directory.
+fn run() -> Result<(), String> {
+    let ws = workspace::Workspace::load()?;
     // Pull any OCI-artifact dependencies into the local cache before launching.
     for dep in &ws.dependencies {
         if let Err(e) = dep.ensure() {
             eprintln!("warning: dependency {:?} unavailable: {e}", dep.name);
         }
     }
-    compositor::run(ws, workspace_mode)
+    compositor::run(ws)
 }
