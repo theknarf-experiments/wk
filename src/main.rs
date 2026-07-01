@@ -1,6 +1,8 @@
 // The backend lives in the `wk-server` crate; bring its workspace/file-format
 // helpers into scope under the familiar `workspace::` path used by the CLI.
-use client_local_ui::{HeadlessClient, WindowClient};
+use client_local_ui::WindowClient;
+use wk_protocol::Client;
+use wk_server::runtime::ServerRuntime;
 use wk_server::workspace;
 
 use clap::CommandFactory;
@@ -86,7 +88,9 @@ fn main() -> Result<(), String> {
     }
 }
 
-/// Open the given `.wk` workspace with a window, or headless.
+/// Open the given `.wk` workspace. The server runs independently on its own
+/// thread; a windowed run attaches the local UI client, a headless run attaches
+/// none and just keeps the server alive until Ctrl-C.
 fn run(file: &Path, headless: bool) -> Result<(), String> {
     let ws = workspace::Workspace::load(file)?;
     // Pull any OCI-artifact dependencies into the local cache before launching.
@@ -95,12 +99,17 @@ fn run(file: &Path, headless: bool) -> Result<(), String> {
             eprintln!("warning: dependency {:?} unavailable: {e}", dep.name);
         }
     }
-    // Build the authoritative half, then hand it to whichever client drives it.
-    let server = wk_server::server::Server::new(&ws, file.to_path_buf())?;
-    let client: Box<dyn wk_protocol::Client<wk_server::server::Server>> = if headless {
-        Box::new(HeadlessClient)
+    // Start the server as an independent service. Clients attach via handles.
+    let runtime = ServerRuntime::spawn(&ws, file.to_path_buf())?;
+    if headless {
+        // No client attached; run the server until Ctrl-C, then save + stop.
+        runtime.block_until_ctrl_c();
+        Ok(())
     } else {
-        Box::new(WindowClient)
-    };
-    client.run(server)
+        // Attach the local UI client on this (main) thread — winit needs it.
+        let result = Box::new(WindowClient).run(runtime.handle());
+        // Window closed (or errored): stop the server, which persists the state.
+        runtime.shutdown();
+        result
+    }
 }

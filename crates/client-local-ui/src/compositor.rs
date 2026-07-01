@@ -20,7 +20,8 @@ use crate::render2d::{Quad, Renderer, TextureId};
 use crate::text::Fonts;
 use wk_protocol::{Command, Wire};
 use wk_server::plugin::{Key, KeyEvent, PointerEvent, ResizeEvent, SharedNode, SharedSurface};
-use wk_server::server::{FileNode, Server, FILE_H, FILE_W};
+use wk_server::runtime::ServerHandle;
+use wk_server::server::{View, FILE_H, FILE_W};
 
 /// Target frame time (~60 fps).
 const FRAME: Duration = Duration::from_nanos(1_000_000_000 / 60);
@@ -524,13 +525,18 @@ fn draw_connection(
     }
 }
 
-/// The compositor's **window client**: the GUI front-end that drives a [`Server`]
-/// and renders its state. winit drives it via `ApplicationHandler`; the per-frame
-/// work happens in `frame`. Everything here is client-local view/input state —
-/// the authoritative document (nodes, wiring, positions) lives in `server`.
+/// The compositor's **window client**: the GUI front-end attached to a running
+/// server. winit drives it via `ApplicationHandler`; the per-frame work happens
+/// in `frame`. Everything here is client-local view/input state — the
+/// authoritative document lives in the server, reached only through `conn`.
 struct App {
-    /// The authoritative running workspace this client drives.
-    server: Server,
+    /// This client's connection to the independently-running server: send
+    /// [`Command`]s, read [`View`] snapshots.
+    conn: ServerHandle,
+    /// The latest snapshot, refreshed at the top of each `frame`.
+    view: View,
+    /// The camera last reported to the server, so we only resend on change.
+    sent_cam: (f32, f32, f32),
     gfx: Option<Gfx>,
 
     views: HashMap<u64, (TextureId, u32, u32)>,
@@ -583,13 +589,16 @@ struct App {
 }
 
 impl App {
-    /// Build the window client for an already-instantiated [`Server`], taking its
-    /// initial camera from the saved workspace view.
-    fn new(server: Server) -> Result<Self, String> {
-        let pan = [server.camera.0, server.camera.1];
-        let zoom = server.camera.2.clamp(ZOOM_MIN, ZOOM_MAX);
+    /// Build the window client for a connection to a running server, taking the
+    /// initial camera from the server's current view (the saved workspace view).
+    fn new(conn: ServerHandle) -> Result<Self, String> {
+        let view = conn.view();
+        let pan = [view.camera.0, view.camera.1];
+        let zoom = view.camera.2.clamp(ZOOM_MIN, ZOOM_MAX);
         Ok(App {
-            server,
+            conn,
+            view,
+            sent_cam: (f32::NAN, f32::NAN, f32::NAN),
             gfx: None,
             views: HashMap::new(),
             text_cache: TextCache::default(),
@@ -623,11 +632,7 @@ impl App {
     }
 
     fn rect_of(&self, id: u64) -> [f32; 4] {
-        win_rect(
-            self.cam,
-            self.server.win_pos[&id],
-            self.server.win_size[&id],
-        )
+        win_rect(self.cam, self.view.win_pos[&id], self.view.win_size[&id])
     }
 
     /// The topmost canvas node (app or file) under `mp`, if any.
@@ -672,12 +677,12 @@ impl App {
 
     /// A centred, cascading canvas position for a newly added file node.
     fn next_file_pos(&self) -> [f32; 2] {
-        self.view_center([FILE_W, FILE_H], self.server.file_nodes.len())
+        self.view_center([FILE_W, FILE_H], self.view.file_nodes.len())
     }
 
     /// The live app node with id `id`, if it is an app (not a file) node.
     fn app_node(&self, id: u64) -> Option<SharedNode> {
-        self.server.app_node(id)
+        self.view.app_node(id)
     }
 
     /// (Re)run an idle or exited node's guest. Commits any in-progress args edit
@@ -685,12 +690,12 @@ impl App {
     fn run_node(&mut self, id: u64) {
         if let Some((eid, text)) = self.editing_args.take() {
             if eid == id {
-                self.server.apply(Command::SetNodeArgs { id, args: text });
+                self.conn.send(Command::SetNodeArgs { id, args: text });
             } else {
                 self.editing_args = Some((eid, text));
             }
         }
-        self.server.apply(Command::RunNode { id });
+        self.conn.send(Command::RunNode { id });
     }
 
     /// The screen-space endpoints of a wire (both nodes must still be placed).
@@ -701,7 +706,7 @@ impl App {
             Wire::Serve(h, hp) => (h, hp),
             Wire::Net(app, net) => (app, net),
         };
-        if self.server.win_pos.contains_key(&a) && self.server.win_pos.contains_key(&b) {
+        if self.view.win_pos.contains_key(&a) && self.view.win_pos.contains_key(&b) {
             // Source's output port (right) to target's input port (left), so the
             // wire flows left-to-right and lines up with the visible dots.
             Some((port_out(self.rect_of(a)), port_in(self.rect_of(b))))
@@ -713,13 +718,13 @@ impl App {
     /// The connection wire nearest to `mp` within the pick radius, if any. Picks
     /// against the drawn curve, not the straight chord, so clicks land on the arc.
     fn wire_at(&self, mp: [f32; 2], zf: f32) -> Option<Wire> {
-        let s = &self.server;
+        let s = &self.view;
         let all = s
             .connections
             .iter()
             .map(|&(f, a)| Wire::File(f, a))
             .chain(s.midi_links.iter().map(|&(s, d)| Wire::Midi(s, d)))
-            .chain(s.serves.iter().map(|(&h, &(hp, _))| Wire::Serve(h, hp)))
+            .chain(s.serves.iter().map(|(&h, &hp)| Wire::Serve(h, hp)))
             .chain(s.net_links.iter().map(|&(a, n)| Wire::Net(a, n)));
         let mut best: Option<(f32, Wire)> = None;
         for w in all {
@@ -741,7 +746,7 @@ impl App {
     /// All command-palette entries (label + action) for the current state.
     fn palette_all(&self) -> Vec<(String, PaletteCmd)> {
         let mut v: Vec<(String, PaletteCmd)> = self
-            .server
+            .view
             .available
             .iter()
             .enumerate()
@@ -856,27 +861,27 @@ impl App {
         match cmd {
             PaletteCmd::Launch(dep) => {
                 let pos = self.view_center([360.0, 260.0], 0);
-                self.server.apply(Command::Launch { dep, pos });
+                self.conn.send(Command::Launch { dep, pos });
             }
             PaletteCmd::AddVirtualFile => {
                 let pos = self.next_file_pos();
-                self.server.apply(Command::AddVirtualFile { pos });
+                self.conn.send(Command::AddVirtualFile { pos });
             }
             PaletteCmd::AddHostFile => {
                 let pos = self.next_file_pos();
-                self.server.apply(Command::AddHostFile { pos });
+                self.conn.send(Command::AddHostFile { pos });
             }
             PaletteCmd::AddPort => {
-                let pos = self.view_center([FILE_W, FILE_H], self.server.host_ports.len());
-                self.server.apply(Command::AddPort { pos });
+                let pos = self.view_center([FILE_W, FILE_H], self.view.host_ports.len());
+                self.conn.send(Command::AddPort { pos });
             }
             PaletteCmd::AddNetwork => {
-                let pos = self.view_center([FILE_W, FILE_H], self.server.net_nodes.len());
-                self.server.apply(Command::AddNetwork { pos });
+                let pos = self.view_center([FILE_W, FILE_H], self.view.net_nodes.len());
+                self.conn.send(Command::AddNetwork { pos });
             }
             PaletteCmd::AddGateway => {
-                let pos = self.view_center([FILE_W, FILE_H], self.server.net_nodes.len());
-                self.server.apply(Command::AddGateway { pos });
+                let pos = self.view_center([FILE_W, FILE_H], self.view.net_nodes.len());
+                self.conn.send(Command::AddGateway { pos });
             }
             PaletteCmd::Zoom(z) => {
                 self.cam
@@ -901,7 +906,9 @@ impl App {
         let Some(mut gfx) = self.gfx.take() else {
             return;
         };
-        self.server.host.tick_epoch();
+        // Refresh our snapshot of the server for this frame. The server ticks
+        // and advances the runtime on its own thread; we only read and send.
+        self.view = self.conn.view();
 
         // Apply pan/zoom (zoom immediate, pan eased).
         if (self.zoom_factor - 1.0).abs() > f32::EPSILON {
@@ -917,6 +924,18 @@ impl App {
         self.pan_delta = [0.0, 0.0];
         self.zoom_factor = 1.0;
 
+        // Report our view to the server (only on change) so it persists the
+        // latest camera when it saves. Camera is a per-client concept; the
+        // server just remembers the last one it was told.
+        let cam = (self.cam.pan[0], self.cam.pan[1], self.cam.zoom);
+        if cam != self.sent_cam {
+            self.sent_cam = cam;
+            self.conn.send(Command::SetCamera {
+                pan: self.cam.pan,
+                zoom: self.cam.zoom,
+            });
+        }
+
         let mp = self.mouse;
         let lmb = self.lmb;
         let down_edge = lmb && !self.prev_lmb;
@@ -929,17 +948,13 @@ impl App {
         // Remember the viewport so newly added nodes land in the current view.
         self.viewport = fb;
 
-        // Server-side per-frame work: reconcile any network wiring that was
-        // pending on a node that has only just finished compiling.
-        self.server.tick();
-
         // ---- reconcile the stacking order with the server's live node set ----
         // Positions are assigned by the server when a node is created, so here the
         // client only tracks draw order: new nodes go on top, gone ones drop out.
-        let nodes: Vec<SharedNode> = self.server.node_reg.lock().unwrap().clone();
+        let nodes: Vec<SharedNode> = self.view.nodes.clone();
         let node_by_id: HashMap<u64, SharedNode> =
             nodes.iter().map(|i| (i.id, i.clone())).collect();
-        let ids = self.server.node_ids();
+        let ids = self.view.node_ids.clone();
         let live: std::collections::HashSet<u64> = ids.iter().copied().collect();
         for &id in &ids {
             if !self.z.contains(&id) {
@@ -948,7 +963,7 @@ impl App {
         }
         self.z.retain(|id| live.contains(id));
 
-        let surfaces: Vec<SharedSurface> = self.server.registry.lock().unwrap().clone();
+        let surfaces: Vec<SharedSurface> = self.view.surfaces.clone();
         let node_surface: HashMap<u64, SharedSurface> = surfaces
             .iter()
             .map(|s| (s.lock().unwrap().node_id, s.clone()))
@@ -993,17 +1008,17 @@ impl App {
                 DragMode::Move if lmb => {
                     let mc = self.cam.to_canvas(mp);
                     let pos = [mc[0] - d.grab[0], mc[1] - d.grab[1]];
-                    self.server.apply(Command::MoveNode { id: d.id, pos });
+                    self.conn.send(Command::MoveNode { id: d.id, pos });
                     self.drag = Some(d);
                 }
                 DragMode::Resize if lmb => {
-                    let p = self.server.win_pos[&d.id];
+                    let p = self.view.win_pos[&d.id];
                     let mc = self.cam.to_canvas(mp);
                     let size = [
                         (mc[0] - p[0]).max(100.0),
                         (mc[1] - p[1]).max(TITLE_H + 40.0),
                     ];
-                    self.server.apply(Command::ResizeNode { id: d.id, size });
+                    self.conn.send(Command::ResizeNode { id: d.id, size });
                     self.drag = Some(d);
                 }
                 DragMode::Connect if lmb => self.drag = Some(d),
@@ -1015,7 +1030,7 @@ impl App {
                         .or_else(|| self.topmost_under(mp))
                     {
                         if target != d.id {
-                            self.server.apply(Command::Connect { a: d.id, b: target });
+                            self.conn.send(Command::Connect { a: d.id, b: target });
                         }
                     }
                 }
@@ -1096,22 +1111,22 @@ impl App {
                     self.z.retain(|&x| x != id);
                     self.z.push(id);
                     let r = self.rect_of(id);
-                    let is_file = self.server.file_nodes.contains_key(&id);
-                    let is_port = self.server.host_ports.contains_key(&id);
-                    let is_net = self.server.net_nodes.contains(&id);
+                    let is_file = self.view.file_nodes.contains_key(&id);
+                    let is_port = self.view.host_ports.contains_key(&id);
+                    let is_net = self.view.net_nodes.contains(&id);
                     if is_file || is_port || is_net {
                         // Canvas widget nodes (file / HostPort / Network): close,
                         // adjust port (HostPort −/+ buttons), or move.
                         let (minus, plus) = port_step_btns(r, zf);
                         if contains(close_btn(r, zf), mp) {
-                            self.server.apply(Command::RemoveNode { id });
+                            self.conn.send(Command::RemoveNode { id });
                         } else if is_port && contains(plus, mp) {
-                            self.server.apply(Command::ChangePort { id, delta: 1 });
+                            self.conn.send(Command::ChangePort { id, delta: 1 });
                         } else if is_port && contains(minus, mp) {
-                            self.server.apply(Command::ChangePort { id, delta: -1 });
+                            self.conn.send(Command::ChangePort { id, delta: -1 });
                         } else {
                             let mc = self.cam.to_canvas(mp);
-                            let p = self.server.win_pos[&id];
+                            let p = self.view.win_pos[&id];
                             self.drag = Some(Drag {
                                 id,
                                 mode: DragMode::Move,
@@ -1139,7 +1154,7 @@ impl App {
                         } else if contains(title_bar(r, zf), mp) {
                             self.editing_args = None;
                             let mc = self.cam.to_canvas(mp);
-                            let p = self.server.win_pos[&id];
+                            let p = self.view.win_pos[&id];
                             self.drag = Some(Drag {
                                 id,
                                 mode: DragMode::Move,
@@ -1148,7 +1163,7 @@ impl App {
                         } else if idle && contains(args_bar(r, zf), mp) {
                             // Click the args bar of an idle node to edit them.
                             let cur = self
-                                .server
+                                .view
                                 .node_args
                                 .get(&id)
                                 .cloned()
@@ -1179,12 +1194,12 @@ impl App {
         if self.del_wire {
             self.del_wire = false;
             if let Some(w) = self.wire_sel.take() {
-                self.server.apply(Command::Disconnect { wire: w });
+                self.conn.send(Command::Disconnect { wire: w });
             }
         }
         // Drop a stale selection (its node was closed/removed).
         if let Some(w) = self.wire_sel {
-            if !self.server.wire_exists(w) {
+            if !self.view.wire_exists(w) {
                 self.wire_sel = None;
             }
         }
@@ -1194,19 +1209,11 @@ impl App {
         if self.drag.is_none() && !self.palette_open {
             if let Some(&id) = self.z.iter().rev().find(|&&id| {
                 contains(
-                    win_rect(
-                        self.cam,
-                        self.server.win_pos[&id],
-                        self.server.win_size[&id],
-                    ),
+                    win_rect(self.cam, self.view.win_pos[&id], self.view.win_size[&id]),
                     mp,
                 )
             }) {
-                let r = win_rect(
-                    self.cam,
-                    self.server.win_pos[&id],
-                    self.server.win_size[&id],
-                );
+                let r = win_rect(self.cam, self.view.win_pos[&id], self.view.win_size[&id]);
                 let ca = content_rect(r, zf);
                 if contains(ca, mp) {
                     if let Some(surf) = node_surface.get(&id) {
@@ -1259,7 +1266,7 @@ impl App {
         for shared in &surfaces {
             let (sid, w, h, pixels) = {
                 let mut s = shared.lock().unwrap();
-                if let Some(size) = self.server.win_size.get(&s.node_id) {
+                if let Some(size) = self.view.win_size.get(&s.node_id) {
                     let cw = (size[0] - 2.0 * BORDER).max(16.0) as u32;
                     let ch = (size[1] - TITLE_H - BORDER).max(16.0) as u32;
                     if cw != s.width || ch != s.height {
@@ -1311,21 +1318,21 @@ impl App {
         // Connection wires, under the nodes: curved arrows from a source's output
         // port to a target's input port. The selected wire is drawn thicker in the
         // highlight colour.
-        for &(file_id, app_id) in &self.server.connections {
+        for &(file_id, app_id) in &self.view.connections {
             if let Some((a, b)) = self.wire_endpoints(Wire::File(file_id, app_id)) {
                 let sel = self.wire_sel == Some(Wire::File(file_id, app_id));
                 let col = if sel { WIRE_SEL_COL } else { WIRE_COL };
                 draw_connection(&mut quads, white, a, b, sel, col, zf, full);
             }
         }
-        for &(src, dst) in &self.server.midi_links {
+        for &(src, dst) in &self.view.midi_links {
             if let Some((a, b)) = self.wire_endpoints(Wire::Midi(src, dst)) {
                 let sel = self.wire_sel == Some(Wire::Midi(src, dst));
                 let col = if sel { WIRE_SEL_COL } else { MIDI_WIRE_COL };
                 draw_connection(&mut quads, white, a, b, sel, col, zf, full);
             }
         }
-        for (&http, &(hostport, _)) in &self.server.serves {
+        for (&http, &hostport) in &self.view.serves {
             if let Some((a, b)) = self.wire_endpoints(Wire::Serve(http, hostport)) {
                 let sel = self.wire_sel == Some(Wire::Serve(http, hostport));
                 let col = if sel { WIRE_SEL_COL } else { HOSTPORT_WIRE };
@@ -1333,7 +1340,7 @@ impl App {
             }
         }
         // Network membership wires (app node — Network node).
-        for &(app, net) in &self.server.net_links {
+        for &(app, net) in &self.view.net_links {
             if let Some((a, b)) = self.wire_endpoints(Wire::Net(app, net)) {
                 let sel = self.wire_sel == Some(Wire::Net(app, net));
                 let col = if sel { WIRE_SEL_COL } else { NET_WIRE_COL };
@@ -1342,8 +1349,8 @@ impl App {
         }
 
         for &id in &self.z {
-            let pos = self.server.win_pos[&id];
-            let size = self.server.win_size[&id];
+            let pos = self.view.win_pos[&id];
+            let size = self.view.win_size[&id];
             let r = win_rect(self.cam, pos, size);
             if r[2] < 0.0 || r[0] > fb[0] || r[3] < 0.0 || r[1] > fb[1] {
                 continue;
@@ -1351,10 +1358,10 @@ impl App {
             let clip = intersect(r, full);
 
             // A file node renders as a small labelled box with a port.
-            if let Some(file) = self.server.file_nodes.get(&id) {
-                let name = file.name().to_string();
-                let bytes = file.size();
-                let host = matches!(file, FileNode::HostMapped(_));
+            if let Some(file) = self.view.file_nodes.get(&id) {
+                let name = file.name.clone();
+                let bytes = file.size;
+                let host = file.host_mapped;
                 let (border, bg, sub_col) = if host {
                     (HOSTFILE_BORDER, HOSTFILE_BG, [0.55, 0.68, 0.85, 1.0])
                 } else {
@@ -1425,8 +1432,8 @@ impl App {
 
             // A HostPort node: a labelled box exposing a wasi:http node to a
             // localhost port when wired.
-            if let Some(&port) = self.server.host_ports.get(&id) {
-                let serving = self.server.serves.values().any(|(hp, _)| *hp == id);
+            if let Some(&port) = self.view.host_ports.get(&id) {
+                let serving = self.view.serves.values().any(|&hp| hp == id);
                 quads.push(Quad::solid(white, r, HOSTPORT_BORDER, clip));
                 let body = [
                     r[0] + BORDER * zf,
@@ -1512,14 +1519,14 @@ impl App {
 
             // A Network node: an isolated virtual network; wired app nodes share
             // it. Shows how many members are on it.
-            if self.server.net_nodes.contains(&id) {
+            if self.view.net_nodes.contains(&id) {
                 let members = self
-                    .server
+                    .view
                     .net_links
                     .iter()
                     .filter(|&&(_, n)| n == id)
                     .count();
-                let is_gw = self.server.gateways.contains(&id);
+                let is_gw = self.view.gateways.contains(&id);
                 quads.push(Quad::solid(white, r, NET_BORDER, clip));
                 let body = [
                     r[0] + BORDER * zf,
@@ -1774,7 +1781,7 @@ impl App {
                     Some((eid, s)) if *eid == id => format!("args: {s}_"),
                     _ => format!(
                         "args: {}  (click to edit, > to run)",
-                        self.server
+                        self.view
                             .node_args
                             .get(&id)
                             .cloned()
@@ -2006,7 +2013,7 @@ impl App {
                 }
             }
             // Server: kill the node and drop all document state referencing it.
-            self.server.apply(Command::RemoveNode { id: *id });
+            self.conn.send(Command::RemoveNode { id: *id });
             // Client-local cleanup.
             self.terminals.remove(id);
             self.z.retain(|x| x != id);
@@ -2087,7 +2094,7 @@ impl ApplicationHandler for App {
                 // Scrolling over a HostPort node adjusts its port (scroll up =
                 // higher), rather than panning the canvas.
                 if let Some(id) = self.topmost_under(self.mouse) {
-                    if self.server.host_ports.contains_key(&id) {
+                    if self.view.host_ports.contains_key(&id) {
                         let step = if dy > 0.0 {
                             dy.ceil() as i32
                         } else if dy < 0.0 {
@@ -2095,7 +2102,7 @@ impl ApplicationHandler for App {
                         } else {
                             0
                         };
-                        self.server.apply(Command::ChangePort { id, delta: step });
+                        self.conn.send(Command::ChangePort { id, delta: step });
                         return;
                     }
                 }
@@ -2173,13 +2180,13 @@ impl ApplicationHandler for App {
 
 /// The single-player front-end: a wgpu window driven by winit. It owns all the
 /// view/input state ([`App`]) and forwards mutations to the server as
-/// [`Command`]s. See [`wk_protocol::Client`].
+/// [`Command`]s over its [`ServerHandle`]. See [`wk_protocol::Client`].
 pub struct WindowClient;
 
-impl wk_protocol::Client<Server> for WindowClient {
-    fn run(self: Box<Self>, server: Server) -> Result<(), String> {
+impl wk_protocol::Client<ServerHandle> for WindowClient {
+    fn run(self: Box<Self>, conn: ServerHandle) -> Result<(), String> {
         let mut event_loop = EventLoop::builder().build().map_err(|e| e.to_string())?;
-        let mut app = App::new(server)?;
+        let mut app = App::new(conn)?;
         loop {
             // Pump (and render, via `about_to_wait`) with the handler set the
             // whole time, blocking up to a frame for events — this paces ~60fps
@@ -2190,8 +2197,8 @@ impl wk_protocol::Client<Server> for WindowClient {
                 break;
             }
         }
-        let cam = (app.cam.pan[0], app.cam.pan[1], app.cam.zoom);
-        app.server.save(cam);
+        // The server owns persistence; the window closing just detaches this
+        // client. The camera was already reported via `Command::SetCamera`.
         Ok(())
     }
 }

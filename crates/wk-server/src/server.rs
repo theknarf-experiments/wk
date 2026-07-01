@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::plugin::{NodeRegistry, PluginHost, SharedNode, SurfaceRegistry};
+use crate::plugin::{NodeRegistry, PluginHost, SharedNode, SharedSurface, SurfaceRegistry};
 use crate::workspace::{Dependency, NetState, NodeState, PortState, Workspace};
 use wk_protocol::{Command, Wire};
 
@@ -68,6 +68,60 @@ impl FileNode {
         match self {
             FileNode::Virtual(f) => crate::vfs::mount_file(fs, &f.name, f.data.clone()),
             FileNode::HostMapped(f) => crate::vfs::mount_host_file(fs, &f.name, f.path.clone()),
+        }
+    }
+}
+
+/// Render-facing metadata about a file node (the client never touches the live
+/// [`FileNode`] behind the server lock).
+#[derive(Clone)]
+pub struct FileMeta {
+    pub name: String,
+    pub size: usize,
+    pub host_mapped: bool,
+}
+
+/// A read-only snapshot of the document a client renders from. Produced by
+/// [`Server::view`] under one lock; everything is owned/cloned except the live
+/// surface and node handles, which are `Arc`s a client uses to paint pixels and
+/// forward input (the in-process fast path; a networked client would receive
+/// pixel streams instead).
+pub struct View {
+    /// Every canvas node id (app/file/port/network), for draw-order reconcile.
+    pub node_ids: Vec<u64>,
+    pub win_pos: HashMap<u64, [f32; 2]>,
+    pub win_size: HashMap<u64, [f32; 2]>,
+    pub file_nodes: HashMap<u64, FileMeta>,
+    pub host_ports: HashMap<u64, u16>,
+    pub net_nodes: HashSet<u64>,
+    pub gateways: HashSet<u64>,
+    pub connections: Vec<(u64, u64)>,
+    pub midi_links: Vec<(u64, u64)>,
+    pub net_links: Vec<(u64, u64)>,
+    /// http node id -> HostPort node id.
+    pub serves: HashMap<u64, u64>,
+    /// Per-node launch args (argv after the program name).
+    pub node_args: HashMap<u64, Vec<String>>,
+    /// The workspace's launchable dependencies (for the command palette).
+    pub available: Vec<Dependency>,
+    pub camera: (f32, f32, f32),
+    pub nodes: Vec<SharedNode>,
+    pub surfaces: Vec<SharedSurface>,
+}
+
+impl View {
+    /// The live app node with id `id`, if it is an app (not a file) node.
+    pub fn app_node(&self, id: u64) -> Option<SharedNode> {
+        self.nodes.iter().find(|n| n.id == id).cloned()
+    }
+
+    /// Whether a given connection currently exists.
+    pub fn wire_exists(&self, w: Wire) -> bool {
+        match w {
+            Wire::File(f, a) => self.connections.contains(&(f, a)),
+            Wire::Midi(s, d) => self.midi_links.contains(&(s, d)),
+            Wire::Serve(h, hp) => self.serves.get(&h) == Some(&hp),
+            Wire::Net(app, net) => self.net_links.contains(&(app, net)),
         }
     }
 }
@@ -861,6 +915,53 @@ impl Server {
             Command::RunNode { id } => self.run_node(id),
             Command::SetNodeArgs { id, args } => self.set_node_args(id, &args),
             Command::ChangePort { id, delta } => self.change_port(id, delta),
+            Command::SetCamera { pan, zoom } => self.camera = (pan[0], pan[1], zoom),
+        }
+    }
+
+    /// A read-only snapshot of everything a client needs to render this frame.
+    /// Taken under a single lock by the runtime and handed to clients so none of
+    /// them holds a live lock on the server (and so the shape is exactly what a
+    /// networked client would receive over the wire).
+    pub fn view(&self) -> View {
+        let nodes: Vec<SharedNode> = self.node_reg.lock().unwrap().clone();
+        let surfaces: Vec<SharedSurface> = self.registry.lock().unwrap().clone();
+        let file_nodes = self
+            .file_nodes
+            .iter()
+            .map(|(&id, f)| {
+                (
+                    id,
+                    FileMeta {
+                        name: f.name().to_string(),
+                        size: f.size(),
+                        host_mapped: matches!(f, FileNode::HostMapped(_)),
+                    },
+                )
+            })
+            .collect();
+        let serves = self
+            .serves
+            .iter()
+            .map(|(&http, &(hostport, _))| (http, hostport))
+            .collect();
+        View {
+            node_ids: self.node_ids(),
+            win_pos: self.win_pos.clone(),
+            win_size: self.win_size.clone(),
+            file_nodes,
+            host_ports: self.host_ports.clone(),
+            net_nodes: self.net_nodes.clone(),
+            gateways: self.gateways.clone(),
+            connections: self.connections.clone(),
+            midi_links: self.midi_links.clone(),
+            net_links: self.net_links.clone(),
+            serves,
+            node_args: self.node_args.clone(),
+            available: self.available.clone(),
+            camera: self.camera,
+            nodes,
+            surfaces,
         }
     }
 }

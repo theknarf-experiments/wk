@@ -58,15 +58,25 @@ pub enum Command {
     SetNodeArgs { id: u64, args: String },
     /// Nudge a HostPort's localhost port by `delta`.
     ChangePort { id: u64, delta: i32 },
+    /// Report a client's current view so the server persists it on save. The
+    /// camera is a per-client concept; the server just remembers the latest it
+    /// was told (there is only one persisted view in the workspace file).
+    SetCamera { pan: [f32; 2], zoom: f32 },
 }
 
-/// A driver over a server `S`. `run` takes ownership of the loop and the server,
-/// returning when the client decides to exit (window closed, signal, etc.).
+/// A client attached to a running server through a connection `C`. `run` owns
+/// the client's own loop and returns when it decides to detach (window closed,
+/// signal, peer disconnect, etc.).
 ///
-/// The trait is generic over the concrete server type rather than naming it, so
-/// this crate stays free of the server's internals while a front-end can still
-/// reach whatever API that server exposes. Boxed-`self` so a caller can pick a
-/// client at runtime behind `dyn Client<S>`.
-pub trait Client<S> {
-    fn run(self: Box<Self>, server: S) -> Result<(), String>;
+/// The server runs independently of any client: `C` is a *connection handle*, not
+/// the server itself — a client sends [`Command`]s over it and reads state
+/// through it, but never owns or drives the server. The handle is cloneable, so
+/// any number of clients (a local UI, an MCP bridge, networked peers) can attach
+/// to the same server at once. "Headless" is simply no client attached.
+///
+/// The trait is generic over the handle type rather than naming it, so this crate
+/// stays free of the server's internals. Boxed-`self` so a caller can pick a
+/// client at runtime behind `dyn Client<C>`.
+pub trait Client<C> {
+    fn run(self: Box<Self>, conn: C) -> Result<(), String>;
 }
