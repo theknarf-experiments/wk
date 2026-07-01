@@ -1063,6 +1063,25 @@ impl App {
         self.active_ws = id;
     }
 
+    /// Move to the next (`forward`) or previous open tab, wrapping around.
+    fn cycle_tab(&mut self, forward: bool) {
+        let n = self.tabs.len();
+        if n < 2 {
+            return;
+        }
+        let i = self
+            .tabs
+            .iter()
+            .position(|&id| id == self.active_ws)
+            .unwrap_or(0);
+        let j = if forward {
+            (i + 1) % n
+        } else {
+            (i + n - 1) % n
+        };
+        self.active_ws = self.tabs[j];
+    }
+
     /// The tab rectangles (one per workspace, in order) and the trailing "+"
     /// button rect. Tabs are labelled by their 1-based position.
     fn tab_layout(&self, gfx: &Gfx) -> (Vec<(NodeId, [f32; 4])>, [f32; 4]) {
@@ -2595,6 +2614,15 @@ impl ApplicationHandler for App {
                         && code == KeyCode::KeyT
                     {
                         self.new_workspace();
+                        return;
+                    }
+                    // Cmd/Ctrl+Tab cycles tabs; add Shift to go backwards.
+                    if pressed
+                        && !event.repeat
+                        && (self.mods.super_key() || self.mods.control_key())
+                        && code == KeyCode::Tab
+                    {
+                        self.cycle_tab(!self.mods.shift_key());
                         return;
                     }
                     // While the palette is open it captures all keystrokes.
