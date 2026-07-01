@@ -28,6 +28,31 @@ fn rect_corners(r: [f32; 4]) -> [[f32; 2]; 4] {
     [[r[0], r[1]], [r[2], r[1]], [r[2], r[3]], [r[0], r[3]]]
 }
 
+/// Resolution of the disc texture (sampled with linear filtering, so it stays
+/// smooth scaled down to a small port).
+const DISC: u32 = 64;
+
+/// A white disc with a 1px antialiased edge in its alpha channel.
+fn disc_pixels() -> Vec<u8> {
+    let d = DISC as usize;
+    let c = (d as f32 - 1.0) * 0.5;
+    let mut px = vec![0u8; d * d * 4];
+    for y in 0..d {
+        for x in 0..d {
+            let (dx, dy) = (x as f32 - c, y as f32 - c);
+            let dist = (dx * dx + dy * dy).sqrt();
+            // Coverage: 1 inside, 0 outside, linear ramp over the last pixel.
+            let a = (c - dist + 0.5).clamp(0.0, 1.0);
+            let i = (y * d + x) * 4;
+            px[i] = 255;
+            px[i + 1] = 255;
+            px[i + 2] = 255;
+            px[i + 3] = (a * 255.0) as u8;
+        }
+    }
+    px
+}
+
 impl Quad {
     /// A textured rect.
     pub fn tex(
@@ -49,6 +74,24 @@ impl Quad {
     /// A solid-colored rect (uses the renderer's white texture).
     pub fn solid(white: TextureId, rect: [f32; 4], color: [f32; 4], clip: [f32; 4]) -> Self {
         Quad::tex(rect, [0.0, 0.0, 1.0, 1.0], color, white, clip)
+    }
+
+    /// A filled circle of `radius` (screen px) centred at `center`, using the
+    /// renderer's antialiased disc texture.
+    pub fn disc(
+        circle: TextureId,
+        center: [f32; 2],
+        radius: f32,
+        color: [f32; 4],
+        clip: [f32; 4],
+    ) -> Self {
+        let r = [
+            center[0] - radius,
+            center[1] - radius,
+            center[0] + radius,
+            center[1] + radius,
+        ];
+        Quad::tex(r, [0.0, 0.0, 1.0, 1.0], color, circle, clip)
     }
 
     /// A solid line segment of the given thickness, in screen pixels.
@@ -103,6 +146,8 @@ pub struct Renderer {
     vertex_capacity: usize,
     /// 1x1 white texture for solid fills.
     pub white: TextureId,
+    /// An antialiased white disc, for round dots (e.g. connection ports).
+    pub circle: TextureId,
 }
 
 impl Renderer {
@@ -210,8 +255,10 @@ impl Renderer {
             vertex_buffer: None,
             vertex_capacity: 0,
             white: TextureId(0),
+            circle: TextureId(0),
         };
         renderer.white = renderer.create_texture(device, queue, 1, 1, &[255, 255, 255, 255]);
+        renderer.circle = renderer.create_texture(device, queue, DISC, DISC, &disc_pixels());
         renderer
     }
 

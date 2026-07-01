@@ -2028,12 +2028,7 @@ impl App {
                 );
                 let pp = port_pos(r);
                 let pr = PORT_R * zf;
-                quads.push(Quad::solid(
-                    white,
-                    [pp[0] - pr, pp[1] - pr, pp[0] + pr, pp[1] + pr],
-                    PORT_COL,
-                    full,
-                ));
+                quads.push(Quad::disc(gfx.renderer.circle, pp, pr, PORT_COL, full));
                 continue;
             }
 
@@ -2122,12 +2117,7 @@ impl App {
                 }
                 let pp = port_pos(r);
                 let pr = PORT_R * zf;
-                quads.push(Quad::solid(
-                    white,
-                    [pp[0] - pr, pp[1] - pr, pp[0] + pr, pp[1] + pr],
-                    PORT_COL,
-                    full,
-                ));
+                quads.push(Quad::disc(gfx.renderer.circle, pp, pr, PORT_COL, full));
                 continue;
             }
 
@@ -2194,12 +2184,7 @@ impl App {
                 );
                 let pp = port_pos(r);
                 let pr = PORT_R * zf;
-                quads.push(Quad::solid(
-                    white,
-                    [pp[0] - pr, pp[1] - pr, pp[0] + pr, pp[1] + pr],
-                    PORT_COL,
-                    full,
-                ));
+                quads.push(Quad::disc(gfx.renderer.circle, pp, pr, PORT_COL, full));
                 continue;
             }
 
@@ -2424,12 +2409,7 @@ impl App {
             // Connection port on the right edge.
             let pp = port_pos(r);
             let pr = PORT_R * zf;
-            quads.push(Quad::solid(
-                white,
-                [pp[0] - pr, pp[1] - pr, pp[0] + pr, pp[1] + pr],
-                PORT_COL,
-                full,
-            ));
+            quads.push(Quad::disc(gfx.renderer.circle, pp, pr, PORT_COL, full));
         }
 
         // The wire being dragged out of a port toward the cursor.
