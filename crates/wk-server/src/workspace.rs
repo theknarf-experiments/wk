@@ -380,16 +380,9 @@ fn uint(v: &KdlValue) -> Option<u64> {
     v.as_integer().map(|i| i as u64)
 }
 
-/// Parse a node id: the Crockford base32 string form, or — for backward
-/// compatibility with pre-UUID workspaces — a bare integer, mapped 1:1 so old
-/// ids (and the connections that reference them) still load, then re-save as
-/// base32.
+/// Parse a node id from its Crockford base32 string form.
 fn node_id(v: &KdlValue) -> Option<NodeId> {
-    if let Some(s) = v.as_string() {
-        s.parse().ok()
-    } else {
-        v.as_integer().map(|i| NodeId::from_u128(i as u128))
-    }
+    v.as_string()?.parse().ok()
 }
 
 /// Parse a `node`/`virtualfile`/`hostfile` entry: `<kind> "<name>" <id> { ... }`.

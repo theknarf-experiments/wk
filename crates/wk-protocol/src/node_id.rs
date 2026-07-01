@@ -35,13 +35,6 @@ impl NodeId {
     pub fn as_u128(self) -> u128 {
         self.0.as_u128()
     }
-
-    /// Build an id from a raw 128-bit value. Used to migrate legacy numeric ids
-    /// from pre-UUID workspace files 1:1 (so their connection references stay
-    /// consistent); new ids come from [`NodeId::new`].
-    pub fn from_u128(n: u128) -> Self {
-        NodeId(uuid::Uuid::from_u128(n))
-    }
 }
 
 impl Default for NodeId {
