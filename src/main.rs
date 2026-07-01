@@ -89,9 +89,9 @@ fn main() -> Result<(), String> {
 /// thread; a windowed run attaches the local UI client, a headless run attaches
 /// none and just keeps the server alive until Ctrl-C.
 fn run(file: &Path, headless: bool) -> Result<(), String> {
-    let ws = workspace::Workspace::load(file)?;
+    let doc = workspace::Document::load(file)?;
     // Pull any OCI-artifact dependencies into the local cache before launching.
-    for dep in &ws.dependencies {
+    for dep in &doc.dependencies {
         if let Err(e) = dep.ensure() {
             eprintln!("warning: dependency {:?} unavailable: {e}", dep.name);
         }
@@ -101,7 +101,7 @@ fn run(file: &Path, headless: bool) -> Result<(), String> {
     //  2. the server gets a copy of the public key and only verifies;
     //  3. the client is handed a minted token and bears it with every action.
     let tokens = TokenService::new();
-    let runtime = ServerRuntime::spawn(&ws, file.to_path_buf(), tokens.public_key())?;
+    let runtime = ServerRuntime::spawn(&doc, file.to_path_buf(), tokens.public_key())?;
     if headless {
         // No client attached; run the server until Ctrl-C, then save + stop.
         runtime.block_until_ctrl_c();

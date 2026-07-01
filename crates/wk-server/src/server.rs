@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::plugin::{NodeRegistry, PluginHost, SharedNode, SharedSurface, SurfaceRegistry};
-use crate::workspace::{Dependency, NetState, NodeState, PortState, Workspace};
+use crate::workspace::{Dependency, Document, NetState, NodeState, PortState, Workspace};
 use wk_protocol::{Command, NodeId, Wire};
 
 /// Default canvas size of a file / port / network node, in canvas pixels.
@@ -98,16 +98,102 @@ pub struct View {
     pub serves: HashMap<NodeId, NodeId>,
     /// Per-node launch args (argv after the program name).
     pub node_args: HashMap<NodeId, Vec<String>>,
-    /// The workspace's launchable dependencies (for the command palette).
+    /// The launchable dependencies (for the command palette).
     pub available: Vec<Dependency>,
     pub nodes: Vec<SharedNode>,
     pub surfaces: Vec<SharedSurface>,
+    /// Which workspace (tab) each node belongs to.
+    pub node_ws: HashMap<NodeId, NodeId>,
+    /// The workspaces (tabs), in order.
+    pub workspaces: Vec<NodeId>,
 }
 
 impl View {
     /// The live app node with id `id`, if it is an app (not a file) node.
     pub fn app_node(&self, id: NodeId) -> Option<SharedNode> {
         self.nodes.iter().find(|n| n.id == id).cloned()
+    }
+
+    /// Narrow this multi-workspace view down to a single tab, keeping only the
+    /// nodes (and wiring between them) that belong to workspace `ws`. Every peer
+    /// runs all workspaces; a client renders just the one it is looking at.
+    pub fn for_workspace(&self, ws: NodeId) -> View {
+        let mine = |id: &NodeId| self.node_ws.get(id).copied() == Some(ws);
+        let keep = |m: &HashMap<NodeId, [f32; 2]>| -> HashMap<NodeId, [f32; 2]> {
+            m.iter()
+                .filter(|(id, _)| mine(id))
+                .map(|(&k, &v)| (k, v))
+                .collect()
+        };
+        View {
+            node_ids: self
+                .node_ids
+                .iter()
+                .copied()
+                .filter(|id| mine(id))
+                .collect(),
+            win_pos: keep(&self.win_pos),
+            win_size: keep(&self.win_size),
+            file_nodes: self
+                .file_nodes
+                .iter()
+                .filter(|(id, _)| mine(id))
+                .map(|(&k, v)| (k, v.clone()))
+                .collect(),
+            host_ports: self
+                .host_ports
+                .iter()
+                .filter(|(id, _)| mine(id))
+                .map(|(&k, &v)| (k, v))
+                .collect(),
+            net_nodes: self
+                .net_nodes
+                .iter()
+                .copied()
+                .filter(|id| mine(id))
+                .collect(),
+            gateways: self
+                .gateways
+                .iter()
+                .copied()
+                .filter(|id| mine(id))
+                .collect(),
+            connections: self
+                .connections
+                .iter()
+                .copied()
+                .filter(|(f, _)| mine(f))
+                .collect(),
+            midi_links: self
+                .midi_links
+                .iter()
+                .copied()
+                .filter(|(s, _)| mine(s))
+                .collect(),
+            net_links: self
+                .net_links
+                .iter()
+                .copied()
+                .filter(|(a, _)| mine(a))
+                .collect(),
+            serves: self
+                .serves
+                .iter()
+                .filter(|(http, _)| mine(http))
+                .map(|(&k, &v)| (k, v))
+                .collect(),
+            node_args: self
+                .node_args
+                .iter()
+                .filter(|(id, _)| mine(id))
+                .map(|(&k, v)| (k, v.clone()))
+                .collect(),
+            available: self.available.clone(),
+            nodes: self.nodes.iter().filter(|n| mine(&n.id)).cloned().collect(),
+            surfaces: self.surfaces.clone(),
+            node_ws: self.node_ws.clone(),
+            workspaces: self.workspaces.clone(),
+        }
     }
 
     /// Whether a given connection currently exists.
@@ -163,21 +249,27 @@ pub struct Server {
     /// Network membership wires, as (app node id, Network node id).
     pub net_links: Vec<(NodeId, NodeId)>,
 
+    /// Which workspace (tab) each node belongs to. Every workspace runs at once;
+    /// the client filters this down to the tab it happens to be viewing.
+    pub node_ws: HashMap<NodeId, NodeId>,
+    /// The workspaces (tabs) in this document, in order — including empty ones.
+    pub workspaces: Vec<NodeId>,
+
     next_port: u16,
     file_seq: u32,
     host_seq: u32,
 }
 
 impl Server {
-    /// Create a server and instantiate the given workspace (spawn its nodes and
-    /// re-apply its wiring). `path` is the `.wk` file to save back to.
-    pub fn new(ws: &Workspace, path: PathBuf) -> Result<Self, String> {
+    /// Create a server and instantiate every workspace in the document (all tabs
+    /// run at once). `path` is the `.wk` file to save back to.
+    pub fn new(doc: &Document, path: PathBuf) -> Result<Self, String> {
         let host = PluginHost::new().map_err(|e| format!("{e:#}"))?;
         let mut server = Server {
             host,
             registry: Arc::new(Mutex::new(Vec::new())),
             node_reg: Arc::new(Mutex::new(Vec::new())),
-            available: ws.dependencies.clone(),
+            available: doc.dependencies.clone(),
             workspace_path: path,
             win_pos: HashMap::new(),
             win_size: HashMap::new(),
@@ -190,15 +282,19 @@ impl Server {
             net_nodes: HashSet::new(),
             gateways: HashSet::new(),
             net_links: Vec::new(),
+            node_ws: HashMap::new(),
+            workspaces: doc.workspaces.iter().map(|w| w.id).collect(),
             next_port: 8080,
             file_seq: 0,
             host_seq: 0,
         };
-        server.instantiate(ws);
+        for ws in &doc.workspaces {
+            server.instantiate(ws);
+        }
         Ok(server)
     }
 
-    /// Spawn the workspace's nodes and re-apply its wiring (used at load). Node
+    /// Spawn one workspace's nodes and re-apply its wiring (used at load). Node
     /// positions are set here so every node has a place the moment it exists.
     fn instantiate(&mut self, saved: &Workspace) {
         // App nodes: resolve the dependency by name, spawn with the saved id.
@@ -319,6 +415,21 @@ impl Server {
                 self.toggle_net(app_id, net_id);
             }
         }
+
+        // Tag every node that got placed with the workspace it belongs to.
+        let ids = saved
+            .nodes
+            .iter()
+            .map(|n| n.id)
+            .chain(saved.virtual_files.iter().map(|n| n.id))
+            .chain(saved.host_files.iter().map(|n| n.id))
+            .chain(saved.host_ports.iter().map(|p| p.id))
+            .chain(saved.nets.iter().map(|n| n.id));
+        for id in ids {
+            if self.win_pos.contains_key(&id) {
+                self.node_ws.insert(id, saved.id);
+            }
+        }
     }
 
     /// Record a node's canvas geometry.
@@ -351,8 +462,8 @@ impl Server {
             .cloned()
     }
 
-    /// Launch a dependency as a new app node at `pos`.
-    fn launch(&mut self, dep: &Dependency, pos: [f32; 2]) {
+    /// Launch a dependency as a new app node at `pos` in workspace `ws`.
+    fn launch(&mut self, dep: &Dependency, pos: [f32; 2], ws: NodeId) {
         let id = self.alloc_id();
         if let Err(e) = self.host.spawn(
             &dep.local_path(),
@@ -368,13 +479,15 @@ impl Server {
         }
         self.place(id, pos, [360.0, 260.0]);
         self.node_args.insert(id, dep.args.clone());
+        self.node_ws.insert(id, ws);
     }
 
-    /// Create a new, empty in-memory VirtualFile node at `pos`.
-    fn add_virtual_file(&mut self, pos: [f32; 2]) {
+    /// Create a new, empty in-memory VirtualFile node at `pos` in workspace `ws`.
+    fn add_virtual_file(&mut self, pos: [f32; 2], ws: NodeId) {
         self.file_seq += 1;
         let id = self.alloc_id();
         self.place(id, pos, [FILE_W, FILE_H]);
+        self.node_ws.insert(id, ws);
         self.file_nodes.insert(
             id,
             FileNode::Virtual(VirtualFile {
@@ -385,7 +498,7 @@ impl Server {
     }
 
     /// Create a HostMappedFile node backed by a fresh host file (`host<n>`).
-    fn add_host_mapped_file(&mut self, pos: [f32; 2]) {
+    fn add_host_mapped_file(&mut self, pos: [f32; 2], ws: NodeId) {
         self.host_seq += 1;
         let id = self.alloc_id();
         let name = format!("host{}", self.host_seq);
@@ -399,31 +512,41 @@ impl Server {
             eprintln!("failed to create host file {}: {e}", path.display());
         }
         self.place(id, pos, [FILE_W, FILE_H]);
+        self.node_ws.insert(id, ws);
         self.file_nodes
             .insert(id, FileNode::HostMapped(HostMappedFile { name, path }));
     }
 
     /// Create a HostPort node at `pos` (auto-assigned localhost port).
-    fn add_host_port(&mut self, pos: [f32; 2]) {
+    fn add_host_port(&mut self, pos: [f32; 2], ws: NodeId) {
         let id = self.alloc_id();
         let port = self.next_port;
         self.next_port = self.next_port.wrapping_add(1).max(8080);
         self.place(id, pos, [FILE_W, FILE_H]);
+        self.node_ws.insert(id, ws);
         self.host_ports.insert(id, port);
     }
 
     /// Create a Network node at `pos`; returns its id.
-    fn add_net_node(&mut self, pos: [f32; 2]) -> NodeId {
+    fn add_net_node(&mut self, pos: [f32; 2], ws: NodeId) -> NodeId {
         let id = self.alloc_id();
         self.place(id, pos, [FILE_W, FILE_H]);
+        self.node_ws.insert(id, ws);
         self.net_nodes.insert(id);
         id
     }
 
     /// Create a Gateway node at `pos` (a Network whose members get host access).
-    fn add_gateway_node(&mut self, pos: [f32; 2]) {
-        let id = self.add_net_node(pos);
+    fn add_gateway_node(&mut self, pos: [f32; 2], ws: NodeId) {
+        let id = self.add_net_node(pos, ws);
         self.gateways.insert(id);
+    }
+
+    /// Register a new (empty) workspace tab with a client-minted id.
+    fn add_workspace(&mut self, id: NodeId) {
+        if !self.workspaces.contains(&id) {
+            self.workspaces.push(id);
+        }
     }
 
     /// (Re)run an idle or exited node's guest with its current args.
@@ -672,6 +795,7 @@ impl Server {
     fn forget(&mut self, id: NodeId) {
         self.win_pos.remove(&id);
         self.win_size.remove(&id);
+        self.node_ws.remove(&id);
     }
 
     /// Whether the given wire still connects two live nodes.
@@ -755,96 +879,120 @@ impl Server {
         self.forget(id);
     }
 
-    /// Snapshot the document into a [`Workspace`] and write it back to disk.
+    /// Snapshot every workspace into a [`Document`] and write it back to disk.
     pub fn save(&self) {
-        let nodes = self
-            .node_reg
-            .lock()
-            .unwrap()
+        let node_list = self.node_reg.lock().unwrap().clone();
+        let workspaces = self
+            .workspaces
             .iter()
-            .filter_map(|node| {
-                Some(NodeState {
-                    name: node.name.clone(),
-                    id: node.id,
-                    pos: *self.win_pos.get(&node.id)?,
-                    size: *self.win_size.get(&node.id)?,
-                    options: node.options.lock().unwrap().clone(),
-                    args: self.node_args.get(&node.id).cloned().unwrap_or_default(),
-                })
+            .map(|&ws_id| {
+                let mine = |id: &NodeId| self.node_ws.get(id).copied() == Some(ws_id);
+                Workspace {
+                    id: ws_id,
+                    nodes: node_list
+                        .iter()
+                        .filter(|n| mine(&n.id))
+                        .filter_map(|node| {
+                            Some(NodeState {
+                                name: node.name.clone(),
+                                id: node.id,
+                                pos: *self.win_pos.get(&node.id)?,
+                                size: *self.win_size.get(&node.id)?,
+                                options: node.options.lock().unwrap().clone(),
+                                args: self.node_args.get(&node.id).cloned().unwrap_or_default(),
+                            })
+                        })
+                        .collect(),
+                    virtual_files: self
+                        .file_nodes
+                        .iter()
+                        .filter(|(id, _)| mine(id))
+                        .filter_map(|(&id, f)| match f {
+                            FileNode::Virtual(v) => Some(NodeState {
+                                name: v.name.clone(),
+                                id,
+                                pos: *self.win_pos.get(&id)?,
+                                size: *self.win_size.get(&id)?,
+                                options: Vec::new(),
+                                args: Vec::new(),
+                            }),
+                            FileNode::HostMapped(_) => None,
+                        })
+                        .collect(),
+                    host_files: self
+                        .file_nodes
+                        .iter()
+                        .filter(|(id, _)| mine(id))
+                        .filter_map(|(&id, f)| match f {
+                            FileNode::HostMapped(h) => Some(NodeState {
+                                name: h.path.to_string_lossy().into_owned(),
+                                id,
+                                pos: *self.win_pos.get(&id)?,
+                                size: *self.win_size.get(&id)?,
+                                options: Vec::new(),
+                                args: Vec::new(),
+                            }),
+                            FileNode::Virtual(_) => None,
+                        })
+                        .collect(),
+                    host_ports: self
+                        .host_ports
+                        .iter()
+                        .filter(|(id, _)| mine(id))
+                        .filter_map(|(&id, &port)| {
+                            Some(PortState {
+                                id,
+                                port,
+                                pos: *self.win_pos.get(&id)?,
+                                size: *self.win_size.get(&id)?,
+                            })
+                        })
+                        .collect(),
+                    connections: self
+                        .connections
+                        .iter()
+                        .filter(|(f, _)| mine(f))
+                        .copied()
+                        .collect(),
+                    midi: self
+                        .midi_links
+                        .iter()
+                        .filter(|(s, _)| mine(s))
+                        .copied()
+                        .collect(),
+                    serves: self
+                        .serves
+                        .iter()
+                        .filter(|(http, _)| mine(http))
+                        .map(|(&http, &(hostport, _))| (http, hostport))
+                        .collect(),
+                    nets: self
+                        .net_nodes
+                        .iter()
+                        .filter(|id| mine(id))
+                        .filter_map(|&id| {
+                            Some(NetState {
+                                id,
+                                gateway: self.gateways.contains(&id),
+                                pos: *self.win_pos.get(&id)?,
+                                size: *self.win_size.get(&id)?,
+                            })
+                        })
+                        .collect(),
+                    net_links: self
+                        .net_links
+                        .iter()
+                        .filter(|(a, _)| mine(a))
+                        .copied()
+                        .collect(),
+                }
             })
             .collect();
-        let virtual_files = self
-            .file_nodes
-            .iter()
-            .filter_map(|(&id, f)| match f {
-                FileNode::Virtual(v) => Some(NodeState {
-                    name: v.name.clone(),
-                    id,
-                    pos: *self.win_pos.get(&id)?,
-                    size: *self.win_size.get(&id)?,
-                    options: Vec::new(),
-                    args: Vec::new(),
-                }),
-                FileNode::HostMapped(_) => None,
-            })
-            .collect();
-        let host_files = self
-            .file_nodes
-            .iter()
-            .filter_map(|(&id, f)| match f {
-                FileNode::HostMapped(h) => Some(NodeState {
-                    name: h.path.to_string_lossy().into_owned(),
-                    id,
-                    pos: *self.win_pos.get(&id)?,
-                    size: *self.win_size.get(&id)?,
-                    options: Vec::new(),
-                    args: Vec::new(),
-                }),
-                FileNode::Virtual(_) => None,
-            })
-            .collect();
-        let host_ports = self
-            .host_ports
-            .iter()
-            .filter_map(|(&id, &port)| {
-                Some(PortState {
-                    id,
-                    port,
-                    pos: *self.win_pos.get(&id)?,
-                    size: *self.win_size.get(&id)?,
-                })
-            })
-            .collect();
-        let serves = self
-            .serves
-            .iter()
-            .map(|(&http, &(hostport, _))| (http, hostport))
-            .collect();
-        let nets = self
-            .net_nodes
-            .iter()
-            .filter_map(|&id| {
-                Some(NetState {
-                    id,
-                    gateway: self.gateways.contains(&id),
-                    pos: *self.win_pos.get(&id)?,
-                    size: *self.win_size.get(&id)?,
-                })
-            })
-            .collect();
-        let ws = Workspace {
+        let doc = Document {
             dependencies: self.available.clone(),
-            nodes,
-            virtual_files,
-            host_files,
-            host_ports,
-            connections: self.connections.clone(),
-            midi: self.midi_links.clone(),
-            serves,
-            nets,
-            net_links: self.net_links.clone(),
+            workspaces,
         };
-        if let Err(e) = ws.save(&self.workspace_path) {
+        if let Err(e) = doc.save(&self.workspace_path) {
             eprintln!("failed to save workspace: {e}");
         }
     }
@@ -853,18 +1001,19 @@ impl Server {
     /// same one a networked client's messages would flow through.
     pub fn apply(&mut self, cmd: Command) {
         match cmd {
-            Command::Launch { dep, pos } => {
+            Command::Launch { dep, pos, ws } => {
                 if let Some(dep) = self.available.get(dep).cloned() {
-                    self.launch(&dep, pos);
+                    self.launch(&dep, pos, ws);
                 }
             }
-            Command::AddVirtualFile { pos } => self.add_virtual_file(pos),
-            Command::AddHostFile { pos } => self.add_host_mapped_file(pos),
-            Command::AddPort { pos } => self.add_host_port(pos),
-            Command::AddNetwork { pos } => {
-                self.add_net_node(pos);
+            Command::AddVirtualFile { pos, ws } => self.add_virtual_file(pos, ws),
+            Command::AddHostFile { pos, ws } => self.add_host_mapped_file(pos, ws),
+            Command::AddPort { pos, ws } => self.add_host_port(pos, ws),
+            Command::AddNetwork { pos, ws } => {
+                self.add_net_node(pos, ws);
             }
-            Command::AddGateway { pos } => self.add_gateway_node(pos),
+            Command::AddGateway { pos, ws } => self.add_gateway_node(pos, ws),
+            Command::AddWorkspace { id } => self.add_workspace(id),
             Command::RemoveNode { id } => {
                 if self.file_nodes.contains_key(&id) {
                     self.remove_file_node(id);
@@ -928,6 +1077,8 @@ impl Server {
             available: self.available.clone(),
             nodes,
             surfaces,
+            node_ws: self.node_ws.clone(),
+            workspaces: self.workspaces.clone(),
         }
     }
 }

@@ -20,7 +20,7 @@ use wk_protocol::Command;
 
 use crate::auth;
 use crate::server::{Server, View};
-use crate::workspace::Workspace;
+use crate::workspace::Document;
 
 /// How often the server loop drains commands and ticks (~60 Hz).
 const STEP: Duration = Duration::from_millis(16);
@@ -75,15 +75,15 @@ pub struct ServerRuntime {
 }
 
 impl ServerRuntime {
-    /// Instantiate the workspace and start the server loop on its own thread.
+    /// Instantiate the document and start the server loop on its own thread.
     /// `public_key` is a copy of the token service's key, used to verify the
     /// token presented with each command.
     pub fn spawn(
-        ws: &Workspace,
+        doc: &Document,
         path: std::path::PathBuf,
         public_key: PublicKey,
     ) -> Result<Self, String> {
-        let server = Server::new(ws, path)?;
+        let server = Server::new(doc, path)?;
         let server = Arc::new(Mutex::new(server));
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));

@@ -36,6 +36,8 @@ const TITLE_H: f32 = 22.0;
 const BORDER: f32 = 1.0;
 /// Top menu bar height, in screen pixels (not zoomed).
 const MENU_H: f32 = 26.0;
+/// Height of the top workspace-tab bar (shown only with more than one tab).
+const TAB_H: f32 = 26.0;
 const PAD: f32 = 6.0;
 
 const CLEAR: wgpu::Color = wgpu::Color {
@@ -394,6 +396,7 @@ enum PaletteCmd {
     AddPort,
     AddNetwork,
     AddGateway,
+    NewWorkspace,
     /// Jump the camera to this zoom factor.
     Zoom(f32),
     Quit,
@@ -554,8 +557,13 @@ struct App {
     /// This client's connection to the independently-running server: send
     /// [`Command`]s, read [`View`] snapshots.
     conn: ServerHandle,
-    /// The latest snapshot, refreshed at the top of each `frame`.
+    /// The latest snapshot, filtered to the active tab, refreshed each `frame`.
     view: View,
+    /// The workspace (tab) this client is currently viewing. Purely client-side:
+    /// all workspaces run on the server; switching tabs never touches it.
+    active_ws: NodeId,
+    /// All workspace ids (tabs), in order — for the tab bar.
+    tabs: Vec<NodeId>,
     gfx: Option<Gfx>,
     /// Nodes currently popped out into their own OS window, keyed by node id.
     detached: HashMap<NodeId, Detached>,
@@ -613,10 +621,15 @@ struct App {
 
 impl App {
     fn new(conn: ServerHandle) -> Result<Self, String> {
-        let view = conn.view();
+        let full = conn.view();
+        let active_ws = full.workspaces.first().copied().unwrap_or_else(NodeId::new);
+        let tabs = full.workspaces.clone();
+        let view = full.for_workspace(active_ws);
         Ok(App {
             conn,
             view,
+            active_ws,
+            tabs,
             gfx: None,
             detached: HashMap::new(),
             pending_detach: Vec::new(),
@@ -904,6 +917,7 @@ impl App {
         v.push(("Add Port".into(), PaletteCmd::AddPort));
         v.push(("Add Network".into(), PaletteCmd::AddNetwork));
         v.push(("Add Gateway".into(), PaletteCmd::AddGateway));
+        v.push(("New Workspace  (Cmd+T)".into(), PaletteCmd::NewWorkspace));
         for &z in &ZOOM_PRESETS {
             v.push((format!("Zoom {:.0}%", z * 100.0), PaletteCmd::Zoom(z)));
         }
@@ -1005,31 +1019,33 @@ impl App {
 
     /// Execute a palette command (from `frame`, where the screen size is known).
     fn run_palette(&mut self, cmd: PaletteCmd, fb: [f32; 2]) {
+        let ws = self.active_ws;
         match cmd {
             PaletteCmd::Launch(dep) => {
                 let pos = self.view_center([360.0, 260.0], 0);
-                self.conn.send(Command::Launch { dep, pos });
+                self.conn.send(Command::Launch { dep, pos, ws });
             }
             PaletteCmd::AddVirtualFile => {
                 let pos = self.next_file_pos();
-                self.conn.send(Command::AddVirtualFile { pos });
+                self.conn.send(Command::AddVirtualFile { pos, ws });
             }
             PaletteCmd::AddHostFile => {
                 let pos = self.next_file_pos();
-                self.conn.send(Command::AddHostFile { pos });
+                self.conn.send(Command::AddHostFile { pos, ws });
             }
             PaletteCmd::AddPort => {
                 let pos = self.view_center([FILE_W, FILE_H], self.view.host_ports.len());
-                self.conn.send(Command::AddPort { pos });
+                self.conn.send(Command::AddPort { pos, ws });
             }
             PaletteCmd::AddNetwork => {
                 let pos = self.view_center([FILE_W, FILE_H], self.view.net_nodes.len());
-                self.conn.send(Command::AddNetwork { pos });
+                self.conn.send(Command::AddNetwork { pos, ws });
             }
             PaletteCmd::AddGateway => {
                 let pos = self.view_center([FILE_W, FILE_H], self.view.net_nodes.len());
-                self.conn.send(Command::AddGateway { pos });
+                self.conn.send(Command::AddGateway { pos, ws });
             }
+            PaletteCmd::NewWorkspace => self.new_workspace(),
             PaletteCmd::Zoom(z) => {
                 self.cam
                     .zoom_at(z / self.cam.zoom, [fb[0] * 0.5, fb[1] * 0.5]);
@@ -1037,6 +1053,28 @@ impl App {
             }
             PaletteCmd::Quit => self.request_exit = true,
         }
+    }
+
+    /// Create a new workspace tab and switch this client's view to it. The client
+    /// mints the id so it can switch locally; the server just records the tab.
+    fn new_workspace(&mut self) {
+        let id = NodeId::new();
+        self.conn.send(Command::AddWorkspace { id });
+        self.active_ws = id;
+    }
+
+    /// The tab rectangles (one per workspace, in order) and the trailing "+"
+    /// button rect. Tabs are labelled by their 1-based position.
+    fn tab_layout(&self, gfx: &Gfx) -> (Vec<(NodeId, [f32; 4])>, [f32; 4]) {
+        let mut rects = Vec::with_capacity(self.tabs.len());
+        let mut x = 0.0;
+        for (i, &id) in self.tabs.iter().enumerate() {
+            let w = gfx.fonts.measure(&format!("{}", i + 1)) as f32 + 2.0 * PAD + 6.0;
+            rects.push((id, [x, 0.0, x + w, TAB_H]));
+            x += w;
+        }
+        let plus_w = gfx.fonts.measure("+") as f32 + 2.0 * PAD;
+        (rects, [x, 0.0, x + plus_w, TAB_H])
     }
 
     /// Panel/query/row rects for the command palette at screen size `fb`.
@@ -1193,7 +1231,12 @@ impl App {
         };
         // Refresh our snapshot of the server for this frame. The server ticks
         // and advances the runtime on its own thread; we only read and send.
-        self.view = self.conn.view();
+        let full = self.conn.view();
+        self.tabs = full.workspaces.clone();
+        if !self.tabs.contains(&self.active_ws) {
+            self.active_ws = self.tabs.first().copied().unwrap_or(self.active_ws);
+        }
+        self.view = full.for_workspace(self.active_ws);
 
         // Apply pan/zoom (zoom immediate, pan eased).
         if (self.zoom_factor - 1.0).abs() > f32::EPSILON {
@@ -1363,6 +1406,17 @@ impl App {
                 self.palette_sel = 0;
                 self.palette_scroll = 0.0;
                 consumed = true;
+            }
+            // Tab bar (top): click a tab to view it, or "+" to open a new one.
+            if !consumed && self.tabs.len() > 1 {
+                let (rects, plus) = self.tab_layout(&gfx);
+                if contains(plus, mp) {
+                    self.new_workspace();
+                    consumed = true;
+                } else if let Some(&(id, _)) = rects.iter().find(|(_, r)| contains(*r, mp)) {
+                    self.active_ws = id;
+                    consumed = true;
+                }
             }
             // Dragging a wire out of a node's output port (right edge). Checked
             // before the node-body hit-test so the port's outer half (past the
@@ -2179,6 +2233,57 @@ impl App {
             full,
         );
 
+        // Top workspace-tab bar — only when the document has more than one tab.
+        if self.tabs.len() > 1 {
+            let (rects, plus) = self.tab_layout(&gfx);
+            quads.push(Quad::solid(white, [0.0, 0.0, fb[0], TAB_H], MENU_BG, full));
+            for (i, &(id, r)) in rects.iter().enumerate() {
+                let bg = if id == self.active_ws {
+                    TITLE_FOCUS
+                } else if contains(r, mp) {
+                    MENU_HOVER
+                } else {
+                    MENU_BG
+                };
+                quads.push(Quad::solid(white, r, bg, full));
+                let label = format!("{}", i + 1);
+                let tw = gfx.fonts.measure(&label) as f32;
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    &label,
+                    (r[0] + r[2]) * 0.5 - tw * 0.5,
+                    (TAB_H - lh) * 0.5,
+                    1.0,
+                    TEXT,
+                    full,
+                );
+            }
+            let pbg = if contains(plus, mp) {
+                MENU_HOVER
+            } else {
+                MENU_BG
+            };
+            quads.push(Quad::solid(white, plus, pbg, full));
+            let pw = gfx.fonts.measure("+") as f32;
+            self.text_cache.draw(
+                &mut quads,
+                &mut gfx.renderer,
+                &gfx.fonts,
+                &gfx.device,
+                &gfx.queue,
+                "+",
+                (plus[0] + plus[2]) * 0.5 - pw * 0.5,
+                (TAB_H - lh) * 0.5,
+                1.0,
+                TEXT,
+                full,
+            );
+        }
+
         // Command palette (Cmd/Ctrl+K): dim the canvas, then a centred panel with
         // the typed query and the filtered commands (selected row highlighted).
         if self.palette_open {
@@ -2481,6 +2586,15 @@ impl ApplicationHandler for App {
                         self.palette_query.clear();
                         self.palette_sel = 0;
                         self.palette_scroll = 0.0;
+                        return;
+                    }
+                    // Cmd/Ctrl+T opens a new workspace tab.
+                    if pressed
+                        && !event.repeat
+                        && (self.mods.super_key() || self.mods.control_key())
+                        && code == KeyCode::KeyT
+                    {
+                        self.new_workspace();
                         return;
                     }
                     // While the palette is open it captures all keystrokes.

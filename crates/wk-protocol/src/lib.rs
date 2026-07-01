@@ -73,18 +73,25 @@ impl Operation {
 /// A mutation a client asks the server to perform. Positions come *from* the
 /// client (it knows its camera) so the server never needs a view.
 pub enum Command {
-    /// Launch the dependency at index `dep` (in the workspace's list) at `pos`.
-    Launch { dep: usize, pos: [f32; 2] },
-    /// Create an in-memory shared file node at `pos`.
-    AddVirtualFile { pos: [f32; 2] },
-    /// Create a disk-backed file node at `pos`.
-    AddHostFile { pos: [f32; 2] },
-    /// Create a HostPort node at `pos`.
-    AddPort { pos: [f32; 2] },
-    /// Create a Network node at `pos`.
-    AddNetwork { pos: [f32; 2] },
-    /// Create a Gateway node at `pos`.
-    AddGateway { pos: [f32; 2] },
+    /// Launch the dependency at index `dep` at `pos` in workspace `ws`.
+    Launch {
+        dep: usize,
+        pos: [f32; 2],
+        ws: NodeId,
+    },
+    /// Create an in-memory shared file node at `pos` in workspace `ws`.
+    AddVirtualFile { pos: [f32; 2], ws: NodeId },
+    /// Create a disk-backed file node at `pos` in workspace `ws`.
+    AddHostFile { pos: [f32; 2], ws: NodeId },
+    /// Create a HostPort node at `pos` in workspace `ws`.
+    AddPort { pos: [f32; 2], ws: NodeId },
+    /// Create a Network node at `pos` in workspace `ws`.
+    AddNetwork { pos: [f32; 2], ws: NodeId },
+    /// Create a Gateway node at `pos` in workspace `ws`.
+    AddGateway { pos: [f32; 2], ws: NodeId },
+    /// Create a new (empty) workspace with the given client-minted id. The client
+    /// mints the id so it can switch its own view to the new tab immediately.
+    AddWorkspace { id: NodeId },
     /// Remove any node (app/file/port/network) by id.
     RemoveNode { id: NodeId },
     /// Move a node to a new canvas position.
@@ -112,7 +119,8 @@ impl Command {
             | Command::AddHostFile { .. }
             | Command::AddPort { .. }
             | Command::AddNetwork { .. }
-            | Command::AddGateway { .. } => Operation::Create,
+            | Command::AddGateway { .. }
+            | Command::AddWorkspace { .. } => Operation::Create,
             Command::RemoveNode { .. } => Operation::Remove,
             Command::Connect { .. } | Command::Disconnect { .. } => Operation::Wire,
             Command::RunNode { .. } | Command::SetNodeArgs { .. } | Command::ChangePort { .. } => {
