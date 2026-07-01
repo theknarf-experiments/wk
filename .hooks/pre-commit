@@ -13,8 +13,10 @@ fi
 cargo fmt --all -- --check
 
 # clippy compiles like `cargo check` and adds lints; `-D warnings` blocks the
-# commit on any rustc or clippy warning.
-cargo clippy --all-targets -- -D warnings
+# commit on any rustc or clippy warning. `--workspace` lints every member crate
+# (wk, wk-server, wk-protocol), not just the root binary.
+cargo clippy --workspace --all-targets -- -D warnings
 
-# --no-tests=pass so an empty test suite doesn't block the commit.
-cargo nextest run --no-tests=pass
+# `--workspace` runs every member crate's tests (the backend tests live in
+# wk-server); `--no-tests=pass` so an empty suite doesn't block the commit.
+cargo nextest run --workspace --no-tests=pass

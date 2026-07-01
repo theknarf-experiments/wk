@@ -16,11 +16,11 @@ use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
 use winit::window::WindowId;
 
 use crate::host_shell::Gfx;
-use crate::plugin::{Key, KeyEvent, PointerEvent, ResizeEvent, SharedNode, SharedSurface};
 use crate::render2d::{Quad, Renderer, TextureId};
-use crate::server::{FileNode, Server, FILE_H, FILE_W};
 use crate::text::Fonts;
 use wk_protocol::{Command, Wire};
+use wk_server::plugin::{Key, KeyEvent, PointerEvent, ResizeEvent, SharedNode, SharedSurface};
+use wk_server::server::{FileNode, Server, FILE_H, FILE_W};
 
 /// Target frame time (~60 fps).
 const FRAME: Duration = Duration::from_nanos(1_000_000_000 / 60);
@@ -536,7 +536,7 @@ struct App {
     views: HashMap<u64, (TextureId, u32, u32)>,
     text_cache: TextCache,
     /// VT terminal per non-graphical node, fed from its stdout.
-    terminals: HashMap<u64, crate::terminal::Terminal>,
+    terminals: HashMap<u64, wk_server::terminal::Terminal>,
 
     cam: Camera,
     pan_target: [f32; 2],
@@ -963,7 +963,7 @@ impl App {
             let term = self
                 .terminals
                 .entry(node.id)
-                .or_insert_with(|| crate::terminal::Terminal::new(node.term_io.clone()));
+                .or_insert_with(|| wk_server::terminal::Terminal::new(node.term_io.clone()));
             if !bytes.is_empty() {
                 term.feed(&bytes);
             }
@@ -1708,8 +1708,8 @@ impl App {
                 self.terminals.get(&id).map(|t| (t.cells(), t.cursor()))
             {
                 // Render the VT cell grid, scaled uniformly to fit the content.
-                let cols = crate::terminal::COLS as f32;
-                let rows = crate::terminal::ROWS as f32;
+                let cols = wk_server::terminal::COLS as f32;
+                let rows = wk_server::terminal::ROWS as f32;
                 let bw = (gfx.fonts.measure("M") as f32).max(1.0);
                 let bh = (gfx.fonts.line_height() as f32).max(1.0);
                 let scale = ((ca[2] - ca[0]) / (cols * bw))

@@ -10,8 +10,11 @@ name = "wk"
 version = "0.1.0"
 edition = "2021"
 
+# The wk binary is the front-end (window + rendering + input). The backend and
+# the client<->server contract are separate crates it depends on.
 [dependencies]
 wk-protocol = { path = "crates/wk-protocol" }
+wk-server = { path = "crates/wk-server" }
 wgpu = "29.0.3"
 env_logger = "0.11.11"
 pollster = "0.4.0"
@@ -20,19 +23,3 @@ winit = "0.30"
 ab_glyph = "0.2"
 bytemuck = { version = "1.25.0", features = ["derive"] }
 clap = { version = "4.6.1", features = ["derive"] }
-kdl = "6"
-wasmtime = { version = "46", features = ["component-model", "async", "cache"] }
-wasmtime-wasi = { version = "46", features = ["p3"] }
-wasmtime-wasi-io = "46"
-wasi-webgpu-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime" }
-wasi-graphics-context-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime" }
-wgpu-core = "29"
-wgpu-types = "29"
-web-audio-api = "1.6.0"
-alacritty_terminal = "0.26.0"
-oci-client = { version = "0.17.0", default-features = false, features = ["rustls-tls"] }
-wasmtime-wasi-http = { version = "46", features = ["p3"] }
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-http-body-util = "0.1"
-smoltcp = "0.13.1"

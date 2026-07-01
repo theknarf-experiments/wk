@@ -1,0 +1,26 @@
+[package]
+name = "wk-server"
+version = "0.1.0"
+edition = "2021"
+description = "The wk backend: the authoritative Server plus the wasm runtime, virtual filesystem, userspace network, audio, MIDI, HTTP, and workspace persistence."
+
+[dependencies]
+wk-protocol = { path = "../wk-protocol" }
+pollster = "0.4.0"
+tokio = { version = "1", features = ["rt", "net", "time", "io-util"] }
+kdl = "6"
+wasmtime = { version = "46", features = ["component-model", "async", "cache"] }
+wasmtime-wasi = { version = "46", features = ["p3"] }
+wasmtime-wasi-io = "46"
+wasi-webgpu-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime" }
+wasi-graphics-context-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime" }
+wgpu-core = "29"
+wgpu-types = "29"
+web-audio-api = "1.6.0"
+alacritty_terminal = "0.26.0"
+oci-client = { version = "0.17.0", default-features = false, features = ["rustls-tls"] }
+wasmtime-wasi-http = { version = "46", features = ["p3"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+smoltcp = "0.13.1"

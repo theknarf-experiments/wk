@@ -4,9 +4,9 @@
 //! [`HeadlessClient`]; future test-runners, MCP bridges, and networked
 //! front-ends are just more `impl Client`s.
 
-use crate::server::Server;
 use std::time::Duration;
 use wk_protocol::Client;
+use wk_server::server::Server;
 
 /// A windowless client: no rendering, no OS input. It keeps the process alive so
 /// the guests (which run on their own threads) keep running, ticks the server to

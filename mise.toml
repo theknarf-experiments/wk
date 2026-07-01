@@ -5,3 +5,7 @@ _.path = ["{{config_root}}"]
 [tasks.setup-hooks]
 description = "Use .hooks as the git hooks directory"
 run = "git config core.hooksPath .hooks"
+
+[tasks.test]
+description = "Run the workspace test suite"
+run = "cargo nextest run --workspace"

@@ -1,21 +1,13 @@
 mod arrows;
-mod audio;
 mod client;
 mod compositor;
 mod host_shell;
-mod http;
-mod midi;
-mod netstack;
-mod oci;
-mod options;
-mod plugin;
 mod render2d;
-mod server;
-mod sockets;
-mod terminal;
 mod text;
-mod vfs;
-mod workspace;
+
+// The backend lives in the `wk-server` crate; bring its workspace/file-format
+// helpers into scope under the familiar `workspace::` path used by the CLI.
+use wk_server::workspace;
 
 use clap::CommandFactory;
 use clap::Parser;
@@ -110,8 +102,8 @@ fn run(file: &Path, headless: bool) -> Result<(), String> {
         }
     }
     // Build the authoritative half, then hand it to whichever client drives it.
-    let server = server::Server::new(&ws, file.to_path_buf())?;
-    let client: Box<dyn wk_protocol::Client<server::Server>> = if headless {
+    let server = wk_server::server::Server::new(&ws, file.to_path_buf())?;
+    let client: Box<dyn wk_protocol::Client<wk_server::server::Server>> = if headless {
         Box::new(client::HeadlessClient)
     } else {
         Box::new(compositor::WindowClient)
