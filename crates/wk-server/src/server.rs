@@ -207,11 +207,68 @@ impl View {
     }
 }
 
+/// The two node ids a [`Wire`] joins.
+fn wire_ends(w: Wire) -> (NodeId, NodeId) {
+    match w {
+        Wire::File(a, b) | Wire::Midi(a, b) | Wire::Serve(a, b) | Wire::Net(a, b) => (a, b),
+    }
+}
+
 /// The in-app mount name for a host-mapped file: the path's base name.
 pub fn host_file_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "hostfile".to_string())
+}
+
+/// Longest undo history kept.
+const UNDO_CAP: usize = 200;
+
+/// A recorded inverse of one mutation, applied by [`Command::Undo`].
+enum Undo {
+    Pos(NodeId, [f32; 2]),
+    Size(NodeId, [f32; 2]),
+    Args(NodeId, Vec<String>),
+    Port(NodeId, u16),
+    /// Re-toggle a connection between two nodes (connect is its own inverse).
+    Wire(NodeId, NodeId),
+    /// Remove a node that a create added.
+    Uncreate(NodeId),
+    /// Recreate a node that was removed, with its wiring.
+    Recreate(Box<Snapshot>),
+}
+
+/// Everything needed to bring a removed node back exactly as it was.
+struct Snapshot {
+    id: NodeId,
+    ws: NodeId,
+    pos: [f32; 2],
+    size: [f32; 2],
+    kind: SnapKind,
+    /// Every connection the node was part of, as raw node pairs.
+    wires: Vec<(NodeId, NodeId)>,
+}
+
+enum SnapKind {
+    App {
+        dep: String,
+        args: Vec<String>,
+        options: Vec<f32>,
+    },
+    Virtual {
+        name: String,
+        data: Vec<u8>,
+    },
+    HostFile {
+        name: String,
+        path: PathBuf,
+    },
+    Port {
+        port: u16,
+    },
+    Net {
+        gateway: bool,
+    },
 }
 
 /// The authoritative running workspace. See the module docs.
@@ -255,6 +312,9 @@ pub struct Server {
     /// The workspaces (tabs) in this document, in order — including empty ones.
     pub workspaces: Vec<NodeId>,
 
+    /// Inverse-command history for [`Command::Undo`].
+    undo: Vec<Undo>,
+
     next_port: u16,
     file_seq: u32,
     host_seq: u32,
@@ -284,6 +344,7 @@ impl Server {
             net_links: Vec::new(),
             node_ws: HashMap::new(),
             workspaces: doc.workspaces.iter().map(|w| w.id).collect(),
+            undo: Vec::new(),
             next_port: 8080,
             file_seq: 0,
             host_seq: 0,
@@ -1105,9 +1166,71 @@ impl Server {
         }
     }
 
-    /// Apply a client [`Command`]. The single entry point for mutations — the
-    /// same one a networked client's messages would flow through.
+    /// Apply a client [`Command`], recording an inverse for [`Command::Undo`]
+    /// where the mutation is undoable. The single entry point for mutations.
     pub fn apply(&mut self, cmd: Command) {
+        match &cmd {
+            // Creates: run, then record removal of whatever new node appeared.
+            Command::Launch { .. }
+            | Command::AddVirtualFile { .. }
+            | Command::AddHostFile { .. }
+            | Command::AddPort { .. }
+            | Command::AddNetwork { .. }
+            | Command::AddGateway { .. }
+            | Command::DuplicateNode { .. } => {
+                let before: HashSet<NodeId> = self.node_ws.keys().copied().collect();
+                self.dispatch(cmd);
+                let created: Vec<NodeId> = self
+                    .node_ws
+                    .keys()
+                    .copied()
+                    .filter(|id| !before.contains(id))
+                    .collect();
+                for id in created {
+                    self.record(Undo::Uncreate(id));
+                }
+                return;
+            }
+            Command::RemoveNode { id } => {
+                if let Some(s) = self.snapshot(*id) {
+                    self.record(Undo::Recreate(Box::new(s)));
+                }
+            }
+            Command::MoveNode { id, .. } => {
+                if let Some(&p) = self.win_pos.get(id) {
+                    self.record(Undo::Pos(*id, p));
+                }
+            }
+            Command::ResizeNode { id, .. } => {
+                if let Some(&s) = self.win_size.get(id) {
+                    self.record(Undo::Size(*id, s));
+                }
+            }
+            Command::SetNodeArgs { id, .. } => {
+                let old = self.node_args.get(id).cloned().unwrap_or_default();
+                self.record(Undo::Args(*id, old));
+            }
+            Command::ChangePort { id, .. } => {
+                if let Some(&p) = self.host_ports.get(id) {
+                    self.record(Undo::Port(*id, p));
+                }
+            }
+            Command::Connect { a, b } => self.record(Undo::Wire(*a, *b)),
+            Command::Disconnect { wire } => {
+                let (a, b) = wire_ends(*wire);
+                self.record(Undo::Wire(a, b));
+            }
+            // Not undoable: workspace tabs, run, and undo itself.
+            Command::AddWorkspace { .. }
+            | Command::RemoveWorkspace { .. }
+            | Command::RunNode { .. }
+            | Command::Undo => {}
+        }
+        self.dispatch(cmd);
+    }
+
+    /// Perform a command's mutation (no undo recording).
+    fn dispatch(&mut self, cmd: Command) {
         match cmd {
             Command::Launch { dep, pos, ws } => {
                 if let Some(dep) = self.available.get(dep).cloned() {
@@ -1132,6 +1255,186 @@ impl Server {
             Command::RunNode { id } => self.run_node(id),
             Command::SetNodeArgs { id, args } => self.set_node_args(id, &args),
             Command::ChangePort { id, delta } => self.change_port(id, delta),
+            Command::Undo => {
+                if let Some(u) = self.undo.pop() {
+                    self.apply_undo(u);
+                }
+            }
+        }
+    }
+
+    /// Push an inverse onto the undo stack, coalescing a run of same-node
+    /// move/resize/args edits (e.g. a drag) into a single entry.
+    fn record(&mut self, u: Undo) {
+        let coalesce = match (self.undo.last(), &u) {
+            (Some(Undo::Pos(a, _)), Undo::Pos(b, _)) => a == b,
+            (Some(Undo::Size(a, _)), Undo::Size(b, _)) => a == b,
+            (Some(Undo::Args(a, _)), Undo::Args(b, _)) => a == b,
+            _ => false,
+        };
+        if coalesce {
+            return;
+        }
+        self.undo.push(u);
+        if self.undo.len() > UNDO_CAP {
+            self.undo.remove(0);
+        }
+    }
+
+    /// Whether a node with this id currently exists (any kind).
+    fn node_exists(&self, id: NodeId) -> bool {
+        self.win_pos.contains_key(&id)
+    }
+
+    /// Apply one recorded inverse. Guards against nodes that have since gone.
+    fn apply_undo(&mut self, u: Undo) {
+        match u {
+            Undo::Pos(id, p) => {
+                if self.win_pos.contains_key(&id) {
+                    self.win_pos.insert(id, p);
+                }
+            }
+            Undo::Size(id, s) => {
+                if self.win_size.contains_key(&id) {
+                    self.win_size.insert(id, s);
+                }
+            }
+            Undo::Args(id, a) => {
+                if self.node_args.contains_key(&id) {
+                    self.node_args.insert(id, a);
+                }
+            }
+            Undo::Port(id, port) => {
+                if let Some(&cur) = self.host_ports.get(&id) {
+                    self.change_port(id, port as i32 - cur as i32);
+                }
+            }
+            Undo::Wire(a, b) => {
+                if self.node_exists(a) && self.node_exists(b) {
+                    self.connect_toggle(a, b);
+                }
+            }
+            Undo::Uncreate(id) => {
+                if self.node_exists(id) {
+                    self.remove_any(id);
+                }
+            }
+            Undo::Recreate(s) => self.recreate(*s),
+        }
+    }
+
+    /// Capture everything needed to bring node `id` back after removal.
+    fn snapshot(&self, id: NodeId) -> Option<Snapshot> {
+        let ws = self.node_ws.get(&id).copied()?;
+        let pos = self.win_pos.get(&id).copied()?;
+        let size = self.win_size.get(&id).copied()?;
+        let kind = if let Some(node) = self.app_node(id) {
+            SnapKind::App {
+                dep: node.name.clone(),
+                args: self.node_args.get(&id).cloned().unwrap_or_default(),
+                options: node.options.lock().unwrap().clone(),
+            }
+        } else if let Some(f) = self.file_nodes.get(&id) {
+            match f {
+                FileNode::Virtual(v) => SnapKind::Virtual {
+                    name: v.name.clone(),
+                    data: v.data.lock().unwrap().clone(),
+                },
+                FileNode::HostMapped(h) => SnapKind::HostFile {
+                    name: h.name.clone(),
+                    path: h.path.clone(),
+                },
+            }
+        } else if let Some(&port) = self.host_ports.get(&id) {
+            SnapKind::Port { port }
+        } else if self.net_nodes.contains(&id) {
+            SnapKind::Net {
+                gateway: self.gateways.contains(&id),
+            }
+        } else {
+            return None;
+        };
+        let mut wires: Vec<(NodeId, NodeId)> = Vec::new();
+        wires.extend(
+            self.connections
+                .iter()
+                .filter(|&&(f, a)| f == id || a == id),
+        );
+        wires.extend(self.midi_links.iter().filter(|&&(s, d)| s == id || d == id));
+        wires.extend(
+            self.serves
+                .iter()
+                .filter(|(&h, &(hp, _))| h == id || hp == id)
+                .map(|(&h, &(hp, _))| (h, hp)),
+        );
+        wires.extend(self.net_links.iter().filter(|&&(a, n)| a == id || n == id));
+        Some(Snapshot {
+            id,
+            ws,
+            pos,
+            size,
+            kind,
+            wires,
+        })
+    }
+
+    /// Bring a removed node back with the same id, then re-establish its wiring.
+    fn recreate(&mut self, s: Snapshot) {
+        match s.kind {
+            SnapKind::App { dep, args, options } => {
+                let Some(d) = self.available.iter().find(|x| x.name == dep).cloned() else {
+                    return;
+                };
+                if self
+                    .host
+                    .spawn(
+                        &d.local_path(),
+                        &d.name,
+                        s.id,
+                        &args,
+                        self.registry.clone(),
+                        self.node_reg.clone(),
+                        options,
+                    )
+                    .is_err()
+                {
+                    return;
+                }
+                self.place(s.id, s.pos, s.size);
+                self.node_args.insert(s.id, args);
+            }
+            SnapKind::Virtual { name, data } => {
+                self.place(s.id, s.pos, s.size);
+                self.file_nodes.insert(
+                    s.id,
+                    FileNode::Virtual(VirtualFile {
+                        name,
+                        data: Arc::new(Mutex::new(data)),
+                    }),
+                );
+            }
+            SnapKind::HostFile { name, path } => {
+                self.place(s.id, s.pos, s.size);
+                self.file_nodes
+                    .insert(s.id, FileNode::HostMapped(HostMappedFile { name, path }));
+            }
+            SnapKind::Port { port } => {
+                self.place(s.id, s.pos, s.size);
+                self.host_ports.insert(s.id, port);
+            }
+            SnapKind::Net { gateway } => {
+                self.place(s.id, s.pos, s.size);
+                self.net_nodes.insert(s.id);
+                if gateway {
+                    self.gateways.insert(s.id);
+                }
+            }
+        }
+        self.node_ws.insert(s.id, s.ws);
+        for (a, b) in s.wires {
+            if self.node_exists(a) && self.node_exists(b) {
+                self.connect_toggle(a, b);
+            }
         }
     }
 

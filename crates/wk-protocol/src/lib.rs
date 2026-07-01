@@ -114,6 +114,8 @@ pub enum Command {
     SetNodeArgs { id: NodeId, args: String },
     /// Nudge a HostPort's localhost port by `delta`.
     ChangePort { id: NodeId, delta: i32 },
+    /// Undo the last undoable mutation (move/resize/wire/args/port/create/delete).
+    Undo,
 }
 
 impl Command {
@@ -134,6 +136,8 @@ impl Command {
                 Operation::Control
             }
             Command::MoveNode { .. } | Command::ResizeNode { .. } => Operation::Arrange,
+            // Undo can restore or remove anything it previously recorded.
+            Command::Undo => Operation::Create,
         }
     }
 }

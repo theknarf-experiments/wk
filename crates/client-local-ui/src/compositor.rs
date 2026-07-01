@@ -2762,6 +2762,14 @@ impl ApplicationHandler for App {
                         self.duplicate_focused();
                         return;
                     }
+                    // Cmd/Ctrl+Z undoes the last mutation.
+                    if pressed
+                        && (self.mods.super_key() || self.mods.control_key())
+                        && code == KeyCode::KeyZ
+                    {
+                        self.conn.send(Command::Undo);
+                        return;
+                    }
                     // While the palette is open it captures all keystrokes.
                     if self.palette_open {
                         if pressed {
