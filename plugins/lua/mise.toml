@@ -2,4 +2,7 @@
 [tasks.build]
 description = "Build this plugin into a wasm component"
 dir = "{{config_root}}"
-run = "./build.sh"
+# wasi-sdk comes from the root mise.toml [tools]; point build.sh at its install
+# (resolved at task time — `mise where` can't be used in an [env] template, it
+# would recurse). Falls back to build.sh's own default when run outside mise.
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build.sh"

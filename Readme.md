@@ -86,18 +86,19 @@ Example plugins live under `plugins/`, spanning graphics (GPU via `wasi:webgpu`
 and CPU frame buffers), audio and MIDI, terminal programs and recompiled C
 software, userspace networking, and filesystem demos.
 
-Every plugin exposes the same `build` task via `mise`, so building is uniform:
+Every plugin exposes the same `build` task via `mise`, and the whole build
+toolchain is pinned and installed by mise (declared in the root `mise.toml`), so
+there's no manual toolchain setup — building is uniform:
 
 ```
 mise trust        # first time only, to trust the plugin's mise.toml
-mise run build
+mise run build    # installs the pinned toolchain if needed, then builds
 ```
 
 Under the hood, Rust plugins build with
-[cargo-component](https://github.com/bytecodealliance/cargo-component)
-(`cargo install cargo-component`); C plugins compile with
-[wasi-sdk](https://github.com/WebAssembly/wasi-sdk) (set `WASI_SDK`, default
-`~/wasi-sdk`) and `wasm-tools`.
+[cargo-component](https://github.com/bytecodealliance/cargo-component); C plugins
+compile with [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) and `wasm-tools`
+— all mise-managed, so `WASI_SDK` and friends are wired up for you.
 
 ## OCI registries
 
