@@ -1,65 +1,131 @@
-# WK
+# wk
 
 `wk` the workspace tool
 
+`wk` is a **workspace runtime for WebAssembly component plugins**. Each plugin
+runs as a sandboxed *node* on a canvas — with its own GPU/CPU surface or
+terminal, its own in-memory filesystem, and its own slice of a userspace
+network — and you wire nodes together to make them cooperate: mount a file into
+a node, route MIDI between two nodes, serve a node over localhost, or drop nodes
+onto a shared virtual network.
+
+Plugins are ordinary WASI 0.2/0.3 components. They can live as local `.wasm`
+files or be pulled from an OCI registry, so `wk` doubles as a little package
+manager for the components it runs.
+
+## Concepts
+
+A workspace is a canvas of **nodes**, saved to a `.wk` file ([KDL](https://kdl.dev/)
+syntax). A node is a **plugin instance** by default: it renders into a virtual
+surface (GPU via `wasi:webgpu`, or a CPU frame buffer) that `wk` composites into
+its window, or it runs in a terminal (`wasi:cli` command components). Some nodes
+instead stand for shared resources a plugin can wire to:
+
+- **File** — a shared file, either in-memory (VirtualFile) or backed by a real
+  host file (HostMappedFile).
+- **HostPort** — a `localhost` port an HTTP node can be served on.
+- **Network / Gateway** — an isolated userspace network (smoltcp). A Gateway
+  additionally grants its members access to the real host network.
+
+**Wiring** two nodes does something different depending on their kinds:
+
+| wire                    | effect                                               |
+| ----------------------- | ---------------------------------------------------- |
+| File → node             | mounts the file into the node's sandboxed filesystem |
+| node → node             | a MIDI link (source out → destination in)            |
+| HTTP node → HostPort    | serves the node on `127.0.0.1:<port>`                |
+| node → Network/Gateway  | joins the node to that virtual network               |
+
+A document can hold several workspaces (shown as tabs); edits are undoable.
+
 ## Setup
 
-First install SDL3:
+The toolchain is pinned to nightly Rust by `rust-toolchain.toml`, so `rustup`
+selects it automatically.
 
-```
-brew install sdl3
-```
-
-This repo uses [mise](https://mise.jdx.dev/) to manage the environment
-(it sets `LIBRARY_PATH` so SDL3 is found at link time). Install it and
-allow this directory's config:
+This repo uses [mise](https://mise.jdx.dev/) to manage the environment (it adds
+Homebrew's `lib` to `LIBRARY_PATH` for native linking and defines a couple of
+tasks). Install it and trust this directory:
 
 ```
 brew install mise
 mise trust
 ```
 
-Point git at the tracked `.hooks` directory. The pre-commit hook runs
-`cargo fmt --all -- --check`, `cargo clippy` (warnings denied) and
-`cargo nextest run`, so install nextest first:
+The tracked `.hooks/pre-commit` runs `cargo fmt --all -- --check`, `cargo clippy`
+(warnings denied) and `cargo nextest run`. Install nextest and point git at the
+hooks directory:
 
 ```
 cargo install cargo-nextest
 mise run setup-hooks
 ```
 
-Then run:
+Then build the CLI:
 
 ```
 cargo run -- --help
 ```
 
-### Setup for components
+## Quick start
 
 ```
-cargo install cargo-component
+cargo run -- init                 # create workspace.wk in the current directory
+cargo run -- add path/to/plugin.wasm   # register a plugin as a named dependency
+cargo run -- run                  # open the workspace in a window
 ```
 
-## Plugins & projects
+Every `.wk` file is its own workspace; pass `-f/--file` to operate on a specific
+one (defaults to `workspace.wk`). Other commands: `list`, `remove <name>`, and
+`publish` (below). `run --headless` loads and runs the workspace with no window,
+keeping the guests alive until Ctrl-C.
 
-`wk` is a compositor for WASM plugins: each plugin is a component that renders
-into a virtual surface (via the standard wasi-gfx interfaces) which `wk`
-composites into its own window.
+## Plugins
 
-Run plugins directly:
+Example plugins live under `plugins/`, spanning graphics (GPU via `wasi:webgpu`
+and CPU frame buffers), audio and MIDI, terminal programs and recompiled C
+software, userspace networking, and filesystem demos.
+
+Every plugin exposes the same `build` task via `mise`, so building is uniform:
 
 ```
-cargo run -- run plugins/triangle/target/wasm32-wasip1/debug/triangle.wasm
+mise trust        # first time only, to trust the plugin's mise.toml
+mise run build
 ```
 
-Or manage a set of plugins with a [KDL](https://kdl.dev/) `wk.kdl` project:
+Under the hood, Rust plugins build with
+[cargo-component](https://github.com/bytecodealliance/cargo-component)
+(`cargo install cargo-component`); C plugins compile with
+[wasi-sdk](https://github.com/WebAssembly/wasi-sdk) (set `WASI_SDK`, default
+`~/wasi-sdk`) and `wasm-tools`.
+
+## OCI registries
+
+`wk` can depend on plugins published to an OCI registry as Wasm OCI Artifacts.
+`compose.yml` brings up a local registry (on `:5001`) for testing the whole
+package-manager path:
 
 ```
-wk init my-workspace          # create wk.kdl
-wk add path/to/plugin.wasm    # register a plugin
-wk run                        # run every plugin in the project
+docker compose up -d
+cargo run -- publish <name> localhost:5001/<name>:1.0
+cargo run -- add oci://localhost:5001/<name>:1.0
+cargo run -- run
 ```
 
-Example plugins live under `plugins/` (`paint` is a CPU/frame-buffer client,
-`triangle` renders on the GPU via `wasi:webgpu`); build them with
-`cargo component build`.
+`scripts/publish-known-set.sh` publishes the bundled plugins as a ready-made set.
+
+## Architecture
+
+Four crates, split so the client/server seam is explicit:
+
+- **`wk-protocol`** — the client↔server contract (the `Command` vocabulary and
+  the `Client` trait), with no knowledge of the server's internals.
+- **`wk-server`** — the authoritative backend: the wasm runtime, the per-node
+  in-memory `wasi:filesystem`, the userspace network fabric (`wasi:sockets` over
+  smoltcp), audio, MIDI, HTTP serving, and `.wk` persistence.
+- **`wk-token-service`** — mints [Biscuit](https://www.biscuitsec.org/) tokens
+  granting operations; the server only verifies, clients only bear them.
+- **`client-local-ui`** — the wgpu/winit window that renders the canvas and
+  drives the server, plus the headless client.
+
+The root `wk` binary is just the CLI that ties them together.
