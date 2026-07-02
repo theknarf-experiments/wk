@@ -431,7 +431,13 @@ fn parse_placed(n: &KdlNode) -> Option<NodeState> {
 fn parse_hostport(n: &KdlNode) -> Option<PortState> {
     let id = node_id(n.get(0)?)?;
     let ch = n.children()?;
-    let port = ch.get("port").and_then(|p| p.get(0)).and_then(uint)? as u16;
+    // Reject an out-of-range port (drop the node) rather than truncate it: a
+    // hand-edited `port 99999` should not silently become 34463.
+    let port = ch
+        .get("port")
+        .and_then(|p| p.get(0))
+        .and_then(uint)
+        .and_then(|n| u16::try_from(n).ok())?;
     let pos = ch.get("pos")?;
     let size = ch.get("size")?;
     Some(PortState {
@@ -731,6 +737,24 @@ mod tests {
 
         assert_eq!(back.workspaces[1].id, wb);
         assert!(back.workspaces[1].nodes.is_empty());
+    }
+
+    #[test]
+    fn hostport_out_of_range_port_is_rejected_not_truncated() {
+        let ws = NodeId::from_u128(1);
+        let hp = NodeId::from_u128(2);
+        let text = |port: u32| {
+            format!(
+                "workspace \"{ws}\" {{\n    \
+                 hostport \"{hp}\" {{ port {port}; pos 0 0; size 10 10 }}\n}}"
+            )
+        };
+        // 99999 doesn't fit in a u16; the node is dropped, not truncated to 34463.
+        let doc = Document::from_kdl(&text(99999)).expect("parses");
+        assert!(doc.workspaces[0].host_ports.is_empty());
+        // A valid port is kept as-is.
+        let doc = Document::from_kdl(&text(8080)).expect("parses");
+        assert_eq!(doc.workspaces[0].host_ports[0].port, 8080);
     }
 
     // ---- property-based round-trip ----

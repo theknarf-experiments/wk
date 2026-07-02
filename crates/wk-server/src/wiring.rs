@@ -26,36 +26,25 @@ pub enum NodeClass {
 /// class, and return it with its canonical orientation, or `None` if the pair
 /// can't be wired.
 ///
-/// The rules (highest priority first) mirror the canvas: a File on exactly one
-/// side mounts into the other; a HostPort on exactly one side serves the other
-/// (the http node) on it; a Network on exactly one side is joined by the other
-/// (the app); two plain nodes form a MIDI link. Two nodes of the *same*
-/// file/port/net class don't form a wire.
+/// A file/port/net node only wires to an *app* ([`NodeClass::Other`]): a File
+/// mounts into the app, a HostPort serves the app (the http node), a Network is
+/// joined by the app. Two apps form a MIDI link. Any other pairing — two special
+/// nodes (even of different kinds, e.g. a HostPort and a Network), or the same
+/// special kind twice — can't be wired.
 pub fn classify(a: NodeId, b: NodeId, ca: NodeClass, cb: NodeClass) -> Option<Wire> {
     use NodeClass::*;
-    // File mount: the file is the first element, the app the second.
-    match (ca == File, cb == File) {
-        (true, false) => return Some(Wire::File(a, b)),
-        (false, true) => return Some(Wire::File(b, a)),
-        (true, true) => return None,
-        (false, false) => {}
+    match (ca, cb) {
+        (File, Other) => Some(Wire::File(a, b)),
+        (Other, File) => Some(Wire::File(b, a)),
+        // The http node is the app side; the HostPort is the second element.
+        (Port, Other) => Some(Wire::Serve(b, a)),
+        (Other, Port) => Some(Wire::Serve(a, b)),
+        // The app is the first element; the network the second.
+        (Net, Other) => Some(Wire::Net(b, a)),
+        (Other, Net) => Some(Wire::Net(a, b)),
+        (Other, Other) => Some(Wire::Midi(a, b)),
+        _ => None,
     }
-    // Serve: the http node is the non-port side, the HostPort the second element.
-    match (ca == Port, cb == Port) {
-        (true, false) => return Some(Wire::Serve(b, a)),
-        (false, true) => return Some(Wire::Serve(a, b)),
-        (true, true) => return None,
-        (false, false) => {}
-    }
-    // Net membership: the app is the first element, the network the second.
-    match (ca == Net, cb == Net) {
-        (true, false) => return Some(Wire::Net(b, a)),
-        (false, true) => return Some(Wire::Net(a, b)),
-        (true, true) => return None,
-        (false, false) => {}
-    }
-    // Neither side is a file/port/net node: an app↔app MIDI link.
-    Some(Wire::Midi(a, b))
 }
 
 /// Toggle a plain `(a, b)` link: remove it if present, else append it. Returns
@@ -146,17 +135,19 @@ mod tests {
     fn classify_covers_every_class_pair() {
         use NodeClass::*;
         let (a, b) = (id(1), id(2));
+        // A special node wires only to an app (Other); every special↔special
+        // pairing is None.
         let cases = [
             (File, File, None),
-            (File, Port, Some(Wire::File(a, b))),
-            (File, Net, Some(Wire::File(a, b))),
+            (File, Port, None),
+            (File, Net, None),
             (File, Other, Some(Wire::File(a, b))),
-            (Port, File, Some(Wire::File(b, a))),
+            (Port, File, None),
             (Port, Port, None),
-            (Port, Net, Some(Wire::Serve(b, a))),
+            (Port, Net, None),
             (Port, Other, Some(Wire::Serve(b, a))),
-            (Net, File, Some(Wire::File(b, a))),
-            (Net, Port, Some(Wire::Serve(a, b))),
+            (Net, File, None),
+            (Net, Port, None),
             (Net, Net, None),
             (Net, Other, Some(Wire::Net(b, a))),
             (Other, File, Some(Wire::File(b, a))),
@@ -197,6 +188,15 @@ mod tests {
                 let (x, y) = wire_ends(w);
                 prop_assert!((x == a && y == b) || (x == b && y == a));
             }
+        }
+
+        /// A wire forms if and only if at least one side is an app node: a
+        /// special (file/port/net) node only connects to an app, and two apps
+        /// form a MIDI link — so two special nodes never wire.
+        #[test]
+        fn classify_requires_an_app_endpoint(a in any_id(), b in any_id(), ca in any_class(), cb in any_class()) {
+            let wired = classify(a, b, ca, cb).is_some();
+            prop_assert_eq!(wired, ca == NodeClass::Other || cb == NodeClass::Other);
         }
 
         /// Toggling the same pair twice restores the original link set, and a

@@ -83,3 +83,9 @@ plugins/udpecho/udpecho.wasm
 
 # echo6 (IPv6 echo example) build artifact
 plugins/echo6/echo6.wasm
+
+# HostMappedFile artifacts: `add_host_mapped_file` currently creates its backing
+# file (`host<n>`) relative to the process cwd, so they land at the repo root
+# when wk runs from here. Ignore them until that's fixed to resolve against the
+# workspace file's directory.
+/host[0-9]*
