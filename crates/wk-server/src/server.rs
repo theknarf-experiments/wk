@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::plugin::{NodeRegistry, PluginHost, SharedNode, SharedSurface, SurfaceRegistry};
+use crate::wiring::{self, NodeClass};
 use crate::workspace::{Dependency, Document, NetState, NodeState, PortState, Workspace};
 use wk_protocol::{Command, NodeId, NodeKind, Resource, ResourceRef, Wire};
 
@@ -309,7 +310,13 @@ pub struct Server {
     pub midi_links: Vec<(NodeId, NodeId)>,
     /// HostPort nodes (canvas id -> localhost port).
     pub host_ports: HashMap<NodeId, u16>,
-    /// Active servers: http node id -> (HostPort id, kill switch).
+    /// Desired serve wiring: (http node id, HostPort id). This is the source of
+    /// truth for save/undo/UI — it survives even while the http node is still
+    /// compiling and thus can't be bound yet (see `serves`).
+    pub serve_links: Vec<(NodeId, NodeId)>,
+    /// Currently *running* servers: http node id -> (HostPort id, kill switch).
+    /// A subset of `serve_links` — an entry appears only once the node is a ready
+    /// wasi:http node and the port bound. Reconciled by `sync_serves`.
     pub serves: HashMap<NodeId, (NodeId, Arc<AtomicBool>)>,
     /// Network nodes (isolated virtual networks) by canvas id.
     pub net_nodes: HashSet<NodeId>,
@@ -350,6 +357,7 @@ impl Server {
             connections: Vec::new(),
             midi_links: Vec::new(),
             host_ports: HashMap::new(),
+            serve_links: Vec::new(),
             serves: HashMap::new(),
             net_nodes: HashSet::new(),
             gateways: HashSet::new(),
@@ -467,10 +475,15 @@ impl Server {
             self.host_ports.insert(hp.id, hp.port);
         }
 
-        // Re-establish serve wiring (starts the servers again).
+        // Record serve wiring as desired state. The http nodes are still
+        // compiling on background threads, so they can't be bound yet; the tick
+        // loop's `sync_serves` starts each server once its node is ready. (Binding
+        // eagerly here would silently drop the wire, since `http_path()` is not
+        // published until compilation finishes — issue that lost serve wires on
+        // every load.)
         for &(http_id, hostport_id) in &saved.serves {
             if self.app_node(http_id).is_some() && self.host_ports.contains_key(&hostport_id) {
-                self.toggle_serve(http_id, hostport_id);
+                self.serve_links.push((http_id, hostport_id));
             }
         }
 
@@ -724,8 +737,13 @@ impl Server {
         }
     }
 
-    /// Set a node's launch args from a whitespace-separated string.
+    /// Set a node's launch args from a whitespace-separated string. Guarded to
+    /// existing nodes so an `Update` on an unknown id can't grow `node_args`
+    /// without bound.
     fn set_node_args(&mut self, id: NodeId, text: &str) {
+        if !self.node_ws.contains_key(&id) {
+            return;
+        }
         let args = text.split_whitespace().map(str::to_string).collect();
         self.node_args.insert(id, args);
     }
@@ -739,30 +757,30 @@ impl Server {
         }
     }
 
+    /// What kind of node `id` is, for classifying a wire (see [`wiring`]).
+    fn class_of(&self, id: NodeId) -> NodeClass {
+        if self.file_nodes.contains_key(&id) {
+            NodeClass::File
+        } else if self.host_ports.contains_key(&id) {
+            NodeClass::Port
+        } else if self.net_nodes.contains(&id) {
+            NodeClass::Net
+        } else {
+            NodeClass::Other
+        }
+    }
+
     /// Toggle a connection between two nodes by their kinds: file⇄app mounts the
     /// file; http-app⇄HostPort serves on localhost; app⇄Network joins the network;
-    /// app⇄app wires MIDI.
+    /// app⇄app wires MIDI. The *decision* (which wire, which orientation) is
+    /// [`wiring::classify`]; this only runs the effect for whichever it returns.
     fn connect_toggle(&mut self, a: NodeId, b: NodeId) {
-        let af = self.file_nodes.contains_key(&a);
-        let bf = self.file_nodes.contains_key(&b);
-        let ap = self.host_ports.contains_key(&a);
-        let bp = self.host_ports.contains_key(&b);
-        let an = self.net_nodes.contains(&a);
-        let bn = self.net_nodes.contains(&b);
-        if af && !bf {
-            self.toggle_file(a, b);
-        } else if bf && !af {
-            self.toggle_file(b, a);
-        } else if ap && !bp {
-            self.toggle_serve(b, a);
-        } else if bp && !ap {
-            self.toggle_serve(a, b);
-        } else if an && !bn {
-            self.toggle_net(b, a);
-        } else if bn && !an {
-            self.toggle_net(a, b);
-        } else if !af && !bf && !ap && !bp && !an && !bn {
-            self.toggle_midi(a, b);
+        match wiring::classify(a, b, self.class_of(a), self.class_of(b)) {
+            Some(Wire::File(file, app)) => self.toggle_file(file, app),
+            Some(Wire::Serve(http, hostport)) => self.toggle_serve(http, hostport),
+            Some(Wire::Net(app, net)) => self.toggle_net(app, net),
+            Some(Wire::Midi(src, dst)) => self.toggle_midi(src, dst),
+            None => {}
         }
     }
 
@@ -776,20 +794,14 @@ impl Server {
 
     /// Wire (or unwire) app node `app_id` onto Network node `net_id`.
     fn toggle_net(&mut self, app_id: NodeId, net_id: NodeId) {
-        if let Some(pos) = self
-            .net_links
-            .iter()
-            .position(|&(a, n)| a == app_id && n == net_id)
-        {
-            self.net_links.remove(pos);
-            self.set_node_net(app_id, app_id); // back to isolated
-            self.set_host_access(app_id, false);
-        } else {
-            // One network per app: drop any existing membership first.
-            self.net_links.retain(|&(a, _)| a != app_id);
-            self.net_links.push((app_id, net_id));
+        if wiring::toggle_unique(&mut self.net_links, app_id, net_id) {
+            // Joined the network (any prior membership was dropped).
             self.set_node_net(app_id, net_id);
             self.set_host_access(app_id, self.gateways.contains(&net_id));
+        } else {
+            // Left; back to isolated.
+            self.set_node_net(app_id, app_id);
+            self.set_host_access(app_id, false);
         }
     }
 
@@ -833,28 +845,54 @@ impl Server {
         self.forget(id);
     }
 
-    /// Wire (or unwire) a wasi:http node to a HostPort: start/stop serving it.
+    /// Wire (or unwire) a wasi:http node to a HostPort. Toggles the *desired*
+    /// serve link; the actual bind is (re)established by [`Self::sync_serves`].
     fn toggle_serve(&mut self, http_id: NodeId, hostport_id: NodeId) {
-        if let Some((_, kill)) = self.serves.remove(&http_id) {
-            kill.store(true, Ordering::Relaxed);
-            return;
+        // "One server per http node" — a new target replaces any existing one.
+        wiring::toggle_unique(&mut self.serve_links, http_id, hostport_id);
+        self.sync_serves();
+    }
+
+    /// Reconcile the running [`Self::serves`] against the desired
+    /// [`Self::serve_links`]: stop servers whose wiring changed or whose node/port
+    /// went away, and start desired servers that aren't running yet and are now
+    /// ready. Idempotent and cheap when nothing changed; called after any serve
+    /// change and once per tick (so a wire made before its node finished
+    /// compiling is honored as soon as the node comes up).
+    fn sync_serves(&mut self) {
+        let active: HashMap<NodeId, NodeId> =
+            self.serves.iter().map(|(&h, &(hp, _))| (h, hp)).collect();
+        let plan = wiring::reconcile_serves(&self.serve_links, &active);
+        // Kill the servers to stop, then (re)bind the ones to start. `start_serve`
+        // applies its own readiness/port-conflict guards.
+        for http in plan.stop {
+            if let Some((_, kill)) = self.serves.remove(&http) {
+                kill.store(true, Ordering::Relaxed);
+            }
         }
+        for (http, hostport) in plan.start {
+            self.start_serve(http, hostport);
+        }
+    }
+
+    /// Try to bind the HTTP server for one desired serve link. Silently does
+    /// nothing if the node isn't a ready wasi:http node yet or its port is already
+    /// served (both are transient during async compile / port conflicts); only a
+    /// real bind failure is logged.
+    fn start_serve(&mut self, http_id: NodeId, hostport_id: NodeId) {
         let Some(node) = self.app_node(http_id) else {
             return;
         };
         let Some(path) = node.http_path() else {
-            return; // not a wasi:http server node
+            return; // not a wasi:http node, or still compiling
         };
         let Some(&port) = self.host_ports.get(&hostport_id) else {
             return;
         };
         // All workspaces run at once, so another node may already be serving this
-        // localhost port. Refuse rather than let the OS bind fail silently.
+        // localhost port. Skip rather than let the OS bind fail; if the other
+        // server later stops, a subsequent tick binds this one.
         if self.port_served_by_other(port, http_id) {
-            eprintln!(
-                "wk: localhost:{port} is already served; not binding {}",
-                node.name
-            );
             return;
         }
         let kill = Arc::new(AtomicBool::new(false));
@@ -878,17 +916,8 @@ impl Server {
     /// Remove a HostPort node, stopping any server bound through it.
     fn remove_host_port(&mut self, id: NodeId) {
         self.host_ports.remove(&id);
-        let bound: Vec<NodeId> = self
-            .serves
-            .iter()
-            .filter(|(_, (hp, _))| *hp == id)
-            .map(|(&http, _)| http)
-            .collect();
-        for http in bound {
-            if let Some((_, kill)) = self.serves.remove(&http) {
-                kill.store(true, Ordering::Relaxed);
-            }
-        }
+        self.serve_links.retain(|&(_, hp)| hp != id);
+        self.sync_serves();
         self.forget(id);
     }
 
@@ -903,6 +932,10 @@ impl Server {
         }
         self.host_ports.insert(id, new);
         self.next_port = self.next_port.max(new.saturating_add(1));
+        // Stop any server bound through this port; the desired serve link is
+        // unchanged (same HostPort id), so `sync_serves` rebinds it on the new
+        // port. If the new port collides with another server the rebind is
+        // skipped and retried on a later tick — the wire itself is preserved.
         let bound: Vec<NodeId> = self
             .serves
             .iter()
@@ -913,8 +946,8 @@ impl Server {
             if let Some((_, kill)) = self.serves.remove(&http) {
                 kill.store(true, Ordering::Relaxed);
             }
-            self.toggle_serve(http, id);
         }
+        self.sync_serves();
     }
 
     /// Wire (or unwire) file node `file_id` into app node `app_id`'s filesystem.
@@ -922,17 +955,13 @@ impl Server {
         let Some(app) = self.app_node(app_id) else {
             return;
         };
-        let file = &self.file_nodes[&file_id];
-        if let Some(pos) = self
-            .connections
-            .iter()
-            .position(|&(f, a)| f == file_id && a == app_id)
-        {
-            crate::vfs::unmount_file(&app.fs, file.name());
-            self.connections.remove(pos);
-        } else {
-            file.mount(&app.fs);
-            self.connections.push((file_id, app_id));
+        let connected = wiring::toggle_pair(&mut self.connections, file_id, app_id);
+        if let Some(file) = self.file_nodes.get(&file_id) {
+            if connected {
+                file.mount(&app.fs);
+            } else {
+                crate::vfs::unmount_file(&app.fs, file.name());
+            }
         }
     }
 
@@ -943,16 +972,10 @@ impl Server {
         };
         let router = self.host.midi();
         let mut routes = router.lock().unwrap();
-        if let Some(pos) = self
-            .midi_links
-            .iter()
-            .position(|&(s, d)| s == src && d == dst)
-        {
-            routes.disconnect(src, dst);
-            self.midi_links.remove(pos);
-        } else {
+        if wiring::toggle_pair(&mut self.midi_links, src, dst) {
             routes.connect(src, dst, dst_node.midi_in.clone());
-            self.midi_links.push((src, dst));
+        } else {
+            routes.disconnect(src, dst);
         }
     }
 
@@ -984,7 +1007,7 @@ impl Server {
         match w {
             Wire::File(f, a) => self.connections.contains(&(f, a)),
             Wire::Midi(s, d) => self.midi_links.contains(&(s, d)),
-            Wire::Serve(h, hp) => self.serves.get(&h).map(|(p, _)| *p) == Some(hp),
+            Wire::Serve(h, hp) => self.serve_links.contains(&(h, hp)),
             Wire::Net(app, net) => self.net_links.contains(&(app, net)),
         }
     }
@@ -1003,7 +1026,7 @@ impl Server {
                 }
             }
             Wire::Serve(h, hp) => {
-                if self.serves.contains_key(&h) {
+                if self.serve_links.contains(&(h, hp)) {
                     self.toggle_serve(h, hp);
                 }
             }
@@ -1015,18 +1038,25 @@ impl Server {
         }
     }
 
-    /// Move / resize a node.
+    /// Move / resize a node. Guarded to existing nodes so an `Update` naming an
+    /// unknown id can't insert phantom geometry that never gets cleaned up (and
+    /// would make `node_exists` report a node that was never created).
     fn set_node_pos(&mut self, id: NodeId, pos: [f32; 2]) {
-        self.win_pos.insert(id, pos);
+        if self.win_pos.contains_key(&id) {
+            self.win_pos.insert(id, pos);
+        }
     }
     fn set_node_size(&mut self, id: NodeId, size: [f32; 2]) {
-        self.win_size.insert(id, size);
+        if self.win_size.contains_key(&id) {
+            self.win_size.insert(id, size);
+        }
     }
 
     /// One server step: reconcile any wiring that was pending on a still-loading
     /// node. Cheap; a client calls it each frame, headless in its tick loop.
     pub fn tick(&mut self) {
         self.sync_net_membership();
+        self.sync_serves();
     }
 
     /// Kill a node and drop everything referencing it (its wiring, geometry, and
@@ -1053,9 +1083,10 @@ impl Server {
         self.net_links.retain(|&(app, _)| app != id);
         self.host.midi().lock().unwrap().remove_node(id);
         self.midi_links.retain(|&(s, d)| s != id && d != id);
-        if let Some((_, kill)) = self.serves.remove(&id) {
-            kill.store(true, Ordering::Relaxed);
-        }
+        // Drop any serve wire touching this node (as http server or HostPort) and
+        // reconcile so its running server, if any, is stopped.
+        self.serve_links.retain(|&(h, hp)| h != id && hp != id);
+        self.sync_serves();
         self.node_args.remove(&id);
         self.forget(id);
     }
@@ -1142,10 +1173,10 @@ impl Server {
                         .copied()
                         .collect(),
                     serves: self
-                        .serves
+                        .serve_links
                         .iter()
                         .filter(|(http, _)| mine(http))
-                        .map(|(&http, &(hostport, _))| (http, hostport))
+                        .copied()
                         .collect(),
                     nets: self
                         .net_nodes
@@ -1406,10 +1437,10 @@ impl Server {
         );
         wires.extend(self.midi_links.iter().filter(|&&(s, d)| s == id || d == id));
         wires.extend(
-            self.serves
+            self.serve_links
                 .iter()
-                .filter(|(&h, &(hp, _))| h == id || hp == id)
-                .map(|(&h, &(hp, _))| (h, hp)),
+                .filter(|&&(h, hp)| h == id || hp == id)
+                .copied(),
         );
         wires.extend(self.net_links.iter().filter(|&&(a, n)| a == id || n == id));
         Some(Snapshot {
@@ -1494,7 +1525,7 @@ impl Server {
         self.connections.iter().any(|&(x, y)| pair(x, y))
             || self.midi_links.iter().any(|&(x, y)| pair(x, y))
             || self.net_links.iter().any(|&(x, y)| pair(x, y))
-            || self.serves.iter().any(|(&h, &(hp, _))| pair(h, hp))
+            || self.serve_links.iter().any(|&(h, hp)| pair(h, hp))
     }
 
     /// Re-establish connections between live nodes (idempotent, so a wire listed
@@ -1558,11 +1589,9 @@ impl Server {
                 )
             })
             .collect();
-        let serves = self
-            .serves
-            .iter()
-            .map(|(&http, &(hostport, _))| (http, hostport))
-            .collect();
+        // Show the desired wiring (what the user drew and what we persist), not
+        // just servers that have finished binding.
+        let serves = self.serve_links.iter().copied().collect();
         View {
             node_ids: self.node_ids(),
             win_pos: self.win_pos.clone(),
@@ -1581,6 +1610,175 @@ impl Server {
             surfaces,
             node_ws: self.node_ws.clone(),
             workspaces: self.workspaces.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    //! Property-based model test of the command/undo state machine. A `Server` is
+    //! expensive to build (engine + gpu global + hub thread), so this uses a
+    //! modest case count. It exercises only the wasm-free node kinds (file, port,
+    //! network, gateway) so no real plugin has to be compiled; app-node creation
+    //! and wiring (which need real wasm) are out of scope here.
+
+    use super::*;
+    use proptest::prelude::*;
+    use wk_protocol::NodePatch;
+
+    fn fresh_server() -> Server {
+        Server::new(&Document::empty(), PathBuf::from("wk-proptest-scratch.wk"))
+            .expect("a headless server constructs")
+    }
+
+    /// The `i`-th live node id (order-stabilized), or `None` when empty. Lets an
+    /// op reference "some existing node" without knowing the server-minted ids.
+    fn nth_live(s: &Server, i: usize) -> Option<NodeId> {
+        let mut ids = s.node_ids();
+        if ids.is_empty() {
+            return None;
+        }
+        ids.sort();
+        Some(ids[i % ids.len()])
+    }
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        CreateFile,
+        CreatePort,
+        CreateNet,
+        CreateGateway,
+        Move(usize, f32, f32),
+        Resize(usize, f32, f32),
+        SetArgs(usize, String),
+        Delete(usize),
+        Duplicate(usize),
+        /// `Update` a (near-certainly) non-existent id — must not create phantom
+        /// geometry.
+        UpdateGhost(u128),
+        Undo,
+    }
+
+    fn op_strat() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            Just(Op::CreateFile),
+            Just(Op::CreatePort),
+            Just(Op::CreateNet),
+            Just(Op::CreateGateway),
+            (any::<usize>(), -1.0e5f32..1.0e5, -1.0e5f32..1.0e5)
+                .prop_map(|(i, x, y)| Op::Move(i, x, y)),
+            (any::<usize>(), 1.0e2f32..1.0e4, 1.0e2f32..1.0e4)
+                .prop_map(|(i, w, h)| Op::Resize(i, w, h)),
+            (any::<usize>(), "[a-z ]{0,8}").prop_map(|(i, a)| Op::SetArgs(i, a)),
+            any::<usize>().prop_map(Op::Delete),
+            any::<usize>().prop_map(Op::Duplicate),
+            any::<u128>().prop_map(Op::UpdateGhost),
+            Just(Op::Undo),
+        ]
+    }
+
+    fn apply_op(s: &mut Server, op: &Op) {
+        let ws = s.workspaces[0];
+        let create = |kind| {
+            Command::Create(Resource::Node {
+                kind,
+                pos: [10.0, 20.0],
+                ws,
+            })
+        };
+        match op {
+            Op::CreateFile => s.apply(create(NodeKind::VirtualFile)),
+            Op::CreatePort => s.apply(create(NodeKind::Port)),
+            Op::CreateNet => s.apply(create(NodeKind::Network)),
+            Op::CreateGateway => s.apply(create(NodeKind::Gateway)),
+            Op::Move(i, x, y) => {
+                if let Some(id) = nth_live(s, *i) {
+                    s.apply(Command::Update {
+                        id,
+                        patch: NodePatch {
+                            pos: Some([*x, *y]),
+                            ..Default::default()
+                        },
+                    });
+                }
+            }
+            Op::Resize(i, w, h) => {
+                if let Some(id) = nth_live(s, *i) {
+                    s.apply(Command::Update {
+                        id,
+                        patch: NodePatch {
+                            size: Some([*w, *h]),
+                            ..Default::default()
+                        },
+                    });
+                }
+            }
+            Op::SetArgs(i, a) => {
+                if let Some(id) = nth_live(s, *i) {
+                    s.apply(Command::Update {
+                        id,
+                        patch: NodePatch {
+                            args: Some(a.clone()),
+                            ..Default::default()
+                        },
+                    });
+                }
+            }
+            Op::Delete(i) => {
+                if let Some(id) = nth_live(s, *i) {
+                    s.apply(Command::Delete(ResourceRef::Node(id)));
+                }
+            }
+            Op::Duplicate(i) => {
+                if let Some(id) = nth_live(s, *i) {
+                    s.apply(Command::Duplicate(id));
+                }
+            }
+            Op::UpdateGhost(n) => s.apply(Command::Update {
+                id: NodeId::from_u128(*n),
+                patch: NodePatch {
+                    pos: Some([1.0, 2.0]),
+                    size: Some([3.0, 4.0]),
+                    args: Some("ghost".into()),
+                    port_delta: None,
+                },
+            }),
+            Op::Undo => s.apply(Command::Undo),
+        }
+    }
+
+    /// The core state invariant: the three per-node maps that must move in
+    /// lockstep agree exactly with the live-node enumeration, and the document
+    /// never loses its last workspace.
+    fn assert_consistent(s: &Server) -> Result<(), TestCaseError> {
+        let pos: HashSet<NodeId> = s.win_pos.keys().copied().collect();
+        let size: HashSet<NodeId> = s.win_size.keys().copied().collect();
+        let ws: HashSet<NodeId> = s.node_ws.keys().copied().collect();
+        let live: HashSet<NodeId> = s.node_ids().into_iter().collect();
+        prop_assert_eq!(&pos, &size, "win_pos and win_size key sets diverged");
+        prop_assert_eq!(&pos, &ws, "win_pos and node_ws key sets diverged");
+        prop_assert_eq!(&pos, &live, "geometry and live-node enumeration diverged");
+        prop_assert!(!s.workspaces.is_empty(), "document lost its last workspace");
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        /// Any sequence of node create/move/resize/delete/duplicate/undo commands
+        /// (including updates to unknown ids) leaves the server's per-node maps
+        /// mutually consistent after every step.
+        #[test]
+        fn node_lifecycle_keeps_state_consistent(
+            ops in prop::collection::vec(op_strat(), 0..40),
+        ) {
+            let mut s = fresh_server();
+            assert_consistent(&s)?;
+            for op in &ops {
+                apply_op(&mut s, op);
+                s.tick();
+                assert_consistent(&s)?;
+            }
         }
     }
 }

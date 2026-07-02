@@ -21,6 +21,12 @@ use crate::plugin::HostState;
 
 type StateFn = dyn Fn() -> HostState + Send + Sync + 'static;
 
+/// Epoch ticks a single request handler may run before it traps. The server
+/// ticks the epoch every ~16ms (see `runtime::STEP`), so this is ~10 seconds —
+/// generous for real handlers, but bounded so a runaway guest can't wedge the
+/// worker thread and the port forever.
+const HTTP_EPOCH_BUDGET: u64 = 600;
+
 /// Run an HTTP server on `127.0.0.1:port` dispatching to `pre`'s
 /// `wasi:http/incoming-handler`, building a fresh `HostState` per request via
 /// `make_state`. Blocks until `kill` is set (then the socket is released).
@@ -32,15 +38,18 @@ pub fn serve(
     kill: Arc<AtomicBool>,
 ) -> Result<()> {
     // wasmtime-wasi pumps bodies via `tokio::spawn` (Send), so we need a
-    // multi-thread runtime. The wasi:http response body is `!Send`, so we can't
-    // spawn the connection itself — connections are handled one at a time (fine
-    // for a HostPort demo; concurrency within a connection still works).
+    // multi-thread runtime. The wasi:http response body is `!Send`, so the
+    // connection future itself can't go on `tokio::spawn`; instead we drive
+    // connections on a single-threaded `LocalSet` via `spawn_local`, which lets
+    // many run concurrently without requiring `Send`. Serving them one at a time
+    // would let a single slow/keep-alive client wedge the port for everyone.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?;
     let make_state: Arc<StateFn> = Arc::new(make_state);
-    rt.block_on(async move {
+    let local = tokio::task::LocalSet::new();
+    rt.block_on(local.run_until(async move {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -63,12 +72,22 @@ pub fn serve(
                     Ok::<_, std::convert::Infallible>(handle(engine, pre, make_state, req).await)
                 }
             });
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .await;
+            // Drive each connection as its own local task so connections don't
+            // block each other. A slow client sending headers a byte at a time is
+            // bounded by `header_read_timeout`; idle keep-alive connections stay
+            // open. When `kill` is set we break the loop and return, dropping the
+            // `LocalSet` and with it every still-running connection task, which
+            // closes the sockets and releases the port immediately.
+            tokio::task::spawn_local(async move {
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .timer(hyper_util::rt::TokioTimer::new())
+                    .header_read_timeout(Duration::from_secs(15))
+                    .serve_connection(io, service)
+                    .await;
+            });
         }
         Ok(())
-    })
+    }))
 }
 
 /// Handle one request, turning any failure into a 500 so hyper always gets a
@@ -95,11 +114,11 @@ async fn dispatch(
     req: Request<hyper::body::Incoming>,
 ) -> Result<Response<HyperOutgoingBody>> {
     let mut store = Store::new(&engine, make_state());
-    // The engine has epoch interruption on (the server uses it to kill runaway
-    // nodes); request handlers run to completion, so push the deadline far out.
-    // (It's relative to the current epoch — `u64::MAX` would overflow once the
-    // server has ticked the epoch.)
-    store.set_epoch_deadline(1 << 60);
+    // The engine has epoch interruption on (the server ticks the epoch every
+    // ~16ms to kill runaway nodes). Give each request handler a finite budget so
+    // an infinite-loop guest traps instead of pinning a worker thread forever and
+    // wedging the port. The deadline is relative to the current epoch.
+    store.set_epoch_deadline(HTTP_EPOCH_BUDGET);
     // Convert the incoming body's error type to wasi:http's ErrorCode.
     let req = req.map(|b| {
         b.map_err(|e| ErrorCode::InternalError(Some(e.to_string())))

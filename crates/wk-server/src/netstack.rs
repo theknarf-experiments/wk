@@ -9,7 +9,7 @@
 //! nothing. Because we move *packets*, traffic can later be rerouted through
 //! middlebox nodes (a VPN/proxy) transparently to the guest.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
@@ -127,11 +127,19 @@ pub struct NodeStack {
     /// Whether this node may reach the real host network (set when wired to a
     /// Gateway node). Off-fabric connections are bridged to host sockets.
     pub host_access: bool,
-    /// Handles of sockets still owned by a live wasi resource. When the owner
-    /// drops, the handle leaves this set (so derived streams/pollables that
-    /// outlive it see it as closed instead of touching a freed handle) and moves
-    /// to `closing` to be reaped once it has drained.
-    live: HashSet<SocketHandle>,
+    /// Sockets still owned by a live wasi resource, each mapped to the generation
+    /// it was created with. When the owner drops, the handle leaves this map (so
+    /// derived streams/pollables that outlive it see it as closed instead of
+    /// touching a freed handle) and moves to `closing` to be reaped once drained.
+    ///
+    /// The generation matters because smoltcp reuses freed slot indices: after a
+    /// handle is reaped, a new socket can be added under the *same* `SocketHandle`
+    /// value. A stale stream captured `(handle, gen)` at creation; checking the
+    /// generation as well as membership prevents it from operating on the
+    /// unrelated socket that later took the slot.
+    live: HashMap<SocketHandle, u64>,
+    /// Monotonic generation counter, bumped per tracked socket.
+    next_gen: u64,
     /// Sockets whose owner has dropped, awaiting a graceful flush before removal
     /// (TX data + FIN sent). Each carries a tick budget so a stuck socket is
     /// still eventually reaped.
@@ -158,20 +166,26 @@ impl NodeStack {
         self.wakers.push(w);
     }
 
-    /// Record a freshly added socket handle as live (owned by a wasi resource).
-    pub fn track(&mut self, h: SocketHandle) {
-        self.live.insert(h);
+    /// Record a freshly added socket handle as live (owned by a wasi resource),
+    /// returning the generation to stamp on the owner and any derived streams.
+    pub fn track(&mut self, h: SocketHandle) -> u64 {
+        let gen = self.next_gen;
+        self.next_gen += 1;
+        self.live.insert(h, gen);
+        gen
     }
 
-    /// Is `h` still a live socket (owned, not yet closing/reaped)?
-    pub fn is_live(&self, h: SocketHandle) -> bool {
-        self.live.contains(&h)
+    /// Is `(h, gen)` still the live socket a resource/stream was created against?
+    /// False once the owner dropped it or the slot was recycled for a new socket
+    /// (which would carry a different generation).
+    pub fn is_current(&self, h: SocketHandle, gen: u64) -> bool {
+        self.live.get(&h) == Some(&gen)
     }
 
     /// The owning resource dropped: stop treating the handle as live and queue it
     /// for reaping once it has drained (the caller closes a TCP socket first).
     pub fn begin_close(&mut self, h: SocketHandle, kind: SockKind) {
-        if self.live.remove(&h) {
+        if self.live.remove(&h).is_some() {
             self.closing.push((h, kind, CLOSE_TICKS));
         }
     }
@@ -263,7 +277,8 @@ impl NetHub {
             ip6,
             name: name.to_string(),
             host_access: false,
-            live: HashSet::new(),
+            live: HashMap::new(),
+            next_gen: 0,
             closing: Vec::new(),
             wakers: Vec::new(),
         }));

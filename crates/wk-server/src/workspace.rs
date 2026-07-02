@@ -13,9 +13,49 @@
 //! }
 //! ```
 
-use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
+use kdl::{KdlDocument, KdlEntry, KdlEntryFormat, KdlNode, KdlValue};
 use std::path::{Path, PathBuf};
 use wk_protocol::NodeId;
+
+/// A KDL entry for a string value that always serializes *quoted*.
+///
+/// Works around a kdl-6 formatter/parser asymmetry: the formatter emits certain
+/// strings (e.g. `-.0`, or a bare `.`) as unquoted identifiers that its own
+/// parser then rejects — so a user-supplied node arg or name like that would
+/// make the whole saved `.wk` file fail to load. Others (number- or
+/// keyword-shaped) would parse as a non-string and be silently dropped. Forcing
+/// an explicit quoted representation keeps every string value round-trippable.
+fn str_entry(s: &str) -> KdlEntry {
+    let mut e = KdlEntry::new(s.to_string());
+    e.set_format(KdlEntryFormat {
+        value_repr: kdl_quote(s),
+        leading: " ".to_string(),
+        // Keep `value_repr` through `KdlDocument::autoformat`.
+        autoformat_keep: true,
+        ..Default::default()
+    });
+    e
+}
+
+/// Escape a string into a KDL quoted-string literal.
+fn kdl_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' | '"' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
 
 /// The default workspace file when none is named on the command line.
 pub const DEFAULT_WORKSPACE: &str = "workspace.wk";
@@ -26,7 +66,7 @@ pub const DEFAULT_WORKSPACE: &str = "workspace.wk";
 const MODELINE: &str = "// vim: set filetype=kdl :";
 
 /// Where a dependency's wasm comes from.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Source {
     Path(PathBuf),
     /// An OCI registry reference (e.g. `ghcr.io/org/name:1.0`), pulled + cached.
@@ -76,7 +116,7 @@ impl Source {
 }
 
 /// One workspace dependency: a short name resolving to a plugin source.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Dependency {
     pub name: String,
     pub source: Source,
@@ -95,7 +135,7 @@ impl Dependency {
 }
 
 /// A placed node: an app instance (`node`) or a file node (`virtualfile`/`hostfile`).
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct NodeState {
     /// Dependency name (for app nodes) or file name (for file nodes).
     pub name: String,
@@ -109,7 +149,7 @@ pub struct NodeState {
 }
 
 /// A HostPort node: a localhost port plus its canvas placement.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PortState {
     pub id: NodeId,
     pub port: u16,
@@ -118,7 +158,7 @@ pub struct PortState {
 }
 
 /// A Network (or Gateway) node and its canvas placement.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct NetState {
     pub id: NodeId,
     pub gateway: bool,
@@ -127,7 +167,7 @@ pub struct NetState {
 }
 
 /// A `.wk` file: shared dependencies plus one or more workspaces (canvas tabs).
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Document {
     pub dependencies: Vec<Dependency>,
     /// Always at least one; shown as tabs when there is more than one.
@@ -135,7 +175,7 @@ pub struct Document {
 }
 
 /// One workspace: a canvas of nodes and the wiring between them, with its own id.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Workspace {
     pub id: NodeId,
     pub nodes: Vec<NodeState>,
@@ -253,12 +293,12 @@ impl Document {
         let mut children = KdlDocument::new();
         for dep in &self.dependencies {
             let mut node = KdlNode::new(dep.name.clone());
-            node.push(KdlEntry::new(dep.source.to_kdl()));
+            node.push(str_entry(&dep.source.to_kdl()));
             if !dep.args.is_empty() {
                 let mut sub = KdlDocument::new();
                 let mut args_node = KdlNode::new("args");
                 for a in &dep.args {
-                    args_node.push(KdlEntry::new(a.clone()));
+                    args_node.push(str_entry(a));
                 }
                 sub.nodes_mut().push(args_node);
                 node.set_children(sub);
@@ -441,7 +481,7 @@ fn net_kdl(n: &NetState) -> KdlNode {
 
 fn placed_kdl(kind: &str, n: &NodeState) -> KdlNode {
     let mut node = KdlNode::new(kind);
-    node.push(KdlEntry::new(n.name.clone()));
+    node.push(str_entry(&n.name));
     node.push(KdlEntry::new(n.id.to_string()));
     let mut ch = KdlDocument::new();
     ch.nodes_mut().push(node2("pos", n.pos[0], n.pos[1]));
@@ -456,7 +496,7 @@ fn placed_kdl(kind: &str, n: &NodeState) -> KdlNode {
     if !n.args.is_empty() {
         let mut args = KdlNode::new("args");
         for a in &n.args {
-            args.push(KdlEntry::new(a.clone()));
+            args.push(str_entry(a));
         }
         ch.nodes_mut().push(args);
     }
@@ -691,5 +731,177 @@ mod tests {
 
         assert_eq!(back.workspaces[1].id, wb);
         assert!(back.workspaces[1].nodes.is_empty());
+    }
+
+    // ---- property-based round-trip ----
+    //
+    // For every document the generator can produce, `parse(format(doc)) == doc`.
+    // The generators below deliberately stay inside the format's domain (finite
+    // coordinates, identifier-shaped dependency names) so a failure means a real
+    // serialization/parse asymmetry rather than an out-of-domain input.
+
+    use proptest::prelude::*;
+
+    /// Any id, derived deterministically from a `u128` so proptest can shrink it.
+    fn any_node_id() -> impl Strategy<Value = NodeId> {
+        any::<u128>().prop_map(NodeId::from_u128)
+    }
+
+    /// A finite canvas coordinate / knob value. Excludes NaN and infinities (not
+    /// representable in the file) and magnitudes past ~1e6, beyond which the KDL
+    /// numeric form is not the concern of this test.
+    fn coord() -> impl Strategy<Value = f32> {
+        -1.0e6f32..=1.0e6f32
+    }
+
+    /// A string stored as a KDL *value* (node/file name, arg). Mixes ordinary
+    /// text with cases that stress the serializer: number/keyword-shaped strings
+    /// that a naive formatter emits unquoted, and characters that must be escaped
+    /// inside a quoted string.
+    fn value_str() -> impl Strategy<Value = String> {
+        prop_oneof![
+            6 => "[a-zA-Z0-9 ._+-]{0,12}",
+            1 => Just("-.0".to_string()),
+            1 => Just("true".to_string()),
+            1 => Just(r#""quo\te""#.to_string()),
+            1 => Just("line\nbreak\ttab".to_string()),
+            1 => Just(String::new()),
+        ]
+    }
+
+    /// A dependency name, which becomes a KDL *node name*. Restricted to bare
+    /// identifiers: the parser intentionally trims a trailing `:` (npm-style), so
+    /// names ending in `:` are not round-trip identities and are excluded here.
+    fn dep_name() -> impl Strategy<Value = String> {
+        "[a-zA-Z][a-zA-Z0-9_-]{0,10}"
+    }
+
+    fn source() -> impl Strategy<Value = Source> {
+        prop_oneof![
+            // No ':' in the path alphabet, so a path can never look like `oci://…`.
+            "[a-zA-Z0-9_./-]{1,20}".prop_map(|s| Source::Path(PathBuf::from(s))),
+            "[a-z0-9][a-z0-9./:-]{0,20}".prop_map(Source::Oci),
+        ]
+    }
+
+    fn dependency() -> impl Strategy<Value = Dependency> {
+        (
+            dep_name(),
+            source(),
+            prop::collection::vec(value_str(), 0..3),
+        )
+            .prop_map(|(name, source, args)| Dependency { name, source, args })
+    }
+
+    fn node_state() -> impl Strategy<Value = NodeState> {
+        (
+            value_str(),
+            any_node_id(),
+            coord(),
+            coord(),
+            coord(),
+            coord(),
+            prop::collection::vec(coord(), 0..4),
+            prop::collection::vec(value_str(), 0..3),
+        )
+            .prop_map(|(name, id, px, py, sx, sy, options, args)| NodeState {
+                name,
+                id,
+                pos: [px, py],
+                size: [sx, sy],
+                options,
+                args,
+            })
+    }
+
+    fn port_state() -> impl Strategy<Value = PortState> {
+        (
+            any_node_id(),
+            any::<u16>(),
+            coord(),
+            coord(),
+            coord(),
+            coord(),
+        )
+            .prop_map(|(id, port, px, py, sx, sy)| PortState {
+                id,
+                port,
+                pos: [px, py],
+                size: [sx, sy],
+            })
+    }
+
+    fn net_state() -> impl Strategy<Value = NetState> {
+        (
+            any_node_id(),
+            any::<bool>(),
+            coord(),
+            coord(),
+            coord(),
+            coord(),
+        )
+            .prop_map(|(id, gateway, px, py, sx, sy)| NetState {
+                id,
+                gateway,
+                pos: [px, py],
+                size: [sx, sy],
+            })
+    }
+
+    fn pair() -> impl Strategy<Value = (NodeId, NodeId)> {
+        (any_node_id(), any_node_id())
+    }
+
+    fn workspace_strat() -> impl Strategy<Value = Workspace> {
+        (
+            any_node_id(),
+            prop::collection::vec(node_state(), 0..3),
+            prop::collection::vec(node_state(), 0..3),
+            prop::collection::vec(node_state(), 0..3),
+            prop::collection::vec(port_state(), 0..3),
+            prop::collection::vec(pair(), 0..3),
+            prop::collection::vec(pair(), 0..3),
+            prop::collection::vec(pair(), 0..3),
+            prop::collection::vec(net_state(), 0..3),
+            prop::collection::vec(pair(), 0..3),
+        )
+            .prop_map(
+                |(id, nodes, vfiles, hfiles, ports, conns, midi, serves, nets, netlinks)| {
+                    Workspace {
+                        id,
+                        nodes,
+                        virtual_files: vfiles,
+                        host_files: hfiles,
+                        host_ports: ports,
+                        connections: conns,
+                        midi,
+                        serves,
+                        nets,
+                        net_links: netlinks,
+                    }
+                },
+            )
+    }
+
+    fn document() -> impl Strategy<Value = Document> {
+        (
+            prop::collection::vec(dependency(), 0..3),
+            // A document always has at least one workspace.
+            prop::collection::vec(workspace_strat(), 1..3),
+        )
+            .prop_map(|(dependencies, workspaces)| Document {
+                dependencies,
+                workspaces,
+            })
+    }
+
+    proptest! {
+        #[test]
+        fn document_kdl_round_trips_for_any_document(doc in document()) {
+            let text = doc.to_kdl();
+            let back = Document::from_kdl(&text)
+                .map_err(|e| TestCaseError::fail(format!("re-parse failed: {e}")))?;
+            prop_assert_eq!(back, doc);
+        }
     }
 }

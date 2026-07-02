@@ -185,7 +185,7 @@ impl OutputStream for VfsOutputStream {
         let mut fs = self.fs.lock().unwrap();
         match fs.nodes.get_mut(&self.node) {
             Some(Node::File(data)) => {
-                write_at(data, self.offset, &bytes);
+                write_at(data, self.offset, &bytes).map_err(|_| StreamError::Closed)?;
                 self.offset += bytes.len() as u64;
                 Ok(())
             }
@@ -213,7 +213,8 @@ impl Pollable for SharedOutputStream {
 
 impl OutputStream for SharedOutputStream {
     fn write(&mut self, bytes: Bytes) -> std::result::Result<(), StreamError> {
-        write_at(&mut self.data.lock().unwrap(), self.offset, &bytes);
+        write_at(&mut self.data.lock().unwrap(), self.offset, &bytes)
+            .map_err(|_| StreamError::Closed)?;
         self.offset += bytes.len() as u64;
         Ok(())
     }
@@ -274,20 +275,35 @@ fn host_write_at(path: &std::path::Path, offset: u64, buf: &[u8]) -> std::io::Re
     Ok(())
 }
 
-/// Copy `bytes` into `data` at `offset`, growing it if needed.
-fn write_at(data: &mut Vec<u8>, offset: u64, bytes: &[u8]) {
-    let start = offset as usize;
-    let end = start + bytes.len();
+/// Upper bound on the size of a single in-memory (or shared) file. Guests fully
+/// control the write offset and `set-size`, so without a cap a single call like
+/// `write(offset = 2^48)` would ask `Vec::resize` for a multi-terabyte
+/// allocation and abort the whole server process.
+const MAX_FILE_SIZE: usize = 256 * 1024 * 1024;
+
+/// Copy `bytes` into `data` at `offset`, growing it if needed. Returns `Err` if
+/// the write would push the file past [`MAX_FILE_SIZE`] (or overflow `usize`),
+/// in which case `data` is left unchanged.
+fn write_at(data: &mut Vec<u8>, offset: u64, bytes: &[u8]) -> std::result::Result<(), ()> {
+    let start = usize::try_from(offset).map_err(|_| ())?;
+    let end = start.checked_add(bytes.len()).ok_or(())?;
+    if end > MAX_FILE_SIZE {
+        return Err(());
+    }
     if data.len() < end {
         data.resize(end, 0);
     }
     data[start..end].copy_from_slice(bytes);
+    Ok(())
 }
 
 /// Read up to `len` bytes of `data` from `offset`, returning (bytes, eof).
 fn read_at(data: &[u8], offset: u64, len: u64) -> (Vec<u8>, bool) {
-    let start = (offset as usize).min(data.len());
-    let end = (start + len as usize).min(data.len());
+    let start = usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .min(data.len());
+    let len = usize::try_from(len).unwrap_or(usize::MAX);
+    let end = start.saturating_add(len).min(data.len());
     (data[start..end].to_vec(), end >= data.len())
 }
 
@@ -498,9 +514,15 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
                 let Some(Node::File(data)) = g.nodes.get_mut(&node) else {
                     return err(ErrorCode::NoEntry);
                 };
-                write_at(data, offset, &buf);
+                if write_at(data, offset, &buf).is_err() {
+                    return err(ErrorCode::FileTooLarge);
+                }
             }
-            Kind::Shared(sh) => write_at(&mut sh.lock().unwrap(), offset, &buf),
+            Kind::Shared(sh) => {
+                if write_at(&mut sh.lock().unwrap(), offset, &buf).is_err() {
+                    return err(ErrorCode::FileTooLarge);
+                }
+            }
             Kind::Host(p) => {
                 if host_write_at(&p, offset, &buf).is_err() {
                     return err(ErrorCode::Io);
@@ -604,15 +626,19 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         size: Filesize,
     ) -> Result<std::result::Result<(), ErrorCode>> {
         let (fs, node) = self.fd_fs(&fd)?;
+        let size = match usize::try_from(size) {
+            Ok(s) if s <= MAX_FILE_SIZE => s,
+            _ => return err(ErrorCode::FileTooLarge),
+        };
         match Self::kind(&fs, node) {
             Kind::File => {
                 if let Some(Node::File(data)) = fs.lock().unwrap().nodes.get_mut(&node) {
-                    data.resize(size as usize, 0);
+                    data.resize(size, 0);
                 }
                 Ok(Ok(()))
             }
             Kind::Shared(sh) => {
-                sh.lock().unwrap().resize(size as usize, 0);
+                sh.lock().unwrap().resize(size, 0);
                 Ok(Ok(()))
             }
             Kind::Host(p) => {
@@ -621,7 +647,7 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
                     .create(true)
                     .truncate(false)
                     .open(&p)
-                    .and_then(|f| f.set_len(size))
+                    .and_then(|f| f.set_len(size as u64))
                 {
                     Ok(()) => Ok(Ok(())),
                     Err(_) => err(ErrorCode::Io),
@@ -970,5 +996,69 @@ mod tests {
         assert!(resolve(&fs.lock().unwrap(), ROOT, "/h").is_none());
         assert_eq!(std::fs::read(&path).unwrap(), b"changed!");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- property-based: the guest-controlled offset/len arithmetic ----
+    //
+    // `read_at`/`write_at` take a fully guest-controlled `u64` offset and length.
+    // These properties pin the invariants that a guest cannot panic the host or
+    // force an unbounded allocation, across the whole `u64` range.
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// `read_at` is total: for *any* offset/len it never panics and returns
+        /// exactly the contiguous run of `data` starting at `offset` (clamped to
+        /// the file), with a correct EOF flag. Guards the former `start + len`
+        /// overflow that panicked on e.g. `offset = 1, len = u64::MAX`.
+        #[test]
+        fn read_at_is_total(
+            data in prop::collection::vec(any::<u8>(), 0..512),
+            offset in any::<u64>(),
+            len in any::<u64>(),
+        ) {
+            let (bytes, eof) = read_at(&data, offset, len);
+
+            // Independent oracle: a contiguous slice from the clamped start.
+            let expected: &[u8] = if offset < data.len() as u64 {
+                let start = offset as usize;
+                let take = usize::try_from(len).unwrap_or(usize::MAX).min(data.len() - start);
+                &data[start..start + take]
+            } else {
+                &[]
+            };
+            prop_assert_eq!(&bytes[..], expected);
+            prop_assert!(bytes.len() as u64 <= len);
+            prop_assert_eq!(eof, offset as usize + expected.len() >= data.len()
+                || offset >= data.len() as u64);
+        }
+
+        /// A write that fits under the cap is readable back byte-for-byte and never
+        /// grows the file past [`MAX_FILE_SIZE`].
+        #[test]
+        fn write_at_within_cap_round_trips(
+            mut data in prop::collection::vec(any::<u8>(), 0..256),
+            offset in 0u64..8192,
+            payload in prop::collection::vec(any::<u8>(), 0..256),
+        ) {
+            write_at(&mut data, offset, &payload).expect("small write is under the cap");
+            prop_assert!(data.len() <= MAX_FILE_SIZE);
+            let (read, _) = read_at(&data, offset, payload.len() as u64);
+            prop_assert_eq!(read, payload);
+        }
+
+        /// A write whose end exceeds the cap (or overflows `usize`) is rejected and
+        /// leaves the file untouched — no giant `Vec::resize` allocation. Directly
+        /// guards the `write(offset = 2^48)` process-abort DoS.
+        #[test]
+        fn write_at_rejects_oversized_offset(
+            mut data in prop::collection::vec(any::<u8>(), 0..64),
+            offset in (MAX_FILE_SIZE as u64)..=u64::MAX,
+            payload in prop::collection::vec(any::<u8>(), 1..16),
+        ) {
+            let before = data.clone();
+            prop_assert!(write_at(&mut data, offset, &payload).is_err());
+            prop_assert_eq!(data, before);
+        }
     }
 }

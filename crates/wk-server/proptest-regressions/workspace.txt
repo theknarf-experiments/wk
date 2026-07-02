@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc fd869b7ac63e48bcf06045b67ee12de2399b16d4619eed3a4f367f7119fc0db4 # shrinks to doc = Document { dependencies: [], workspaces: [Workspace { id: NodeId(00000000000000000000000000), nodes: [], virtual_files: [], host_files: [NodeState { name: "", id: NodeId(00000000000000000000000000), pos: [0.0, 0.0], size: [0.0, 0.0], options: [], args: ["-.0"] }], host_ports: [], connections: [], midi: [], serves: [], nets: [], net_links: [] }] }

@@ -18,7 +18,7 @@ mod node_id;
 pub use node_id::NodeId;
 
 /// A connection wire, identified by the two node ids it joins (by kind).
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Wire {
     /// A file node (`file_id`) mounted into an app node (`app_id`).
     File(NodeId, NodeId),

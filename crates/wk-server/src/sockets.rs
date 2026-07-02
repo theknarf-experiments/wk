@@ -82,6 +82,9 @@ pub struct Net;
 /// start/finish dance needs.
 pub struct TcpSock {
     handle: SocketHandle,
+    /// Generation of `handle` at creation, to detect slot recycling (see
+    /// `NodeStack::is_current`). Copied onto derived streams/pollables.
+    gen: u64,
     family: IpAddressFamily,
     /// Port set by `start-bind`, used by `start-listen`.
     bound_port: u16,
@@ -201,6 +204,8 @@ fn host_pump(mut stream: std::net::TcpStream, incoming: SharedPipe, outgoing: Sh
 /// wasi's bind/stream dance needs.
 pub struct UdpSock {
     handle: SocketHandle,
+    /// Generation of `handle` at creation (see `NodeStack::is_current`).
+    gen: u64,
     family: IpAddressFamily,
     /// Port set by `start-bind` / chosen at `finish-bind`.
     bound_port: u16,
@@ -216,6 +221,7 @@ pub struct UdpSock {
 pub struct Datagrams {
     stack: SharedStack,
     handle: SocketHandle,
+    gen: u64,
     remote: Option<IpSocketAddress>,
 }
 
@@ -310,6 +316,7 @@ enum Want {
 struct SockPollable {
     stack: SharedStack,
     want: Want,
+    gen: u64,
 }
 
 #[async_trait]
@@ -318,6 +325,7 @@ impl Pollable for SockPollable {
         WantReady {
             stack: self.stack.clone(),
             want: self.want,
+            gen: self.gen,
         }
         .await
     }
@@ -326,6 +334,7 @@ impl Pollable for SockPollable {
 struct WantReady {
     stack: SharedStack,
     want: Want,
+    gen: u64,
 }
 
 impl Future for WantReady {
@@ -335,9 +344,10 @@ impl Future for WantReady {
         let handle = match self.want {
             Want::Event(h) | Want::Read(h) | Want::Write(h) => h,
         };
-        // The socket was reaped (its owner dropped): resolve so the awaiter
-        // unblocks and the following operation sees the closed socket.
-        if !g.is_live(handle) {
+        // The socket was reaped (its owner dropped) or its slot was recycled:
+        // resolve so the awaiter unblocks and the following operation sees the
+        // closed socket, rather than polling an unrelated socket in the slot.
+        if !g.is_current(handle, self.gen) {
             return Poll::Ready(());
         }
         let ready = {
@@ -364,13 +374,14 @@ impl Future for WantReady {
 struct UdpReady {
     stack: SharedStack,
     handle: SocketHandle,
+    gen: u64,
     send: bool,
 }
 impl Future for UdpReady {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
         let mut g = self.stack.lock().unwrap();
-        if !g.is_live(self.handle) {
+        if !g.is_current(self.handle, self.gen) {
             return Poll::Ready(());
         }
         let s = g.sockets.get::<udp::Socket>(self.handle);
@@ -391,6 +402,7 @@ impl Future for UdpReady {
 struct UdpStreamPollable {
     stack: SharedStack,
     handle: SocketHandle,
+    gen: u64,
     send: bool,
 }
 #[async_trait]
@@ -399,6 +411,7 @@ impl Pollable for UdpStreamPollable {
         UdpReady {
             stack: self.stack.clone(),
             handle: self.handle,
+            gen: self.gen,
             send: self.send,
         }
         .await
@@ -415,6 +428,7 @@ impl Pollable for ReadyNow {
 struct TcpInput {
     stack: SharedStack,
     handle: SocketHandle,
+    gen: u64,
 }
 
 #[async_trait]
@@ -423,6 +437,7 @@ impl Pollable for TcpInput {
         WantReady {
             stack: self.stack.clone(),
             want: Want::Read(self.handle),
+            gen: self.gen,
         }
         .await
     }
@@ -431,7 +446,7 @@ impl Pollable for TcpInput {
 impl InputStream for TcpInput {
     fn read(&mut self, size: usize) -> StreamResult<Bytes> {
         let mut g = self.stack.lock().unwrap();
-        if !g.is_live(self.handle) {
+        if !g.is_current(self.handle, self.gen) {
             return Err(StreamError::Closed);
         }
         let s = g.sockets.get_mut::<tcp::Socket>(self.handle);
@@ -451,6 +466,7 @@ impl InputStream for TcpInput {
 struct TcpOutput {
     stack: SharedStack,
     handle: SocketHandle,
+    gen: u64,
 }
 
 #[async_trait]
@@ -459,6 +475,7 @@ impl Pollable for TcpOutput {
         WantReady {
             stack: self.stack.clone(),
             want: Want::Write(self.handle),
+            gen: self.gen,
         }
         .await
     }
@@ -467,7 +484,7 @@ impl Pollable for TcpOutput {
 impl OutputStream for TcpOutput {
     fn check_write(&mut self) -> StreamResult<usize> {
         let mut g = self.stack.lock().unwrap();
-        if !g.is_live(self.handle) {
+        if !g.is_current(self.handle, self.gen) {
             return Err(StreamError::Closed);
         }
         let s = g.sockets.get_mut::<tcp::Socket>(self.handle);
@@ -481,7 +498,7 @@ impl OutputStream for TcpOutput {
             return Ok(());
         }
         let mut g = self.stack.lock().unwrap();
-        if !g.is_live(self.handle) {
+        if !g.is_current(self.handle, self.gen) {
             return Err(StreamError::Closed);
         }
         let s = g.sockets.get_mut::<tcp::Socket>(self.handle);
@@ -636,18 +653,19 @@ impl wasi::sockets::tcp_create_socket::Host for HostState {
         let Some(stack) = self.stack() else {
             return Ok(Err(ErrorCode::AccessDenied));
         };
-        let handle = {
+        let (handle, gen) = {
             let sock = tcp::Socket::new(
                 tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
                 tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
             );
             let mut g = stack.lock().unwrap();
             let h = g.sockets.add(sock);
-            g.track(h);
-            h
+            let gen = g.track(h);
+            (h, gen)
         };
         Ok(Ok(self.table().push(TcpSock {
             handle,
+            gen,
             family,
             bound_port: 0,
             local: None,
@@ -759,7 +777,10 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
         let Some(stack) = self.stack() else {
             return Ok(Err(ErrorCode::AccessDenied));
         };
-        let handle = self.table().get(&this)?.handle;
+        let (handle, gen) = {
+            let s = self.table().get(&this)?;
+            (s.handle, s.gen)
+        };
         let state = stack
             .lock()
             .unwrap()
@@ -771,8 +792,9 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
                 let input: DynInputStream = Box::new(TcpInput {
                     stack: stack.clone(),
                     handle,
+                    gen,
                 });
-                let output: DynOutputStream = Box::new(TcpOutput { stack, handle });
+                let output: DynOutputStream = Box::new(TcpOutput { stack, handle, gen });
                 let i = self.table().push(input)?;
                 let o = self.table().push(output)?;
                 Ok(Ok((i, o)))
@@ -829,9 +851,9 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
         let Some(stack) = self.stack() else {
             return Ok(Err(ErrorCode::AccessDenied));
         };
-        let (listen_handle, family, port) = {
+        let (listen_handle, family, port, listen_gen) = {
             let s = self.table().get(&this)?;
-            (s.handle, s.family, s.bound_port)
+            (s.handle, s.family, s.bound_port, s.gen)
         };
         // A peer has connected once the listening socket reaches Established.
         let conn_handle = {
@@ -847,7 +869,7 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
                 tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
             );
             let new_listen = g.sockets.add(fresh);
-            g.track(new_listen);
+            let new_gen = g.track(new_listen);
             if g.sockets
                 .get_mut::<tcp::Socket>(new_listen)
                 .listen(port)
@@ -855,12 +877,17 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
             {
                 return Ok(Err(ErrorCode::Unknown));
             }
-            // Point the listener resource at the new socket.
-            self.table().get_mut(&this)?.handle = new_listen;
+            // Point the listener resource at the new socket. The accepted
+            // connection keeps the listener's original handle+generation (still
+            // live), so its streams below stay valid.
+            let sm = self.table().get_mut(&this)?;
+            sm.handle = new_listen;
+            sm.gen = new_gen;
             listen_handle
         };
         let conn = self.table().push(TcpSock {
             handle: conn_handle,
+            gen: listen_gen,
             family,
             bound_port: port,
             local: None,
@@ -871,10 +898,12 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
         let input: DynInputStream = Box::new(TcpInput {
             stack: stack.clone(),
             handle: conn_handle,
+            gen: listen_gen,
         });
         let output: DynOutputStream = Box::new(TcpOutput {
             stack,
             handle: conn_handle,
+            gen: listen_gen,
         });
         let i = self.table().push(input)?;
         let o = self.table().push(output)?;
@@ -923,10 +952,14 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
             return subscribe(self.table(), p);
         }
         let stack = self.stack().expect("socket exists => has a stack");
-        let handle = self.table().get(&this)?.handle;
+        let (handle, gen) = {
+            let s = self.table().get(&this)?;
+            (s.handle, s.gen)
+        };
         let p = self.table().push(SockPollable {
             stack,
             want: Want::Event(handle),
+            gen,
         })?;
         subscribe(self.table(), p)
     }
@@ -954,11 +987,14 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
         // connections would otherwise leak a socket per connection. The guest is
         // done with it (its byte streams do no I/O after the socket is dropped).
         if let Some(stack) = self.stack() {
-            let handle = self.table().get(&rep)?.handle;
+            let (handle, gen) = {
+                let s = self.table().get(&rep)?;
+                (s.handle, s.gen)
+            };
             let mut g = stack.lock().unwrap();
             // Queue a graceful FIN, then hand the socket to the hub to reap once
             // its pending data and FIN have flushed.
-            if g.is_live(handle) {
+            if g.is_current(handle, gen) {
                 g.sockets.get_mut::<tcp::Socket>(handle).close();
             }
             g.begin_close(handle, crate::netstack::SockKind::Tcp);
@@ -1159,15 +1195,16 @@ impl wasi::sockets::udp_create_socket::Host for HostState {
         let Some(stack) = self.stack() else {
             return Ok(Err(ErrorCode::AccessDenied));
         };
-        let handle = {
+        let (handle, gen) = {
             let sock = udp::Socket::new(udp_packet_buffer(), udp_packet_buffer());
             let mut g = stack.lock().unwrap();
             let h = g.sockets.add(sock);
-            g.track(h);
-            h
+            let gen = g.track(h);
+            (h, gen)
         };
         Ok(Ok(self.table().push(UdpSock {
             handle,
+            gen,
             family,
             bound_port: 0,
             local: None,
@@ -1246,9 +1283,9 @@ impl wasi::sockets::udp::HostUdpSocket for HostState {
         let Some(stack) = self.stack() else {
             return Ok(Err(ErrorCode::AccessDenied));
         };
-        let (handle, bound) = {
+        let (handle, gen, bound) = {
             let s = self.table().get(&this)?;
-            (s.handle, s.bound)
+            (s.handle, s.gen, s.bound)
         };
         if !bound {
             return Ok(Err(ErrorCode::InvalidState));
@@ -1258,11 +1295,13 @@ impl wasi::sockets::udp::HostUdpSocket for HostState {
         let incoming = self.table().push(Datagrams {
             stack: stack.clone(),
             handle,
+            gen,
             remote,
         })?;
         let outgoing = self.table().push(Datagrams {
             stack,
             handle,
+            gen,
             remote,
         })?;
         Ok(Ok((incoming, outgoing)))
@@ -1338,10 +1377,14 @@ impl wasi::sockets::udp::HostUdpSocket for HostState {
     }
     fn subscribe(&mut self, this: Resource<UdpSock>) -> Result<Resource<DynPollable>> {
         let stack = self.stack().expect("socket exists => has a stack");
-        let handle = self.table().get(&this)?.handle;
+        let (handle, gen) = {
+            let s = self.table().get(&this)?;
+            (s.handle, s.gen)
+        };
         let p = self.table().push(UdpStreamPollable {
             stack,
             handle,
+            gen,
             send: true,
         })?;
         subscribe(self.table(), p)
@@ -1367,13 +1410,13 @@ impl wasi::sockets::udp::HostIncomingDatagramStream for HostState {
         this: Resource<Datagrams>,
         max_results: u64,
     ) -> Result<std::result::Result<Vec<wasi::sockets::udp::IncomingDatagram>, ErrorCode>> {
-        let (stack, handle, filter) = {
+        let (stack, handle, gen, filter) = {
             let d = self.table().get(&this)?;
-            (d.stack.clone(), d.handle, d.remote)
+            (d.stack.clone(), d.handle, d.gen, d.remote)
         };
         let mut out = Vec::new();
         let mut g = stack.lock().unwrap();
-        if !g.is_live(handle) {
+        if !g.is_current(handle, gen) {
             return Ok(Ok(out));
         }
         let s = g.sockets.get_mut::<udp::Socket>(handle);
@@ -1399,13 +1442,14 @@ impl wasi::sockets::udp::HostIncomingDatagramStream for HostState {
         Ok(Ok(out))
     }
     fn subscribe(&mut self, this: Resource<Datagrams>) -> Result<Resource<DynPollable>> {
-        let (stack, handle) = {
+        let (stack, handle, gen) = {
             let d = self.table().get(&this)?;
-            (d.stack.clone(), d.handle)
+            (d.stack.clone(), d.handle, d.gen)
         };
         let p = self.table().push(UdpStreamPollable {
             stack,
             handle,
+            gen,
             send: false,
         })?;
         subscribe(self.table(), p)
@@ -1421,12 +1465,12 @@ impl wasi::sockets::udp::HostOutgoingDatagramStream for HostState {
         &mut self,
         this: Resource<Datagrams>,
     ) -> Result<std::result::Result<u64, ErrorCode>> {
-        let (stack, handle) = {
+        let (stack, handle, gen) = {
             let d = self.table().get(&this)?;
-            (d.stack.clone(), d.handle)
+            (d.stack.clone(), d.handle, d.gen)
         };
         let g = stack.lock().unwrap();
-        if !g.is_live(handle) {
+        if !g.is_current(handle, gen) {
             return Ok(Ok(0));
         }
         let can = g.sockets.get::<udp::Socket>(handle).can_send();
@@ -1437,12 +1481,12 @@ impl wasi::sockets::udp::HostOutgoingDatagramStream for HostState {
         this: Resource<Datagrams>,
         datagrams: Vec<wasi::sockets::udp::OutgoingDatagram>,
     ) -> Result<std::result::Result<u64, ErrorCode>> {
-        let (stack, handle, default_remote) = {
+        let (stack, handle, gen, default_remote) = {
             let d = self.table().get(&this)?;
-            (d.stack.clone(), d.handle, d.remote)
+            (d.stack.clone(), d.handle, d.gen, d.remote)
         };
         let mut g = stack.lock().unwrap();
-        if !g.is_live(handle) {
+        if !g.is_current(handle, gen) {
             return Ok(Ok(0));
         }
         let s = g.sockets.get_mut::<udp::Socket>(handle);
@@ -1467,13 +1511,14 @@ impl wasi::sockets::udp::HostOutgoingDatagramStream for HostState {
         Ok(Ok(sent))
     }
     fn subscribe(&mut self, this: Resource<Datagrams>) -> Result<Resource<DynPollable>> {
-        let (stack, handle) = {
+        let (stack, handle, gen) = {
             let d = self.table().get(&this)?;
-            (d.stack.clone(), d.handle)
+            (d.stack.clone(), d.handle, d.gen)
         };
         let p = self.table().push(UdpStreamPollable {
             stack,
             handle,
+            gen,
             send: true,
         })?;
         subscribe(self.table(), p)

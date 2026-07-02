@@ -1490,7 +1490,16 @@ impl App {
         let menu_btn = [fb[0] - menu_btn_w, fb[1] - MENU_H, fb[0], fb[1]];
 
         // Continue an in-progress drag (move / resize / connect).
-        if let Some(d) = self.drag.take() {
+        //
+        // The dragged node can vanish mid-drag — undo of its creation, closing
+        // its workspace, or switching tabs (which filters it out of the
+        // active-workspace view). In that case abandon the drag instead of
+        // indexing a now-missing key in `view.win_pos`/`win_size`.
+        if let Some(d) = self
+            .drag
+            .take()
+            .filter(|d| self.view.win_pos.contains_key(&d.id))
+        {
             match d.mode {
                 DragMode::Move if lmb => {
                     let mc = self.cam.to_canvas(mp);

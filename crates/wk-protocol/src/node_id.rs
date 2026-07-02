@@ -35,6 +35,13 @@ impl NodeId {
     pub fn as_u128(self) -> u128 {
         self.0.as_u128()
     }
+
+    /// Reconstruct an id from a raw 128-bit value (inverse of [`Self::as_u128`]).
+    /// Any `u128` yields a valid id whose 26-char text form round-trips back to
+    /// it, which makes it convenient for deterministic tests.
+    pub fn from_u128(n: u128) -> Self {
+        NodeId(Uuid::from_u128(n))
+    }
 }
 
 impl Default for NodeId {
