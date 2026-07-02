@@ -114,19 +114,3 @@ cargo run -- run
 ```
 
 `scripts/publish-known-set.sh` publishes the bundled plugins as a ready-made set.
-
-## Architecture
-
-Four crates, split so the client/server seam is explicit:
-
-- **`wk-protocol`** — the client↔server contract (the `Command` vocabulary and
-  the `Client` trait), with no knowledge of the server's internals.
-- **`wk-server`** — the authoritative backend: the wasm runtime, the per-node
-  in-memory `wasi:filesystem`, the userspace network fabric (`wasi:sockets` over
-  smoltcp), audio, MIDI, HTTP serving, and `.wk` persistence.
-- **`wk-token-service`** — mints [Biscuit](https://www.biscuitsec.org/) tokens
-  granting operations; the server only verifies, clients only bear them.
-- **`client-local-ui`** — the wgpu/winit window that renders the canvas and
-  drives the server, plus the headless client.
-
-The root `wk` binary is just the CLI that ties them together.
