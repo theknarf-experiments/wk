@@ -334,10 +334,17 @@ pub struct Server {
 
     /// Canvas file nodes (in-memory or disk-backed) wired into apps.
     pub file_nodes: HashMap<NodeId, FileNode>,
-    /// File connections as (file id, app node id).
+    /// Desired file connections as (file id, app node id).
     pub connections: Vec<(NodeId, NodeId)>,
-    /// MIDI connections as (source node id, destination node id).
+    /// Active file mounts: (file, app) -> (mount name, the app's fs). Stores the
+    /// name+fs so a mount can be torn down even after either node is gone.
+    /// Mirrors `connections`; reconciled by `sync_mounts`.
+    mounted: HashMap<(NodeId, NodeId), (String, crate::vfs::SharedFs)>,
+    /// Desired MIDI connections as (source node id, destination node id).
     pub midi_links: Vec<(NodeId, NodeId)>,
+    /// Active MIDI routes: (src, dst) currently in the router. Mirrors
+    /// `midi_links`; reconciled by `sync_midi`.
+    routed: HashSet<(NodeId, NodeId)>,
     /// HostPort nodes (canvas id -> localhost port).
     pub host_ports: HashMap<NodeId, u16>,
     /// Desired serve wiring: (http node id, HostPort id). This is the source of
@@ -377,7 +384,9 @@ impl Server {
             node_args: HashMap::new(),
             file_nodes: HashMap::new(),
             connections: Vec::new(),
+            mounted: HashMap::new(),
             midi_links: Vec::new(),
+            routed: HashSet::new(),
             host_ports: HashMap::new(),
             serve_links: Vec::new(),
             serves: HashMap::new(),
@@ -463,27 +472,18 @@ impl Server {
                 .insert(f.id, FileNode::HostMapped(HostMappedFile { name, path }));
         }
 
-        // Re-wire file connections: mount each file into its connected app's fs.
+        // Record desired file connections; `sync_mounts` (below) applies them.
         for &(file_id, app_id) in &saved.connections {
-            let (Some(file), Some(app)) = (self.file_nodes.get(&file_id), self.app_node(app_id))
-            else {
-                continue;
-            };
-            file.mount(&app.fs);
-            self.connections.push((file_id, app_id));
+            if self.file_nodes.contains_key(&file_id) && self.app_node(app_id).is_some() {
+                self.connections.push((file_id, app_id));
+            }
         }
 
-        // Re-wire MIDI connections through the router.
+        // Record desired MIDI connections; `sync_midi` (below) routes them.
         for &(src, dst) in &saved.midi {
-            let (Some(_), Some(dst_node)) = (self.app_node(src), self.app_node(dst)) else {
-                continue;
-            };
-            self.host
-                .midi()
-                .lock()
-                .unwrap()
-                .connect(src, dst, dst_node.midi_in.clone());
-            self.midi_links.push((src, dst));
+            if self.app_node(src).is_some() && self.app_node(dst).is_some() {
+                self.midi_links.push((src, dst));
+            }
         }
 
         // HostPort nodes: recreate at their saved positions and ports.
@@ -520,6 +520,10 @@ impl Server {
                 self.toggle_net(app_id, net_id);
             }
         }
+
+        // Apply the recorded file/MIDI wiring now that every node is placed.
+        self.sync_mounts();
+        self.sync_midi();
     }
 
     /// Record a node's base fact: kind, workspace, and canvas geometry.
@@ -954,47 +958,66 @@ impl Server {
     }
 
     /// Wire (or unwire) file node `file_id` into app node `app_id`'s filesystem.
+    /// Updates the desired `connections` relation; the mount itself is applied by
+    /// [`Self::sync_mounts`].
     fn toggle_file(&mut self, file_id: NodeId, app_id: NodeId) {
-        let Some(app) = self.app_node(app_id) else {
-            return;
-        };
-        let connected = wiring::toggle_pair(&mut self.connections, file_id, app_id);
-        if let Some(file) = self.file_nodes.get(&file_id) {
-            if connected {
-                file.mount(&app.fs);
-            } else {
-                crate::vfs::unmount_file(&app.fs, file.name());
+        wiring::toggle_pair(&mut self.connections, file_id, app_id);
+        self.sync_mounts();
+    }
+
+    /// Reconcile the actual file mounts against the desired `connections`: mount
+    /// each newly-wired file into its app's fs, unmount ones no longer wired.
+    /// Idempotent; runs after any connection change and once per tick.
+    fn sync_mounts(&mut self) {
+        let active: HashSet<(NodeId, NodeId)> = self.mounted.keys().copied().collect();
+        let plan = wiring::reconcile_links(&self.connections, &active);
+        for pair in plan.remove {
+            if let Some((name, fs)) = self.mounted.remove(&pair) {
+                crate::vfs::unmount_file(&fs, &name);
             }
+        }
+        for (file, app) in plan.add {
+            let (Some(f), Some(node)) = (self.file_nodes.get(&file), self.app_node(app)) else {
+                continue; // a node isn't resolvable yet — retried next reconcile
+            };
+            let name = f.name().to_string();
+            f.mount(&node.fs);
+            self.mounted.insert((file, app), (name, node.fs.clone()));
         }
     }
 
     /// Wire (or unwire) app node `src`'s MIDI output into app node `dst`'s input.
+    /// Updates the desired `midi_links` relation; routing is applied by
+    /// [`Self::sync_midi`].
     fn toggle_midi(&mut self, src: NodeId, dst: NodeId) {
-        let (Some(_src), Some(dst_node)) = (self.app_node(src), self.app_node(dst)) else {
-            return;
-        };
+        wiring::toggle_pair(&mut self.midi_links, src, dst);
+        self.sync_midi();
+    }
+
+    /// Reconcile the MIDI router against the desired `midi_links`: add each new
+    /// route (once its destination exists), drop routes no longer wired.
+    fn sync_midi(&mut self) {
+        let plan = wiring::reconcile_links(&self.midi_links, &self.routed);
         let router = self.host.midi();
         let mut routes = router.lock().unwrap();
-        if wiring::toggle_pair(&mut self.midi_links, src, dst) {
-            routes.connect(src, dst, dst_node.midi_in.clone());
-        } else {
+        for (src, dst) in plan.remove {
             routes.disconnect(src, dst);
+            self.routed.remove(&(src, dst));
+        }
+        for (src, dst) in plan.add {
+            if let Some(dst_node) = self.app_node(dst) {
+                routes.connect(src, dst, dst_node.midi_in.clone());
+                self.routed.insert((src, dst));
+            }
         }
     }
 
-    /// Remove a file node, unmounting it from every app it was connected to.
+    /// Remove a file node; `sync_mounts` unmounts it from every app it was
+    /// connected to (using the stored mount handles, so it works after the node
+    /// is gone).
     fn remove_file_node(&mut self, id: NodeId) {
-        let Some(file) = self.file_nodes.remove(&id) else {
-            return;
-        };
-        let nodes = self.node_reg.lock().unwrap().clone();
-        for &(f, a) in self.connections.iter().filter(|&&(f, _)| f == id) {
-            let _ = f;
-            if let Some(app) = nodes.iter().find(|n| n.id == a) {
-                crate::vfs::unmount_file(&app.fs, file.name());
-            }
-        }
         self.connections.retain(|&(f, _)| f != id);
+        self.sync_mounts();
         self.forget(id);
     }
 
@@ -1061,6 +1084,8 @@ impl Server {
     /// One server step: reconcile any wiring that was pending on a still-loading
     /// node. Cheap; a client calls it each frame, headless in its tick loop.
     pub fn tick(&mut self) {
+        self.sync_mounts();
+        self.sync_midi();
         self.sync_net_membership();
         self.sync_serves();
     }
@@ -1085,15 +1110,16 @@ impl Server {
             false
         });
         self.node_reg.lock().unwrap().retain(|x| x.id != id);
+        // Drop every wire touching this node from the desired relations, then
+        // reconcile so the corresponding effects (mounts, routes, servers) are
+        // torn down. (Its net stack was already detached above.)
         self.connections.retain(|&(_, app)| app != id);
         self.net_links.retain(|&(app, _)| app != id);
-        self.host.midi().lock().unwrap().remove_node(id);
         self.midi_links.retain(|&(s, d)| s != id && d != id);
-        // Drop any serve wire touching this node (as http server or HostPort) and
-        // reconcile so its running server, if any, is stopped.
         self.serve_links.retain(|&(h, hp)| h != id && hp != id);
+        self.sync_mounts();
+        self.sync_midi();
         self.sync_serves();
-        self.node_args.remove(&id);
         self.forget(id);
     }
 

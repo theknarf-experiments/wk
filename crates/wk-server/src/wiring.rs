@@ -122,6 +122,39 @@ pub fn reconcile_serves(
     ServePlan { stop, start }
 }
 
+/// A plain set-diff plan for link-driven effects (file mounts, MIDI routes):
+/// which desired links aren't applied yet, and which applied links are no longer
+/// desired. Simpler than [`ServePlan`] — these effects have no readiness or
+/// one-per constraint, so it's a pure set difference.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct LinkPlan {
+    /// Desired but not active — apply the effect (mount / route).
+    pub add: Vec<(NodeId, NodeId)>,
+    /// Active but no longer desired — tear it down (unmount / unroute).
+    pub remove: Vec<(NodeId, NodeId)>,
+}
+
+/// Diff a desired link list against the set currently applied. The caller
+/// performs the effects; a desired link whose node isn't resolvable yet simply
+/// stays in `add` and is retried on the next reconcile.
+pub fn reconcile_links(
+    desired: &[(NodeId, NodeId)],
+    active: &HashSet<(NodeId, NodeId)>,
+) -> LinkPlan {
+    let want: HashSet<(NodeId, NodeId)> = desired.iter().copied().collect();
+    let add = want
+        .iter()
+        .copied()
+        .filter(|p| !active.contains(p))
+        .collect();
+    let remove = active
+        .iter()
+        .copied()
+        .filter(|p| !want.contains(p))
+        .collect();
+    LinkPlan { add, remove }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +326,51 @@ mod tests {
             let serve_links: Vec<(NodeId, NodeId)> = links.iter().map(|(&h, &hp)| (h, hp)).collect();
             let plan = reconcile_serves(&serve_links, &links);
             prop_assert_eq!(plan, ServePlan::default());
+        }
+
+        /// A link plan only adds desired-but-inactive links and only removes
+        /// active-but-undesired ones, with no overlap.
+        #[test]
+        fn link_plan_is_well_formed(
+            desired in prop::collection::vec((any_id(), any_id()), 0..8),
+            active in prop::collection::hash_set((any_id(), any_id()), 0..8),
+        ) {
+            let want: HashSet<(NodeId, NodeId)> = desired.iter().copied().collect();
+            let plan = reconcile_links(&desired, &active);
+            for p in &plan.add {
+                prop_assert!(want.contains(p) && !active.contains(p));
+            }
+            for p in &plan.remove {
+                prop_assert!(active.contains(p) && !want.contains(p));
+            }
+        }
+
+        /// Applying the plan (add the adds, drop the removes) makes the active set
+        /// exactly the desired set — reconcile converges in one pass.
+        #[test]
+        fn applying_link_plan_reaches_desired_state(
+            desired in prop::collection::vec((any_id(), any_id()), 0..8),
+            active in prop::collection::hash_set((any_id(), any_id()), 0..8),
+        ) {
+            let plan = reconcile_links(&desired, &active);
+            let mut result = active.clone();
+            for p in &plan.remove {
+                result.remove(p);
+            }
+            for p in &plan.add {
+                result.insert(*p);
+            }
+            let want: HashSet<(NodeId, NodeId)> = desired.iter().copied().collect();
+            prop_assert_eq!(result, want);
+        }
+
+        /// Reconciling an already-consistent set proposes no changes.
+        #[test]
+        fn link_reconcile_is_idempotent_at_fixpoint(
+            active in prop::collection::hash_set((any_id(), any_id()), 0..8),
+        ) {
+            let desired: Vec<(NodeId, NodeId)> = active.iter().copied().collect();
+            prop_assert_eq!(reconcile_links(&desired, &active), LinkPlan::default());
         }
     }
 }
