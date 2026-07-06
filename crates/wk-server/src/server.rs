@@ -313,6 +313,40 @@ pub struct NodeRec {
     pub size: [f32; 2],
 }
 
+/// The workspace **graph**: the base facts that make up the document — every
+/// node, its per-node data, the wiring between nodes, the workspace tabs, and the
+/// launchable dependencies. This is the persisted, syncable source of truth; the
+/// runtime it drives (live wasm nodes, active effects, undo) lives on [`Server`].
+///
+/// Both [`Server::view`] (client snapshot) and [`Server::save`] (`.wk` file)
+/// project from *this* — there is one representation of the facts.
+#[derive(Default)]
+pub struct Graph {
+    /// Every placed node's base record (kind + workspace + canvas geometry),
+    /// keyed by node id. One row per node, kind explicit.
+    pub nodes: HashMap<NodeId, NodeRec>,
+    /// Per-node launch args (argv after the program name). Side table keyed by id.
+    pub node_args: HashMap<NodeId, Vec<String>>,
+    /// Canvas file nodes (in-memory or disk-backed) wired into apps.
+    pub file_nodes: HashMap<NodeId, FileNode>,
+    /// HostPort nodes (canvas id -> localhost port).
+    pub host_ports: HashMap<NodeId, u16>,
+
+    /// File connections as (file id, app node id).
+    pub connections: Vec<(NodeId, NodeId)>,
+    /// MIDI connections as (source node id, destination node id).
+    pub midi_links: Vec<(NodeId, NodeId)>,
+    /// Serve wiring: (http node id, HostPort id).
+    pub serve_links: Vec<(NodeId, NodeId)>,
+    /// Network membership wires, as (app node id, Network node id).
+    pub net_links: Vec<(NodeId, NodeId)>,
+
+    /// The workspaces (tabs) in this document, in order — including empty ones.
+    pub workspaces: Vec<NodeId>,
+    /// The workspace's launchable dependencies.
+    pub available: Vec<Dependency>,
+}
+
 /// The authoritative running workspace. See the module docs.
 pub struct Server {
     pub host: PluginHost,
@@ -320,46 +354,24 @@ pub struct Server {
     pub registry: SurfaceRegistry,
     /// Live wasm nodes.
     pub node_reg: NodeRegistry,
-    /// The workspace's launchable dependencies.
-    pub available: Vec<Dependency>,
     /// The `.wk` file this workspace loads from and saves back to.
     workspace_path: PathBuf,
 
-    /// Every placed node's base record (kind + workspace + canvas geometry),
-    /// keyed by node id. Replaces the old parallel win_pos/win_size/node_ws/
-    /// net_nodes/gateways maps — one row per node, kind made explicit.
-    pub nodes: HashMap<NodeId, NodeRec>,
-    /// Per-node launch args (argv after the program name). Side table keyed by id.
-    pub node_args: HashMap<NodeId, Vec<String>>,
+    /// The base facts (see [`Graph`]).
+    pub graph: Graph,
 
-    /// Canvas file nodes (in-memory or disk-backed) wired into apps.
-    pub file_nodes: HashMap<NodeId, FileNode>,
-    /// Desired file connections as (file id, app node id).
-    pub connections: Vec<(NodeId, NodeId)>,
+    // ---- runtime state derived from `graph` (not persisted, not synced) ----
     /// Active file mounts: (file, app) -> (mount name, the app's fs). Stores the
     /// name+fs so a mount can be torn down even after either node is gone.
-    /// Mirrors `connections`; reconciled by `sync_mounts`.
+    /// Mirrors `graph.connections`; reconciled by `sync_mounts`.
     mounted: HashMap<(NodeId, NodeId), (String, crate::vfs::SharedFs)>,
-    /// Desired MIDI connections as (source node id, destination node id).
-    pub midi_links: Vec<(NodeId, NodeId)>,
     /// Active MIDI routes: (src, dst) currently in the router. Mirrors
-    /// `midi_links`; reconciled by `sync_midi`.
+    /// `graph.midi_links`; reconciled by `sync_midi`.
     routed: HashSet<(NodeId, NodeId)>,
-    /// HostPort nodes (canvas id -> localhost port).
-    pub host_ports: HashMap<NodeId, u16>,
-    /// Desired serve wiring: (http node id, HostPort id). This is the source of
-    /// truth for save/undo/UI — it survives even while the http node is still
-    /// compiling and thus can't be bound yet (see `serves`).
-    pub serve_links: Vec<(NodeId, NodeId)>,
     /// Currently *running* servers: http node id -> (HostPort id, kill switch).
-    /// A subset of `serve_links` — an entry appears only once the node is a ready
-    /// wasi:http node and the port bound. Reconciled by `sync_serves`.
+    /// A subset of `graph.serve_links` — an entry appears only once the node is a
+    /// ready wasi:http node and the port bound. Reconciled by `sync_serves`.
     pub serves: HashMap<NodeId, (NodeId, Arc<AtomicBool>)>,
-    /// Network membership wires, as (app node id, Network node id).
-    pub net_links: Vec<(NodeId, NodeId)>,
-
-    /// The workspaces (tabs) in this document, in order — including empty ones.
-    pub workspaces: Vec<NodeId>,
 
     /// Inverse-command history for [`Command::Undo`].
     undo: Vec<Undo>,
@@ -378,20 +390,15 @@ impl Server {
             host,
             registry: Arc::new(Mutex::new(Vec::new())),
             node_reg: Arc::new(Mutex::new(Vec::new())),
-            available: doc.dependencies.clone(),
             workspace_path: path,
-            nodes: HashMap::new(),
-            node_args: HashMap::new(),
-            file_nodes: HashMap::new(),
-            connections: Vec::new(),
+            graph: Graph {
+                available: doc.dependencies.clone(),
+                workspaces: doc.workspaces.iter().map(|w| w.id).collect(),
+                ..Graph::default()
+            },
             mounted: HashMap::new(),
-            midi_links: Vec::new(),
             routed: HashSet::new(),
-            host_ports: HashMap::new(),
-            serve_links: Vec::new(),
             serves: HashMap::new(),
-            net_links: Vec::new(),
-            workspaces: doc.workspaces.iter().map(|w| w.id).collect(),
             undo: Vec::new(),
             next_port: 8080,
             file_seq: 0,
@@ -408,7 +415,13 @@ impl Server {
     fn instantiate(&mut self, saved: &Workspace) {
         // App nodes: resolve the dependency by name, spawn with the saved id.
         for n in &saved.nodes {
-            let Some(dep) = self.available.iter().find(|d| d.name == n.name).cloned() else {
+            let Some(dep) = self
+                .graph
+                .available
+                .iter()
+                .find(|d| d.name == n.name)
+                .cloned()
+            else {
                 eprintln!(
                     "workspace references unknown dependency {:?}; skipping",
                     n.name
@@ -432,7 +445,7 @@ impl Server {
             ) {
                 Ok(()) => {
                     self.place(n.id, Kind::App, saved.id, n.pos, n.size);
-                    self.node_args.insert(n.id, args);
+                    self.graph.node_args.insert(n.id, args);
                 }
                 Err(e) => eprintln!("failed to restore {}: {e:#}", dep.name),
             }
@@ -448,7 +461,7 @@ impl Server {
             {
                 self.file_seq = self.file_seq.max(num);
             }
-            self.file_nodes.insert(
+            self.graph.file_nodes.insert(
                 f.id,
                 FileNode::Virtual(VirtualFile {
                     name: f.name.clone(),
@@ -468,21 +481,22 @@ impl Server {
             {
                 self.host_seq = self.host_seq.max(num);
             }
-            self.file_nodes
+            self.graph
+                .file_nodes
                 .insert(f.id, FileNode::HostMapped(HostMappedFile { name, path }));
         }
 
         // Record desired file connections; `sync_mounts` (below) applies them.
         for &(file_id, app_id) in &saved.connections {
-            if self.file_nodes.contains_key(&file_id) && self.app_node(app_id).is_some() {
-                self.connections.push((file_id, app_id));
+            if self.graph.file_nodes.contains_key(&file_id) && self.app_node(app_id).is_some() {
+                self.graph.connections.push((file_id, app_id));
             }
         }
 
         // Record desired MIDI connections; `sync_midi` (below) routes them.
         for &(src, dst) in &saved.midi {
             if self.app_node(src).is_some() && self.app_node(dst).is_some() {
-                self.midi_links.push((src, dst));
+                self.graph.midi_links.push((src, dst));
             }
         }
 
@@ -490,7 +504,7 @@ impl Server {
         for hp in &saved.host_ports {
             self.next_port = self.next_port.max(hp.port.saturating_add(1));
             self.place(hp.id, Kind::Port, saved.id, hp.pos, hp.size);
-            self.host_ports.insert(hp.id, hp.port);
+            self.graph.host_ports.insert(hp.id, hp.port);
         }
 
         // Record serve wiring as desired state. The http nodes are still
@@ -500,8 +514,9 @@ impl Server {
         // published until compilation finishes — issue that lost serve wires on
         // every load.)
         for &(http_id, hostport_id) in &saved.serves {
-            if self.app_node(http_id).is_some() && self.host_ports.contains_key(&hostport_id) {
-                self.serve_links.push((http_id, hostport_id));
+            if self.app_node(http_id).is_some() && self.graph.host_ports.contains_key(&hostport_id)
+            {
+                self.graph.serve_links.push((http_id, hostport_id));
             }
         }
 
@@ -528,7 +543,7 @@ impl Server {
 
     /// Record a node's base fact: kind, workspace, and canvas geometry.
     fn place(&mut self, id: NodeId, kind: Kind, ws: NodeId, pos: [f32; 2], size: [f32; 2]) {
-        self.nodes.insert(
+        self.graph.nodes.insert(
             id,
             NodeRec {
                 kind,
@@ -541,7 +556,7 @@ impl Server {
 
     /// This node's kind, if it exists.
     fn kind_of(&self, id: NodeId) -> Option<Kind> {
-        self.nodes.get(&id).map(|n| n.kind)
+        self.graph.nodes.get(&id).map(|n| n.kind)
     }
 
     /// Whether `id` is a Network or Gateway node.
@@ -561,7 +576,7 @@ impl Server {
     /// Every live canvas node id (app, file, port, network), for a client to
     /// reconcile its stacking order against.
     pub fn node_ids(&self) -> Vec<NodeId> {
-        self.nodes.keys().copied().collect()
+        self.graph.nodes.keys().copied().collect()
     }
 
     /// The live app node with id `id`, if it is an app (not a file) node.
@@ -590,7 +605,7 @@ impl Server {
             return;
         }
         self.place(id, Kind::App, ws, pos, [360.0, 260.0]);
-        self.node_args.insert(id, dep.args.clone());
+        self.graph.node_args.insert(id, dep.args.clone());
     }
 
     /// Create a new, empty in-memory VirtualFile node at `pos` in workspace `ws`.
@@ -598,7 +613,7 @@ impl Server {
         self.file_seq += 1;
         let id = self.alloc_id();
         self.place(id, Kind::File, ws, pos, [FILE_W, FILE_H]);
-        self.file_nodes.insert(
+        self.graph.file_nodes.insert(
             id,
             FileNode::Virtual(VirtualFile {
                 name: format!("file{}", self.file_seq),
@@ -622,7 +637,8 @@ impl Server {
             eprintln!("failed to create host file {}: {e}", path.display());
         }
         self.place(id, Kind::File, ws, pos, [FILE_W, FILE_H]);
-        self.file_nodes
+        self.graph
+            .file_nodes
             .insert(id, FileNode::HostMapped(HostMappedFile { name, path }));
     }
 
@@ -632,7 +648,7 @@ impl Server {
         let port = self.next_port;
         self.next_port = self.next_port.wrapping_add(1).max(8080);
         self.place(id, Kind::Port, ws, pos, [FILE_W, FILE_H]);
-        self.host_ports.insert(id, port);
+        self.graph.host_ports.insert(id, port);
     }
 
     /// Create a Network node at `pos`; returns its id.
@@ -650,24 +666,31 @@ impl Server {
 
     /// Register a new (empty) workspace tab with a client-minted id.
     fn add_workspace(&mut self, id: NodeId) {
-        if !self.workspaces.contains(&id) {
-            self.workspaces.push(id);
+        if !self.graph.workspaces.contains(&id) {
+            self.graph.workspaces.push(id);
         }
     }
 
     /// Duplicate a node into the same workspace at an offset. App nodes are
     /// relaunched with their current args + knob settings; wiring isn't copied.
     fn duplicate(&mut self, id: NodeId) {
-        let Some(&NodeRec { ws, pos, size, .. }) = self.nodes.get(&id) else {
+        let Some(&NodeRec { ws, pos, size, .. }) = self.graph.nodes.get(&id) else {
             return;
         };
         let off = [pos[0] + 40.0, pos[1] + 40.0];
 
         if let Some(node) = self.app_node(id) {
-            let Some(dep) = self.available.iter().find(|d| d.name == node.name).cloned() else {
+            let Some(dep) = self
+                .graph
+                .available
+                .iter()
+                .find(|d| d.name == node.name)
+                .cloned()
+            else {
                 return;
             };
             let args = self
+                .graph
                 .node_args
                 .get(&id)
                 .cloned()
@@ -687,11 +710,12 @@ impl Server {
                 return;
             }
             self.place(new_id, Kind::App, ws, off, size);
-            self.node_args.insert(new_id, args);
+            self.graph.node_args.insert(new_id, args);
             return;
         }
 
         match self
+            .graph
             .file_nodes
             .get(&id)
             .map(|f| matches!(f, FileNode::Virtual(_)))
@@ -724,10 +748,11 @@ impl Server {
     /// Delete a workspace and every node in it. A no-op for the last workspace —
     /// a document always keeps at least one.
     fn remove_workspace(&mut self, id: NodeId) {
-        if self.workspaces.len() <= 1 || !self.workspaces.contains(&id) {
+        if self.graph.workspaces.len() <= 1 || !self.graph.workspaces.contains(&id) {
             return;
         }
         let victims: Vec<NodeId> = self
+            .graph
             .nodes
             .iter()
             .filter(|(_, rec)| rec.ws == id)
@@ -736,13 +761,13 @@ impl Server {
         for n in victims {
             self.remove_any(n);
         }
-        self.workspaces.retain(|&w| w != id);
+        self.graph.workspaces.retain(|&w| w != id);
     }
 
     /// (Re)run an idle or exited node's guest with its current args.
     fn run_node(&mut self, id: NodeId) {
         if let Some(node) = self.app_node(id) {
-            let args = self.node_args.get(&id).cloned().unwrap_or_default();
+            let args = self.graph.node_args.get(&id).cloned().unwrap_or_default();
             if let Err(e) = self.host.run_node(&node, &args) {
                 eprintln!("failed to run {}: {e:#}", node.name);
             }
@@ -753,11 +778,11 @@ impl Server {
     /// existing nodes so an `Update` on an unknown id can't grow `node_args`
     /// without bound.
     fn set_node_args(&mut self, id: NodeId, text: &str) {
-        if !self.nodes.contains_key(&id) {
+        if !self.graph.nodes.contains_key(&id) {
             return;
         }
         let args = text.split_whitespace().map(str::to_string).collect();
-        self.node_args.insert(id, args);
+        self.graph.node_args.insert(id, args);
     }
 
     /// Grant/revoke a node's host-network access (on its fabric stack).
@@ -803,7 +828,7 @@ impl Server {
 
     /// Wire (or unwire) app node `app_id` onto Network node `net_id`.
     fn toggle_net(&mut self, app_id: NodeId, net_id: NodeId) {
-        if wiring::toggle_unique(&mut self.net_links, app_id, net_id) {
+        if wiring::toggle_unique(&mut self.graph.net_links, app_id, net_id) {
             // Joined the network (any prior membership was dropped).
             self.set_node_net(app_id, net_id);
             self.set_host_access(app_id, self.is_gateway(net_id));
@@ -819,7 +844,7 @@ impl Server {
     /// its membership applied here once it's ready.
     fn sync_net_membership(&self) {
         let nodes = self.node_reg.lock().unwrap().clone();
-        for &(app, net) in &self.net_links {
+        for &(app, net) in &self.graph.net_links {
             let Some(stack) = nodes
                 .iter()
                 .find(|n| n.id == app)
@@ -839,6 +864,7 @@ impl Server {
     /// Remove a Network/Gateway node, returning its members to isolation.
     fn remove_net_node(&mut self, id: NodeId) {
         let members: Vec<NodeId> = self
+            .graph
             .net_links
             .iter()
             .filter(|&&(_, n)| n == id)
@@ -848,7 +874,7 @@ impl Server {
             self.set_node_net(app, app);
             self.set_host_access(app, false);
         }
-        self.net_links.retain(|&(_, n)| n != id);
+        self.graph.net_links.retain(|&(_, n)| n != id);
         self.forget(id);
     }
 
@@ -856,7 +882,7 @@ impl Server {
     /// serve link; the actual bind is (re)established by [`Self::sync_serves`].
     fn toggle_serve(&mut self, http_id: NodeId, hostport_id: NodeId) {
         // "One server per http node" — a new target replaces any existing one.
-        wiring::toggle_unique(&mut self.serve_links, http_id, hostport_id);
+        wiring::toggle_unique(&mut self.graph.serve_links, http_id, hostport_id);
         self.sync_serves();
     }
 
@@ -869,7 +895,7 @@ impl Server {
     fn sync_serves(&mut self) {
         let active: HashMap<NodeId, NodeId> =
             self.serves.iter().map(|(&h, &(hp, _))| (h, hp)).collect();
-        let plan = wiring::reconcile_serves(&self.serve_links, &active);
+        let plan = wiring::reconcile_serves(&self.graph.serve_links, &active);
         // Kill the servers to stop, then (re)bind the ones to start. `start_serve`
         // applies its own readiness/port-conflict guards.
         for http in plan.stop {
@@ -893,7 +919,7 @@ impl Server {
         let Some(path) = node.http_path() else {
             return; // not a wasi:http node, or still compiling
         };
-        let Some(&port) = self.host_ports.get(&hostport_id) else {
+        let Some(&port) = self.graph.host_ports.get(&hostport_id) else {
             return;
         };
         // All workspaces run at once, so another node may already be serving this
@@ -915,29 +941,29 @@ impl Server {
 
     /// Whether some *other* http node is already serving localhost `port`.
     fn port_served_by_other(&self, port: u16, except_http: NodeId) -> bool {
-        self.serves
-            .iter()
-            .any(|(&http, &(hp, _))| http != except_http && self.host_ports.get(&hp) == Some(&port))
+        self.serves.iter().any(|(&http, &(hp, _))| {
+            http != except_http && self.graph.host_ports.get(&hp) == Some(&port)
+        })
     }
 
     /// Remove a HostPort node, stopping any server bound through it.
     fn remove_host_port(&mut self, id: NodeId) {
-        self.host_ports.remove(&id);
-        self.serve_links.retain(|&(_, hp)| hp != id);
+        self.graph.host_ports.remove(&id);
+        self.graph.serve_links.retain(|&(_, hp)| hp != id);
         self.sync_serves();
         self.forget(id);
     }
 
     /// Change a HostPort's localhost port by `delta`, live-rebinding any server.
     fn change_port(&mut self, id: NodeId, delta: i32) {
-        let Some(&cur) = self.host_ports.get(&id) else {
+        let Some(&cur) = self.graph.host_ports.get(&id) else {
             return;
         };
         let new = (cur as i32 + delta).clamp(1, 65535) as u16;
         if new == cur {
             return;
         }
-        self.host_ports.insert(id, new);
+        self.graph.host_ports.insert(id, new);
         self.next_port = self.next_port.max(new.saturating_add(1));
         // Stop any server bound through this port; the desired serve link is
         // unchanged (same HostPort id), so `sync_serves` rebinds it on the new
@@ -961,7 +987,7 @@ impl Server {
     /// Updates the desired `connections` relation; the mount itself is applied by
     /// [`Self::sync_mounts`].
     fn toggle_file(&mut self, file_id: NodeId, app_id: NodeId) {
-        wiring::toggle_pair(&mut self.connections, file_id, app_id);
+        wiring::toggle_pair(&mut self.graph.connections, file_id, app_id);
         self.sync_mounts();
     }
 
@@ -970,14 +996,15 @@ impl Server {
     /// Idempotent; runs after any connection change and once per tick.
     fn sync_mounts(&mut self) {
         let active: HashSet<(NodeId, NodeId)> = self.mounted.keys().copied().collect();
-        let plan = wiring::reconcile_links(&self.connections, &active);
+        let plan = wiring::reconcile_links(&self.graph.connections, &active);
         for pair in plan.remove {
             if let Some((name, fs)) = self.mounted.remove(&pair) {
                 crate::vfs::unmount_file(&fs, &name);
             }
         }
         for (file, app) in plan.add {
-            let (Some(f), Some(node)) = (self.file_nodes.get(&file), self.app_node(app)) else {
+            let (Some(f), Some(node)) = (self.graph.file_nodes.get(&file), self.app_node(app))
+            else {
                 continue; // a node isn't resolvable yet — retried next reconcile
             };
             let name = f.name().to_string();
@@ -990,14 +1017,14 @@ impl Server {
     /// Updates the desired `midi_links` relation; routing is applied by
     /// [`Self::sync_midi`].
     fn toggle_midi(&mut self, src: NodeId, dst: NodeId) {
-        wiring::toggle_pair(&mut self.midi_links, src, dst);
+        wiring::toggle_pair(&mut self.graph.midi_links, src, dst);
         self.sync_midi();
     }
 
     /// Reconcile the MIDI router against the desired `midi_links`: add each new
     /// route (once its destination exists), drop routes no longer wired.
     fn sync_midi(&mut self) {
-        let plan = wiring::reconcile_links(&self.midi_links, &self.routed);
+        let plan = wiring::reconcile_links(&self.graph.midi_links, &self.routed);
         let router = self.host.midi();
         let mut routes = router.lock().unwrap();
         for (src, dst) in plan.remove {
@@ -1016,7 +1043,7 @@ impl Server {
     /// connected to (using the stored mount handles, so it works after the node
     /// is gone).
     fn remove_file_node(&mut self, id: NodeId) {
-        self.connections.retain(|&(f, _)| f != id);
+        self.graph.connections.retain(|&(f, _)| f != id);
         self.sync_mounts();
         self.forget(id);
     }
@@ -1025,19 +1052,19 @@ impl Server {
     /// Drop a node's base record and every side-table entry keyed by it, so no
     /// path can leave an orphan (args/file/port) behind a removed node.
     fn forget(&mut self, id: NodeId) {
-        self.nodes.remove(&id);
-        self.node_args.remove(&id);
-        self.file_nodes.remove(&id);
-        self.host_ports.remove(&id);
+        self.graph.nodes.remove(&id);
+        self.graph.node_args.remove(&id);
+        self.graph.file_nodes.remove(&id);
+        self.graph.host_ports.remove(&id);
     }
 
     /// Whether the given wire still connects two live nodes.
     pub fn wire_exists(&self, w: Wire) -> bool {
         match w {
-            Wire::File(f, a) => self.connections.contains(&(f, a)),
-            Wire::Midi(s, d) => self.midi_links.contains(&(s, d)),
-            Wire::Serve(h, hp) => self.serve_links.contains(&(h, hp)),
-            Wire::Net(app, net) => self.net_links.contains(&(app, net)),
+            Wire::File(f, a) => self.graph.connections.contains(&(f, a)),
+            Wire::Midi(s, d) => self.graph.midi_links.contains(&(s, d)),
+            Wire::Serve(h, hp) => self.graph.serve_links.contains(&(h, hp)),
+            Wire::Net(app, net) => self.graph.net_links.contains(&(app, net)),
         }
     }
 
@@ -1045,22 +1072,22 @@ impl Server {
     fn disconnect_wire(&mut self, w: Wire) {
         match w {
             Wire::File(f, a) => {
-                if self.connections.contains(&(f, a)) {
+                if self.graph.connections.contains(&(f, a)) {
                     self.toggle_file(f, a);
                 }
             }
             Wire::Midi(s, d) => {
-                if self.midi_links.contains(&(s, d)) {
+                if self.graph.midi_links.contains(&(s, d)) {
                     self.toggle_midi(s, d);
                 }
             }
             Wire::Serve(h, hp) => {
-                if self.serve_links.contains(&(h, hp)) {
+                if self.graph.serve_links.contains(&(h, hp)) {
                     self.toggle_serve(h, hp);
                 }
             }
             Wire::Net(app, net) => {
-                if self.net_links.contains(&(app, net)) {
+                if self.graph.net_links.contains(&(app, net)) {
                     self.toggle_net(app, net);
                 }
             }
@@ -1071,12 +1098,12 @@ impl Server {
     /// unknown id can't insert phantom geometry that never gets cleaned up (and
     /// would make `node_exists` report a node that was never created).
     fn set_node_pos(&mut self, id: NodeId, pos: [f32; 2]) {
-        if let Some(rec) = self.nodes.get_mut(&id) {
+        if let Some(rec) = self.graph.nodes.get_mut(&id) {
             rec.pos = pos;
         }
     }
     fn set_node_size(&mut self, id: NodeId, size: [f32; 2]) {
-        if let Some(rec) = self.nodes.get_mut(&id) {
+        if let Some(rec) = self.graph.nodes.get_mut(&id) {
             rec.size = size;
         }
     }
@@ -1113,10 +1140,12 @@ impl Server {
         // Drop every wire touching this node from the desired relations, then
         // reconcile so the corresponding effects (mounts, routes, servers) are
         // torn down. (Its net stack was already detached above.)
-        self.connections.retain(|&(_, app)| app != id);
-        self.net_links.retain(|&(app, _)| app != id);
-        self.midi_links.retain(|&(s, d)| s != id && d != id);
-        self.serve_links.retain(|&(h, hp)| h != id && hp != id);
+        self.graph.connections.retain(|&(_, app)| app != id);
+        self.graph.net_links.retain(|&(app, _)| app != id);
+        self.graph.midi_links.retain(|&(s, d)| s != id && d != id);
+        self.graph
+            .serve_links
+            .retain(|&(h, hp)| h != id && hp != id);
         self.sync_mounts();
         self.sync_midi();
         self.sync_serves();
@@ -1127,10 +1156,11 @@ impl Server {
     pub fn save(&self) {
         let node_list = self.node_reg.lock().unwrap().clone();
         let workspaces = self
+            .graph
             .workspaces
             .iter()
             .map(|&ws_id| {
-                let mine = |id: &NodeId| self.nodes.get(id).map(|n| n.ws) == Some(ws_id);
+                let mine = |id: &NodeId| self.graph.nodes.get(id).map(|n| n.ws) == Some(ws_id);
                 Workspace {
                     id: ws_id,
                     nodes: node_list
@@ -1140,14 +1170,20 @@ impl Server {
                             Some(NodeState {
                                 name: node.name.clone(),
                                 id: node.id,
-                                pos: self.nodes.get(&node.id)?.pos,
-                                size: self.nodes.get(&node.id)?.size,
+                                pos: self.graph.nodes.get(&node.id)?.pos,
+                                size: self.graph.nodes.get(&node.id)?.size,
                                 options: node.options.lock().unwrap().clone(),
-                                args: self.node_args.get(&node.id).cloned().unwrap_or_default(),
+                                args: self
+                                    .graph
+                                    .node_args
+                                    .get(&node.id)
+                                    .cloned()
+                                    .unwrap_or_default(),
                             })
                         })
                         .collect(),
                     virtual_files: self
+                        .graph
                         .file_nodes
                         .iter()
                         .filter(|(id, _)| mine(id))
@@ -1155,8 +1191,8 @@ impl Server {
                             FileNode::Virtual(v) => Some(NodeState {
                                 name: v.name.clone(),
                                 id,
-                                pos: self.nodes.get(&id)?.pos,
-                                size: self.nodes.get(&id)?.size,
+                                pos: self.graph.nodes.get(&id)?.pos,
+                                size: self.graph.nodes.get(&id)?.size,
                                 options: Vec::new(),
                                 args: Vec::new(),
                             }),
@@ -1164,6 +1200,7 @@ impl Server {
                         })
                         .collect(),
                     host_files: self
+                        .graph
                         .file_nodes
                         .iter()
                         .filter(|(id, _)| mine(id))
@@ -1171,8 +1208,8 @@ impl Server {
                             FileNode::HostMapped(h) => Some(NodeState {
                                 name: h.path.to_string_lossy().into_owned(),
                                 id,
-                                pos: self.nodes.get(&id)?.pos,
-                                size: self.nodes.get(&id)?.size,
+                                pos: self.graph.nodes.get(&id)?.pos,
+                                size: self.graph.nodes.get(&id)?.size,
                                 options: Vec::new(),
                                 args: Vec::new(),
                             }),
@@ -1180,6 +1217,7 @@ impl Server {
                         })
                         .collect(),
                     host_ports: self
+                        .graph
                         .host_ports
                         .iter()
                         .filter(|(id, _)| mine(id))
@@ -1187,30 +1225,34 @@ impl Server {
                             Some(PortState {
                                 id,
                                 port,
-                                pos: self.nodes.get(&id)?.pos,
-                                size: self.nodes.get(&id)?.size,
+                                pos: self.graph.nodes.get(&id)?.pos,
+                                size: self.graph.nodes.get(&id)?.size,
                             })
                         })
                         .collect(),
                     connections: self
+                        .graph
                         .connections
                         .iter()
                         .filter(|(f, _)| mine(f))
                         .copied()
                         .collect(),
                     midi: self
+                        .graph
                         .midi_links
                         .iter()
                         .filter(|(s, _)| mine(s))
                         .copied()
                         .collect(),
                     serves: self
+                        .graph
                         .serve_links
                         .iter()
                         .filter(|(http, _)| mine(http))
                         .copied()
                         .collect(),
                     nets: self
+                        .graph
                         .nodes
                         .iter()
                         .filter(|(id, rec)| rec.kind.is_net() && mine(id))
@@ -1222,6 +1264,7 @@ impl Server {
                         })
                         .collect(),
                     net_links: self
+                        .graph
                         .net_links
                         .iter()
                         .filter(|(a, _)| mine(a))
@@ -1231,7 +1274,7 @@ impl Server {
             })
             .collect();
         let doc = Document {
-            dependencies: self.available.clone(),
+            dependencies: self.graph.available.clone(),
             workspaces,
         };
         if let Err(e) = doc.save(&self.workspace_path) {
@@ -1245,9 +1288,10 @@ impl Server {
         match &cmd {
             // Node creates: run, then record removal of whatever node appeared.
             Command::Create(Resource::Node { .. }) | Command::Duplicate(_) => {
-                let before: HashSet<NodeId> = self.nodes.keys().copied().collect();
+                let before: HashSet<NodeId> = self.graph.nodes.keys().copied().collect();
                 self.dispatch(cmd);
                 let created: Vec<NodeId> = self
+                    .graph
                     .nodes
                     .keys()
                     .copied()
@@ -1265,27 +1309,27 @@ impl Server {
                 }
             }
             Command::Create(Resource::Workspace { id }) => {
-                if !self.workspaces.contains(id) {
+                if !self.graph.workspaces.contains(id) {
                     self.record(Undo::DropWorkspace(*id));
                 }
             }
             Command::Update { id, patch } => {
                 if patch.pos.is_some() {
-                    if let Some(rec) = self.nodes.get(id) {
+                    if let Some(rec) = self.graph.nodes.get(id) {
                         self.record(Undo::Pos(*id, rec.pos));
                     }
                 }
                 if patch.size.is_some() {
-                    if let Some(rec) = self.nodes.get(id) {
+                    if let Some(rec) = self.graph.nodes.get(id) {
                         self.record(Undo::Size(*id, rec.size));
                     }
                 }
                 if patch.args.is_some() {
-                    let old = self.node_args.get(id).cloned().unwrap_or_default();
+                    let old = self.graph.node_args.get(id).cloned().unwrap_or_default();
                     self.record(Undo::Args(*id, old));
                 }
                 if patch.port_delta.is_some() {
-                    if let Some(&p) = self.host_ports.get(id) {
+                    if let Some(&p) = self.graph.host_ports.get(id) {
                         self.record(Undo::Port(*id, p));
                     }
                 }
@@ -1302,7 +1346,7 @@ impl Server {
                 }
             }
             Command::Delete(ResourceRef::Workspace(id)) => {
-                if self.workspaces.len() > 1 && self.workspaces.contains(id) {
+                if self.graph.workspaces.len() > 1 && self.graph.workspaces.contains(id) {
                     if let Some(s) = self.snapshot_workspace(*id) {
                         self.record(Undo::RecreateWorkspace(Box::new(s)));
                     }
@@ -1319,7 +1363,7 @@ impl Server {
         match cmd {
             Command::Create(Resource::Node { kind, pos, ws }) => match kind {
                 NodeKind::App { dep } => {
-                    if let Some(dep) = self.available.get(dep).cloned() {
+                    if let Some(dep) = self.graph.available.get(dep).cloned() {
                         self.launch(&dep, pos, ws);
                     }
                 }
@@ -1386,7 +1430,7 @@ impl Server {
 
     /// Whether a node with this id currently exists (any kind).
     fn node_exists(&self, id: NodeId) -> bool {
-        self.nodes.contains_key(&id)
+        self.graph.nodes.contains_key(&id)
     }
 
     /// Apply one recorded inverse. Guards against nodes that have since gone.
@@ -1395,12 +1439,12 @@ impl Server {
             Undo::Pos(id, p) => self.set_node_pos(id, p),
             Undo::Size(id, s) => self.set_node_size(id, s),
             Undo::Args(id, a) => {
-                if self.node_args.contains_key(&id) {
-                    self.node_args.insert(id, a);
+                if self.graph.node_args.contains_key(&id) {
+                    self.graph.node_args.insert(id, a);
                 }
             }
             Undo::Port(id, port) => {
-                if let Some(&cur) = self.host_ports.get(&id) {
+                if let Some(&cur) = self.graph.host_ports.get(&id) {
                     self.change_port(id, port as i32 - cur as i32);
                 }
             }
@@ -1422,14 +1466,14 @@ impl Server {
 
     /// Capture everything needed to bring node `id` back after removal.
     fn snapshot(&self, id: NodeId) -> Option<Snapshot> {
-        let &NodeRec { ws, pos, size, .. } = self.nodes.get(&id)?;
+        let &NodeRec { ws, pos, size, .. } = self.graph.nodes.get(&id)?;
         let kind = if let Some(node) = self.app_node(id) {
             SnapKind::App {
                 dep: node.name.clone(),
-                args: self.node_args.get(&id).cloned().unwrap_or_default(),
+                args: self.graph.node_args.get(&id).cloned().unwrap_or_default(),
                 options: node.options.lock().unwrap().clone(),
             }
-        } else if let Some(f) = self.file_nodes.get(&id) {
+        } else if let Some(f) = self.graph.file_nodes.get(&id) {
             match f {
                 FileNode::Virtual(v) => SnapKind::Virtual {
                     name: v.name.clone(),
@@ -1440,7 +1484,7 @@ impl Server {
                     path: h.path.clone(),
                 },
             }
-        } else if let Some(&port) = self.host_ports.get(&id) {
+        } else if let Some(&port) = self.graph.host_ports.get(&id) {
             SnapKind::Port { port }
         } else if self.is_net(id) {
             SnapKind::Net {
@@ -1451,18 +1495,30 @@ impl Server {
         };
         let mut wires: Vec<(NodeId, NodeId)> = Vec::new();
         wires.extend(
-            self.connections
+            self.graph
+                .connections
                 .iter()
                 .filter(|&&(f, a)| f == id || a == id),
         );
-        wires.extend(self.midi_links.iter().filter(|&&(s, d)| s == id || d == id));
         wires.extend(
-            self.serve_links
+            self.graph
+                .midi_links
+                .iter()
+                .filter(|&&(s, d)| s == id || d == id),
+        );
+        wires.extend(
+            self.graph
+                .serve_links
                 .iter()
                 .filter(|&&(h, hp)| h == id || hp == id)
                 .copied(),
         );
-        wires.extend(self.net_links.iter().filter(|&&(a, n)| a == id || n == id));
+        wires.extend(
+            self.graph
+                .net_links
+                .iter()
+                .filter(|&&(a, n)| a == id || n == id),
+        );
         Some(Snapshot {
             id,
             ws,
@@ -1483,7 +1539,13 @@ impl Server {
     fn recreate_node(&mut self, s: &Snapshot) {
         match &s.kind {
             SnapKind::App { dep, args, options } => {
-                let Some(d) = self.available.iter().find(|x| &x.name == dep).cloned() else {
+                let Some(d) = self
+                    .graph
+                    .available
+                    .iter()
+                    .find(|x| &x.name == dep)
+                    .cloned()
+                else {
                     return;
                 };
                 if self
@@ -1502,11 +1564,11 @@ impl Server {
                     return;
                 }
                 self.place(s.id, Kind::App, s.ws, s.pos, s.size);
-                self.node_args.insert(s.id, args.clone());
+                self.graph.node_args.insert(s.id, args.clone());
             }
             SnapKind::Virtual { name, data } => {
                 self.place(s.id, Kind::File, s.ws, s.pos, s.size);
-                self.file_nodes.insert(
+                self.graph.file_nodes.insert(
                     s.id,
                     FileNode::Virtual(VirtualFile {
                         name: name.clone(),
@@ -1516,7 +1578,7 @@ impl Server {
             }
             SnapKind::HostFile { name, path } => {
                 self.place(s.id, Kind::File, s.ws, s.pos, s.size);
-                self.file_nodes.insert(
+                self.graph.file_nodes.insert(
                     s.id,
                     FileNode::HostMapped(HostMappedFile {
                         name: name.clone(),
@@ -1526,7 +1588,7 @@ impl Server {
             }
             SnapKind::Port { port } => {
                 self.place(s.id, Kind::Port, s.ws, s.pos, s.size);
-                self.host_ports.insert(s.id, *port);
+                self.graph.host_ports.insert(s.id, *port);
             }
             SnapKind::Net { gateway } => {
                 let kind = if *gateway {
@@ -1542,10 +1604,10 @@ impl Server {
     /// Whether two nodes are already joined by any connection.
     fn wired(&self, a: NodeId, b: NodeId) -> bool {
         let pair = |x: NodeId, y: NodeId| (x == a && y == b) || (x == b && y == a);
-        self.connections.iter().any(|&(x, y)| pair(x, y))
-            || self.midi_links.iter().any(|&(x, y)| pair(x, y))
-            || self.net_links.iter().any(|&(x, y)| pair(x, y))
-            || self.serve_links.iter().any(|&(h, hp)| pair(h, hp))
+        self.graph.connections.iter().any(|&(x, y)| pair(x, y))
+            || self.graph.midi_links.iter().any(|&(x, y)| pair(x, y))
+            || self.graph.net_links.iter().any(|&(x, y)| pair(x, y))
+            || self.graph.serve_links.iter().any(|&(h, hp)| pair(h, hp))
     }
 
     /// Re-establish connections between live nodes (idempotent, so a wire listed
@@ -1560,8 +1622,9 @@ impl Server {
 
     /// Capture a whole workspace tab (its position + every node) for undo.
     fn snapshot_workspace(&self, ws: NodeId) -> Option<WsSnapshot> {
-        let index = self.workspaces.iter().position(|&w| w == ws)?;
+        let index = self.graph.workspaces.iter().position(|&w| w == ws)?;
         let nodes = self
+            .graph
             .nodes
             .iter()
             .filter(|(_, rec)| rec.ws == ws)
@@ -1576,9 +1639,9 @@ impl Server {
 
     /// Bring a removed workspace back: its tab, all its nodes, then their wiring.
     fn recreate_workspace(&mut self, s: WsSnapshot) {
-        if !self.workspaces.contains(&s.id) {
-            let i = s.index.min(self.workspaces.len());
-            self.workspaces.insert(i, s.id);
+        if !self.graph.workspaces.contains(&s.id) {
+            let i = s.index.min(self.graph.workspaces.len());
+            self.graph.workspaces.insert(i, s.id);
         }
         for node in &s.nodes {
             self.recreate_node(node);
@@ -1596,6 +1659,7 @@ impl Server {
         let nodes: Vec<SharedNode> = self.node_reg.lock().unwrap().clone();
         let surfaces: Vec<SharedSurface> = self.registry.lock().unwrap().clone();
         let file_nodes = self
+            .graph
             .file_nodes
             .iter()
             .map(|(&id, f)| {
@@ -1611,19 +1675,31 @@ impl Server {
             .collect();
         // Show the desired wiring (what the user drew and what we persist), not
         // just servers that have finished binding.
-        let serves = self.serve_links.iter().copied().collect();
+        let serves = self.graph.serve_links.iter().copied().collect();
         // Project the normalized node table back into the per-attribute maps the
         // client View exposes (kept flat so the compositor is unchanged).
-        let win_pos = self.nodes.iter().map(|(&id, r)| (id, r.pos)).collect();
-        let win_size = self.nodes.iter().map(|(&id, r)| (id, r.size)).collect();
-        let node_ws = self.nodes.iter().map(|(&id, r)| (id, r.ws)).collect();
+        let win_pos = self
+            .graph
+            .nodes
+            .iter()
+            .map(|(&id, r)| (id, r.pos))
+            .collect();
+        let win_size = self
+            .graph
+            .nodes
+            .iter()
+            .map(|(&id, r)| (id, r.size))
+            .collect();
+        let node_ws = self.graph.nodes.iter().map(|(&id, r)| (id, r.ws)).collect();
         let net_nodes = self
+            .graph
             .nodes
             .iter()
             .filter(|(_, r)| r.kind.is_net())
             .map(|(&id, _)| id)
             .collect();
         let gateways = self
+            .graph
             .nodes
             .iter()
             .filter(|(_, r)| r.kind == Kind::Gateway)
@@ -1634,19 +1710,19 @@ impl Server {
             win_pos,
             win_size,
             file_nodes,
-            host_ports: self.host_ports.clone(),
+            host_ports: self.graph.host_ports.clone(),
             net_nodes,
             gateways,
-            connections: self.connections.clone(),
-            midi_links: self.midi_links.clone(),
-            net_links: self.net_links.clone(),
+            connections: self.graph.connections.clone(),
+            midi_links: self.graph.midi_links.clone(),
+            net_links: self.graph.net_links.clone(),
             serves,
-            node_args: self.node_args.clone(),
-            available: self.available.clone(),
+            node_args: self.graph.node_args.clone(),
+            available: self.graph.available.clone(),
             nodes,
             surfaces,
             node_ws,
-            workspaces: self.workspaces.clone(),
+            workspaces: self.graph.workspaces.clone(),
         }
     }
 }
@@ -1715,7 +1791,7 @@ mod model_tests {
     }
 
     fn apply_op(s: &mut Server, op: &Op) {
-        let ws = s.workspaces[0];
+        let ws = s.graph.workspaces[0];
         let create = |kind| {
             Command::Create(Resource::Node {
                 kind,
@@ -1788,23 +1864,26 @@ mod model_tests {
     /// set of live nodes, no side table (args/files/ports) holds an entry for a
     /// node not in the table, and the document keeps at least one workspace.
     fn assert_consistent(s: &Server) -> Result<(), TestCaseError> {
-        let base: HashSet<NodeId> = s.nodes.keys().copied().collect();
+        let base: HashSet<NodeId> = s.graph.nodes.keys().copied().collect();
         let live: HashSet<NodeId> = s.node_ids().into_iter().collect();
         prop_assert_eq!(
             &base,
             &live,
             "node table and live-node enumeration diverged"
         );
-        for id in s.node_args.keys() {
+        for id in s.graph.node_args.keys() {
             prop_assert!(base.contains(id), "orphan node_args entry");
         }
-        for id in s.file_nodes.keys() {
+        for id in s.graph.file_nodes.keys() {
             prop_assert!(base.contains(id), "orphan file_nodes entry");
         }
-        for id in s.host_ports.keys() {
+        for id in s.graph.host_ports.keys() {
             prop_assert!(base.contains(id), "orphan host_ports entry");
         }
-        prop_assert!(!s.workspaces.is_empty(), "document lost its last workspace");
+        prop_assert!(
+            !s.graph.workspaces.is_empty(),
+            "document lost its last workspace"
+        );
         Ok(())
     }
 
