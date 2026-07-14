@@ -168,12 +168,14 @@ pub struct NetState {
     pub size: [f32; 2],
 }
 
-/// An Iroh uplink node: its identity, the peer it dials, and its placement.
+/// An uplink node (Iroh or Veilid — the KDL node name says which): its
+/// identity, the peer it dials, and its placement.
 #[derive(Clone, Debug, PartialEq)]
-pub struct IrohState {
+pub struct UplinkState {
     pub id: NodeId,
-    /// The uplink's ed25519 secret key, hex-encoded, so its ticket (its
-    /// dialable identity) survives restarts. Anyone with this key can
+    /// The uplink's persisted identity — Iroh: its ed25519 secret key,
+    /// hex-encoded; Veilid: its DHT owner keypair string. Either way this is
+    /// what keeps the ticket stable across restarts, and anyone holding it can
     /// impersonate the uplink — treat the `.wk` file accordingly.
     pub secret: Option<String>,
     /// The remote uplink's ticket, re-dialed at load.
@@ -182,7 +184,7 @@ pub struct IrohState {
     pub size: [f32; 2],
 }
 
-impl IrohState {
+impl UplinkState {
     /// Hex-encode a secret for persistence.
     pub fn secret_hex(bytes: &[u8; 32]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -223,7 +225,8 @@ pub struct Workspace {
     pub serves: Vec<(NodeId, NodeId)>,
     pub nets: Vec<NetState>,
     pub net_links: Vec<(NodeId, NodeId)>,
-    pub irohs: Vec<IrohState>,
+    pub irohs: Vec<UplinkState>,
+    pub veilids: Vec<UplinkState>,
 }
 
 impl Workspace {
@@ -241,6 +244,7 @@ impl Workspace {
             nets: Vec::new(),
             net_links: Vec::new(),
             irohs: Vec::new(),
+            veilids: Vec::new(),
         }
     }
 }
@@ -408,7 +412,8 @@ fn parse_workspace(n: &KdlNode) -> Option<Workspace> {
             "network" => ws.nets.extend(parse_net(c, false)),
             "gateway" => ws.nets.extend(parse_net(c, true)),
             "netlink" => ws.net_links.extend(pair(c)),
-            "iroh" => ws.irohs.extend(parse_iroh(c)),
+            "iroh" => ws.irohs.extend(parse_uplink(c)),
+            "veilid" => ws.veilids.extend(parse_uplink(c)),
             _ => {}
         }
     }
@@ -447,7 +452,10 @@ fn workspace_kdl(ws: &Workspace) -> KdlNode {
         ch.nodes_mut().push(pair_kdl("netlink", app, net));
     }
     for i in &ws.irohs {
-        ch.nodes_mut().push(iroh_kdl(i));
+        ch.nodes_mut().push(uplink_kdl("iroh", i));
+    }
+    for v in &ws.veilids {
+        ch.nodes_mut().push(uplink_kdl("veilid", v));
     }
     node.set_children(ch);
     node
@@ -531,9 +539,9 @@ fn parse_net(n: &KdlNode, gateway: bool) -> Option<NetState> {
     })
 }
 
-/// Parse an `iroh <id> { secret "<hex>"; peer "<ticket>"; pos x y; size w h }`
-/// entry.
-fn parse_iroh(n: &KdlNode) -> Option<IrohState> {
+/// Parse an `iroh`/`veilid` `<id> { secret "…"; peer "<ticket>"; pos x y;
+/// size w h }` entry.
+fn parse_uplink(n: &KdlNode) -> Option<UplinkState> {
     let id = node_id(n.get(0)?)?;
     let ch = n.children()?;
     let text = |name: &str| {
@@ -544,7 +552,7 @@ fn parse_iroh(n: &KdlNode) -> Option<IrohState> {
     };
     let pos = ch.get("pos")?;
     let size = ch.get("size")?;
-    Some(IrohState {
+    Some(UplinkState {
         id,
         secret: text("secret"),
         peer: text("peer"),
@@ -553,8 +561,8 @@ fn parse_iroh(n: &KdlNode) -> Option<IrohState> {
     })
 }
 
-fn iroh_kdl(i: &IrohState) -> KdlNode {
-    let mut node = KdlNode::new("iroh");
+fn uplink_kdl(kind: &str, i: &UplinkState) -> KdlNode {
+    let mut node = KdlNode::new(kind);
     node.push(KdlEntry::new(i.id.to_string()));
     let mut ch = KdlDocument::new();
     if let Some(s) = &i.secret {
@@ -806,11 +814,18 @@ mod tests {
                         },
                     ],
                     net_links: vec![(synth, net)],
-                    irohs: vec![IrohState {
+                    irohs: vec![UplinkState {
                         id: mdst,
-                        secret: Some(IrohState::secret_hex(&[7u8; 32])),
+                        secret: Some(UplinkState::secret_hex(&[7u8; 32])),
                         peer: Some("endpointabc123".into()),
                         pos: [800.0, 100.0],
+                        size: [130.0, 44.0],
+                    }],
+                    veilids: vec![UplinkState {
+                        id: msrc,
+                        secret: Some("VLD0:pubkey:secretkey".into()),
+                        peer: Some("VLD0:remoterecordkey".into()),
+                        pos: [900.0, 100.0],
                         size: [130.0, 44.0],
                     }],
                 },
@@ -994,7 +1009,7 @@ mod tests {
             })
     }
 
-    fn iroh_state() -> impl Strategy<Value = IrohState> {
+    fn uplink_state() -> impl Strategy<Value = UplinkState> {
         (
             any_node_id(),
             prop::option::of(prop::collection::vec(any::<u8>(), 32)),
@@ -1004,10 +1019,10 @@ mod tests {
             coord(),
             coord(),
         )
-            .prop_map(|(id, secret, peer, px, py, sx, sy)| IrohState {
+            .prop_map(|(id, secret, peer, px, py, sx, sy)| UplinkState {
                 id,
                 secret: secret
-                    .map(|s| IrohState::secret_hex(&<[u8; 32]>::try_from(s.as_slice()).unwrap())),
+                    .map(|s| UplinkState::secret_hex(&<[u8; 32]>::try_from(s.as_slice()).unwrap())),
                 peer,
                 pos: [px, py],
                 size: [sx, sy],
@@ -1030,10 +1045,25 @@ mod tests {
             prop::collection::vec(pair(), 0..3),
             prop::collection::vec(net_state(), 0..3),
             prop::collection::vec(pair(), 0..3),
-            prop::collection::vec(iroh_state(), 0..3),
+            (
+                prop::collection::vec(uplink_state(), 0..3),
+                prop::collection::vec(uplink_state(), 0..3),
+            ),
         )
             .prop_map(
-                |(id, nodes, vfiles, hfiles, ports, conns, midi, serves, nets, netlinks, irohs)| {
+                |(
+                    id,
+                    nodes,
+                    vfiles,
+                    hfiles,
+                    ports,
+                    conns,
+                    midi,
+                    serves,
+                    nets,
+                    netlinks,
+                    (irohs, veilids),
+                )| {
                     Workspace {
                         id,
                         nodes,
@@ -1046,6 +1076,7 @@ mod tests {
                         nets,
                         net_links: netlinks,
                         irohs,
+                        veilids,
                     }
                 },
             )

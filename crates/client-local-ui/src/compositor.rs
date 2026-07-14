@@ -408,6 +408,7 @@ enum PaletteCmd {
     AddNetwork,
     AddGateway,
     AddIroh,
+    AddVeilid,
     NewWorkspace,
     CloseWorkspace,
     /// Jump the camera to this zoom factor.
@@ -1019,6 +1020,11 @@ impl App {
             PaletteCmd::AddIroh,
         ));
         v.push(PaletteRow::new(
+            "Add Veilid Uplink",
+            d("extend a network over onion-routed Veilid"),
+            PaletteCmd::AddVeilid,
+        ));
+        v.push(PaletteRow::new(
             "New Workspace  (Cmd+T)",
             None,
             PaletteCmd::NewWorkspace,
@@ -1061,8 +1067,8 @@ impl App {
             "gateway".into()
         } else if self.view.net_nodes.contains(&id) {
             "network".into()
-        } else if self.view.iroh_nodes.contains_key(&id) {
-            "iroh".into()
+        } else if let Some(u) = self.view.uplinks.get(&id) {
+            u.kind.label().to_lowercase()
         } else {
             "node".into()
         }
@@ -1226,9 +1232,17 @@ impl App {
                 }));
             }
             PaletteCmd::AddIroh => {
-                let pos = self.view_center([FILE_W, FILE_H], self.view.iroh_nodes.len());
+                let pos = self.view_center([FILE_W, FILE_H], self.view.uplinks.len());
                 self.conn.send(Command::Create(Resource::Node {
                     kind: NodeKind::Iroh,
+                    pos,
+                    ws,
+                }));
+            }
+            PaletteCmd::AddVeilid => {
+                let pos = self.view_center([FILE_W, FILE_H], self.view.uplinks.len());
+                self.conn.send(Command::Create(Resource::Node {
+                    kind: NodeKind::Veilid,
                     pos,
                     ws,
                 }));
@@ -1720,8 +1734,8 @@ impl App {
                     let is_file = self.view.file_nodes.contains_key(&id);
                     let is_port = self.view.host_ports.contains_key(&id);
                     let is_net = self.view.net_nodes.contains(&id);
-                    let is_iroh = self.view.iroh_nodes.contains_key(&id);
-                    if is_file || is_port || is_net || is_iroh {
+                    let is_uplink = self.view.uplinks.contains_key(&id);
+                    if is_file || is_port || is_net || is_uplink {
                         // Canvas widget nodes (file / HostPort / Network / Iroh):
                         // close, adjust port (HostPort −/+ buttons), edit the
                         // peer ticket (Iroh, lower half), or move.
@@ -1744,7 +1758,7 @@ impl App {
                                     ..Default::default()
                                 },
                             });
-                        } else if is_iroh && mp[1] > (r[1] + r[3]) * 0.5 {
+                        } else if is_uplink && mp[1] > (r[1] + r[3]) * 0.5 {
                             // Click the status line to type/paste the remote
                             // ticket; Enter dials it.
                             let cur = self
@@ -2237,10 +2251,10 @@ impl App {
                 continue;
             }
 
-            // An Iroh uplink node: extends the Network it's wired to onto a
+            // An uplink node (Iroh or Veilid): extends the Network it's wired to onto a
             // remote fabric over p2p QUIC. The status line doubles as the peer
             // ticket field (click, paste/type, Enter dials).
-            if let Some(meta) = self.view.iroh_nodes.get(&id).cloned() {
+            if let Some(meta) = self.view.uplinks.get(&id).cloned() {
                 quads.push(Quad::solid(white, r, NET_BORDER, clip));
                 let body = [
                     r[0] + BORDER * zf,
@@ -2256,7 +2270,7 @@ impl App {
                     &gfx.fonts,
                     &gfx.device,
                     &gfx.queue,
-                    "Iroh",
+                    meta.kind.label(),
                     r[0] + PAD * zf,
                     r[1] + PAD * zf,
                     zf,

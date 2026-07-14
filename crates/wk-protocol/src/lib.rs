@@ -119,6 +119,9 @@ pub enum NodeKind {
     Gateway,
     /// An iroh uplink: extends a Network to a remote fabric over p2p QUIC.
     Iroh,
+    /// A Veilid uplink: extends a Network to a remote fabric over Veilid's
+    /// onion-routed p2p network.
+    Veilid,
 }
 
 /// A resource to create.

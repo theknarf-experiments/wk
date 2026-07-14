@@ -22,6 +22,7 @@ pub mod server;
 pub mod sockets;
 pub mod terminal;
 pub mod uplink;
+pub mod veilid;
 pub mod vfs;
 pub mod wiring;
 pub mod workspace;

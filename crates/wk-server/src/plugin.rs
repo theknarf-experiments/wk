@@ -812,6 +812,18 @@ impl PluginHost {
         crate::uplink::Uplink::start(self.hub.clone(), net, secret, true)
     }
 
+    /// Start a Veilid uplink tunneling virtual network `net` (see
+    /// [`crate::veilid`]). `node` namespaces its store; `identity` is the
+    /// persisted DHT owner keypair (fresh if `None`).
+    pub fn veilid_uplink(
+        &self,
+        net: NodeId,
+        identity: Option<&str>,
+        node: NodeId,
+    ) -> Result<crate::veilid::VeilidUplink> {
+        crate::veilid::VeilidUplink::start(self.hub.clone(), net, identity, node)
+    }
+
     /// Register a plugin as a `Node` under `id` and return immediately — the
     /// component is compiled on a background thread so other nodes aren't blocked
     /// (Cranelift on a multi-MB debug component takes hundreds of ms to seconds).

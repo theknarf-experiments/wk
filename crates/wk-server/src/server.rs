@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use crate::plugin::{NodeRegistry, PluginHost, SharedNode, SharedSurface, SurfaceRegistry};
 use crate::wiring::{self, NodeClass};
 use crate::workspace::{
-    Dependency, Document, IrohState, NetState, NodeState, PortState, Workspace,
+    Dependency, Document, NetState, NodeState, PortState, UplinkState, Workspace,
 };
 use wk_protocol::{Command, NodeId, NodeKind, Resource, ResourceRef, Wire};
 
@@ -80,13 +80,70 @@ pub struct FileMeta {
     pub host_mapped: bool,
 }
 
-/// Render-facing metadata about an Iroh uplink node.
+/// Which p2p transport an uplink node tunnels over.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UplinkKind {
+    Iroh,
+    Veilid,
+}
+
+impl UplinkKind {
+    /// The display label shown on the canvas node.
+    pub fn label(self) -> &'static str {
+        match self {
+            UplinkKind::Iroh => "Iroh",
+            UplinkKind::Veilid => "Veilid",
+        }
+    }
+}
+
+/// Render-facing metadata about an uplink node (Iroh or Veilid).
 #[derive(Clone)]
-pub struct IrohMeta {
+pub struct UplinkMeta {
+    pub kind: UplinkKind,
     /// This uplink's dialable ticket (shown so the user can share it).
     pub ticket: String,
     /// Live tunnel connections.
     pub peers: usize,
+}
+
+/// A running uplink of either transport, with one surface for the server.
+enum UplinkHandle {
+    Iroh(crate::uplink::Uplink),
+    Veilid(crate::veilid::VeilidUplink),
+}
+
+impl UplinkHandle {
+    fn kind(&self) -> UplinkKind {
+        match self {
+            UplinkHandle::Iroh(_) => UplinkKind::Iroh,
+            UplinkHandle::Veilid(_) => UplinkKind::Veilid,
+        }
+    }
+    fn ticket(&self) -> &str {
+        match self {
+            UplinkHandle::Iroh(u) => u.ticket(),
+            UplinkHandle::Veilid(u) => u.ticket(),
+        }
+    }
+    fn dial(&self, ticket: &str) -> wasmtime::Result<()> {
+        match self {
+            UplinkHandle::Iroh(u) => u.dial(ticket),
+            UplinkHandle::Veilid(u) => u.dial(ticket),
+        }
+    }
+    fn set_net(&self, net: NodeId) {
+        match self {
+            UplinkHandle::Iroh(u) => u.set_net(net),
+            UplinkHandle::Veilid(u) => u.set_net(net),
+        }
+    }
+    fn peers(&self) -> usize {
+        match self {
+            UplinkHandle::Iroh(u) => u.peers(),
+            UplinkHandle::Veilid(u) => u.peers(),
+        }
+    }
 }
 
 /// A read-only snapshot of the document a client renders from. Produced by
@@ -103,7 +160,7 @@ pub struct View {
     pub host_ports: HashMap<NodeId, u16>,
     pub net_nodes: HashSet<NodeId>,
     pub gateways: HashSet<NodeId>,
-    pub iroh_nodes: HashMap<NodeId, IrohMeta>,
+    pub uplinks: HashMap<NodeId, UplinkMeta>,
     pub connections: Vec<(NodeId, NodeId)>,
     pub midi_links: Vec<(NodeId, NodeId)>,
     pub net_links: Vec<(NodeId, NodeId)>,
@@ -171,8 +228,8 @@ impl View {
                 .copied()
                 .filter(|id| mine(id))
                 .collect(),
-            iroh_nodes: self
-                .iroh_nodes
+            uplinks: self
+                .uplinks
                 .iter()
                 .filter(|(id, _)| mine(id))
                 .map(|(&k, v)| (k, v.clone()))
@@ -305,6 +362,11 @@ enum SnapKind {
         /// The peer ticket it was dialing (stored as its args).
         peer: Vec<String>,
     },
+    Veilid {
+        identity: String,
+        /// The peer ticket it was dialing (stored as its args).
+        peer: Vec<String>,
+    },
 }
 
 /// What kind of node this is. The base fact that used to be inferred by probing
@@ -318,6 +380,8 @@ pub enum Kind {
     Gateway,
     /// An iroh uplink: extends the Network it's wired to onto a remote fabric.
     Iroh,
+    /// A Veilid uplink: like Iroh, over Veilid's onion-routed network.
+    Veilid,
 }
 
 impl Kind {
@@ -370,6 +434,9 @@ pub struct Graph {
     /// identity) survives restarts. The peer ticket it dials lives in
     /// `node_args`. Side table keyed by node id.
     pub iroh_secrets: HashMap<NodeId, [u8; 32]>,
+    /// Veilid uplink nodes' DHT owner keypairs (string form), the Veilid
+    /// equivalent of `iroh_secrets`. Side table keyed by node id.
+    pub veilid_ids: HashMap<NodeId, String>,
 
     /// The workspaces (tabs) in this document, in order — including empty ones.
     pub workspaces: Vec<NodeId>,
@@ -404,9 +471,9 @@ pub struct Server {
     /// TCP forward into its network) and the port bound. Reconciled by
     /// `sync_serves`.
     pub serves: HashMap<NodeId, (NodeId, Arc<AtomicBool>)>,
-    /// Running iroh uplinks, one per Iroh node. Dropping one closes its
-    /// endpoint and detaches its trunk.
-    uplinks: HashMap<NodeId, crate::uplink::Uplink>,
+    /// Running uplinks (Iroh or Veilid), one per uplink node. Dropping one
+    /// closes its endpoint and detaches its trunk.
+    uplinks: HashMap<NodeId, UplinkHandle>,
 
     /// Inverse-command history for [`Command::Undo`].
     undo: Vec<Undo>,
@@ -566,8 +633,8 @@ impl Server {
             self.place(net.id, kind, saved.id, net.pos, net.size);
         }
 
-        // Iroh uplink nodes: restart each endpoint with its saved identity (so
-        // its ticket is unchanged) and re-dial its saved peer.
+        // Uplink nodes: restart each endpoint with its saved identity (so its
+        // ticket is unchanged) and re-dial its saved peer.
         for ir in &saved.irohs {
             let secret = ir
                 .secret_bytes()
@@ -577,11 +644,17 @@ impl Server {
                 self.set_node_args(ir.id, peer);
             }
         }
+        for v in &saved.veilids {
+            self.create_veilid_uplink(v.id, v.secret.as_deref(), v.pos, v.size, saved.id);
+            if let Some(peer) = &v.peer {
+                self.set_node_args(v.id, peer);
+            }
+        }
 
         // Re-wire network membership (rejoins the network + grants host access;
         // an uplink member re-trunks its network).
         for &(app_id, net_id) in &saved.net_links {
-            if (self.app_node(app_id).is_some() || self.is_iroh(app_id)) && self.is_net(net_id) {
+            if (self.app_node(app_id).is_some() || self.is_uplink(app_id)) && self.is_net(net_id) {
                 self.toggle_net(app_id, net_id);
             }
         }
@@ -619,9 +692,9 @@ impl Server {
         self.kind_of(id) == Some(Kind::Gateway)
     }
 
-    /// Whether `id` is an Iroh uplink node.
-    fn is_iroh(&self, id: NodeId) -> bool {
-        self.kind_of(id) == Some(Kind::Iroh)
+    /// Whether `id` is an uplink node (Iroh or Veilid).
+    fn is_uplink(&self, id: NodeId) -> bool {
+        matches!(self.kind_of(id), Some(Kind::Iroh | Kind::Veilid))
     }
 
     fn alloc_id(&mut self) -> NodeId {
@@ -726,6 +799,33 @@ impl Server {
         self.create_uplink(id, secret, pos, [FILE_W, FILE_H], ws);
     }
 
+    /// Create a Veilid uplink node at `pos` with a fresh identity.
+    fn add_veilid_node(&mut self, pos: [f32; 2], ws: NodeId) {
+        let id = self.alloc_id();
+        self.create_veilid_uplink(id, None, pos, [FILE_W, FILE_H], ws);
+    }
+
+    /// Create (or restore) a Veilid uplink node with a known id (and, when
+    /// restoring, its persisted DHT owner keypair, so its ticket is unchanged).
+    fn create_veilid_uplink(
+        &mut self,
+        id: NodeId,
+        identity: Option<&str>,
+        pos: [f32; 2],
+        size: [f32; 2],
+        ws: NodeId,
+    ) {
+        match self.host.veilid_uplink(id, identity, id) {
+            Ok(up) => {
+                eprintln!("[veilid] uplink {id} ticket: {}", up.ticket());
+                self.graph.veilid_ids.insert(id, up.identity().to_string());
+                self.uplinks.insert(id, UplinkHandle::Veilid(up));
+                self.place(id, Kind::Veilid, ws, pos, size);
+            }
+            Err(e) => eprintln!("failed to start veilid uplink: {e:#}"),
+        }
+    }
+
     /// Create (or restore) an Iroh uplink node with a known id and secret. Until
     /// wired to a Network the uplink trunks the node's own (empty) net, so a
     /// connected peer sees nothing.
@@ -740,7 +840,7 @@ impl Server {
         match self.host.uplink(id, Some(secret)) {
             Ok(up) => {
                 eprintln!("[iroh] uplink {id} ticket: {}", up.ticket());
-                self.uplinks.insert(id, up);
+                self.uplinks.insert(id, UplinkHandle::Iroh(up));
                 self.graph.iroh_secrets.insert(id, secret);
                 self.place(id, Kind::Iroh, ws, pos, size);
             }
@@ -817,6 +917,7 @@ impl Server {
             // A duplicate uplink is a fresh identity with no peer — tickets
             // are per-endpoint, so there is nothing meaningful to copy.
             Some(Kind::Iroh) => self.add_iroh_node(off, ws),
+            Some(Kind::Veilid) => self.add_veilid_node(off, ws),
             _ => {}
         }
     }
@@ -827,7 +928,7 @@ impl Server {
             Some(Kind::File) => self.remove_file_node(id),
             Some(Kind::Port) => self.remove_host_port(id),
             Some(Kind::Network | Kind::Gateway) => self.remove_net_node(id),
-            Some(Kind::Iroh) => self.remove_iroh_node(id),
+            Some(Kind::Iroh | Kind::Veilid) => self.remove_uplink_node(id),
             Some(Kind::App) => self.close_node(id),
             None => {}
         }
@@ -897,7 +998,7 @@ impl Server {
             Some(Kind::File) => NodeClass::File,
             Some(Kind::Port) => NodeClass::Port,
             Some(Kind::Network | Kind::Gateway) => NodeClass::Net,
-            Some(Kind::Iroh) => NodeClass::Iroh,
+            Some(Kind::Iroh | Kind::Veilid) => NodeClass::Uplink,
             Some(Kind::App) | None => NodeClass::Other,
         }
     }
@@ -991,9 +1092,9 @@ impl Server {
         self.forget(id);
     }
 
-    /// Remove an Iroh uplink node; dropping the uplink closes its endpoint and
-    /// detaches its trunk from the fabric.
-    fn remove_iroh_node(&mut self, id: NodeId) {
+    /// Remove an uplink node (Iroh or Veilid); dropping the uplink closes its
+    /// endpoint and detaches its trunk from the fabric.
+    fn remove_uplink_node(&mut self, id: NodeId) {
         self.uplinks.remove(&id);
         self.graph.net_links.retain(|&(a, _)| a != id);
         self.forget(id);
@@ -1182,6 +1283,7 @@ impl Server {
         self.graph.file_nodes.remove(&id);
         self.graph.host_ports.remove(&id);
         self.graph.iroh_secrets.remove(&id);
+        self.graph.veilid_ids.remove(&id);
     }
 
     /// Whether the given wire still connects two live nodes.
@@ -1402,9 +1504,29 @@ impl Server {
                         .iter()
                         .filter(|(id, _)| mine(id))
                         .filter_map(|(&id, secret)| {
-                            Some(IrohState {
+                            Some(UplinkState {
                                 id,
-                                secret: Some(IrohState::secret_hex(secret)),
+                                secret: Some(UplinkState::secret_hex(secret)),
+                                peer: self
+                                    .graph
+                                    .node_args
+                                    .get(&id)
+                                    .filter(|a| !a.is_empty())
+                                    .map(|a| a.join(" ")),
+                                pos: self.graph.nodes.get(&id)?.pos,
+                                size: self.graph.nodes.get(&id)?.size,
+                            })
+                        })
+                        .collect(),
+                    veilids: self
+                        .graph
+                        .veilid_ids
+                        .iter()
+                        .filter(|(id, _)| mine(id))
+                        .filter_map(|(&id, identity)| {
+                            Some(UplinkState {
+                                id,
+                                secret: Some(identity.clone()),
                                 peer: self
                                     .graph
                                     .node_args
@@ -1521,6 +1643,7 @@ impl Server {
                 }
                 NodeKind::Gateway => self.add_gateway_node(pos, ws),
                 NodeKind::Iroh => self.add_iroh_node(pos, ws),
+                NodeKind::Veilid => self.add_veilid_node(pos, ws),
             },
             // Create is create only: a wire that already exists is left alone
             // (removal is Delete, so a create-only token can never disconnect).
@@ -1642,6 +1765,11 @@ impl Server {
                 secret,
                 peer: self.graph.node_args.get(&id).cloned().unwrap_or_default(),
             }
+        } else if let Some(identity) = self.graph.veilid_ids.get(&id) {
+            SnapKind::Veilid {
+                identity: identity.clone(),
+                peer: self.graph.node_args.get(&id).cloned().unwrap_or_default(),
+            }
         } else {
             return None;
         };
@@ -1756,6 +1884,12 @@ impl Server {
                     self.set_node_args(s.id, &peer.join(" "));
                 }
             }
+            SnapKind::Veilid { identity, peer } => {
+                self.create_veilid_uplink(s.id, Some(identity), s.pos, s.size, s.ws);
+                if !peer.is_empty() {
+                    self.set_node_args(s.id, &peer.join(" "));
+                }
+            }
         }
     }
 
@@ -1863,13 +1997,14 @@ impl Server {
             .filter(|(_, r)| r.kind == Kind::Gateway)
             .map(|(&id, _)| id)
             .collect();
-        let iroh_nodes = self
+        let uplinks = self
             .uplinks
             .iter()
             .map(|(&id, up)| {
                 (
                     id,
-                    IrohMeta {
+                    UplinkMeta {
+                        kind: up.kind(),
                         ticket: up.ticket().to_string(),
                         peers: up.peers(),
                     },
@@ -1884,7 +2019,7 @@ impl Server {
             host_ports: self.graph.host_ports.clone(),
             net_nodes,
             gateways,
-            iroh_nodes,
+            uplinks,
             connections: self.graph.connections.clone(),
             midi_links: self.graph.midi_links.clone(),
             net_links: self.graph.net_links.clone(),
@@ -1949,7 +2084,7 @@ mod model_tests {
         };
         let ia = setup(&mut a);
         let ib = setup(&mut b);
-        let ticket = a.view().iroh_nodes[&ia].ticket.clone();
+        let ticket = a.view().uplinks[&ia].ticket.clone();
 
         b.apply(Command::Update {
             id: ib,
@@ -1962,10 +2097,7 @@ mod model_tests {
         // The dialer retries on a 2s cadence; allow a few rounds.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            let (pa, pb) = (
-                a.view().iroh_nodes[&ia].peers,
-                b.view().iroh_nodes[&ib].peers,
-            );
+            let (pa, pb) = (a.view().uplinks[&ia].peers, b.view().uplinks[&ib].peers);
             if pa == 1 && pb == 1 {
                 break;
             }
@@ -1974,6 +2106,69 @@ mod model_tests {
                 "uplinks never connected (peers: a={pa} b={pb})"
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Like `iroh_nodes_wire_and_dial_between_servers`, but over Veilid: two
+    /// servers each grow a Veilid node wired to a Network; pasting one's ticket
+    /// (a DHT record key) into the other establishes routed peers both ways.
+    /// Needs the public Veilid network (bootstrap, DHT, private routes), and
+    /// attaching can take tens of seconds — ignored by default, run manually:
+    /// `cargo test -p wk-server veilid_nodes -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs the public Veilid network; slow attach"]
+    fn veilid_nodes_wire_and_dial_between_servers() {
+        let mut a = fresh_server();
+        let mut b = fresh_server();
+        let setup = |s: &mut Server| {
+            let ws = s.graph.workspaces[0];
+            s.apply(Command::Create(Resource::Node {
+                kind: NodeKind::Veilid,
+                pos: [0.0, 0.0],
+                ws,
+            }));
+            s.apply(Command::Create(Resource::Node {
+                kind: NodeKind::Network,
+                pos: [100.0, 0.0],
+                ws,
+            }));
+            let uplink = *s.graph.veilid_ids.keys().next().expect("veilid node");
+            let net = s
+                .graph
+                .nodes
+                .iter()
+                .find(|(_, r)| r.kind == Kind::Network)
+                .map(|(&id, _)| id)
+                .expect("network node");
+            s.apply(Command::Create(Resource::Wire { a: uplink, b: net }));
+            uplink
+        };
+        let va = setup(&mut a);
+        let vb = setup(&mut b);
+        let ticket = a.view().uplinks[&va].ticket.clone();
+        eprintln!("[test] dialing {ticket}");
+
+        b.apply(Command::Update {
+            id: vb,
+            patch: NodePatch {
+                args: Some(ticket),
+                ..Default::default()
+            },
+        });
+
+        // Attach + DHT publish + route import can take a while on the real
+        // network; the dialer retries every 5s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        loop {
+            let (pa, pb) = (a.view().uplinks[&va].peers, b.view().uplinks[&vb].peers);
+            if pa >= 1 && pb >= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "veilid uplinks never connected (peers: a={pa} b={pb})"
+            );
+            std::thread::sleep(std::time::Duration::from_secs(2));
         }
     }
 

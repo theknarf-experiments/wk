@@ -19,8 +19,8 @@ pub enum NodeClass {
     File,
     Port,
     Net,
-    /// An iroh uplink node — wires only to a Network (the net it extends).
-    Iroh,
+    /// An uplink node (Iroh/Veilid) — wires only to a Network (the net it extends).
+    Uplink,
     Other,
 }
 
@@ -30,7 +30,7 @@ pub enum NodeClass {
 ///
 /// A file/port/net node only wires to an *app* ([`NodeClass::Other`]): a File
 /// mounts into the app, a HostPort serves the app (the http node), a Network is
-/// joined by the app. Two apps form a MIDI link. An Iroh uplink joins a Network
+/// joined by the app. Two apps form a MIDI link. An uplink node (Iroh, Veilid) joins a Network
 /// exactly like an app does (it's a member whose "traffic" is the remote
 /// fabric). Any other pairing — two special nodes, or the same special kind
 /// twice — can't be wired.
@@ -43,8 +43,8 @@ pub fn classify(a: NodeId, b: NodeId, ca: NodeClass, cb: NodeClass) -> Option<Wi
         (Port, Other) => Some(Wire::Serve(b, a)),
         (Other, Port) => Some(Wire::Serve(a, b)),
         // The app (or uplink) is the first element; the network the second.
-        (Net, Other) | (Net, Iroh) => Some(Wire::Net(b, a)),
-        (Other, Net) | (Iroh, Net) => Some(Wire::Net(a, b)),
+        (Net, Other) | (Net, Uplink) => Some(Wire::Net(b, a)),
+        (Other, Net) | (Uplink, Net) => Some(Wire::Net(a, b)),
         (Other, Other) => Some(Wire::Midi(a, b)),
         _ => None,
     }
@@ -171,34 +171,34 @@ mod tests {
     fn classify_covers_every_class_pair() {
         use NodeClass::*;
         let (a, b) = (id(1), id(2));
-        // A special node wires only to an app (Other) — except an Iroh uplink,
+        // A special node wires only to an app (Other) — except an uplink node,
         // which wires only to a Network; every other special↔special pairing
         // is None.
         let cases = [
             (File, File, None),
             (File, Port, None),
             (File, Net, None),
-            (File, Iroh, None),
+            (File, Uplink, None),
             (File, Other, Some(Wire::File(a, b))),
             (Port, File, None),
             (Port, Port, None),
             (Port, Net, None),
-            (Port, Iroh, None),
+            (Port, Uplink, None),
             (Port, Other, Some(Wire::Serve(b, a))),
             (Net, File, None),
             (Net, Port, None),
             (Net, Net, None),
-            (Net, Iroh, Some(Wire::Net(b, a))),
+            (Net, Uplink, Some(Wire::Net(b, a))),
             (Net, Other, Some(Wire::Net(b, a))),
-            (Iroh, File, None),
-            (Iroh, Port, None),
-            (Iroh, Net, Some(Wire::Net(a, b))),
-            (Iroh, Iroh, None),
-            (Iroh, Other, None),
+            (Uplink, File, None),
+            (Uplink, Port, None),
+            (Uplink, Net, Some(Wire::Net(a, b))),
+            (Uplink, Uplink, None),
+            (Uplink, Other, None),
             (Other, File, Some(Wire::File(b, a))),
             (Other, Port, Some(Wire::Serve(a, b))),
             (Other, Net, Some(Wire::Net(a, b))),
-            (Other, Iroh, None),
+            (Other, Uplink, None),
             (Other, Other, Some(Wire::Midi(a, b))),
         ];
         for (ca, cb, want) in cases {
@@ -211,7 +211,7 @@ mod tests {
             Just(NodeClass::File),
             Just(NodeClass::Port),
             Just(NodeClass::Net),
-            Just(NodeClass::Iroh),
+            Just(NodeClass::Uplink),
             Just(NodeClass::Other),
         ]
     }
@@ -238,14 +238,14 @@ mod tests {
         }
 
         /// A wire forms if and only if one side is an app node paired with a
-        /// non-Iroh node, or the pair is an Iroh uplink and a Network — two
+        /// non-Uplink node, or the pair is an Uplink uplink and a Network — two
         /// special nodes otherwise never wire.
         #[test]
         fn classify_requires_an_app_or_uplink_endpoint(a in any_id(), b in any_id(), ca in any_class(), cb in any_class()) {
             use NodeClass::*;
             let wired = classify(a, b, ca, cb).is_some();
-            let app_pair = (ca == Other || cb == Other) && ca != Iroh && cb != Iroh;
-            let uplink_pair = matches!((ca, cb), (Iroh, Net) | (Net, Iroh));
+            let app_pair = (ca == Other || cb == Other) && ca != Uplink && cb != Uplink;
+            let uplink_pair = matches!((ca, cb), (Uplink, Net) | (Net, Uplink));
             prop_assert_eq!(wired, app_pair || uplink_pair);
         }
 
