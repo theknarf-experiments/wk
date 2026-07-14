@@ -368,9 +368,11 @@ pub struct Server {
     /// Active MIDI routes: (src, dst) currently in the router. Mirrors
     /// `graph.midi_links`; reconciled by `sync_midi`.
     routed: HashSet<(NodeId, NodeId)>,
-    /// Currently *running* servers: http node id -> (HostPort id, kill switch).
-    /// A subset of `graph.serve_links` — an entry appears only once the node is a
-    /// ready wasi:http node and the port bound. Reconciled by `sync_serves`.
+    /// Currently *running* servers: served node id -> (HostPort id, kill switch).
+    /// A subset of `graph.serve_links` — an entry appears only once the node is
+    /// ready (a wasi:http node dispatched per request, or a fabric node with a
+    /// TCP forward into its network) and the port bound. Reconciled by
+    /// `sync_serves`.
     pub serves: HashMap<NodeId, (NodeId, Arc<AtomicBool>)>,
 
     /// Inverse-command history for [`Command::Undo`].
@@ -878,8 +880,8 @@ impl Server {
         self.forget(id);
     }
 
-    /// Wire (or unwire) a wasi:http node to a HostPort. Toggles the *desired*
-    /// serve link; the actual bind is (re)established by [`Self::sync_serves`].
+    /// Wire (or unwire) an app node to a HostPort. Toggles the *desired* serve
+    /// link; the actual bind is (re)established by [`Self::sync_serves`].
     fn toggle_serve(&mut self, http_id: NodeId, hostport_id: NodeId) {
         // "One server per http node" — a new target replaces any existing one.
         wiring::toggle_unique(&mut self.graph.serve_links, http_id, hostport_id);
@@ -908,16 +910,15 @@ impl Server {
         }
     }
 
-    /// Try to bind the HTTP server for one desired serve link. Silently does
-    /// nothing if the node isn't a ready wasi:http node yet or its port is already
-    /// served (both are transient during async compile / port conflicts); only a
-    /// real bind failure is logged.
+    /// Try to bind the server for one desired serve link. A wasi:http node gets
+    /// an HTTP server dispatching into its handler; a fabric (wasi:sockets) node
+    /// gets a TCP forward from the localhost port to its fabric address at the
+    /// same port number. Silently does nothing if the node isn't ready yet or
+    /// its port is already served (both are transient during async compile /
+    /// port conflicts); only a real bind failure is logged.
     fn start_serve(&mut self, http_id: NodeId, hostport_id: NodeId) {
         let Some(node) = self.app_node(http_id) else {
             return;
-        };
-        let Some(path) = node.http_path() else {
-            return; // not a wasi:http node, or still compiling
         };
         let Some(&port) = self.graph.host_ports.get(&hostport_id) else {
             return;
@@ -929,10 +930,15 @@ impl Server {
             return;
         }
         let kill = Arc::new(AtomicBool::new(false));
-        if let Err(e) = self
-            .host
-            .serve(&path, port, Some(node.term_io.clone()), kill.clone())
-        {
+        let bound = if let Some(path) = node.http_path() {
+            self.host
+                .serve(&path, port, Some(node.term_io.clone()), kill.clone())
+        } else if let Some(stack) = node.net_stack() {
+            self.host.forward(stack, port, kill.clone())
+        } else {
+            return; // still compiling, or a node with nothing to serve
+        };
+        if let Err(e) = bound {
             eprintln!("failed to serve {} on :{port}: {e:#}", node.name);
             return;
         }

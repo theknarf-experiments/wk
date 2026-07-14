@@ -16,6 +16,7 @@ pub mod netstack;
 pub mod oci;
 pub mod options;
 pub mod plugin;
+pub mod portfwd;
 pub mod runtime;
 pub mod server;
 pub mod sockets;

@@ -257,6 +257,28 @@ impl NetHub {
         Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, ip.octets()[3] as u16)
     }
 
+    /// Pick a fabric IPv4 address whose host octet isn't taken by any attached
+    /// stack, starting from `seed` (so id-derived addresses stay stable when
+    /// free). Host octets live in `2..=251`; with all 250 taken the seed is
+    /// returned as-is.
+    pub fn alloc_ip(&self, seed: u8) -> Ipv4Address {
+        let used: std::collections::HashSet<u8> = self
+            .stacks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.lock().unwrap().ip.octets()[3])
+            .collect();
+        let mut octet = seed.clamp(2, 251);
+        for _ in 0..250 {
+            if !used.contains(&octet) {
+                break;
+            }
+            octet = 2 + (octet - 1) % 250;
+        }
+        Ipv4Address::new(10, 0, 0, octet)
+    }
+
     /// Attach a node named `name` to virtual network `net` at address `ip`,
     /// returning its stack (to drive via wasi:sockets).
     pub fn attach(&self, net: NodeId, ip: Ipv4Address, name: &str) -> SharedStack {

@@ -793,6 +793,19 @@ impl PluginHost {
         Ok(())
     }
 
+    /// Forward `127.0.0.1:port` into the fabric at `target`'s address (same port
+    /// number) — publishing a `wasi:sockets` server node on a HostPort, the way
+    /// [`Self::serve`] publishes a `wasi:http` node. Returns once the port is
+    /// bound; runs until `kill` is set.
+    pub fn forward(
+        &self,
+        target: crate::netstack::SharedStack,
+        port: u16,
+        kill: Arc<AtomicBool>,
+    ) -> Result<()> {
+        crate::portfwd::forward(self.hub.clone(), target, port, kill)
+    }
+
     /// Register a plugin as a `Node` under `id` and return immediately — the
     /// component is compiled on a background thread so other nodes aren't blocked
     /// (Cranelift on a multi-MB debug component takes hundreds of ms to seconds).
@@ -864,8 +877,9 @@ impl PluginHost {
         // it's alone on its own virtual network (net id = node id) — isolated —
         // until the server wires it to a Network node.
         let net_stack = if !is_http && component_imports_sockets(&component, &self.engine) {
-            let ip =
-                smoltcp::wire::Ipv4Address::new(10, 0, 0, (2 + (node.id.as_u128() % 250)) as u8);
+            // Seeded from the node id so a node keeps its address across
+            // re-runs; alloc_ip skips octets already taken by other stacks.
+            let ip = self.hub.alloc_ip((2 + (node.id.as_u128() % 250)) as u8);
             Some(self.hub.attach(node.id, ip, name))
         } else {
             None
