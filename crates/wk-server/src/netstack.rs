@@ -28,6 +28,20 @@ use smoltcp::wire::{
 /// One raw IP packet on the fabric (Medium::Ip — no Ethernet header).
 pub type Frame = Vec<u8>;
 
+/// The destination address of a raw fabric frame. The IP version is in the
+/// first nibble (4 or 6); parse the dst either way, `None` for garbage.
+fn frame_dst(frame: &[u8]) -> Option<IpAddress> {
+    match frame.first().map(|b| b >> 4) {
+        Some(4) => Ipv4Packet::new_checked(frame)
+            .ok()
+            .map(|p| p.dst_addr().into()),
+        Some(6) => Ipv6Packet::new_checked(frame)
+            .ok()
+            .map(|p| p.dst_addr().into()),
+        _ => None,
+    }
+}
+
 type Queue = Arc<Mutex<VecDeque<Frame>>>;
 
 fn queue() -> Queue {
@@ -212,10 +226,51 @@ impl NodeStack {
 
 pub type SharedStack = Arc<Mutex<NodeStack>>;
 
+/// A trunk port on a virtual network: it receives every frame on its net whose
+/// destination is no local stack (which would otherwise drop at the isolation
+/// boundary), and can inject frames from elsewhere — a remote fabric, a
+/// middlebox — into the net. Whoever attaches the trunk (an Iroh uplink, a VPN
+/// node) shuttles frames between `drain_outbound` and `inject`.
+pub struct TrunkPort {
+    /// The network this trunk extends (follows rewiring via [`Self::set_net`]).
+    net: Mutex<NodeId>,
+    /// Frames leaving the local net (no local owner for the dst) for the
+    /// remote side.
+    outbound: Queue,
+    /// Frames arriving from the remote side, delivered into the net on the
+    /// next hub step. Never re-trunked (split horizon), so two joined fabrics
+    /// can't loop a frame back and forth.
+    inbound: Queue,
+}
+
+impl TrunkPort {
+    pub fn net(&self) -> NodeId {
+        *self.net.lock().unwrap()
+    }
+    pub fn set_net(&self, net: NodeId) {
+        *self.net.lock().unwrap() = net;
+    }
+    /// Take the frames headed for the remote side.
+    pub fn drain_outbound(&self) -> Vec<Frame> {
+        self.outbound.lock().unwrap().drain(..).collect()
+    }
+    /// Hand a frame from the remote side to the local net.
+    pub fn inject(&self, frame: Frame) {
+        self.inbound.lock().unwrap().push_back(frame);
+    }
+    fn drain_inbound(&self) -> Vec<Frame> {
+        self.inbound.lock().unwrap().drain(..).collect()
+    }
+    fn deliver_outbound(&self, frame: Frame) {
+        self.outbound.lock().unwrap().push_back(frame);
+    }
+}
+
 /// The network hub: owns every node stack and drives them on a background
 /// thread, routing packets between same-network nodes.
 pub struct NetHub {
     stacks: Mutex<Vec<SharedStack>>,
+    trunks: Mutex<Vec<Arc<TrunkPort>>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -224,6 +279,7 @@ impl NetHub {
     pub fn new() -> Arc<NetHub> {
         let hub = Arc::new(NetHub {
             stacks: Mutex::new(Vec::new()),
+            trunks: Mutex::new(Vec::new()),
             stop: Arc::new(AtomicBool::new(false)),
         });
         let driver = hub.clone();
@@ -317,6 +373,27 @@ impl NetHub {
             .retain(|s| !Arc::ptr_eq(s, stack));
     }
 
+    /// Attach a trunk to virtual network `net`: frames on that net with no
+    /// local destination flow out of it instead of dropping.
+    pub fn attach_trunk(&self, net: NodeId) -> Arc<TrunkPort> {
+        let trunk = Arc::new(TrunkPort {
+            net: Mutex::new(net),
+            outbound: queue(),
+            inbound: queue(),
+        });
+        self.trunks.lock().unwrap().push(trunk.clone());
+        trunk
+    }
+
+    /// Remove a trunk (on unwire / node close); its net's off-fabric frames
+    /// drop again.
+    pub fn detach_trunk(&self, trunk: &Arc<TrunkPort>) {
+        self.trunks
+            .lock()
+            .unwrap()
+            .retain(|t| !Arc::ptr_eq(t, trunk));
+    }
+
     /// One driver step: poll every stack, route packets between same-network
     /// peers, poll again to deliver, and wake parked pollables. Exposed for
     /// tests; the hub thread calls it in a loop.
@@ -350,26 +427,32 @@ impl NetHub {
             routes.push((net, ip, ip6, s.clone()));
         }
 
-        // Phase 2: deliver each frame to the same-network node owning the dest IP.
-        // The IP version is in the first nibble (4 or 6); parse the dst either way.
-        for (net, frame) in outbound {
-            let dst: IpAddress = match frame.first().map(|b| b >> 4) {
-                Some(4) => match Ipv4Packet::new_checked(&frame[..]) {
-                    Ok(p) => p.dst_addr().into(),
-                    Err(_) => continue,
-                },
-                Some(6) => match Ipv6Packet::new_checked(&frame[..]) {
-                    Ok(p) => p.dst_addr().into(),
-                    Err(_) => continue,
-                },
-                _ => continue,
-            };
+        // Phase 2: deliver each frame to the same-network node owning the dest
+        // IP. A stack-originated frame with no local owner leaves through the
+        // net's trunk(s) — or drops if there are none (the isolation boundary).
+        // Frames a trunk injected deliver to local stacks only (split horizon:
+        // an unknown dst must not bounce back out to the remote side).
+        let trunks: Vec<Arc<TrunkPort>> = self.trunks.lock().unwrap().clone();
+        let deliver = |net: NodeId, frame: Frame, from_trunk: bool| {
+            let Some(dst) = frame_dst(&frame) else { return };
             if let Some((_, _, _, stack)) = routes.iter().find(|(n, v4, v6, _)| {
                 *n == net && (dst == IpAddress::Ipv4(*v4) || dst == IpAddress::Ipv6(*v6))
             }) {
                 stack.lock().unwrap().device.deliver(frame);
+            } else if !from_trunk {
+                for t in trunks.iter().filter(|t| t.net() == net) {
+                    t.deliver_outbound(frame.clone());
+                }
             }
-            // Off-network / unknown dest: dropped (the isolation boundary).
+        };
+        for (net, frame) in outbound {
+            deliver(net, frame, false);
+        }
+        for t in &trunks {
+            let net = t.net();
+            for frame in t.drain_inbound() {
+                deliver(net, frame, true);
+            }
         }
 
         // Phase 3: poll again so delivered frames are processed now, reap any
@@ -584,6 +667,155 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(&got, b"hello wk net");
+    }
+
+    /// Two independent fabrics (separate hubs, as in two wk instances) joined
+    /// by a trunk on each and a "virtual cable" shuttling frames between them:
+    /// a TCP client on one fabric reaches a server on the other. This is the
+    /// packet path an Iroh uplink node rides — the cable becomes the QUIC
+    /// connection.
+    #[test]
+    fn trunked_fabrics_talk_tcp_across_hubs() {
+        let hub_a = NetHub::new();
+        let hub_b = NetHub::new();
+        let net = NodeId::nil();
+        let client = hub_a.attach(net, Ipv4Address::new(10, 0, 0, 1), "client");
+        let server = hub_b.attach(net, Ipv4Address::new(10, 0, 0, 2), "server");
+        let trunk_a = hub_a.attach_trunk(net);
+        let trunk_b = hub_b.attach_trunk(net);
+
+        // The cable: shuttle frames both ways (an uplink node's pump).
+        let (ta, tb) = (trunk_a.clone(), trunk_b.clone());
+        let stop = Arc::new(AtomicBool::new(false));
+        let cable_stop = stop.clone();
+        let cable = std::thread::spawn(move || {
+            while !cable_stop.load(Ordering::Relaxed) {
+                for f in ta.drain_outbound() {
+                    tb.inject(f);
+                }
+                for f in tb.drain_outbound() {
+                    ta.inject(f);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        let server_h = {
+            let mut g = server.lock().unwrap();
+            let h = g.sockets.add(tcp_socket());
+            g.sockets.get_mut::<tcp::Socket>(h).listen(80).unwrap();
+            h
+        };
+        let client_h = {
+            let mut g = client.lock().unwrap();
+            let h = g.sockets.add(tcp_socket());
+            let NodeStack { iface, sockets, .. } = &mut *g;
+            sockets
+                .get_mut::<tcp::Socket>(h)
+                .connect(iface.context(), (Ipv4Address::new(10, 0, 0, 2), 80), 49152)
+                .unwrap();
+            h
+        };
+
+        let mut sent = false;
+        let mut got: Vec<u8> = Vec::new();
+        for _ in 0..500 {
+            hub_a.step();
+            hub_b.step();
+            {
+                let mut g = client.lock().unwrap();
+                let cs = g.sockets.get_mut::<tcp::Socket>(client_h);
+                if cs.can_send() && !sent {
+                    cs.send_slice(b"across fabrics").unwrap();
+                    sent = true;
+                }
+            }
+            {
+                let mut g = server.lock().unwrap();
+                let ss = g.sockets.get_mut::<tcp::Socket>(server_h);
+                if ss.can_recv() {
+                    let mut buf = [0u8; 64];
+                    let n = ss.recv_slice(&mut buf).unwrap();
+                    got.extend_from_slice(&buf[..n]);
+                }
+            }
+            if got.len() >= 14 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        stop.store(true, Ordering::Relaxed);
+        cable.join().unwrap();
+        assert_eq!(&got, b"across fabrics");
+    }
+
+    /// A trunk only taps its own network: another net's off-fabric frames still
+    /// drop, and frames a trunk injected never leave through a trunk again
+    /// (split horizon), so joined fabrics can't loop unknown destinations.
+    #[test]
+    fn trunk_taps_its_net_only_and_never_reflects() {
+        let hub = NetHub::new();
+        let net = NodeId::nil();
+        let other_net = NodeId::new();
+        let sender = hub.attach(other_net, Ipv4Address::new(10, 0, 0, 1), "sender");
+        let trunk = hub.attach_trunk(net);
+        let trunk2 = hub.attach_trunk(net);
+
+        // A node on ANOTHER net sends to an address nobody owns.
+        let h = {
+            let mut g = sender.lock().unwrap();
+            let h = g.sockets.add(udp_socket());
+            g.sockets.get_mut::<udp::Socket>(h).bind(4000).unwrap();
+            h
+        };
+        sender
+            .lock()
+            .unwrap()
+            .sockets
+            .get_mut::<udp::Socket>(h)
+            .send_slice(b"lost", (Ipv4Address::new(10, 0, 0, 99), 4001))
+            .unwrap();
+        for _ in 0..10 {
+            hub.step();
+        }
+        assert!(
+            trunk.drain_outbound().is_empty(),
+            "trunk tapped a frame from a different net"
+        );
+
+        // Move the sender onto the trunked net: now the frame flows out — and
+        // to BOTH trunks on the net.
+        sender.lock().unwrap().net = net;
+        sender
+            .lock()
+            .unwrap()
+            .sockets
+            .get_mut::<udp::Socket>(h)
+            .send_slice(b"tapped", (Ipv4Address::new(10, 0, 0, 99), 4001))
+            .unwrap();
+        let mut out = Vec::new();
+        for _ in 0..10 {
+            hub.step();
+            out.extend(trunk.drain_outbound());
+        }
+        assert!(
+            !out.is_empty(),
+            "trunk missed an off-fabric frame on its net"
+        );
+        let mut out2 = Vec::new();
+        for _ in 0..2 {
+            out2.extend(trunk2.drain_outbound());
+        }
+        assert!(!out2.is_empty(), "second trunk on the net missed the frame");
+
+        // Re-injecting that unknown-dst frame must NOT come back out of any
+        // trunk (split horizon) — it just drops.
+        trunk.inject(out[0].clone());
+        for _ in 0..10 {
+            hub.step();
+        }
+        assert!(trunk.drain_outbound().is_empty());
+        assert!(trunk2.drain_outbound().is_empty());
     }
 
     /// Nodes on DIFFERENT virtual networks can't reach each other, even at the
