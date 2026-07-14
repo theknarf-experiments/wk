@@ -407,6 +407,7 @@ enum PaletteCmd {
     AddPort,
     AddNetwork,
     AddGateway,
+    AddIroh,
     NewWorkspace,
     CloseWorkspace,
     /// Jump the camera to this zoom factor.
@@ -967,6 +968,7 @@ impl App {
         v.push(("Add Port".into(), PaletteCmd::AddPort));
         v.push(("Add Network".into(), PaletteCmd::AddNetwork));
         v.push(("Add Gateway".into(), PaletteCmd::AddGateway));
+        v.push(("Add Iroh Uplink".into(), PaletteCmd::AddIroh));
         v.push(("New Workspace  (Cmd+T)".into(), PaletteCmd::NewWorkspace));
         if self.tabs.len() > 1 {
             v.push((
@@ -1000,6 +1002,8 @@ impl App {
             "gateway".into()
         } else if self.view.net_nodes.contains(&id) {
             "network".into()
+        } else if self.view.iroh_nodes.contains_key(&id) {
+            "iroh".into()
         } else {
             "node".into()
         }
@@ -1154,6 +1158,14 @@ impl App {
                 let pos = self.view_center([FILE_W, FILE_H], self.view.net_nodes.len());
                 self.conn.send(Command::Create(Resource::Node {
                     kind: NodeKind::Gateway,
+                    pos,
+                    ws,
+                }));
+            }
+            PaletteCmd::AddIroh => {
+                let pos = self.view_center([FILE_W, FILE_H], self.view.iroh_nodes.len());
+                self.conn.send(Command::Create(Resource::Node {
+                    kind: NodeKind::Iroh,
                     pos,
                     ws,
                 }));
@@ -1645,9 +1657,11 @@ impl App {
                     let is_file = self.view.file_nodes.contains_key(&id);
                     let is_port = self.view.host_ports.contains_key(&id);
                     let is_net = self.view.net_nodes.contains(&id);
-                    if is_file || is_port || is_net {
-                        // Canvas widget nodes (file / HostPort / Network): close,
-                        // adjust port (HostPort −/+ buttons), or move.
+                    let is_iroh = self.view.iroh_nodes.contains_key(&id);
+                    if is_file || is_port || is_net || is_iroh {
+                        // Canvas widget nodes (file / HostPort / Network / Iroh):
+                        // close, adjust port (HostPort −/+ buttons), edit the
+                        // peer ticket (Iroh, lower half), or move.
                         let (minus, plus) = port_step_btns(r, zf);
                         if contains(close_btn(r, zf), mp) {
                             self.conn.send(Command::Delete(ResourceRef::Node(id)));
@@ -1667,6 +1681,17 @@ impl App {
                                     ..Default::default()
                                 },
                             });
+                        } else if is_iroh && mp[1] > (r[1] + r[3]) * 0.5 {
+                            // Click the status line to type/paste the remote
+                            // ticket; Enter dials it.
+                            let cur = self
+                                .view
+                                .node_args
+                                .get(&id)
+                                .cloned()
+                                .unwrap_or_default()
+                                .join(" ");
+                            self.editing_args = Some((id, cur));
                         } else {
                             let mc = self.cam.to_canvas(mp);
                             let p = self.view.win_pos[&id];
@@ -2126,6 +2151,89 @@ impl App {
                     r[1] + (PAD + lh) * zf,
                     zf * 0.7,
                     [0.72, 0.62, 0.9, 1.0],
+                    clip,
+                );
+                let cb = close_btn(r, zf);
+                if contains(cb, mp) {
+                    quads.push(Quad::solid(white, cb, CLOSE_HOT, clip));
+                }
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    "x",
+                    cb[0] + (cb[2] - cb[0]) * 0.28,
+                    cb[1] + (cb[3] - cb[1]) * 0.05,
+                    zf * 0.8,
+                    TEXT,
+                    clip,
+                );
+                draw_ports(&mut quads, gfx.renderer.circle, r, zf, mp, full);
+                continue;
+            }
+
+            // An Iroh uplink node: extends the Network it's wired to onto a
+            // remote fabric over p2p QUIC. The status line doubles as the peer
+            // ticket field (click, paste/type, Enter dials).
+            if let Some(meta) = self.view.iroh_nodes.get(&id).cloned() {
+                quads.push(Quad::solid(white, r, NET_BORDER, clip));
+                let body = [
+                    r[0] + BORDER * zf,
+                    r[1] + BORDER * zf,
+                    r[2] - BORDER * zf,
+                    r[3] - BORDER * zf,
+                ];
+                quads.push(Quad::solid(white, body, NET_BG, clip));
+                let lh = gfx.fonts.line_height() as f32;
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    "Iroh",
+                    r[0] + PAD * zf,
+                    r[1] + PAD * zf,
+                    zf,
+                    TEXT,
+                    clip,
+                );
+                let editing = matches!(&self.editing_args, Some((eid, _)) if *eid == id);
+                let (line, col) = if editing {
+                    // Show the tail of the in-progress ticket with a caret.
+                    let text = match &self.editing_args {
+                        Some((_, s)) => s.as_str(),
+                        None => "",
+                    };
+                    let tail: String = text
+                        .chars()
+                        .rev()
+                        .take(14)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    (format!("{tail}_"), TEXT)
+                } else if meta.peers > 0 {
+                    (format!("● {} peer(s)", meta.peers), [0.4, 0.85, 0.5, 1.0])
+                } else if self.view.node_args.get(&id).is_some_and(|a| !a.is_empty()) {
+                    ("dialing…".into(), [0.72, 0.62, 0.9, 1.0])
+                } else {
+                    ("click to add peer".into(), [0.55, 0.7, 0.72, 1.0])
+                };
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    &line,
+                    r[0] + PAD * zf,
+                    r[1] + (PAD + lh) * zf,
+                    zf * 0.7,
+                    col,
                     clip,
                 );
                 let cb = close_btn(r, zf);

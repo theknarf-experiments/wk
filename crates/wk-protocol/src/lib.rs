@@ -117,6 +117,8 @@ pub enum NodeKind {
     Network,
     /// A network whose members get host access.
     Gateway,
+    /// An iroh uplink: extends a Network to a remote fabric over p2p QUIC.
+    Iroh,
 }
 
 /// A resource to create.

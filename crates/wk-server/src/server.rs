@@ -15,7 +15,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::plugin::{NodeRegistry, PluginHost, SharedNode, SharedSurface, SurfaceRegistry};
 use crate::wiring::{self, NodeClass};
-use crate::workspace::{Dependency, Document, NetState, NodeState, PortState, Workspace};
+use crate::workspace::{
+    Dependency, Document, IrohState, NetState, NodeState, PortState, Workspace,
+};
 use wk_protocol::{Command, NodeId, NodeKind, Resource, ResourceRef, Wire};
 
 /// Default canvas size of a file / port / network node, in canvas pixels.
@@ -78,6 +80,15 @@ pub struct FileMeta {
     pub host_mapped: bool,
 }
 
+/// Render-facing metadata about an Iroh uplink node.
+#[derive(Clone)]
+pub struct IrohMeta {
+    /// This uplink's dialable ticket (shown so the user can share it).
+    pub ticket: String,
+    /// Live tunnel connections.
+    pub peers: usize,
+}
+
 /// A read-only snapshot of the document a client renders from. Produced by
 /// [`Server::view`] under one lock; everything is owned/cloned except the live
 /// surface and node handles, which are `Arc`s a client uses to paint pixels and
@@ -92,6 +103,7 @@ pub struct View {
     pub host_ports: HashMap<NodeId, u16>,
     pub net_nodes: HashSet<NodeId>,
     pub gateways: HashSet<NodeId>,
+    pub iroh_nodes: HashMap<NodeId, IrohMeta>,
     pub connections: Vec<(NodeId, NodeId)>,
     pub midi_links: Vec<(NodeId, NodeId)>,
     pub net_links: Vec<(NodeId, NodeId)>,
@@ -158,6 +170,12 @@ impl View {
                 .iter()
                 .copied()
                 .filter(|id| mine(id))
+                .collect(),
+            iroh_nodes: self
+                .iroh_nodes
+                .iter()
+                .filter(|(id, _)| mine(id))
+                .map(|(&k, v)| (k, v.clone()))
                 .collect(),
             connections: self
                 .connections
@@ -282,6 +300,11 @@ enum SnapKind {
     Net {
         gateway: bool,
     },
+    Iroh {
+        secret: [u8; 32],
+        /// The peer ticket it was dialing (stored as its args).
+        peer: Vec<String>,
+    },
 }
 
 /// What kind of node this is. The base fact that used to be inferred by probing
@@ -293,6 +316,8 @@ pub enum Kind {
     Port,
     Network,
     Gateway,
+    /// An iroh uplink: extends the Network it's wired to onto a remote fabric.
+    Iroh,
 }
 
 impl Kind {
@@ -341,6 +366,11 @@ pub struct Graph {
     /// Network membership wires, as (app node id, Network node id).
     pub net_links: Vec<(NodeId, NodeId)>,
 
+    /// Iroh uplink nodes' ed25519 secrets, so a node's ticket (its dialable
+    /// identity) survives restarts. The peer ticket it dials lives in
+    /// `node_args`. Side table keyed by node id.
+    pub iroh_secrets: HashMap<NodeId, [u8; 32]>,
+
     /// The workspaces (tabs) in this document, in order — including empty ones.
     pub workspaces: Vec<NodeId>,
     /// The workspace's launchable dependencies.
@@ -374,6 +404,9 @@ pub struct Server {
     /// TCP forward into its network) and the port bound. Reconciled by
     /// `sync_serves`.
     pub serves: HashMap<NodeId, (NodeId, Arc<AtomicBool>)>,
+    /// Running iroh uplinks, one per Iroh node. Dropping one closes its
+    /// endpoint and detaches its trunk.
+    uplinks: HashMap<NodeId, crate::uplink::Uplink>,
 
     /// Inverse-command history for [`Command::Undo`].
     undo: Vec<Undo>,
@@ -401,6 +434,7 @@ impl Server {
             mounted: HashMap::new(),
             routed: HashSet::new(),
             serves: HashMap::new(),
+            uplinks: HashMap::new(),
             undo: Vec::new(),
             next_port: 8080,
             file_seq: 0,
@@ -531,9 +565,23 @@ impl Server {
             };
             self.place(net.id, kind, saved.id, net.pos, net.size);
         }
-        // Re-wire network membership (rejoins the network + grants host access).
+
+        // Iroh uplink nodes: restart each endpoint with its saved identity (so
+        // its ticket is unchanged) and re-dial its saved peer.
+        for ir in &saved.irohs {
+            let secret = ir
+                .secret_bytes()
+                .unwrap_or_else(|| iroh::SecretKey::generate().to_bytes());
+            self.create_uplink(ir.id, secret, ir.pos, ir.size, saved.id);
+            if let Some(peer) = &ir.peer {
+                self.set_node_args(ir.id, peer);
+            }
+        }
+
+        // Re-wire network membership (rejoins the network + grants host access;
+        // an uplink member re-trunks its network).
         for &(app_id, net_id) in &saved.net_links {
-            if self.app_node(app_id).is_some() && self.is_net(net_id) {
+            if (self.app_node(app_id).is_some() || self.is_iroh(app_id)) && self.is_net(net_id) {
                 self.toggle_net(app_id, net_id);
             }
         }
@@ -569,6 +617,11 @@ impl Server {
     /// Whether `id` is a Gateway node (a Network that grants host access).
     fn is_gateway(&self, id: NodeId) -> bool {
         self.kind_of(id) == Some(Kind::Gateway)
+    }
+
+    /// Whether `id` is an Iroh uplink node.
+    fn is_iroh(&self, id: NodeId) -> bool {
+        self.kind_of(id) == Some(Kind::Iroh)
     }
 
     fn alloc_id(&mut self) -> NodeId {
@@ -666,6 +719,35 @@ impl Server {
         self.place(id, Kind::Gateway, ws, pos, [FILE_W, FILE_H]);
     }
 
+    /// Create an Iroh uplink node at `pos` with a fresh identity.
+    fn add_iroh_node(&mut self, pos: [f32; 2], ws: NodeId) {
+        let id = self.alloc_id();
+        let secret = iroh::SecretKey::generate().to_bytes();
+        self.create_uplink(id, secret, pos, [FILE_W, FILE_H], ws);
+    }
+
+    /// Create (or restore) an Iroh uplink node with a known id and secret. Until
+    /// wired to a Network the uplink trunks the node's own (empty) net, so a
+    /// connected peer sees nothing.
+    fn create_uplink(
+        &mut self,
+        id: NodeId,
+        secret: [u8; 32],
+        pos: [f32; 2],
+        size: [f32; 2],
+        ws: NodeId,
+    ) {
+        match self.host.uplink(id, Some(secret)) {
+            Ok(up) => {
+                eprintln!("[iroh] uplink {id} ticket: {}", up.ticket());
+                self.uplinks.insert(id, up);
+                self.graph.iroh_secrets.insert(id, secret);
+                self.place(id, Kind::Iroh, ws, pos, size);
+            }
+            Err(e) => eprintln!("failed to start iroh uplink: {e:#}"),
+        }
+    }
+
     /// Register a new (empty) workspace tab with a client-minted id.
     fn add_workspace(&mut self, id: NodeId) {
         if !self.graph.workspaces.contains(&id) {
@@ -732,16 +814,20 @@ impl Server {
             Some(Kind::Network) => {
                 self.add_net_node(off, ws);
             }
+            // A duplicate uplink is a fresh identity with no peer — tickets
+            // are per-endpoint, so there is nothing meaningful to copy.
+            Some(Kind::Iroh) => self.add_iroh_node(off, ws),
             _ => {}
         }
     }
 
-    /// Remove a node by kind (app/file/port/network).
+    /// Remove a node by kind (app/file/port/network/uplink).
     fn remove_any(&mut self, id: NodeId) {
         match self.kind_of(id) {
             Some(Kind::File) => self.remove_file_node(id),
             Some(Kind::Port) => self.remove_host_port(id),
             Some(Kind::Network | Kind::Gateway) => self.remove_net_node(id),
+            Some(Kind::Iroh) => self.remove_iroh_node(id),
             Some(Kind::App) => self.close_node(id),
             None => {}
         }
@@ -778,13 +864,22 @@ impl Server {
 
     /// Set a node's launch args from a whitespace-separated string. Guarded to
     /// existing nodes so an `Update` on an unknown id can't grow `node_args`
-    /// without bound.
+    /// without bound. For an Iroh uplink the args are its peer ticket — setting
+    /// them dials the peer.
     fn set_node_args(&mut self, id: NodeId, text: &str) {
         if !self.graph.nodes.contains_key(&id) {
             return;
         }
         let args = text.split_whitespace().map(str::to_string).collect();
         self.graph.node_args.insert(id, args);
+        if let Some(up) = self.uplinks.get(&id) {
+            let ticket = text.trim();
+            if !ticket.is_empty() {
+                if let Err(e) = up.dial(ticket) {
+                    eprintln!("[iroh] {e:#}");
+                }
+            }
+        }
     }
 
     /// Grant/revoke a node's host-network access (on its fabric stack).
@@ -802,6 +897,7 @@ impl Server {
             Some(Kind::File) => NodeClass::File,
             Some(Kind::Port) => NodeClass::Port,
             Some(Kind::Network | Kind::Gateway) => NodeClass::Net,
+            Some(Kind::Iroh) => NodeClass::Iroh,
             Some(Kind::App) | None => NodeClass::Other,
         }
     }
@@ -828,9 +924,16 @@ impl Server {
         }
     }
 
-    /// Wire (or unwire) app node `app_id` onto Network node `net_id`.
+    /// Wire (or unwire) app node (or Iroh uplink) `app_id` onto Network node
+    /// `net_id`.
     fn toggle_net(&mut self, app_id: NodeId, net_id: NodeId) {
-        if wiring::toggle_unique(&mut self.graph.net_links, app_id, net_id) {
+        let joined = wiring::toggle_unique(&mut self.graph.net_links, app_id, net_id);
+        // An uplink member: its trunk follows the wire (own empty net = idle).
+        if let Some(up) = self.uplinks.get(&app_id) {
+            up.set_net(if joined { net_id } else { app_id });
+            return;
+        }
+        if joined {
             // Joined the network (any prior membership was dropped).
             self.set_node_net(app_id, net_id);
             self.set_host_access(app_id, self.is_gateway(net_id));
@@ -847,6 +950,10 @@ impl Server {
     fn sync_net_membership(&self) {
         let nodes = self.node_reg.lock().unwrap().clone();
         for &(app, net) in &self.graph.net_links {
+            if let Some(up) = self.uplinks.get(&app) {
+                up.set_net(net);
+                continue;
+            }
             let Some(stack) = nodes
                 .iter()
                 .find(|n| n.id == app)
@@ -873,10 +980,22 @@ impl Server {
             .map(|&(a, _)| a)
             .collect();
         for app in members {
+            if let Some(up) = self.uplinks.get(&app) {
+                up.set_net(app);
+                continue;
+            }
             self.set_node_net(app, app);
             self.set_host_access(app, false);
         }
         self.graph.net_links.retain(|&(_, n)| n != id);
+        self.forget(id);
+    }
+
+    /// Remove an Iroh uplink node; dropping the uplink closes its endpoint and
+    /// detaches its trunk from the fabric.
+    fn remove_iroh_node(&mut self, id: NodeId) {
+        self.uplinks.remove(&id);
+        self.graph.net_links.retain(|&(a, _)| a != id);
         self.forget(id);
     }
 
@@ -1062,6 +1181,7 @@ impl Server {
         self.graph.node_args.remove(&id);
         self.graph.file_nodes.remove(&id);
         self.graph.host_ports.remove(&id);
+        self.graph.iroh_secrets.remove(&id);
     }
 
     /// Whether the given wire still connects two live nodes.
@@ -1276,6 +1396,26 @@ impl Server {
                         .filter(|(a, _)| mine(a))
                         .copied()
                         .collect(),
+                    irohs: self
+                        .graph
+                        .iroh_secrets
+                        .iter()
+                        .filter(|(id, _)| mine(id))
+                        .filter_map(|(&id, secret)| {
+                            Some(IrohState {
+                                id,
+                                secret: Some(IrohState::secret_hex(secret)),
+                                peer: self
+                                    .graph
+                                    .node_args
+                                    .get(&id)
+                                    .filter(|a| !a.is_empty())
+                                    .map(|a| a.join(" ")),
+                                pos: self.graph.nodes.get(&id)?.pos,
+                                size: self.graph.nodes.get(&id)?.size,
+                            })
+                        })
+                        .collect(),
                 }
             })
             .collect();
@@ -1380,6 +1520,7 @@ impl Server {
                     self.add_net_node(pos, ws);
                 }
                 NodeKind::Gateway => self.add_gateway_node(pos, ws),
+                NodeKind::Iroh => self.add_iroh_node(pos, ws),
             },
             // Create is create only: a wire that already exists is left alone
             // (removal is Delete, so a create-only token can never disconnect).
@@ -1496,6 +1637,11 @@ impl Server {
             SnapKind::Net {
                 gateway: self.is_gateway(id),
             }
+        } else if let Some(&secret) = self.graph.iroh_secrets.get(&id) {
+            SnapKind::Iroh {
+                secret,
+                peer: self.graph.node_args.get(&id).cloned().unwrap_or_default(),
+            }
         } else {
             return None;
         };
@@ -1604,6 +1750,12 @@ impl Server {
                 };
                 self.place(s.id, kind, s.ws, s.pos, s.size);
             }
+            SnapKind::Iroh { secret, peer } => {
+                self.create_uplink(s.id, *secret, s.pos, s.size, s.ws);
+                if !peer.is_empty() {
+                    self.set_node_args(s.id, &peer.join(" "));
+                }
+            }
         }
     }
 
@@ -1711,6 +1863,19 @@ impl Server {
             .filter(|(_, r)| r.kind == Kind::Gateway)
             .map(|(&id, _)| id)
             .collect();
+        let iroh_nodes = self
+            .uplinks
+            .iter()
+            .map(|(&id, up)| {
+                (
+                    id,
+                    IrohMeta {
+                        ticket: up.ticket().to_string(),
+                        peers: up.peers(),
+                    },
+                )
+            })
+            .collect();
         View {
             node_ids: self.node_ids(),
             win_pos,
@@ -1719,6 +1884,7 @@ impl Server {
             host_ports: self.graph.host_ports.clone(),
             net_nodes,
             gateways,
+            iroh_nodes,
             connections: self.graph.connections.clone(),
             midi_links: self.graph.midi_links.clone(),
             net_links: self.graph.net_links.clone(),
@@ -1748,6 +1914,67 @@ mod model_tests {
     fn fresh_server() -> Server {
         Server::new(&Document::empty(), PathBuf::from("wk-proptest-scratch.wk"))
             .expect("a headless server constructs")
+    }
+
+    /// Two servers each grow an Iroh node wired to a Network; pasting one's
+    /// ticket into the other (the args patch) establishes a live tunnel — the
+    /// whole client path (palette create → wire → paste → dial) minus pixels.
+    #[test]
+    fn iroh_nodes_wire_and_dial_between_servers() {
+        let mut a = fresh_server();
+        let mut b = fresh_server();
+        let setup = |s: &mut Server| {
+            let ws = s.graph.workspaces[0];
+            s.apply(Command::Create(Resource::Node {
+                kind: NodeKind::Iroh,
+                pos: [0.0, 0.0],
+                ws,
+            }));
+            s.apply(Command::Create(Resource::Node {
+                kind: NodeKind::Network,
+                pos: [100.0, 0.0],
+                ws,
+            }));
+            let iroh = *s.graph.iroh_secrets.keys().next().expect("iroh node");
+            let net = s
+                .graph
+                .nodes
+                .iter()
+                .find(|(_, r)| r.kind == Kind::Network)
+                .map(|(&id, _)| id)
+                .expect("network node");
+            s.apply(Command::Create(Resource::Wire { a: iroh, b: net }));
+            assert!(s.graph.net_links.contains(&(iroh, net)));
+            iroh
+        };
+        let ia = setup(&mut a);
+        let ib = setup(&mut b);
+        let ticket = a.view().iroh_nodes[&ia].ticket.clone();
+
+        b.apply(Command::Update {
+            id: ib,
+            patch: NodePatch {
+                args: Some(ticket),
+                ..Default::default()
+            },
+        });
+
+        // The dialer retries on a 2s cadence; allow a few rounds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (pa, pb) = (
+                a.view().iroh_nodes[&ia].peers,
+                b.view().iroh_nodes[&ib].peers,
+            );
+            if pa == 1 && pb == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "uplinks never connected (peers: a={pa} b={pb})"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     /// The `i`-th live node id (order-stabilized), or `None` when empty. Lets an

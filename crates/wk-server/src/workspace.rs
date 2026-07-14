@@ -166,6 +166,40 @@ pub struct NetState {
     pub size: [f32; 2],
 }
 
+/// An Iroh uplink node: its identity, the peer it dials, and its placement.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IrohState {
+    pub id: NodeId,
+    /// The uplink's ed25519 secret key, hex-encoded, so its ticket (its
+    /// dialable identity) survives restarts. Anyone with this key can
+    /// impersonate the uplink — treat the `.wk` file accordingly.
+    pub secret: Option<String>,
+    /// The remote uplink's ticket, re-dialed at load.
+    pub peer: Option<String>,
+    pub pos: [f32; 2],
+    pub size: [f32; 2],
+}
+
+impl IrohState {
+    /// Hex-encode a secret for persistence.
+    pub fn secret_hex(bytes: &[u8; 32]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The stored secret as key bytes, if present and well-formed.
+    pub fn secret_bytes(&self) -> Option<[u8; 32]> {
+        let s = self.secret.as_ref()?;
+        if s.len() != 64 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()?;
+        }
+        Some(out)
+    }
+}
+
 /// A `.wk` file: shared dependencies plus one or more workspaces (canvas tabs).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Document {
@@ -187,6 +221,7 @@ pub struct Workspace {
     pub serves: Vec<(NodeId, NodeId)>,
     pub nets: Vec<NetState>,
     pub net_links: Vec<(NodeId, NodeId)>,
+    pub irohs: Vec<IrohState>,
 }
 
 impl Workspace {
@@ -203,6 +238,7 @@ impl Workspace {
             serves: Vec::new(),
             nets: Vec::new(),
             net_links: Vec::new(),
+            irohs: Vec::new(),
         }
     }
 }
@@ -356,6 +392,7 @@ fn parse_workspace(n: &KdlNode) -> Option<Workspace> {
             "network" => ws.nets.extend(parse_net(c, false)),
             "gateway" => ws.nets.extend(parse_net(c, true)),
             "netlink" => ws.net_links.extend(pair(c)),
+            "iroh" => ws.irohs.extend(parse_iroh(c)),
             _ => {}
         }
     }
@@ -392,6 +429,9 @@ fn workspace_kdl(ws: &Workspace) -> KdlNode {
     }
     for &(app, net) in &ws.net_links {
         ch.nodes_mut().push(pair_kdl("netlink", app, net));
+    }
+    for i in &ws.irohs {
+        ch.nodes_mut().push(iroh_kdl(i));
     }
     node.set_children(ch);
     node
@@ -473,6 +513,48 @@ fn parse_net(n: &KdlNode, gateway: bool) -> Option<NetState> {
         pos: [pos.get(0).and_then(num)?, pos.get(1).and_then(num)?],
         size: [size.get(0).and_then(num)?, size.get(1).and_then(num)?],
     })
+}
+
+/// Parse an `iroh <id> { secret "<hex>"; peer "<ticket>"; pos x y; size w h }`
+/// entry.
+fn parse_iroh(n: &KdlNode) -> Option<IrohState> {
+    let id = node_id(n.get(0)?)?;
+    let ch = n.children()?;
+    let text = |name: &str| {
+        ch.get(name)
+            .and_then(|x| x.get(0))
+            .and_then(|v| v.as_string())
+            .map(str::to_string)
+    };
+    let pos = ch.get("pos")?;
+    let size = ch.get("size")?;
+    Some(IrohState {
+        id,
+        secret: text("secret"),
+        peer: text("peer"),
+        pos: [pos.get(0).and_then(num)?, pos.get(1).and_then(num)?],
+        size: [size.get(0).and_then(num)?, size.get(1).and_then(num)?],
+    })
+}
+
+fn iroh_kdl(i: &IrohState) -> KdlNode {
+    let mut node = KdlNode::new("iroh");
+    node.push(KdlEntry::new(i.id.to_string()));
+    let mut ch = KdlDocument::new();
+    if let Some(s) = &i.secret {
+        let mut n = KdlNode::new("secret");
+        n.push(str_entry(s));
+        ch.nodes_mut().push(n);
+    }
+    if let Some(p) = &i.peer {
+        let mut n = KdlNode::new("peer");
+        n.push(str_entry(p));
+        ch.nodes_mut().push(n);
+    }
+    ch.nodes_mut().push(node2("pos", i.pos[0], i.pos[1]));
+    ch.nodes_mut().push(node2("size", i.size[0], i.size[1]));
+    node.set_children(ch);
+    node
 }
 
 fn net_kdl(n: &NetState) -> KdlNode {
@@ -702,6 +784,13 @@ mod tests {
                         },
                     ],
                     net_links: vec![(synth, net)],
+                    irohs: vec![IrohState {
+                        id: mdst,
+                        secret: Some(IrohState::secret_hex(&[7u8; 32])),
+                        peer: Some("endpointabc123".into()),
+                        pos: [800.0, 100.0],
+                        size: [130.0, 44.0],
+                    }],
                 },
                 Workspace {
                     id: wb,
@@ -872,6 +961,26 @@ mod tests {
             })
     }
 
+    fn iroh_state() -> impl Strategy<Value = IrohState> {
+        (
+            any_node_id(),
+            prop::option::of(prop::collection::vec(any::<u8>(), 32)),
+            prop::option::of(value_str()),
+            coord(),
+            coord(),
+            coord(),
+            coord(),
+        )
+            .prop_map(|(id, secret, peer, px, py, sx, sy)| IrohState {
+                id,
+                secret: secret
+                    .map(|s| IrohState::secret_hex(&<[u8; 32]>::try_from(s.as_slice()).unwrap())),
+                peer,
+                pos: [px, py],
+                size: [sx, sy],
+            })
+    }
+
     fn pair() -> impl Strategy<Value = (NodeId, NodeId)> {
         (any_node_id(), any_node_id())
     }
@@ -888,9 +997,10 @@ mod tests {
             prop::collection::vec(pair(), 0..3),
             prop::collection::vec(net_state(), 0..3),
             prop::collection::vec(pair(), 0..3),
+            prop::collection::vec(iroh_state(), 0..3),
         )
             .prop_map(
-                |(id, nodes, vfiles, hfiles, ports, conns, midi, serves, nets, netlinks)| {
+                |(id, nodes, vfiles, hfiles, ports, conns, midi, serves, nets, netlinks, irohs)| {
                     Workspace {
                         id,
                         nodes,
@@ -902,6 +1012,7 @@ mod tests {
                         serves,
                         nets,
                         net_links: netlinks,
+                        irohs,
                     }
                 },
             )

@@ -806,6 +806,12 @@ impl PluginHost {
         crate::portfwd::forward(self.hub.clone(), target, port, kill)
     }
 
+    /// Start an iroh uplink tunneling virtual network `net` (see
+    /// [`crate::uplink`]), with n0's public relays/discovery enabled.
+    pub fn uplink(&self, net: NodeId, secret: Option<[u8; 32]>) -> Result<crate::uplink::Uplink> {
+        crate::uplink::Uplink::start(self.hub.clone(), net, secret, true)
+    }
+
     /// Register a plugin as a `Node` under `id` and return immediately — the
     /// component is compiled on a background thread so other nodes aren't blocked
     /// (Cranelift on a multi-MB debug component takes hundreds of ms to seconds).
