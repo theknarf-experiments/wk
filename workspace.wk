@@ -1,46 +1,71 @@
 // vim: set filetype=kdl :
 dependencies {
-    triangle "plugins/triangle/target/wasm32-wasip1/debug/triangle.wasm"
-    paint "plugins/paint/target/wasm32-wasip1/debug/paint.wasm"
-    file_demo "plugins/file-demo/target/wasm32-wasip1/debug/file_demo.wasm"
-    piano "plugins/piano/target/wasm32-wasip1/debug/piano.wasm"
-    arp "plugins/arp/target/wasm32-wasip1/debug/arp.wasm"
-    synth "plugins/synth/target/wasm32-wasip1/debug/synth.wasm"
-    wsh "plugins/wsh/target/wasm32-wasip1/debug/wsh.wasm"
-    kilo "plugins/kilo/kilo.wasm" {
-        args welcome.txt
+    triangle "plugins/triangle/target/wasm32-wasip1/debug/triangle.wasm" {
+        description "spinning webgpu triangle"
     }
-    lua "plugins/lua/lua.wasm"
-    sqlite "plugins/sqlite/sqlite3.wasm"
+    paint "plugins/paint/target/wasm32-wasip1/debug/paint.wasm" {
+        description "self-driving animated gradient canvas"
+    }
+    file_demo "plugins/file-demo/target/wasm32-wasip1/debug/file_demo.wasm" {
+        description "shows the file node wired into it"
+    }
+    piano "plugins/piano/target/wasm32-wasip1/debug/piano.wasm" {
+        description "on-screen keyboard emitting MIDI"
+    }
+    arp "plugins/arp/target/wasm32-wasip1/debug/arp.wasm" {
+        description "arpeggiator: MIDI in, patterns out"
+    }
+    synth "plugins/synth/target/wasm32-wasip1/debug/synth.wasm" {
+        description "MIDI synth with tweakable knobs"
+    }
+    wsh "plugins/wsh/target/wasm32-wasip1/debug/wsh.wasm" {
+        description "tiny toy shell in a terminal node"
+    }
+    kilo "plugins/kilo/kilo.wasm" {
+        description "the kilo text editor"
+        args "welcome.txt"
+    }
+    lua "plugins/lua/lua.wasm" {
+        description "Lua interpreter REPL"
+    }
+    sqlite "plugins/sqlite/sqlite3.wasm" {
+        description "sqlite3 shell"
+    }
     fetch "plugins/fetch/fetch.wasm" {
-        args example.com "80"
+        description "TCP client: fetches host port over the fabric"
+        args "example.com" "80"
     }
     netserve "plugins/netserve/netserve.wasm" {
+        description "BSD-sockets TCP server on the fabric"
         args "80"
     }
     udpecho "plugins/udpecho/udpecho.wasm" {
-        args server "4242"
+        description "UDP echo (server or client mode)"
+        args "server" "4242"
     }
     echo6 "plugins/echo6/echo6.wasm" {
-        args server "80"
+        description "IPv6 TCP echo (server or client mode)"
+        args "server" "80"
     }
-    http_hello "oci://ghcr.io/bytecodealliance/sample-wasi-http-rust/sample-wasi-http-rust:latest"
+    http_hello "oci://ghcr.io/bytecodealliance/sample-wasi-http-rust/sample-wasi-http-rust:latest" {
+        description "sample wasi:http server; serve it on a Port"
+    }
 }
 workspace "0000000000000000000000000A" {
-    node triangle "0000000000000000000000000M" {
+    node "triangle" "0000000000000000000000000M" {
         pos 23.52801513671875 475.4468688964844
         size 360.0 260.0
     }
-    node piano "0000000000000000000000000N" {
+    node "piano" "0000000000000000000000000N" {
         pos 131.9261474609375 956.8433227539063
         size 360.0 260.0
     }
-    node synth "0000000000000000000000000P" {
+    node "synth" "0000000000000000000000000P" {
         pos 1234.687744140625 973.3001098632813
         size 360.0 260.0
         options 0.30000001192092896 2.0 0.0 1800.0 3.0 0.019999999552965164 0.3499999940395355
     }
-    node arp "0000000000000000000000000Q" {
+    node "arp" "0000000000000000000000000Q" {
         pos 666.044189453125 933.49267578125
         size 360.0 260.0
         options 5.488880634307861 0.6000000238418579 0.0 1.0
