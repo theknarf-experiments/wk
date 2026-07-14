@@ -21,6 +21,7 @@ pub mod runtime;
 pub mod server;
 pub mod sockets;
 pub mod terminal;
+pub mod uplink;
 pub mod vfs;
 pub mod wiring;
 pub mod workspace;

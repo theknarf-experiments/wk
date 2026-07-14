@@ -79,7 +79,12 @@ impl Device for VirtualNic {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
-        caps.max_transmission_unit = 65535;
+        // The IPv6 minimum link MTU. Frames must fit in one QUIC datagram when
+        // a network is extended to a remote fabric (see [`crate::uplink`]), and
+        // ~1200 bytes is the safe inner payload on a 1500-MTU path — so cap
+        // every fabric link rather than let local TCP negotiate 64K segments
+        // that would drop the moment they cross an uplink.
+        caps.max_transmission_unit = 1280;
         caps.checksum = ChecksumCapabilities::ignored();
         caps
     }
