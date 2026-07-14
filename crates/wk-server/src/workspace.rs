@@ -122,6 +122,8 @@ pub struct Dependency {
     pub source: Source,
     /// Args passed to the plugin (after argv[0] = name); e.g. a filename.
     pub args: Vec<String>,
+    /// An optional one-line description, shown in the command palette.
+    pub description: Option<String>,
 }
 
 impl Dependency {
@@ -296,10 +298,17 @@ impl Document {
                                     .collect()
                             })
                             .unwrap_or_default();
+                        let description = n
+                            .children()
+                            .and_then(|ch| ch.get("description"))
+                            .and_then(|d| d.get(0))
+                            .and_then(|v| v.as_string())
+                            .map(str::to_string);
                         Some(Dependency {
                             name,
                             source: Source::parse(source),
                             args,
+                            description,
                         })
                     })
                     .collect()
@@ -330,13 +339,20 @@ impl Document {
         for dep in &self.dependencies {
             let mut node = KdlNode::new(dep.name.clone());
             node.push(str_entry(&dep.source.to_kdl()));
+            let mut sub = KdlDocument::new();
+            if let Some(d) = &dep.description {
+                let mut desc_node = KdlNode::new("description");
+                desc_node.push(str_entry(d));
+                sub.nodes_mut().push(desc_node);
+            }
             if !dep.args.is_empty() {
-                let mut sub = KdlDocument::new();
                 let mut args_node = KdlNode::new("args");
                 for a in &dep.args {
                     args_node.push(str_entry(a));
                 }
                 sub.nodes_mut().push(args_node);
+            }
+            if !sub.nodes().is_empty() {
                 node.set_children(sub);
             }
             children.nodes_mut().push(node);
@@ -640,6 +656,7 @@ pub fn add(target: String, path: &Path) -> Result<(), String> {
         name: name.clone(),
         source,
         args: Vec::new(),
+        description: None,
     });
     doc.save(path)?;
     println!("added dependency: {name}");
@@ -668,7 +685,10 @@ pub fn list(path: &Path) -> Result<(), String> {
         println!("(no dependencies; add one with `wk add <path>`)");
     }
     for dep in &doc.dependencies {
-        println!("  {}  {}", dep.name, dep.source.to_kdl());
+        match &dep.description {
+            Some(d) => println!("  {}  {}  — {d}", dep.name, dep.source.to_kdl()),
+            None => println!("  {}  {}", dep.name, dep.source.to_kdl()),
+        }
     }
     Ok(())
 }
@@ -726,11 +746,13 @@ mod tests {
                     name: "triangle".into(),
                     source: Source::Path("plugins/triangle.wasm".into()),
                     args: Vec::new(),
+                    description: Some("spinning demo triangle".into()),
                 },
                 Dependency {
                     name: "fetch".into(),
                     source: Source::Oci("ghcr.io/o/fetch:1".into()),
                     args: vec!["example.com".into(), "80".into()],
+                    description: None,
                 },
             ],
             workspaces: vec![
@@ -804,6 +826,11 @@ mod tests {
         let back = Document::from_kdl(&text).expect("parses (modeline ignored)");
         assert_eq!(back.dependencies.len(), 2);
         assert_eq!(back.dependencies[0].name, "triangle");
+        assert_eq!(
+            back.dependencies[0].description.as_deref(),
+            Some("spinning demo triangle")
+        );
+        assert_eq!(back.dependencies[1].description, None);
         assert_eq!(back.dependencies[1].args, vec!["example.com", "80"]);
         assert!(matches!(back.dependencies[1].source, Source::Oci(_)));
 
@@ -902,8 +929,14 @@ mod tests {
             dep_name(),
             source(),
             prop::collection::vec(value_str(), 0..3),
+            prop::option::of(value_str()),
         )
-            .prop_map(|(name, source, args)| Dependency { name, source, args })
+            .prop_map(|(name, source, args, description)| Dependency {
+                name,
+                source,
+                args,
+                description,
+            })
     }
 
     fn node_state() -> impl Strategy<Value = NodeState> {

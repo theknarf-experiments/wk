@@ -415,6 +415,24 @@ enum PaletteCmd {
     Quit,
 }
 
+/// One command-palette row: a label, an optional dim description drawn after
+/// it, and the command the row runs.
+struct PaletteRow {
+    label: String,
+    desc: Option<String>,
+    cmd: PaletteCmd,
+}
+
+impl PaletteRow {
+    fn new(label: impl Into<String>, desc: Option<String>, cmd: PaletteCmd) -> Self {
+        PaletteRow {
+            label: label.into(),
+            desc,
+            cmd,
+        }
+    }
+}
+
 /// Most filtered command-palette rows shown at once.
 const PALETTE_MAX: usize = 9;
 
@@ -955,38 +973,79 @@ impl App {
     }
 
     /// All command-palette entries (label + action) for the current state.
-    fn palette_all(&self) -> Vec<(String, PaletteCmd)> {
-        let mut v: Vec<(String, PaletteCmd)> = self
+    fn palette_all(&self) -> Vec<PaletteRow> {
+        let d = |s: &str| Some(s.to_string());
+        let mut v: Vec<PaletteRow> = self
             .view
             .available
             .iter()
             .enumerate()
-            .map(|(i, dep)| (format!("Add {}", dep.name), PaletteCmd::Launch(i)))
+            .map(|(i, dep)| {
+                PaletteRow::new(
+                    format!("Add {}", dep.name),
+                    dep.description.clone(),
+                    PaletteCmd::Launch(i),
+                )
+            })
             .collect();
-        v.push(("Add Virtual File".into(), PaletteCmd::AddVirtualFile));
-        v.push(("Add Host File".into(), PaletteCmd::AddHostFile));
-        v.push(("Add Port".into(), PaletteCmd::AddPort));
-        v.push(("Add Network".into(), PaletteCmd::AddNetwork));
-        v.push(("Add Gateway".into(), PaletteCmd::AddGateway));
-        v.push(("Add Iroh Uplink".into(), PaletteCmd::AddIroh));
-        v.push(("New Workspace  (Cmd+T)".into(), PaletteCmd::NewWorkspace));
+        v.push(PaletteRow::new(
+            "Add Virtual File",
+            d("an in-memory shared file"),
+            PaletteCmd::AddVirtualFile,
+        ));
+        v.push(PaletteRow::new(
+            "Add Host File",
+            d("a disk-backed file"),
+            PaletteCmd::AddHostFile,
+        ));
+        v.push(PaletteRow::new(
+            "Add Port",
+            d("publish a node on a localhost port"),
+            PaletteCmd::AddPort,
+        ));
+        v.push(PaletteRow::new(
+            "Add Network",
+            d("an isolated virtual network"),
+            PaletteCmd::AddNetwork,
+        ));
+        v.push(PaletteRow::new(
+            "Add Gateway",
+            d("a network whose members get host access"),
+            PaletteCmd::AddGateway,
+        ));
+        v.push(PaletteRow::new(
+            "Add Iroh Uplink",
+            d("extend a network to a remote peer"),
+            PaletteCmd::AddIroh,
+        ));
+        v.push(PaletteRow::new(
+            "New Workspace  (Cmd+T)",
+            None,
+            PaletteCmd::NewWorkspace,
+        ));
         if self.tabs.len() > 1 {
-            v.push((
-                "Close Workspace  (Cmd+W)".into(),
+            v.push(PaletteRow::new(
+                "Close Workspace  (Cmd+W)",
+                None,
                 PaletteCmd::CloseWorkspace,
             ));
         }
         for &z in &ZOOM_PRESETS {
-            v.push((format!("Zoom {:.0}%", z * 100.0), PaletteCmd::Zoom(z)));
+            v.push(PaletteRow::new(
+                format!("Zoom {:.0}%", z * 100.0),
+                None,
+                PaletteCmd::Zoom(z),
+            ));
         }
         // Jump to any node in the active workspace (searchable by name).
         for &id in &self.view.node_ids {
-            v.push((
+            v.push(PaletteRow::new(
                 format!("Go to {}", self.node_label(id)),
+                None,
                 PaletteCmd::GoTo(id),
             ));
         }
-        v.push(("Quit wk".into(), PaletteCmd::Quit));
+        v.push(PaletteRow::new("Quit wk", None, PaletteCmd::Quit));
         v
     }
 
@@ -1009,12 +1068,19 @@ impl App {
         }
     }
 
-    /// Palette entries matching the current query (case-insensitive substring).
-    fn palette_filtered(&self) -> Vec<(String, PaletteCmd)> {
+    /// Palette entries matching the current query (case-insensitive substring
+    /// of the label or the description).
+    fn palette_filtered(&self) -> Vec<PaletteRow> {
         let q = self.palette_query.to_lowercase();
         self.palette_all()
             .into_iter()
-            .filter(|(label, _)| q.is_empty() || label.to_lowercase().contains(&q))
+            .filter(|r| {
+                q.is_empty()
+                    || r.label.to_lowercase().contains(&q)
+                    || r.desc
+                        .as_ref()
+                        .is_some_and(|d| d.to_lowercase().contains(&q))
+            })
             .collect()
     }
 
@@ -1067,10 +1133,7 @@ impl App {
                 self.palette_query.clear();
             }
             KeyCode::Enter | KeyCode::NumpadEnter => {
-                self.palette_run = self
-                    .palette_filtered()
-                    .get(self.palette_sel)
-                    .map(|(_, c)| *c);
+                self.palette_run = self.palette_filtered().get(self.palette_sel).map(|r| r.cmd);
                 self.palette_open = false;
                 self.palette_query.clear();
             }
@@ -1576,10 +1639,10 @@ impl App {
                 let (px, py, pw, row_h) = Self::palette_layout(fb);
                 let filtered = self.palette_filtered();
                 let start = (self.palette_scroll.round() as usize).min(filtered.len());
-                for (i, (_, cmd)) in filtered.iter().skip(start).take(PALETTE_MAX).enumerate() {
+                for (i, r) in filtered.iter().skip(start).take(PALETTE_MAX).enumerate() {
                     let y0 = py + (i as f32 + 1.0) * row_h;
                     if contains([px, y0, px + pw, y0 + row_h], mp) {
-                        self.palette_run = Some(*cmd);
+                        self.palette_run = Some(r.cmd);
                         break;
                     }
                 }
@@ -2671,7 +2734,7 @@ impl App {
                 full,
             );
             let start = (self.palette_scroll.round() as usize).min(filtered.len());
-            for (i, (label, _)) in filtered.iter().skip(start).take(PALETTE_MAX).enumerate() {
+            for (i, prow) in filtered.iter().skip(start).take(PALETTE_MAX).enumerate() {
                 let row = start + i;
                 let y0 = py + (i as f32 + 1.0) * row_h;
                 let r = [px, y0, px + pw, y0 + row_h];
@@ -2685,13 +2748,31 @@ impl App {
                     &gfx.fonts,
                     &gfx.device,
                     &gfx.queue,
-                    label,
+                    &prow.label,
                     px + PAD,
                     y0 + (row_h - lh) * 0.5,
                     1.0,
                     TEXT,
                     full,
                 );
+                // The description, dimmer, after the label — clipped to the row
+                // so a long one can't spill out of the panel.
+                if let Some(desc) = &prow.desc {
+                    let dx = px + PAD + gfx.fonts.measure(&prow.label) as f32 + 14.0;
+                    self.text_cache.draw(
+                        &mut quads,
+                        &mut gfx.renderer,
+                        &gfx.fonts,
+                        &gfx.device,
+                        &gfx.queue,
+                        desc,
+                        dx,
+                        y0 + (row_h - lh * 0.85) * 0.5,
+                        0.85,
+                        [0.5, 0.54, 0.6, 1.0],
+                        [r[0], r[1], r[2] - PAD, r[3]],
+                    );
+                }
             }
         }
 
