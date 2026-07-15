@@ -25,6 +25,10 @@ dependencies {
         description "the kilo text editor"
         args "welcome.txt"
     }
+    vim "plugins/vim/vim.wasm" {
+        description "the Vim text editor (unmodified upstream)"
+        args "-u" "NONE"
+    }
     lua "plugins/lua/lua.wasm" {
         description "Lua interpreter REPL"
     }
@@ -52,24 +56,50 @@ dependencies {
     }
 }
 workspace "0000000000000000000000000A" {
-    node "triangle" "0000000000000000000000000M" {
-        pos 23.52801513671875 475.4468688964844
+    node "piano" "01KXKBVCH9ER99001419XXW2HC" {
+        pos 598.2177124023438 796.9777221679688
         size 360.0 260.0
     }
-    node "piano" "0000000000000000000000000N" {
-        pos 131.9261474609375 956.8433227539063
-        size 360.0 260.0
-    }
-    node "synth" "0000000000000000000000000P" {
-        pos 1234.687744140625 973.3001098632813
+    node "synth" "01KXKBW2N8EWH9HA37THM8YPK6" {
+        pos 1562.47900390625 811.9581298828125
         size 360.0 260.0
         options 0.30000001192092896 2.0 0.0 1800.0 3.0 0.019999999552965164 0.3499999940395355
     }
-    node "arp" "0000000000000000000000000Q" {
-        pos 666.044189453125 933.49267578125
+    node "sqlite" "01KXKBXDW8F5H9FXF1GYY6SH2K" {
+        pos 832.9036865234375 434.3338928222656
         size 360.0 260.0
-        options 5.488880634307861 0.6000000238418579 0.0 1.0
     }
-    midi "0000000000000000000000000N" "0000000000000000000000000Q"
-    midi "0000000000000000000000000Q" "0000000000000000000000000P"
+    node "kilo" "01KXKBY0K3E4SAS9HHGKSQ8BJV" {
+        pos 1241.5064697265625 461.9730224609375
+        size 394.884521484375 260.26092529296875
+        args "welcome.txt"
+    }
+    node "lua" "01KXKBY91QFZGBP9W6MDTHANCX" {
+        pos 1666.578125 160.35964965820313
+        size 360.0 260.0
+    }
+    node "netserve" "01KXKBZDAJFBGBA4TEKX7G31Q8" {
+        pos 837.3056030273438 1206.591064453125
+        size 360.0 260.0
+        args "8080"
+    }
+    node "arp" "01KXKC6BZ8E7S8JCDCDH34D4RW" {
+        pos 1072.0032958984375 842.7313842773438
+        size 360.0 260.0
+        options 8.0 0.6000000238418579 0.0 1.0
+    }
+    virtualfile "file1" "01KXKBYQ1NEG1A7FJZEBTD4QPK" {
+        pos 1146.753662109375 239.01611328125
+        size 130.0 44.0
+    }
+    hostport "01KXKC18KWFZ9T25M90T6G83E9" {
+        port 8184
+        pos 1336.610595703125 1225.660400390625
+        size 130.0 44.0
+    }
+    connection "01KXKBYQ1NEG1A7FJZEBTD4QPK" "01KXKBY0K3E4SAS9HHGKSQ8BJV"
+    connection "01KXKBYQ1NEG1A7FJZEBTD4QPK" "01KXKBY91QFZGBP9W6MDTHANCX"
+    midi "01KXKBVCH9ER99001419XXW2HC" "01KXKC6BZ8E7S8JCDCDH34D4RW"
+    midi "01KXKC6BZ8E7S8JCDCDH34D4RW" "01KXKBW2N8EWH9HA37THM8YPK6"
+    serve "01KXKBZDAJFBGBA4TEKX7G31Q8" "01KXKC18KWFZ9T25M90T6G83E9"
 }
