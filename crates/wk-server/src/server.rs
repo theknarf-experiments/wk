@@ -439,7 +439,7 @@ pub struct Server {
     /// Currently *running* servers: served node id -> (HostPort id, kill switch).
     /// A subset of `graph.serve_links` — an entry appears only once the node is
     /// ready (a wasi:http node dispatched per request, or a fabric node with a
-    /// TCP forward into its network) and the port bound. Reconciled by
+    /// TCP+UDP forward into its network) and the port bound. Reconciled by
     /// `sync_serves`.
     pub serves: HashMap<NodeId, (NodeId, Arc<AtomicBool>)>,
     /// Running uplinks (Iroh or Veilid), one per uplink node. Dropping one
@@ -962,7 +962,7 @@ impl Server {
 
     /// Try to bind the server for one desired serve link. A wasi:http node gets
     /// an HTTP server dispatching into its handler; a fabric (wasi:sockets) node
-    /// gets a TCP forward from the localhost port to its fabric address at the
+    /// gets a TCP+UDP forward from the localhost port to its fabric address at the
     /// same port number. Silently does nothing if the node isn't ready yet or
     /// its port is already served (both are transient during async compile /
     /// port conflicts); only a real bind failure is logged.
