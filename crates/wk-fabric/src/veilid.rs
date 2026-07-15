@@ -210,6 +210,21 @@ async fn publish_route(
     Some((rb.route_id, rb.blob))
 }
 
+/// Send an app message to a peer route, pruning the route from `peers` if the
+/// send fails — a dead or stale route (the far side rotated it and Veilid
+/// hasn't told us) drops out lazily, and once `peers` empties the retry tick
+/// re-fetches the peer's current blob. Also stops routes accumulating across
+/// route rotations.
+async fn send_to(rc: &RoutingContext, peers: &Peers, route: &RouteId, msg: Vec<u8>) {
+    if rc
+        .app_message(Target::RouteId(route.clone()), msg)
+        .await
+        .is_err()
+    {
+        peers.lock().unwrap().retain(|r| r != route);
+    }
+}
+
 /// Read a remote uplink's current route blob from its DHT record and import
 /// it, returning the peer route.
 async fn fetch_peer(api: &VeilidAPI, rc: &RoutingContext, key: &RecordKey) -> Option<RouteId> {
@@ -296,7 +311,7 @@ async fn drive(
                                 for r in routes {
                                     let mut m = vec![TAG_HELLO_ACK];
                                     m.extend_from_slice(blob);
-                                    let _ = rc.app_message(Target::RouteId(r), m).await;
+                                    send_to(&rc, &peers, &r, m).await;
                                 }
                             }
                         }
@@ -319,12 +334,22 @@ async fn drive(
                     m.push(TAG_FRAME);
                     m.extend_from_slice(&frame);
                     for r in &routes {
-                        let _ = rc.app_message(Target::RouteId(r.clone()), m.clone()).await;
+                        // Prune a route that errors — a stale/dead route drops
+                        // out and the retry tick re-fetches the peer's blob.
+                        send_to(&rc, &peers, r, m.clone()).await;
                     }
                 }
             }
             _ = retry.tick() => {
-                // Establish (or re-establish) the dialed peer once attached.
+                // Self-heal a route publish that failed transiently: without
+                // this, a single failure left `local` None forever (no code
+                // path republished) and the DHT record held a dead blob.
+                if attached && local.is_none() {
+                    local = publish_route(api, &rc, &owner, &mut record_open).await;
+                }
+                // Establish (or re-establish) the dialed peer once attached —
+                // `peers` empties when a route is pruned, so a rotated peer is
+                // re-fetched here.
                 let unconnected = peers.lock().unwrap().is_empty();
                 if attached && unconnected {
                     if let Some(key) = &target {
@@ -333,7 +358,7 @@ async fn drive(
                             if let Some((_, blob)) = &local {
                                 let mut m = vec![TAG_HELLO];
                                 m.extend_from_slice(blob);
-                                let _ = rc.app_message(Target::RouteId(route), m).await;
+                                send_to(&rc, &peers, &route, m).await;
                             }
                         }
                     }

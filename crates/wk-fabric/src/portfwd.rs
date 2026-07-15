@@ -11,7 +11,7 @@
 //! IP packets on the node's network: middlebox nodes in the path see it like
 //! any node-to-node flow.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,8 +26,10 @@ use crate::netstack::{NetHub, SharedStack, SockKind};
 /// Per-direction buffer for each forwarded connection's smoltcp socket.
 const SOCK_BUF: usize = 64 * 1024;
 
-/// Drop a UDP client's fabric socket after this long without traffic.
-const UDP_IDLE: Duration = Duration::from_secs(60);
+/// Drop a UDP client's fabric socket after this long without traffic (a typical
+/// NAT UDP timeout — long enough that a slow request/response round-trip isn't
+/// torn down mid-flight, short enough to reclaim idle sockets).
+const UDP_IDLE: Duration = Duration::from_secs(120);
 
 fn tcp_socket() -> tcp::Socket<'static> {
     tcp::Socket::new(
@@ -132,11 +134,29 @@ fn udp_pump(
 ) {
     struct Session {
         handle: smoltcp::iface::SocketHandle,
+        /// The bridge-side local port, freed from `used` when the session ends.
+        port: u16,
         last: Instant,
     }
     let mut sessions: HashMap<SocketAddr, Session> = HashMap::new();
-    let mut local_port: u16 = 49152;
+    // Local ports currently bound by a live session, so a new session never
+    // collides with one (the old wrapping counter blackholed a client forever
+    // once it wrapped onto a still-bound port).
+    let mut used: HashSet<u16> = HashSet::new();
+    let mut next_port: u16 = 49152;
     let mut buf = [0u8; 2048];
+
+    // Pick a free ephemeral port (49152..=65535), or None if all are in use.
+    let mut alloc_port = |used: &HashSet<u16>| -> Option<u16> {
+        for _ in 0..=(u16::MAX - 49152) {
+            let p = next_port;
+            next_port = if p == u16::MAX { 49152 } else { p + 1 };
+            if !used.contains(&p) {
+                return Some(p);
+            }
+        }
+        None
+    };
 
     while !kill.load(Ordering::Relaxed) {
         // Host -> fabric: drain everything pending (recv_from blocks up to the
@@ -152,22 +172,22 @@ fn udp_pump(
                             sess.handle
                         }
                         None => {
+                            let Some(port) = alloc_port(&used) else {
+                                continue; // NAT table full — drop (extremely rare)
+                            };
                             let h = g.sockets.add(udp_socket());
-                            // Track + begin_close on expiry so the hub reaps it.
+                            // Track + begin_close on end so the hub reaps it.
                             let _gen = g.track(h);
-                            local_port = local_port.checked_add(1).unwrap_or(49152);
-                            if g.sockets
-                                .get_mut::<udp::Socket>(h)
-                                .bind(local_port)
-                                .is_err()
-                            {
+                            if g.sockets.get_mut::<udp::Socket>(h).bind(port).is_err() {
                                 g.begin_close(h, SockKind::Udp);
                                 continue;
                             }
+                            used.insert(port);
                             sessions.insert(
                                 src,
                                 Session {
                                     handle: h,
+                                    port,
                                     last: Instant::now(),
                                 },
                             );
@@ -203,7 +223,8 @@ fn udp_pump(
             }
         }
 
-        // Expire idle clients so a long-lived forward doesn't leak sockets.
+        // Expire idle clients so a long-lived forward doesn't leak sockets,
+        // freeing their local ports for reuse.
         let now = Instant::now();
         let expired: Vec<SocketAddr> = sessions
             .iter()
@@ -214,6 +235,7 @@ fn udp_pump(
             let mut g = bridge.lock().unwrap();
             for src in expired {
                 if let Some(sess) = sessions.remove(&src) {
+                    used.remove(&sess.port);
                     g.begin_close(sess.handle, SockKind::Udp);
                 }
             }
