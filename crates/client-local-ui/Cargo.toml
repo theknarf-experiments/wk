@@ -12,3 +12,4 @@ winit = "0.30"
 ab_glyph = "0.2"
 bytemuck = { version = "1.25.0", features = ["derive"] }
 pollster = "0.4.0"
+arboard = "3.6.1"

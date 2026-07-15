@@ -635,6 +635,9 @@ struct App {
     kbd_focus: Option<NodeId>,
     /// When editing an idle node's args: its id and the in-progress text.
     editing_args: Option<(NodeId, String)>,
+    /// System clipboard, for pasting into the args/ticket field and the
+    /// command palette. `None` if the platform has no clipboard.
+    clipboard: Option<arboard::Clipboard>,
     drag: Option<Drag>,
     /// The connection wire currently selected (click to select, Delete to remove).
     wire_sel: Option<Wire>,
@@ -695,6 +698,7 @@ impl App {
             z: Vec::new(),
             kbd_focus: None,
             editing_args: None,
+            clipboard: arboard::Clipboard::new().ok(),
             drag: None,
             wire_sel: None,
             del_wire: false,
@@ -769,6 +773,13 @@ impl App {
     /// The live app node with id `id`, if it is an app (not a file) node.
     fn app_node(&self, id: NodeId) -> Option<SharedNode> {
         self.view.app_node(id)
+    }
+
+    /// Current clipboard text (single line — tickets/args paste as one line),
+    /// or `None` if there's no clipboard or it holds no text.
+    fn clipboard_text(&mut self) -> Option<String> {
+        let text = self.clipboard.as_mut()?.get_text().ok()?;
+        Some(text.trim().to_string())
     }
 
     /// (Re)run an idle or exited node's guest. Commits any in-progress args edit
@@ -1582,6 +1593,21 @@ impl App {
             .map(|(p, _)| p)
             .collect();
         self.view = full.for_workspace(self.active_ws);
+
+        // Drop keyboard/edit state pointing at a node that's no longer visible
+        // (deleted, or in another tab) so keystrokes — including a paste — can't
+        // route into a dead or off-screen editor.
+        if let Some((id, _)) = &self.editing_args {
+            if !self.view.win_pos.contains_key(id) {
+                self.editing_args = None;
+            }
+        }
+        if self
+            .kbd_focus
+            .is_some_and(|id| !self.view.win_pos.contains_key(&id))
+        {
+            self.kbd_focus = None;
+        }
 
         // Apply pan/zoom (zoom immediate, pan eased).
         if (self.zoom_factor - 1.0).abs() > f32::EPSILON {
@@ -2977,11 +3003,30 @@ impl ApplicationHandler for App {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let pressed = event.state == ElementState::Pressed;
                     // Cmd/Ctrl+K toggles the command palette.
-                    if pressed
-                        && !event.repeat
+                    // An "app chord" is Cmd (macOS) always, or Ctrl only when no
+                    // app/terminal is focused — so a focused terminal keeps its
+                    // control keys (Ctrl+C/D/K/W/Z go to the shell, not to wk's
+                    // duplicate/palette/close-tab/undo). Use Cmd, or click empty
+                    // canvas to unfocus, to reach these while a terminal is up.
+                    let app_chord = self.mods.super_key()
+                        || (self.mods.control_key() && self.kbd_focus.is_none());
+                    let paste = pressed
                         && (self.mods.super_key() || self.mods.control_key())
-                        && code == KeyCode::KeyK
-                    {
+                        && code == KeyCode::KeyV;
+                    // Paste into whichever text field is capturing input.
+                    if paste && (self.palette_open || self.editing_args.is_some()) {
+                        if let Some(text) = self.clipboard_text() {
+                            if self.palette_open {
+                                self.palette_query.push_str(&text);
+                                self.palette_sel = 0;
+                                self.palette_scroll = 0.0;
+                            } else if let Some((_, s)) = self.editing_args.as_mut() {
+                                s.push_str(&text);
+                            }
+                        }
+                        return;
+                    }
+                    if pressed && !event.repeat && app_chord && code == KeyCode::KeyK {
                         self.palette_open = !self.palette_open;
                         self.palette_query.clear();
                         self.palette_sel = 0;
@@ -2989,11 +3034,7 @@ impl ApplicationHandler for App {
                         return;
                     }
                     // Cmd/Ctrl+T opens a new workspace tab.
-                    if pressed
-                        && !event.repeat
-                        && (self.mods.super_key() || self.mods.control_key())
-                        && code == KeyCode::KeyT
-                    {
+                    if pressed && !event.repeat && app_chord && code == KeyCode::KeyT {
                         self.new_workspace();
                         return;
                     }
@@ -3005,28 +3046,17 @@ impl ApplicationHandler for App {
                         return;
                     }
                     // Cmd/Ctrl+W closes the current workspace tab.
-                    if pressed
-                        && !event.repeat
-                        && (self.mods.super_key() || self.mods.control_key())
-                        && code == KeyCode::KeyW
-                    {
+                    if pressed && !event.repeat && app_chord && code == KeyCode::KeyW {
                         self.close_workspace(self.active_ws);
                         return;
                     }
                     // Cmd/Ctrl+D duplicates the focused / hovered node.
-                    if pressed
-                        && !event.repeat
-                        && (self.mods.super_key() || self.mods.control_key())
-                        && code == KeyCode::KeyD
-                    {
+                    if pressed && !event.repeat && app_chord && code == KeyCode::KeyD {
                         self.duplicate_focused();
                         return;
                     }
                     // Cmd/Ctrl+Z undoes the last mutation.
-                    if pressed
-                        && (self.mods.super_key() || self.mods.control_key())
-                        && code == KeyCode::KeyZ
-                    {
+                    if pressed && app_chord && code == KeyCode::KeyZ {
                         self.conn.send(Command::Undo);
                         return;
                     }
