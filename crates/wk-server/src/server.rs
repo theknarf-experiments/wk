@@ -319,6 +319,15 @@ enum Undo {
     Port(NodeId, u16),
     /// Re-toggle a connection between two nodes (connect is its own inverse).
     Wire(NodeId, NodeId),
+    /// Undo a "one destination per source" wire (net membership, serve): drop
+    /// the new `(src, new_dst)` and restore the link it displaced, if any.
+    /// Plain [`Undo::Wire`] can't express this — toggling the new wire off just
+    /// leaves `src` unwired instead of back on its previous destination.
+    RewireUnique {
+        src: NodeId,
+        new_dst: NodeId,
+        old_dst: Option<NodeId>,
+    },
     /// Remove a node that a create added.
     Uncreate(NodeId),
     /// Recreate a node that was removed, with its wiring.
@@ -845,8 +854,9 @@ impl Server {
 
     /// Set a node's launch args from a whitespace-separated string. Guarded to
     /// existing nodes so an `Update` on an unknown id can't grow `node_args`
-    /// without bound. For an Iroh uplink the args are its peer ticket — setting
-    /// them dials the peer.
+    /// without bound. For an uplink the args are its peer ticket — this dials
+    /// it live (or *undials*, stopping the dialer, when cleared), so undo and
+    /// clearing stay in sync with the running uplink instead of diverging.
     fn set_node_args(&mut self, id: NodeId, text: &str) {
         if !self.graph.nodes.contains_key(&id) {
             return;
@@ -854,11 +864,9 @@ impl Server {
         let args = text.split_whitespace().map(str::to_string).collect();
         self.graph.node_args.insert(id, args);
         if let Some(up) = self.uplinks.get(&id) {
-            let ticket = text.trim();
-            if !ticket.is_empty() {
-                if let Err(e) = up.dial(ticket) {
-                    eprintln!("[iroh] {e:#}");
-                }
+            // Empty ticket → undial (Uplink::dial treats "" as "stop dialing").
+            if let Err(e) = up.dial(text.trim()) {
+                eprintln!("[uplink] {e:#}");
             }
         }
     }
@@ -1371,7 +1379,37 @@ impl Server {
             Command::Create(Resource::Wire { a, b }) => {
                 // Only record when the create will actually connect.
                 if !self.wired(*a, *b) {
-                    self.record(Undo::Wire(*a, *b));
+                    // Net/serve wires are "one per source": connecting may
+                    // displace an existing link, which undo must restore.
+                    match wiring::classify(*a, *b, self.class_of(*a), self.class_of(*b)) {
+                        Some(Wire::Net(app, net)) => {
+                            let old_dst = self
+                                .graph
+                                .net_links
+                                .iter()
+                                .find(|&&(s, _)| s == app)
+                                .map(|&(_, d)| d);
+                            self.record(Undo::RewireUnique {
+                                src: app,
+                                new_dst: net,
+                                old_dst,
+                            });
+                        }
+                        Some(Wire::Serve(http, hostport)) => {
+                            let old_dst = self
+                                .graph
+                                .serve_links
+                                .iter()
+                                .find(|&&(s, _)| s == http)
+                                .map(|&(_, d)| d);
+                            self.record(Undo::RewireUnique {
+                                src: http,
+                                new_dst: hostport,
+                                old_dst,
+                            });
+                        }
+                        _ => self.record(Undo::Wire(*a, *b)),
+                    }
                 }
             }
             Command::Create(Resource::Workspace { id }) => {
@@ -1507,13 +1545,33 @@ impl Server {
             Undo::Pos(id, p) => self.set_node_pos(id, p),
             Undo::Size(id, s) => self.set_node_size(id, s),
             Undo::Args(id, a) => {
-                if self.graph.node_args.contains_key(&id) {
-                    self.graph.node_args.insert(id, a);
+                // Route through set_node_args so an uplink re-dials (or undials)
+                // the restored ticket instead of the live dialer diverging from
+                // the persisted args.
+                if self.graph.nodes.contains_key(&id) {
+                    self.set_node_args(id, &a.join(" "));
                 }
             }
             Undo::Port(id, port) => {
                 if let Some(&cur) = self.graph.host_ports.get(&id) {
                     self.change_port(id, port as i32 - cur as i32);
+                }
+            }
+            Undo::RewireUnique {
+                src,
+                new_dst,
+                old_dst,
+            } => {
+                // Drop the new wire (toggle it off), then restore the displaced
+                // one. connect_toggle reclassifies by kind, so orientation is
+                // handled the same as the forward connect.
+                if self.node_exists(src) && self.node_exists(new_dst) && self.wired(src, new_dst) {
+                    self.connect_toggle(src, new_dst);
+                }
+                if let Some(old) = old_dst {
+                    if self.node_exists(src) && self.node_exists(old) && !self.wired(src, old) {
+                        self.connect_toggle(src, old);
+                    }
                 }
             }
             Undo::Wire(a, b) => {
@@ -1901,6 +1959,55 @@ mod model_tests {
     fn fresh_server() -> Server {
         Server::new(&Document::empty(), PathBuf::from("wk-proptest-scratch.wk"))
             .expect("a headless server constructs")
+    }
+
+    /// Undoing a *moved* one-per-source wire restores the displaced link, not
+    /// just drops the new one. An uplink joins net1, then is rewired to net2
+    /// (membership moves, net1 link displaced); undo must return it to net1.
+    /// Uses uplink nodes since they wire to Networks without needing wasm.
+    #[test]
+    fn undo_of_a_moved_membership_restores_the_previous_net() {
+        let mut s = fresh_server();
+        let ws = s.graph.workspaces[0];
+        let add_net = |s: &mut Server| {
+            s.apply(Command::Create(Resource::Node {
+                kind: NodeKind::Network,
+                pos: [0.0, 0.0],
+                ws,
+            }));
+        };
+        s.apply(Command::Create(Resource::Node {
+            kind: NodeKind::Iroh,
+            pos: [0.0, 0.0],
+            ws,
+        }));
+        add_net(&mut s);
+        add_net(&mut s);
+        let uplink = *s.graph.iroh_secrets.keys().next().expect("uplink");
+        let mut nets: Vec<NodeId> = s
+            .graph
+            .nodes
+            .iter()
+            .filter(|(_, r)| r.kind == Kind::Network)
+            .map(|(&id, _)| id)
+            .collect();
+        nets.sort();
+        let (net1, net2) = (nets[0], nets[1]);
+
+        s.apply(Command::Create(Resource::Wire { a: uplink, b: net1 }));
+        assert!(s.graph.net_links.contains(&(uplink, net1)));
+        // Move membership to net2 — displaces the net1 link.
+        s.apply(Command::Create(Resource::Wire { a: uplink, b: net2 }));
+        assert!(s.graph.net_links.contains(&(uplink, net2)));
+        assert!(!s.graph.net_links.contains(&(uplink, net1)));
+
+        // Undo the move: back on net1, not left isolated.
+        s.apply(Command::Undo);
+        assert!(
+            s.graph.net_links.contains(&(uplink, net1)),
+            "undo restored the displaced net1 membership"
+        );
+        assert!(!s.graph.net_links.contains(&(uplink, net2)));
     }
 
     /// A node whose dependency isn't in the list (renamed/removed, or an

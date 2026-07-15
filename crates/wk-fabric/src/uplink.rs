@@ -36,7 +36,8 @@ pub struct Uplink {
     trunk: Arc<TrunkPort>,
     hub: Arc<NetHub>,
     conns: Conns,
-    dial_tx: mpsc::UnboundedSender<EndpointAddr>,
+    /// `Some(addr)` sets the dial target; `None` clears it (undial).
+    dial_tx: mpsc::UnboundedSender<Option<EndpointAddr>>,
     stop: Option<oneshot::Sender<()>>,
 }
 
@@ -117,11 +118,16 @@ impl Uplink {
     }
 
     /// Dial a remote uplink by its ticket. The dialer keeps retrying (and
-    /// re-dials after a drop), so a peer that isn't up yet is fine.
+    /// re-dials after a drop), so a peer that isn't up yet is fine. An empty
+    /// ticket *undials*: the dialer stops re-connecting to any prior target.
     pub fn dial(&self, ticket: &str) -> Result<()> {
-        let t = EndpointTicket::from_str(ticket.trim())
-            .map_err(|e| anyhow::anyhow!("bad ticket: {e}"))?;
-        let _ = self.dial_tx.send(t.endpoint_addr().clone());
+        let ticket = ticket.trim();
+        if ticket.is_empty() {
+            let _ = self.dial_tx.send(None);
+            return Ok(());
+        }
+        let t = EndpointTicket::from_str(ticket).map_err(|e| anyhow::anyhow!("bad ticket: {e}"))?;
+        let _ = self.dial_tx.send(Some(t.endpoint_addr().clone()));
         Ok(())
     }
 
@@ -204,7 +210,7 @@ async fn pump(trunk: Arc<TrunkPort>, conns: Conns) {
 /// there's no live connection, re-dial (2s cadence) after drops or failures.
 async fn dialer(
     ep: Endpoint,
-    mut rx: mpsc::UnboundedReceiver<EndpointAddr>,
+    mut rx: mpsc::UnboundedReceiver<Option<EndpointAddr>>,
     conns: Conns,
     trunk: Arc<TrunkPort>,
 ) {
@@ -212,8 +218,9 @@ async fn dialer(
     let mut retry = tokio::time::interval(Duration::from_secs(2));
     loop {
         tokio::select! {
+            // `Some(new)` sets/clears the target (undial); `None` = channel closed.
             t = rx.recv() => match t {
-                Some(addr) => target = Some(addr),
+                Some(new) => target = new,
                 None => return,
             },
             _ = retry.tick() => {}
