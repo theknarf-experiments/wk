@@ -296,13 +296,21 @@ fn detach_btn(r: [f32; 4], z: f32) -> [f32; 4] {
     let gap = 4.0 * z;
     [cb[0] - w - gap, cb[1], cb[0] - gap, cb[3]]
 }
-/// The Run/▶ button, just left of the detach button. Shown only on an idle or
-/// exited node so it can be (re)started after wiring.
-fn run_btn(r: [f32; 4], z: f32) -> [f32; 4] {
+/// The Files button, just left of the detach button. Opens the node's virtual
+/// filesystem inspector. Shown on app nodes (which have a per-node fs).
+fn files_btn(r: [f32; 4], z: f32) -> [f32; 4] {
     let db = detach_btn(r, z);
     let w = db[2] - db[0];
     let gap = 4.0 * z;
     [db[0] - w - gap, db[1], db[0] - gap, db[3]]
+}
+/// The Run/▶ button, just left of the Files button. Shown only on an idle or
+/// exited node so it can be (re)started after wiring.
+fn run_btn(r: [f32; 4], z: f32) -> [f32; 4] {
+    let fb = files_btn(r, z);
+    let w = fb[2] - fb[0];
+    let gap = 4.0 * z;
+    [fb[0] - w - gap, fb[1], fb[0] - gap, fb[3]]
 }
 /// The editable launch-args bar along the bottom of an idle node's body (a
 /// one-line input strip, so it doesn't paint over the node's output above).
@@ -437,6 +445,45 @@ impl PaletteRow {
 /// Most filtered command-palette rows shown at once.
 const PALETTE_MAX: usize = 9;
 
+/// Modal state for inspecting one node's virtual filesystem. The listing and
+/// any file preview are read live from the node's `fs` each frame, so this
+/// holds only the navigation cursor.
+struct Inspector {
+    /// The node whose filesystem is being browsed.
+    node: NodeId,
+    /// Current directory, as an absolute path (`""`/`"/"` = root).
+    dir: String,
+    /// A file within `dir` being previewed, if any.
+    file: Option<String>,
+    /// Scroll offset (first visible row) into the current listing.
+    scroll: usize,
+}
+
+impl Inspector {
+    /// Join `dir` and a child `name` into an absolute path.
+    fn child_path(&self, name: &str) -> String {
+        if self.dir.is_empty() {
+            format!("/{name}")
+        } else {
+            format!("{}/{name}", self.dir)
+        }
+    }
+    /// Ascend to the parent directory.
+    fn go_up(&mut self) {
+        self.file = None;
+        self.scroll = 0;
+        match self.dir.rfind('/') {
+            Some(0) | None => self.dir.clear(),
+            Some(i) => self.dir.truncate(i),
+        }
+    }
+}
+
+/// Rows of the inspector listing visible at once.
+const INSPECT_ROWS: usize = 14;
+/// Max bytes previewed of a file.
+const INSPECT_PREVIEW_CAP: usize = 64 * 1024;
+
 /// Connection port radius, in canvas pixels.
 const PORT_R: f32 = 6.0;
 const FILE_BG: [f32; 4] = [0.20, 0.17, 0.10, 1.0];
@@ -506,6 +553,62 @@ struct WidgetChrome<'a> {
     status_col: [f32; 4],
     /// Text scale of the status line relative to the title.
     status_scale: f32,
+}
+
+/// The inspector's interactive regions for a listing of `n_entries` rows:
+/// `(panel, close_btn, up_row, entry_rows, preview)`. `entry_rows` pairs a row
+/// rect with the entry index (after `scroll`). Pure geometry, shared by the
+/// click hit-test and the draw so they never diverge; free-standing so it can
+/// be unit-tested without a live `App`.
+#[allow(clippy::type_complexity)]
+fn inspect_geom(
+    fb: [f32; 2],
+    n_entries: usize,
+    has_up: bool,
+    scroll: usize,
+) -> (
+    [f32; 4],
+    [f32; 4],
+    Option<[f32; 4]>,
+    Vec<([f32; 4], usize)>,
+    [f32; 4],
+) {
+    let (x, y, w, h, row_h) = App::inspect_layout(fb);
+    let panel = [x, y, x + w, y + h];
+    let close = {
+        let s = row_h - 8.0;
+        [x + w - s - 6.0, y + 4.0, x + w - 6.0, y + 4.0 + s]
+    };
+    // Bottom third is the preview strip; the listing fills the middle.
+    let preview_h = (h * 0.34).max(row_h * 3.0);
+    let list_top = y + row_h;
+    let list_bottom = y + h - preview_h;
+    let preview = [x, list_bottom, x + w, y + h];
+    let rows_fit = (((list_bottom - list_top) / row_h).floor() as usize).max(1);
+
+    let up = has_up.then_some([x, list_top, x + w, list_top + row_h]);
+    let mut rows = Vec::new();
+    // The ".." row takes the first slot when present.
+    let mut slot = if has_up { 1 } else { 0 };
+    let mut idx = scroll;
+    while slot < rows_fit && idx < n_entries {
+        let ry = list_top + slot as f32 * row_h;
+        rows.push(([x, ry, x + w, ry + row_h], idx));
+        slot += 1;
+        idx += 1;
+    }
+    (panel, close, up, rows, preview)
+}
+
+/// A compact human-readable byte count for the inspector.
+fn human_size(n: usize) -> String {
+    if n < 1024 {
+        format!("{n} B")
+    } else if n < 1024 * 1024 {
+        format!("{:.1} K", n as f64 / 1024.0)
+    } else {
+        format!("{:.1} M", n as f64 / (1024.0 * 1024.0))
+    }
 }
 
 fn near(a: [f32; 2], b: [f32; 2], radius: f32) -> bool {
@@ -635,6 +738,8 @@ struct App {
     kbd_focus: Option<NodeId>,
     /// When editing an idle node's args: its id and the in-progress text.
     editing_args: Option<(NodeId, String)>,
+    /// When inspecting a node's virtual filesystem (a modal overlay).
+    inspect: Option<Inspector>,
     /// System clipboard, for pasting into the args/ticket field and the
     /// command palette. `None` if the platform has no clipboard.
     clipboard: Option<arboard::Clipboard>,
@@ -698,6 +803,7 @@ impl App {
             z: Vec::new(),
             kbd_focus: None,
             editing_args: None,
+            inspect: None,
             clipboard: arboard::Clipboard::new().ok(),
             drag: None,
             wire_sel: None,
@@ -1360,6 +1466,38 @@ impl App {
         (x, y, w, row_h)
     }
 
+    /// The inspector panel `(x, y, w, h, row_h)` centered on screen `fb`.
+    fn inspect_layout(fb: [f32; 2]) -> (f32, f32, f32, f32, f32) {
+        let row_h = MENU_H + 2.0;
+        let w = (fb[0] * 0.6).clamp(360.0, 720.0);
+        // Title + a listing + a preview strip; bounded to the screen.
+        let h = (row_h * (INSPECT_ROWS as f32 + 6.0) + 8.0).min(fb[1] - 80.0);
+        let x = (fb[0] - w) * 0.5;
+        let y = (fb[1] - h) * 0.5;
+        (x, y, w, h, row_h)
+    }
+
+    /// The inspector's interactive regions for the current node's listing of
+    /// `n_entries` rows — see [`inspect_geom`] (this just supplies the modal's
+    /// current `dir`/`scroll`).
+    #[allow(clippy::type_complexity)]
+    fn inspect_regions(
+        &self,
+        fb: [f32; 2],
+        n_entries: usize,
+    ) -> (
+        [f32; 4],
+        [f32; 4],
+        Option<[f32; 4]>,
+        Vec<([f32; 4], usize)>,
+        [f32; 4],
+    ) {
+        let insp = self.inspect.as_ref();
+        let has_up = insp.is_some_and(|i| !i.dir.is_empty());
+        let scroll = insp.map_or(0, |i| i.scroll);
+        inspect_geom(fb, n_entries, has_up, scroll)
+    }
+
     /// Draw the shared chrome of a small "widget" node (file / HostPort /
     /// Network / uplink): the bordered box, a title and a status line, the
     /// hover-lit close button, and the wiring ports. Kind-specific extras (a
@@ -1787,9 +1925,37 @@ impl App {
             // Any fresh click clears the wire selection; a click that lands on a
             // wire (empty-canvas branch below) re-selects it.
             self.wire_sel = None;
+            // The filesystem inspector is modal: navigate on a row click,
+            // dismiss on the close box or a click outside the panel.
+            if let Some(insp) = &self.inspect {
+                let entries = node_by_id
+                    .get(&insp.node)
+                    .map(|n| n.fs.lock().unwrap().list_dir(&insp.dir).unwrap_or_default())
+                    .unwrap_or_default();
+                let (panel, close, up, rows, _preview) = self.inspect_regions(fb, entries.len());
+                if contains(close, mp) || !contains(panel, mp) {
+                    self.inspect = None;
+                } else if up.is_some_and(|r| contains(r, mp)) {
+                    if let Some(i) = self.inspect.as_mut() {
+                        i.go_up();
+                    }
+                } else if let Some(&(_, idx)) = rows.iter().find(|(r, _)| contains(*r, mp)) {
+                    let entry = entries[idx].clone();
+                    if let Some(i) = self.inspect.as_mut() {
+                        if entry.is_dir {
+                            i.dir = i.child_path(&entry.name);
+                            i.file = None;
+                            i.scroll = 0;
+                        } else {
+                            i.file = Some(entry.name.clone());
+                        }
+                    }
+                }
+                consumed = true;
+            }
             // The command palette is modal: click a row to run it, click
             // anywhere else to dismiss it.
-            if self.palette_open {
+            if !consumed && self.palette_open {
                 let (px, py, pw, row_h) = Self::palette_layout(fb);
                 let filtered = self.palette_filtered();
                 let start = (self.palette_scroll.round() as usize).min(filtered.len());
@@ -1929,6 +2095,17 @@ impl App {
                             to_close.push(id);
                         } else if contains(detach_btn(r, zf), mp) {
                             self.toggle_detach(id);
+                        } else if contains(files_btn(r, zf), mp) {
+                            // Open (or toggle) the node's filesystem inspector.
+                            self.inspect = match self.inspect.take() {
+                                Some(insp) if insp.node == id => None,
+                                _ => Some(Inspector {
+                                    node: id,
+                                    dir: String::new(),
+                                    file: None,
+                                    scroll: 0,
+                                }),
+                            };
                         } else if idle && contains(run_btn(r, zf), mp) {
                             self.run_node(id);
                         } else if contains(resize_grip(r, zf), mp) {
@@ -2437,6 +2614,36 @@ impl App {
                 clip,
             ));
 
+            // Files button: opens the node's virtual-filesystem inspector.
+            // Drawn as a small "document" icon (a box with a couple of lines).
+            let fbn = files_btn(r, zf);
+            let open = matches!(&self.inspect, Some(i) if i.node == id);
+            if open || contains(fbn, mp) {
+                quads.push(Quad::solid(white, fbn, TITLE_FOCUS, clip));
+            }
+            {
+                let pad = (fbn[2] - fbn[0]) * 0.26;
+                let doc = [fbn[0] + pad, fbn[1] + pad, fbn[2] - pad, fbn[3] - pad];
+                quads.push(Quad::solid(white, doc, TEXT, clip));
+                // Two "text" lines inside the document.
+                let lw = (doc[2] - doc[0]) * 0.6;
+                let lh = (doc[3] - doc[1]) * 0.13;
+                let lc = if open || contains(fbn, mp) {
+                    TITLE_FOCUS
+                } else {
+                    panel
+                };
+                for k in 0..2 {
+                    let ly = doc[1] + (doc[3] - doc[1]) * (0.32 + 0.28 * k as f32);
+                    quads.push(Quad::solid(
+                        white,
+                        [doc[0] + lh, ly, doc[0] + lh + lw, ly + lh],
+                        lc,
+                        clip,
+                    ));
+                }
+            }
+
             // Run/▶ button for an idle or exited node (start or re-start it).
             if node_idle {
                 let rb = run_btn(r, zf);
@@ -2798,6 +3005,225 @@ impl App {
             }
         }
 
+        // Filesystem inspector (Files button): dim the canvas, then a centred
+        // panel listing the node's live virtual filesystem with a file preview.
+        if let Some(insp) = &self.inspect {
+            let node = node_by_id.get(&insp.node);
+            let node_name = node.map(|n| n.name.clone()).unwrap_or_default();
+            let entries = node
+                .map(|n| n.fs.lock().unwrap().list_dir(&insp.dir).unwrap_or_default())
+                .unwrap_or_default();
+            let (panel, close, up, rows, preview) = self.inspect_regions(fb, entries.len());
+            let (_, _, _, _, row_h) = Self::inspect_layout(fb);
+            let dim = [0.55, 0.58, 0.64, 1.0];
+
+            quads.push(Quad::solid(white, full, [0.0, 0.0, 0.0, 0.45], full));
+            quads.push(Quad::solid(white, panel, BORDER_COL, full));
+            let inset = [
+                panel[0] + 1.0,
+                panel[1] + 1.0,
+                panel[2] - 1.0,
+                panel[3] - 1.0,
+            ];
+            quads.push(Quad::solid(white, inset, BODY, full));
+
+            // Title row: node name + current directory path.
+            let title = format!(
+                "files: {node_name}    /{}",
+                insp.dir.trim_start_matches('/')
+            );
+            self.text_cache.draw(
+                &mut quads,
+                &mut gfx.renderer,
+                &gfx.fonts,
+                &gfx.device,
+                &gfx.queue,
+                &title,
+                panel[0] + PAD,
+                panel[1] + (row_h - lh) * 0.5,
+                1.0,
+                TEXT,
+                [panel[0], panel[1], close[0] - 4.0, panel[1] + row_h],
+            );
+            if contains(close, mp) {
+                quads.push(Quad::solid(white, close, TITLE_FOCUS, full));
+            }
+            self.text_cache.draw(
+                &mut quads,
+                &mut gfx.renderer,
+                &gfx.fonts,
+                &gfx.device,
+                &gfx.queue,
+                "x",
+                close[0] + (close[2] - close[0]) * 0.28,
+                close[1] + (close[3] - close[1]) * 0.02,
+                0.8,
+                TEXT,
+                full,
+            );
+
+            // The ".." (parent) row.
+            if let Some(ur) = up {
+                if contains(ur, mp) {
+                    quads.push(Quad::solid(white, ur, TITLE_FOCUS, full));
+                }
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    "../",
+                    ur[0] + PAD,
+                    ur[1] + (row_h - lh) * 0.5,
+                    1.0,
+                    dim,
+                    ur,
+                );
+            }
+
+            // Directory entries: dirs (blue, trailing "/") then files (+ size).
+            for &(rr, idx) in &rows {
+                let e = &entries[idx];
+                let selected = insp.file.as_deref() == Some(e.name.as_str());
+                if contains(rr, mp) || selected {
+                    quads.push(Quad::solid(white, rr, TITLE_FOCUS, full));
+                }
+                let label = if e.is_dir {
+                    format!("{}/", e.name)
+                } else {
+                    e.name.clone()
+                };
+                let col = if e.is_dir {
+                    [0.6, 0.78, 0.95, 1.0]
+                } else {
+                    TEXT
+                };
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    &label,
+                    rr[0] + PAD,
+                    rr[1] + (row_h - lh) * 0.5,
+                    1.0,
+                    col,
+                    [rr[0], rr[1], rr[2] - PAD, rr[3]],
+                );
+                if !e.is_dir {
+                    let sz = human_size(e.size);
+                    let sw = gfx.fonts.measure(&sz) as f32;
+                    self.text_cache.draw(
+                        &mut quads,
+                        &mut gfx.renderer,
+                        &gfx.fonts,
+                        &gfx.device,
+                        &gfx.queue,
+                        &sz,
+                        rr[2] - PAD - sw,
+                        rr[1] + (row_h - lh) * 0.5,
+                        1.0,
+                        dim,
+                        rr,
+                    );
+                }
+            }
+            if entries.is_empty() {
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    "(empty directory)",
+                    panel[0] + PAD,
+                    panel[1] + row_h * 1.4,
+                    1.0,
+                    dim,
+                    full,
+                );
+            }
+
+            // Preview strip: a separator line then the selected file's text.
+            quads.push(Quad::solid(
+                white,
+                [preview[0], preview[1], preview[2], preview[1] + 1.0],
+                BORDER_COL,
+                full,
+            ));
+            match &insp.file {
+                Some(fname) => {
+                    let path = insp.child_path(fname);
+                    let bytes = node
+                        .and_then(|n| n.fs.lock().unwrap().read_file(&path, INSPECT_PREVIEW_CAP))
+                        .unwrap_or_default();
+                    let header = format!("{fname}  ({})", human_size(bytes.len()));
+                    self.text_cache.draw(
+                        &mut quads,
+                        &mut gfx.renderer,
+                        &gfx.fonts,
+                        &gfx.device,
+                        &gfx.queue,
+                        &header,
+                        preview[0] + PAD,
+                        preview[1] + 4.0,
+                        0.85,
+                        dim,
+                        preview,
+                    );
+                    let text = String::from_utf8_lossy(&bytes);
+                    let top = preview[1] + 4.0 + lh;
+                    let max_lines = ((preview[3] - top - 4.0) / lh).floor() as usize;
+                    for (li, line) in text.lines().take(max_lines).enumerate() {
+                        // Sanitize control bytes so they don't corrupt the grid.
+                        let clean: String = line
+                            .chars()
+                            .map(|c| {
+                                if c == '\t' {
+                                    ' '
+                                } else if c.is_control() {
+                                    '\u{fffd}'
+                                } else {
+                                    c
+                                }
+                            })
+                            .take(400)
+                            .collect();
+                        self.text_cache.draw(
+                            &mut quads,
+                            &mut gfx.renderer,
+                            &gfx.fonts,
+                            &gfx.device,
+                            &gfx.queue,
+                            &clean,
+                            preview[0] + PAD,
+                            top + li as f32 * lh,
+                            0.9,
+                            TEXT,
+                            preview,
+                        );
+                    }
+                }
+                None => {
+                    self.text_cache.draw(
+                        &mut quads,
+                        &mut gfx.renderer,
+                        &gfx.fonts,
+                        &gfx.device,
+                        &gfx.queue,
+                        "select a file to preview",
+                        preview[0] + PAD,
+                        preview[1] + 6.0,
+                        0.9,
+                        dim,
+                        preview,
+                    );
+                }
+            }
+        }
+
         // ---- render ----
         let frame = match gfx.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
@@ -3089,6 +3515,17 @@ impl ApplicationHandler for App {
                         self.conn.send(Command::Undo);
                         return;
                     }
+                    // The filesystem inspector is modal: Escape backs out of a
+                    // file preview, then closes the inspector.
+                    if self.inspect.is_some() {
+                        if pressed && code == KeyCode::Escape {
+                            match self.inspect.as_mut().and_then(|i| i.file.take()) {
+                                Some(_) => {} // was previewing → back to listing
+                                None => self.inspect = None,
+                            }
+                        }
+                        return;
+                    }
                     // While the palette is open it captures all keystrokes.
                     if self.palette_open {
                         if pressed {
@@ -3153,5 +3590,57 @@ impl wk_protocol::Client<ServerHandle> for WindowClient {
         // The server owns persistence; the window closing just detaches this
         // client.
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod inspect_tests {
+    use super::*;
+
+    /// The inspector's row geometry is well-formed: every region sits inside the
+    /// panel, entry rows are stacked in order below the title (and below the
+    /// ".." row when present), don't overlap the preview strip, and `scroll`
+    /// offsets which entry the first visible row maps to.
+    #[test]
+    fn inspect_geom_is_well_formed() {
+        let fb = [1440.0, 900.0];
+        let within = |r: [f32; 4], outer: [f32; 4]| {
+            r[0] >= outer[0] - 0.5
+                && r[1] >= outer[1] - 0.5
+                && r[2] <= outer[2] + 0.5
+                && r[3] <= outer[3] + 0.5
+        };
+
+        // Root directory (no ".."), plenty of entries.
+        let (panel, close, up, rows, preview) = inspect_geom(fb, 100, false, 0);
+        assert!(up.is_none(), "root has no parent row");
+        assert!(within(close, panel));
+        assert!(within(preview, panel));
+        assert!(!rows.is_empty());
+        // Rows are inside the panel, above the preview, stacked, and map 1:1 to
+        // entry indices from 0.
+        let mut prev_bottom = f32::MIN;
+        for (i, &(r, idx)) in rows.iter().enumerate() {
+            assert_eq!(idx, i, "row {i} maps to entry {i}");
+            assert!(within(r, panel));
+            assert!(r[3] <= preview[1] + 0.5, "row sits above the preview strip");
+            assert!(r[1] >= prev_bottom - 0.5, "rows don't overlap");
+            prev_bottom = r[3];
+        }
+
+        // A subdirectory: the ".." row appears and takes the first slot, so one
+        // fewer entry row fits.
+        let (_, _, up2, rows2, _) = inspect_geom(fb, 100, true, 0);
+        let up2 = up2.expect("subdirectory has a parent row");
+        assert!(up2[1] < rows2[0].0[1], "\"..\" is above the first entry");
+        assert_eq!(rows.len(), rows2.len() + 1);
+
+        // Scrolling offsets the first visible entry index.
+        let (_, _, _, rows3, _) = inspect_geom(fb, 100, false, 5);
+        assert_eq!(rows3[0].1, 5);
+
+        // A short listing shows only as many rows as there are entries.
+        let (_, _, _, rows4, _) = inspect_geom(fb, 2, false, 0);
+        assert_eq!(rows4.len(), 2);
     }
 }

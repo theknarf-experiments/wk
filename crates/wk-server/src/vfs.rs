@@ -105,6 +105,67 @@ pub fn new_fs() -> SharedFs {
     Arc::new(Mutex::new(Fs::default()))
 }
 
+/// One entry in a directory listing, for read-only UI inspection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DirEntry {
+    pub name: String,
+    pub is_dir: bool,
+    /// File byte length (0 for a directory). For a host-mapped file this is the
+    /// on-disk length; for a shared file, the connected node's current bytes.
+    pub size: usize,
+}
+
+impl Fs {
+    /// Byte length of the file node `id` (0 for a directory or missing node).
+    fn file_len(&self, id: u64) -> usize {
+        match self.nodes.get(&id) {
+            Some(Node::File(d)) => d.len(),
+            Some(Node::Shared(sh)) => sh.lock().unwrap().len(),
+            Some(Node::Host(p)) => std::fs::metadata(p).map(|m| m.len() as usize).unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    /// List the entries directly under directory `path` (root = `""` or `"/"`),
+    /// directories first then files, each group sorted by name. `None` if the
+    /// path doesn't resolve to a directory. Read-only; for UI inspection.
+    pub fn list_dir(&self, path: &str) -> Option<Vec<DirEntry>> {
+        let id = resolve(self, ROOT, path)?;
+        let Node::Dir(children) = self.nodes.get(&id)? else {
+            return None;
+        };
+        let mut out: Vec<DirEntry> = children
+            .iter()
+            .map(|(name, &cid)| DirEntry {
+                name: name.clone(),
+                is_dir: matches!(self.nodes.get(&cid), Some(Node::Dir(_))),
+                size: self.file_len(cid),
+            })
+            .collect();
+        out.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+        Some(out)
+    }
+
+    /// Read up to `cap` bytes of the file at `path` for preview, or `None` if it
+    /// isn't a file. Read-only; a host-mapped file is read from disk.
+    pub fn read_file(&self, path: &str, cap: usize) -> Option<Vec<u8>> {
+        let id = resolve(self, ROOT, path)?;
+        match self.nodes.get(&id)? {
+            Node::File(d) => Some(d.iter().take(cap).copied().collect()),
+            Node::Shared(sh) => Some(sh.lock().unwrap().iter().take(cap).copied().collect()),
+            Node::Host(p) => {
+                use std::io::Read;
+                let mut f = std::fs::File::open(p).ok()?;
+                let mut buf = vec![0u8; cap];
+                let n = f.read(&mut buf).ok()?;
+                buf.truncate(n);
+                Some(buf)
+            }
+            Node::Dir(_) => None,
+        }
+    }
+}
+
 /// Connect a canvas file node into `fs` as the shared file `/name`.
 pub fn mount_file(fs: &SharedFs, name: &str, data: SharedFile) {
     unmount_file(fs, name);
@@ -965,6 +1026,52 @@ mod tests {
             .add_child(ROOT, "secret", Node::File(b"x".to_vec()));
         assert!(resolve(&a.lock().unwrap(), ROOT, "/secret").is_some());
         assert!(resolve(&b.lock().unwrap(), ROOT, "/secret").is_none());
+    }
+
+    #[test]
+    fn inspection_lists_dirs_first_and_reads_files() {
+        let fs = new_fs();
+        {
+            let mut g = fs.lock().unwrap();
+            g.add_child(ROOT, "readme", Node::File(b"hello world".to_vec()));
+            g.add_child(ROOT, "sub", Node::Dir(BTreeMap::new()));
+            let sub = resolve(&g, ROOT, "/sub").unwrap();
+            g.add_child(sub, "nested.txt", Node::File(b"deep".to_vec()));
+        }
+        let g = fs.lock().unwrap();
+
+        // Root: directory first, then file, each with its size.
+        let root = g.list_dir("").expect("root is a dir");
+        assert_eq!(
+            root,
+            vec![
+                DirEntry {
+                    name: "sub".into(),
+                    is_dir: true,
+                    size: 0
+                },
+                DirEntry {
+                    name: "readme".into(),
+                    is_dir: false,
+                    size: 11
+                },
+            ]
+        );
+        // Descend and read.
+        assert_eq!(g.list_dir("/sub").unwrap().len(), 1);
+        assert_eq!(
+            g.read_file("/readme", 1024).as_deref(),
+            Some(&b"hello world"[..])
+        );
+        assert_eq!(
+            g.read_file("/sub/nested.txt", 1024).as_deref(),
+            Some(&b"deep"[..])
+        );
+        // A directory isn't readable as a file; a file isn't listable as a dir.
+        assert!(g.read_file("/sub", 16).is_none());
+        assert!(g.list_dir("/readme").is_none());
+        // Preview is capped.
+        assert_eq!(g.read_file("/readme", 4).as_deref(), Some(&b"hell"[..]));
     }
 
     #[test]
