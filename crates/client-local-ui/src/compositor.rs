@@ -494,6 +494,20 @@ fn draw_ports(
         quads.push(Quad::disc(circle, center, rad, col, clip));
     }
 }
+/// What varies between the small "widget" nodes (file / HostPort / Network /
+/// uplink) when drawing their shared chrome — see [`App::draw_widget`].
+struct WidgetChrome<'a> {
+    r: [f32; 4],
+    border: [f32; 4],
+    bg: [f32; 4],
+    title: &'a str,
+    title_col: [f32; 4],
+    status: &'a str,
+    status_col: [f32; 4],
+    /// Text scale of the status line relative to the title.
+    status_scale: f32,
+}
+
 fn near(a: [f32; 2], b: [f32; 2], radius: f32) -> bool {
     let (dx, dy) = (a[0] - b[0], a[1] - b[1]);
     dx * dx + dy * dy <= radius * radius
@@ -1335,6 +1349,77 @@ impl App {
         (x, y, w, row_h)
     }
 
+    /// Draw the shared chrome of a small "widget" node (file / HostPort /
+    /// Network / uplink): the bordered box, a title and a status line, the
+    /// hover-lit close button, and the wiring ports. Kind-specific extras (a
+    /// HostPort's −/+ buttons) draw on top afterwards.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_widget(
+        &mut self,
+        quads: &mut Vec<Quad>,
+        gfx: &mut Gfx,
+        white: TextureId,
+        zf: f32,
+        mp: [f32; 2],
+        clip: [f32; 4],
+        full: [f32; 4],
+        w: WidgetChrome,
+    ) {
+        quads.push(Quad::solid(white, w.r, w.border, clip));
+        let body = [
+            w.r[0] + BORDER * zf,
+            w.r[1] + BORDER * zf,
+            w.r[2] - BORDER * zf,
+            w.r[3] - BORDER * zf,
+        ];
+        quads.push(Quad::solid(white, body, w.bg, clip));
+        let lh = gfx.fonts.line_height() as f32;
+        self.text_cache.draw(
+            quads,
+            &mut gfx.renderer,
+            &gfx.fonts,
+            &gfx.device,
+            &gfx.queue,
+            w.title,
+            w.r[0] + PAD * zf,
+            w.r[1] + PAD * zf,
+            zf,
+            w.title_col,
+            clip,
+        );
+        self.text_cache.draw(
+            quads,
+            &mut gfx.renderer,
+            &gfx.fonts,
+            &gfx.device,
+            &gfx.queue,
+            w.status,
+            w.r[0] + PAD * zf,
+            w.r[1] + (PAD + lh) * zf,
+            zf * w.status_scale,
+            w.status_col,
+            clip,
+        );
+        let cb = close_btn(w.r, zf);
+        if contains(cb, mp) {
+            quads.push(Quad::solid(white, cb, CLOSE_HOT, clip));
+        }
+        self.text_cache.draw(
+            quads,
+            &mut gfx.renderer,
+            &gfx.fonts,
+            &gfx.device,
+            &gfx.queue,
+            "x",
+            cb[0] + (cb[2] - cb[0]) * 0.28,
+            cb[1] + (cb[3] - cb[1]) * 0.05,
+            zf * 0.8,
+            TEXT,
+            clip,
+        );
+        draw_ports(quads, gfx.renderer.circle, w.r, zf, mp, full);
+    }
+
     /// Draw a terminal cell grid, scaled uniformly to fit `area`, clipped to
     /// `clip`. Shared by the in-workspace node body and its detached window.
     fn draw_term_grid(
@@ -2018,75 +2103,44 @@ impl App {
             let clip = intersect(r, full);
 
             // A file node renders as a small labelled box with a port.
+            // VirtualFiles show their byte count; HostMappedFiles show the
+            // size plus a "disk" marker so they read as backed by a path.
             if let Some(file) = self.view.file_nodes.get(&id) {
                 let name = file.name.clone();
-                let bytes = file.size;
-                let host = file.host_mapped;
-                let (border, bg, sub_col) = if host {
-                    (HOSTFILE_BORDER, HOSTFILE_BG, [0.55, 0.68, 0.85, 1.0])
+                let (border, bg, status, status_col) = if file.host_mapped {
+                    (
+                        HOSTFILE_BORDER,
+                        HOSTFILE_BG,
+                        format!("{} B · disk", file.size),
+                        [0.55, 0.68, 0.85, 1.0],
+                    )
                 } else {
-                    (FILE_BORDER, FILE_BG, [0.65, 0.6, 0.5, 1.0])
+                    (
+                        FILE_BORDER,
+                        FILE_BG,
+                        format!("{} B", file.size),
+                        [0.65, 0.6, 0.5, 1.0],
+                    )
                 };
-                quads.push(Quad::solid(white, r, border, clip));
-                let body = [
-                    r[0] + BORDER * zf,
-                    r[1] + BORDER * zf,
-                    r[2] - BORDER * zf,
-                    r[3] - BORDER * zf,
-                ];
-                quads.push(Quad::solid(white, body, bg, clip));
-                let lh = gfx.fonts.line_height() as f32;
-                self.text_cache.draw(
+                self.draw_widget(
                     &mut quads,
-                    &mut gfx.renderer,
-                    &gfx.fonts,
-                    &gfx.device,
-                    &gfx.queue,
-                    &name,
-                    r[0] + PAD * zf,
-                    r[1] + PAD * zf,
+                    &mut gfx,
+                    white,
                     zf,
-                    TEXT,
+                    mp,
                     clip,
+                    full,
+                    WidgetChrome {
+                        r,
+                        border,
+                        bg,
+                        title: &name,
+                        title_col: TEXT,
+                        status: &status,
+                        status_col,
+                        status_scale: 0.85,
+                    },
                 );
-                // VirtualFiles show their byte count; HostMappedFiles show the
-                // size plus a "disk" marker so they read as backed by a path.
-                let sub = if host {
-                    format!("{bytes} B · disk")
-                } else {
-                    format!("{bytes} B")
-                };
-                self.text_cache.draw(
-                    &mut quads,
-                    &mut gfx.renderer,
-                    &gfx.fonts,
-                    &gfx.device,
-                    &gfx.queue,
-                    &sub,
-                    r[0] + PAD * zf,
-                    r[1] + (PAD + lh) * zf,
-                    zf * 0.85,
-                    sub_col,
-                    clip,
-                );
-                let cb = close_btn(r, zf);
-                if contains(cb, mp) {
-                    quads.push(Quad::solid(white, cb, CLOSE_HOT, clip));
-                }
-                self.text_cache.draw(
-                    &mut quads,
-                    &mut gfx.renderer,
-                    &gfx.fonts,
-                    &gfx.device,
-                    &gfx.queue,
-                    "x",
-                    cb[0] + (cb[2] - cb[0]) * 0.28,
-                    cb[1] + (cb[3] - cb[1]) * 0.05,
-                    zf * 0.8,
-                    TEXT,
-                    clip,
-                );
-                draw_ports(&mut quads, gfx.renderer.circle, r, zf, mp, full);
                 continue;
             }
 
@@ -2095,28 +2149,6 @@ impl App {
             if let Some(&port) = self.view.host_ports.get(&id) {
                 let serving = self.view.serves.values().any(|&hp| hp == id);
                 let conflict = self.port_conflicts.contains(&port);
-                quads.push(Quad::solid(white, r, HOSTPORT_BORDER, clip));
-                let body = [
-                    r[0] + BORDER * zf,
-                    r[1] + BORDER * zf,
-                    r[2] - BORDER * zf,
-                    r[3] - BORDER * zf,
-                ];
-                quads.push(Quad::solid(white, body, HOSTPORT_BG, clip));
-                let lh = gfx.fonts.line_height() as f32;
-                self.text_cache.draw(
-                    &mut quads,
-                    &mut gfx.renderer,
-                    &gfx.fonts,
-                    &gfx.device,
-                    &gfx.queue,
-                    &format!("HostPort :{port}"),
-                    r[0] + PAD * zf,
-                    r[1] + PAD * zf,
-                    zf,
-                    if conflict { WARN } else { TEXT },
-                    clip,
-                );
                 let (status, status_col) = if conflict {
                     ("port in use", WARN)
                 } else if serving {
@@ -2124,35 +2156,24 @@ impl App {
                 } else {
                     ("idle", [0.55, 0.7, 0.72, 1.0])
                 };
-                self.text_cache.draw(
+                self.draw_widget(
                     &mut quads,
-                    &mut gfx.renderer,
-                    &gfx.fonts,
-                    &gfx.device,
-                    &gfx.queue,
-                    status,
-                    r[0] + PAD * zf,
-                    r[1] + (PAD + lh) * zf,
-                    zf * 0.7,
-                    status_col,
+                    &mut gfx,
+                    white,
+                    zf,
+                    mp,
                     clip,
-                );
-                let cb = close_btn(r, zf);
-                if contains(cb, mp) {
-                    quads.push(Quad::solid(white, cb, CLOSE_HOT, clip));
-                }
-                self.text_cache.draw(
-                    &mut quads,
-                    &mut gfx.renderer,
-                    &gfx.fonts,
-                    &gfx.device,
-                    &gfx.queue,
-                    "x",
-                    cb[0] + (cb[2] - cb[0]) * 0.28,
-                    cb[1] + (cb[3] - cb[1]) * 0.05,
-                    zf * 0.8,
-                    TEXT,
-                    clip,
+                    full,
+                    WidgetChrome {
+                        r,
+                        border: HOSTPORT_BORDER,
+                        bg: HOSTPORT_BG,
+                        title: &format!("HostPort :{port}"),
+                        title_col: if conflict { WARN } else { TEXT },
+                        status,
+                        status_col,
+                        status_scale: 0.7,
+                    },
                 );
                 // Port −/+ buttons (also: scroll over the node to change fast).
                 let (minus, plus) = port_step_btns(r, zf);
@@ -2177,7 +2198,6 @@ impl App {
                         clip,
                     );
                 }
-                draw_ports(&mut quads, gfx.renderer.circle, r, zf, mp, full);
                 continue;
             }
 
@@ -2191,94 +2211,39 @@ impl App {
                     .filter(|&&(_, n)| n == id)
                     .count();
                 let is_gw = self.view.gateways.contains(&id);
-                quads.push(Quad::solid(white, r, NET_BORDER, clip));
-                let body = [
-                    r[0] + BORDER * zf,
-                    r[1] + BORDER * zf,
-                    r[2] - BORDER * zf,
-                    r[3] - BORDER * zf,
-                ];
-                quads.push(Quad::solid(white, body, NET_BG, clip));
-                let lh = gfx.fonts.line_height() as f32;
-                self.text_cache.draw(
+                let status = if is_gw {
+                    format!("host • {members}")
+                } else {
+                    format!("{members} node(s)")
+                };
+                self.draw_widget(
                     &mut quads,
-                    &mut gfx.renderer,
-                    &gfx.fonts,
-                    &gfx.device,
-                    &gfx.queue,
-                    if is_gw { "Gateway" } else { "Network" },
-                    r[0] + PAD * zf,
-                    r[1] + PAD * zf,
+                    &mut gfx,
+                    white,
                     zf,
-                    TEXT,
+                    mp,
                     clip,
-                );
-                self.text_cache.draw(
-                    &mut quads,
-                    &mut gfx.renderer,
-                    &gfx.fonts,
-                    &gfx.device,
-                    &gfx.queue,
-                    &if is_gw {
-                        format!("host • {members}")
-                    } else {
-                        format!("{members} node(s)")
+                    full,
+                    WidgetChrome {
+                        r,
+                        border: NET_BORDER,
+                        bg: NET_BG,
+                        title: if is_gw { "Gateway" } else { "Network" },
+                        title_col: TEXT,
+                        status: &status,
+                        status_col: [0.72, 0.62, 0.9, 1.0],
+                        status_scale: 0.7,
                     },
-                    r[0] + PAD * zf,
-                    r[1] + (PAD + lh) * zf,
-                    zf * 0.7,
-                    [0.72, 0.62, 0.9, 1.0],
-                    clip,
                 );
-                let cb = close_btn(r, zf);
-                if contains(cb, mp) {
-                    quads.push(Quad::solid(white, cb, CLOSE_HOT, clip));
-                }
-                self.text_cache.draw(
-                    &mut quads,
-                    &mut gfx.renderer,
-                    &gfx.fonts,
-                    &gfx.device,
-                    &gfx.queue,
-                    "x",
-                    cb[0] + (cb[2] - cb[0]) * 0.28,
-                    cb[1] + (cb[3] - cb[1]) * 0.05,
-                    zf * 0.8,
-                    TEXT,
-                    clip,
-                );
-                draw_ports(&mut quads, gfx.renderer.circle, r, zf, mp, full);
                 continue;
             }
 
-            // An uplink node (Iroh or Veilid): extends the Network it's wired to onto a
-            // remote fabric over p2p QUIC. The status line doubles as the peer
+            // An uplink node (Iroh or Veilid): extends the Network it's wired
+            // to onto a remote fabric. The status line doubles as the peer
             // ticket field (click, paste/type, Enter dials).
             if let Some(meta) = self.view.uplinks.get(&id).cloned() {
-                quads.push(Quad::solid(white, r, NET_BORDER, clip));
-                let body = [
-                    r[0] + BORDER * zf,
-                    r[1] + BORDER * zf,
-                    r[2] - BORDER * zf,
-                    r[3] - BORDER * zf,
-                ];
-                quads.push(Quad::solid(white, body, NET_BG, clip));
-                let lh = gfx.fonts.line_height() as f32;
-                self.text_cache.draw(
-                    &mut quads,
-                    &mut gfx.renderer,
-                    &gfx.fonts,
-                    &gfx.device,
-                    &gfx.queue,
-                    meta.kind.label(),
-                    r[0] + PAD * zf,
-                    r[1] + PAD * zf,
-                    zf,
-                    TEXT,
-                    clip,
-                );
                 let editing = matches!(&self.editing_args, Some((eid, _)) if *eid == id);
-                let (line, col) = if editing {
+                let (status, status_col) = if editing {
                     // Show the tail of the in-progress ticket with a caret.
                     let text = match &self.editing_args {
                         Some((_, s)) => s.as_str(),
@@ -2300,37 +2265,25 @@ impl App {
                 } else {
                     ("click to add peer".into(), [0.55, 0.7, 0.72, 1.0])
                 };
-                self.text_cache.draw(
+                self.draw_widget(
                     &mut quads,
-                    &mut gfx.renderer,
-                    &gfx.fonts,
-                    &gfx.device,
-                    &gfx.queue,
-                    &line,
-                    r[0] + PAD * zf,
-                    r[1] + (PAD + lh) * zf,
-                    zf * 0.7,
-                    col,
+                    &mut gfx,
+                    white,
+                    zf,
+                    mp,
                     clip,
+                    full,
+                    WidgetChrome {
+                        r,
+                        border: NET_BORDER,
+                        bg: NET_BG,
+                        title: meta.kind.label(),
+                        title_col: TEXT,
+                        status: &status,
+                        status_col,
+                        status_scale: 0.7,
+                    },
                 );
-                let cb = close_btn(r, zf);
-                if contains(cb, mp) {
-                    quads.push(Quad::solid(white, cb, CLOSE_HOT, clip));
-                }
-                self.text_cache.draw(
-                    &mut quads,
-                    &mut gfx.renderer,
-                    &gfx.fonts,
-                    &gfx.device,
-                    &gfx.queue,
-                    "x",
-                    cb[0] + (cb[2] - cb[0]) * 0.28,
-                    cb[1] + (cb[3] - cb[1]) * 0.05,
-                    zf * 0.8,
-                    TEXT,
-                    clip,
-                );
-                draw_ports(&mut quads, gfx.renderer.circle, r, zf, mp, full);
                 continue;
             }
 
