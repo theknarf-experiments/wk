@@ -28,7 +28,8 @@ use wasmtime_wasi_io::bytes::Bytes;
 use wasmtime_wasi_io::poll::Pollable;
 use wasmtime_wasi_io::streams::{InputStream, OutputStream, StreamError, StreamResult};
 
-/// Fixed terminal grid size; guests are told this via `$COLUMNS`/`$LINES`.
+/// Default terminal grid size (a launch-time guess in `$COLUMNS`/`$LINES`); the
+/// client resizes each terminal to fit its node.
 pub const COLS: usize = 80;
 pub const ROWS: usize = 24;
 
@@ -70,8 +71,8 @@ pub struct TermIo {
     inp: Mutex<InpState>,
     tty: Mutex<TtyMode>,
     /// The grid size (cols, rows) the client has sized this terminal to. The
-    /// guest reads it via `wk:tty/control`/`ioctl(TIOCGWINSZ)`; changing it wakes
-    /// a blocked read (see `winch`) so the guest can raise SIGWINCH.
+    /// guest reads it via `wk:tty/control`/`ioctl(TIOCGWINSZ)` and polls it for
+    /// changes to raise its own SIGWINCH (WASI can't wake a blocked read).
     size: Mutex<(u16, u16)>,
 }
 
