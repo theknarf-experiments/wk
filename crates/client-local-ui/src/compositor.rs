@@ -1592,6 +1592,30 @@ impl App {
             .filter(|&(_, c)| c > 1)
             .map(|(p, _)| p)
             .collect();
+        // The live set across *every* workspace — client-local per-node state
+        // (terminals, detached windows, surface textures) is keyed by node/
+        // surface, not by tab, so it must be reconciled against all workspaces.
+        // Reconciling against the active-tab-only view would tear down a
+        // detached window or drop a terminal's scrollback on every tab switch.
+        let all_nodes: Vec<SharedNode> = full.nodes.clone();
+        let all_node_ids: std::collections::HashSet<NodeId> =
+            all_nodes.iter().map(|n| n.id).collect();
+        let all_surface_ids: std::collections::HashSet<u64> =
+            full.surfaces.iter().map(|s| s.lock().unwrap().id).collect();
+        // Free GPU textures for surfaces that vanished by any path (undo, node
+        // exit, workspace close) — not just the close-button path.
+        let stale_views: Vec<u64> = self
+            .views
+            .keys()
+            .copied()
+            .filter(|sid| !all_surface_ids.contains(sid))
+            .collect();
+        for sid in stale_views {
+            if let Some((tex, _, _)) = self.views.remove(&sid) {
+                gfx.renderer.remove_texture(tex);
+            }
+        }
+
         self.view = full.for_workspace(self.active_ws);
 
         // Drop keyboard/edit state pointing at a node that's no longer visible
@@ -1638,9 +1662,11 @@ impl App {
         // ---- reconcile the stacking order with the server's live node set ----
         // Positions are assigned by the server when a node is created, so here the
         // client only tracks draw order: new nodes go on top, gone ones drop out.
-        let nodes: Vec<SharedNode> = self.view.nodes.clone();
+        // Keyed over *all* workspaces so detached windows / terminals in
+        // another tab still resolve their node; the active-tab render is gated
+        // by `z` (below), so this doesn't draw off-tab nodes.
         let node_by_id: HashMap<NodeId, SharedNode> =
-            nodes.iter().map(|i| (i.id, i.clone())).collect();
+            all_nodes.iter().map(|i| (i.id, i.clone())).collect();
         let ids = self.view.node_ids.clone();
         let live: std::collections::HashSet<NodeId> = ids.iter().copied().collect();
         for &id in &ids {
@@ -1657,7 +1683,10 @@ impl App {
             .collect();
 
         // ---- feed terminal nodes (those without a surface) ----
-        for node in &nodes {
+        // Feed *every* workspace's terminals, not just the active tab's, so a
+        // node's output while you're on another tab keeps draining into its
+        // scrollback instead of buffering and replaying in one gulp on return.
+        for node in &all_nodes {
             if node_surface.contains_key(&node.id) {
                 continue;
             }
@@ -1671,7 +1700,7 @@ impl App {
             }
         }
         self.terminals
-            .retain(|id, _| node_by_id.contains_key(id) && !node_surface.contains_key(id));
+            .retain(|id, _| all_node_ids.contains(id) && !node_surface.contains_key(id));
 
         // ---- interaction ----
         let mut to_close: Vec<NodeId> = Vec::new();
@@ -2834,9 +2863,9 @@ impl App {
         }
 
         // ---- detached node windows ----
-        // Drop windows for nodes that vanished (closed elsewhere), then forward
-        // each window's queued input to its node and render its own window.
-        self.detached.retain(|id, _| node_by_id.contains_key(id));
+        // Drop windows only for nodes that vanished from *every* workspace
+        // (closed elsewhere) — a node detached in another tab keeps its window.
+        self.detached.retain(|id, _| all_node_ids.contains(id));
         let det_ids: Vec<NodeId> = self.detached.keys().copied().collect();
         for id in det_ids {
             let (mouse, lmb_d, prev_d, keys, term_in) = {
