@@ -136,72 +136,71 @@ impl Dependency {
     }
 }
 
-/// A placed node: an app instance (`node`) or a file node (`virtualfile`/`hostfile`).
+/// One placed canvas node, of any kind: the shared unit of the `.wk` file,
+/// load-time restore, and the server's undo snapshots — a node saved, deleted
+/// + undone, or loaded is materialized from exactly this.
 #[derive(Clone, Debug, PartialEq)]
-pub struct NodeState {
-    /// Dependency name (for app nodes) or file name (for file nodes).
-    pub name: String,
+pub struct NodeSnap {
     pub id: NodeId,
     pub pos: [f32; 2],
     pub size: [f32; 2],
-    /// App-node option values (knob settings), persisted positionally.
-    pub options: Vec<f32>,
-    /// App-node launch args, editable in the GUI.
-    pub args: Vec<String>,
+    pub kind: SnapKind,
 }
 
-/// A HostPort node: a localhost port plus its canvas placement.
+/// The kind-specific part of a [`NodeSnap`]. Each variant serializes under its
+/// own KDL node name (`node`, `virtualfile`, `hostfile`, `hostport`,
+/// `network`/`gateway`, `iroh`, `veilid`).
 #[derive(Clone, Debug, PartialEq)]
-pub struct PortState {
-    pub id: NodeId,
-    pub port: u16,
-    pub pos: [f32; 2],
-    pub size: [f32; 2],
+pub enum SnapKind {
+    /// An app node; `name` resolves against the dependency list.
+    App {
+        name: String,
+        /// Option values (knob settings), persisted positionally.
+        options: Vec<f32>,
+        /// Launch args, editable in the GUI. Empty falls back to the
+        /// dependency's default args at materialization.
+        args: Vec<String>,
+    },
+    /// An in-memory shared file. Its *bytes* are runtime state: undo carries
+    /// them alongside the snap, the `.wk` file does not persist them.
+    VirtualFile { name: String },
+    /// A disk-backed file node (its mount name derives from the path).
+    HostFile { path: PathBuf },
+    /// A localhost HostPort.
+    Port { port: u16 },
+    /// A Network node (or Gateway — a Network granting host access).
+    Net { gateway: bool },
+    /// An uplink node extending a Network to a remote fabric. `secret` is the
+    /// persisted identity — Iroh: a hex ed25519 key; Veilid: a DHT owner
+    /// keypair string. It keeps the ticket stable across restarts, and anyone
+    /// holding it can impersonate the uplink — treat the `.wk` file
+    /// accordingly. `peer` is the remote ticket, re-dialed at load.
+    Iroh {
+        secret: Option<String>,
+        peer: Option<String>,
+    },
+    /// See [`SnapKind::Iroh`].
+    Veilid {
+        secret: Option<String>,
+        peer: Option<String>,
+    },
 }
 
-/// A Network (or Gateway) node and its canvas placement.
-#[derive(Clone, Debug, PartialEq)]
-pub struct NetState {
-    pub id: NodeId,
-    pub gateway: bool,
-    pub pos: [f32; 2],
-    pub size: [f32; 2],
+/// Hex-encode an uplink secret for persistence.
+pub fn secret_hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// An uplink node (Iroh or Veilid — the KDL node name says which): its
-/// identity, the peer it dials, and its placement.
-#[derive(Clone, Debug, PartialEq)]
-pub struct UplinkState {
-    pub id: NodeId,
-    /// The uplink's persisted identity — Iroh: its ed25519 secret key,
-    /// hex-encoded; Veilid: its DHT owner keypair string. Either way this is
-    /// what keeps the ticket stable across restarts, and anyone holding it can
-    /// impersonate the uplink — treat the `.wk` file accordingly.
-    pub secret: Option<String>,
-    /// The remote uplink's ticket, re-dialed at load.
-    pub peer: Option<String>,
-    pub pos: [f32; 2],
-    pub size: [f32; 2],
-}
-
-impl UplinkState {
-    /// Hex-encode a secret for persistence.
-    pub fn secret_hex(bytes: &[u8; 32]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+/// Decode a persisted uplink secret, if well-formed.
+pub fn secret_bytes(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
     }
-
-    /// The stored secret as key bytes, if present and well-formed.
-    pub fn secret_bytes(&self) -> Option<[u8; 32]> {
-        let s = self.secret.as_ref()?;
-        if s.len() != 64 {
-            return None;
-        }
-        let mut out = [0u8; 32];
-        for (i, byte) in out.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()?;
-        }
-        Some(out)
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()?;
     }
+    Some(out)
 }
 
 /// A `.wk` file: shared dependencies plus one or more workspaces (canvas tabs).
@@ -216,17 +215,17 @@ pub struct Document {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Workspace {
     pub id: NodeId,
-    pub nodes: Vec<NodeState>,
-    pub virtual_files: Vec<NodeState>,
-    pub host_files: Vec<NodeState>,
-    pub host_ports: Vec<PortState>,
+    /// Every placed node, of any kind (each serializes under its kind's KDL
+    /// node name). File order is preserved.
+    pub nodes: Vec<NodeSnap>,
+    /// File mounts as (file id, app node id).
     pub connections: Vec<(NodeId, NodeId)>,
+    /// MIDI links as (source, destination).
     pub midi: Vec<(NodeId, NodeId)>,
+    /// Serve wiring as (served node id, HostPort id).
     pub serves: Vec<(NodeId, NodeId)>,
-    pub nets: Vec<NetState>,
+    /// Network membership as (member id, Network id).
     pub net_links: Vec<(NodeId, NodeId)>,
-    pub irohs: Vec<UplinkState>,
-    pub veilids: Vec<UplinkState>,
 }
 
 impl Workspace {
@@ -235,16 +234,10 @@ impl Workspace {
         Workspace {
             id: NodeId::new(),
             nodes: Vec::new(),
-            virtual_files: Vec::new(),
-            host_files: Vec::new(),
-            host_ports: Vec::new(),
             connections: Vec::new(),
             midi: Vec::new(),
             serves: Vec::new(),
-            nets: Vec::new(),
             net_links: Vec::new(),
-            irohs: Vec::new(),
-            veilids: Vec::new(),
         }
     }
 }
@@ -402,19 +395,11 @@ fn parse_workspace(n: &KdlNode) -> Option<Workspace> {
     };
     for c in n.children().map(|ch| ch.nodes()).unwrap_or(&[]) {
         match c.name().value() {
-            "node" => ws.nodes.extend(parse_placed(c)),
-            "virtualfile" => ws.virtual_files.extend(parse_placed(c)),
-            "hostfile" => ws.host_files.extend(parse_placed(c)),
-            "hostport" => ws.host_ports.extend(parse_hostport(c)),
             "connection" => ws.connections.extend(pair(c)),
             "midi" => ws.midi.extend(pair(c)),
             "serve" => ws.serves.extend(pair(c)),
-            "network" => ws.nets.extend(parse_net(c, false)),
-            "gateway" => ws.nets.extend(parse_net(c, true)),
             "netlink" => ws.net_links.extend(pair(c)),
-            "iroh" => ws.irohs.extend(parse_uplink(c)),
-            "veilid" => ws.veilids.extend(parse_uplink(c)),
-            _ => {}
+            _ => ws.nodes.extend(parse_snap(c)),
         }
     }
     Some(ws)
@@ -425,16 +410,7 @@ fn workspace_kdl(ws: &Workspace) -> KdlNode {
     node.push(KdlEntry::new(ws.id.to_string()));
     let mut ch = KdlDocument::new();
     for n in &ws.nodes {
-        ch.nodes_mut().push(placed_kdl("node", n));
-    }
-    for f in &ws.virtual_files {
-        ch.nodes_mut().push(placed_kdl("virtualfile", f));
-    }
-    for f in &ws.host_files {
-        ch.nodes_mut().push(placed_kdl("hostfile", f));
-    }
-    for hp in &ws.host_ports {
-        ch.nodes_mut().push(hostport_kdl(hp));
+        ch.nodes_mut().push(snap_kdl(n));
     }
     for &(file, node) in &ws.connections {
         ch.nodes_mut().push(pair_kdl("connection", file, node));
@@ -442,107 +418,23 @@ fn workspace_kdl(ws: &Workspace) -> KdlNode {
     for &(src, dst) in &ws.midi {
         ch.nodes_mut().push(pair_kdl("midi", src, dst));
     }
-    for &(http, hostport) in &ws.serves {
-        ch.nodes_mut().push(pair_kdl("serve", http, hostport));
+    for &(served, hostport) in &ws.serves {
+        ch.nodes_mut().push(pair_kdl("serve", served, hostport));
     }
-    for n in &ws.nets {
-        ch.nodes_mut().push(net_kdl(n));
-    }
-    for &(app, net) in &ws.net_links {
-        ch.nodes_mut().push(pair_kdl("netlink", app, net));
-    }
-    for i in &ws.irohs {
-        ch.nodes_mut().push(uplink_kdl("iroh", i));
-    }
-    for v in &ws.veilids {
-        ch.nodes_mut().push(uplink_kdl("veilid", v));
+    for &(member, net) in &ws.net_links {
+        ch.nodes_mut().push(pair_kdl("netlink", member, net));
     }
     node.set_children(ch);
     node
 }
 
-/// Parse a `node`/`virtualfile`/`hostfile` entry: `<kind> "<name>" <id> { ... }`.
-fn parse_placed(n: &KdlNode) -> Option<NodeState> {
-    let name = n.get(0)?.as_string()?.to_string();
-    let id = node_id(n.get(1)?)?;
-    let ch = n.children()?;
-    let pos = ch.get("pos")?;
-    let size = ch.get("size")?;
-    let options = ch
-        .get("options")
-        .map(|o| o.entries().iter().filter_map(|e| num(e.value())).collect())
-        .unwrap_or_default();
-    let args = ch
-        .get("args")
-        .map(|a| {
-            a.entries()
-                .iter()
-                .filter_map(|e| e.value().as_string().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    Some(NodeState {
-        name,
-        id,
-        pos: [pos.get(0).and_then(num)?, pos.get(1).and_then(num)?],
-        size: [size.get(0).and_then(num)?, size.get(1).and_then(num)?],
-        options,
-        args,
-    })
-}
-
-/// Parse a `hostport <id> { port <p>; pos x y; size w h }` entry.
-fn parse_hostport(n: &KdlNode) -> Option<PortState> {
-    let id = node_id(n.get(0)?)?;
-    let ch = n.children()?;
-    // Reject an out-of-range port (drop the node) rather than truncate it: a
-    // hand-edited `port 99999` should not silently become 34463.
-    let port = ch
-        .get("port")
-        .and_then(|p| p.get(0))
-        .and_then(uint)
-        .and_then(|n| u16::try_from(n).ok())?;
-    let pos = ch.get("pos")?;
-    let size = ch.get("size")?;
-    Some(PortState {
-        id,
-        port,
-        pos: [pos.get(0).and_then(num)?, pos.get(1).and_then(num)?],
-        size: [size.get(0).and_then(num)?, size.get(1).and_then(num)?],
-    })
-}
-
-fn hostport_kdl(p: &PortState) -> KdlNode {
-    let mut node = KdlNode::new("hostport");
-    node.push(KdlEntry::new(p.id.to_string()));
-    let mut ch = KdlDocument::new();
-    let mut port = KdlNode::new("port");
-    port.push(KdlEntry::new(p.port as i128));
-    ch.nodes_mut().push(port);
-    ch.nodes_mut().push(node2("pos", p.pos[0], p.pos[1]));
-    ch.nodes_mut().push(node2("size", p.size[0], p.size[1]));
-    node.set_children(ch);
-    node
-}
-
-/// Parse a `network`/`gateway <id> { pos x y; size w h }` entry.
-fn parse_net(n: &KdlNode, gateway: bool) -> Option<NetState> {
-    let id = node_id(n.get(0)?)?;
-    let ch = n.children()?;
-    let pos = ch.get("pos")?;
-    let size = ch.get("size")?;
-    Some(NetState {
-        id,
-        gateway,
-        pos: [pos.get(0).and_then(num)?, pos.get(1).and_then(num)?],
-        size: [size.get(0).and_then(num)?, size.get(1).and_then(num)?],
-    })
-}
-
-/// Parse an `iroh`/`veilid` `<id> { secret "…"; peer "<ticket>"; pos x y;
-/// size w h }` entry.
-fn parse_uplink(n: &KdlNode) -> Option<UplinkState> {
-    let id = node_id(n.get(0)?)?;
+/// Parse one placed node of any kind, dispatching on the KDL node name.
+/// Unknown names yield `None` (tolerated, like any unknown entry).
+fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
+    // Named kinds (`node "<name>" <id>`) carry the name first; the rest are
+    // `<kind> <id>`.
+    let named = matches!(n.name().value(), "node" | "virtualfile" | "hostfile");
+    let id = node_id(n.get(if named { 1 } else { 0 })?)?;
     let ch = n.children()?;
     let text = |name: &str| {
         ch.get(name)
@@ -550,67 +442,128 @@ fn parse_uplink(n: &KdlNode) -> Option<UplinkState> {
             .and_then(|v| v.as_string())
             .map(str::to_string)
     };
+    let kind = match n.name().value() {
+        "node" => {
+            let options = ch
+                .get("options")
+                .map(|o| o.entries().iter().filter_map(|e| num(e.value())).collect())
+                .unwrap_or_default();
+            let args = ch
+                .get("args")
+                .map(|a| {
+                    a.entries()
+                        .iter()
+                        .filter_map(|e| e.value().as_string().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            SnapKind::App {
+                name: n.get(0)?.as_string()?.to_string(),
+                options,
+                args,
+            }
+        }
+        "virtualfile" => SnapKind::VirtualFile {
+            name: n.get(0)?.as_string()?.to_string(),
+        },
+        "hostfile" => SnapKind::HostFile {
+            path: PathBuf::from(n.get(0)?.as_string()?),
+        },
+        // Reject an out-of-range port (drop the node) rather than truncate it:
+        // a hand-edited `port 99999` should not silently become 34463.
+        "hostport" => SnapKind::Port {
+            port: ch
+                .get("port")
+                .and_then(|p| p.get(0))
+                .and_then(uint)
+                .and_then(|n| u16::try_from(n).ok())?,
+        },
+        "network" => SnapKind::Net { gateway: false },
+        "gateway" => SnapKind::Net { gateway: true },
+        "iroh" => SnapKind::Iroh {
+            secret: text("secret"),
+            peer: text("peer"),
+        },
+        "veilid" => SnapKind::Veilid {
+            secret: text("secret"),
+            peer: text("peer"),
+        },
+        _ => return None,
+    };
     let pos = ch.get("pos")?;
     let size = ch.get("size")?;
-    Some(UplinkState {
+    Some(NodeSnap {
         id,
-        secret: text("secret"),
-        peer: text("peer"),
         pos: [pos.get(0).and_then(num)?, pos.get(1).and_then(num)?],
         size: [size.get(0).and_then(num)?, size.get(1).and_then(num)?],
+        kind,
     })
 }
 
-fn uplink_kdl(kind: &str, i: &UplinkState) -> KdlNode {
-    let mut node = KdlNode::new(kind);
-    node.push(KdlEntry::new(i.id.to_string()));
-    let mut ch = KdlDocument::new();
-    if let Some(s) = &i.secret {
-        let mut n = KdlNode::new("secret");
-        n.push(str_entry(s));
-        ch.nodes_mut().push(n);
-    }
-    if let Some(p) = &i.peer {
-        let mut n = KdlNode::new("peer");
-        n.push(str_entry(p));
-        ch.nodes_mut().push(n);
-    }
-    ch.nodes_mut().push(node2("pos", i.pos[0], i.pos[1]));
-    ch.nodes_mut().push(node2("size", i.size[0], i.size[1]));
-    node.set_children(ch);
-    node
-}
-
-fn net_kdl(n: &NetState) -> KdlNode {
-    let mut node = KdlNode::new(if n.gateway { "gateway" } else { "network" });
-    node.push(KdlEntry::new(n.id.to_string()));
-    let mut ch = KdlDocument::new();
-    ch.nodes_mut().push(node2("pos", n.pos[0], n.pos[1]));
-    ch.nodes_mut().push(node2("size", n.size[0], n.size[1]));
-    node.set_children(ch);
-    node
-}
-
-fn placed_kdl(kind: &str, n: &NodeState) -> KdlNode {
-    let mut node = KdlNode::new(kind);
-    node.push(str_entry(&n.name));
-    node.push(KdlEntry::new(n.id.to_string()));
-    let mut ch = KdlDocument::new();
-    ch.nodes_mut().push(node2("pos", n.pos[0], n.pos[1]));
-    ch.nodes_mut().push(node2("size", n.size[0], n.size[1]));
-    if !n.options.is_empty() {
-        let mut opts = KdlNode::new("options");
-        for &v in &n.options {
-            opts.push(KdlEntry::new(v as f64));
+/// Serialize one placed node under its kind's KDL node name.
+fn snap_kdl(s: &NodeSnap) -> KdlNode {
+    let name = match &s.kind {
+        SnapKind::App { .. } => "node",
+        SnapKind::VirtualFile { .. } => "virtualfile",
+        SnapKind::HostFile { .. } => "hostfile",
+        SnapKind::Port { .. } => "hostport",
+        SnapKind::Net { gateway: false } => "network",
+        SnapKind::Net { gateway: true } => "gateway",
+        SnapKind::Iroh { .. } => "iroh",
+        SnapKind::Veilid { .. } => "veilid",
+    };
+    let mut node = KdlNode::new(name);
+    // Named kinds lead with the name, then the id.
+    match &s.kind {
+        SnapKind::App { name, .. } | SnapKind::VirtualFile { name } => {
+            node.push(str_entry(name));
         }
-        ch.nodes_mut().push(opts);
-    }
-    if !n.args.is_empty() {
-        let mut args = KdlNode::new("args");
-        for a in &n.args {
-            args.push(str_entry(a));
+        SnapKind::HostFile { path } => {
+            node.push(str_entry(&path.to_string_lossy()));
         }
-        ch.nodes_mut().push(args);
+        _ => {}
+    }
+    node.push(KdlEntry::new(s.id.to_string()));
+
+    let mut ch = KdlDocument::new();
+    let mut child_str = |key: &str, value: &str| {
+        let mut n = KdlNode::new(key);
+        n.push(str_entry(value));
+        ch.nodes_mut().push(n);
+    };
+    match &s.kind {
+        SnapKind::Iroh { secret, peer } | SnapKind::Veilid { secret, peer } => {
+            if let Some(sec) = secret {
+                child_str("secret", sec);
+            }
+            if let Some(p) = peer {
+                child_str("peer", p);
+            }
+        }
+        SnapKind::Port { port } => {
+            let mut p = KdlNode::new("port");
+            p.push(KdlEntry::new(*port as i128));
+            ch.nodes_mut().push(p);
+        }
+        _ => {}
+    }
+    ch.nodes_mut().push(node2("pos", s.pos[0], s.pos[1]));
+    ch.nodes_mut().push(node2("size", s.size[0], s.size[1]));
+    if let SnapKind::App { options, args, .. } = &s.kind {
+        if !options.is_empty() {
+            let mut opts = KdlNode::new("options");
+            for &v in options {
+                opts.push(KdlEntry::new(v as f64));
+            }
+            ch.nodes_mut().push(opts);
+        }
+        if !args.is_empty() {
+            let mut a = KdlNode::new("args");
+            for arg in args {
+                a.push(str_entry(arg));
+            }
+            ch.nodes_mut().push(a);
+        }
     }
     node.set_children(ch);
     node
@@ -766,68 +719,74 @@ mod tests {
             workspaces: vec![
                 Workspace {
                     id: wa,
-                    nodes: vec![NodeState {
-                        name: "synth".into(),
-                        id: synth,
-                        pos: [40.0, 56.0],
-                        size: [360.0, 260.0],
-                        options: vec![8.0, 0.6, 0.0, 1.0],
-                        args: vec!["netserve".into(), "80".into()],
-                    }],
-                    virtual_files: vec![NodeState {
-                        name: "chan".into(),
-                        id: chan,
-                        pos: [200.0, 120.0],
-                        size: [130.0, 44.0],
-                        options: Vec::new(),
-                        args: Vec::new(),
-                    }],
-                    host_files: vec![NodeState {
-                        name: "notes.txt".into(),
-                        id: notes,
-                        pos: [200.0, 200.0],
-                        size: [130.0, 44.0],
-                        options: Vec::new(),
-                        args: Vec::new(),
-                    }],
-                    host_ports: vec![PortState {
-                        id: port,
-                        port: 8080,
-                        pos: [600.0, 100.0],
-                        size: [130.0, 44.0],
-                    }],
+                    nodes: vec![
+                        NodeSnap {
+                            id: synth,
+                            pos: [40.0, 56.0],
+                            size: [360.0, 260.0],
+                            kind: SnapKind::App {
+                                name: "synth".into(),
+                                options: vec![8.0, 0.6, 0.0, 1.0],
+                                args: vec!["netserve".into(), "80".into()],
+                            },
+                        },
+                        NodeSnap {
+                            id: chan,
+                            pos: [200.0, 120.0],
+                            size: [130.0, 44.0],
+                            kind: SnapKind::VirtualFile {
+                                name: "chan".into(),
+                            },
+                        },
+                        NodeSnap {
+                            id: notes,
+                            pos: [200.0, 200.0],
+                            size: [130.0, 44.0],
+                            kind: SnapKind::HostFile {
+                                path: "notes.txt".into(),
+                            },
+                        },
+                        NodeSnap {
+                            id: port,
+                            pos: [600.0, 100.0],
+                            size: [130.0, 44.0],
+                            kind: SnapKind::Port { port: 8080 },
+                        },
+                        NodeSnap {
+                            id: net,
+                            pos: [700.0, 100.0],
+                            size: [130.0, 44.0],
+                            kind: SnapKind::Net { gateway: false },
+                        },
+                        NodeSnap {
+                            id: gw,
+                            pos: [700.0, 200.0],
+                            size: [130.0, 44.0],
+                            kind: SnapKind::Net { gateway: true },
+                        },
+                        NodeSnap {
+                            id: mdst,
+                            pos: [800.0, 100.0],
+                            size: [130.0, 44.0],
+                            kind: SnapKind::Iroh {
+                                secret: Some(secret_hex(&[7u8; 32])),
+                                peer: Some("endpointabc123".into()),
+                            },
+                        },
+                        NodeSnap {
+                            id: msrc,
+                            pos: [900.0, 100.0],
+                            size: [130.0, 44.0],
+                            kind: SnapKind::Veilid {
+                                secret: Some("VLD0:pubkey:secretkey".into()),
+                                peer: Some("VLD0:remoterecordkey".into()),
+                            },
+                        },
+                    ],
                     connections: vec![(chan, synth)],
                     midi: vec![(msrc, mdst)],
                     serves: vec![(synth, port)],
-                    nets: vec![
-                        NetState {
-                            id: net,
-                            gateway: false,
-                            pos: [700.0, 100.0],
-                            size: [130.0, 44.0],
-                        },
-                        NetState {
-                            id: gw,
-                            gateway: true,
-                            pos: [700.0, 200.0],
-                            size: [130.0, 44.0],
-                        },
-                    ],
                     net_links: vec![(synth, net)],
-                    irohs: vec![UplinkState {
-                        id: mdst,
-                        secret: Some(UplinkState::secret_hex(&[7u8; 32])),
-                        peer: Some("endpointabc123".into()),
-                        pos: [800.0, 100.0],
-                        size: [130.0, 44.0],
-                    }],
-                    veilids: vec![UplinkState {
-                        id: msrc,
-                        secret: Some("VLD0:pubkey:secretkey".into()),
-                        peer: Some("VLD0:remoterecordkey".into()),
-                        pos: [900.0, 100.0],
-                        size: [130.0, 44.0],
-                    }],
                 },
                 Workspace {
                     id: wb,
@@ -849,25 +808,8 @@ mod tests {
         assert_eq!(back.dependencies[1].args, vec!["example.com", "80"]);
         assert!(matches!(back.dependencies[1].source, Source::Oci(_)));
 
-        assert_eq!(back.workspaces.len(), 2);
-        let a = &back.workspaces[0];
-        assert_eq!(a.id, wa);
-        assert_eq!(a.nodes.len(), 1);
-        assert_eq!(a.nodes[0].name, "synth");
-        assert_eq!(a.nodes[0].options, vec![8.0, 0.6, 0.0, 1.0]);
-        assert_eq!(a.nodes[0].args, vec!["netserve".to_string(), "80".into()]);
-        assert!(a.virtual_files[0].options.is_empty());
-        assert_eq!(a.host_files[0].name, "notes.txt");
-        assert_eq!(a.host_ports[0].port, 8080);
-        assert_eq!(a.connections, vec![(chan, synth)]);
-        assert_eq!(a.midi, vec![(msrc, mdst)]);
-        assert_eq!(a.serves, vec![(synth, port)]);
-        assert_eq!(a.nets.len(), 2);
-        assert!(a.nets[1].gateway);
-        assert_eq!(a.net_links, vec![(synth, net)]);
-
-        assert_eq!(back.workspaces[1].id, wb);
-        assert!(back.workspaces[1].nodes.is_empty());
+        // Nodes of every kind, wiring, and order survive exactly.
+        assert_eq!(back, doc);
     }
 
     #[test]
@@ -882,10 +824,13 @@ mod tests {
         };
         // 99999 doesn't fit in a u16; the node is dropped, not truncated to 34463.
         let doc = Document::from_kdl(&text(99999)).expect("parses");
-        assert!(doc.workspaces[0].host_ports.is_empty());
+        assert!(doc.workspaces[0].nodes.is_empty());
         // A valid port is kept as-is.
         let doc = Document::from_kdl(&text(8080)).expect("parses");
-        assert_eq!(doc.workspaces[0].host_ports[0].port, 8080);
+        assert_eq!(
+            doc.workspaces[0].nodes[0].kind,
+            SnapKind::Port { port: 8080 }
+        );
     }
 
     // ---- property-based round-trip ----
@@ -954,78 +899,53 @@ mod tests {
             })
     }
 
-    fn node_state() -> impl Strategy<Value = NodeState> {
+    fn uplink_fields() -> impl Strategy<Value = (Option<String>, Option<String>)> {
         (
-            value_str(),
-            any_node_id(),
-            coord(),
-            coord(),
-            coord(),
-            coord(),
-            prop::collection::vec(coord(), 0..4),
-            prop::collection::vec(value_str(), 0..3),
-        )
-            .prop_map(|(name, id, px, py, sx, sy, options, args)| NodeState {
-                name,
-                id,
-                pos: [px, py],
-                size: [sx, sy],
-                options,
-                args,
-            })
-    }
-
-    fn port_state() -> impl Strategy<Value = PortState> {
-        (
-            any_node_id(),
-            any::<u16>(),
-            coord(),
-            coord(),
-            coord(),
-            coord(),
-        )
-            .prop_map(|(id, port, px, py, sx, sy)| PortState {
-                id,
-                port,
-                pos: [px, py],
-                size: [sx, sy],
-            })
-    }
-
-    fn net_state() -> impl Strategy<Value = NetState> {
-        (
-            any_node_id(),
-            any::<bool>(),
-            coord(),
-            coord(),
-            coord(),
-            coord(),
-        )
-            .prop_map(|(id, gateway, px, py, sx, sy)| NetState {
-                id,
-                gateway,
-                pos: [px, py],
-                size: [sx, sy],
-            })
-    }
-
-    fn uplink_state() -> impl Strategy<Value = UplinkState> {
-        (
-            any_node_id(),
-            prop::option::of(prop::collection::vec(any::<u8>(), 32)),
+            prop::option::of(
+                prop::collection::vec(any::<u8>(), 32)
+                    .prop_map(|s| secret_hex(&<[u8; 32]>::try_from(s.as_slice()).unwrap())),
+            ),
             prop::option::of(value_str()),
-            coord(),
-            coord(),
-            coord(),
-            coord(),
         )
-            .prop_map(|(id, secret, peer, px, py, sx, sy)| UplinkState {
+    }
+
+    fn snap_kind() -> impl Strategy<Value = SnapKind> {
+        prop_oneof![
+            (
+                value_str(),
+                prop::collection::vec(coord(), 0..4),
+                prop::collection::vec(value_str(), 0..3),
+            )
+                .prop_map(|(name, options, args)| SnapKind::App {
+                    name,
+                    options,
+                    args
+                }),
+            value_str().prop_map(|name| SnapKind::VirtualFile { name }),
+            value_str().prop_map(|p| SnapKind::HostFile {
+                path: PathBuf::from(p)
+            }),
+            any::<u16>().prop_map(|port| SnapKind::Port { port }),
+            any::<bool>().prop_map(|gateway| SnapKind::Net { gateway }),
+            uplink_fields().prop_map(|(secret, peer)| SnapKind::Iroh { secret, peer }),
+            uplink_fields().prop_map(|(secret, peer)| SnapKind::Veilid { secret, peer }),
+        ]
+    }
+
+    fn node_snap() -> impl Strategy<Value = NodeSnap> {
+        (
+            any_node_id(),
+            coord(),
+            coord(),
+            coord(),
+            coord(),
+            snap_kind(),
+        )
+            .prop_map(|(id, px, py, sx, sy, kind)| NodeSnap {
                 id,
-                secret: secret
-                    .map(|s| UplinkState::secret_hex(&<[u8; 32]>::try_from(s.as_slice()).unwrap())),
-                peer,
                 pos: [px, py],
                 size: [sx, sy],
+                kind,
             })
     }
 
@@ -1036,50 +956,20 @@ mod tests {
     fn workspace_strat() -> impl Strategy<Value = Workspace> {
         (
             any_node_id(),
-            prop::collection::vec(node_state(), 0..3),
-            prop::collection::vec(node_state(), 0..3),
-            prop::collection::vec(node_state(), 0..3),
-            prop::collection::vec(port_state(), 0..3),
+            prop::collection::vec(node_snap(), 0..6),
             prop::collection::vec(pair(), 0..3),
             prop::collection::vec(pair(), 0..3),
             prop::collection::vec(pair(), 0..3),
-            prop::collection::vec(net_state(), 0..3),
             prop::collection::vec(pair(), 0..3),
-            (
-                prop::collection::vec(uplink_state(), 0..3),
-                prop::collection::vec(uplink_state(), 0..3),
-            ),
         )
-            .prop_map(
-                |(
-                    id,
-                    nodes,
-                    vfiles,
-                    hfiles,
-                    ports,
-                    conns,
-                    midi,
-                    serves,
-                    nets,
-                    netlinks,
-                    (irohs, veilids),
-                )| {
-                    Workspace {
-                        id,
-                        nodes,
-                        virtual_files: vfiles,
-                        host_files: hfiles,
-                        host_ports: ports,
-                        connections: conns,
-                        midi,
-                        serves,
-                        nets,
-                        net_links: netlinks,
-                        irohs,
-                        veilids,
-                    }
-                },
-            )
+            .prop_map(|(id, nodes, conns, midi, serves, netlinks)| Workspace {
+                id,
+                nodes,
+                connections: conns,
+                midi,
+                serves,
+                net_links: netlinks,
+            })
     }
 
     fn document() -> impl Strategy<Value = Document> {

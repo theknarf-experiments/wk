@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use crate::plugin::{NodeRegistry, PluginHost, SharedNode, SharedSurface, SurfaceRegistry};
 use crate::wiring::{self, NodeClass};
 use crate::workspace::{
-    Dependency, Document, NetState, NodeState, PortState, UplinkState, Workspace,
+    secret_bytes, secret_hex, Dependency, Document, NodeSnap, SnapKind, Workspace,
 };
 use wk_protocol::{Command, NodeId, NodeKind, Resource, ResourceRef, Wire};
 
@@ -328,45 +328,16 @@ struct WsSnapshot {
 
 /// Everything needed to bring a removed node back exactly as it was.
 struct Snapshot {
-    id: NodeId,
     ws: NodeId,
-    pos: [f32; 2],
-    size: [f32; 2],
-    kind: SnapKind,
+    /// The node itself, in the same shape the `.wk` file persists
+    /// ([`crate::workspace::NodeSnap`]) — undo and load-time restore
+    /// materialize through the same path.
+    node: NodeSnap,
+    /// A VirtualFile's in-memory bytes: undo restores them; the `.wk` file
+    /// deliberately does not persist content. Empty for every other kind.
+    file_data: Vec<u8>,
     /// Every connection the node was part of, as raw node pairs.
     wires: Vec<(NodeId, NodeId)>,
-}
-
-enum SnapKind {
-    App {
-        dep: String,
-        args: Vec<String>,
-        options: Vec<f32>,
-    },
-    Virtual {
-        name: String,
-        data: Vec<u8>,
-    },
-    HostFile {
-        name: String,
-        path: PathBuf,
-    },
-    Port {
-        port: u16,
-    },
-    Net {
-        gateway: bool,
-    },
-    Iroh {
-        secret: [u8; 32],
-        /// The peer ticket it was dialing (stored as its args).
-        peer: Vec<String>,
-    },
-    Veilid {
-        identity: String,
-        /// The peer ticket it was dialing (stored as its args).
-        peer: Vec<String>,
-    },
 }
 
 /// What kind of node this is. The base fact that used to be inferred by probing
@@ -513,152 +484,24 @@ impl Server {
         Ok(server)
     }
 
-    /// Spawn one workspace's nodes and re-apply its wiring (used at load). Node
-    /// positions are set here so every node has a place the moment it exists.
+    /// Spawn one workspace's nodes and re-apply its wiring (used at load).
+    /// Every node materializes through [`Self::materialize`] — the same path
+    /// undo uses — then the saved wires are re-established generically. A wire
+    /// whose node is still compiling is recorded as desired state and applied
+    /// by the tick loop's reconcilers once the node is ready.
     fn instantiate(&mut self, saved: &Workspace) {
-        // App nodes: resolve the dependency by name, spawn with the saved id.
-        for n in &saved.nodes {
-            let Some(dep) = self
-                .graph
-                .available
-                .iter()
-                .find(|d| d.name == n.name)
-                .cloned()
-            else {
-                eprintln!(
-                    "workspace references unknown dependency {:?}; skipping",
-                    n.name
-                );
-                continue;
-            };
-            // The node's saved (possibly-edited) args, else the dependency default.
-            let args = if n.args.is_empty() {
-                dep.args.clone()
-            } else {
-                n.args.clone()
-            };
-            match self.host.spawn(
-                &dep.local_path(),
-                &dep.name,
-                n.id,
-                &args,
-                self.registry.clone(),
-                self.node_reg.clone(),
-                n.options.clone(),
-            ) {
-                Ok(()) => {
-                    self.place(n.id, Kind::App, saved.id, n.pos, n.size);
-                    self.graph.node_args.insert(n.id, args);
-                }
-                Err(e) => eprintln!("failed to restore {}: {e:#}", dep.name),
-            }
+        for snap in &saved.nodes {
+            self.materialize(saved.id, snap, &[]);
         }
-
-        // VirtualFile nodes: recreate empty shared buffers at their saved spots.
-        for f in &saved.virtual_files {
-            self.place(f.id, Kind::File, saved.id, f.pos, f.size);
-            if let Some(num) = f
-                .name
-                .strip_prefix("file")
-                .and_then(|s| s.parse::<u32>().ok())
-            {
-                self.file_seq = self.file_seq.max(num);
-            }
-            self.graph.file_nodes.insert(
-                f.id,
-                FileNode::Virtual(VirtualFile {
-                    name: f.name.clone(),
-                    data: Arc::new(Mutex::new(Vec::new())),
-                }),
-            );
-        }
-
-        // HostMappedFile nodes: re-map their saved host paths (name = path).
-        for f in &saved.host_files {
-            self.place(f.id, Kind::File, saved.id, f.pos, f.size);
-            let path = PathBuf::from(&f.name);
-            let name = host_file_name(&path);
-            if let Some(num) = name
-                .strip_prefix("host")
-                .and_then(|s| s.parse::<u32>().ok())
-            {
-                self.host_seq = self.host_seq.max(num);
-            }
-            self.graph
-                .file_nodes
-                .insert(f.id, FileNode::HostMapped(HostMappedFile { name, path }));
-        }
-
-        // Record desired file connections; `sync_mounts` (below) applies them.
-        for &(file_id, app_id) in &saved.connections {
-            if self.graph.file_nodes.contains_key(&file_id) && self.app_node(app_id).is_some() {
-                self.graph.connections.push((file_id, app_id));
-            }
-        }
-
-        // Record desired MIDI connections; `sync_midi` (below) routes them.
-        for &(src, dst) in &saved.midi {
-            if self.app_node(src).is_some() && self.app_node(dst).is_some() {
-                self.graph.midi_links.push((src, dst));
-            }
-        }
-
-        // HostPort nodes: recreate at their saved positions and ports.
-        for hp in &saved.host_ports {
-            self.next_port = self.next_port.max(hp.port.saturating_add(1));
-            self.place(hp.id, Kind::Port, saved.id, hp.pos, hp.size);
-            self.graph.host_ports.insert(hp.id, hp.port);
-        }
-
-        // Record serve wiring as desired state. The http nodes are still
-        // compiling on background threads, so they can't be bound yet; the tick
-        // loop's `sync_serves` starts each server once its node is ready. (Binding
-        // eagerly here would silently drop the wire, since `http_path()` is not
-        // published until compilation finishes — issue that lost serve wires on
-        // every load.)
-        for &(http_id, hostport_id) in &saved.serves {
-            if self.app_node(http_id).is_some() && self.graph.host_ports.contains_key(&hostport_id)
-            {
-                self.graph.serve_links.push((http_id, hostport_id));
-            }
-        }
-
-        // Network/Gateway nodes: recreate at their saved spots.
-        for net in &saved.nets {
-            let kind = if net.gateway {
-                Kind::Gateway
-            } else {
-                Kind::Network
-            };
-            self.place(net.id, kind, saved.id, net.pos, net.size);
-        }
-
-        // Uplink nodes: restart each endpoint with its saved identity (so its
-        // ticket is unchanged) and re-dial its saved peer.
-        for ir in &saved.irohs {
-            self.create_uplink(ir.id, ir.secret_bytes(), ir.pos, ir.size, saved.id);
-            if let Some(peer) = &ir.peer {
-                self.set_node_args(ir.id, peer);
-            }
-        }
-        for v in &saved.veilids {
-            self.create_veilid_uplink(v.id, v.secret.as_deref(), v.pos, v.size, saved.id);
-            if let Some(peer) = &v.peer {
-                self.set_node_args(v.id, peer);
-            }
-        }
-
-        // Re-wire network membership (rejoins the network + grants host access;
-        // an uplink member re-trunks its network).
-        for &(app_id, net_id) in &saved.net_links {
-            if (self.app_node(app_id).is_some() || self.is_uplink(app_id)) && self.is_net(net_id) {
-                self.toggle_net(app_id, net_id);
-            }
-        }
-
-        // Apply the recorded file/MIDI wiring now that every node is placed.
-        self.sync_mounts();
-        self.sync_midi();
+        let wires: Vec<(NodeId, NodeId)> = saved
+            .connections
+            .iter()
+            .chain(&saved.midi)
+            .chain(&saved.serves)
+            .chain(&saved.net_links)
+            .copied()
+            .collect();
+        self.rewire(&wires);
     }
 
     /// Record a node's base fact: kind, workspace, and canvas geometry.
@@ -679,19 +522,9 @@ impl Server {
         self.graph.nodes.get(&id).map(|n| n.kind)
     }
 
-    /// Whether `id` is a Network or Gateway node.
-    fn is_net(&self, id: NodeId) -> bool {
-        self.kind_of(id).is_some_and(Kind::is_net)
-    }
-
     /// Whether `id` is a Gateway node (a Network that grants host access).
     fn is_gateway(&self, id: NodeId) -> bool {
         self.kind_of(id) == Some(Kind::Gateway)
-    }
-
-    /// Whether `id` is an uplink node (Iroh or Veilid).
-    fn is_uplink(&self, id: NodeId) -> bool {
-        matches!(self.kind_of(id), Some(Kind::Iroh | Kind::Veilid))
     }
 
     fn alloc_id(&mut self) -> NodeId {
@@ -1378,83 +1211,26 @@ impl Server {
     }
 
     /// Snapshot every workspace into a [`Document`] and write it back to disk.
+    /// Each node projects through [`Self::node_snap`] — the same shape undo
+    /// captures — ordered by kind then id, so saves are deterministic.
     pub fn save(&self) {
-        let node_list = self.node_reg.lock().unwrap().clone();
         let workspaces = self
             .graph
             .workspaces
             .iter()
             .map(|&ws_id| {
                 let mine = |id: &NodeId| self.graph.nodes.get(id).map(|n| n.ws) == Some(ws_id);
+                let mut ids: Vec<NodeId> = self
+                    .graph
+                    .nodes
+                    .iter()
+                    .filter(|(_, rec)| rec.ws == ws_id)
+                    .map(|(&id, _)| id)
+                    .collect();
+                ids.sort_by_key(|id| (self.graph.nodes[id].kind as u8, *id));
                 Workspace {
                     id: ws_id,
-                    nodes: node_list
-                        .iter()
-                        .filter(|n| mine(&n.id))
-                        .filter_map(|node| {
-                            Some(NodeState {
-                                name: node.name.clone(),
-                                id: node.id,
-                                pos: self.graph.nodes.get(&node.id)?.pos,
-                                size: self.graph.nodes.get(&node.id)?.size,
-                                options: node.options.lock().unwrap().clone(),
-                                args: self
-                                    .graph
-                                    .node_args
-                                    .get(&node.id)
-                                    .cloned()
-                                    .unwrap_or_default(),
-                            })
-                        })
-                        .collect(),
-                    virtual_files: self
-                        .graph
-                        .file_nodes
-                        .iter()
-                        .filter(|(id, _)| mine(id))
-                        .filter_map(|(&id, f)| match f {
-                            FileNode::Virtual(v) => Some(NodeState {
-                                name: v.name.clone(),
-                                id,
-                                pos: self.graph.nodes.get(&id)?.pos,
-                                size: self.graph.nodes.get(&id)?.size,
-                                options: Vec::new(),
-                                args: Vec::new(),
-                            }),
-                            FileNode::HostMapped(_) => None,
-                        })
-                        .collect(),
-                    host_files: self
-                        .graph
-                        .file_nodes
-                        .iter()
-                        .filter(|(id, _)| mine(id))
-                        .filter_map(|(&id, f)| match f {
-                            FileNode::HostMapped(h) => Some(NodeState {
-                                name: h.path.to_string_lossy().into_owned(),
-                                id,
-                                pos: self.graph.nodes.get(&id)?.pos,
-                                size: self.graph.nodes.get(&id)?.size,
-                                options: Vec::new(),
-                                args: Vec::new(),
-                            }),
-                            FileNode::Virtual(_) => None,
-                        })
-                        .collect(),
-                    host_ports: self
-                        .graph
-                        .host_ports
-                        .iter()
-                        .filter(|(id, _)| mine(id))
-                        .filter_map(|(&id, &port)| {
-                            Some(PortState {
-                                id,
-                                port,
-                                pos: self.graph.nodes.get(&id)?.pos,
-                                size: self.graph.nodes.get(&id)?.size,
-                            })
-                        })
-                        .collect(),
+                    nodes: ids.iter().filter_map(|&id| self.node_snap(id)).collect(),
                     connections: self
                         .graph
                         .connections
@@ -1473,20 +1249,8 @@ impl Server {
                         .graph
                         .serve_links
                         .iter()
-                        .filter(|(http, _)| mine(http))
+                        .filter(|(served, _)| mine(served))
                         .copied()
-                        .collect(),
-                    nets: self
-                        .graph
-                        .nodes
-                        .iter()
-                        .filter(|(id, rec)| rec.kind.is_net() && mine(id))
-                        .map(|(&id, rec)| NetState {
-                            id,
-                            gateway: rec.kind == Kind::Gateway,
-                            pos: rec.pos,
-                            size: rec.size,
-                        })
                         .collect(),
                     net_links: self
                         .graph
@@ -1494,46 +1258,6 @@ impl Server {
                         .iter()
                         .filter(|(a, _)| mine(a))
                         .copied()
-                        .collect(),
-                    irohs: self
-                        .graph
-                        .iroh_secrets
-                        .iter()
-                        .filter(|(id, _)| mine(id))
-                        .filter_map(|(&id, secret)| {
-                            Some(UplinkState {
-                                id,
-                                secret: Some(UplinkState::secret_hex(secret)),
-                                peer: self
-                                    .graph
-                                    .node_args
-                                    .get(&id)
-                                    .filter(|a| !a.is_empty())
-                                    .map(|a| a.join(" ")),
-                                pos: self.graph.nodes.get(&id)?.pos,
-                                size: self.graph.nodes.get(&id)?.size,
-                            })
-                        })
-                        .collect(),
-                    veilids: self
-                        .graph
-                        .veilid_ids
-                        .iter()
-                        .filter(|(id, _)| mine(id))
-                        .filter_map(|(&id, identity)| {
-                            Some(UplinkState {
-                                id,
-                                secret: Some(identity.clone()),
-                                peer: self
-                                    .graph
-                                    .node_args
-                                    .get(&id)
-                                    .filter(|a| !a.is_empty())
-                                    .map(|a| a.join(" ")),
-                                pos: self.graph.nodes.get(&id)?.pos,
-                                size: self.graph.nodes.get(&id)?.size,
-                            })
-                        })
                         .collect(),
                 }
             })
@@ -1731,44 +1455,73 @@ impl Server {
         }
     }
 
-    /// Capture everything needed to bring node `id` back after removal.
-    fn snapshot(&self, id: NodeId) -> Option<Snapshot> {
-        let &NodeRec { ws, pos, size, .. } = self.graph.nodes.get(&id)?;
-        let kind = if let Some(node) = self.app_node(id) {
-            SnapKind::App {
-                dep: node.name.clone(),
-                args: self.graph.node_args.get(&id).cloned().unwrap_or_default(),
-                options: node.options.lock().unwrap().clone(),
+    /// Project node `id` into the persisted shape ([`NodeSnap`]) — the same
+    /// projection [`Self::save`] writes to the `.wk` file.
+    fn node_snap(&self, id: NodeId) -> Option<NodeSnap> {
+        let &NodeRec {
+            ws: _,
+            pos,
+            size,
+            kind,
+        } = self.graph.nodes.get(&id)?;
+        let kind = match kind {
+            Kind::App => {
+                let node = self.app_node(id)?;
+                let options = node.options.lock().unwrap().clone();
+                SnapKind::App {
+                    name: node.name.clone(),
+                    options,
+                    args: self.graph.node_args.get(&id).cloned().unwrap_or_default(),
+                }
             }
-        } else if let Some(f) = self.graph.file_nodes.get(&id) {
-            match f {
-                FileNode::Virtual(v) => SnapKind::Virtual {
+            Kind::File => match self.graph.file_nodes.get(&id)? {
+                FileNode::Virtual(v) => SnapKind::VirtualFile {
                     name: v.name.clone(),
-                    data: v.data.lock().unwrap().clone(),
                 },
                 FileNode::HostMapped(h) => SnapKind::HostFile {
-                    name: h.name.clone(),
                     path: h.path.clone(),
                 },
-            }
-        } else if let Some(&port) = self.graph.host_ports.get(&id) {
-            SnapKind::Port { port }
-        } else if self.is_net(id) {
-            SnapKind::Net {
-                gateway: self.is_gateway(id),
-            }
-        } else if let Some(&secret) = self.graph.iroh_secrets.get(&id) {
-            SnapKind::Iroh {
-                secret,
-                peer: self.graph.node_args.get(&id).cloned().unwrap_or_default(),
-            }
-        } else if let Some(identity) = self.graph.veilid_ids.get(&id) {
-            SnapKind::Veilid {
-                identity: identity.clone(),
-                peer: self.graph.node_args.get(&id).cloned().unwrap_or_default(),
-            }
-        } else {
-            return None;
+            },
+            Kind::Port => SnapKind::Port {
+                port: *self.graph.host_ports.get(&id)?,
+            },
+            Kind::Network => SnapKind::Net { gateway: false },
+            Kind::Gateway => SnapKind::Net { gateway: true },
+            Kind::Iroh => SnapKind::Iroh {
+                secret: self.graph.iroh_secrets.get(&id).map(secret_hex),
+                peer: self.peer_ticket(id),
+            },
+            Kind::Veilid => SnapKind::Veilid {
+                secret: self.graph.veilid_ids.get(&id).cloned(),
+                peer: self.peer_ticket(id),
+            },
+        };
+        Some(NodeSnap {
+            id,
+            pos,
+            size,
+            kind,
+        })
+    }
+
+    /// An uplink node's dialed peer ticket (rides its args), if set.
+    fn peer_ticket(&self, id: NodeId) -> Option<String> {
+        self.graph
+            .node_args
+            .get(&id)
+            .filter(|a| !a.is_empty())
+            .map(|a| a.join(" "))
+    }
+
+    /// Capture everything needed to bring node `id` back after removal.
+    fn snapshot(&self, id: NodeId) -> Option<Snapshot> {
+        let ws = self.graph.nodes.get(&id)?.ws;
+        let node = self.node_snap(id)?;
+        // A VirtualFile's bytes are runtime-only state: carried for undo,
+        // never persisted.
+        let file_data = match self.graph.file_nodes.get(&id) {
+            Some(FileNode::Virtual(v)) => v.data.lock().unwrap().clone(),
+            _ => Vec::new(),
         };
         let mut wires: Vec<(NodeId, NodeId)> = Vec::new();
         wires.extend(
@@ -1797,74 +1550,98 @@ impl Server {
                 .filter(|&&(a, n)| a == id || n == id),
         );
         Some(Snapshot {
-            id,
             ws,
-            pos,
-            size,
-            kind,
+            node,
+            file_data,
             wires,
         })
     }
 
     /// Bring a removed node back with the same id, then re-establish its wiring.
     fn recreate(&mut self, s: Snapshot) {
-        self.recreate_node(&s);
+        self.materialize(s.ws, &s.node, &s.file_data);
         self.rewire(&s.wires);
     }
 
-    /// Bring a removed node back with the same id (no wiring yet).
-    fn recreate_node(&mut self, s: &Snapshot) {
+    /// Materialize a node from its persisted shape into workspace `ws` — the
+    /// single creation path shared by load-time restore and undo. `file_data`
+    /// seeds a VirtualFile's bytes (undo has them; the `.wk` file doesn't).
+    fn materialize(&mut self, ws: NodeId, s: &NodeSnap, file_data: &[u8]) {
         match &s.kind {
-            SnapKind::App { dep, args, options } => {
-                let Some(d) = self
+            SnapKind::App {
+                name,
+                options,
+                args,
+            } => {
+                let Some(dep) = self
                     .graph
                     .available
                     .iter()
-                    .find(|x| &x.name == dep)
+                    .find(|d| &d.name == name)
                     .cloned()
                 else {
+                    eprintln!("workspace references unknown dependency {name:?}; skipping");
                     return;
                 };
-                if self
-                    .host
-                    .spawn(
-                        &d.local_path(),
-                        &d.name,
-                        s.id,
-                        args,
-                        self.registry.clone(),
-                        self.node_reg.clone(),
-                        options.clone(),
-                    )
-                    .is_err()
-                {
+                // The node's saved (possibly-edited) args, else the dependency
+                // default (the file format doesn't distinguish "no args saved"
+                // from "explicitly none").
+                let args = if args.is_empty() {
+                    dep.args.clone()
+                } else {
+                    args.clone()
+                };
+                if let Err(e) = self.host.spawn(
+                    &dep.local_path(),
+                    &dep.name,
+                    s.id,
+                    &args,
+                    self.registry.clone(),
+                    self.node_reg.clone(),
+                    options.clone(),
+                ) {
+                    eprintln!("failed to restore {}: {e:#}", dep.name);
                     return;
                 }
-                self.place(s.id, Kind::App, s.ws, s.pos, s.size);
-                self.graph.node_args.insert(s.id, args.clone());
+                self.place(s.id, Kind::App, ws, s.pos, s.size);
+                self.graph.node_args.insert(s.id, args);
             }
-            SnapKind::Virtual { name, data } => {
-                self.place(s.id, Kind::File, s.ws, s.pos, s.size);
+            SnapKind::VirtualFile { name } => {
+                if let Some(num) = name
+                    .strip_prefix("file")
+                    .and_then(|s| s.parse::<u32>().ok())
+                {
+                    self.file_seq = self.file_seq.max(num);
+                }
+                self.place(s.id, Kind::File, ws, s.pos, s.size);
                 self.graph.file_nodes.insert(
                     s.id,
                     FileNode::Virtual(VirtualFile {
                         name: name.clone(),
-                        data: Arc::new(Mutex::new(data.clone())),
+                        data: Arc::new(Mutex::new(file_data.to_vec())),
                     }),
                 );
             }
-            SnapKind::HostFile { name, path } => {
-                self.place(s.id, Kind::File, s.ws, s.pos, s.size);
+            SnapKind::HostFile { path } => {
+                let name = host_file_name(path);
+                if let Some(num) = name
+                    .strip_prefix("host")
+                    .and_then(|s| s.parse::<u32>().ok())
+                {
+                    self.host_seq = self.host_seq.max(num);
+                }
+                self.place(s.id, Kind::File, ws, s.pos, s.size);
                 self.graph.file_nodes.insert(
                     s.id,
                     FileNode::HostMapped(HostMappedFile {
-                        name: name.clone(),
+                        name,
                         path: path.clone(),
                     }),
                 );
             }
             SnapKind::Port { port } => {
-                self.place(s.id, Kind::Port, s.ws, s.pos, s.size);
+                self.next_port = self.next_port.max(port.saturating_add(1));
+                self.place(s.id, Kind::Port, ws, s.pos, s.size);
                 self.graph.host_ports.insert(s.id, *port);
             }
             SnapKind::Net { gateway } => {
@@ -1873,18 +1650,19 @@ impl Server {
                 } else {
                     Kind::Network
                 };
-                self.place(s.id, kind, s.ws, s.pos, s.size);
+                self.place(s.id, kind, ws, s.pos, s.size);
             }
             SnapKind::Iroh { secret, peer } => {
-                self.create_uplink(s.id, Some(*secret), s.pos, s.size, s.ws);
-                if !peer.is_empty() {
-                    self.set_node_args(s.id, &peer.join(" "));
+                let secret = secret.as_deref().and_then(secret_bytes);
+                self.create_uplink(s.id, secret, s.pos, s.size, ws);
+                if let Some(peer) = peer {
+                    self.set_node_args(s.id, peer);
                 }
             }
-            SnapKind::Veilid { identity, peer } => {
-                self.create_veilid_uplink(s.id, Some(identity), s.pos, s.size, s.ws);
-                if !peer.is_empty() {
-                    self.set_node_args(s.id, &peer.join(" "));
+            SnapKind::Veilid { secret, peer } => {
+                self.create_veilid_uplink(s.id, secret.as_deref(), s.pos, s.size, ws);
+                if let Some(peer) = peer {
+                    self.set_node_args(s.id, peer);
                 }
             }
         }
@@ -1933,7 +1711,7 @@ impl Server {
             self.graph.workspaces.insert(i, s.id);
         }
         for node in &s.nodes {
-            self.recreate_node(node);
+            self.materialize(node.ws, &node.node, &node.file_data);
         }
         for node in &s.nodes {
             self.rewire(&node.wires);
