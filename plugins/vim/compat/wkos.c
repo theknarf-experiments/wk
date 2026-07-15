@@ -1,46 +1,15 @@
-/* WASI shims for the Unix process/tty facilities Vim references but WASI lacks.
+/* WASI stubs for the Unix process facilities Vim references but WASI lacks.
  *
- * The terminal bridge (tcgetattr/tcsetattr) is real: tcsetattr emits wk's
- * private raw-mode toggle so wk's terminal switches modes, exactly like the
- * kilo port. Everything else — fork/exec/waitpid/pipe/select — is a stub that
- * fails cleanly: Vim compiles its job/shell-out paths unconditionally but they
- * are never reachable in wk (there are no subprocesses), so these only need to
- * satisfy the linker and return an error. No Vim source is modified. */
+ * The terminal itself (tcgetattr/tcsetattr/ioctl) is handled by the shared
+ * ../tty-compat shim over wk's wk:tty/control capability — not here. What
+ * remains is the process/job machinery: fork/exec/waitpid/pipe/select. Vim
+ * compiles those paths unconditionally but they are never reachable in wk
+ * (there are no subprocesses), so these only need to satisfy the linker and
+ * return an error. No Vim source is modified. */
 
 #include <errno.h>
 #include <sys/types.h>
-#include <termios.h>
 #include <unistd.h>
-
-/* ---- terminal: the one real bridge ---- */
-
-int tcgetattr(int fd, struct termios *t) {
-    (void)fd;
-    if (!t)
-        return -1;
-    t->c_iflag = BRKINT | ICRNL | INPCK | ISTRIP | IXON;
-    t->c_oflag = OPOST | ONLCR;
-    t->c_cflag = CS8;
-    t->c_lflag = ECHO | ECHOE | ICANON | IEXTEN | ISIG; /* cooked */
-    for (int i = 0; i < NCCS; i++)
-        t->c_cc[i] = 0;
-    t->c_cc[VMIN] = 1;
-    return 0;
-}
-
-int tcsetattr(int fd, int actions, const struct termios *t) {
-    (void)fd;
-    (void)actions;
-    if (!t)
-        return -1;
-    /* Raw when both canonical mode and echo are off — wk's terminal switches
-     * on this private escape (intercepted, never shown). */
-    if (!(t->c_lflag & (ICANON | ECHO)))
-        (void)write(STDOUT_FILENO, "\x1b[?7777h", 8);
-    else
-        (void)write(STDOUT_FILENO, "\x1b[?7777l", 8);
-    return 0;
-}
 
 /* ---- process control: no subprocesses under WASI ---- */
 

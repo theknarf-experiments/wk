@@ -273,6 +273,9 @@ pub struct HostState {
     /// MIDI it sends.
     pub(crate) node_id: NodeId,
     pub(crate) fs: crate::vfs::SharedFs,
+    /// This node's terminal stdio; backs `wk:tty/control` so the guest's
+    /// `termios` shim can set the line-discipline mode the client reads.
+    pub(crate) term_io: crate::terminal::SharedTermIo,
     pub(crate) midi_in: crate::midi::SharedInbox,
     pub(crate) midi_router: crate::midi::Router,
     pub(crate) options: crate::options::SharedOptions,
@@ -852,6 +855,7 @@ impl PluginHost {
         crate::audio::add_to_linker(&mut linker)?;
         crate::midi::add_to_linker(&mut linker)?;
         crate::options::add_to_linker(&mut linker)?;
+        crate::tty::add_to_linker(&mut linker)?;
         wasi::surface::surface::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
         wasi::graphics_context::graphics_context::add_to_linker::<_, HasSelf<_>>(
             &mut linker,
@@ -909,6 +913,9 @@ impl PluginHost {
             registry: Arc::new(Mutex::new(Vec::new())),
             node_id: NodeId::nil(),
             fs: fs.clone(),
+            // An http handler isn't a terminal; a throwaway TermIo satisfies the
+            // `wk:tty/control` impl without affecting anything.
+            term_io: term_io.clone().unwrap_or_else(crate::terminal::TermIo::new),
             midi_in: midi_in.clone(),
             midi_router: midi.clone(),
             options: crate::options::new_options(Vec::new()),
@@ -1128,6 +1135,7 @@ impl PluginHost {
             registry: run.surfaces.clone(),
             node_id: node.id,
             fs: node.fs.clone(),
+            term_io: node.term_io.clone(),
             midi_in: node.midi_in.clone(),
             midi_router: self.midi.clone(),
             options: node.options.clone(),

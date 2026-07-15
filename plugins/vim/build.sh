@@ -4,14 +4,15 @@
 # setjmp/exnref exception-handling flags), with a hand-generated config for
 # cross-compiling (Vim's autoconf can't run wasm test programs).
 #
-# Non-stock pieces are all in compat/ (kilo principle — supply via the runtime,
-# don't patch the app): a <termios.h>/<sys/ioctl.h> that bridge raw mode to wk's
-# terminal, a no-op termcap library (headless terminal → Vim's builtin termcaps),
-# and stubs for the process/tty syscalls WASI lacks (fork/exec/select/...).
+# Non-stock pieces are supplied via the runtime, not by patching Vim: the shared
+# ../tty-compat termios shim (maps termios onto wk's wk:tty/control capability —
+# raw mode, window size), a no-op termcap library (headless terminal → Vim's
+# builtin termcaps), and stubs for the process syscalls WASI lacks (fork/exec/
+# select/...) in compat/wkos.c.
 #
-# Requires wasi-sdk (WASI_SDK, default ~/wasi-sdk) and wasm-tools. Vim source is
-# fetched (and cached) under vim-src/ on first run; auto/config.h etc. are
-# generated once by configure (also cached).
+# Requires wasi-sdk (WASI_SDK, default ~/wasi-sdk), wasm-tools, and wit-bindgen.
+# Vim source is fetched (and cached) under vim-src/ on first run; auto/config.h
+# etc. are generated once by configure (also cached).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -19,6 +20,10 @@ WASI_SDK="${WASI_SDK:-$HOME/wasi-sdk}"
 VIM_VER=9.1.0000
 SRC=vim-src/src
 COMPAT="$(pwd)/compat"
+# Shared terminal shim: a portable <termios.h>/<sys/ioctl.h> plus wit-bindgen'd
+# bindings to wk:tty/control (regenerated into tty-compat/gen).
+TTYCOMPAT="$(pwd)/../tty-compat"
+TTYGEN="$TTYCOMPAT/gen"
 
 # WASIp1→component adapter, pinned to our wasmtime (46). Prefer an explicit
 # override or a copy already in the cargo registry; otherwise fetch the release
@@ -47,11 +52,16 @@ if [ ! -d vim-src ]; then
     rm -f vim.tar.gz
 fi
 
+# Generate the wk:tty/control C bindings the shared termios shim calls.
+mkdir -p "$TTYGEN"
+wit-bindgen c --world terminal "$TTYCOMPAT/wit/tty.wit" --out-dir "$TTYGEN"
+
 # Exception-handling flags (setjmp → exnref) + the WASI emulated features Vim's
-# libc calls need. -Icompat first so our <termios.h>/<sys/ioctl.h> win.
+# libc calls need. -I the shared tty shim (and its generated bindings) first so
+# its <termios.h>/<sys/ioctl.h> win over anything in the sysroot or compat/.
 EH="-mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false"
 DEFS="-DHAVE_CONFIG_H -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_GETPID"
-CFLAGS="--target=wasm32-wasip1 -O2 $EH $DEFS -Wno-deprecated-declarations -Wno-implicit-function-declaration -I$COMPAT -I$SRC -I$SRC/proto"
+CFLAGS="--target=wasm32-wasip1 -O2 $EH $DEFS -Wno-deprecated-declarations -Wno-implicit-function-declaration -I$TTYCOMPAT -I$TTYGEN -I$COMPAT -I$SRC -I$SRC/proto"
 
 # --- one-time config generation (cross-compile: preset the AC_TRY_RUN caches) ---
 if [ ! -f "$SRC/auto/config.h" ]; then
@@ -134,8 +144,11 @@ for f in $FILES; do
 done
 
 # --- link + componentize ---
-env PATH="$CLANG_PATH" "$CLANG" --target=wasm32-wasip1 $EH -I"$COMPAT" \
+# The shared termios shim (termios.c) + its wk:tty/control bindings (terminal.c),
+# and terminal_component_type.o so `component new` lifts the wk:tty import.
+env PATH="$CLANG_PATH" "$CLANG" --target=wasm32-wasip1 $EH -I"$TTYCOMPAT" -I"$TTYGEN" -I"$COMPAT" \
     $OBJS "$COMPAT/wkos.c" "$COMPAT/libwktcap.a" \
+    "$TTYCOMPAT/termios.c" "$TTYGEN/terminal.c" "$TTYGEN/terminal_component_type.o" \
     -lsetjmp -lwasi-emulated-signal -lwasi-emulated-process-clocks \
     -lwasi-emulated-mman -lwasi-emulated-getpid \
     -o vim.core.wasm

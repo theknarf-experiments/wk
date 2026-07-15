@@ -42,11 +42,33 @@ struct InpState {
     closed: bool,
 }
 
+/// The terminal's line-discipline mode, mirroring the termios flags that matter:
+/// `canonical` (ICANON) = cooked, line-buffered/edited input delivered on Enter;
+/// `echo` (ECHO) = echo typed characters. A guest sets this through the
+/// `wk:tty/control` interface (host side in `crate::tty`); the client reads it to
+/// decide whether to run the cooked line discipline. A fresh terminal is cooked.
+#[derive(Clone, Copy)]
+pub struct TtyMode {
+    pub echo: bool,
+    pub canonical: bool,
+}
+
+impl Default for TtyMode {
+    fn default() -> Self {
+        TtyMode {
+            echo: true,
+            canonical: true,
+        }
+    }
+}
+
 /// The guest's stdio, shared between its thread and the client. `out` is
-/// stdout/stderr (guest → client), `inp` is stdin (client → guest).
+/// stdout/stderr (guest → client), `inp` is stdin (client → guest), `tty` is the
+/// line-discipline mode the guest requests via `wk:tty/control`.
 pub struct TermIo {
     out: Mutex<VecDeque<u8>>,
     inp: Mutex<InpState>,
+    tty: Mutex<TtyMode>,
 }
 
 pub type SharedTermIo = Arc<TermIo>;
@@ -60,7 +82,25 @@ impl TermIo {
                 waker: None,
                 closed: false,
             }),
+            tty: Mutex::new(TtyMode::default()),
         })
+    }
+
+    /// Set the line-discipline mode (called by the `wk:tty/control` host impl
+    /// when the guest runs `tcsetattr`).
+    pub fn set_tty(&self, echo: bool, canonical: bool) {
+        *self.tty.lock().unwrap() = TtyMode { echo, canonical };
+    }
+
+    /// The current line-discipline mode.
+    pub fn tty(&self) -> TtyMode {
+        *self.tty.lock().unwrap()
+    }
+
+    /// Whether the terminal is in raw mode (non-canonical) — the guest gets
+    /// keystrokes verbatim and draws its own screen.
+    pub fn is_raw(&self) -> bool {
+        !self.tty.lock().unwrap().canonical
     }
 
     fn write_out(&self, b: &[u8]) {
@@ -231,26 +271,25 @@ pub struct Terminal {
     parser: Processor,
     /// The line being edited, in cooked mode (delivered to the guest on Enter).
     line: Vec<u8>,
-    /// Raw mode: the guest gets keystrokes verbatim with no echo or line editing
-    /// (what a full-screen TUI like an editor needs). Toggled by the guest via a
-    /// private escape (see `feed`).
-    raw: bool,
+    /// The guest's stdio, so the terminal can read the line-discipline mode the
+    /// guest set through `wk:tty/control` (raw/echo/canonical).
+    io: SharedTermIo,
 }
 
 impl Terminal {
     pub fn new(io: SharedTermIo) -> Self {
-        let term = Term::new(Config::default(), &GridSize, EventProxy(io));
+        let term = Term::new(Config::default(), &GridSize, EventProxy(io.clone()));
         Terminal {
             term,
             parser: Processor::new(),
             line: Vec::new(),
-            raw: false,
+            io,
         }
     }
 
     /// Whether the guest has put the terminal in raw mode.
     pub fn is_raw(&self) -> bool {
-        self.raw
+        self.io.is_raw()
     }
 
     /// Feed keyboard bytes through a cooked-mode line discipline (the default a
@@ -260,6 +299,9 @@ impl Terminal {
     /// end-of-input. Escape sequences (arrow keys etc.) are swallowed. (A future
     /// raw-mode/termios path would bypass this and forward bytes verbatim.)
     pub fn key_input(&mut self, bytes: &[u8], io: &SharedTermIo) {
+        // Honor termios ECHO: on for a normal prompt, off for e.g. a password
+        // entry (canonical but no echo). Line editing still works either way.
+        let echo = io.tty().echo;
         let mut i = 0;
         while i < bytes.len() {
             let b = bytes[i];
@@ -273,7 +315,9 @@ impl Terminal {
                 }
                 0x7f | 0x08 if !self.line.is_empty() => {
                     self.line.pop();
-                    self.feed(b"\x08 \x08");
+                    if echo {
+                        self.feed(b"\x08 \x08");
+                    }
                 }
                 0x03 => {
                     self.line.clear();
@@ -291,7 +335,9 @@ impl Terminal {
                 }
                 0x20..=0x7e => {
                     self.line.push(b);
-                    self.feed(&[b]);
+                    if echo {
+                        self.feed(&[b]);
+                    }
                 }
                 _ => {}
             }
@@ -300,29 +346,20 @@ impl Terminal {
 
     /// Feed guest stdout bytes through the VT parser, updating the grid.
     pub fn feed(&mut self, bytes: &[u8]) {
-        // Intercept wk's private raw-mode toggle and strip it from what the VT
-        // parser sees. This is wk's stand-in for `termios` raw mode until WASI
-        // gains a tty interface: `ESC[?7777h` enters raw, `ESC[?7777l` leaves it.
-        // Outside raw mode, do ONLCR (a bare LF also returns the carriage) so
-        // naive `println!` guests don't stair-step; raw TUIs emit their own CRLF.
-        const RAW_ON: &[u8] = b"\x1b[?7777h";
-        const RAW_OFF: &[u8] = b"\x1b[?7777l";
+        // Raw vs cooked comes from the guest via `wk:tty/control` (read off the
+        // shared `TermIo`), not from sniffing the byte stream. In cooked mode do
+        // ONLCR — a bare LF also returns the carriage — so naive `println!`
+        // guests don't stair-step; a raw TUI emits its own CRLF.
+        if self.io.is_raw() {
+            self.parser.advance(&mut self.term, bytes);
+            return;
+        }
         let mut buf = Vec::with_capacity(bytes.len());
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i..].starts_with(RAW_ON) {
-                self.raw = true;
-                i += RAW_ON.len();
-            } else if bytes[i..].starts_with(RAW_OFF) {
-                self.raw = false;
-                i += RAW_OFF.len();
-            } else {
-                if !self.raw && bytes[i] == b'\n' {
-                    buf.push(b'\r');
-                }
-                buf.push(bytes[i]);
-                i += 1;
+        for &b in bytes {
+            if b == b'\n' {
+                buf.push(b'\r');
             }
+            buf.push(b);
         }
         self.parser.advance(&mut self.term, &buf);
     }
@@ -505,19 +542,31 @@ mod tests {
     }
 
     #[test]
-    fn raw_mode_toggle_is_intercepted() {
-        let mut term = Terminal::new(TermIo::new());
+    fn raw_mode_follows_the_shared_tty_state() {
+        // Raw mode is driven by the guest through wk:tty/control (shared TermIo),
+        // not by a byte-stream escape. A fresh terminal is cooked.
+        let io = TermIo::new();
+        let mut term = Terminal::new(io.clone());
         assert!(!term.is_raw());
-        term.feed(b"\x1b[?7777hX"); // enter raw, then print X
-        assert!(term.is_raw());
+
+        // Cooked: a bare LF gets a carriage return (ONLCR), so text doesn't
+        // stair-step.
+        term.feed(b"a\nb");
         let cells = term.cells();
-        assert!(cells.iter().any(|c| c.ch == 'X'));
-        assert!(
-            !cells.iter().any(|c| c.ch == '7'),
-            "toggle stripped, not drawn"
-        );
-        term.feed(b"\x1b[?7777l");
-        assert!(!term.is_raw());
+        assert!(cells
+            .iter()
+            .any(|c| c.ch == 'b' && c.col == 0 && c.row == 1));
+
+        // Guest goes raw (canonical off): the terminal reports it, and ONLCR
+        // stops (the app is responsible for its own CRLF).
+        io.set_tty(false, false);
+        assert!(term.is_raw());
+        let mut term = Terminal::new(io.clone());
+        term.feed(b"a\nb");
+        let cells = term.cells();
+        assert!(cells
+            .iter()
+            .any(|c| c.ch == 'b' && c.col == 1 && c.row == 1));
     }
 
     #[test]

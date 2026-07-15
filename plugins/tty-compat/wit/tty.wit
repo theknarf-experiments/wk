@@ -1,0 +1,25 @@
+// Guest-side view of wk's terminal-control capability. The `control` interface
+// here MUST match crates/wk-server/wit-tty/world.wit exactly (same package,
+// record, and functions) — the host implements it, this shim imports it.
+//
+// This is wk's stand-in for the not-yet-standardized WASI terminal raw-mode
+// controls (WASI issue #161); a portable termios shim (termios.c) maps
+// tcgetattr/tcsetattr onto it, so an unmodified terminal app needs no
+// host-specific code.
+package wk:tty;
+
+interface control {
+    record state {
+        cols: u32,
+        rows: u32,
+        echo: bool,
+        canonical: bool,
+    }
+    get: func() -> state;
+    set: func(echo: bool, canonical: bool);
+}
+
+/// The guest imports the control capability; wk provides it.
+world terminal {
+    import control;
+}

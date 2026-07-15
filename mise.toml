@@ -7,6 +7,7 @@ cargo.binstall = true
 # Plugin build toolchain, shared by every plugin's `build` task (mise config
 # inherits down the tree). Pinned for reproducibility.
 "cargo:cargo-component" = "0.21.1"       # Rust plugins → wasm components
+"cargo:wit-bindgen-cli" = "0.46.0"       # C bindings for wk's custom host interfaces
 "wasm-tools" = "1.252.0"                  # componentization for C plugins
 "github:WebAssembly/wasi-sdk" = "wasi-sdk-33"  # clang + wasi-sysroot for C plugins
 

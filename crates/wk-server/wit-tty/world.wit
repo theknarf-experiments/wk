@@ -1,0 +1,40 @@
+package wk:tty;
+
+/// Terminal line-discipline control — wk's stand-in for the terminal raw-mode
+/// interface WASI has not yet standardized (the `wasi:cli` terminal resources
+/// carry only a "in the future, this may include functions for disabling
+/// echoing" placeholder; see WASI issue #161). Modeled on POSIX `termios` and
+/// WASIX's tty: a small state a terminal guest reads and writes to choose how
+/// its stdin/stdout are processed.
+///
+/// A plain CLI/REPL leaves the terminal canonical (cooked): input is line
+/// buffered and edited by the host, echoed as typed, delivered on Enter. A
+/// full-screen app (an editor) goes raw — canonical and echo off — so every
+/// keystroke arrives immediately and the app draws its own screen. The host
+/// owns the window size; guests read it here instead of relying on env vars.
+///
+/// This is the capability a portable `termios` shim maps `tcgetattr`/
+/// `tcsetattr` onto, so an unmodified terminal app needs no host-specific code
+/// — only a generic shim, until WASI standardizes this and the shim retargets
+/// the ratified interface.
+interface control {
+    /// The terminal's current window size and line-discipline mode.
+    record state {
+        cols: u32,
+        rows: u32,
+        echo: bool,
+        canonical: bool,
+    }
+
+    /// Read the current window size and line-discipline mode.
+    get: func() -> state;
+
+    /// Set the line discipline. `echo` mirrors termios `ECHO`; `canonical`
+    /// mirrors `ICANON`. The window size is host-owned and unaffected.
+    set: func(echo: bool, canonical: bool);
+}
+
+/// The host side: wk implements (imports) the tty control interface for guests.
+world tty-host {
+    import control;
+}
