@@ -56,8 +56,10 @@ CFLAGS="--target=wasm32-wasip1 -O2 $EH $DEFS -Wno-deprecated-declarations -Wno-i
 # --- one-time config generation (cross-compile: preset the AC_TRY_RUN caches) ---
 if [ ! -f "$SRC/auto/config.h" ]; then
     echo "configuring Vim for wasm32-wasi..."
-    # A no-op termcap lib so configure's tgetent check passes; Vim then uses its
-    # builtin termcaps at runtime.
+    # A minimal termcap lib so configure's tgetent check passes; at runtime
+    # tgetent reports "no database" (Vim uses its builtin termcaps) and tgoto
+    # formats their parameter codes. (Rebuilt below too, in case only the stub
+    # changed while auto/config.h is already cached.)
     "$CLANG" --target=wasm32-wasip1 -O2 -c "$COMPAT/tcap_stub.c" -o "$COMPAT/tcap_stub.o"
     "$WASI_SDK/bin/llvm-ar" rcs "$COMPAT/libwktcap.a" "$COMPAT/tcap_stub.o"
     (
@@ -77,13 +79,31 @@ if [ ! -f "$SRC/auto/config.h" ]; then
             --disable-nls --disable-selinux --disable-smack --disable-acl \
             --disable-canberra --disable-libsodium >/dev/null
         # Fix wasi-wrong config the AC_TRY_RUN/link probes guessed for the host.
+        # HAVE_TGETENT stays on (Vim's Unix build assumes it — e.g. os_unix.c
+        # calls the HAVE_TGETENT-only term_set_winsize unconditionally); the
+        # builtin termcaps drive everything, formatted through tcap_stub's tgoto.
         sed -i.bak \
             -e 's|#define HAVE_DLOPEN 1|/* #undef HAVE_DLOPEN */|' \
             -e 's|/\* #undef HAVE_SETJMP_H \*/|#define HAVE_SETJMP_H 1|' \
             -e 's|/\* #undef HAVE_TERMIOS_H \*/|#define HAVE_TERMIOS_H 1|' \
             auto/config.h
-        # osdef.h (prototype extraction) needs the EH flag so <setjmp.h> parses.
-        CC="$CLANG --target=wasm32-wasip1 $EH $DEFS -I$COMPAT" srcdir=. sh osdef.sh
+        # osdef.h: hand-written, not osdef.sh-generated. osdef.sh probes by
+        # compiling AND running a program to see which prototypes the system
+        # headers already provide; under a wasm cross-compile it can't run, so it
+        # emits its entire K&R fallback list, which clashes with wasi-libc. Since
+        # wasi-libc declares every standard function Vim needs, the only extra
+        # prototypes required are the termcap ones (tcap_stub.c provides them).
+        cat > auto/osdef.h <<'OSDEF'
+/* Hand-written for the wasm32-wasi cross build; see build.sh. wasi-libc
+ * declares every standard function Vim uses, so only the termcap prototypes
+ * (satisfied by compat/tcap_stub.c) need supplying here. */
+extern int	tgetent(char *, char *);
+extern int	tgetnum(char *);
+extern int	tgetflag(char *);
+extern char	*tgetstr(char *, char **);
+extern char	*tgoto(char *, int, int);
+extern int	tputs(char *, int, int (*)(int));
+OSDEF
     )
     # pathdef.c: compiled-in paths (normally Makefile-generated).
     cat > "$SRC/auto/pathdef.c" <<'PATHDEF'
@@ -96,6 +116,11 @@ char_u *compiled_user = (char_u *)"wk";
 char_u *compiled_sys = (char_u *)"wk";
 PATHDEF
 fi
+
+# Rebuild the termcap lib every run so edits to tcap_stub.c take effect even
+# when auto/config.h (and thus the one-time block above) is already cached.
+"$CLANG" --target=wasm32-wasip1 -O2 -c "$COMPAT/tcap_stub.c" -o "$COMPAT/tcap_stub.o"
+"$WASI_SDK/bin/llvm-ar" rcs "$COMPAT/libwktcap.a" "$COMPAT/tcap_stub.o"
 
 # --- compile every core source ---
 FILES=$(awk '/^BASIC_SRC = /{f=1} f{print} /^$/{if(f)exit}' "$SRC/Makefile" | grep -oE "[a-z_0-9]+\.c")

@@ -163,4 +163,7 @@ mode_t umask(mode_t mask) {
     return 0;
 }
 
-void sync(void) {}
+/* No header declares sync() here, so its callers assume the K&R `int sync()`;
+ * match that so the wasm call signatures agree (a void return would make
+ * wasm-ld insert a trapping trampoline). Nothing to flush under WASI. */
+int sync(void) { return 0; }
