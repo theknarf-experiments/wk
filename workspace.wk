@@ -3,6 +3,9 @@ dependencies {
     triangle "plugins/triangle/target/wasm32-wasip1/debug/triangle.wasm" {
         description "spinning webgpu triangle"
     }
+    shader "plugins/shader/target/wasm32-wasip1/debug/shader.wasm" {
+        description "live WGSL shader; wire a file in to live-code it, MIDI in to react"
+    }
     paint "plugins/paint/target/wasm32-wasip1/debug/paint.wasm" {
         description "self-driving animated gradient canvas"
     }
@@ -57,8 +60,8 @@ dependencies {
 }
 workspace "0000000000000000000000000A" {
     node "piano" "01KXKBVCH9ER99001419XXW2HC" {
-        pos 598.2177124023438 796.9777221679688
-        size 360.0 260.0
+        pos 544.1168823242188 800.279052734375
+        size 397.3065185546875 271.95550537109375
     }
     node "synth" "01KXKBW2N8EWH9HA37THM8YPK6" {
         pos 1562.47900390625 811.9581298828125
@@ -86,15 +89,23 @@ workspace "0000000000000000000000000A" {
     node "arp" "01KXKC6BZ8E7S8JCDCDH34D4RW" {
         pos 1072.0032958984375 842.7313842773438
         size 360.0 260.0
-        options 8.0 0.6000000238418579 0.0 1.0
+        options 1.8509018421173096 0.6000000238418579 0.0 1.0
     }
     node "vim" "01KXKEMAWGF3HRQ1Z4AKF26YE2" {
         pos 282.8747863769531 128.94216918945313
-        size 466.6814270019531 307.1646728515625
+        size 433.9378967285156 317.3260192871094
         args "-u" "NONE"
     }
     virtualfile "file1" "01KXKBYQ1NEG1A7FJZEBTD4QPK" {
         pos 1146.753662109375 239.01611328125
+        size 130.0 44.0
+    }
+    node "shader" "01KXKF6000000000000000SHDR" {
+        pos 770.0 128.0
+        size 400.0 360.0
+    }
+    virtualfile "shader.wgsl" "01KXKF7000000000000000WGSF" {
+        pos 540.0 470.0
         size 130.0 44.0
     }
     hostport "01KXKC18KWFZ9T25M90T6G83E9" {
@@ -105,7 +116,10 @@ workspace "0000000000000000000000000A" {
     connection "01KXKBYQ1NEG1A7FJZEBTD4QPK" "01KXKBY0K3E4SAS9HHGKSQ8BJV"
     connection "01KXKBYQ1NEG1A7FJZEBTD4QPK" "01KXKBY91QFZGBP9W6MDTHANCX"
     connection "01KXKBYQ1NEG1A7FJZEBTD4QPK" "01KXKEMAWGF3HRQ1Z4AKF26YE2"
+    connection "01KXKF7000000000000000WGSF" "01KXKF6000000000000000SHDR"
+    connection "01KXKF7000000000000000WGSF" "01KXKEMAWGF3HRQ1Z4AKF26YE2"
     midi "01KXKBVCH9ER99001419XXW2HC" "01KXKC6BZ8E7S8JCDCDH34D4RW"
     midi "01KXKC6BZ8E7S8JCDCDH34D4RW" "01KXKBW2N8EWH9HA37THM8YPK6"
+    midi "01KXKBVCH9ER99001419XXW2HC" "01KXKF6000000000000000SHDR"
     serve "01KXKBZDAJFBGBA4TEKX7G31Q8" "01KXKC18KWFZ9T25M90T6G83E9"
 }

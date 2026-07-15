@@ -1,0 +1,18 @@
+package wk:shader;
+
+/// A live shader viewer. It renders a WGSL fragment shader read from a virtual
+/// file mounted into it (wire the same file node into an editor to live-code the
+/// shader), re-reading and recompiling it on change. A bound uniform exposes the
+/// time, the resolution, and 128 MIDI values, so the shader can react to a MIDI
+/// controller wired to it. Renders with wasi:webgpu into an offscreen texture,
+/// reads the pixels back, and delivers them through wasi:frame-buffer for the
+/// host to composite (same path as the triangle example).
+world shader {
+    import wasi:webgpu/webgpu@0.0.1;
+    import wasi:surface/surface@0.0.1;
+    import wasi:graphics-context/graphics-context@0.0.1;
+    import wasi:frame-buffer/frame-buffer@0.0.1;
+    import wk:midi/midi;
+
+    export run: func();
+}
