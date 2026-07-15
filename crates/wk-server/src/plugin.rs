@@ -740,7 +740,9 @@ impl PluginHost {
     /// Serve a `wasi:http/incoming-handler` component on `127.0.0.1:port`,
     /// dispatching each request to a fresh isolated store. `term_io` receives the
     /// guest's stdout/stderr (the HostPort/node case); `None` inherits stdio (the
-    /// throwaway CLI case). Blocks until `kill` is set.
+    /// throwaway CLI case). Binds the port synchronously (so a bind failure is
+    /// reported to the caller, not swallowed on a background thread); the server
+    /// then runs until `kill` is set.
     pub fn serve(
         &self,
         path: &Path,
@@ -748,6 +750,12 @@ impl PluginHost {
         term_io: Option<crate::terminal::SharedTermIo>,
         kill: Arc<AtomicBool>,
     ) -> Result<()> {
+        // Bind before spawning so a port conflict is an error here — otherwise
+        // `start_serve` would record a server that never actually bound and
+        // never retry it.
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let listener = std::net::TcpListener::bind(addr)
+            .map_err(|e| wasmtime::Error::msg(format!("bind {addr}: {e}")))?;
         let component = Component::from_file(&self.engine, path)?;
         let linker = self.build_linker()?;
         let pre =
@@ -786,7 +794,7 @@ impl PluginHost {
         };
         let engine = self.engine.clone();
         std::thread::spawn(move || {
-            if let Err(e) = crate::http::serve(engine, pre, make_state, port, kill) {
+            if let Err(e) = crate::http::serve(engine, pre, make_state, listener, kill) {
                 eprintln!("http server error: {e:#}");
             }
         });
@@ -922,6 +930,21 @@ impl PluginHost {
         };
         // Publish; the server now sees a ready node.
         let _ = node.setup.set(setup);
+
+        // If the node was deleted while it was compiling, `close_node` set its
+        // kill flag but couldn't detach a fabric stack that didn't exist yet
+        // (setup was unpublished). Honor the deletion now that setup is public:
+        // detach the stack we just attached and never start the guest —
+        // otherwise it would run unkillable, its id already gone from every
+        // table. `detach` is idempotent, so a concurrent `close_node` racing us
+        // here is harmless.
+        if node.kill.load(Ordering::Relaxed) {
+            if let Some(stack) = node.net_stack() {
+                self.hub.detach(&stack);
+            }
+            node.finished.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
 
         // Networked nodes wait to be wired + Run; http nodes wait to be served.
         // Everything else runs now (its component is already compiled).

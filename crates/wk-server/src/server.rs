@@ -283,6 +283,17 @@ impl View {
     }
 }
 
+/// Which saved-workspace relation a raw `(a, b)` pair belongs to. Used only to
+/// round-trip wires touching an unplaced node (see `Server::unplaced_wires`),
+/// where the node kinds needed to classify a live [`Wire`] aren't available.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WireRel {
+    Connection,
+    Midi,
+    Serve,
+    NetLink,
+}
+
 /// The two node ids a [`Wire`] joins.
 fn wire_ends(w: Wire) -> (NodeId, NodeId) {
     match w {
@@ -446,6 +457,18 @@ pub struct Server {
     /// closes its endpoint and detaches its trunk.
     uplinks: HashMap<NodeId, UplinkHandle>,
 
+    /// Nodes present in the loaded `.wk` file that couldn't be materialized —
+    /// an app whose dependency isn't in the list (renamed/removed), or an
+    /// uplink whose endpoint failed to start (offline). Kept as `(ws, snap)`
+    /// so [`Self::save`] round-trips them verbatim instead of silently
+    /// deleting them (which, for an uplink, would lose its identity secret and
+    /// orphan every peer holding its ticket). Populated only at load.
+    unplaced: Vec<(NodeId, NodeSnap)>,
+    /// Saved wires that touch an unplaced node (so they never entered the live
+    /// graph), kept as `(ws, relation, a, b)` so save round-trips them and an
+    /// unplaced node comes back still wired once it can materialize.
+    unplaced_wires: Vec<(NodeId, WireRel, NodeId, NodeId)>,
+
     /// Inverse-command history for [`Command::Undo`].
     undo: Vec<Undo>,
 
@@ -473,6 +496,8 @@ impl Server {
             routed: HashSet::new(),
             serves: HashMap::new(),
             uplinks: HashMap::new(),
+            unplaced: Vec::new(),
+            unplaced_wires: Vec::new(),
             undo: Vec::new(),
             next_port: 8080,
             file_seq: 0,
@@ -492,6 +517,31 @@ impl Server {
     fn instantiate(&mut self, saved: &Workspace) {
         for snap in &saved.nodes {
             self.materialize(saved.id, snap, &[]);
+            // A node that failed to materialize (unknown dependency, offline
+            // uplink) is preserved verbatim so save doesn't delete it.
+            if !self.node_exists(snap.id) {
+                self.unplaced.push((saved.id, snap.clone()));
+            }
+        }
+        // Preserve wires touching an unplaced node (rewire skips them since the
+        // endpoint doesn't exist) so they come back when it materializes.
+        let orphan: HashSet<NodeId> = self
+            .unplaced
+            .iter()
+            .filter(|(w, _)| *w == saved.id)
+            .map(|(_, s)| s.id)
+            .collect();
+        for (rel, pairs) in [
+            (WireRel::Connection, &saved.connections),
+            (WireRel::Midi, &saved.midi),
+            (WireRel::Serve, &saved.serves),
+            (WireRel::NetLink, &saved.net_links),
+        ] {
+            for &(a, b) in pairs {
+                if orphan.contains(&a) || orphan.contains(&b) {
+                    self.unplaced_wires.push((saved.id, rel, a, b));
+                }
+            }
         }
         let wires: Vec<(NodeId, NodeId)> = saved
             .connections
@@ -1228,37 +1278,64 @@ impl Server {
                     .map(|(&id, _)| id)
                     .collect();
                 ids.sort_by_key(|id| (self.graph.nodes[id].kind as u8, *id));
+                let mut nodes: Vec<NodeSnap> =
+                    ids.iter().filter_map(|&id| self.node_snap(id)).collect();
+                // Re-emit any node from the loaded file that never materialized
+                // (its ids are disjoint from `graph.nodes`, so no duplication).
+                nodes.extend(
+                    self.unplaced
+                        .iter()
+                        .filter(|(w, _)| *w == ws_id)
+                        .map(|(_, s)| s.clone()),
+                );
+                // Orphan wires (touching an unplaced node) for this workspace,
+                // re-added to their relation so they round-trip.
+                let orphan = |rel: WireRel| -> Vec<(NodeId, NodeId)> {
+                    self.unplaced_wires
+                        .iter()
+                        .filter(|(w, r, ..)| *w == ws_id && *r == rel)
+                        .map(|&(_, _, a, b)| (a, b))
+                        .collect()
+                };
+                let mut connections: Vec<(NodeId, NodeId)> = self
+                    .graph
+                    .connections
+                    .iter()
+                    .filter(|(f, _)| mine(f))
+                    .copied()
+                    .collect();
+                connections.extend(orphan(WireRel::Connection));
+                let mut midi: Vec<(NodeId, NodeId)> = self
+                    .graph
+                    .midi_links
+                    .iter()
+                    .filter(|(s, _)| mine(s))
+                    .copied()
+                    .collect();
+                midi.extend(orphan(WireRel::Midi));
+                let mut serves: Vec<(NodeId, NodeId)> = self
+                    .graph
+                    .serve_links
+                    .iter()
+                    .filter(|(served, _)| mine(served))
+                    .copied()
+                    .collect();
+                serves.extend(orphan(WireRel::Serve));
+                let mut net_links: Vec<(NodeId, NodeId)> = self
+                    .graph
+                    .net_links
+                    .iter()
+                    .filter(|(a, _)| mine(a))
+                    .copied()
+                    .collect();
+                net_links.extend(orphan(WireRel::NetLink));
                 Workspace {
                     id: ws_id,
-                    nodes: ids.iter().filter_map(|&id| self.node_snap(id)).collect(),
-                    connections: self
-                        .graph
-                        .connections
-                        .iter()
-                        .filter(|(f, _)| mine(f))
-                        .copied()
-                        .collect(),
-                    midi: self
-                        .graph
-                        .midi_links
-                        .iter()
-                        .filter(|(s, _)| mine(s))
-                        .copied()
-                        .collect(),
-                    serves: self
-                        .graph
-                        .serve_links
-                        .iter()
-                        .filter(|(served, _)| mine(served))
-                        .copied()
-                        .collect(),
-                    net_links: self
-                        .graph
-                        .net_links
-                        .iter()
-                        .filter(|(a, _)| mine(a))
-                        .copied()
-                        .collect(),
+                    nodes,
+                    connections,
+                    midi,
+                    serves,
+                    net_links,
                 }
             })
             .collect();
@@ -1824,6 +1901,75 @@ mod model_tests {
     fn fresh_server() -> Server {
         Server::new(&Document::empty(), PathBuf::from("wk-proptest-scratch.wk"))
             .expect("a headless server constructs")
+    }
+
+    /// A node whose dependency isn't in the list (renamed/removed, or an
+    /// offline uplink) can't materialize — but load→save must not silently
+    /// delete it or the wire touching it. It round-trips verbatim so re-adding
+    /// the dependency brings it back, wired.
+    #[test]
+    fn unresolvable_node_and_its_wire_survive_save() {
+        use crate::workspace::{NodeSnap, SnapKind};
+        let ws = NodeId::new();
+        let ghost = NodeId::new();
+        let file = NodeId::new();
+        let doc = Document {
+            dependencies: Vec::new(), // "ghost" isn't here
+            workspaces: vec![Workspace {
+                id: ws,
+                nodes: vec![
+                    NodeSnap {
+                        id: ghost,
+                        pos: [10.0, 10.0],
+                        size: [360.0, 260.0],
+                        kind: SnapKind::App {
+                            name: "ghost".into(),
+                            options: vec![1.0, 2.0],
+                            args: vec!["hello".into()],
+                        },
+                    },
+                    NodeSnap {
+                        id: file,
+                        pos: [20.0, 20.0],
+                        size: [130.0, 44.0],
+                        kind: SnapKind::VirtualFile {
+                            name: "file1".into(),
+                        },
+                    },
+                ],
+                connections: vec![(file, ghost)],
+                midi: Vec::new(),
+                serves: Vec::new(),
+                net_links: Vec::new(),
+            }],
+        };
+        let path = std::env::temp_dir().join("wk-unresolvable-test.wk");
+        let server = Server::new(&doc, path.clone()).expect("server constructs");
+        // The file placed; the ghost didn't (unknown dep) but is remembered.
+        assert!(server.node_exists(file));
+        assert!(!server.node_exists(ghost));
+        server.save();
+
+        let back = Document::load(&path).expect("reloads");
+        let w = &back.workspaces[0];
+        let ghost_snap = w
+            .nodes
+            .iter()
+            .find(|n| n.id == ghost)
+            .expect("ghost node preserved, not deleted");
+        assert_eq!(
+            ghost_snap.kind,
+            SnapKind::App {
+                name: "ghost".into(),
+                options: vec![1.0, 2.0],
+                args: vec!["hello".into()],
+            }
+        );
+        assert!(
+            w.connections.contains(&(file, ghost)),
+            "the wire to the unresolved node is preserved"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Two servers each grow an Iroh node wired to a Network; pasting one's

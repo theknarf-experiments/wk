@@ -3,7 +3,6 @@
 //! the listening socket — the guest never touches the network — and dispatches
 //! each request to a fresh, isolated `Store` (the `wasmtime serve` model).
 
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,7 +33,7 @@ pub fn serve(
     engine: Engine,
     pre: ProxyPre<HostState>,
     make_state: impl Fn() -> HostState + Send + Sync + 'static,
-    port: u16,
+    listener: std::net::TcpListener,
     kill: Arc<AtomicBool>,
 ) -> Result<()> {
     // wasmtime-wasi pumps bodies via `tokio::spawn` (Send), so we need a
@@ -43,6 +42,7 @@ pub fn serve(
     // connections on a single-threaded `LocalSet` via `spawn_local`, which lets
     // many run concurrently without requiring `Send`. Serving them one at a time
     // would let a single slow/keep-alive client wedge the port for everyone.
+    listener.set_nonblocking(true)?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -50,10 +50,9 @@ pub fn serve(
     let make_state: Arc<StateFn> = Arc::new(make_state);
     let local = tokio::task::LocalSet::new();
     rt.block_on(local.run_until(async move {
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|e| wasmtime::Error::msg(format!("bind {addr}: {e}")))?;
+        // The caller already bound the port (so a bind failure is reported
+        // synchronously); adopt it into tokio.
+        let listener = tokio::net::TcpListener::from_std(listener)?;
         loop {
             if kill.load(Ordering::Relaxed) {
                 break;
