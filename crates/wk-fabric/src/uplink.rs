@@ -14,11 +14,11 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use anyhow::Result;
 use iroh::endpoint::{presets, Connection};
 use iroh::{Endpoint, EndpointAddr, SecretKey};
 use iroh_tickets::endpoint::EndpointTicket;
 use tokio::sync::{mpsc, oneshot};
-use wasmtime::Result;
 use wk_protocol::NodeId;
 
 use crate::netstack::{NetHub, TrunkPort};
@@ -32,6 +32,7 @@ type Conns = Arc<Mutex<Vec<Connection>>>;
 /// it closes the endpoint and detaches the trunk.
 pub struct Uplink {
     ticket: String,
+    secret: [u8; 32],
     trunk: Arc<TrunkPort>,
     hub: Arc<NetHub>,
     conns: Conns,
@@ -55,17 +56,20 @@ impl Uplink {
             .worker_threads(1)
             .enable_all()
             .build()?;
+        // Resolve (or mint) the identity here so the caller can read it back
+        // via [`Self::secret`] and persist it.
+        let secret = secret.unwrap_or_else(|| SecretKey::generate().to_bytes());
         let endpoint = rt.block_on(async {
             let builder = if relays {
                 Endpoint::builder(presets::N0)
             } else {
                 Endpoint::builder(presets::Minimal)
             };
-            let builder = match secret {
-                Some(bytes) => builder.secret_key(SecretKey::from_bytes(&bytes)),
-                None => builder,
-            };
-            builder.alpns(vec![ALPN.to_vec()]).bind().await
+            builder
+                .secret_key(SecretKey::from_bytes(&secret))
+                .alpns(vec![ALPN.to_vec()])
+                .bind()
+                .await
         })?;
         let ticket = EndpointTicket::from(endpoint.addr()).to_string();
 
@@ -93,6 +97,7 @@ impl Uplink {
 
         Ok(Uplink {
             ticket,
+            secret,
             trunk,
             hub,
             conns,
@@ -106,11 +111,16 @@ impl Uplink {
         &self.ticket
     }
 
+    /// The ed25519 secret to persist so the ticket survives restarts.
+    pub fn secret(&self) -> [u8; 32] {
+        self.secret
+    }
+
     /// Dial a remote uplink by its ticket. The dialer keeps retrying (and
     /// re-dials after a drop), so a peer that isn't up yet is fine.
     pub fn dial(&self, ticket: &str) -> Result<()> {
         let t = EndpointTicket::from_str(ticket.trim())
-            .map_err(|e| wasmtime::Error::msg(format!("bad ticket: {e}")))?;
+            .map_err(|e| anyhow::anyhow!("bad ticket: {e}"))?;
         let _ = self.dial_tx.send(t.endpoint_addr().clone());
         Ok(())
     }

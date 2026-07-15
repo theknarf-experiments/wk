@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Result;
 use smoltcp::socket::tcp;
-use wasmtime::Result;
 
 use crate::netstack::{NetHub, SharedStack, SockKind};
 
@@ -42,8 +42,7 @@ pub fn forward(
     kill: Arc<AtomicBool>,
 ) -> Result<()> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener =
-        TcpListener::bind(addr).map_err(|e| wasmtime::Error::msg(format!("bind {addr}: {e}")))?;
+    let listener = TcpListener::bind(addr).map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
     // Nonblocking so the accept loop can poll the kill flag.
     listener.set_nonblocking(true)?;
 

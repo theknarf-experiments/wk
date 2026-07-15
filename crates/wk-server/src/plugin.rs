@@ -137,7 +137,7 @@ pub struct Node {
 pub struct NodeSetup {
     /// This node's network stack on the fabric (`Some` if it imports
     /// wasi:sockets), so the server can move it between virtual networks.
-    pub net_stack: Option<crate::netstack::SharedStack>,
+    pub net_stack: Option<wk_fabric::netstack::SharedStack>,
     /// Set if this is a `wasi:http` server (exports `incoming-handler`): the
     /// component path to serve when wired to a HostPort. Such nodes aren't run.
     pub http_path: Option<std::path::PathBuf>,
@@ -158,7 +158,7 @@ impl Node {
     pub fn is_loading(&self) -> bool {
         self.setup.get().is_none()
     }
-    pub fn net_stack(&self) -> Option<crate::netstack::SharedStack> {
+    pub fn net_stack(&self) -> Option<wk_fabric::netstack::SharedStack> {
         self.setup.get().and_then(|s| s.net_stack.clone())
     }
     pub fn http_path(&self) -> Option<std::path::PathBuf> {
@@ -644,7 +644,7 @@ pub struct PluginHost {
     engine: Engine,
     gpu: Arc<wgpu_core::global::Global>,
     midi: crate::midi::Router,
-    hub: Arc<crate::netstack::NetHub>,
+    hub: Arc<wk_fabric::netstack::NetHub>,
 }
 
 impl PluginHost {
@@ -674,7 +674,7 @@ impl PluginHost {
             engine: Engine::new(&config)?,
             gpu: new_gpu_instance(),
             midi: crate::midi::new_router(),
-            hub: crate::netstack::NetHub::new(),
+            hub: wk_fabric::netstack::NetHub::new(),
         })
     }
 
@@ -683,7 +683,7 @@ impl PluginHost {
         self.midi.clone()
     }
 
-    pub fn detach_net(&self, stack: &crate::netstack::SharedStack) {
+    pub fn detach_net(&self, stack: &wk_fabric::netstack::SharedStack) {
         self.hub.detach(stack);
     }
 
@@ -799,29 +799,37 @@ impl PluginHost {
     /// bound; runs until `kill` is set.
     pub fn forward(
         &self,
-        target: crate::netstack::SharedStack,
+        target: wk_fabric::netstack::SharedStack,
         port: u16,
         kill: Arc<AtomicBool>,
     ) -> Result<()> {
-        crate::portfwd::forward(self.hub.clone(), target, port, kill)
+        // The fabric crate reports plain anyhow errors; bridge into wasmtime's.
+        wk_fabric::portfwd::forward(self.hub.clone(), target, port, kill)
+            .map_err(wasmtime::Error::from_anyhow)
     }
 
     /// Start an iroh uplink tunneling virtual network `net` (see
-    /// [`crate::uplink`]), with n0's public relays/discovery enabled.
-    pub fn uplink(&self, net: NodeId, secret: Option<[u8; 32]>) -> Result<crate::uplink::Uplink> {
-        crate::uplink::Uplink::start(self.hub.clone(), net, secret, true)
+    /// [`wk_fabric::uplink`]), with n0's public relays/discovery enabled.
+    pub fn uplink(
+        &self,
+        net: NodeId,
+        secret: Option<[u8; 32]>,
+    ) -> Result<wk_fabric::uplink::Uplink> {
+        wk_fabric::uplink::Uplink::start(self.hub.clone(), net, secret, true)
+            .map_err(wasmtime::Error::from_anyhow)
     }
 
     /// Start a Veilid uplink tunneling virtual network `net` (see
-    /// [`crate::veilid`]). `node` namespaces its store; `identity` is the
+    /// [`wk_fabric::veilid`]). `node` namespaces its store; `identity` is the
     /// persisted DHT owner keypair (fresh if `None`).
     pub fn veilid_uplink(
         &self,
         net: NodeId,
         identity: Option<&str>,
         node: NodeId,
-    ) -> Result<crate::veilid::VeilidUplink> {
-        crate::veilid::VeilidUplink::start(self.hub.clone(), net, identity, node)
+    ) -> Result<wk_fabric::veilid::VeilidUplink> {
+        wk_fabric::veilid::VeilidUplink::start(self.hub.clone(), net, identity, node)
+            .map_err(wasmtime::Error::from_anyhow)
     }
 
     /// Register a plugin as a `Node` under `id` and return immediately — the

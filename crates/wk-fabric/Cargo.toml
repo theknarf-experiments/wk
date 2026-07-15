@@ -1,0 +1,19 @@
+[package]
+name = "wk-fabric"
+version = "0.1.0"
+edition = "2021"
+description = "wk's userspace network fabric: per-node smoltcp stacks routed by a hub, trunk ports for middleboxes, localhost port publishing, and p2p uplinks (iroh, Veilid) that extend a virtual network across machines."
+
+[dependencies]
+wk-protocol = { path = "../wk-protocol" }
+anyhow = "1"
+bytes = "1"
+smoltcp = "0.13.1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+iroh = "1"
+iroh-tickets = "1"
+# 0.5.6 pins ed25519-dalek 3.0.0-rc.1 while iroh pins =rc.0 — unresolvable.
+veilid-core = "=0.5.5"
+# veilid-core 0.5.5 breaks against veilid-tools 0.5.6 (its new `stop_token`
+# re-export makes veilid-core's glob imports ambiguous); pin the pair.
+veilid-tools = "=0.5.5"

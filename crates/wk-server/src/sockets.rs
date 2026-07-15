@@ -1,5 +1,5 @@
 //! wk's own `wasi:sockets` host implementation, backed by per-node smoltcp
-//! stacks on the [`crate::netstack`] fabric (not the host OS): a guest's BSD
+//! stacks on the [`wk_fabric::netstack`] fabric (not the host OS): a guest's BSD
 //! socket calls drive a smoltcp socket on the node's stack, which the hub routes
 //! to peers on the same virtual network. TCP and UDP are both implemented,
 //! dual-stack (IPv4 `10.0.0.0/24` + IPv6 ULA `fd00::/64`). A node wired to a
@@ -24,8 +24,8 @@ use wasmtime_wasi_io::streams::{
 };
 use wasmtime_wasi_io::IoView;
 
-use crate::netstack::{NodeStack, SharedStack};
 use crate::plugin::HostState;
+use wk_fabric::netstack::{NodeStack, SharedStack};
 
 wasmtime::component::bindgen!({
     path: "wit-sockets",
@@ -61,11 +61,11 @@ pub struct NetCtx {
     pub stack: SharedStack,
     pub next_port: u16,
     /// The fabric hub, for resolving peer node names on this node's network.
-    pub hub: std::sync::Arc<crate::netstack::NetHub>,
+    pub hub: std::sync::Arc<wk_fabric::netstack::NetHub>,
 }
 
 impl NetCtx {
-    pub fn new(stack: SharedStack, hub: std::sync::Arc<crate::netstack::NetHub>) -> Self {
+    pub fn new(stack: SharedStack, hub: std::sync::Arc<wk_fabric::netstack::NetHub>) -> Self {
         NetCtx {
             stack,
             next_port: 49152,
@@ -997,7 +997,7 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
             if g.is_current(handle, gen) {
                 g.sockets.get_mut::<tcp::Socket>(handle).close();
             }
-            g.begin_close(handle, crate::netstack::SockKind::Tcp);
+            g.begin_close(handle, wk_fabric::netstack::SockKind::Tcp);
         }
         self.table().delete(rep)?;
         Ok(())
@@ -1397,7 +1397,7 @@ impl wasi::sockets::udp::HostUdpSocket for HostState {
             stack
                 .lock()
                 .unwrap()
-                .begin_close(handle, crate::netstack::SockKind::Udp);
+                .begin_close(handle, wk_fabric::netstack::SockKind::Udp);
         }
         self.table().delete(rep)?;
         Ok(())

@@ -25,10 +25,7 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 smoltcp = "0.13.1"
-iroh = "1"
-iroh-tickets = "1"
-bytes = "1"
-veilid-core = "=0.5.5"
+wk-fabric = { path = "../wk-fabric" }
 
 [dev-dependencies]
 proptest = "1"

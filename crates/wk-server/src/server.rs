@@ -109,8 +109,8 @@ pub struct UplinkMeta {
 
 /// A running uplink of either transport, with one surface for the server.
 enum UplinkHandle {
-    Iroh(crate::uplink::Uplink),
-    Veilid(crate::veilid::VeilidUplink),
+    Iroh(wk_fabric::uplink::Uplink),
+    Veilid(wk_fabric::veilid::VeilidUplink),
 }
 
 impl UplinkHandle {
@@ -126,7 +126,7 @@ impl UplinkHandle {
             UplinkHandle::Veilid(u) => u.ticket(),
         }
     }
-    fn dial(&self, ticket: &str) -> wasmtime::Result<()> {
+    fn dial(&self, ticket: &str) -> wasmtime::anyhow::Result<()> {
         match self {
             UplinkHandle::Iroh(u) => u.dial(ticket),
             UplinkHandle::Veilid(u) => u.dial(ticket),
@@ -636,10 +636,7 @@ impl Server {
         // Uplink nodes: restart each endpoint with its saved identity (so its
         // ticket is unchanged) and re-dial its saved peer.
         for ir in &saved.irohs {
-            let secret = ir
-                .secret_bytes()
-                .unwrap_or_else(|| iroh::SecretKey::generate().to_bytes());
-            self.create_uplink(ir.id, secret, ir.pos, ir.size, saved.id);
+            self.create_uplink(ir.id, ir.secret_bytes(), ir.pos, ir.size, saved.id);
             if let Some(peer) = &ir.peer {
                 self.set_node_args(ir.id, peer);
             }
@@ -795,8 +792,7 @@ impl Server {
     /// Create an Iroh uplink node at `pos` with a fresh identity.
     fn add_iroh_node(&mut self, pos: [f32; 2], ws: NodeId) {
         let id = self.alloc_id();
-        let secret = iroh::SecretKey::generate().to_bytes();
-        self.create_uplink(id, secret, pos, [FILE_W, FILE_H], ws);
+        self.create_uplink(id, None, pos, [FILE_W, FILE_H], ws);
     }
 
     /// Create a Veilid uplink node at `pos` with a fresh identity.
@@ -826,22 +822,23 @@ impl Server {
         }
     }
 
-    /// Create (or restore) an Iroh uplink node with a known id and secret. Until
+    /// Create (or restore) an Iroh uplink node with a known id (and, when
+    /// restoring, its persisted secret, so its ticket is unchanged). Until
     /// wired to a Network the uplink trunks the node's own (empty) net, so a
     /// connected peer sees nothing.
     fn create_uplink(
         &mut self,
         id: NodeId,
-        secret: [u8; 32],
+        secret: Option<[u8; 32]>,
         pos: [f32; 2],
         size: [f32; 2],
         ws: NodeId,
     ) {
-        match self.host.uplink(id, Some(secret)) {
+        match self.host.uplink(id, secret) {
             Ok(up) => {
                 eprintln!("[iroh] uplink {id} ticket: {}", up.ticket());
+                self.graph.iroh_secrets.insert(id, up.secret());
                 self.uplinks.insert(id, UplinkHandle::Iroh(up));
-                self.graph.iroh_secrets.insert(id, secret);
                 self.place(id, Kind::Iroh, ws, pos, size);
             }
             Err(e) => eprintln!("failed to start iroh uplink: {e:#}"),
@@ -1879,7 +1876,7 @@ impl Server {
                 self.place(s.id, kind, s.ws, s.pos, s.size);
             }
             SnapKind::Iroh { secret, peer } => {
-                self.create_uplink(s.id, *secret, s.pos, s.size, s.ws);
+                self.create_uplink(s.id, Some(*secret), s.pos, s.size, s.ws);
                 if !peer.is_empty() {
                     self.set_node_args(s.id, &peer.join(" "));
                 }

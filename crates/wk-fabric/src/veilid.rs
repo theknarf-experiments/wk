@@ -15,12 +15,12 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use anyhow::Result;
 use tokio::sync::{mpsc, oneshot};
 use veilid_core::{
     api_startup, Crypto, DHTSchema, KeyPair, RecordKey, RouteId, RoutingContext, Target, VeilidAPI,
     VeilidConfig, VeilidUpdate, CRYPTO_KIND_VLD0,
 };
-use wasmtime::Result;
 use wk_protocol::NodeId;
 
 use crate::netstack::{NetHub, TrunkPort};
@@ -65,7 +65,7 @@ impl VeilidUplink {
 
         let owner: KeyPair = match identity {
             Some(s) => KeyPair::from_str(s.trim())
-                .map_err(|e| wasmtime::Error::msg(format!("bad veilid identity: {e}")))?,
+                .map_err(|e| anyhow::anyhow!("bad veilid identity: {e}"))?,
             None => Crypto::generate_keypair(CRYPTO_KIND_VLD0)?,
         };
         let identity = owner.to_string();
@@ -140,8 +140,8 @@ impl VeilidUplink {
     /// Dial a remote uplink by its ticket (a DHT record key). The driver keeps
     /// retrying while unconnected, so a peer that isn't up yet is fine.
     pub fn dial(&self, ticket: &str) -> Result<()> {
-        let key = RecordKey::from_str(ticket.trim())
-            .map_err(|e| wasmtime::Error::msg(format!("bad ticket: {e}")))?;
+        let key =
+            RecordKey::from_str(ticket.trim()).map_err(|e| anyhow::anyhow!("bad ticket: {e}"))?;
         let _ = self.dial_tx.send(key);
         Ok(())
     }
