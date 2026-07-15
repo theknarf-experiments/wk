@@ -110,6 +110,12 @@ fn wake_pipe(p: &SharedPipe) {
     }
 }
 
+/// Cap, per direction, on a gateway connection's bridge buffer. Bounds host RAM
+/// when a guest stops reading (host→guest) or floods a slow host (guest→host):
+/// the pump stops reading past this (TCP backpressure to the remote), and the
+/// guest's output stream reports no write space until it drains.
+const HOST_BUF_CAP: usize = 256 * 1024;
+
 /// A connection to the real host network, bridged to the guest's byte streams by
 /// a per-connection thread. Created only for nodes wired to a Gateway node.
 struct HostConn {
@@ -117,6 +123,22 @@ struct HostConn {
     outgoing: SharedPipe, // guest -> host
     connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
     failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set when the guest drops the socket, so `host_pump` exits and closes the
+    /// real host FD promptly instead of lingering until the remote closes.
+    abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for HostConn {
+    fn drop(&mut self) {
+        // The guest is gone: tear the host connection down (the pump thread
+        // sees `abort`, breaks, and drops the TcpStream → the FD closes). Also
+        // mark the guest→host pipe closed so a still-live output stream doesn't
+        // keep the pump waiting on a half-open write side.
+        self.abort.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.outgoing.lock().unwrap().closed = true;
+        wake_pipe(&self.incoming);
+        wake_pipe(&self.outgoing);
+    }
 }
 
 impl HostConn {
@@ -127,11 +149,13 @@ impl HostConn {
         let outgoing: SharedPipe = Default::default();
         let connected = Arc::new(AtomicBool::new(false));
         let failed = Arc::new(AtomicBool::new(false));
-        let (inc, out, conn, fail) = (
+        let abort = Arc::new(AtomicBool::new(false));
+        let (inc, out, conn, fail, ab) = (
             incoming.clone(),
             outgoing.clone(),
             connected.clone(),
             failed.clone(),
+            abort.clone(),
         );
         let addr = match ip {
             smoltcp::wire::IpAddress::Ipv4(v4) => std::net::SocketAddr::from((v4.octets(), port)),
@@ -142,7 +166,7 @@ impl HostConn {
                 Ok(stream) => {
                     conn.store(true, std::sync::atomic::Ordering::Relaxed);
                     wake_pipe(&inc);
-                    host_pump(stream, inc, out);
+                    host_pump(stream, inc, out, ab);
                 }
                 Err(_) => {
                     fail.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -155,44 +179,68 @@ impl HostConn {
             outgoing,
             connected,
             failed,
+            abort,
         }
     }
 }
 
 /// Pump bytes between a real host socket and the guest pipes until either side
-/// closes. A short read timeout lets one thread service both directions.
-fn host_pump(mut stream: std::net::TcpStream, incoming: SharedPipe, outgoing: SharedPipe) {
+/// closes or the guest drops the socket (`abort`). A short read timeout lets one
+/// thread service both directions; buffering is bounded by [`HOST_BUF_CAP`].
+fn host_pump(
+    mut stream: std::net::TcpStream,
+    incoming: SharedPipe,
+    outgoing: SharedPipe,
+    abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     use std::io::{Read, Write};
+    use std::sync::atomic::Ordering;
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(10)));
     let mut tmp = [0u8; 16 * 1024];
     loop {
-        match stream.read(&mut tmp) {
-            Ok(0) => {
-                incoming.lock().unwrap().closed = true;
-                wake_pipe(&incoming);
-                break;
+        // Guest dropped the socket → close the host FD and stop.
+        if abort.load(Ordering::Relaxed) {
+            break;
+        }
+        // Host -> guest, only while the guest's inbox has room (else leave the
+        // bytes in the socket, backpressuring the remote).
+        let has_room = incoming.lock().unwrap().buf.len() < HOST_BUF_CAP;
+        if has_room {
+            match stream.read(&mut tmp) {
+                Ok(0) => {
+                    incoming.lock().unwrap().closed = true;
+                    wake_pipe(&incoming);
+                    break;
+                }
+                Ok(n) => {
+                    incoming.lock().unwrap().buf.extend(&tmp[..n]);
+                    wake_pipe(&incoming);
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => {
+                    incoming.lock().unwrap().closed = true;
+                    wake_pipe(&incoming);
+                    break;
+                }
             }
-            Ok(n) => {
-                incoming.lock().unwrap().buf.extend(&tmp[..n]);
-                wake_pipe(&incoming);
-            }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => {
-                incoming.lock().unwrap().closed = true;
-                wake_pipe(&incoming);
-                break;
-            }
+        } else {
+            // Inbox full and we're not reading: pace the loop so it doesn't spin.
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let (out, guest_closed) = {
             let mut g = outgoing.lock().unwrap();
             (g.buf.drain(..).collect::<Vec<u8>>(), g.closed)
         };
-        if !out.is_empty() && stream.write_all(&out).is_err() {
-            incoming.lock().unwrap().closed = true;
-            wake_pipe(&incoming);
-            break;
+        if !out.is_empty() {
+            if stream.write_all(&out).is_err() {
+                incoming.lock().unwrap().closed = true;
+                wake_pipe(&incoming);
+                break;
+            }
+            // Draining freed space → wake a writer parked on backpressure.
+            wake_pipe(&outgoing);
         }
         if guest_closed {
             let _ = stream.shutdown(std::net::Shutdown::Write);
@@ -579,18 +627,51 @@ struct HostOutput {
 }
 #[async_trait]
 impl Pollable for HostOutput {
-    async fn ready(&mut self) {} // always writable (buffered)
+    async fn ready(&mut self) {
+        PipeWritable {
+            pipe: self.pipe.clone(),
+        }
+        .await
+    }
 }
 impl OutputStream for HostOutput {
     fn check_write(&mut self) -> StreamResult<usize> {
-        Ok(64 * 1024)
+        // Advertise only the remaining buffer room so a guest that respects the
+        // wasi contract backpressures instead of growing host RAM unbounded.
+        let p = self.pipe.lock().unwrap();
+        if p.closed {
+            return Err(StreamError::Closed);
+        }
+        Ok(HOST_BUF_CAP.saturating_sub(p.buf.len()))
     }
     fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
-        self.pipe.lock().unwrap().buf.extend(bytes.iter());
+        let mut p = self.pipe.lock().unwrap();
+        if p.closed {
+            return Err(StreamError::Closed);
+        }
+        p.buf.extend(bytes.iter());
         Ok(())
     }
     fn flush(&mut self) -> StreamResult<()> {
         Ok(())
+    }
+}
+
+/// Ready when a gateway pipe has write room (below [`HOST_BUF_CAP`]) or is
+/// closed — the backpressure counterpart of [`PipeReady`].
+struct PipeWritable {
+    pipe: SharedPipe,
+}
+impl Future for PipeWritable {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
+        let mut p = self.pipe.lock().unwrap();
+        if p.closed || p.buf.len() < HOST_BUF_CAP {
+            Poll::Ready(())
+        } else {
+            p.wakers.push(cx.waker().clone());
+            Poll::Pending
+        }
     }
 }
 

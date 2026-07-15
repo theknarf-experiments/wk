@@ -60,6 +60,20 @@ pub struct VirtualSurface {
 
 static NEXT_SURFACE_ID: AtomicU64 = AtomicU64::new(0);
 
+/// Largest surface edge a guest may request. Caps the RGBA8 backing buffer at
+/// `MAX_SURFACE_EDGE² * 4` (~256 MB at 8192) and, crucially, keeps
+/// `width * height * 4` from overflowing when computed — a guest asking for
+/// 65536×65536 would otherwise wrap to a too-small buffer.
+const MAX_SURFACE_EDGE: u32 = 8192;
+
+/// Clamp a requested surface size and return `(width, height, byte_len)` for its
+/// RGBA8 buffer, computed without overflow.
+fn surface_dims(width: u32, height: u32) -> (u32, u32, usize) {
+    let w = width.clamp(1, MAX_SURFACE_EDGE);
+    let h = height.clamp(1, MAX_SURFACE_EDGE);
+    (w, h, w as usize * h as usize * 4)
+}
+
 /// Error a closed surface returns to unwind and end its guest cleanly. The
 /// driver recognises it and exits the guest thread without logging an error.
 #[derive(Debug)]
@@ -75,12 +89,13 @@ impl std::error::Error for SurfaceClosed {}
 
 impl VirtualSurface {
     fn new(node_id: NodeId, width: u32, height: u32) -> Self {
+        let (width, height, bytes) = surface_dims(width, height);
         Self {
             id: NEXT_SURFACE_ID.fetch_add(1, Ordering::Relaxed),
             node_id,
             width,
             height,
-            pixels: vec![0; (width * height * 4) as usize],
+            pixels: vec![0; bytes],
             frame_ready: false,
             closed: false,
             resize: None,
@@ -502,13 +517,10 @@ impl wasi::surface::surface::HostSurface for HostState {
     ) -> Result<()> {
         let shared = self.surface_shared(&self_)?;
         let mut s = shared.lock().unwrap();
-        if let Some(w) = width {
-            s.width = w;
-        }
-        if let Some(h) = height {
-            s.height = h;
-        }
-        s.pixels = vec![0; (s.width * s.height * 4) as usize];
+        let (w, h, bytes) = surface_dims(width.unwrap_or(s.width), height.unwrap_or(s.height));
+        s.width = w;
+        s.height = h;
+        s.pixels = vec![0; bytes];
         Ok(())
     }
 
@@ -603,6 +615,19 @@ impl wasi::surface::surface::HostSurface for HostState {
     }
 
     fn drop(&mut self, rep: Resource<SurfaceState>) -> Result<()> {
+        // Remove the surface from the shared registry the client iterates every
+        // frame — otherwise a guest that creates surfaces in a loop grows it
+        // (and leaks the client's GPU texture) without bound until node close.
+        let shared = self.table.get(&rep)?.shared.clone();
+        {
+            let mut g = shared.lock().unwrap();
+            g.closed = true;
+            g.wake();
+        }
+        self.registry
+            .lock()
+            .unwrap()
+            .retain(|s| !Arc::ptr_eq(s, &shared));
         self.table.delete(rep)?;
         Ok(())
     }
@@ -1195,6 +1220,17 @@ mod tests {
     fn full_host_linker_builds() {
         let host = PluginHost::new().expect("host");
         host.build_linker().expect("full linker builds");
+    }
+
+    /// A guest-requested surface size is clamped and its RGBA8 byte length is
+    /// computed without overflowing `u32` (65536² * 4 would wrap otherwise).
+    #[test]
+    fn surface_dims_clamp_without_overflow() {
+        let (w, h, bytes) = surface_dims(u32::MAX, u32::MAX);
+        assert!(w <= MAX_SURFACE_EDGE && h <= MAX_SURFACE_EDGE);
+        assert_eq!(bytes, w as usize * h as usize * 4);
+        // Zero clamps up to 1 — no zero-area (empty-buffer) surface.
+        assert_eq!(surface_dims(0, 0), (1, 1, 4));
     }
 
     /// Outbound wasi:http is denied unless the node's fabric stack has host

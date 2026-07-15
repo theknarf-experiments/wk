@@ -71,7 +71,17 @@ impl Default for Fs {
     }
 }
 
+/// Largest number of nodes (files + directories) one app's in-memory fs may
+/// hold. Bounds host memory: a guest can otherwise `open`/`mkdir` in a loop and
+/// allocate unbounded entries (each a file up to [`MAX_FILE_SIZE`]).
+const MAX_FS_NODES: usize = 100_000;
+
 impl Fs {
+    /// Whether the fs is at its node cap, so a create must be refused.
+    fn at_capacity(&self) -> bool {
+        self.nodes.len() >= MAX_FS_NODES
+    }
+
     fn alloc(&mut self, node: Node) -> u64 {
         let id = self.next;
         self.next += 1;
@@ -571,6 +581,9 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
                 return err(ErrorCode::Exist);
             }
         }
+        if g.at_capacity() {
+            return err(ErrorCode::InsufficientSpace);
+        }
         let id = g.alloc(Node::Dir(BTreeMap::new()));
         if let Some(Node::Dir(children)) = g.nodes.get_mut(&parent) {
             children.insert(name, id);
@@ -698,6 +711,9 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
                     let Some((parent, name)) = resolve_parent(&g, start, &path) else {
                         return err(ErrorCode::NoEntry);
                     };
+                    if g.at_capacity() {
+                        return err(ErrorCode::InsufficientSpace);
+                    }
                     let id = g.alloc(Node::File(Vec::new()));
                     if let Some(Node::Dir(children)) = g.nodes.get_mut(&parent) {
                         children.insert(name, id);
