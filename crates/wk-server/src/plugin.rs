@@ -1118,6 +1118,10 @@ impl PluginHost {
         // argv[0] is the program name, then the configured args (e.g. a filename).
         let mut argv = vec![node.name.clone()];
         argv.extend(args.iter().cloned());
+        // Initial $COLUMNS/$LINES from the terminal's current size (the client may
+        // have already sized it to the node's window); apps that query the size
+        // via ioctl/wk:tty get the live value and follow later resizes.
+        let (cols, rows) = node.term_io.size();
         let mut ctx_builder = WasiCtxBuilder::new();
         ctx_builder
             .stdout(crate::terminal::stdout(&node.term_io))
@@ -1125,8 +1129,8 @@ impl PluginHost {
             .stdin(crate::terminal::stdin(&node.term_io))
             .args(&argv)
             .env("TERM", "xterm-256color")
-            .env("COLUMNS", crate::terminal::COLS.to_string())
-            .env("LINES", crate::terminal::ROWS.to_string());
+            .env("COLUMNS", cols.to_string())
+            .env("LINES", rows.to_string());
         // Outbound http follows the node's fabric stack's host access (gateway).
         let http_stack = net.as_ref().map(|n| n.stack.clone());
         let state = HostState {

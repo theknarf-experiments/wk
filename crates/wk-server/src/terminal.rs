@@ -69,6 +69,10 @@ pub struct TermIo {
     out: Mutex<VecDeque<u8>>,
     inp: Mutex<InpState>,
     tty: Mutex<TtyMode>,
+    /// The grid size (cols, rows) the client has sized this terminal to. The
+    /// guest reads it via `wk:tty/control`/`ioctl(TIOCGWINSZ)`; changing it wakes
+    /// a blocked read (see `winch`) so the guest can raise SIGWINCH.
+    size: Mutex<(u16, u16)>,
 }
 
 pub type SharedTermIo = Arc<TermIo>;
@@ -83,7 +87,20 @@ impl TermIo {
                 closed: false,
             }),
             tty: Mutex::new(TtyMode::default()),
+            size: Mutex::new((COLS as u16, ROWS as u16)),
         })
+    }
+
+    /// The current grid size (cols, rows).
+    pub fn size(&self) -> (u16, u16) {
+        *self.size.lock().unwrap()
+    }
+
+    /// Record a new grid size. The guest's terminal shim polls this (via
+    /// `wk:tty/control`) and raises SIGWINCH when it changes — WASI has no way to
+    /// wake a blocked read, so delivery is poll-driven on the guest side.
+    pub fn set_size(&self, cols: u16, rows: u16) {
+        *self.size.lock().unwrap() = (cols, rows);
     }
 
     /// Set the line-discipline mode (called by the `wk:tty/control` host impl
@@ -241,17 +258,22 @@ impl EventListener for EventProxy {
     }
 }
 
-/// Fixed grid dimensions for `alacritty_terminal`.
-struct GridSize;
+/// Grid dimensions for `alacritty_terminal`. The default (`COLS`×`ROWS`) is just
+/// a launch-time guess; the client resizes the grid to fit the node's window.
+#[derive(Clone, Copy)]
+struct GridSize {
+    cols: usize,
+    rows: usize,
+}
 impl Dimensions for GridSize {
     fn total_lines(&self) -> usize {
-        ROWS
+        self.rows
     }
     fn screen_lines(&self) -> usize {
-        ROWS
+        self.rows
     }
     fn columns(&self) -> usize {
-        COLS
+        self.cols
     }
 }
 
@@ -278,13 +300,34 @@ pub struct Terminal {
 
 impl Terminal {
     pub fn new(io: SharedTermIo) -> Self {
-        let term = Term::new(Config::default(), &GridSize, EventProxy(io.clone()));
+        let (cols, rows) = io.size();
+        let dims = GridSize {
+            cols: cols as usize,
+            rows: rows as usize,
+        };
+        let term = Term::new(Config::default(), &dims, EventProxy(io.clone()));
         Terminal {
             term,
             parser: Processor::new(),
             line: Vec::new(),
             io,
         }
+    }
+
+    /// Resize the grid to `cols`×`rows` (both clamped to at least 1). Reflows the
+    /// alacritty grid and records the size on the shared `TermIo`, which wakes a
+    /// blocked guest read so it can raise SIGWINCH and redraw.
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        if self.io.size() == (cols, rows) {
+            return;
+        }
+        self.term.resize(GridSize {
+            cols: cols as usize,
+            rows: rows as usize,
+        });
+        self.io.set_size(cols, rows);
     }
 
     /// Whether the guest has put the terminal in raw mode.
@@ -366,6 +409,7 @@ impl Terminal {
 
     /// The non-blank cells currently displayed.
     pub fn cells(&self) -> Vec<CellView> {
+        let rows = self.term.grid().screen_lines();
         let mut out = Vec::new();
         for indexed in self.term.grid().display_iter() {
             let cell = indexed.cell;
@@ -374,7 +418,7 @@ impl Terminal {
             }
             let row = indexed.point.line.0;
             let col = indexed.point.column.0;
-            if row < 0 || row as usize >= ROWS {
+            if row < 0 || row as usize >= rows {
                 continue;
             }
 
@@ -410,7 +454,7 @@ impl Terminal {
         }
         let p = self.term.grid().cursor.point;
         let row = p.line.0;
-        if row < 0 || row as usize >= ROWS {
+        if row < 0 || row as usize >= self.term.grid().screen_lines() {
             return None;
         }
         Some((p.column.0, row as usize))
@@ -539,6 +583,26 @@ mod tests {
         io.write_out(b"out");
         assert_eq!(io.drain_out(), b"out");
         assert!(io.drain_out().is_empty());
+    }
+
+    #[test]
+    fn resize_grows_the_grid_and_publishes_the_size() {
+        let io = TermIo::new();
+        let mut term = Terminal::new(io.clone());
+        assert_eq!(io.size(), (COLS as u16, ROWS as u16));
+
+        // Draw a cell near the bottom-right of a bigger grid, then confirm it's
+        // visible only after the grid is resized to include it.
+        term.resize(100, 40);
+        assert_eq!(io.size(), (100, 40), "size published for the guest to read");
+        term.feed(b"\x1b[38;90HX"); // cursor to row 38, col 90 (1-based), print X
+        let cells = term.cells();
+        assert!(
+            cells
+                .iter()
+                .any(|c| c.ch == 'X' && c.row == 37 && c.col == 89),
+            "cell in the enlarged grid is rendered"
+        );
     }
 
     #[test]

@@ -10,7 +10,6 @@ use wasmtime::component::{HasData, Linker};
 use wasmtime::Result;
 
 use crate::plugin::HostState;
-use crate::terminal;
 
 wasmtime::component::bindgen!({
     path: "wit-tty",
@@ -32,9 +31,10 @@ impl HasData for HasTty {
 impl wk::tty::control::Host for HostState {
     fn get(&mut self) -> Result<wk::tty::control::State> {
         let mode = self.term_io.tty();
+        let (cols, rows) = self.term_io.size();
         Ok(wk::tty::control::State {
-            cols: terminal::COLS as u32,
-            rows: terminal::ROWS as u32,
+            cols: cols as u32,
+            rows: rows as u32,
             echo: mode.echo,
             canonical: mode.canonical,
         })

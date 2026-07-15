@@ -146,7 +146,7 @@ done
 # --- link + componentize ---
 # The shared termios shim (termios.c) + its wk:tty/control bindings (terminal.c),
 # and terminal_component_type.o so `component new` lifts the wk:tty import.
-env PATH="$CLANG_PATH" "$CLANG" --target=wasm32-wasip1 $EH -I"$TTYCOMPAT" -I"$TTYGEN" -I"$COMPAT" \
+env PATH="$CLANG_PATH" "$CLANG" --target=wasm32-wasip1 $EH -D_WASI_EMULATED_SIGNAL -I"$TTYCOMPAT" -I"$TTYGEN" -I"$COMPAT" \
     $OBJS "$COMPAT/wkos.c" "$COMPAT/libwktcap.a" \
     "$TTYCOMPAT/termios.c" "$TTYGEN/terminal.c" "$TTYGEN/terminal_component_type.o" \
     -lsetjmp -lwasi-emulated-signal -lwasi-emulated-process-clocks \

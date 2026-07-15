@@ -1571,6 +1571,7 @@ impl App {
 
     /// Draw a terminal cell grid, scaled uniformly to fit `area`, clipped to
     /// `clip`. Shared by the in-workspace node body and its detached window.
+    #[allow(clippy::too_many_arguments)]
     fn draw_term_grid(
         &mut self,
         quads: &mut Vec<Quad>,
@@ -1579,10 +1580,11 @@ impl App {
         cursor: Option<(usize, usize)>,
         area: [f32; 4],
         clip: [f32; 4],
+        grid: (u16, u16),
     ) {
         let white = gfx.renderer.white;
-        let cols = wk_server::terminal::COLS as f32;
-        let rows = wk_server::terminal::ROWS as f32;
+        let cols = grid.0 as f32;
+        let rows = grid.1 as f32;
         let bw = (gfx.fonts.measure("M") as f32).max(1.0);
         let bh = (gfx.fonts.line_height() as f32).max(1.0);
         let scale = ((area[2] - area[0]) / (cols * bw))
@@ -1658,10 +1660,22 @@ impl App {
                     full,
                 ));
             }
-        } else if let Some((cells, cursor)) =
-            self.terminals.get(&id).map(|t| (t.cells(), t.cursor()))
-        {
-            self.draw_term_grid(&mut quads, gfx, &cells, cursor, full, full);
+        } else if self.terminals.contains_key(&id) {
+            // Detached window: no camera zoom, so the grid is the window size
+            // divided by the cell metrics.
+            let bw = (gfx.fonts.measure("M") as f32).max(1.0);
+            let bh = (gfx.fonts.line_height() as f32).max(1.0);
+            let cols = ((fb[0] / bw).floor() as i32).clamp(1, 500) as u16;
+            let rows = ((fb[1] / bh).floor() as i32).clamp(1, 300) as u16;
+            if let Some(t) = self.terminals.get_mut(&id) {
+                t.resize(cols, rows);
+            }
+            let (cells, cursor) = self
+                .terminals
+                .get(&id)
+                .map(|t| (t.cells(), t.cursor()))
+                .unwrap();
+            self.draw_term_grid(&mut quads, gfx, &cells, cursor, full, full, (cols, rows));
         } else {
             quads.push(Quad::solid(white, full, DETACHED_BG, full));
         }
@@ -2716,10 +2730,31 @@ impl App {
                         ca_clip,
                     ));
                 }
-            } else if let Some((cells, cursor)) =
-                self.terminals.get(&id).map(|t| (t.cells(), t.cursor()))
-            {
-                self.draw_term_grid(&mut quads, &mut gfx, &cells, cursor, ca, ca_clip);
+            } else if self.terminals.contains_key(&id) {
+                // Size the grid to the node's canvas rect, independent of zoom:
+                // divide by the on-screen cell size (base metric × zoom) so a
+                // bigger node shows more cells while zooming just scales them.
+                let bw = (gfx.fonts.measure("M") as f32).max(1.0);
+                let bh = (gfx.fonts.line_height() as f32).max(1.0);
+                let cols = (((ca[2] - ca[0]) / (bw * zf)).floor() as i32).clamp(1, 500) as u16;
+                let rows = (((ca[3] - ca[1]) / (bh * zf)).floor() as i32).clamp(1, 300) as u16;
+                if let Some(t) = self.terminals.get_mut(&id) {
+                    t.resize(cols, rows);
+                }
+                let (cells, cursor) = self
+                    .terminals
+                    .get(&id)
+                    .map(|t| (t.cells(), t.cursor()))
+                    .unwrap();
+                self.draw_term_grid(
+                    &mut quads,
+                    &mut gfx,
+                    &cells,
+                    cursor,
+                    ca,
+                    ca_clip,
+                    (cols, rows),
+                );
             }
 
             // Idle node: a one-line, editable launch-args bar along the bottom
