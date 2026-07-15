@@ -270,6 +270,9 @@ pub struct HostState {
     /// This store's `wasi:http` context (outbound requests, and serving when a
     /// node exports `wasi:http/incoming-handler`).
     http_ctx: wasmtime_wasi_http::WasiHttpCtx,
+    /// Gates outbound `wasi:http` behind the node's host access (see
+    /// [`GatedHttpHooks`]).
+    http_hooks: GatedHttpHooks,
     gpu: Arc<wgpu_core::global::Global>,
 }
 
@@ -278,7 +281,7 @@ impl wasmtime_wasi_http::p2::WasiHttpView for HostState {
         wasmtime_wasi_http::p2::WasiHttpCtxView {
             ctx: &mut self.http_ctx,
             table: &mut self.table,
-            hooks: Default::default(),
+            hooks: &mut self.http_hooks,
         }
     }
 }
@@ -288,8 +291,105 @@ impl wasmtime_wasi_http::p3::WasiHttpView for HostState {
         wasmtime_wasi_http::p3::WasiHttpCtxView {
             ctx: &mut self.http_ctx,
             table: &mut self.table,
-            hooks: Default::default(),
+            hooks: &mut self.http_hooks,
         }
+    }
+}
+
+/// Gates a store's **outbound** `wasi:http` requests behind the same host-access
+/// check as raw sockets ([`crate::sockets`]): a guest reaches the real host
+/// network only when its node is wired to a Gateway (which sets `host_access`
+/// on the node's fabric stack). A node with no fabric stack — a pure-http node,
+/// or a per-request serve store — is denied. Without this, `wasi:http/
+/// outgoing-handler` dialed straight over the host OS, a hole around the whole
+/// fabric+Gateway sandbox that let an "isolated" node reach arbitrary hosts.
+struct GatedHttpHooks {
+    /// The node's fabric stack, if it has one; `host_access` is read live so
+    /// wiring/unwiring a Gateway takes effect between requests.
+    stack: Option<wk_fabric::netstack::SharedStack>,
+}
+
+impl GatedHttpHooks {
+    fn host_allowed(&self) -> bool {
+        self.stack
+            .as_ref()
+            .is_some_and(|s| s.lock().unwrap().host_access)
+    }
+}
+
+impl wasmtime_wasi_http::p2::WasiHttpHooks for GatedHttpHooks {
+    fn send_request(
+        &mut self,
+        request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+        config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
+    ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
+    {
+        use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+        if !self.host_allowed() {
+            return Err(ErrorCode::HttpRequestDenied.into());
+        }
+        Ok(wasmtime_wasi_http::p2::default_send_request(
+            request, config,
+        ))
+    }
+}
+
+impl wasmtime_wasi_http::p3::WasiHttpHooks for GatedHttpHooks {
+    fn send_request(
+        &mut self,
+        request: hyper::Request<
+            http_body_util::combinators::UnsyncBoxBody<
+                hyper::body::Bytes,
+                wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
+            >,
+        >,
+        options: Option<wasmtime_wasi_http::p3::RequestOptions>,
+        fut: Box<
+            dyn std::future::Future<
+                    Output = std::result::Result<
+                        (),
+                        wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
+                    >,
+                > + Send,
+        >,
+    ) -> Box<
+        dyn std::future::Future<
+                Output = std::result::Result<
+                    (
+                        hyper::Response<
+                            http_body_util::combinators::UnsyncBoxBody<
+                                hyper::body::Bytes,
+                                wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
+                            >,
+                        >,
+                        Box<
+                            dyn std::future::Future<
+                                    Output = std::result::Result<
+                                        (),
+                                        wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
+                                    >,
+                                > + Send,
+                        >,
+                    ),
+                    wasmtime_wasi::TrappableError<
+                        wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
+                    >,
+                >,
+            > + Send,
+    > {
+        use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode;
+        let _ = fut;
+        if !self.host_allowed() {
+            return Box::new(async move { Err(ErrorCode::HttpRequestDenied.into()) });
+        }
+        Box::new(async move {
+            use http_body_util::BodyExt;
+            let (res, io) = wasmtime_wasi_http::p3::default_send_request(request, options).await?;
+            Ok((
+                res.map(BodyExt::boxed_unsync),
+                Box::new(io) as Box<dyn std::future::Future<Output = _> + Send>,
+            ))
+        })
     }
 }
 
@@ -790,6 +890,9 @@ impl PluginHost {
             net: None,
             random_ctx: wasmtime_wasi::random::WasiRandomCtx::default(),
             http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
+            // A per-request serve store has no fabric stack, so outbound http is
+            // denied — an incoming-handler can't proxy to arbitrary hosts.
+            http_hooks: GatedHttpHooks { stack: None },
             gpu: gpu.clone(),
         };
         let engine = self.engine.clone();
@@ -992,6 +1095,8 @@ impl PluginHost {
             .env("TERM", "xterm-256color")
             .env("COLUMNS", crate::terminal::COLS.to_string())
             .env("LINES", crate::terminal::ROWS.to_string());
+        // Outbound http follows the node's fabric stack's host access (gateway).
+        let http_stack = net.as_ref().map(|n| n.stack.clone());
         let state = HostState {
             ctx: ctx_builder.build(),
             table: ResourceTable::new(),
@@ -1004,6 +1109,7 @@ impl PluginHost {
             net,
             random_ctx: wasmtime_wasi::random::WasiRandomCtx::default(),
             http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
+            http_hooks: GatedHttpHooks { stack: http_stack },
             gpu: Arc::clone(&self.gpu),
         };
         let mut store = Store::new(&self.engine, state);
@@ -1089,5 +1195,29 @@ mod tests {
     fn full_host_linker_builds() {
         let host = PluginHost::new().expect("host");
         host.build_linker().expect("full linker builds");
+    }
+
+    /// Outbound wasi:http is denied unless the node's fabric stack has host
+    /// access (i.e. it's wired to a Gateway) — the same gate as raw sockets.
+    /// A stackless store (pure-http node / serve store) is always denied.
+    #[test]
+    fn outbound_http_gated_by_host_access() {
+        // No stack → denied (a served http node can't proxy to the host).
+        assert!(!GatedHttpHooks { stack: None }.host_allowed());
+
+        let hub = wk_fabric::netstack::NetHub::new();
+        let stack = hub.attach(
+            NodeId::nil(),
+            smoltcp::wire::Ipv4Address::new(10, 0, 0, 2),
+            "n",
+        );
+        let hooks = GatedHttpHooks {
+            stack: Some(stack.clone()),
+        };
+        // On its own isolated net (no Gateway) → denied.
+        assert!(!hooks.host_allowed());
+        // Wiring to a Gateway sets host_access → allowed.
+        stack.lock().unwrap().host_access = true;
+        assert!(hooks.host_allowed());
     }
 }
