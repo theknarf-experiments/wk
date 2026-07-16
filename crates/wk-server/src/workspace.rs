@@ -203,12 +203,29 @@ pub fn secret_bytes(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// A `.wk` file: shared dependencies plus one or more workspaces (canvas tabs).
+/// A `.wk` file: optional imports of other `.wk` files, shared dependencies, and
+/// one or more workspaces (canvas tabs).
+///
+/// A file loaded on its own (via [`Document::load`]) carries only what it
+/// literally contains, with empty provenance. [`Document::load_resolved`]
+/// follows `imports` and returns a *merged* document — `dependencies` and
+/// `workspaces` include everything pulled in — while recording which of those
+/// came from an import in `imported_deps`/`imported_workspaces`. Serialization
+/// ([`to_kdl`](Document::to_kdl)) writes the `import` lines and *omits* imported
+/// content, so an autosave (or a CLI edit) preserves the composition instead of
+/// flattening it into one file.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Document {
+    /// Paths (relative to this file) of other `.wk` files to pull in.
+    pub imports: Vec<String>,
     pub dependencies: Vec<Dependency>,
     /// Always at least one; shown as tabs when there is more than one.
     pub workspaces: Vec<Workspace>,
+    /// Names of `dependencies` that came from an import — not re-serialized.
+    /// Empty unless produced by [`Document::load_resolved`].
+    pub imported_deps: std::collections::HashSet<String>,
+    /// Ids of `workspaces` that came from an import — not re-serialized.
+    pub imported_workspaces: std::collections::HashSet<NodeId>,
 }
 
 /// One workspace: a canvas of nodes and the wiring between them, with its own id.
@@ -249,14 +266,21 @@ impl Default for Workspace {
 }
 
 impl Document {
-    /// An empty document: no dependencies, one blank workspace.
+    /// An empty document: no imports or dependencies, one blank workspace.
     pub fn empty() -> Self {
         Document {
+            imports: Vec::new(),
             dependencies: Vec::new(),
             workspaces: vec![Workspace::new()],
+            imported_deps: std::collections::HashSet::new(),
+            imported_workspaces: std::collections::HashSet::new(),
         }
     }
 
+    /// Load a single `.wk` file verbatim — its own imports/dependencies/
+    /// workspaces, with empty provenance. Used by the CLI edit commands (which
+    /// operate on one file) and by [`Self::load_resolved`] per file. Does *not*
+    /// follow imports; see [`Self::load_resolved`] for the merged, runnable view.
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| {
             format!(
@@ -267,6 +291,38 @@ impl Document {
         Self::from_kdl(&text).map_err(|e| format!("{}: {e}", path.display()))
     }
 
+    /// Load `path` and everything it `import`s, recursively, into one merged
+    /// document for running: `dependencies` and `workspaces` include all pulled-
+    /// in content, with `imported_deps`/`imported_workspaces` recording what came
+    /// from an import (so a later save doesn't flatten the composition). Imports
+    /// are resolved relative to the importing file; a file already pulled in
+    /// (a diamond, or a cycle) is visited once. The top-level file's own
+    /// `imports` are preserved for re-serialization.
+    pub fn load_resolved(path: &Path) -> Result<Self, String> {
+        let mut merged = Document {
+            imports: Vec::new(),
+            dependencies: Vec::new(),
+            workspaces: Vec::new(),
+            imported_deps: std::collections::HashSet::new(),
+            imported_workspaces: std::collections::HashSet::new(),
+        };
+        let mut dep_names = std::collections::HashSet::new();
+        let mut ws_ids = std::collections::HashSet::new();
+        let mut visited = std::collections::HashSet::new();
+        resolve_into(
+            path,
+            false,
+            &mut merged,
+            &mut dep_names,
+            &mut ws_ids,
+            &mut visited,
+        )?;
+        if merged.workspaces.is_empty() {
+            merged.workspaces.push(Workspace::new());
+        }
+        Ok(merged)
+    }
+
     pub fn save(&self, path: &Path) -> Result<(), String> {
         std::fs::write(path, self.to_kdl())
             .map_err(|e| format!("failed to write {}: {e}", path.display()))
@@ -274,6 +330,14 @@ impl Document {
 
     fn from_kdl(text: &str) -> Result<Self, String> {
         let doc: KdlDocument = text.parse().map_err(|e| format!("parse error: {e}"))?;
+
+        // `import "other.wk"` lines (a path per node, resolved by load_resolved).
+        let imports = doc
+            .nodes()
+            .iter()
+            .filter(|n| n.name().value() == "import")
+            .filter_map(|n| n.get(0).and_then(|v| v.as_string()).map(str::to_string))
+            .collect();
 
         let dependencies = doc
             .get("dependencies")
@@ -323,17 +387,34 @@ impl Document {
         }
 
         Ok(Document {
+            imports,
             dependencies,
             workspaces,
+            imported_deps: std::collections::HashSet::new(),
+            imported_workspaces: std::collections::HashSet::new(),
         })
     }
 
     fn to_kdl(&self) -> String {
         let mut doc = KdlDocument::new();
 
+        // Import lines first, so the file reads top-down: what it pulls in, then
+        // what it adds. Imported deps/workspaces are omitted below (they live in
+        // the imported files); a raw single-file document has empty provenance,
+        // so nothing is filtered.
+        for imp in &self.imports {
+            let mut node = KdlNode::new("import");
+            node.push(str_entry(imp));
+            doc.nodes_mut().push(node);
+        }
+
         let mut deps = KdlNode::new("dependencies");
         let mut children = KdlDocument::new();
-        for dep in &self.dependencies {
+        for dep in self
+            .dependencies
+            .iter()
+            .filter(|d| !self.imported_deps.contains(&d.name))
+        {
             let mut node = KdlNode::new(dep.name.clone());
             node.push(str_entry(&dep.source.to_kdl()));
             let mut sub = KdlDocument::new();
@@ -354,10 +435,17 @@ impl Document {
             }
             children.nodes_mut().push(node);
         }
-        deps.set_children(children);
-        doc.nodes_mut().push(deps);
+        // Omit an empty `dependencies` block (e.g. a file that only imports).
+        if !children.nodes().is_empty() {
+            deps.set_children(children);
+            doc.nodes_mut().push(deps);
+        }
 
-        for ws in &self.workspaces {
+        for ws in self
+            .workspaces
+            .iter()
+            .filter(|w| !self.imported_workspaces.contains(&w.id))
+        {
             doc.nodes_mut().push(workspace_kdl(ws));
         }
 
@@ -365,6 +453,60 @@ impl Document {
         // Lead with a modeline so `.wk` files highlight as KDL in editors.
         format!("{MODELINE}\n{doc}")
     }
+}
+
+/// Recursively merge `path` (and its imports) into `merged`. `is_import` is
+/// false for the top-level file (its content is "own") and true for anything
+/// pulled in via `import`. Dedup: a dependency name / workspace id already seen
+/// wins (so a local definition overrides an imported one, since a file's own
+/// content is merged before recursing into its imports).
+fn resolve_into(
+    path: &Path,
+    is_import: bool,
+    merged: &mut Document,
+    dep_names: &mut std::collections::HashSet<String>,
+    ws_ids: &mut std::collections::HashSet<NodeId>,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) -> Result<(), String> {
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(canon) {
+        return Ok(()); // already pulled in (a diamond, or a cycle)
+    }
+    let doc = Document::load(path)?;
+    if !is_import {
+        merged.imports = doc.imports.clone();
+    }
+    for dep in doc.dependencies {
+        if dep_names.insert(dep.name.clone()) {
+            if is_import {
+                merged.imported_deps.insert(dep.name.clone());
+            }
+            merged.dependencies.push(dep);
+        }
+    }
+    for ws in doc.workspaces {
+        // A deps-only file gets an auto-added blank workspace; don't let an
+        // import contribute a phantom empty tab.
+        let empty = ws.nodes.is_empty()
+            && ws.connections.is_empty()
+            && ws.midi.is_empty()
+            && ws.serves.is_empty()
+            && ws.net_links.is_empty();
+        if is_import && empty {
+            continue;
+        }
+        if ws_ids.insert(ws.id) {
+            if is_import {
+                merged.imported_workspaces.insert(ws.id);
+            }
+            merged.workspaces.push(ws);
+        }
+    }
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    for imp in doc.imports {
+        resolve_into(&base.join(&imp), true, merged, dep_names, ws_ids, visited)?;
+    }
+    Ok(())
 }
 
 fn num(v: &KdlValue) -> Option<f32> {
@@ -628,7 +770,7 @@ pub fn add(target: String, path: &Path) -> Result<(), String> {
 /// a dependency name (resolved to its local wasm) or a `.wasm` path; `reference`
 /// is the target, e.g. `localhost:5000/triangle:1.0`.
 pub fn publish(plugin: String, reference: String, path: &Path) -> Result<(), String> {
-    let wasm = Document::load(path)
+    let wasm = Document::load_resolved(path)
         .ok()
         .and_then(|d| d.dependencies.into_iter().find(|d| d.name == plugin))
         .map(|d| d.local_path())
@@ -639,16 +781,22 @@ pub fn publish(plugin: String, reference: String, path: &Path) -> Result<(), Str
     Ok(())
 }
 
-/// Print the file's dependencies.
+/// Print the dependencies available to the file — its own plus any pulled in via
+/// `import` (marked `(imported)`).
 pub fn list(path: &Path) -> Result<(), String> {
-    let doc = Document::load(path)?;
+    let doc = Document::load_resolved(path)?;
     if doc.dependencies.is_empty() {
         println!("(no dependencies; add one with `wk add <path>`)");
     }
     for dep in &doc.dependencies {
+        let tag = if doc.imported_deps.contains(&dep.name) {
+            "  (imported)"
+        } else {
+            ""
+        };
         match &dep.description {
-            Some(d) => println!("  {}  {}  — {d}", dep.name, dep.source.to_kdl()),
-            None => println!("  {}  {}", dep.name, dep.source.to_kdl()),
+            Some(d) => println!("  {}  {}  — {d}{tag}", dep.name, dep.source.to_kdl()),
+            None => println!("  {}  {}{tag}", dep.name, dep.source.to_kdl()),
         }
     }
     Ok(())
@@ -672,6 +820,93 @@ pub fn remove(name: String, path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_merges_for_running_and_save_preserves_the_composition() {
+        let dir = std::env::temp_dir().join("wk-import-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("root.wk");
+        let child = dir.join("child.wk");
+        // Root: deps only (no workspace). Child: imports root, adds its own dep
+        // and an own workspace.
+        std::fs::write(&root, "dependencies {\n  triangle \"a/tri.wasm\"\n}\n").unwrap();
+        let ws = NodeId::from_u128(42);
+        std::fs::write(
+            &child,
+            format!(
+                "import \"root.wk\"\ndependencies {{\n  synth \"b/synth.wasm\"\n}}\nworkspace \"{ws}\" {{\n}}\n"
+            ),
+        )
+        .unwrap();
+
+        // Running view: both deps present; root's is marked imported; the only
+        // workspace is the child's (root's auto-blank is skipped).
+        let doc = Document::load_resolved(&child).unwrap();
+        let names: Vec<&str> = doc.dependencies.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"synth") && names.contains(&"triangle"));
+        assert!(doc.imported_deps.contains("triangle"));
+        assert!(!doc.imported_deps.contains("synth"));
+        assert_eq!(doc.workspaces.len(), 1);
+        assert_eq!(doc.workspaces[0].id, ws);
+        assert_eq!(doc.imports, vec!["root.wk".to_string()]);
+
+        // Saving the resolved doc back preserves the import and does NOT inline
+        // the imported dependency.
+        doc.save(&child).unwrap();
+        let text = std::fs::read_to_string(&child).unwrap();
+        assert!(text.contains("import"), "import line preserved");
+        assert!(text.contains("synth"), "own dep kept");
+        assert!(!text.contains("triangle"), "imported dep not inlined");
+
+        // The raw single-file view still owns only its own dep + the import.
+        let raw = Document::load(&child).unwrap();
+        assert_eq!(raw.imports, vec!["root.wk".to_string()]);
+        assert_eq!(raw.dependencies.len(), 1);
+        assert_eq!(raw.dependencies[0].name, "synth");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repo_example_resolves_against_the_root_deps() {
+        // The shipped example imports the repo's deps-only root workspace.
+        let example = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example/live-coding.wk"
+        ));
+        let doc = Document::load_resolved(example).expect("example resolves");
+        let names: Vec<&str> = doc.dependencies.iter().map(|d| d.name.as_str()).collect();
+        // Deps come entirely from the import (root workspace.wk).
+        for want in ["shader", "vim", "piano"] {
+            assert!(names.contains(&want), "{want} available via import");
+            assert!(doc.imported_deps.contains(want), "{want} marked imported");
+        }
+        // The example's own workspace (with the host file wired in) is present.
+        assert_eq!(doc.workspaces.len(), 1);
+        let ws = &doc.workspaces[0];
+        assert!(ws.nodes.iter().any(
+            |n| matches!(&n.kind, SnapKind::HostFile { path } if path.ends_with("shader.wgsl"))
+        ));
+        assert_eq!(ws.connections.len(), 2, "host file wired to shader + vim");
+        assert_eq!(ws.midi.len(), 1, "piano wired to shader");
+    }
+
+    #[test]
+    fn imports_are_cycle_safe() {
+        let dir = std::env::temp_dir().join("wk-import-cycle");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.wk");
+        let b = dir.join("b.wk");
+        // a imports b, b imports a — must not loop forever.
+        std::fs::write(&a, "import \"b.wk\"\ndependencies {\n  aa \"a.wasm\"\n}\n").unwrap();
+        std::fs::write(&b, "import \"a.wk\"\ndependencies {\n  bb \"b.wasm\"\n}\n").unwrap();
+        let doc = Document::load_resolved(&a).unwrap();
+        let names: Vec<&str> = doc.dependencies.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"aa") && names.contains(&"bb"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn source_parse_and_roundtrip() {
@@ -702,6 +937,9 @@ mod tests {
             NodeId::new(),
         );
         let doc = Document {
+            imports: Vec::new(),
+            imported_deps: std::collections::HashSet::new(),
+            imported_workspaces: std::collections::HashSet::new(),
             dependencies: vec![
                 Dependency {
                     name: "triangle".into(),
@@ -979,8 +1217,11 @@ mod tests {
             prop::collection::vec(workspace_strat(), 1..3),
         )
             .prop_map(|(dependencies, workspaces)| Document {
+                imports: Vec::new(),
                 dependencies,
                 workspaces,
+                imported_deps: std::collections::HashSet::new(),
+                imported_workspaces: std::collections::HashSet::new(),
             })
     }
 

@@ -89,7 +89,9 @@ fn main() -> Result<(), String> {
 /// thread; a windowed run attaches the local UI client, a headless run attaches
 /// none and just keeps the server alive until Ctrl-C.
 fn run(file: &Path, headless: bool) -> Result<(), String> {
-    let doc = workspace::Document::load(file)?;
+    // Resolve `import`s into one merged document to run (the CLI edit commands
+    // use the raw single-file `load` instead).
+    let doc = workspace::Document::load_resolved(file)?;
     // Pull any OCI-artifact dependencies into the local cache before launching.
     for dep in &doc.dependencies {
         if let Err(e) = dep.ensure() {

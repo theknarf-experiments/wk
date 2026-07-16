@@ -484,6 +484,14 @@ pub struct Server {
     next_port: u16,
     file_seq: u32,
     host_seq: u32,
+
+    /// `import` directives from the loaded top-level `.wk` file, re-emitted on
+    /// save so the composition is preserved.
+    imports: Vec<String>,
+    /// Dependency names / workspace ids that came from an import — omitted on
+    /// save (they live in the imported files). See [`Document::load_resolved`].
+    imported_deps: HashSet<String>,
+    imported_workspaces: HashSet<NodeId>,
 }
 
 impl Server {
@@ -511,6 +519,9 @@ impl Server {
             next_port: 8080,
             file_seq: 0,
             host_seq: 0,
+            imports: doc.imports.clone(),
+            imported_deps: doc.imported_deps.clone(),
+            imported_workspaces: doc.imported_workspaces.clone(),
         };
         for ws in &doc.workspaces {
             server.instantiate(ws);
@@ -1347,9 +1358,15 @@ impl Server {
                 }
             })
             .collect();
+        // Carry the import provenance so `to_kdl` re-emits the `import` lines and
+        // omits imported deps/workspaces — an autosave preserves the composition
+        // rather than inlining every imported file.
         let doc = Document {
+            imports: self.imports.clone(),
             dependencies: self.graph.available.clone(),
             workspaces,
+            imported_deps: self.imported_deps.clone(),
+            imported_workspaces: self.imported_workspaces.clone(),
         };
         if let Err(e) = doc.save(&self.workspace_path) {
             eprintln!("failed to save workspace: {e}");
@@ -2021,6 +2038,9 @@ mod model_tests {
         let ghost = NodeId::new();
         let file = NodeId::new();
         let doc = Document {
+            imports: Vec::new(),
+            imported_deps: std::collections::HashSet::new(),
+            imported_workspaces: std::collections::HashSet::new(),
             dependencies: Vec::new(), // "ghost" isn't here
             workspaces: vec![Workspace {
                 id: ws,
