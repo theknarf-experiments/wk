@@ -56,6 +56,9 @@ enum Commands {
 
     /// Open a workspace (default workspace.wk)
     Run {
+        /// Workspace file to open. Overrides the global `--file`; defaults to
+        /// `workspace.wk`. So `wk run example/live-coding.wk` just works.
+        file: Option<PathBuf>,
         /// Run without a window: load and run the workspace, keep the guests
         /// alive, and exit on Ctrl-C. No rendering or OS input.
         #[arg(long)]
@@ -77,7 +80,10 @@ fn main() -> Result<(), String> {
         }
         Some(Commands::List) => workspace::list(file),
         Some(Commands::Remove { plugin }) => workspace::remove(plugin.clone(), file),
-        Some(Commands::Run { headless }) => run(file, *headless),
+        Some(Commands::Run {
+            file: run_file,
+            headless,
+        }) => run(run_file.as_deref().unwrap_or(file), *headless),
         None => {
             Cli::command().print_help().map_err(|e| e.to_string())?;
             Ok(())
