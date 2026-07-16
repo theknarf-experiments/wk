@@ -1,8 +1,12 @@
 //! The wk **workspace file**: a `.wk` file (KDL syntax; `workspace.wk` by
 //! default) holding a project's shared *dependencies* plus one or more
-//! *workspaces* (canvas tabs), each with its own id, nodes, and wiring.
+//! *workspaces* (canvas tabs), each with its own id, nodes, and wiring. It can
+//! also `import` other `.wk` files, pulling in their dependencies and
+//! workspaces (recursively) — so a project can split a shared dependency list
+//! from the setups that use it. See [`Document::load_resolved`].
 //!
 //! ```kdl
+//! import "../deps.wk"        // pull in another file's deps + workspaces
 //! dependencies {
 //!     triangle "plugins/triangle/.../triangle.wasm"
 //!     foo      "oci://ghcr.io/org/foo:1.0"
