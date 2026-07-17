@@ -10,6 +10,7 @@
 
 pub mod audio;
 pub mod auth;
+pub mod dockerfile;
 pub mod http;
 pub mod layers;
 pub mod midi;
