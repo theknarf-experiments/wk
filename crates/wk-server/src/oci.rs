@@ -30,7 +30,7 @@ fn client_for(image: &Reference) -> Client {
     Client::new(config)
 }
 
-fn cache_dir() -> PathBuf {
+pub(crate) fn cache_dir() -> PathBuf {
     std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
@@ -40,7 +40,7 @@ fn cache_dir() -> PathBuf {
 }
 
 /// Make a reference safe to use as a filename.
-fn sanitize(reference: &str) -> String {
+pub(crate) fn sanitize(reference: &str) -> String {
     reference
         .chars()
         .map(|c| {
