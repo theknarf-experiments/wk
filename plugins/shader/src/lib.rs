@@ -63,12 +63,51 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 "#;
 
 /// Rendered when nothing is wired in (and as a safe fallback if a shader fails
-/// to compile before any good one loads): a plain, static placeholder — dull on
-/// purpose, so the node reads as "empty, wire something in" rather than a demo.
+/// to compile before any good one loads): SMPTE broadcast colour bars — the old
+/// "no signal" TV test pattern, so an unconfigured node reads as "wire something
+/// in" rather than a demo. Static by design.
 const FALLBACK: &str = r#"
 fn main_image(uv: vec2<f32>) -> vec3<f32> {
-    let g = 0.10 + 0.04 * uv.y;
-    return vec3<f32>(g, g, g * 1.08);
+    let black = vec3<f32>(0.03, 0.03, 0.03);
+    let col = min(u32(floor(uv.x * 7.0)), 6u);
+
+    // Top ~67%: the seven 75%-amplitude colour bars.
+    if (uv.y < 0.67) {
+        var bars = array<vec3<f32>, 7>(
+            vec3<f32>(0.75, 0.75, 0.75), // gray
+            vec3<f32>(0.75, 0.75, 0.0),  // yellow
+            vec3<f32>(0.0, 0.75, 0.75),  // cyan
+            vec3<f32>(0.0, 0.75, 0.0),   // green
+            vec3<f32>(0.75, 0.0, 0.75),  // magenta
+            vec3<f32>(0.75, 0.0, 0.0),   // red
+            vec3<f32>(0.0, 0.0, 0.75),   // blue
+        );
+        return bars[col];
+    }
+
+    // Castellation strip (~8%): reversed primaries against black.
+    if (uv.y < 0.75) {
+        var strip = array<vec3<f32>, 7>(
+            vec3<f32>(0.0, 0.0, 0.75),   // blue
+            black,
+            vec3<f32>(0.75, 0.0, 0.75),  // magenta
+            black,
+            vec3<f32>(0.0, 0.75, 0.75),  // cyan
+            black,
+            vec3<f32>(0.75, 0.75, 0.75), // gray
+        );
+        return strip[col];
+    }
+
+    // Bottom ~25%: -I, white, +Q, then the PLUGE (sub-black / black / lighter).
+    if (uv.x < 1.0 / 7.0) { return vec3<f32>(0.0, 0.13, 0.30); }  // -I
+    if (uv.x < 2.0 / 7.0) { return vec3<f32>(1.0, 1.0, 1.0); }    // 100% white
+    if (uv.x < 3.0 / 7.0) { return vec3<f32>(0.20, 0.0, 0.36); }  // +Q
+    if (uv.x < 5.0 / 7.0) { return black; }
+    if (uv.x < 5.0 / 7.0 + 1.0 / 21.0) { return vec3<f32>(0.0, 0.0, 0.0); }    // sub-black
+    if (uv.x < 5.0 / 7.0 + 2.0 / 21.0) { return black; }                       // black
+    if (uv.x < 6.0 / 7.0) { return vec3<f32>(0.07, 0.07, 0.07); }              // +black
+    return black;
 }
 "#;
 
