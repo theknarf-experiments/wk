@@ -28,9 +28,8 @@ dependencies {
         description "the kilo text editor"
         args "welcome.txt"
     }
-    vim "plugins/vim/vim.wasm" {
-        description "the Vim text editor (unmodified upstream)"
-        args "-u" "NONE"
+    vim "docker://plugins/vim/Dockerfile" {
+        description "the Vim text editor (a wasm container: vim.wasm + its runtime)"
     }
     lua "plugins/lua/lua.wasm" {
         description "Lua interpreter REPL"
@@ -57,4 +56,6 @@ dependencies {
     http_hello "oci://ghcr.io/bytecodealliance/sample-wasi-http-rust/sample-wasi-http-rust:latest" {
         description "sample wasi:http server; serve it on a Port"
     }
+}
+workspace "01KXNW9K5HE8SA351748KG6GFA" {
 }

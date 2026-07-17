@@ -6,7 +6,7 @@ workspace "01KXKGB000000000000000WS00" {
     note "01KXKGB000000000000000NT07" {
         pos 60.0 60.0
         size 340.0 220.0
-        text "Terminals — unmodified C apps\ncompiled to WASI, in wk's\nterminal (raw mode over a\ncapability, live resize).\n\nvim and kilo share notes.txt:\nedit in one, reopen in the other.\nlua / sqlite / wsh are REPLs."
+        text "Terminals — unmodified C apps\ncompiled to WASI, in wk's\nterminal (raw mode over a\ncapability, live resize).\n\nvim runs as an OCI container\n(vim.wasm + runtime layers) —\ntry :help! vim and kilo share\nnotes.txt: edit in one, reopen\nin the other. lua / sqlite / wsh\nare REPLs."
     }
     node "wsh" "01KXKGB000000000000000SH05" {
         pos 500.0 60.0
