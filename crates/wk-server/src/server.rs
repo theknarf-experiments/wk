@@ -23,6 +23,9 @@ use wk_protocol::{Command, NodeId, NodeKind, Resource, ResourceRef, Wire};
 /// Default canvas size of a file / port / network node, in canvas pixels.
 pub const FILE_W: f32 = 130.0;
 pub const FILE_H: f32 = 44.0;
+/// Default size of a new note node.
+pub const NOTE_W: f32 = 220.0;
+pub const NOTE_H: f32 = 130.0;
 
 /// An in-memory canvas file node: a named shared buffer you wire into app nodes.
 pub struct VirtualFile {
@@ -158,6 +161,8 @@ pub struct View {
     pub win_size: HashMap<NodeId, [f32; 2]>,
     pub file_nodes: HashMap<NodeId, FileMeta>,
     pub host_ports: HashMap<NodeId, u16>,
+    /// Note nodes (canvas id -> the sticky-note text).
+    pub notes: HashMap<NodeId, String>,
     pub net_nodes: HashSet<NodeId>,
     pub gateways: HashSet<NodeId>,
     pub uplinks: HashMap<NodeId, UplinkMeta>,
@@ -215,6 +220,12 @@ impl View {
                 .iter()
                 .filter(|(id, _)| mine(id))
                 .map(|(&k, &v)| (k, v))
+                .collect(),
+            notes: self
+                .notes
+                .iter()
+                .filter(|(id, _)| mine(id))
+                .map(|(&k, v)| (k, v.clone()))
                 .collect(),
             net_nodes: self
                 .net_nodes
@@ -317,6 +328,7 @@ enum Undo {
     Size(NodeId, [f32; 2]),
     Args(NodeId, Vec<String>),
     Port(NodeId, u16),
+    Text(NodeId, String),
     /// Re-toggle a connection between two nodes (connect is its own inverse).
     Wire(NodeId, NodeId),
     /// Undo a "one destination per source" wire (net membership, serve): drop
@@ -373,6 +385,8 @@ pub enum Kind {
     Iroh,
     /// A Veilid uplink: like Iroh, over Veilid's onion-routed network.
     Veilid,
+    /// A yellow sticky note: a purely visual annotation, wired to nothing.
+    Note,
 }
 
 impl Kind {
@@ -411,6 +425,8 @@ pub struct Graph {
     pub file_nodes: HashMap<NodeId, FileNode>,
     /// HostPort nodes (canvas id -> localhost port).
     pub host_ports: HashMap<NodeId, u16>,
+    /// Note nodes' text (canvas id -> the sticky-note contents).
+    pub note_text: HashMap<NodeId, String>,
 
     /// File connections as (file id, app node id).
     pub connections: Vec<(NodeId, NodeId)>,
@@ -679,6 +695,13 @@ impl Server {
         self.graph.host_ports.insert(id, port);
     }
 
+    /// Add a yellow note (annotation) node, seeded with placeholder text.
+    fn add_note(&mut self, pos: [f32; 2], ws: NodeId) {
+        let id = self.alloc_id();
+        self.place(id, Kind::Note, ws, pos, [NOTE_W, NOTE_H]);
+        self.graph.note_text.insert(id, "note".to_string());
+    }
+
     /// Create a Network node at `pos`; returns its id.
     fn add_net_node(&mut self, pos: [f32; 2], ws: NodeId) -> NodeId {
         let id = self.alloc_id();
@@ -830,6 +853,8 @@ impl Server {
             Some(Kind::Network | Kind::Gateway) => self.remove_net_node(id),
             Some(Kind::Iroh | Kind::Veilid) => self.remove_uplink_node(id),
             Some(Kind::App) => self.close_node(id),
+            // A note wires to nothing and runs nothing; just drop it.
+            Some(Kind::Note) => self.forget(id),
             None => {}
         }
     }
@@ -898,7 +923,7 @@ impl Server {
             Some(Kind::Port) => NodeClass::Port,
             Some(Kind::Network | Kind::Gateway) => NodeClass::Net,
             Some(Kind::Iroh | Kind::Veilid) => NodeClass::Uplink,
-            Some(Kind::App) | None => NodeClass::Other,
+            Some(Kind::App) | Some(Kind::Note) | None => NodeClass::Other,
         }
     }
 
@@ -1183,6 +1208,7 @@ impl Server {
         self.graph.host_ports.remove(&id);
         self.graph.iroh_secrets.remove(&id);
         self.graph.veilid_ids.remove(&id);
+        self.graph.note_text.remove(&id);
     }
 
     /// Whether the given wire still connects two live nodes.
@@ -1454,6 +1480,11 @@ impl Server {
                         self.record(Undo::Port(*id, p));
                     }
                 }
+                if patch.text.is_some() {
+                    if let Some(t) = self.graph.note_text.get(id).cloned() {
+                        self.record(Undo::Text(*id, t));
+                    }
+                }
             }
             Command::Delete(ResourceRef::Node(id)) => {
                 if let Some(s) = self.snapshot(*id) {
@@ -1497,6 +1528,7 @@ impl Server {
                 NodeKind::Gateway => self.add_gateway_node(pos, ws),
                 NodeKind::Iroh => self.add_iroh_node(pos, ws),
                 NodeKind::Veilid => self.add_veilid_node(pos, ws),
+                NodeKind::Note => self.add_note(pos, ws),
             },
             // Create is create only: a wire that already exists is left alone
             // (removal is Delete, so a create-only token can never disconnect).
@@ -1519,6 +1551,11 @@ impl Server {
                 if let Some(delta) = patch.port_delta {
                     self.change_port(id, delta);
                 }
+                if let Some(text) = patch.text {
+                    if self.graph.note_text.contains_key(&id) {
+                        self.graph.note_text.insert(id, text);
+                    }
+                }
             }
             Command::Delete(ResourceRef::Node(id)) => self.remove_any(id),
             Command::Delete(ResourceRef::Wire(w)) => self.disconnect_wire(w),
@@ -1540,6 +1577,7 @@ impl Server {
             (Some(Undo::Pos(a, _)), Undo::Pos(b, _)) => a == b,
             (Some(Undo::Size(a, _)), Undo::Size(b, _)) => a == b,
             (Some(Undo::Args(a, _)), Undo::Args(b, _)) => a == b,
+            (Some(Undo::Text(a, _)), Undo::Text(b, _)) => a == b,
             _ => false,
         };
         if coalesce {
@@ -1567,6 +1605,11 @@ impl Server {
                 // the persisted args.
                 if self.graph.nodes.contains_key(&id) {
                     self.set_node_args(id, &a.join(" "));
+                }
+            }
+            Undo::Text(id, t) => {
+                if self.graph.note_text.contains_key(&id) {
+                    self.graph.note_text.insert(id, t);
                 }
             }
             Undo::Port(id, port) => {
@@ -1646,6 +1689,9 @@ impl Server {
             Kind::Veilid => SnapKind::Veilid {
                 secret: self.graph.veilid_ids.get(&id).cloned(),
                 peer: self.peer_ticket(id),
+            },
+            Kind::Note => SnapKind::Note {
+                text: self.graph.note_text.get(&id).cloned().unwrap_or_default(),
             },
         };
         Some(NodeSnap {
@@ -1817,6 +1863,10 @@ impl Server {
                     self.set_node_args(s.id, peer);
                 }
             }
+            SnapKind::Note { text } => {
+                self.place(s.id, Kind::Note, ws, s.pos, s.size);
+                self.graph.note_text.insert(s.id, text.clone());
+            }
         }
     }
 
@@ -1944,6 +1994,7 @@ impl Server {
             win_size,
             file_nodes,
             host_ports: self.graph.host_ports.clone(),
+            notes: self.graph.note_text.clone(),
             net_nodes,
             gateways,
             uplinks,
@@ -2330,6 +2381,7 @@ mod model_tests {
                     size: Some([3.0, 4.0]),
                     args: Some("ghost".into()),
                     port_delta: None,
+                    text: None,
                 },
             }),
             Op::Undo => s.apply(Command::Undo),

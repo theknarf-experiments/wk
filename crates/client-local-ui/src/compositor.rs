@@ -22,7 +22,7 @@ use crate::text::Fonts;
 use wk_protocol::{Command, NodeId, NodeKind, NodePatch, Resource, ResourceRef, Wire};
 use wk_server::plugin::{Key, KeyEvent, PointerEvent, ResizeEvent, SharedNode, SharedSurface};
 use wk_server::runtime::ServerHandle;
-use wk_server::server::{View, FILE_H, FILE_W};
+use wk_server::server::{View, FILE_H, FILE_W, NOTE_H, NOTE_W};
 use wk_server::terminal::CellView;
 
 const FRAME: Duration = Duration::from_nanos(1_000_000_000 / 60);
@@ -417,6 +417,7 @@ enum PaletteCmd {
     AddGateway,
     AddIroh,
     AddVeilid,
+    AddNote,
     NewWorkspace,
     CloseWorkspace,
     /// Jump the camera to this zoom factor.
@@ -492,6 +493,14 @@ const FILE_BORDER: [f32; 4] = [0.55, 0.45, 0.25, 1.0];
 /// from in-memory VirtualFiles.
 const HOSTFILE_BG: [f32; 4] = [0.10, 0.14, 0.22, 1.0];
 const HOSTFILE_BORDER: [f32; 4] = [0.30, 0.45, 0.65, 1.0];
+/// Note nodes: a warm yellow sticky, dark text, for annotations.
+const NOTE_BG: [f32; 4] = [0.93, 0.86, 0.42, 1.0];
+const NOTE_BORDER: [f32; 4] = [0.72, 0.62, 0.18, 1.0];
+const NOTE_TEXT: [f32; 4] = [0.14, 0.12, 0.05, 1.0];
+/// A slightly deeper yellow drag strip along a note's top edge.
+const NOTE_GRIP: [f32; 4] = [0.86, 0.76, 0.30, 1.0];
+/// Height (canvas units) of a note's top drag strip; below it, the body edits.
+const NOTE_GRAB: f32 = 16.0;
 const PORT_COL: [f32; 4] = [0.70, 0.72, 0.80, 1.0];
 /// Input-port (left, target) dot — dimmer than the output port you drag from.
 const PORT_IN_COL: [f32; 4] = [0.42, 0.44, 0.52, 1.0];
@@ -738,6 +747,8 @@ struct App {
     kbd_focus: Option<NodeId>,
     /// When editing an idle node's args: its id and the in-progress text.
     editing_args: Option<(NodeId, String)>,
+    /// When editing a note's text: its id and the in-progress text.
+    editing_note: Option<(NodeId, String)>,
     /// When inspecting a node's virtual filesystem (a modal overlay).
     inspect: Option<Inspector>,
     /// System clipboard, for pasting into the args/ticket field and the
@@ -803,6 +814,7 @@ impl App {
             z: Vec::new(),
             kbd_focus: None,
             editing_args: None,
+            editing_note: None,
             inspect: None,
             clipboard: arboard::Clipboard::new().ok(),
             drag: None,
@@ -1156,6 +1168,11 @@ impl App {
             PaletteCmd::AddVeilid,
         ));
         v.push(PaletteRow::new(
+            "Add Note",
+            d("a yellow sticky note for annotations"),
+            PaletteCmd::AddNote,
+        ));
+        v.push(PaletteRow::new(
             "New Workspace  (Cmd+T)",
             None,
             PaletteCmd::NewWorkspace,
@@ -1254,6 +1271,44 @@ impl App {
             _ => {
                 if let (Some((_, s)), Some(t)) = (self.editing_args.as_mut(), text) {
                     for ch in t.chars().filter(|c| !c.is_control()) {
+                        s.push(ch);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Send the in-progress note edit to the server and stop editing.
+    fn commit_note(&mut self) {
+        if let Some((id, text)) = self.editing_note.take() {
+            self.conn.send(Command::Update {
+                id,
+                patch: NodePatch {
+                    text: Some(text),
+                    ..Default::default()
+                },
+            });
+        }
+    }
+
+    /// Handle a key press while editing a note's text. Enter inserts a newline
+    /// (notes are multi-line); Escape commits and stops editing.
+    fn editing_note_key(&mut self, code: KeyCode, text: Option<&str>) {
+        match code {
+            KeyCode::Escape => self.commit_note(),
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                if let Some((_, s)) = self.editing_note.as_mut() {
+                    s.push('\n');
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some((_, s)) = self.editing_note.as_mut() {
+                    s.pop();
+                }
+            }
+            _ => {
+                if let (Some((_, s)), Some(t)) = (self.editing_note.as_mut(), text) {
+                    for ch in t.chars().filter(|c| *c == '\n' || !c.is_control()) {
                         s.push(ch);
                     }
                 }
@@ -1374,6 +1429,14 @@ impl App {
                 let pos = self.view_center([FILE_W, FILE_H], self.view.uplinks.len());
                 self.conn.send(Command::Create(Resource::Node {
                     kind: NodeKind::Veilid,
+                    pos,
+                    ws,
+                }));
+            }
+            PaletteCmd::AddNote => {
+                let pos = self.view_center([NOTE_W, NOTE_H], self.view.notes.len());
+                self.conn.send(Command::Create(Resource::Node {
+                    kind: NodeKind::Note,
                     pos,
                     ws,
                 }));
@@ -1567,6 +1630,101 @@ impl App {
             clip,
         );
         draw_ports(quads, gfx.renderer.circle, w.r, zf, mp, full);
+    }
+
+    /// Draw a yellow sticky note: word-wrapped text on a warm panel, with a close
+    /// button but no ports (a note wires to nothing). `editing` appends a caret.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_note(
+        &mut self,
+        quads: &mut Vec<Quad>,
+        gfx: &mut Gfx,
+        white: TextureId,
+        zf: f32,
+        r: [f32; 4],
+        clip: [f32; 4],
+        mp: [f32; 2],
+        text: &str,
+        editing: bool,
+    ) {
+        quads.push(Quad::solid(white, r, NOTE_BORDER, clip));
+        let body = [
+            r[0] + BORDER * zf,
+            r[1] + BORDER * zf,
+            r[2] - BORDER * zf,
+            r[3] - BORDER * zf,
+        ];
+        quads.push(Quad::solid(white, body, NOTE_BG, clip));
+        // A deeper-yellow top strip: the drag handle (the body below edits).
+        let grip = [body[0], body[1], body[2], r[1] + NOTE_GRAB * zf];
+        quads.push(Quad::solid(white, grip, NOTE_GRIP, clip));
+
+        let lh = gfx.fonts.line_height() as f32;
+        let pad = PAD * zf;
+        let max_units = (((r[2] - r[0]) - 2.0 * pad) / zf).max(1.0);
+        let shown = if editing {
+            format!("{text}\u{2588}")
+        } else {
+            text.to_string()
+        };
+        // Word-wrap (honoring explicit newlines) up front, so measuring the font
+        // doesn't overlap the mutable renderer borrow used to draw.
+        let mut lines: Vec<String> = Vec::new();
+        for para in shown.split('\n') {
+            let mut cur = String::new();
+            for word in para.split(' ') {
+                let cand = if cur.is_empty() {
+                    word.to_string()
+                } else {
+                    format!("{cur} {word}")
+                };
+                if cur.is_empty() || (gfx.fonts.measure(&cand) as f32) <= max_units {
+                    cur = cand;
+                } else {
+                    lines.push(std::mem::take(&mut cur));
+                    cur = word.to_string();
+                }
+            }
+            lines.push(cur);
+        }
+        let mut y = r[1] + NOTE_GRAB * zf + pad * 0.5;
+        for line in &lines {
+            if y + lh * zf > r[3] {
+                break; // clip overflow to the note's height
+            }
+            self.text_cache.draw(
+                quads,
+                &mut gfx.renderer,
+                &gfx.fonts,
+                &gfx.device,
+                &gfx.queue,
+                line,
+                r[0] + pad,
+                y,
+                zf,
+                NOTE_TEXT,
+                clip,
+            );
+            y += lh * zf;
+        }
+
+        let cb = close_btn(r, zf);
+        if contains(cb, mp) {
+            quads.push(Quad::solid(white, cb, CLOSE_HOT, clip));
+        }
+        self.text_cache.draw(
+            quads,
+            &mut gfx.renderer,
+            &gfx.fonts,
+            &gfx.device,
+            &gfx.queue,
+            "x",
+            cb[0] + (cb[2] - cb[0]) * 0.28,
+            cb[1] + (cb[3] - cb[1]) * 0.05,
+            zf * 0.8,
+            NOTE_TEXT,
+            clip,
+        );
     }
 
     /// Draw a terminal cell grid, scaled uniformly to fit `area`, clipped to
@@ -1778,6 +1936,11 @@ impl App {
                 self.editing_args = None;
             }
         }
+        if let Some((id, _)) = &self.editing_note {
+            if !self.view.win_pos.contains_key(id) {
+                self.editing_note = None;
+            }
+        }
         if self
             .kbd_focus
             .is_some_and(|id| !self.view.win_pos.contains_key(&id))
@@ -1936,6 +2099,17 @@ impl App {
 
         if down_edge && self.drag.is_none() {
             let mut consumed = false;
+            // A click anywhere but the currently-edited note's body commits that
+            // note's text (a click on it keeps editing).
+            if let Some((eid, _)) = self.editing_note.clone() {
+                let er = self.rect_of(eid);
+                let same = self.topmost_under(mp) == Some(eid)
+                    && !contains(close_btn(er, zf), mp)
+                    && mp[1] >= er[1] + NOTE_GRAB * zf;
+                if !same {
+                    self.commit_note();
+                }
+            }
             // Any fresh click clears the wire selection; a click that lands on a
             // wire (empty-canvas branch below) re-selects it.
             self.wire_sel = None;
@@ -2055,7 +2229,27 @@ impl App {
                     let is_port = self.view.host_ports.contains_key(&id);
                     let is_net = self.view.net_nodes.contains(&id);
                     let is_uplink = self.view.uplinks.contains_key(&id);
-                    if is_file || is_port || is_net || is_uplink {
+                    let is_note = self.view.notes.contains_key(&id);
+                    if is_note {
+                        // Note: close (top-right), drag from the top strip, or
+                        // click the body to edit the text.
+                        if contains(close_btn(r, zf), mp) {
+                            self.conn.send(Command::Delete(ResourceRef::Node(id)));
+                        } else if mp[1] < r[1] + NOTE_GRAB * zf {
+                            let mc = self.cam.to_canvas(mp);
+                            let p = self.view.win_pos[&id];
+                            self.drag = Some(Drag {
+                                id,
+                                mode: DragMode::Move,
+                                grab: [mc[0] - p[0], mc[1] - p[1]],
+                            });
+                        } else if !matches!(&self.editing_note, Some((eid, _)) if *eid == id) {
+                            // Start editing (a click on an already-editing note
+                            // keeps its in-progress buffer).
+                            let cur = self.view.notes.get(&id).cloned().unwrap_or_default();
+                            self.editing_note = Some((id, cur));
+                        }
+                    } else if is_file || is_port || is_net || is_uplink {
                         // Canvas widget nodes (file / HostPort / Network / Iroh):
                         // close, adjust port (HostPort −/+ buttons), edit the
                         // peer ticket (Iroh, lower half), or move.
@@ -2530,6 +2724,16 @@ impl App {
                         status_scale: 0.7,
                     },
                 );
+                continue;
+            }
+
+            // A note: a yellow annotation panel (no ports, no title bar).
+            if let Some(note_text) = self.view.notes.get(&id) {
+                let (text, editing) = match &self.editing_note {
+                    Some((eid, buf)) if *eid == id => (buf.clone(), true),
+                    _ => (note_text.clone(), false),
+                };
+                self.draw_note(&mut quads, &mut gfx, white, zf, r, clip, mp, &text, editing);
                 continue;
             }
 
@@ -3504,13 +3708,19 @@ impl ApplicationHandler for App {
                         && (self.mods.super_key() || self.mods.control_key())
                         && code == KeyCode::KeyV;
                     // Paste into whichever text field is capturing input.
-                    if paste && (self.palette_open || self.editing_args.is_some()) {
+                    if paste
+                        && (self.palette_open
+                            || self.editing_args.is_some()
+                            || self.editing_note.is_some())
+                    {
                         if let Some(text) = self.clipboard_text() {
                             if self.palette_open {
                                 self.palette_query.push_str(&text);
                                 self.palette_sel = 0;
                                 self.palette_scroll = 0.0;
                             } else if let Some((_, s)) = self.editing_args.as_mut() {
+                                s.push_str(&text);
+                            } else if let Some((_, s)) = self.editing_note.as_mut() {
                                 s.push_str(&text);
                             }
                         }
@@ -3572,6 +3782,13 @@ impl ApplicationHandler for App {
                     if self.editing_args.is_some() {
                         if pressed {
                             self.editing_args_key(code, event.text.as_deref());
+                        }
+                        return;
+                    }
+                    // While editing a note, keystrokes edit its text.
+                    if self.editing_note.is_some() {
+                        if pressed {
+                            self.editing_note_key(code, event.text.as_deref());
                         }
                         return;
                     }

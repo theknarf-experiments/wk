@@ -188,6 +188,8 @@ pub enum SnapKind {
         secret: Option<String>,
         peer: Option<String>,
     },
+    /// A yellow sticky note: purely visual annotation, wired to nothing.
+    Note { text: String },
 }
 
 /// Hex-encode an uplink secret for persistence.
@@ -579,7 +581,10 @@ fn workspace_kdl(ws: &Workspace) -> KdlNode {
 fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
     // Named kinds (`node "<name>" <id>`) carry the name first; the rest are
     // `<kind> <id>`.
-    let named = matches!(n.name().value(), "node" | "virtualfile" | "hostfile");
+    let named = matches!(
+        n.name().value(),
+        "node" | "virtualfile" | "hostfile" | "note"
+    );
     let id = node_id(n.get(if named { 1 } else { 0 })?)?;
     let ch = n.children()?;
     let text = |name: &str| {
@@ -614,6 +619,9 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
         },
         "hostfile" => SnapKind::HostFile {
             path: PathBuf::from(n.get(0)?.as_string()?),
+        },
+        "note" => SnapKind::Note {
+            text: n.get(0)?.as_string()?.to_string(),
         },
         // Reject an out-of-range port (drop the node) rather than truncate it:
         // a hand-edited `port 99999` should not silently become 34463.
@@ -657,15 +665,19 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         SnapKind::Net { gateway: true } => "gateway",
         SnapKind::Iroh { .. } => "iroh",
         SnapKind::Veilid { .. } => "veilid",
+        SnapKind::Note { .. } => "note",
     };
     let mut node = KdlNode::new(name);
-    // Named kinds lead with the name, then the id.
+    // Named kinds lead with the name (or note text), then the id.
     match &s.kind {
         SnapKind::App { name, .. } | SnapKind::VirtualFile { name } => {
             node.push(str_entry(name));
         }
         SnapKind::HostFile { path } => {
             node.push(str_entry(&path.to_string_lossy()));
+        }
+        SnapKind::Note { text } => {
+            node.push(str_entry(text));
         }
         _ => {}
     }
@@ -1171,6 +1183,7 @@ mod tests {
             any::<bool>().prop_map(|gateway| SnapKind::Net { gateway }),
             uplink_fields().prop_map(|(secret, peer)| SnapKind::Iroh { secret, peer }),
             uplink_fields().prop_map(|(secret, peer)| SnapKind::Veilid { secret, peer }),
+            value_str().prop_map(|text| SnapKind::Note { text }),
         ]
     }
 

@@ -122,6 +122,8 @@ pub enum NodeKind {
     /// A Veilid uplink: extends a Network to a remote fabric over Veilid's
     /// onion-routed p2p network.
     Veilid,
+    /// A yellow sticky note — a purely visual annotation, wired to nothing.
+    Note,
 }
 
 /// A resource to create.
@@ -162,6 +164,8 @@ pub struct NodePatch {
     pub args: Option<String>,
     /// Nudge a HostPort's localhost port by this delta (requires `Update`).
     pub port_delta: Option<i32>,
+    /// Set a note node's text (requires `Update`).
+    pub text: Option<String>,
 }
 
 /// A mutation a client asks the server to perform: create/update/delete on a
