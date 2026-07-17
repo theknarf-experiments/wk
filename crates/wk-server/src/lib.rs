@@ -11,6 +11,7 @@
 pub mod audio;
 pub mod auth;
 pub mod http;
+pub mod layers;
 pub mod midi;
 pub mod oci;
 pub mod options;

@@ -53,6 +53,12 @@ enum Node {
     /// node connected to this app): reads and writes hit the actual path, so
     /// they persist and are visible to the host.
     Host(std::path::PathBuf),
+    /// An immutable file from a filesystem layer (an OCI image layer or a local
+    /// layer source). The bytes are `Arc`-shared with every other node running
+    /// the same layer and never mutated: a write first replaces this with a
+    /// private [`Node::File`] copy (file-granularity copy-up, like overlayfs —
+    /// see [`Fs::copy_up`]).
+    RoFile(Arc<Vec<u8>>),
 }
 
 const ROOT: u64 = 0;
@@ -96,6 +102,116 @@ impl Fs {
             children.insert(name.to_string(), id);
         }
     }
+
+    /// If `id` is a read-only layer file, replace it in place with a private
+    /// mutable copy of its bytes (file-granularity copy-up, like overlayfs).
+    /// The shared layer bytes are untouched; every write path calls this first.
+    fn copy_up(&mut self, id: u64) {
+        if let Some(Node::RoFile(bytes)) = self.nodes.get(&id) {
+            let private = bytes.as_ref().clone();
+            self.nodes.insert(id, Node::File(private));
+        }
+    }
+
+    // ---- path-level helpers for applying filesystem layers (crate::layers) ----
+
+    /// Resolve the directory at `path`, creating missing components. `None` if a
+    /// component already exists as a file, or the fs is at capacity.
+    pub(crate) fn ensure_dir_path(&mut self, path: &str) -> Option<u64> {
+        let mut cur = ROOT;
+        for comp in components(path) {
+            let existing = match self.nodes.get(&cur) {
+                Some(Node::Dir(children)) => children.get(comp).copied(),
+                _ => return None,
+            };
+            cur = match existing {
+                Some(id) => match self.nodes.get(&id) {
+                    Some(Node::Dir(_)) => id,
+                    _ => return None,
+                },
+                None => {
+                    if self.at_capacity() {
+                        return None;
+                    }
+                    let id = self.alloc(Node::Dir(BTreeMap::new()));
+                    if let Some(Node::Dir(children)) = self.nodes.get_mut(&cur) {
+                        children.insert(comp.to_string(), id);
+                    }
+                    id
+                }
+            };
+        }
+        Some(cur)
+    }
+
+    /// Place a shared read-only layer file at `path`, creating parent
+    /// directories and replacing any existing entry (a later layer wins).
+    pub(crate) fn put_ro_file_at(&mut self, path: &str, bytes: Arc<Vec<u8>>) {
+        let comps = components(path);
+        let Some((name, dirs)) = comps.split_last() else {
+            return;
+        };
+        let Some(parent) = self.ensure_dir_path(&dirs.join("/")) else {
+            return;
+        };
+        if self.at_capacity() {
+            return;
+        }
+        self.remove_path_in(parent, name);
+        let id = self.alloc(Node::RoFile(bytes));
+        if let Some(Node::Dir(children)) = self.nodes.get_mut(&parent) {
+            children.insert((*name).to_string(), id);
+        }
+    }
+
+    /// Remove the entry at `path` (recursively for a directory). A missing path
+    /// is a no-op — an OCI whiteout may target something no layer provided.
+    pub(crate) fn remove_path(&mut self, path: &str) {
+        let comps = components(path);
+        let Some((name, dirs)) = comps.split_last() else {
+            return;
+        };
+        if let Some(parent) = resolve(self, ROOT, &dirs.join("/")) {
+            self.remove_path_in(parent, name);
+        }
+    }
+
+    /// Remove every child of the directory at `path` (an OCI opaque marker).
+    pub(crate) fn clear_dir_at(&mut self, path: &str) {
+        if let Some(id) = resolve(self, ROOT, path) {
+            let children: Vec<u64> = match self.nodes.get_mut(&id) {
+                Some(Node::Dir(c)) => {
+                    let ids = c.values().copied().collect();
+                    c.clear();
+                    ids
+                }
+                _ => return,
+            };
+            for child in children {
+                self.drop_subtree(child);
+            }
+        }
+    }
+
+    /// Detach child `name` of `parent` and drop its whole subtree.
+    fn remove_path_in(&mut self, parent: u64, name: &str) {
+        let removed = match self.nodes.get_mut(&parent) {
+            Some(Node::Dir(children)) => children.remove(name),
+            _ => None,
+        };
+        if let Some(id) = removed {
+            self.drop_subtree(id);
+        }
+    }
+
+    /// Drop `id` and, if it is a directory, everything under it.
+    fn drop_subtree(&mut self, id: u64) {
+        if let Some(Node::Dir(children)) = self.nodes.remove(&id) {
+            for (_, child) in children {
+                self.drop_subtree(child);
+            }
+        }
+    }
 }
 
 pub type SharedFs = Arc<Mutex<Fs>>;
@@ -120,6 +236,7 @@ impl Fs {
     fn file_len(&self, id: u64) -> usize {
         match self.nodes.get(&id) {
             Some(Node::File(d)) => d.len(),
+            Some(Node::RoFile(d)) => d.len(),
             Some(Node::Shared(sh)) => sh.lock().unwrap().len(),
             Some(Node::Host(p)) => std::fs::metadata(p).map(|m| m.len() as usize).unwrap_or(0),
             _ => 0,
@@ -152,6 +269,7 @@ impl Fs {
         let id = resolve(self, ROOT, path)?;
         match self.nodes.get(&id)? {
             Node::File(d) => Some(d.iter().take(cap).copied().collect()),
+            Node::RoFile(d) => Some(d.iter().take(cap).copied().collect()),
             Node::Shared(sh) => Some(sh.lock().unwrap().iter().take(cap).copied().collect()),
             Node::Host(p) => {
                 use std::io::Read;
@@ -254,6 +372,7 @@ impl Pollable for VfsOutputStream {
 impl OutputStream for VfsOutputStream {
     fn write(&mut self, bytes: Bytes) -> std::result::Result<(), StreamError> {
         let mut fs = self.fs.lock().unwrap();
+        fs.copy_up(self.node);
         match fs.nodes.get_mut(&self.node) {
             Some(Node::File(data)) => {
                 write_at(data, self.offset, &bytes).map_err(|_| StreamError::Closed)?;
@@ -433,6 +552,8 @@ fn err<T>(code: ErrorCode) -> Result<std::result::Result<T, ErrorCode>> {
 /// callers can act without holding the filesystem lock.
 enum Kind {
     File,
+    /// An immutable layer file (reads serve the shared bytes; writes copy up).
+    Ro(Arc<Vec<u8>>),
     Shared(SharedFile),
     Host(std::path::PathBuf),
     Dir,
@@ -450,6 +571,7 @@ impl HostState {
     fn kind(fs: &SharedFs, node: u64) -> Kind {
         match fs.lock().unwrap().nodes.get(&node) {
             Some(Node::File(_)) => Kind::File,
+            Some(Node::RoFile(d)) => Kind::Ro(d.clone()),
             Some(Node::Shared(sh)) => Kind::Shared(sh.clone()),
             Some(Node::Host(p)) => Kind::Host(p.clone()),
             Some(Node::Dir(_)) => Kind::Dir,
@@ -491,6 +613,10 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
                 let start = (offset as usize).min(data.len());
                 Bytes::copy_from_slice(&data[start..])
             }
+            Kind::Ro(d) => {
+                let start = (offset as usize).min(d.len());
+                Bytes::copy_from_slice(&d[start..])
+            }
             Kind::Shared(sh) => {
                 let d = sh.lock().unwrap();
                 let start = (offset as usize).min(d.len());
@@ -515,7 +641,8 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
     ) -> Result<std::result::Result<Resource<DynOutputStream>, ErrorCode>> {
         let (fs, node) = self.fd_fs(&fd)?;
         let stream: DynOutputStream = match Self::kind(&fs, node) {
-            Kind::File => Box::new(VfsOutputStream { fs, node, offset }),
+            // A layer file copy-ups on the stream's first write.
+            Kind::File | Kind::Ro(_) => Box::new(VfsOutputStream { fs, node, offset }),
             Kind::Shared(data) => Box::new(SharedOutputStream { data, offset }),
             Kind::Host(path) => Box::new(HostOutputStream { path, offset }),
             _ => return err(ErrorCode::IsDirectory),
@@ -529,11 +656,16 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
     ) -> Result<std::result::Result<Resource<DynOutputStream>, ErrorCode>> {
         let (fs, node) = self.fd_fs(&fd)?;
         let stream: DynOutputStream = match Self::kind(&fs, node) {
-            Kind::File => {
-                let offset = fs.lock().unwrap().nodes.get(&node).map_or(0, |n| match n {
-                    Node::File(d) => d.len() as u64,
-                    _ => 0,
-                });
+            Kind::File | Kind::Ro(_) => {
+                // Append needs the private copy's length; copy up now.
+                let offset = {
+                    let mut g = fs.lock().unwrap();
+                    g.copy_up(node);
+                    g.nodes.get(&node).map_or(0, |n| match n {
+                        Node::File(d) => d.len() as u64,
+                        _ => 0,
+                    })
+                };
                 Box::new(VfsOutputStream { fs, node, offset })
             }
             Kind::Shared(data) => {
@@ -565,6 +697,7 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
                 };
                 Ok(Ok(read_at(data, offset, len)))
             }
+            Kind::Ro(d) => Ok(Ok(read_at(&d, offset, len))),
             Kind::Shared(sh) => Ok(Ok(read_at(&sh.lock().unwrap(), offset, len))),
             Kind::Host(p) => Ok(Ok(read_at(&host_read(&p), offset, len))),
             Kind::Dir => err(ErrorCode::IsDirectory),
@@ -580,8 +713,9 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
     ) -> Result<std::result::Result<Filesize, ErrorCode>> {
         let (fs, node) = self.fd_fs(&fd)?;
         match Self::kind(&fs, node) {
-            Kind::File => {
+            Kind::File | Kind::Ro(_) => {
                 let mut g = fs.lock().unwrap();
+                g.copy_up(node);
                 let Some(Node::File(data)) = g.nodes.get_mut(&node) else {
                     return err(ErrorCode::NoEntry);
                 };
@@ -705,8 +839,10 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
             _ => return err(ErrorCode::FileTooLarge),
         };
         match Self::kind(&fs, node) {
-            Kind::File => {
-                if let Some(Node::File(data)) = fs.lock().unwrap().nodes.get_mut(&node) {
+            Kind::File | Kind::Ro(_) => {
+                let mut g = fs.lock().unwrap();
+                g.copy_up(node);
+                if let Some(Node::File(data)) = g.nodes.get_mut(&node) {
                     data.resize(size, 0);
                 }
                 Ok(Ok(()))
@@ -750,6 +886,9 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
                     if oflags.contains(OpenFlags::TRUNCATE) {
                         match g.nodes.get_mut(&id) {
                             Some(Node::File(data)) => data.clear(),
+                            Some(Node::RoFile(_)) => {
+                                g.nodes.insert(id, Node::File(Vec::new()));
+                            }
                             Some(Node::Shared(sh)) => sh.lock().unwrap().clear(),
                             // Truncate (or create) the backing host file to empty.
                             Some(Node::Host(p)) => {
@@ -980,6 +1119,7 @@ impl HostState {
 fn stat_node(fs: &Fs, id: u64) -> Option<DescriptorStat> {
     let (ty, size) = match fs.nodes.get(&id)? {
         Node::File(data) => (DescriptorType::RegularFile, data.len() as u64),
+        Node::RoFile(data) => (DescriptorType::RegularFile, data.len() as u64),
         Node::Dir(_) => (DescriptorType::Directory, 0),
         Node::Shared(sh) => (DescriptorType::RegularFile, sh.lock().unwrap().len() as u64),
         Node::Host(p) => (DescriptorType::RegularFile, host_size(p)),
@@ -1095,6 +1235,86 @@ mod tests {
         unmount_file(&a, "chan");
         assert!(resolve(&a.lock().unwrap(), ROOT, "/chan").is_none());
         assert!(resolve(&b.lock().unwrap(), ROOT, "/chan").is_some());
+    }
+
+    #[test]
+    fn ro_file_reads_and_stats_like_a_file() {
+        // A layer-backed read-only file is indistinguishable from a private one
+        // on the read paths: size, preview, listing.
+        let fs = new_fs();
+        let bytes: Arc<Vec<u8>> = Arc::new(b"from a layer".to_vec());
+        fs.lock()
+            .unwrap()
+            .add_child(ROOT, "ro", Node::RoFile(bytes.clone()));
+        let g = fs.lock().unwrap();
+        let node = resolve(&g, ROOT, "/ro").expect("resolves");
+        assert_eq!(stat_node(&g, node).unwrap().size, 12);
+        assert_eq!(
+            g.read_file("/ro", 1024).as_deref(),
+            Some(&b"from a layer"[..])
+        );
+        assert_eq!(g.list_dir("").unwrap()[0].size, 12);
+    }
+
+    #[test]
+    fn copy_up_detaches_from_the_shared_layer() {
+        // Two filesystems share one layer file (same Arc). Writing in one
+        // copies up to a private file; the other still sees the layer bytes,
+        // and the layer itself is never mutated.
+        let bytes: Arc<Vec<u8>> = Arc::new(b"immutable".to_vec());
+        let a = new_fs();
+        let b = new_fs();
+        a.lock()
+            .unwrap()
+            .add_child(ROOT, "f", Node::RoFile(bytes.clone()));
+        b.lock()
+            .unwrap()
+            .add_child(ROOT, "f", Node::RoFile(bytes.clone()));
+
+        {
+            let mut g = a.lock().unwrap();
+            let id = resolve(&g, ROOT, "/f").unwrap();
+            g.copy_up(id);
+            match g.nodes.get_mut(&id) {
+                Some(Node::File(data)) => {
+                    write_at(data, 0, b"MUTATED!!").unwrap();
+                }
+                other => panic!(
+                    "copy_up should yield a private File, got {:?}",
+                    other.is_some()
+                ),
+            }
+        }
+        // A sees its private mutation; B still reads the untouched layer bytes.
+        assert_eq!(
+            a.lock().unwrap().read_file("/f", 64).as_deref(),
+            Some(&b"MUTATED!!"[..])
+        );
+        assert_eq!(
+            b.lock().unwrap().read_file("/f", 64).as_deref(),
+            Some(&b"immutable"[..])
+        );
+        assert_eq!(&*bytes, b"immutable");
+    }
+
+    #[test]
+    fn copy_up_is_a_no_op_for_private_and_dir_nodes() {
+        let fs = new_fs();
+        {
+            let mut g = fs.lock().unwrap();
+            g.add_child(ROOT, "f", Node::File(b"mine".to_vec()));
+            g.add_child(ROOT, "d", Node::Dir(BTreeMap::new()));
+            let f = resolve(&g, ROOT, "/f").unwrap();
+            let d = resolve(&g, ROOT, "/d").unwrap();
+            g.copy_up(f);
+            g.copy_up(d);
+            assert!(matches!(g.nodes.get(&f), Some(Node::File(_))));
+            assert!(matches!(g.nodes.get(&d), Some(Node::Dir(_))));
+        }
+        assert_eq!(
+            fs.lock().unwrap().read_file("/f", 64).as_deref(),
+            Some(&b"mine"[..])
+        );
     }
 
     #[test]
