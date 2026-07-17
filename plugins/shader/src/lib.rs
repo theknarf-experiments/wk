@@ -62,10 +62,20 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// The starter shader: rendered when nothing is connected, and written into a
-/// connected-but-empty file so there's example code to edit. Documents the
-/// live-coding contract (write `main_image`; use `u.time`, `u.res`, `cc(n)`).
-const DEFAULT_USER: &str = r#"// Live shader — edit me; the viewer hot-reloads on every save.
+/// Rendered when nothing is wired in (and as a safe fallback if a shader fails
+/// to compile before any good one loads): a plain, static placeholder — dull on
+/// purpose, so the node reads as "empty, wire something in" rather than a demo.
+const FALLBACK: &str = r#"
+fn main_image(uv: vec2<f32>) -> vec3<f32> {
+    let g = 0.10 + 0.04 * uv.y;
+    return vec3<f32>(g, g, g * 1.08);
+}
+"#;
+
+/// Written into a connected-but-empty file so there's example code to edit —
+/// documents the live-coding contract (write `main_image`; use `u.time`,
+/// `u.res`, `cc(n)`) with a shader worth looking at.
+const STARTER: &str = r#"// Live shader — edit me; the viewer hot-reloads on every save.
 //   main_image(uv) returns an RGB colour; uv is 0..1 across the surface.
 //   u.time  seconds since start      u.res  surface size in pixels
 //   cc(n)   MIDI CC/note n, 0..1 (wire a MIDI source into this node)
@@ -230,31 +240,31 @@ impl Guest for Component {
             label: None,
         });
 
-        // Compile the initial program (connected file, else the default). If a
-        // file is connected but empty, seed it with the starter shader so it's
-        // ready to edit in a wired-up editor.
+        // Compile the initial program. With a file wired in, use its contents
+        // (seeding a connected-but-empty file with the starter so it's ready to
+        // edit); with nothing wired in, show the plain fallback.
         let mut current_src;
         let mut program = {
             let path = shader_path();
-            let existing = path
-                .as_ref()
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .unwrap_or_default();
-            let src = if existing.trim().is_empty() {
-                if let Some(p) = &path {
-                    let _ = std::fs::write(p, DEFAULT_USER);
+            let src = match &path {
+                Some(p) => {
+                    let existing = std::fs::read_to_string(p).unwrap_or_default();
+                    if existing.trim().is_empty() {
+                        let _ = std::fs::write(p, STARTER);
+                        STARTER.to_string()
+                    } else {
+                        existing
+                    }
                 }
-                DEFAULT_USER.to_string()
-            } else {
-                existing
+                None => FALLBACK.to_string(),
             };
             current_src = src.clone();
             Program::new(&device, &uniforms, &src)
                 .or_else(|e| {
-                    println!("[shader] initial compile failed: {e}\n[shader] using the default");
-                    Program::new(&device, &uniforms, DEFAULT_USER)
+                    println!("[shader] initial compile failed: {e}\n[shader] using the fallback");
+                    Program::new(&device, &uniforms, FALLBACK)
                 })
-                .expect("default shader compiles")
+                .expect("fallback shader compiles")
         };
 
         let start = std::time::Instant::now();
