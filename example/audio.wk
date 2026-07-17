@@ -1,0 +1,23 @@
+// vim: set filetype=kdl :
+// A MIDI signal chain. Run from the repo root:  wk run example/audio.wk
+import "../workspace.wk"
+workspace "01KXKGA000000000000000WS00" {
+    note "Audio — a MIDI signal chain.\n\nPiano -> Arpeggiator -> Synth.\n\nPlay the on-screen keyboard; the\narp turns held notes into\npatterns; the synth sounds them\nthrough the Web Audio host. Tweak\nthe synth's knobs and the arp." "01KXKGA000000000000000NT04" {
+        pos 60.0 60.0
+        size 320.0 230.0
+    }
+    node "piano" "01KXKGA000000000000000PN01" {
+        pos 60.0 330.0
+        size 380.0 200.0
+    }
+    node "arp" "01KXKGA000000000000000AR02" {
+        pos 480.0 330.0
+        size 360.0 250.0
+    }
+    node "synth" "01KXKGA000000000000000SY03" {
+        pos 880.0 330.0
+        size 360.0 260.0
+    }
+    midi "01KXKGA000000000000000PN01" "01KXKGA000000000000000AR02"
+    midi "01KXKGA000000000000000AR02" "01KXKGA000000000000000SY03"
+}

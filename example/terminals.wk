@@ -1,0 +1,38 @@
+// vim: set filetype=kdl :
+// Terminal apps (unmodified C, compiled to WASI). Run from the repo root:
+//   wk run example/terminals.wk
+import "../workspace.wk"
+workspace "01KXKGB000000000000000WS00" {
+    note "Terminals — unmodified C apps\ncompiled to WASI, in wk's\nterminal (raw mode over a\ncapability, live resize).\n\nvim and kilo share notes.txt:\nedit in one, reopen in the other.\nlua / sqlite / wsh are REPLs." "01KXKGB000000000000000NT07" {
+        pos 60.0 60.0
+        size 340.0 220.0
+    }
+    node "wsh" "01KXKGB000000000000000SH05" {
+        pos 500.0 60.0
+        size 380.0 210.0
+    }
+    node "vim" "01KXKGB000000000000000VM01" {
+        pos 60.0 320.0
+        size 430.0 330.0
+        args "-u" "NONE" "notes.txt"
+    }
+    node "kilo" "01KXKGB000000000000000KL02" {
+        pos 520.0 320.0
+        size 430.0 330.0
+        args "notes.txt"
+    }
+    node "lua" "01KXKGB000000000000000LU03" {
+        pos 990.0 60.0
+        size 360.0 260.0
+    }
+    node "sqlite" "01KXKGB000000000000000SQ04" {
+        pos 990.0 350.0
+        size 360.0 260.0
+    }
+    virtualfile "notes.txt" "01KXKGB000000000000000FL06" {
+        pos 430.0 690.0
+        size 130.0 44.0
+    }
+    connection "01KXKGB000000000000000FL06" "01KXKGB000000000000000VM01"
+    connection "01KXKGB000000000000000FL06" "01KXKGB000000000000000KL02"
+}

@@ -1,0 +1,21 @@
+// vim: set filetype=kdl :
+// GPU + canvas rendering. Run from the repo root:  wk run example/graphics.wk
+import "../workspace.wk"
+workspace "01KXKGC000000000000000WS00" {
+    note "Graphics — wasi-webgpu + canvas.\n\nTriangle renders with WebGPU.\nPaint is a self-driving canvas.\nShader runs live WGSL — wire a\nfile into it to hot-reload, or a\nMIDI source to make it react\n(see example/live-coding.wk)." "01KXKGC000000000000000NT04" {
+        pos 60.0 60.0
+        size 320.0 220.0
+    }
+    node "triangle" "01KXKGC000000000000000TR01" {
+        pos 60.0 320.0
+        size 300.0 300.0
+    }
+    node "paint" "01KXKGC000000000000000PA02" {
+        pos 400.0 320.0
+        size 300.0 300.0
+    }
+    node "shader" "01KXKGC000000000000000SH03" {
+        pos 740.0 320.0
+        size 360.0 360.0
+    }
+}

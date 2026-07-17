@@ -1,0 +1,26 @@
+// vim: set filetype=kdl :
+// The userspace network fabric. Run from the repo root:
+//   wk run example/network.wk
+import "../workspace.wk"
+workspace "01KXKGD000000000000000WS00" {
+    note "Networking — the userspace fabric.\n\nnetserve is a BSD-sockets TCP\nserver on a virtual Network\n(isolated, like a Docker bridge).\n\nClick the netserve node's play\nbutton to start it (networked\nnodes stay idle until run). The\nHostPort publishes it to\nlocalhost:8080 — then:\n  curl localhost:8080" "01KXKGD000000000000000NT04" {
+        pos 60.0 60.0
+        size 360.0 300.0
+    }
+    node "netserve" "01KXKGD000000000000000NS01" {
+        pos 60.0 340.0
+        size 380.0 240.0
+        args "8080"
+    }
+    network "01KXKGD000000000000000NW03" {
+        pos 500.0 380.0
+        size 130.0 44.0
+    }
+    hostport "01KXKGD000000000000000HP02" {
+        port 8080
+        pos 500.0 480.0
+        size 130.0 44.0
+    }
+    netlink "01KXKGD000000000000000NS01" "01KXKGD000000000000000NW03"
+    serve "01KXKGD000000000000000NS01" "01KXKGD000000000000000HP02"
+}
