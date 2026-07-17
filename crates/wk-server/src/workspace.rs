@@ -581,10 +581,7 @@ fn workspace_kdl(ws: &Workspace) -> KdlNode {
 fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
     // Named kinds (`node "<name>" <id>`) carry the name first; the rest are
     // `<kind> <id>`.
-    let named = matches!(
-        n.name().value(),
-        "node" | "virtualfile" | "hostfile" | "note"
-    );
+    let named = matches!(n.name().value(), "node" | "virtualfile" | "hostfile");
     let id = node_id(n.get(if named { 1 } else { 0 })?)?;
     let ch = n.children()?;
     let text = |name: &str| {
@@ -621,7 +618,7 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
             path: PathBuf::from(n.get(0)?.as_string()?),
         },
         "note" => SnapKind::Note {
-            text: n.get(0)?.as_string()?.to_string(),
+            text: text("text").unwrap_or_default(),
         },
         // Reject an out-of-range port (drop the node) rather than truncate it:
         // a hand-edited `port 99999` should not silently become 34463.
@@ -676,9 +673,6 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         SnapKind::HostFile { path } => {
             node.push(str_entry(&path.to_string_lossy()));
         }
-        SnapKind::Note { text } => {
-            node.push(str_entry(text));
-        }
         _ => {}
     }
     node.push(KdlEntry::new(s.id.to_string()));
@@ -703,6 +697,7 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
             p.push(KdlEntry::new(*port as i128));
             ch.nodes_mut().push(p);
         }
+        SnapKind::Note { text } => child_str("text", text),
         _ => {}
     }
     ch.nodes_mut().push(node2("pos", s.pos[0], s.pos[1]));

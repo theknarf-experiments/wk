@@ -3,9 +3,10 @@
 //   wk run example/network.wk
 import "../workspace.wk"
 workspace "01KXKGD000000000000000WS00" {
-    note "Networking — the userspace fabric.\n\nnetserve is a BSD-sockets TCP\nserver on a virtual Network\n(isolated, like a Docker bridge).\n\nClick the netserve node's play\nbutton to start it (networked\nnodes stay idle until run). The\nHostPort publishes it to\nlocalhost:8080 — then:\n  curl localhost:8080" "01KXKGD000000000000000NT04" {
+    note "01KXKGD000000000000000NT04" {
         pos 60.0 60.0
         size 360.0 300.0
+        text "Networking — the userspace fabric.\n\nnetserve is a BSD-sockets TCP\nserver on a virtual Network\n(isolated, like a Docker bridge).\n\nClick the netserve node's play\nbutton to start it (networked\nnodes stay idle until run). The\nHostPort publishes it to\nlocalhost:8080 — then:\n  curl localhost:8080"
     }
     node "netserve" "01KXKGD000000000000000NS01" {
         pos 60.0 340.0
