@@ -640,10 +640,11 @@ impl Server {
             &dep.local_path(),
             &dep.name,
             id,
-            &dep.args,
+            &dep.effective_args(),
             self.registry.clone(),
             self.node_reg.clone(),
             Vec::new(),
+            dep.container(),
         ) {
             eprintln!("failed to launch {}: {e:#}", dep.name);
             return;
@@ -801,7 +802,7 @@ impl Server {
                 .node_args
                 .get(&id)
                 .cloned()
-                .unwrap_or_else(|| dep.args.clone());
+                .unwrap_or_else(|| dep.effective_args());
             let options = node.options.lock().unwrap().clone();
             let new_id = self.alloc_id();
             if let Err(e) = self.host.spawn(
@@ -812,6 +813,7 @@ impl Server {
                 self.registry.clone(),
                 self.node_reg.clone(),
                 options,
+                dep.container(),
             ) {
                 eprintln!("failed to duplicate {}: {e:#}", dep.name);
                 return;
@@ -1785,7 +1787,7 @@ impl Server {
                 // default (the file format doesn't distinguish "no args saved"
                 // from "explicitly none").
                 let args = if args.is_empty() {
-                    dep.args.clone()
+                    dep.effective_args()
                 } else {
                     args.clone()
                 };
@@ -1797,6 +1799,7 @@ impl Server {
                     self.registry.clone(),
                     self.node_reg.clone(),
                     options.clone(),
+                    dep.container(),
                 ) {
                     eprintln!("failed to restore {}: {e:#}", dep.name);
                     return;

@@ -40,6 +40,50 @@ pub struct ImageManifest {
     pub labels: BTreeMap<String, String>,
 }
 
+impl ImageManifest {
+    /// The default guest argv after the program name: the entrypoint's own
+    /// arguments, then CMD — Docker's argv composition, minus entrypoint[0]
+    /// (the wasm itself).
+    pub fn default_args(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.entrypoint.iter().skip(1).cloned().collect();
+        out.extend(self.cmd.iter().cloned());
+        out
+    }
+
+    /// What containerizes a node running this image: the rootfs layers to
+    /// mount and the guest environment.
+    pub fn container_setup(&self) -> ContainerSetup {
+        ContainerSetup {
+            layers: self.layers.clone(),
+            env: self.env.clone(),
+        }
+    }
+}
+
+/// The per-node slice of an image: rootfs layers + guest env. Handed to the
+/// plugin host at spawn so the node's filesystem is populated (Arc-shared,
+/// copy-on-write) before the guest starts.
+#[derive(Clone, Debug, Default)]
+pub struct ContainerSetup {
+    pub layers: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+/// Mount `setup`'s image layers into a node's filesystem, in order. Layer
+/// content loads through the shared cache, so N nodes running one image store
+/// its bytes once.
+pub fn mount(fs: &crate::vfs::SharedFs, setup: &ContainerSetup) -> Result<(), String> {
+    for digest in &setup.layers {
+        let layer = crate::layers::cached(digest, || {
+            let bytes = std::fs::read(layer_path(digest))
+                .map_err(|e| format!("read layer {digest}: {e}"))?;
+            crate::layers::from_tar_bytes(&bytes)
+        })?;
+        crate::layers::apply(fs, &layer, "");
+    }
+    Ok(())
+}
+
 /// Root of the image store (shares the wk cache dir with pulled artifacts).
 fn store_dir() -> PathBuf {
     crate::oci::cache_dir()
@@ -224,6 +268,27 @@ fn copy_layer(
         }
     }
     b.into_inner().map_err(|e| format!("finish layer: {e}"))
+}
+
+/// Path of the alias file mapping a Dockerfile source to its built image id.
+fn alias_path(dockerfile: &Path) -> PathBuf {
+    let key = crate::oci::sanitize(&dockerfile.to_string_lossy());
+    store_dir().join("images").join(format!("{key}.alias"))
+}
+
+/// Build the Dockerfile and record a source→image alias, so later lookups
+/// (without rebuilding) resolve the entrypoint and manifest.
+pub fn build_and_alias(dockerfile: &Path) -> Result<String, String> {
+    let id = build(dockerfile)?;
+    write_creating_dirs(&alias_path(dockerfile), id.as_bytes())?;
+    Ok(id)
+}
+
+/// The built image behind a Dockerfile source, if it has been built.
+pub fn aliased_image(dockerfile: &Path) -> Option<(String, ImageManifest)> {
+    let id = std::fs::read_to_string(alias_path(dockerfile)).ok()?;
+    let manifest = load_image(id.trim())?;
+    Some((id.trim().to_string(), manifest))
 }
 
 /// Build the image described by `dockerfile_path` (context = its directory)
@@ -422,6 +487,20 @@ mod tests {
                 .as_deref(),
             Some(&b"*help*"[..])
         );
+    }
+
+    #[test]
+    fn build_and_alias_resolves_the_entrypoint() {
+        isolated_store("alias");
+        let ctx = vim_like_context("alias");
+        let df = ctx.join("Dockerfile");
+        let id = build_and_alias(&df).expect("builds");
+        let (aid, manifest) = aliased_image(&df).expect("alias resolves");
+        assert_eq!(aid, id);
+        assert_eq!(manifest.entrypoint, vec!["/app.wasm"]);
+        assert!(entrypoint_path(&id).is_file());
+        // Default args = entrypoint[1..] ++ cmd.
+        assert_eq!(manifest.default_args(), vec!["--default".to_string()]);
     }
 
     #[test]

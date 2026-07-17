@@ -75,47 +75,69 @@ pub enum Source {
     Path(PathBuf),
     /// An OCI registry reference (e.g. `ghcr.io/org/name:1.0`), pulled + cached.
     Oci(String),
+    /// A Dockerfile to build into a local OCI image (`docker://<path>`): the
+    /// entrypoint wasm runs as the node, the image's layers become its rootfs.
+    Dockerfile(PathBuf),
 }
 
 impl Source {
-    /// Parse the string form stored in the workspace file (an `oci://` prefix means OCI).
+    /// Parse the string form stored in the workspace file: an `oci://` prefix
+    /// means a registry artifact, `docker://` a Dockerfile to build locally.
     pub fn parse(s: &str) -> Self {
-        match s.strip_prefix("oci://") {
-            Some(reference) => Source::Oci(reference.to_string()),
-            None => Source::Path(PathBuf::from(s)),
+        if let Some(reference) = s.strip_prefix("oci://") {
+            return Source::Oci(reference.to_string());
         }
+        if let Some(path) = s.strip_prefix("docker://") {
+            return Source::Dockerfile(PathBuf::from(path));
+        }
+        Source::Path(PathBuf::from(s))
     }
 
     pub fn to_kdl(&self) -> String {
         match self {
             Source::Path(p) => p.to_string_lossy().into_owned(),
             Source::Oci(reference) => format!("oci://{reference}"),
+            Source::Dockerfile(p) => format!("docker://{}", p.to_string_lossy()),
         }
     }
 
-    /// The local path to load the wasm from. For OCI this is the cache location
-    /// (which [`Source::ensure`] populates); it may not exist until then.
+    /// The local path to load the wasm from. For OCI this is the cache location,
+    /// for a Dockerfile the built image's extracted entrypoint (both populated
+    /// by [`Source::ensure`]); it may not exist until then.
     pub fn local_path(&self) -> PathBuf {
         match self {
             Source::Path(p) => p.clone(),
             Source::Oci(reference) => crate::oci::cache_path(reference),
+            Source::Dockerfile(p) => crate::images::aliased_image(p)
+                .map(|(id, _)| crate::images::entrypoint_path(&id))
+                .unwrap_or_else(|| crate::images::entrypoint_path("unbuilt")),
         }
     }
 
-    /// Pull + cache an OCI artifact if it isn't already cached. A no-op for local paths.
+    /// Make the source runnable: pull + cache an OCI artifact, or (re)build a
+    /// Dockerfile image — a content-addressed cache hit when unchanged. A no-op
+    /// for local paths.
     pub fn ensure(&self) -> Result<(), String> {
-        if let Source::Oci(reference) = self {
-            let path = crate::oci::cache_path(reference);
-            if !path.exists() {
-                println!("pulling {reference} ...");
-                let bytes = crate::oci::pull(reference)?;
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        match self {
+            Source::Oci(reference) => {
+                let path = crate::oci::cache_path(reference);
+                if !path.exists() {
+                    println!("pulling {reference} ...");
+                    let bytes = crate::oci::pull(reference)?;
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    }
+                    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
                 }
-                std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+                Ok(())
             }
+            Source::Dockerfile(p) => {
+                let id = crate::images::build_and_alias(p)?;
+                println!("built {} -> {id}", p.display());
+                Ok(())
+            }
+            Source::Path(_) => Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -137,6 +159,31 @@ impl Dependency {
 
     pub fn ensure(&self) -> Result<(), String> {
         self.source.ensure()
+    }
+
+    /// The built image behind a `docker://` source — the layers to mount and
+    /// the guest env — if this dependency is one (and it has been built).
+    pub fn container(&self) -> Option<crate::images::ContainerSetup> {
+        match &self.source {
+            Source::Dockerfile(p) => {
+                crate::images::aliased_image(p).map(|(_, m)| m.container_setup())
+            }
+            _ => None,
+        }
+    }
+
+    /// The dependency's default launch args: its own, or — for an image with
+    /// none set — the image's ENTRYPOINT[1..] + CMD.
+    pub fn effective_args(&self) -> Vec<String> {
+        if !self.args.is_empty() {
+            return self.args.clone();
+        }
+        match &self.source {
+            Source::Dockerfile(p) => crate::images::aliased_image(p)
+                .map(|(_, m)| m.default_args())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -748,9 +795,10 @@ pub fn init(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Add a plugin to the file as a dependency. `target` is a local `.wasm` path or
-/// an `oci://<ref>` registry reference; the name is its file stem or the OCI
-/// repository's last segment. An OCI artifact is pulled now to validate it.
+/// Add a plugin to the file as a dependency. `target` is a local `.wasm` path,
+/// an `oci://<ref>` registry reference, or a `docker://<Dockerfile>` build; the
+/// name is its file stem, the OCI repository's last segment, or the
+/// Dockerfile's directory name. The source is pulled/built now to validate it.
 pub fn add(target: String, path: &Path) -> Result<(), String> {
     let mut doc = Document::load(path)?;
     let source = Source::parse(&target);
@@ -760,6 +808,12 @@ pub fn add(target: String, path: &Path) -> Result<(), String> {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "plugin".to_string()),
         Source::Oci(reference) => crate::oci::name_for(reference),
+        // The Dockerfile's directory names the image (plugins/vim/Dockerfile -> vim).
+        Source::Dockerfile(p) => p
+            .parent()
+            .and_then(|d| d.file_name())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "image".to_string()),
     };
     source.ensure()?;
     if doc.dependencies.iter().any(|d| d.name == name) {
@@ -931,6 +985,14 @@ mod tests {
             "oci://ghcr.io/o/f:1"
         );
         assert_eq!(Source::Path("a/b.wasm".into()).to_kdl(), "a/b.wasm");
+        match Source::parse("docker://plugins/vim/Dockerfile") {
+            Source::Dockerfile(p) => assert_eq!(p, PathBuf::from("plugins/vim/Dockerfile")),
+            other => panic!("expected dockerfile source, got {other:?}"),
+        }
+        assert_eq!(
+            Source::Dockerfile("plugins/vim/Dockerfile".into()).to_kdl(),
+            "docker://plugins/vim/Dockerfile"
+        );
     }
 
     #[test]

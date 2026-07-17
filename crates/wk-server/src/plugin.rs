@@ -145,6 +145,8 @@ pub struct Node {
     /// The compiled component and its wiring, filled in by the background compile
     /// thread. `None` while the node is still compiling.
     pub setup: OnceLock<NodeSetup>,
+    /// Environment for the guest (a container image's ENV), applied on run.
+    pub env: Vec<(String, String)>,
 }
 
 /// A node's compiled component plus how to run and wire it — published once the
@@ -993,6 +995,7 @@ impl PluginHost {
         surfaces: SurfaceRegistry,
         nodes: NodeRegistry,
         initial_options: Vec<f32>,
+        container: Option<crate::images::ContainerSetup>,
     ) -> Result<()> {
         let node = Arc::new(Node {
             id,
@@ -1007,6 +1010,10 @@ impl PluginHost {
             running: Arc::new(AtomicBool::new(false)),
             kill: Arc::new(AtomicBool::new(false)),
             setup: OnceLock::new(),
+            env: container
+                .as_ref()
+                .map(|c| c.env.clone())
+                .unwrap_or_default(),
         });
         nodes.lock().unwrap().push(node.clone());
 
@@ -1017,6 +1024,14 @@ impl PluginHost {
         std::thread::Builder::new()
             .name(format!("wk-compile-{name}"))
             .spawn(move || {
+                // Mount the container image's rootfs layers (Arc-shared,
+                // copy-on-write) before the guest can run.
+                if let Some(c) = &container {
+                    if let Err(e) = crate::images::mount(&node.fs, c) {
+                        eprintln!("failed to mount image for {name:?}: {e}");
+                        return;
+                    }
+                }
                 if let Err(e) = host.load_and_setup(&node, &path, &name, &args, surfaces) {
                     eprintln!("failed to load plugin {name:?}: {e:#}");
                 }
@@ -1127,7 +1142,13 @@ impl PluginHost {
             .stdout(crate::terminal::stdout(&node.term_io))
             .stderr(crate::terminal::stdout(&node.term_io))
             .stdin(crate::terminal::stdin(&node.term_io))
-            .args(&argv)
+            .args(&argv);
+        // A container image's ENV first, then the terminal vars (so TERM etc.
+        // reflect the actual terminal even if the image sets them).
+        for (k, v) in &node.env {
+            ctx_builder.env(k, v);
+        }
+        ctx_builder
             .env("TERM", "xterm-256color")
             .env("COLUMNS", cols.to_string())
             .env("LINES", rows.to_string());
