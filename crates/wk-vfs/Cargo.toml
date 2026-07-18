@@ -1,0 +1,15 @@
+[package]
+name = "wk-vfs"
+version = "0.1.0"
+edition = "2021"
+description = "wk's per-node in-memory virtual filesystem: sandboxed wasi:filesystem host with immutable, Arc-shared OCI image layers (copy-on-write), canvas file mounts, and build-time snapshot/diff."
+
+[dependencies]
+wasmtime = { version = "46", features = ["component-model", "async"] }
+wasmtime-wasi = "46"
+wasmtime-wasi-io = "46"
+tar = "0.4"
+flate2 = "1"
+
+[dev-dependencies]
+proptest = "1"

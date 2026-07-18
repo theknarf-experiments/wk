@@ -5,6 +5,14 @@
 //! node" on the canvas explicitly *connected* to an app: it appears as a shared
 //! file in that app's filesystem (see `mount_file`), so wiring one file node to
 //! two apps lets them talk through it.
+//!
+//! On top of the private tree sit **immutable layers** ([`layers`]): OCI image
+//! content applied as `Arc`-shared read-only files with file-granularity
+//! copy-on-write (overlayfs semantics), so N nodes running one image store its
+//! bytes once. The host embeds the filesystem by implementing [`VfsView`] and
+//! calling [`add_to_linker`].
+
+pub mod layers;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -19,7 +27,7 @@ use wasmtime_wasi_io::streams::{DynInputStream, DynOutputStream, OutputStream, S
 use wasmtime_wasi_io::IoView;
 
 wasmtime::component::bindgen!({
-    path: "wit-fs",
+    path: "wit",
     world: "fs-host",
     imports: { default: trappable },
     require_store_data_send: true,
@@ -34,7 +42,38 @@ wasmtime::component::bindgen!({
     },
 });
 
-use crate::plugin::HostState;
+/// What the embedder's store must provide for this crate's `wasi:filesystem`
+/// implementation: the resource table (via [`IoView`]) and the filesystem the
+/// guest should see.
+pub trait VfsView: IoView {
+    /// The filesystem this store's guest sees (an `Arc` handle).
+    fn fs(&mut self) -> SharedFs;
+}
+
+impl<T: VfsView + ?Sized> VfsView for &mut T {
+    fn fs(&mut self) -> SharedFs {
+        T::fs(self)
+    }
+}
+
+/// Adapter carrying the generated `wasi:filesystem` trait impls for any
+/// [`VfsView`] store — a local wrapper, so the impls can't collide with the
+/// generated blanket `&mut T` ones (the same shape as wasmtime-wasi's
+/// `WasiImpl`).
+#[repr(transparent)]
+pub struct VfsImpl<T>(pub T);
+
+impl<T: VfsView> IoView for VfsImpl<T> {
+    fn table(&mut self) -> &mut ResourceTable {
+        self.0.table()
+    }
+}
+impl<T: VfsView> VfsView for VfsImpl<T> {
+    fn fs(&mut self) -> SharedFs {
+        self.0.fs()
+    }
+}
+
 use wasi::filesystem::types::{
     Advice, DescriptorFlags, DescriptorStat, DescriptorType, DirectoryEntry, ErrorCode, Filesize,
     MetadataHashValue, NewTimestamp, OpenFlags, PathFlags,
@@ -131,7 +170,7 @@ impl Fs {
 
     /// Resolve the directory at `path`, creating missing components. `None` if a
     /// component already exists as a file, or the fs is at capacity.
-    pub(crate) fn ensure_dir_path(&mut self, path: &str) -> Option<u64> {
+    pub fn ensure_dir_path(&mut self, path: &str) -> Option<u64> {
         let mut cur = ROOT;
         for comp in components(path) {
             let existing = match self.nodes.get(&cur) {
@@ -160,7 +199,7 @@ impl Fs {
 
     /// Place a shared read-only layer file at `path`, creating parent
     /// directories and replacing any existing entry (a later layer wins).
-    pub(crate) fn put_ro_file_at(&mut self, path: &str, bytes: Arc<Vec<u8>>) {
+    pub fn put_ro_file_at(&mut self, path: &str, bytes: Arc<Vec<u8>>) {
         let comps = components(path);
         let Some((name, dirs)) = comps.split_last() else {
             return;
@@ -180,7 +219,7 @@ impl Fs {
 
     /// Remove the entry at `path` (recursively for a directory). A missing path
     /// is a no-op — an OCI whiteout may target something no layer provided.
-    pub(crate) fn remove_path(&mut self, path: &str) {
+    pub fn remove_path(&mut self, path: &str) {
         let comps = components(path);
         let Some((name, dirs)) = comps.split_last() else {
             return;
@@ -191,7 +230,7 @@ impl Fs {
     }
 
     /// Remove every child of the directory at `path` (an OCI opaque marker).
-    pub(crate) fn clear_dir_at(&mut self, path: &str) {
+    pub fn clear_dir_at(&mut self, path: &str) {
         if let Some(id) = resolve(self, ROOT, path) {
             let children: Vec<u64> = match self.nodes.get_mut(&id) {
                 Some(Node::Dir(c)) => {
@@ -208,11 +247,9 @@ impl Fs {
     }
 
     /// Place a *private* (mutable) file at `path`, creating parents and
-    /// replacing any existing entry. Guest writes create private files through
-    /// the wasi host traits; this host-side twin lets tests (the mock RUN
-    /// runner, diff fixtures) mutate a rootfs the same way.
-    #[cfg(test)]
-    pub(crate) fn put_file_at(&mut self, path: &str, bytes: Vec<u8>) {
+    /// replacing any existing entry — the host-side twin of a guest write
+    /// (used by build tooling and tests to seed a rootfs).
+    pub fn put_file_at(&mut self, path: &str, bytes: Vec<u8>) {
         let comps = components(path);
         let Some((name, dirs)) = comps.split_last() else {
             return;
@@ -233,7 +270,7 @@ impl Fs {
     /// Every path in the filesystem (no leading `/`; the root itself omitted)
     /// classified for build-time diffs: layer files vs privately written files
     /// vs directories vs canvas mounts. See `crate::images`'s RUN capture.
-    pub(crate) fn snapshot(&self) -> BTreeMap<String, PathKind> {
+    pub fn snapshot(&self) -> BTreeMap<String, PathKind> {
         let mut out = BTreeMap::new();
         fn walk(fs: &Fs, dir: u64, prefix: &str, out: &mut BTreeMap<String, PathKind>) {
             let Some(Node::Dir(children)) = fs.nodes.get(&dir) else {
@@ -612,16 +649,17 @@ pub fn add_wasi_except_fs<T: WasiView + 'static>(l: &mut Linker<T>) -> Result<()
     Ok(())
 }
 
-/// Add our in-memory `wasi:filesystem` to the linker.
-pub fn add_to_linker(l: &mut Linker<HostState>) -> Result<()> {
-    wasi::filesystem::types::add_to_linker::<_, HasFs>(l, |s| s)?;
-    wasi::filesystem::preopens::add_to_linker::<_, HasFs>(l, |s| s)?;
+/// Add our in-memory `wasi:filesystem` to the linker, for any store type that
+/// implements [`VfsView`].
+pub fn add_to_linker<T: VfsView + 'static>(l: &mut Linker<T>) -> Result<()> {
+    wasi::filesystem::types::add_to_linker::<_, HasFs<T>>(l, |s| VfsImpl(s))?;
+    wasi::filesystem::preopens::add_to_linker::<_, HasFs<T>>(l, |s| VfsImpl(s))?;
     Ok(())
 }
 
-struct HasFs;
-impl HasData for HasFs {
-    type Data<'a> = &'a mut HostState;
+struct HasFs<T>(std::marker::PhantomData<T>);
+impl<T: VfsView + 'static> HasData for HasFs<T> {
+    type Data<'a> = VfsImpl<&'a mut T>;
 }
 
 /// `Ok(Err(code))` shorthand.
@@ -641,15 +679,16 @@ enum Kind {
     Missing,
 }
 
-impl HostState {
-    /// Clone the `fs` Arc for the descriptor `fd` (all this node's descriptors
-    /// share the one filesystem).
-    fn fd_fs(&mut self, fd: &Resource<Descriptor>) -> Result<(SharedFs, u64)> {
-        let d = self.table().get(fd)?;
-        Ok((d.fs.clone(), d.node))
-    }
+/// Clone the `fs` Arc for the descriptor `fd` (all this node's descriptors
+/// share the one filesystem).
+fn fd_fs<T: VfsView>(view: &mut T, fd: &Resource<Descriptor>) -> Result<(SharedFs, u64)> {
+    let d = view.table().get(fd)?;
+    Ok((d.fs.clone(), d.node))
+}
 
-    fn kind(fs: &SharedFs, node: u64) -> Kind {
+/// What `node` is, cloning shared handles so callers can act without the lock.
+fn node_kind(fs: &SharedFs, node: u64) -> Kind {
+    {
         match fs.lock().unwrap().nodes.get(&node) {
             Some(Node::File(_)) => Kind::File,
             Some(Node::RoFile(d)) => Kind::Ro(d.clone()),
@@ -661,15 +700,15 @@ impl HostState {
     }
 }
 
-impl wasi::filesystem::preopens::Host for HostState {
+impl<T: VfsView> wasi::filesystem::preopens::Host for VfsImpl<T> {
     fn get_directories(&mut self) -> Result<Vec<(Resource<Descriptor>, String)>> {
-        let fs = self.fs.clone();
+        let fs = self.fs();
         let root = self.table().push(Descriptor { fs, node: ROOT })?;
         Ok(vec![(root, "/".to_string())])
     }
 }
 
-impl wasi::filesystem::types::Host for HostState {
+impl<T: VfsView> wasi::filesystem::types::Host for VfsImpl<T> {
     fn filesystem_error_code(
         &mut self,
         _err: Resource<wasmtime::Error>,
@@ -678,14 +717,14 @@ impl wasi::filesystem::types::Host for HostState {
     }
 }
 
-impl wasi::filesystem::types::HostDescriptor for HostState {
+impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
     fn read_via_stream(
         &mut self,
         fd: Resource<Descriptor>,
         offset: Filesize,
     ) -> Result<std::result::Result<Resource<DynInputStream>, ErrorCode>> {
-        let (fs, node) = self.fd_fs(&fd)?;
-        let bytes = match Self::kind(&fs, node) {
+        let (fs, node) = fd_fs(self, &fd)?;
+        let bytes = match node_kind(&fs, node) {
             Kind::File => {
                 let g = fs.lock().unwrap();
                 let Some(Node::File(data)) = g.nodes.get(&node) else {
@@ -720,8 +759,8 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         fd: Resource<Descriptor>,
         offset: Filesize,
     ) -> Result<std::result::Result<Resource<DynOutputStream>, ErrorCode>> {
-        let (fs, node) = self.fd_fs(&fd)?;
-        let stream: DynOutputStream = match Self::kind(&fs, node) {
+        let (fs, node) = fd_fs(self, &fd)?;
+        let stream: DynOutputStream = match node_kind(&fs, node) {
             // A layer file copy-ups on the stream's first write.
             Kind::File | Kind::Ro(_) => Box::new(VfsOutputStream { fs, node, offset }),
             Kind::Shared(data) => Box::new(SharedOutputStream { data, offset }),
@@ -735,8 +774,8 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         &mut self,
         fd: Resource<Descriptor>,
     ) -> Result<std::result::Result<Resource<DynOutputStream>, ErrorCode>> {
-        let (fs, node) = self.fd_fs(&fd)?;
-        let stream: DynOutputStream = match Self::kind(&fs, node) {
+        let (fs, node) = fd_fs(self, &fd)?;
+        let stream: DynOutputStream = match node_kind(&fs, node) {
             Kind::File | Kind::Ro(_) => {
                 // Append needs the private copy's length; copy up now.
                 let offset = {
@@ -769,8 +808,8 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         len: Filesize,
         offset: Filesize,
     ) -> Result<std::result::Result<(Vec<u8>, bool), ErrorCode>> {
-        let (fs, node) = self.fd_fs(&fd)?;
-        match Self::kind(&fs, node) {
+        let (fs, node) = fd_fs(self, &fd)?;
+        match node_kind(&fs, node) {
             Kind::File => {
                 let g = fs.lock().unwrap();
                 let Some(Node::File(data)) = g.nodes.get(&node) else {
@@ -792,8 +831,8 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         buf: Vec<u8>,
         offset: Filesize,
     ) -> Result<std::result::Result<Filesize, ErrorCode>> {
-        let (fs, node) = self.fd_fs(&fd)?;
-        match Self::kind(&fs, node) {
+        let (fs, node) = fd_fs(self, &fd)?;
+        match node_kind(&fs, node) {
             Kind::File | Kind::Ro(_) => {
                 let mut g = fs.lock().unwrap();
                 g.copy_up(node);
@@ -824,7 +863,7 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         &mut self,
         fd: Resource<Descriptor>,
     ) -> Result<std::result::Result<Resource<DirEntryStream>, ErrorCode>> {
-        let (fs, node) = self.fd_fs(&fd)?;
+        let (fs, node) = fd_fs(self, &fd)?;
         let entries = {
             let g = fs.lock().unwrap();
             match g.nodes.get(&node) {
@@ -847,7 +886,7 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         fd: Resource<Descriptor>,
         path: String,
     ) -> Result<std::result::Result<(), ErrorCode>> {
-        let (fs, node) = self.fd_fs(&fd)?;
+        let (fs, node) = fd_fs(self, &fd)?;
         let mut g = fs.lock().unwrap();
         let Some((parent, name)) = resolve_parent(&g, node, &path) else {
             return err(ErrorCode::NoEntry);
@@ -871,7 +910,7 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         &mut self,
         fd: Resource<Descriptor>,
     ) -> Result<std::result::Result<DescriptorStat, ErrorCode>> {
-        let (fs, node) = self.fd_fs(&fd)?;
+        let (fs, node) = fd_fs(self, &fd)?;
         let g = fs.lock().unwrap();
         match stat_node(&g, node) {
             Some(s) => Ok(Ok(s)),
@@ -885,7 +924,7 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         _path_flags: PathFlags,
         path: String,
     ) -> Result<std::result::Result<DescriptorStat, ErrorCode>> {
-        let (fs, node) = self.fd_fs(&fd)?;
+        let (fs, node) = fd_fs(self, &fd)?;
         let g = fs.lock().unwrap();
         match resolve(&g, node, &path).and_then(|id| stat_node(&g, id)) {
             Some(s) => Ok(Ok(s)),
@@ -897,7 +936,7 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         &mut self,
         fd: Resource<Descriptor>,
     ) -> Result<std::result::Result<DescriptorType, ErrorCode>> {
-        let (fs, node) = self.fd_fs(&fd)?;
+        let (fs, node) = fd_fs(self, &fd)?;
         let g = fs.lock().unwrap();
         Ok(Ok(node_type(&g, node)))
     }
@@ -914,12 +953,12 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         fd: Resource<Descriptor>,
         size: Filesize,
     ) -> Result<std::result::Result<(), ErrorCode>> {
-        let (fs, node) = self.fd_fs(&fd)?;
+        let (fs, node) = fd_fs(self, &fd)?;
         let size = match usize::try_from(size) {
             Ok(s) if s <= MAX_FILE_SIZE => s,
             _ => return err(ErrorCode::FileTooLarge),
         };
-        match Self::kind(&fs, node) {
+        match node_kind(&fs, node) {
             Kind::File | Kind::Ro(_) => {
                 let mut g = fs.lock().unwrap();
                 g.copy_up(node);
@@ -956,7 +995,7 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         oflags: OpenFlags,
         _flags: DescriptorFlags,
     ) -> Result<std::result::Result<Resource<Descriptor>, ErrorCode>> {
-        let (fs, start) = self.fd_fs(&fd)?;
+        let (fs, start) = fd_fs(self, &fd)?;
         let node = {
             let mut g = fs.lock().unwrap();
             match resolve(&g, start, &path) {
@@ -1011,7 +1050,7 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         fd: Resource<Descriptor>,
         path: String,
     ) -> Result<std::result::Result<(), ErrorCode>> {
-        self.unlink(fd, &path, true)
+        unlink(self, fd, &path, true)
     }
 
     fn unlink_file_at(
@@ -1019,7 +1058,7 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         fd: Resource<Descriptor>,
         path: String,
     ) -> Result<std::result::Result<(), ErrorCode>> {
-        self.unlink(fd, &path, false)
+        unlink(self, fd, &path, false)
     }
 
     fn rename_at(
@@ -1029,7 +1068,7 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         new_fd: Resource<Descriptor>,
         new_path: String,
     ) -> Result<std::result::Result<(), ErrorCode>> {
-        let (fs, old_start) = self.fd_fs(&fd)?;
+        let (fs, old_start) = fd_fs(self, &fd)?;
         let new_start = self.table().get(&new_fd)?.node;
         // Rename only within one filesystem (node ids are per-fs).
         if !Arc::ptr_eq(&fs, &self.table().get(&new_fd)?.fs) {
@@ -1059,8 +1098,8 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
     }
 
     fn is_same_object(&mut self, a: Resource<Descriptor>, b: Resource<Descriptor>) -> Result<bool> {
-        let (afs, an) = self.fd_fs(&a)?;
-        let (bfs, bn) = self.fd_fs(&b)?;
+        let (afs, an) = fd_fs(self, &a)?;
+        let (bfs, bn) = fd_fs(self, &b)?;
         Ok(Arc::ptr_eq(&afs, &bfs) && an == bn)
     }
 
@@ -1068,7 +1107,7 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         &mut self,
         fd: Resource<Descriptor>,
     ) -> Result<std::result::Result<MetadataHashValue, ErrorCode>> {
-        let (_fs, node) = self.fd_fs(&fd)?;
+        let (_fs, node) = fd_fs(self, &fd)?;
         Ok(Ok(MetadataHashValue {
             lower: node,
             upper: 0,
@@ -1081,7 +1120,7 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
         _path_flags: PathFlags,
         path: String,
     ) -> Result<std::result::Result<MetadataHashValue, ErrorCode>> {
-        let (fs, node) = self.fd_fs(&fd)?;
+        let (fs, node) = fd_fs(self, &fd)?;
         let g = fs.lock().unwrap();
         match resolve(&g, node, &path) {
             Some(id) => Ok(Ok(MetadataHashValue {
@@ -1162,39 +1201,37 @@ impl wasi::filesystem::types::HostDescriptor for HostState {
     }
 }
 
-impl HostState {
-    /// Remove a file (`dir=false`) or empty directory (`dir=true`) at `path`.
-    fn unlink(
-        &mut self,
-        fd: Resource<Descriptor>,
-        path: &str,
-        dir: bool,
-    ) -> Result<std::result::Result<(), ErrorCode>> {
-        let (fs, start) = self.fd_fs(&fd)?;
-        let mut g = fs.lock().unwrap();
-        let Some((parent, name)) = resolve_parent(&g, start, path) else {
-            return err(ErrorCode::NoEntry);
-        };
-        let id = match g.nodes.get(&parent) {
-            Some(Node::Dir(c)) => match c.get(&name) {
-                Some(id) => *id,
-                None => return err(ErrorCode::NoEntry),
-            },
-            _ => return err(ErrorCode::NotDirectory),
-        };
-        match (dir, g.nodes.get(&id)) {
-            (true, Some(Node::Dir(c))) if !c.is_empty() => return err(ErrorCode::NotEmpty),
-            (true, Some(Node::Dir(_))) => {}
-            (true, _) => return err(ErrorCode::NotDirectory),
-            (false, Some(Node::Dir(_))) | (false, None) => return err(ErrorCode::IsDirectory),
-            (false, _) => {}
-        }
-        g.nodes.remove(&id);
-        if let Some(Node::Dir(c)) = g.nodes.get_mut(&parent) {
-            c.remove(&name);
-        }
-        Ok(Ok(()))
+/// Remove a file (`dir=false`) or empty directory (`dir=true`) at `path`.
+fn unlink<T: VfsView>(
+    view: &mut T,
+    fd: Resource<Descriptor>,
+    path: &str,
+    dir: bool,
+) -> Result<std::result::Result<(), ErrorCode>> {
+    let (fs, start) = fd_fs(view, &fd)?;
+    let mut g = fs.lock().unwrap();
+    let Some((parent, name)) = resolve_parent(&g, start, path) else {
+        return err(ErrorCode::NoEntry);
+    };
+    let id = match g.nodes.get(&parent) {
+        Some(Node::Dir(c)) => match c.get(&name) {
+            Some(id) => *id,
+            None => return err(ErrorCode::NoEntry),
+        },
+        _ => return err(ErrorCode::NotDirectory),
+    };
+    match (dir, g.nodes.get(&id)) {
+        (true, Some(Node::Dir(c))) if !c.is_empty() => return err(ErrorCode::NotEmpty),
+        (true, Some(Node::Dir(_))) => {}
+        (true, _) => return err(ErrorCode::NotDirectory),
+        (false, Some(Node::Dir(_))) | (false, None) => return err(ErrorCode::IsDirectory),
+        (false, _) => {}
     }
+    g.nodes.remove(&id);
+    if let Some(Node::Dir(c)) = g.nodes.get_mut(&parent) {
+        c.remove(&name);
+    }
+    Ok(Ok(()))
 }
 
 fn stat_node(fs: &Fs, id: u64) -> Option<DescriptorStat> {
@@ -1215,7 +1252,7 @@ fn stat_node(fs: &Fs, id: u64) -> Option<DescriptorStat> {
     })
 }
 
-impl wasi::filesystem::types::HostDirectoryEntryStream for HostState {
+impl<T: VfsView> wasi::filesystem::types::HostDirectoryEntryStream for VfsImpl<T> {
     fn read_directory_entry(
         &mut self,
         stream: Resource<DirEntryStream>,

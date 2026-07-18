@@ -32,6 +32,7 @@ http-body-util = "0.1"
 smoltcp = "0.13.1"
 wk-fabric = { path = "../wk-fabric" }
 wk-dockerfile = { path = "../wk-dockerfile" }
+wk-vfs = { path = "../wk-vfs" }
 wit-component = "0.253.0"
 
 [dev-dependencies]

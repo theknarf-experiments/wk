@@ -426,6 +426,12 @@ impl WasiView for HostState {
     }
 }
 
+impl wk_vfs::VfsView for HostState {
+    fn fs(&mut self) -> crate::vfs::SharedFs {
+        self.fs.clone()
+    }
+}
+
 impl wasmtime_wasi_io::IoView for HostState {
     fn table(&mut self) -> &mut ResourceTable {
         &mut self.table

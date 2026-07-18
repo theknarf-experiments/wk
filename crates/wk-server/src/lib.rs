@@ -12,7 +12,6 @@ pub mod audio;
 pub mod auth;
 pub mod http;
 pub mod images;
-pub mod layers;
 pub mod midi;
 pub mod oci;
 pub mod options;
@@ -22,6 +21,11 @@ pub mod server;
 pub mod sockets;
 pub mod terminal;
 pub mod tty;
-pub mod vfs;
 pub mod wiring;
+
+// The virtual filesystem (and its immutable layer engine) lives in the
+// wk-vfs crate; re-exported here so `crate::vfs`/`crate::layers` paths (and
+// downstream `wk_server::vfs` users) stay stable.
+pub use wk_vfs as vfs;
+pub use wk_vfs::layers;
 pub mod workspace;

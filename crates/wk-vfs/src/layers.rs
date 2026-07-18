@@ -1,12 +1,12 @@
 //! Immutable filesystem layers: the content of an OCI image layer (or a local
 //! layer source) as a reusable, `Arc`-shared value that can be applied into any
-//! node's [`crate::vfs::Fs`].
+//! node's [`crate::Fs`].
 //!
 //! A [`Layer`] is an ordered list of entries — directories, files, and OCI
 //! whiteouts (`.wh.<name>` deletes, `.wh..wh..opq` clears a directory). File
 //! bytes are `Arc`s: applying the same layer to five nodes stores the bytes
 //! once, and the vfs copy-on-writes per node on first write (see
-//! [`crate::vfs`]'s `RoFile`). A process-wide cache keyed by source digest makes
+//! the crate's `RoFile`). A process-wide cache keyed by source digest makes
 //! repeat applications (and repeat loads) cheap.
 
 use std::collections::HashMap;
@@ -14,7 +14,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::vfs::SharedFs;
+use crate::SharedFs;
 
 /// One entry of a layer, with a `/`-free normalized path ("a/b/c").
 #[derive(Debug)]
@@ -204,7 +204,7 @@ pub fn cached(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vfs::new_fs;
+    use crate::new_fs;
 
     /// Build an in-memory tar with the given (path, contents) files; a trailing
     /// `/` in the path makes a directory.

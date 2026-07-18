@@ -10893,6 +10893,7 @@ dependencies = [
  "wk-dockerfile",
  "wk-fabric",
  "wk-protocol",
+ "wk-vfs",
 ]
 
 [[package]]
@@ -10901,6 +10902,18 @@ version = "0.1.0"
 dependencies = [
  "biscuit-auth",
  "wk-protocol",
+]
+
+[[package]]
+name = "wk-vfs"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "proptest",
+ "tar",
+ "wasmtime",
+ "wasmtime-wasi",
+ "wasmtime-wasi-io",
 ]
 
 [[package]]
