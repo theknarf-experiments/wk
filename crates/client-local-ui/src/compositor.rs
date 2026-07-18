@@ -456,8 +456,9 @@ struct Inspector {
     dir: String,
     /// A file within `dir` being previewed, if any.
     file: Option<String>,
-    /// Scroll offset (first visible row) into the current listing.
-    scroll: usize,
+    /// Scroll offset into the current listing, in rows. An `f32` so trackpad
+    /// pixel deltas accumulate; floored when mapping to entries.
+    scroll: f32,
 }
 
 impl Inspector {
@@ -472,7 +473,7 @@ impl Inspector {
     /// Ascend to the parent directory.
     fn go_up(&mut self) {
         self.file = None;
-        self.scroll = 0;
+        self.scroll = 0.0;
         match self.dir.rfind('/') {
             Some(0) | None => self.dir.clear(),
             Some(i) => self.dir.truncate(i),
@@ -564,24 +565,35 @@ struct WidgetChrome<'a> {
     status_scale: f32,
 }
 
-/// The inspector's interactive regions for a listing of `n_entries` rows:
-/// `(panel, close_btn, up_row, entry_rows, preview)`. `entry_rows` pairs a row
-/// rect with the entry index (after `scroll`). Pure geometry, shared by the
-/// click hit-test and the draw so they never diverge; free-standing so it can
-/// be unit-tested without a live `App`.
-#[allow(clippy::type_complexity)]
-fn inspect_geom(
-    fb: [f32; 2],
-    n_entries: usize,
-    has_up: bool,
-    scroll: usize,
-) -> (
+/// The inspector's interactive regions for a listing: `(panel, close_btn,
+/// up_row, entry_rows, preview)`. `entry_rows` pairs a row rect with its entry
+/// index (after `scroll`). Pure geometry, shared by the click hit-test and the
+/// draw so they never diverge, and unit-testable without a live `App`.
+type InspectRegions = (
     [f32; 4],
     [f32; 4],
     Option<[f32; 4]>,
     Vec<([f32; 4], usize)>,
     [f32; 4],
-) {
+);
+
+/// How many listing rows fit between the inspector's title and preview strip.
+fn inspect_rows_fit(fb: [f32; 2]) -> usize {
+    let (_x, y, _w, h, row_h) = App::inspect_layout(fb);
+    let preview_h = (h * 0.34).max(row_h * 3.0);
+    let list_top = y + row_h;
+    let list_bottom = y + h - preview_h;
+    (((list_bottom - list_top) / row_h).floor() as usize).max(1)
+}
+
+/// The largest useful scroll offset: past it the last entry has already
+/// reached the last row (the ".." row costs one slot of capacity).
+fn inspect_max_scroll(fb: [f32; 2], n_entries: usize, has_up: bool) -> usize {
+    let visible = inspect_rows_fit(fb).saturating_sub(has_up as usize).max(1);
+    n_entries.saturating_sub(visible)
+}
+
+fn inspect_geom(fb: [f32; 2], n_entries: usize, has_up: bool, scroll: usize) -> InspectRegions {
     let (x, y, w, h, row_h) = App::inspect_layout(fb);
     let panel = [x, y, x + w, y + h];
     let close = {
@@ -593,7 +605,7 @@ fn inspect_geom(
     let list_top = y + row_h;
     let list_bottom = y + h - preview_h;
     let preview = [x, list_bottom, x + w, y + h];
-    let rows_fit = (((list_bottom - list_top) / row_h).floor() as usize).max(1);
+    let rows_fit = inspect_rows_fit(fb);
 
     let up = has_up.then_some([x, list_top, x + w, list_top + row_h]);
     let mut rows = Vec::new();
@@ -1543,21 +1555,10 @@ impl App {
     /// The inspector's interactive regions for the current node's listing of
     /// `n_entries` rows — see [`inspect_geom`] (this just supplies the modal's
     /// current `dir`/`scroll`).
-    #[allow(clippy::type_complexity)]
-    fn inspect_regions(
-        &self,
-        fb: [f32; 2],
-        n_entries: usize,
-    ) -> (
-        [f32; 4],
-        [f32; 4],
-        Option<[f32; 4]>,
-        Vec<([f32; 4], usize)>,
-        [f32; 4],
-    ) {
+    fn inspect_regions(&self, fb: [f32; 2], n_entries: usize) -> InspectRegions {
         let insp = self.inspect.as_ref();
         let has_up = insp.is_some_and(|i| !i.dir.is_empty());
-        let scroll = insp.map_or(0, |i| i.scroll);
+        let scroll = insp.map_or(0, |i| i.scroll.floor().max(0.0) as usize);
         inspect_geom(fb, n_entries, has_up, scroll)
     }
 
@@ -2133,7 +2134,7 @@ impl App {
                         if entry.is_dir {
                             i.dir = i.child_path(&entry.name);
                             i.file = None;
-                            i.scroll = 0;
+                            i.scroll = 0.0;
                         } else {
                             i.file = Some(entry.name.clone());
                         }
@@ -2311,7 +2312,7 @@ impl App {
                                     node: id,
                                     dir: String::new(),
                                     file: None,
-                                    scroll: 0,
+                                    scroll: 0.0,
                                 }),
                             };
                         } else if idle && contains(run_btn(r, zf), mp) {
@@ -3412,6 +3413,36 @@ impl App {
                     }
                 }
             }
+            // Overflowing listing: a thin scrollbar along the right edge shows
+            // where the visible window sits (and that there's more to reach).
+            let has_up = !insp.dir.is_empty();
+            let visible = inspect_rows_fit(fb).saturating_sub(has_up as usize).max(1);
+            if entries.len() > visible {
+                let list_top = panel[1] + row_h + if has_up { row_h } else { 0.0 };
+                let list_bottom = preview[1];
+                let track_h = (list_bottom - list_top).max(1.0);
+                let frac_pos = insp.scroll.floor().max(0.0) / entries.len() as f32;
+                let frac_len = visible as f32 / entries.len() as f32;
+                let ty = list_top + track_h * frac_pos;
+                let th = (track_h * frac_len).max(12.0);
+                quads.push(Quad::solid(
+                    white,
+                    [panel[2] - 6.0, list_top, panel[2] - 3.0, list_bottom],
+                    [0.16, 0.17, 0.21, 1.0],
+                    full,
+                ));
+                quads.push(Quad::solid(
+                    white,
+                    [
+                        panel[2] - 6.0,
+                        ty,
+                        panel[2] - 3.0,
+                        (ty + th).min(list_bottom),
+                    ],
+                    [0.45, 0.48, 0.56, 1.0],
+                    full,
+                ));
+            }
             if entries.is_empty() {
                 self.text_cache.draw(
                     &mut quads,
@@ -3700,6 +3731,20 @@ impl ApplicationHandler for App {
                     self.palette_scroll = (self.palette_scroll - dy).clamp(0.0, max);
                     return;
                 }
+                // Likewise the (modal) file inspector: the wheel scrolls its
+                // listing, clamped so the tail stays reachable but no further.
+                if let Some(insp) = &self.inspect {
+                    let (node, dir) = (insp.node, insp.dir.clone());
+                    let len = self
+                        .app_node(node)
+                        .and_then(|n| n.fs.lock().unwrap().list_dir(&dir).map(|v| v.len()))
+                        .unwrap_or(0);
+                    let max = inspect_max_scroll(self.viewport, len, !dir.is_empty()) as f32;
+                    if let Some(insp) = &mut self.inspect {
+                        insp.scroll = (insp.scroll - dy).clamp(0.0, max);
+                    }
+                    return;
+                }
                 // Scrolling over a HostPort node adjusts its port (scroll up =
                 // higher), rather than panning the canvas.
                 if let Some(id) = self.topmost_under(self.mouse) {
@@ -3891,6 +3936,35 @@ impl wk_protocol::Client<ServerHandle> for WindowClient {
 #[cfg(test)]
 mod inspect_tests {
     use super::*;
+
+    /// Scrolling offsets which entries are visible, is clamped so the last
+    /// entry lands in the last row at max scroll, and the ".." slot costs one
+    /// row of capacity.
+    #[test]
+    fn inspect_scrolling_clamps_and_offsets_rows() {
+        let fb = [1440.0, 900.0];
+        let (_, _, _, rows7, _) = inspect_geom(fb, 100, false, 7);
+        assert_eq!(rows7[0].1, 7, "first visible entry follows the scroll");
+        let (_, _, _, rows0, _) = inspect_geom(fb, 100, false, 0);
+        assert_eq!(rows7.len(), rows0.len(), "capacity independent of scroll");
+
+        let max = inspect_max_scroll(fb, 100, false);
+        assert!(max > 0, "100 entries overflow the panel");
+        let (_, _, _, rows_max, _) = inspect_geom(fb, 100, false, max);
+        assert_eq!(rows_max.last().unwrap().1, 99, "last entry visible at max");
+        assert_eq!(rows_max[0].1, max, "no overscroll past the tail");
+
+        assert_eq!(
+            inspect_max_scroll(fb, 3, false),
+            0,
+            "few entries: no scroll"
+        );
+        assert_eq!(
+            inspect_max_scroll(fb, 100, true),
+            max + 1,
+            "the .. row costs one slot of capacity"
+        );
+    }
 
     /// The inspector's row geometry is well-formed: every region sits inside the
     /// panel, entry rows are stacked in order below the title (and below the
