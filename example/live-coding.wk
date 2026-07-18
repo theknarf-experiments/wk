@@ -1,25 +1,21 @@
 // vim: set filetype=kdl :
-// A live shader-coding setup. Run from the repo root:  wk example/live-coding.wk
-// It imports the repo's dependency list, then wires an on-disk shader file into
-// both the shader viewer and vim — edit shader.wgsl in vim (or any editor) and
-// the viewer hot-reloads. The piano feeds MIDI to the shader (cc(1u), cc(60u)).
 import "../workspace.wk"
 workspace "01KXKG7000000000000000WS00" {
-    node "vim" "01KXKG7000000000000000VM01" {
-        pos 60.0 80.0
-        size 470.0 420.0
-        args "-u" "NONE" "shader.wgsl"
+    node "piano" "01KXKG7000000000000000PN03" {
+        pos 60.0 540.0
+        size 360.0 200.0
     }
     node "shader" "01KXKG7000000000000000SH02" {
         pos 570.0 80.0
         size 440.0 420.0
     }
-    node "piano" "01KXKG7000000000000000PN03" {
-        pos 60.0 540.0
-        size 360.0 200.0
+    node "vim" "01KXKG7000000000000000VM01" {
+        pos 6.292694091796875 -0.1733264923095703
+        size 470.0 420.0
+        args "shader.wgsl"
     }
     hostfile "example/shader.wgsl" "01KXKG7000000000000000HF04" {
-        pos 400.0 320.0
+        pos 487.3367919921875 584.0228271484375
         size 150.0 44.0
     }
     connection "01KXKG7000000000000000HF04" "01KXKG7000000000000000SH02"

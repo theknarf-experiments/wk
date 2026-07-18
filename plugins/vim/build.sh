@@ -84,7 +84,7 @@ if [ ! -f "$SRC/auto/config.h" ]; then
             vim_cv_uname_output=Linux vim_cv_uname_r_output= vim_cv_uname_m_output=wasm32 \
             ac_cv_sizeof_int=4 ac_cv_sizeof_long=4 ac_cv_sizeof_time_t=8 ac_cv_sizeof_off_t=8
         ./configure --host=wasm32-wasi --build=x86_64-apple-darwin \
-            --with-features=tiny --enable-gui=no --without-x --with-tlib=wktcap \
+            --with-features=normal --enable-gui=no --without-x --with-tlib=wktcap \
             --disable-netbeans --disable-channel --disable-terminal \
             --disable-nls --disable-selinux --disable-smack --disable-acl \
             --disable-canberra --disable-libsodium >/dev/null
@@ -92,10 +92,14 @@ if [ ! -f "$SRC/auto/config.h" ]; then
         # HAVE_TGETENT stays on (Vim's Unix build assumes it — e.g. os_unix.c
         # calls the HAVE_TGETENT-only term_set_winsize unconditionally); the
         # builtin termcaps drive everything, formatted through tcap_stub's tgoto.
+        # HAVE_GETTIMEOFDAY off: it only gates FEAT_RELTIME (regex/redraw
+        # timeouts via setitimer/sigaction, which wasi lacks) and a crypt-seed
+        # fallback; disabling it keeps the normal-feature build linking.
         sed -i.bak \
             -e 's|#define HAVE_DLOPEN 1|/* #undef HAVE_DLOPEN */|' \
             -e 's|/\* #undef HAVE_SETJMP_H \*/|#define HAVE_SETJMP_H 1|' \
             -e 's|/\* #undef HAVE_TERMIOS_H \*/|#define HAVE_TERMIOS_H 1|' \
+            -e 's|#define HAVE_GETTIMEOFDAY 1|/* #undef HAVE_GETTIMEOFDAY */|' \
             auto/config.h
         # osdef.h: hand-written, not osdef.sh-generated. osdef.sh probes by
         # compiling AND running a program to see which prototypes the system
@@ -139,6 +143,12 @@ OBJS=""
 for f in $FILES; do
     src="$SRC/$f"; [ -f "$src" ] || src="$SRC/auto/$f"
     obj="wkobj/${f%.c}.o"
+    env PATH="$CLANG_PATH" "$CLANG" $CFLAGS -c "$src" -o "$obj"
+    OBJS="$OBJS $obj"
+done
+# The bundled xdiff library (the +diff feature links xdl_* symbols).
+for src in "$SRC"/xdiff/*.c; do
+    obj="wkobj/xdiff_$(basename "${src%.c}").o"
     env PATH="$CLANG_PATH" "$CLANG" $CFLAGS -c "$src" -o "$obj"
     OBJS="$OBJS $obj"
 done

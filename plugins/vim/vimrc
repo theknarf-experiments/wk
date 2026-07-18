@@ -1,0 +1,5 @@
+" wk's system vimrc (installed at $VIM/vimrc by the container build).
+" The terminal is alacritty-backed and speaks 256-colour SGR; vim's builtin
+" termcap can't know that, so declare it — defaults.vim then turns syntax
+" highlighting on.
+set t_Co=256

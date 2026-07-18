@@ -15,7 +15,7 @@ workspace "01KXKGB000000000000000WS00" {
     node "vim" "01KXKGB000000000000000VM01" {
         pos 60.0 320.0
         size 430.0 330.0
-        args "-u" "NONE" "notes.txt"
+        args "notes.txt"
     }
     node "kilo" "01KXKGB000000000000000KL02" {
         pos 520.0 320.0
