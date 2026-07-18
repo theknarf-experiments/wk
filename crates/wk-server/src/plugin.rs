@@ -768,6 +768,76 @@ fn add_random(l: &mut Linker<HostState>) -> Result<()> {
     Ok(())
 }
 
+/// Build-time `RUN` execution: run a wasi:cli command component against the
+/// build's rootfs (its writes become the RUN's layer). stdout/stderr pass
+/// through to wk's own, like `docker build` streaming a step's output.
+impl crate::images::BuildRunner for PluginHost {
+    fn run(
+        &self,
+        wasm: &[u8],
+        argv: &[String],
+        env: &[(String, String)],
+        fs: &crate::vfs::SharedFs,
+    ) -> std::result::Result<(), String> {
+        let component =
+            Component::new(&self.engine, wasm).map_err(|e| format!("compile RUN target: {e:#}"))?;
+        let linker = self
+            .build_linker()
+            .map_err(|e| format!("link RUN step: {e:#}"))?;
+        let mut b = WasiCtxBuilder::new();
+        b.inherit_stdout().inherit_stderr().args(argv);
+        for (k, v) in env {
+            b.env(k, v);
+        }
+        let state = HostState {
+            ctx: b.build(),
+            table: ResourceTable::new(),
+            registry: Arc::new(Mutex::new(Vec::new())),
+            node_id: NodeId::nil(),
+            fs: fs.clone(),
+            term_io: crate::terminal::TermIo::new(),
+            midi_in: crate::midi::new_inbox(),
+            midi_router: self.midi.clone(),
+            options: crate::options::new_options(Vec::new()),
+            net: None,
+            random_ctx: wasmtime_wasi::random::WasiRandomCtx::default(),
+            http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
+            // No fabric stack at build time: outbound http is denied, keeping
+            // builds hermetic.
+            http_hooks: GatedHttpHooks { stack: None },
+            gpu: Arc::clone(&self.gpu),
+        };
+        let mut store = Store::new(&self.engine, state);
+        // The engine runs with epoch interruption (for killing runaway nodes);
+        // a build step just keeps going — nothing increments epochs during a
+        // CLI build, and a live server's ticks shouldn't abort it either.
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_callback(|_| Ok(wasmtime::UpdateDeadline::Continue(1)));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .map_err(|e| format!("tokio runtime: {e}"))?;
+        rt.block_on(async move {
+            let command = wasmtime_wasi::p2::bindings::Command::instantiate_async(
+                &mut store, &component, &linker,
+            )
+            .await
+            .map_err(|e| format!("instantiate RUN step: {e:#}"))?;
+            match command.wasi_cli_run().call_run(&mut store).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(())) => Err("RUN step exited with failure".to_string()),
+                Err(e) => match e.downcast_ref::<wasmtime_wasi::I32Exit>() {
+                    Some(wasmtime_wasi::I32Exit(0)) => Ok(()),
+                    Some(wasmtime_wasi::I32Exit(code)) => {
+                        Err(format!("RUN step exited with status {code}"))
+                    }
+                    None => Err(format!("RUN step trapped: {e:#}")),
+                },
+            }
+        })
+    }
+}
+
 /// Owns the wasmtime engine and spawns plugin clients on their own threads.
 #[derive(Clone)]
 pub struct PluginHost {

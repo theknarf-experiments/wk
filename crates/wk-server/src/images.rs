@@ -141,6 +141,32 @@ pub fn load_image(id: &str) -> Option<ImageManifest> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Every stored image: (id, manifest), sorted by id.
+pub fn list_images() -> Vec<(String, ImageManifest)> {
+    let dir = store_dir().join("images");
+    let mut out: Vec<(String, ImageManifest)> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let id = name.strip_suffix(".json")?.to_string();
+            Some((id.clone(), load_image(&id)?))
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Remove a stored image: its manifest and extracted entrypoint. Layer tars
+/// stay (they are content-addressed and may be shared by other images).
+/// Returns whether anything was removed.
+pub fn remove_image(id: &str) -> bool {
+    let removed = std::fs::remove_file(image_path(id)).is_ok();
+    let _ = std::fs::remove_file(entrypoint_path(id));
+    removed
+}
+
 /// Normalize an in-image destination path against the current workdir: an
 /// absolute dest is used as-is; a relative one joins the workdir. The result is
 /// a normalized, leading-`/`-free layer path.
@@ -277,9 +303,19 @@ fn alias_path(dockerfile: &Path) -> PathBuf {
 }
 
 /// Build the Dockerfile and record a source→image alias, so later lookups
-/// (without rebuilding) resolve the entrypoint and manifest.
+/// (without rebuilding) resolve the entrypoint and manifest. A Dockerfile with
+/// RUN steps gets a real wasm runner (a scratch plugin host).
 pub fn build_and_alias(dockerfile: &Path) -> Result<String, String> {
-    let id = build(dockerfile)?;
+    let needs_runner = std::fs::read_to_string(dockerfile)
+        .ok()
+        .and_then(|src| dockerfile::parse(&src).ok())
+        .is_some_and(|df| df.instructions.iter().any(|i| matches!(i, Instr::Run(_))));
+    let id = if needs_runner {
+        let host = crate::plugin::PluginHost::new().map_err(|e| format!("build runner: {e:#}"))?;
+        build_with_runner(dockerfile, Some(&host))?
+    } else {
+        build(dockerfile)?
+    };
     write_creating_dirs(&alias_path(dockerfile), id.as_bytes())?;
     Ok(id)
 }
@@ -293,8 +329,89 @@ pub fn aliased_image(dockerfile: &Path) -> Option<(String, ImageManifest)> {
 
 /// Build the image described by `dockerfile_path` (context = its directory)
 /// into the store. Deterministic: the returned image id is a digest of the
-/// layer contents + config, so an unchanged build is a cache hit.
+/// layer contents + config, so an unchanged build is a cache hit. RUN
+/// instructions error without a runner; use [`build_with_runner`].
 pub fn build(dockerfile_path: &Path) -> Result<String, String> {
+    build_with_runner(dockerfile_path, None)
+}
+
+/// Executes a build-time `RUN` step: run the wasm CLI `wasm` with `argv` and
+/// `env` against the build rootfs `fs` (its writes become the RUN's layer).
+/// The plugin host implements this; tests inject mocks.
+pub trait BuildRunner {
+    fn run(
+        &self,
+        wasm: &[u8],
+        argv: &[String],
+        env: &[(String, String)],
+        fs: &crate::vfs::SharedFs,
+    ) -> Result<(), String>;
+}
+
+/// Capture everything written to `fs` since `before` as a layer tarball:
+/// privately written files (created or copied-up), new directories, and
+/// deletions (as OCI whiteouts, topmost path only). `None` if nothing changed.
+fn diff_layer(
+    before: &BTreeMap<String, crate::vfs::PathKind>,
+    fs: &crate::vfs::SharedFs,
+) -> Result<Option<Vec<u8>>, String> {
+    use crate::vfs::PathKind;
+    let g = fs.lock().unwrap();
+    let after = g.snapshot();
+    let mut b = tar::Builder::new(Vec::new());
+    let mut changed = false;
+    for path in before.keys() {
+        if !after.contains_key(path) {
+            // Skip children of an already-whited-out directory.
+            let covered = path
+                .rsplit_once('/')
+                .is_some_and(|(dir, _)| before.contains_key(dir) && !after.contains_key(dir));
+            if covered {
+                continue;
+            }
+            let (dir, name) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
+            let wh = if dir.is_empty() {
+                format!(".wh.{name}")
+            } else {
+                format!("{dir}/.wh.{name}")
+            };
+            tar_file(&mut b, &wh, b"")?;
+            changed = true;
+        }
+    }
+    for (path, kind) in &after {
+        match kind {
+            PathKind::Dir if !before.contains_key(path) => {
+                tar_dir_entry(&mut b, path)?;
+                changed = true;
+            }
+            // A private file is a write since the last snapshot: RUN layers are
+            // re-applied as layer files, so anything private here is new.
+            PathKind::PrivateFile => {
+                let data = g
+                    .read_file(path, usize::MAX)
+                    .ok_or_else(|| format!("diff: {path} vanished"))?;
+                tar_file(&mut b, path, &data)?;
+                changed = true;
+            }
+            _ => {}
+        }
+    }
+    if !changed {
+        return Ok(None);
+    }
+    b.into_inner()
+        .map(Some)
+        .map_err(|e| format!("finish diff layer: {e}"))
+}
+
+/// [`build`], with a runner for `RUN` instructions. The rootfs is materialized
+/// live as layers apply, so each RUN sees the filesystem built so far and its
+/// writes are captured (via [`diff_layer`]) as the next layer.
+pub fn build_with_runner(
+    dockerfile_path: &Path,
+    runner: Option<&dyn BuildRunner>,
+) -> Result<String, String> {
     let source = std::fs::read_to_string(dockerfile_path)
         .map_err(|e| format!("read {}: {e}", dockerfile_path.display()))?;
     let context = dockerfile_path
@@ -313,6 +430,15 @@ pub fn build(dockerfile_path: &Path) -> Result<String, String> {
         labels: BTreeMap::new(),
     };
     let mut workdir = "/".to_string();
+    // The rootfs built so far, kept live for RUN steps and the final
+    // entrypoint extraction.
+    let rootfs = crate::vfs::new_fs();
+    let apply_tar = |manifest: &mut ImageManifest, tar: &[u8]| -> Result<(), String> {
+        let digest = put_layer(tar)?;
+        crate::layers::apply(&rootfs, &crate::layers::from_tar_bytes(tar)?, "");
+        manifest.layers.push(digest);
+        Ok(())
+    };
     for instr in &df.instructions {
         match instr {
             Instr::From { image } => {
@@ -325,6 +451,11 @@ pub fn build(dockerfile_path: &Path) -> Result<String, String> {
                              (FROM scratch, or pull/build it first)"
                         )
                     })?;
+                    for digest in &base.layers {
+                        let bytes = std::fs::read(layer_path(digest))
+                            .map_err(|e| format!("read layer {digest}: {e}"))?;
+                        crate::layers::apply(&rootfs, &crate::layers::from_tar_bytes(&bytes)?, "");
+                    }
                     manifest.layers.extend(base.layers);
                     manifest.env.extend(base.env);
                     manifest.entrypoint = base.entrypoint;
@@ -333,7 +464,32 @@ pub fn build(dockerfile_path: &Path) -> Result<String, String> {
             }
             Instr::Copy { srcs, dest } => {
                 let tar = copy_layer(&context, &workdir, srcs, dest)?;
-                manifest.layers.push(put_layer(&tar)?);
+                apply_tar(&mut manifest, &tar)?;
+            }
+            Instr::Run(argv) => {
+                let Some(runner) = runner else {
+                    return Err(
+                        "RUN needs a build runner (wasm execution); build through wk".into(),
+                    );
+                };
+                let exe = argv
+                    .first()
+                    .ok_or("RUN needs a command (a wasm path in the rootfs)")?;
+                let wasm = rootfs
+                    .lock()
+                    .unwrap()
+                    .read_file(exe, usize::MAX)
+                    .ok_or_else(|| format!("RUN {exe}: not found in the rootfs built so far"))?;
+                if !wasm.starts_with(b"\0asm") {
+                    return Err(format!("RUN {exe}: not a wasm file"));
+                }
+                let before = rootfs.lock().unwrap().snapshot();
+                runner.run(&wasm, argv, &manifest.env, &rootfs)?;
+                if let Some(tar) = diff_layer(&before, &rootfs)? {
+                    // Store AND re-apply: the outputs become layer files, so the
+                    // next RUN's diff starts clean.
+                    apply_tar(&mut manifest, &tar)?;
+                }
             }
             Instr::Env(pairs) => manifest.env.extend(pairs.iter().cloned()),
             Instr::Entrypoint(argv) => manifest.entrypoint = argv.clone(),
@@ -359,15 +515,6 @@ pub fn build(dockerfile_path: &Path) -> Result<String, String> {
         .or(manifest.cmd.first())
         .cloned()
         .ok_or("the Dockerfile sets no ENTRYPOINT (or CMD)")?;
-
-    // Materialize the rootfs and extract the entrypoint component from it.
-    let rootfs = crate::vfs::new_fs();
-    for digest in &manifest.layers {
-        let bytes =
-            std::fs::read(layer_path(digest)).map_err(|e| format!("read layer {digest}: {e}"))?;
-        let layer = crate::layers::from_tar_bytes(&bytes)?;
-        crate::layers::apply(&rootfs, &layer, "");
-    }
     let wasm = rootfs
         .lock()
         .unwrap()
@@ -501,6 +648,133 @@ mod tests {
         assert!(entrypoint_path(&id).is_file());
         // Default args = entrypoint[1..] ++ cmd.
         assert_eq!(manifest.default_args(), vec!["--default".to_string()]);
+    }
+
+    /// A mock RUN runner: records its invocation and mutates the rootfs the
+    /// way a generator component would (writes a file, deletes a seed).
+    struct MockRunner {
+        called: std::sync::atomic::AtomicUsize,
+    }
+    impl BuildRunner for MockRunner {
+        fn run(
+            &self,
+            wasm: &[u8],
+            argv: &[String],
+            env: &[(String, String)],
+            fs: &crate::vfs::SharedFs,
+        ) -> Result<(), String> {
+            self.called
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(wasm.starts_with(b"\0asm"), "handed the target's bytes");
+            assert_eq!(argv, ["/gen.wasm", "--make"]);
+            assert!(
+                env.contains(&("X".to_string(), "1".to_string())),
+                "sees prior ENV"
+            );
+            let mut g = fs.lock().unwrap();
+            g.put_file_at("data/out.txt", b"made".to_vec());
+            g.remove_path("data/seed.txt");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn run_layer_captures_writes_and_deletes() {
+        isolated_store("run");
+        let ctx = vim_like_context("run");
+        std::fs::write(ctx.join("seed.txt"), b"seed").unwrap();
+        std::fs::write(
+            ctx.join("Dockerfile"),
+            "FROM scratch\n\
+             COPY app.wasm /gen.wasm\n\
+             COPY seed.txt /data/seed.txt\n\
+             ENV X=1\n\
+             RUN /gen.wasm --make\n\
+             ENTRYPOINT [\"/gen.wasm\"]\n",
+        )
+        .unwrap();
+        let runner = MockRunner {
+            called: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let id = build_with_runner(&ctx.join("Dockerfile"), Some(&runner)).expect("builds");
+        assert_eq!(runner.called.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let m = load_image(&id).expect("stored");
+        assert_eq!(m.layers.len(), 3, "two COPYs + one RUN layer");
+
+        // Replay all layers into a fresh fs: the RUN's write is there, the
+        // deleted seed is gone (captured as a whiteout).
+        let fs = crate::vfs::new_fs();
+        for l in &m.layers {
+            let bytes = std::fs::read(layer_path(l)).unwrap();
+            crate::layers::apply(&fs, &crate::layers::from_tar_bytes(&bytes).unwrap(), "");
+        }
+        let g = fs.lock().unwrap();
+        assert_eq!(
+            g.read_file("/data/out.txt", 64).as_deref(),
+            Some(&b"made"[..])
+        );
+        assert!(
+            g.read_file("/data/seed.txt", 64).is_none(),
+            "whiteout captured"
+        );
+        assert!(g.read_file("/gen.wasm", 64).is_some());
+    }
+
+    #[test]
+    fn run_without_a_runner_is_an_error() {
+        isolated_store("norunner");
+        let ctx = vim_like_context("norunner");
+        std::fs::write(
+            ctx.join("Dockerfile"),
+            "FROM scratch\nCOPY app.wasm /g.wasm\nRUN /g.wasm\nENTRYPOINT [\"/g.wasm\"]\n",
+        )
+        .unwrap();
+        let err = build(&ctx.join("Dockerfile")).unwrap_err();
+        assert!(err.contains("RUN"), "err was: {err}");
+    }
+
+    #[test]
+    fn run_target_must_exist_and_be_wasm() {
+        isolated_store("runtarget");
+        let ctx = vim_like_context("runtarget");
+        let runner = MockRunner {
+            called: std::sync::atomic::AtomicUsize::new(0),
+        };
+        std::fs::write(
+            ctx.join("Dockerfile"),
+            "FROM scratch\nCOPY app.wasm /g.wasm\nRUN /missing.wasm\nENTRYPOINT [\"/g.wasm\"]\n",
+        )
+        .unwrap();
+        let err = build_with_runner(&ctx.join("Dockerfile"), Some(&runner)).unwrap_err();
+        assert!(err.contains("missing.wasm"), "err was: {err}");
+
+        std::fs::write(ctx.join("notwasm.txt"), b"plain text").unwrap();
+        std::fs::write(
+            ctx.join("Dockerfile"),
+            "FROM scratch\nCOPY notwasm.txt /t\nRUN /t\nENTRYPOINT [\"/t\"]\n",
+        )
+        .unwrap();
+        let err = build_with_runner(&ctx.join("Dockerfile"), Some(&runner)).unwrap_err();
+        assert!(err.contains("wasm"), "err was: {err}");
+    }
+
+    #[test]
+    fn list_and_remove_images() {
+        isolated_store("listrm");
+        let ctx = vim_like_context("listrm");
+        let id = build_and_alias(&ctx.join("Dockerfile")).expect("builds");
+
+        let listed = list_images();
+        assert!(listed
+            .iter()
+            .any(|(i, m)| i == &id && m.entrypoint == vec!["/app.wasm"]));
+
+        assert!(remove_image(&id), "removes a stored image");
+        assert!(load_image(&id).is_none(), "manifest gone");
+        assert!(!entrypoint_path(&id).is_file(), "extracted wasm gone");
+        assert!(!remove_image(&id), "second remove reports missing");
+        assert!(list_images().iter().all(|(i, _)| i != &id));
     }
 
     #[test]

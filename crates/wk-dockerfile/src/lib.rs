@@ -3,10 +3,10 @@
 //! wk builds OCI images whose entrypoint is a wasm component, so the supported
 //! instruction set is the copy-and-configure subset: `FROM` (single stage),
 //! `COPY`/`ADD` from the build context, `ENTRYPOINT`/`CMD` (exec or shell
-//! form), `ENV`, `WORKDIR`, `LABEL`. Anything that needs an execution
-//! environment at build time (`RUN`) is a hard error — there is no shell to run
-//! it in — and metadata-only instructions wk can't honor (`EXPOSE`, `USER`,
-//! `VOLUME`, ...) parse but are recorded as ignored.
+//! form), `ENV`, `WORKDIR`, `LABEL`, and `RUN` — with the twist that a RUN
+//! target must be a wasm CLI inside the rootfs built so far (there is no shell;
+//! the embedder executes the component). Metadata-only instructions wk can't
+//! honor (`EXPOSE`, `USER`, `VOLUME`, ...) parse but are recorded as ignored.
 //!
 //! The file is split into logical lines first (joining `\` continuations and
 //! dropping `#` comments); each line's instruction grammar — quoted strings,
@@ -27,6 +27,9 @@ pub enum Instr {
     Cmd(Vec<String>),
     /// `ENV K=V ...` (or the legacy `ENV K V`).
     Env(Vec<(String, String)>),
+    /// `RUN <wasm> <args>...` — executed at build time by the embedder, which
+    /// requires the target to be a wasm CLI inside the rootfs built so far.
+    Run(Vec<String>),
     /// `WORKDIR /path`.
     Workdir(String),
     /// `LABEL k=v ...` — carried into the image config.
@@ -290,12 +293,13 @@ pub fn parse(source: &str) -> Result<Dockerfile, String> {
                     .into_result()
                     .map_err(|e| arg_err(line_no, &kw, e))?,
             ),
-            "RUN" => {
-                return Err(format!(
-                    "Dockerfile line {line_no}: RUN is not supported — a wk container has no \
-                     build-time execution environment; COPY prebuilt files instead"
-                ))
-            }
+            "RUN" => Instr::Run(
+                exec_array()
+                    .parse(rest)
+                    .into_result()
+                    .or_else(|_| words().parse(rest).into_result())
+                    .map_err(|e| arg_err(line_no, &kw, e))?,
+            ),
             "EXPOSE" | "USER" | "VOLUME" | "STOPSIGNAL" | "HEALTHCHECK" | "SHELL"
             | "MAINTAINER" | "ONBUILD" | "ARG" => Instr::Ignored { keyword: kw },
             other => {
@@ -412,10 +416,19 @@ CMD ["-u", "NONE"]
     }
 
     #[test]
-    fn run_is_a_clear_error() {
-        let err = parse("FROM scratch\nRUN make install\n").unwrap_err();
-        assert!(err.to_lowercase().contains("run"), "err was: {err}");
-        assert!(err.contains("line 2"), "err carries the line: {err}");
+    fn run_parses_exec_and_shell_forms() {
+        // RUN is allowed at parse time; the *builder* enforces that the target
+        // is a wasm file it can execute.
+        let df = parse("FROM scratch\nRUN /gen.wasm --out /data\n").expect("parses");
+        assert_eq!(
+            df.instructions[1],
+            Instr::Run(vec!["/gen.wasm".into(), "--out".into(), "/data".into()])
+        );
+        let df = parse("FROM scratch\nRUN [\"/gen.wasm\", \"a b\"]\n").expect("parses");
+        assert_eq!(
+            df.instructions[1],
+            Instr::Run(vec!["/gen.wasm".into(), "a b".into()])
+        );
     }
 
     #[test]

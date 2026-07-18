@@ -43,6 +43,18 @@ use wasi::filesystem::types::{
 /// The bytes of a canvas "file node", shared by every app it is connected to.
 pub type SharedFile = Arc<Mutex<Vec<u8>>>;
 
+/// How a path exists in an `Fs`, for build-time diffs (see [`Fs::snapshot`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PathKind {
+    Dir,
+    /// An immutable layer file (`RoFile`) — untouched since its layer applied.
+    LayerFile,
+    /// A privately written file: created or copied-up since the last layer.
+    PrivateFile,
+    /// A canvas file mount (shared/host) — not part of any image.
+    Mounted,
+}
+
 enum Node {
     File(Vec<u8>),
     Dir(BTreeMap<String, u64>),
@@ -191,6 +203,61 @@ impl Fs {
                 self.drop_subtree(child);
             }
         }
+    }
+
+    /// Place a *private* (mutable) file at `path`, creating parents and
+    /// replacing any existing entry. Guest writes create private files through
+    /// the wasi host traits; this host-side twin lets tests (the mock RUN
+    /// runner, diff fixtures) mutate a rootfs the same way.
+    #[cfg(test)]
+    pub(crate) fn put_file_at(&mut self, path: &str, bytes: Vec<u8>) {
+        let comps = components(path);
+        let Some((name, dirs)) = comps.split_last() else {
+            return;
+        };
+        let Some(parent) = self.ensure_dir_path(&dirs.join("/")) else {
+            return;
+        };
+        if self.at_capacity() {
+            return;
+        }
+        self.remove_path_in(parent, name);
+        let id = self.alloc(Node::File(bytes));
+        if let Some(Node::Dir(children)) = self.nodes.get_mut(&parent) {
+            children.insert((*name).to_string(), id);
+        }
+    }
+
+    /// Every path in the filesystem (no leading `/`; the root itself omitted)
+    /// classified for build-time diffs: layer files vs privately written files
+    /// vs directories vs canvas mounts. See `crate::images`'s RUN capture.
+    pub(crate) fn snapshot(&self) -> BTreeMap<String, PathKind> {
+        let mut out = BTreeMap::new();
+        fn walk(fs: &Fs, dir: u64, prefix: &str, out: &mut BTreeMap<String, PathKind>) {
+            let Some(Node::Dir(children)) = fs.nodes.get(&dir) else {
+                return;
+            };
+            for (name, &id) in children {
+                let path = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                let kind = match fs.nodes.get(&id) {
+                    Some(Node::Dir(_)) => PathKind::Dir,
+                    Some(Node::RoFile(_)) => PathKind::LayerFile,
+                    Some(Node::File(_)) => PathKind::PrivateFile,
+                    Some(Node::Shared(_) | Node::Host(_)) => PathKind::Mounted,
+                    None => continue,
+                };
+                out.insert(path.clone(), kind);
+                if kind == PathKind::Dir {
+                    walk(fs, id, &path, out);
+                }
+            }
+        }
+        walk(self, ROOT, "", &mut out);
+        out
     }
 
     /// Detach child `name` of `parent` and drop its whole subtree.
@@ -1315,6 +1382,24 @@ mod tests {
             fs.lock().unwrap().read_file("/f", 64).as_deref(),
             Some(&b"mine"[..])
         );
+    }
+
+    #[test]
+    fn snapshot_classifies_paths_for_build_diffs() {
+        let fs = new_fs();
+        {
+            let mut g = fs.lock().unwrap();
+            g.put_ro_file_at("layered/ro.txt", Arc::new(b"layer".to_vec()));
+            g.put_file_at("written/out.txt", b"private".to_vec());
+            g.ensure_dir_path("empty");
+        }
+        let g = fs.lock().unwrap();
+        let snap = g.snapshot();
+        assert_eq!(snap.get("layered/ro.txt"), Some(&PathKind::LayerFile));
+        assert_eq!(snap.get("written/out.txt"), Some(&PathKind::PrivateFile));
+        assert_eq!(snap.get("empty"), Some(&PathKind::Dir));
+        assert_eq!(snap.get("layered"), Some(&PathKind::Dir));
+        assert!(!snap.contains_key(""), "root itself is not listed");
     }
 
     #[test]

@@ -54,6 +54,12 @@ enum Commands {
         plugin: String,
     },
 
+    /// Manage wk's local OCI image store
+    Images {
+        #[command(subcommand)]
+        cmd: ImagesCmd,
+    },
+
     /// Open a workspace (default workspace.wk)
     Run {
         /// Workspace file to open. Overrides the global `--file`; defaults to
@@ -64,6 +70,55 @@ enum Commands {
         #[arg(long)]
         headless: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ImagesCmd {
+    /// List stored images (id, entrypoint, layers)
+    List,
+    /// Remove a stored image by id (layer tars stay; they're shared)
+    Rm {
+        /// Image id (sha256-<hex>)
+        id: String,
+    },
+    /// Build a Dockerfile into the image store (wasm RUN steps execute)
+    Build {
+        /// Path to the Dockerfile (context = its directory)
+        dockerfile: PathBuf,
+    },
+}
+
+fn images_cmd(cmd: &ImagesCmd) -> Result<(), String> {
+    use wk_server::images;
+    match cmd {
+        ImagesCmd::List => {
+            let all = images::list_images();
+            if all.is_empty() {
+                println!("(no images; build one with `wk images build <Dockerfile>`)");
+            }
+            for (id, m) in all {
+                println!(
+                    "  {id}  entrypoint={}  layers={}",
+                    m.entrypoint.join(" "),
+                    m.layers.len()
+                );
+            }
+            Ok(())
+        }
+        ImagesCmd::Rm { id } => {
+            if images::remove_image(id) {
+                println!("removed {id}");
+                Ok(())
+            } else {
+                Err(format!("no image {id}"))
+            }
+        }
+        ImagesCmd::Build { dockerfile } => {
+            let id = images::build_and_alias(dockerfile)?;
+            println!("built {} -> {id}", dockerfile.display());
+            Ok(())
+        }
+    }
 }
 
 fn main() -> Result<(), String> {
@@ -79,6 +134,7 @@ fn main() -> Result<(), String> {
             workspace::publish(plugin.clone(), reference.clone(), file)
         }
         Some(Commands::List) => workspace::list(file),
+        Some(Commands::Images { cmd }) => images_cmd(cmd),
         Some(Commands::Remove { plugin }) => workspace::remove(plugin.clone(), file),
         Some(Commands::Run {
             file: run_file,
