@@ -120,14 +120,9 @@ impl Source {
     pub fn ensure(&self) -> Result<(), String> {
         match self {
             Source::Oci(reference) => {
-                let path = crate::oci::cache_path(reference);
-                if !path.exists() {
+                if !crate::oci::cache_path(reference).exists() {
                     println!("pulling {reference} ...");
-                    let bytes = crate::oci::pull(reference)?;
-                    if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-                    }
-                    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+                    crate::oci::pull_into_cache(reference)?;
                 }
                 Ok(())
             }
@@ -168,7 +163,11 @@ impl Dependency {
             Source::Dockerfile(p) => {
                 crate::images::aliased_image(p).map(|(_, m)| m.container_setup())
             }
-            _ => None,
+            // A pulled container image stores under its sanitized reference; a
+            // plain wasm artifact has no stored image and mounts nothing.
+            Source::Oci(reference) => crate::images::load_image(&crate::oci::sanitize(reference))
+                .map(|m| m.container_setup()),
+            Source::Path(_) => None,
         }
     }
 
@@ -182,7 +181,10 @@ impl Dependency {
             Source::Dockerfile(p) => crate::images::aliased_image(p)
                 .map(|(_, m)| m.default_args())
                 .unwrap_or_default(),
-            _ => Vec::new(),
+            Source::Oci(reference) => crate::images::load_image(&crate::oci::sanitize(reference))
+                .map(|m| m.default_args())
+                .unwrap_or_default(),
+            Source::Path(_) => Vec::new(),
         }
     }
 }

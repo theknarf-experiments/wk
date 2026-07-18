@@ -296,6 +296,110 @@ fn copy_layer(
     b.into_inner().map_err(|e| format!("finish layer: {e}"))
 }
 
+/// Turns pulled wasm into loadable wasm (componentizes a core module; see
+/// `crate::oci::ensure_component`). A seam so image ingestion is testable.
+pub type AdaptFn = dyn Fn(&[u8]) -> Result<Vec<u8>, String>;
+
+/// Ingest a pulled OCI container image into the store: tar layers (gunzipped
+/// if compressed) become content-addressed layers, the image config's
+/// Entrypoint/Cmd/Env/WorkingDir/Labels become the manifest, and the
+/// entrypoint wasm is extracted from the rootfs — run through `adapt` (which
+/// componentizes a core module; see `crate::oci`) — and written to the
+/// artifact cache path so `Source::Oci` loads it unchanged. The image is
+/// stored under the sanitized reference, so `FROM <reference>` finds it.
+pub fn store_pulled_image(
+    reference: &str,
+    layers: &[(String, Vec<u8>)],
+    config_json: &[u8],
+    adapt: &AdaptFn,
+) -> Result<String, String> {
+    let mut manifest = ImageManifest {
+        layers: Vec::new(),
+        entrypoint: Vec::new(),
+        cmd: Vec::new(),
+        env: Vec::new(),
+        workdir: None,
+        labels: BTreeMap::new(),
+    };
+    for (media, bytes) in layers {
+        if !media.contains("tar") {
+            return Err(format!("{reference}: unsupported layer media type {media}"));
+        }
+        // Store decompressed, so every consumer reads plain tars.
+        let plain: Vec<u8> = if bytes.starts_with(&[0x1f, 0x8b]) {
+            use std::io::Read;
+            let mut out = Vec::new();
+            flate2::read::GzDecoder::new(bytes.as_slice())
+                .read_to_end(&mut out)
+                .map_err(|e| format!("{reference}: gunzip layer: {e}"))?;
+            out
+        } else {
+            bytes.clone()
+        };
+        manifest.layers.push(put_layer(&plain)?);
+    }
+
+    // The OCI/Docker image config: {"config": {"Entrypoint": [...], ...}}.
+    let config: serde_json::Value = serde_json::from_slice(config_json)
+        .map_err(|e| format!("{reference}: parse image config: {e}"))?;
+    let cfg = config.get("config").cloned().unwrap_or_default();
+    let strings = |v: Option<&serde_json::Value>| -> Vec<String> {
+        v.and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    manifest.entrypoint = strings(cfg.get("Entrypoint"));
+    manifest.cmd = strings(cfg.get("Cmd"));
+    manifest.env = strings(cfg.get("Env"))
+        .into_iter()
+        .filter_map(|kv| {
+            kv.split_once('=')
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        })
+        .collect();
+    manifest.workdir = cfg
+        .get("WorkingDir")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if let Some(labels) = cfg.get("Labels").and_then(|v| v.as_object()) {
+        for (k, v) in labels {
+            if let Some(v) = v.as_str() {
+                manifest.labels.insert(k.clone(), v.to_string());
+            }
+        }
+    }
+
+    // Extract the entrypoint wasm from the rootfs; componentize if needed.
+    let exe = manifest
+        .entrypoint
+        .first()
+        .or(manifest.cmd.first())
+        .cloned()
+        .ok_or_else(|| format!("{reference}: image config has no Entrypoint or Cmd"))?;
+    let rootfs = crate::vfs::new_fs();
+    for digest in &manifest.layers {
+        let bytes =
+            std::fs::read(layer_path(digest)).map_err(|e| format!("read layer {digest}: {e}"))?;
+        crate::layers::apply(&rootfs, &crate::layers::from_tar_bytes(&bytes)?, "");
+    }
+    let wasm = rootfs
+        .lock()
+        .unwrap()
+        .read_file(&exe, usize::MAX)
+        .ok_or_else(|| format!("{reference}: entrypoint {exe:?} not found in the image"))?;
+    let wasm = adapt(&wasm)?;
+
+    let id = crate::oci::sanitize(reference);
+    save_image(&id, &manifest)?;
+    write_creating_dirs(&crate::oci::cache_path(reference), &wasm)?;
+    Ok(id)
+}
+
 /// Path of the alias file mapping a Dockerfile source to its built image id.
 fn alias_path(dockerfile: &Path) -> PathBuf {
     let key = crate::oci::sanitize(&dockerfile.to_string_lossy());
@@ -775,6 +879,110 @@ mod tests {
         assert!(!entrypoint_path(&id).is_file(), "extracted wasm gone");
         assert!(!remove_image(&id), "second remove reports missing");
         assert!(list_images().iter().all(|(i, _)| i != &id));
+    }
+
+    /// Synthetic pulled image: a plain tar layer holding the component, a
+    /// gzipped tar layer holding data, and a Docker-style config JSON.
+    #[test]
+    fn pulled_image_is_stored_with_config_and_entrypoint() {
+        isolated_store("pull");
+        // A minimal *component* header (\0asm + component-model version), so no
+        // adaptation is needed.
+        let component = b"\0asm\x0d\x00\x01\x00-pretend-component".to_vec();
+        let mut b1 = tar::Builder::new(Vec::new());
+        {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_size(component.len() as u64);
+            h.set_mode(0o755);
+            b1.append_data(&mut h, "app.wasm", component.as_slice())
+                .unwrap();
+        }
+        let l1 = b1.into_inner().unwrap();
+        let mut b2 = tar::Builder::new(Vec::new());
+        {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_size(4);
+            h.set_mode(0o644);
+            b2.append_data(&mut h, "etc/motd", &b"data"[..]).unwrap();
+        }
+        let l2_plain = b2.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut gz, &l2_plain).unwrap();
+        let l2 = gz.finish().unwrap();
+
+        let config = br#"{
+            "architecture": "wasm32", "os": "wasi",
+            "config": {
+                "Entrypoint": ["/app.wasm"],
+                "Cmd": ["--serve"],
+                "Env": ["A=1", "B=two words"],
+                "WorkingDir": "/srv",
+                "Labels": {"maintainer": "wk"}
+            }
+        }"#;
+
+        let layers = vec![
+            ("application/vnd.oci.image.layer.v1.tar".to_string(), l1),
+            (
+                "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                l2,
+            ),
+        ];
+        let reference = "ghcr.io/org/thing:1";
+        let id =
+            store_pulled_image(reference, &layers, config, &|b| Ok(b.to_vec())).expect("stores");
+
+        let m = load_image(&id).expect("manifest under the sanitized reference");
+        assert_eq!(m.layers.len(), 2);
+        assert_eq!(m.entrypoint, vec!["/app.wasm"]);
+        assert_eq!(m.cmd, vec!["--serve"]);
+        assert_eq!(
+            m.env,
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "two words".to_string())
+            ]
+        );
+        assert_eq!(m.workdir.as_deref(), Some("/srv"));
+
+        // The gzipped layer is stored decompressed (plain tar).
+        let stored = std::fs::read(layer_path(&m.layers[1])).unwrap();
+        assert!(!stored.starts_with(&[0x1f, 0x8b]), "stored as plain tar");
+
+        // The entrypoint component landed at the artifact cache path, so
+        // Source::Oci's local_path works unchanged.
+        assert_eq!(
+            std::fs::read(crate::oci::cache_path(reference)).unwrap(),
+            component
+        );
+    }
+
+    #[test]
+    fn pulled_core_module_goes_through_the_adapter() {
+        isolated_store("pulladapt");
+        let module = b"\0asm\x01\x00\x00\x00-core-module".to_vec();
+        let mut b1 = tar::Builder::new(Vec::new());
+        {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_size(module.len() as u64);
+            h.set_mode(0o755);
+            b1.append_data(&mut h, "m.wasm", module.as_slice()).unwrap();
+        }
+        let layers = vec![(
+            "application/vnd.docker.image.rootfs.diff.tar.gzip".to_string(),
+            b1.into_inner().unwrap(),
+        )];
+        let config = br#"{"config": {"Entrypoint": ["/m.wasm"]}}"#;
+        let reference = "docker.io/org/mod:1";
+        store_pulled_image(reference, &layers, config, &|_| Ok(b"ADAPTED".to_vec()))
+            .expect("stores");
+        assert_eq!(
+            std::fs::read(crate::oci::cache_path(reference)).unwrap(),
+            b"ADAPTED"
+        );
     }
 
     #[test]
