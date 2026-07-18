@@ -43,9 +43,11 @@ use wasi::filesystem::types::{
 /// The bytes of a canvas "file node", shared by every app it is connected to.
 pub type SharedFile = Arc<Mutex<Vec<u8>>>;
 
-/// How a path exists in an `Fs`, for build-time diffs (see [`Fs::snapshot`]).
+/// How a path exists in an `Fs`: provenance for build-time diffs (see
+/// [`Fs::snapshot`]) and for the UI's file inspector (layer vs written vs
+/// mounted badges).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PathKind {
+pub enum PathKind {
     Dir,
     /// An immutable layer file (`RoFile`) — untouched since its layer applied.
     LayerFile,
@@ -296,6 +298,9 @@ pub struct DirEntry {
     /// File byte length (0 for a directory). For a host-mapped file this is the
     /// on-disk length; for a shared file, the connected node's current bytes.
     pub size: usize,
+    /// Where the entry comes from: an image layer, a private write, or a
+    /// canvas mount — shown as a badge in the file inspector.
+    pub origin: PathKind,
 }
 
 impl Fs {
@@ -320,10 +325,19 @@ impl Fs {
         };
         let mut out: Vec<DirEntry> = children
             .iter()
-            .map(|(name, &cid)| DirEntry {
-                name: name.clone(),
-                is_dir: matches!(self.nodes.get(&cid), Some(Node::Dir(_))),
-                size: self.file_len(cid),
+            .map(|(name, &cid)| {
+                let origin = match self.nodes.get(&cid) {
+                    Some(Node::Dir(_)) => PathKind::Dir,
+                    Some(Node::RoFile(_)) => PathKind::LayerFile,
+                    Some(Node::Shared(_) | Node::Host(_)) => PathKind::Mounted,
+                    _ => PathKind::PrivateFile,
+                };
+                DirEntry {
+                    name: name.clone(),
+                    is_dir: origin == PathKind::Dir,
+                    size: self.file_len(cid),
+                    origin,
+                }
             })
             .collect();
         out.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
@@ -1247,7 +1261,8 @@ mod tests {
         }
         let g = fs.lock().unwrap();
 
-        // Root: directory first, then file, each with its size.
+        // Root: directory first, then file, each with its size and origin (a
+        // plain File is a private write; the UI badges these).
         let root = g.list_dir("").expect("root is a dir");
         assert_eq!(
             root,
@@ -1255,12 +1270,14 @@ mod tests {
                 DirEntry {
                     name: "sub".into(),
                     is_dir: true,
-                    size: 0
+                    size: 0,
+                    origin: PathKind::Dir,
                 },
                 DirEntry {
                     name: "readme".into(),
                     is_dir: false,
-                    size: 11
+                    size: 11,
+                    origin: PathKind::PrivateFile,
                 },
             ]
         );
@@ -1279,6 +1296,29 @@ mod tests {
         assert!(g.list_dir("/readme").is_none());
         // Preview is capped.
         assert_eq!(g.read_file("/readme", 4).as_deref(), Some(&b"hell"[..]));
+    }
+
+    #[test]
+    fn listing_reports_each_entrys_origin() {
+        let fs = new_fs();
+        let shared: SharedFile = Arc::new(Mutex::new(b"chan".to_vec()));
+        {
+            let mut g = fs.lock().unwrap();
+            g.put_ro_file_at("from-layer.txt", Arc::new(b"ro".to_vec()));
+            g.add_child(ROOT, "written.txt", Node::File(b"w".to_vec()));
+            g.add_child(ROOT, "chan", Node::Shared(shared.clone()));
+        }
+        let g = fs.lock().unwrap();
+        let by_name = |n: &str| {
+            g.list_dir("")
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == n)
+                .unwrap()
+        };
+        assert_eq!(by_name("from-layer.txt").origin, PathKind::LayerFile);
+        assert_eq!(by_name("written.txt").origin, PathKind::PrivateFile);
+        assert_eq!(by_name("chan").origin, PathKind::Mounted);
     }
 
     #[test]

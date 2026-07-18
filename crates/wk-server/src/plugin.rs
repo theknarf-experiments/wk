@@ -147,6 +147,10 @@ pub struct Node {
     pub setup: OnceLock<NodeSetup>,
     /// Environment for the guest (a container image's ENV), applied on run.
     pub env: Vec<(String, String)>,
+    /// The container image's layer digests mounted into `fs` (empty for a
+    /// plain wasm node) — the file inspector shows the count and badges
+    /// layer-backed entries.
+    pub layers: Vec<String>,
 }
 
 /// A node's compiled component plus how to run and wire it — published once the
@@ -1083,6 +1087,10 @@ impl PluginHost {
             env: container
                 .as_ref()
                 .map(|c| c.env.clone())
+                .unwrap_or_default(),
+            layers: container
+                .as_ref()
+                .map(|c| c.layers.clone())
                 .unwrap_or_default(),
         });
         nodes.lock().unwrap().push(node.clone());

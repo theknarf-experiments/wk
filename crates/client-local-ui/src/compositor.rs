@@ -3266,11 +3266,24 @@ impl App {
             ];
             quads.push(Quad::solid(white, inset, BODY, full));
 
-            // Title row: node name + current directory path.
-            let title = format!(
-                "files: {node_name}    /{}",
-                insp.dir.trim_start_matches('/')
-            );
+            // Title row: node name + current directory path (+ the image's
+            // layer count for a container node).
+            let n_layers = node_by_id
+                .get(&insp.node)
+                .map(|n| n.layers.len())
+                .unwrap_or(0);
+            let title = if n_layers > 0 {
+                format!(
+                    "files: {node_name}  ·  image: {n_layers} layer{}    /{}",
+                    if n_layers == 1 { "" } else { "s" },
+                    insp.dir.trim_start_matches('/')
+                )
+            } else {
+                format!(
+                    "files: {node_name}    /{}",
+                    insp.dir.trim_start_matches('/')
+                )
+            };
             self.text_cache.draw(
                 &mut quads,
                 &mut gfx.renderer,
@@ -3352,6 +3365,20 @@ impl App {
                     [rr[0], rr[1], rr[2] - PAD, rr[3]],
                 );
                 if !e.is_dir {
+                    use wk_server::vfs::PathKind;
+                    // Provenance badge: canvas mounts always; layer/edited
+                    // distinctions only for container nodes (a plain node's
+                    // files are all "written" — no signal in saying so).
+                    let badge: Option<(&str, [f32; 4])> = match e.origin {
+                        PathKind::Mounted => Some(("mount", [0.72, 0.58, 0.85, 1.0])),
+                        PathKind::LayerFile if n_layers > 0 => {
+                            Some(("layer", [0.5, 0.65, 0.85, 1.0]))
+                        }
+                        PathKind::PrivateFile if n_layers > 0 => {
+                            Some(("edited", [0.85, 0.72, 0.45, 1.0]))
+                        }
+                        _ => None,
+                    };
                     let sz = human_size(e.size);
                     let sw = gfx.fonts.measure(&sz) as f32;
                     self.text_cache.draw(
@@ -3367,6 +3394,22 @@ impl App {
                         dim,
                         rr,
                     );
+                    if let Some((tag, col)) = badge {
+                        let tw = gfx.fonts.measure(tag) as f32 * 0.85;
+                        self.text_cache.draw(
+                            &mut quads,
+                            &mut gfx.renderer,
+                            &gfx.fonts,
+                            &gfx.device,
+                            &gfx.queue,
+                            tag,
+                            rr[2] - PAD - sw - 12.0 - tw,
+                            rr[1] + (row_h - lh * 0.85) * 0.5,
+                            0.85,
+                            col,
+                            rr,
+                        );
+                    }
                 }
             }
             if entries.is_empty() {
