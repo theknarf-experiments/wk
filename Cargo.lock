@@ -10760,6 +10760,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "wk-dockerfile"
+version = "0.1.0"
+dependencies = [
+ "chumsky",
+]
+
+[[package]]
 name = "wk-fabric"
 version = "0.1.0"
 dependencies = [
@@ -10787,7 +10794,6 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "biscuit-auth",
- "chumsky",
  "flate2",
  "http-body-util",
  "hyper",
@@ -10811,6 +10817,7 @@ dependencies = [
  "web-audio-api",
  "wgpu-core",
  "wgpu-types",
+ "wk-dockerfile",
  "wk-fabric",
  "wk-protocol",
 ]

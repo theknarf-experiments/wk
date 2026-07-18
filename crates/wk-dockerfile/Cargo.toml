@@ -1,0 +1,8 @@
+[package]
+name = "wk-dockerfile"
+version = "0.1.0"
+edition = "2021"
+description = "Dockerfile parser (chumsky) for wk's wasm-container builds."
+
+[dependencies]
+chumsky = "0.13.0"

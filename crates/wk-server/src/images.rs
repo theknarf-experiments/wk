@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
-use crate::dockerfile::{self, Instr};
+use wk_dockerfile::{self as dockerfile, Instr};
 
 /// A stored image's manifest: what to mount and how to run it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

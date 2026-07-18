@@ -31,7 +31,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 smoltcp = "0.13.1"
 wk-fabric = { path = "../wk-fabric" }
-chumsky = "0.13.0"
+wk-dockerfile = { path = "../wk-dockerfile" }
 
 [dev-dependencies]
 proptest = "1"
