@@ -6,6 +6,9 @@ dependencies {
     shader "plugins/shader/target/wasm32-wasip1/debug/shader.wasm" {
         description "live WGSL shader; wire a file in to live-code it, MIDI in to react"
     }
+    screenview "plugins/screenview/target/wasm32-wasip1/debug/screenview.wasm" {
+        description "views frames from a Screen Capture node (wire one in)"
+    }
     paint "plugins/paint/target/wasm32-wasip1/debug/paint.wasm" {
         description "self-driving animated gradient canvas"
     }

@@ -151,6 +151,9 @@ pub struct Node {
     /// plain wasm node) — the file inspector shows the count and badges
     /// layer-backed entries.
     pub layers: Vec<String>,
+    /// The Screen Capture frame slot granted to this node by a capture wire
+    /// (`None` while unwired). Set by the server's capture reconciler.
+    pub capture_src: crate::capture::SharedCaptureSrc,
 }
 
 /// A node's compiled component plus how to run and wire it — published once the
@@ -282,6 +285,10 @@ pub struct HostState {
     /// This node's terminal stdio; backs `wk:tty/control` so the guest's
     /// `termios` shim can set the line-discipline mode the client reads.
     pub(crate) term_io: crate::terminal::SharedTermIo,
+    /// The capture frame slot granted by a capture wire (shared with the
+    /// node; `None` while unwired) + the last frame sequence this store saw.
+    pub(crate) capture_src: crate::capture::SharedCaptureSrc,
+    pub(crate) capture_seq: u64,
     pub(crate) midi_in: crate::midi::SharedInbox,
     pub(crate) midi_router: crate::midi::Router,
     pub(crate) options: crate::options::SharedOptions,
@@ -806,6 +813,8 @@ impl crate::images::BuildRunner for PluginHost {
             node_id: NodeId::nil(),
             fs: fs.clone(),
             term_io: crate::terminal::TermIo::new(),
+            capture_src: crate::capture::new_src(),
+            capture_seq: 0,
             midi_in: crate::midi::new_inbox(),
             midi_router: self.midi.clone(),
             options: crate::options::new_options(Vec::new()),
@@ -938,6 +947,7 @@ impl PluginHost {
         crate::midi::add_to_linker(&mut linker)?;
         crate::options::add_to_linker(&mut linker)?;
         crate::tty::add_to_linker(&mut linker)?;
+        crate::capture::add_to_linker(&mut linker)?;
         wasi::surface::surface::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
         wasi::graphics_context::graphics_context::add_to_linker::<_, HasSelf<_>>(
             &mut linker,
@@ -998,6 +1008,8 @@ impl PluginHost {
             // An http handler isn't a terminal; a throwaway TermIo satisfies the
             // `wk:tty/control` impl without affecting anything.
             term_io: term_io.clone().unwrap_or_else(crate::terminal::TermIo::new),
+            capture_src: crate::capture::new_src(),
+            capture_seq: 0,
             midi_in: midi_in.clone(),
             midi_router: midi.clone(),
             options: crate::options::new_options(Vec::new()),
@@ -1098,6 +1110,7 @@ impl PluginHost {
                 .as_ref()
                 .map(|c| c.layers.clone())
                 .unwrap_or_default(),
+            capture_src: crate::capture::new_src(),
         });
         nodes.lock().unwrap().push(node.clone());
 
@@ -1245,6 +1258,8 @@ impl PluginHost {
             node_id: node.id,
             fs: node.fs.clone(),
             term_io: node.term_io.clone(),
+            capture_src: node.capture_src.clone(),
+            capture_seq: 0,
             midi_in: node.midi_in.clone(),
             midi_router: self.midi.clone(),
             options: node.options.clone(),

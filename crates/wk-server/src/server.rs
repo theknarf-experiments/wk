@@ -169,6 +169,11 @@ pub struct View {
     pub connections: Vec<(NodeId, NodeId)>,
     pub midi_links: Vec<(NodeId, NodeId)>,
     pub net_links: Vec<(NodeId, NodeId)>,
+    /// Screen-capture grants as (app, Capture node).
+    pub capture_links: Vec<(NodeId, NodeId)>,
+    /// Each Capture node's frame slot — the local client writes captured
+    /// canvas frames into these (only while the node has a wired app).
+    pub capture_feeds: HashMap<NodeId, crate::capture::SharedFrameSlot>,
     /// http node id -> HostPort node id.
     pub serves: HashMap<NodeId, NodeId>,
     /// Per-node launch args (argv after the program name).
@@ -263,6 +268,18 @@ impl View {
                 .copied()
                 .filter(|(a, _)| mine(a))
                 .collect(),
+            capture_links: self
+                .capture_links
+                .iter()
+                .copied()
+                .filter(|(a, _)| mine(a))
+                .collect(),
+            capture_feeds: self
+                .capture_feeds
+                .iter()
+                .filter(|(id, _)| mine(id))
+                .map(|(&k, v)| (k, v.clone()))
+                .collect(),
             serves: self
                 .serves
                 .iter()
@@ -289,6 +306,7 @@ impl View {
             Wire::File(f, a) => self.connections.contains(&(f, a)),
             Wire::Midi(s, d) => self.midi_links.contains(&(s, d)),
             Wire::Serve(h, hp) => self.serves.get(&h) == Some(&hp),
+            Wire::Capture(a, c) => self.capture_links.contains(&(a, c)),
             Wire::Net(app, net) => self.net_links.contains(&(app, net)),
         }
     }
@@ -303,12 +321,17 @@ enum WireRel {
     Midi,
     Serve,
     NetLink,
+    CaptureLink,
 }
 
 /// The two node ids a [`Wire`] joins.
 fn wire_ends(w: Wire) -> (NodeId, NodeId) {
     match w {
-        Wire::File(a, b) | Wire::Midi(a, b) | Wire::Serve(a, b) | Wire::Net(a, b) => (a, b),
+        Wire::File(a, b)
+        | Wire::Midi(a, b)
+        | Wire::Serve(a, b)
+        | Wire::Net(a, b)
+        | Wire::Capture(a, b) => (a, b),
     }
 }
 
@@ -387,6 +410,8 @@ pub enum Kind {
     Veilid,
     /// A yellow sticky note: a purely visual annotation, wired to nothing.
     Note,
+    /// A Screen Capture node: grants wired apps captured frames.
+    Capture,
 }
 
 impl Kind {
@@ -436,6 +461,8 @@ pub struct Graph {
     pub serve_links: Vec<(NodeId, NodeId)>,
     /// Network membership wires, as (app node id, Network node id).
     pub net_links: Vec<(NodeId, NodeId)>,
+    /// Screen-capture grants, as (app node id, Capture node id).
+    pub capture_links: Vec<(NodeId, NodeId)>,
 
     /// Iroh uplink nodes' ed25519 secrets, so a node's ticket (its dialable
     /// identity) survives restarts. The peer ticket it dials lives in
@@ -481,6 +508,9 @@ pub struct Server {
     /// Running uplinks (Iroh or Veilid), one per uplink node. Dropping one
     /// closes its endpoint and detaches its trunk.
     uplinks: HashMap<NodeId, UplinkHandle>,
+    /// Each Capture node's frame slot (the client fills it; wired apps read
+    /// it through their `capture_src`, kept in sync by [`Self::sync_captures`]).
+    capture_feeds: HashMap<NodeId, crate::capture::SharedFrameSlot>,
 
     /// Nodes present in the loaded `.wk` file that couldn't be materialized —
     /// an app whose dependency isn't in the list (renamed/removed), or an
@@ -529,6 +559,7 @@ impl Server {
             routed: HashSet::new(),
             serves: HashMap::new(),
             uplinks: HashMap::new(),
+            capture_feeds: HashMap::new(),
             unplaced: Vec::new(),
             unplaced_wires: Vec::new(),
             undo: Vec::new(),
@@ -572,6 +603,7 @@ impl Server {
             (WireRel::Midi, &saved.midi),
             (WireRel::Serve, &saved.serves),
             (WireRel::NetLink, &saved.net_links),
+            (WireRel::CaptureLink, &saved.capture_links),
         ] {
             for &(a, b) in pairs {
                 if orphan.contains(&a) || orphan.contains(&b) {
@@ -701,6 +733,14 @@ impl Server {
         let id = self.alloc_id();
         self.place(id, Kind::Note, ws, pos, [NOTE_W, NOTE_H]);
         self.graph.note_text.insert(id, "note".to_string());
+    }
+
+    /// Add a Screen Capture capability node (its frame slot starts empty; the
+    /// client fills it while an app is wired).
+    fn add_capture_node(&mut self, pos: [f32; 2], ws: NodeId) {
+        let id = self.alloc_id();
+        self.place(id, Kind::Capture, ws, pos, [FILE_W, FILE_H]);
+        self.capture_feeds.insert(id, crate::capture::new_slot());
     }
 
     /// Create a Network node at `pos`; returns its id.
@@ -857,7 +897,39 @@ impl Server {
             Some(Kind::App) => self.close_node(id),
             // A note wires to nothing and runs nothing; just drop it.
             Some(Kind::Note) => self.forget(id),
+            Some(Kind::Capture) => self.remove_capture_node(id),
             None => {}
+        }
+    }
+
+    /// Remove a Capture node: revoke every grant through it, drop its feed.
+    fn remove_capture_node(&mut self, id: NodeId) {
+        self.graph.capture_links.retain(|&(_, cap)| cap != id);
+        self.capture_feeds.remove(&id);
+        self.sync_captures();
+        self.forget(id);
+    }
+
+    /// Toggle a screen-capture grant (one capture source per app), then point
+    /// wired apps at their granted frame slots.
+    fn toggle_capture(&mut self, app: NodeId, cap: NodeId) {
+        wiring::toggle_unique(&mut self.graph.capture_links, app, cap);
+        self.sync_captures();
+    }
+
+    /// Point every app node's `capture_src` at its granted Capture node's frame
+    /// slot (or clear it). Mirrors `sync_midi`: the graph's capture links are
+    /// the desired state; this makes the runtime match.
+    fn sync_captures(&mut self) {
+        let nodes: Vec<crate::plugin::SharedNode> = self.node_reg.lock().unwrap().clone();
+        for node in nodes {
+            let feed = self
+                .graph
+                .capture_links
+                .iter()
+                .find(|&&(app, _)| app == node.id)
+                .and_then(|(_, cap)| self.capture_feeds.get(cap).cloned());
+            *node.capture_src.lock().unwrap() = feed;
         }
     }
 
@@ -925,6 +997,7 @@ impl Server {
             Some(Kind::Port) => NodeClass::Port,
             Some(Kind::Network | Kind::Gateway) => NodeClass::Net,
             Some(Kind::Iroh | Kind::Veilid) => NodeClass::Uplink,
+            Some(Kind::Capture) => NodeClass::Capture,
             Some(Kind::App) | Some(Kind::Note) | None => NodeClass::Other,
         }
     }
@@ -938,6 +1011,7 @@ impl Server {
             Some(Wire::File(file, app)) => self.toggle_file(file, app),
             Some(Wire::Serve(http, hostport)) => self.toggle_serve(http, hostport),
             Some(Wire::Net(app, net)) => self.toggle_net(app, net),
+            Some(Wire::Capture(app, cap)) => self.toggle_capture(app, cap),
             Some(Wire::Midi(src, dst)) => self.toggle_midi(src, dst),
             None => {}
         }
@@ -1219,6 +1293,7 @@ impl Server {
             Wire::File(f, a) => self.graph.connections.contains(&(f, a)),
             Wire::Midi(s, d) => self.graph.midi_links.contains(&(s, d)),
             Wire::Serve(h, hp) => self.graph.serve_links.contains(&(h, hp)),
+            Wire::Capture(a, c) => self.graph.capture_links.contains(&(a, c)),
             Wire::Net(app, net) => self.graph.net_links.contains(&(app, net)),
         }
     }
@@ -1244,6 +1319,11 @@ impl Server {
             Wire::Net(app, net) => {
                 if self.graph.net_links.contains(&(app, net)) {
                     self.toggle_net(app, net);
+                }
+            }
+            Wire::Capture(app, cap) => {
+                if self.graph.capture_links.contains(&(app, cap)) {
+                    self.toggle_capture(app, cap);
                 }
             }
         }
@@ -1303,6 +1383,7 @@ impl Server {
             .retain(|&(h, hp)| h != id && hp != id);
         self.sync_mounts();
         self.sync_midi();
+        self.sync_captures();
         self.sync_serves();
         self.forget(id);
     }
@@ -1376,6 +1457,14 @@ impl Server {
                     .copied()
                     .collect();
                 net_links.extend(orphan(WireRel::NetLink));
+                let mut capture_links: Vec<(NodeId, NodeId)> = self
+                    .graph
+                    .capture_links
+                    .iter()
+                    .filter(|(a, _)| mine(a))
+                    .copied()
+                    .collect();
+                capture_links.extend(orphan(WireRel::CaptureLink));
                 Workspace {
                     id: ws_id,
                     nodes,
@@ -1383,6 +1472,7 @@ impl Server {
                     midi,
                     serves,
                     net_links,
+                    capture_links,
                 }
             })
             .collect();
@@ -1531,6 +1621,7 @@ impl Server {
                 NodeKind::Iroh => self.add_iroh_node(pos, ws),
                 NodeKind::Veilid => self.add_veilid_node(pos, ws),
                 NodeKind::Note => self.add_note(pos, ws),
+                NodeKind::Capture => self.add_capture_node(pos, ws),
             },
             // Create is create only: a wire that already exists is left alone
             // (removal is Delete, so a create-only token can never disconnect).
@@ -1695,6 +1786,7 @@ impl Server {
             Kind::Note => SnapKind::Note {
                 text: self.graph.note_text.get(&id).cloned().unwrap_or_default(),
             },
+            Kind::Capture => SnapKind::Capture,
         };
         Some(NodeSnap {
             id,
@@ -1748,6 +1840,12 @@ impl Server {
                 .net_links
                 .iter()
                 .filter(|&&(a, n)| a == id || n == id),
+        );
+        wires.extend(
+            self.graph
+                .capture_links
+                .iter()
+                .filter(|&&(a, c)| a == id || c == id),
         );
         Some(Snapshot {
             ws,
@@ -1869,6 +1967,12 @@ impl Server {
             SnapKind::Note { text } => {
                 self.place(s.id, Kind::Note, ws, s.pos, s.size);
                 self.graph.note_text.insert(s.id, text.clone());
+            }
+            SnapKind::Capture => {
+                self.place(s.id, Kind::Capture, ws, s.pos, s.size);
+                self.capture_feeds
+                    .entry(s.id)
+                    .or_insert_with(crate::capture::new_slot);
             }
         }
     }
@@ -2004,6 +2108,8 @@ impl Server {
             connections: self.graph.connections.clone(),
             midi_links: self.graph.midi_links.clone(),
             net_links: self.graph.net_links.clone(),
+            capture_links: self.graph.capture_links.clone(),
+            capture_feeds: self.capture_feeds.clone(),
             serves,
             node_args: self.graph.node_args.clone(),
             available: self.graph.available.clone(),
@@ -2121,6 +2227,7 @@ mod model_tests {
                 connections: vec![(file, ghost)],
                 midi: Vec::new(),
                 serves: Vec::new(),
+                capture_links: Vec::new(),
                 net_links: Vec::new(),
             }],
         };

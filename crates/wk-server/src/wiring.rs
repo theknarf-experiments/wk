@@ -21,6 +21,8 @@ pub enum NodeClass {
     Net,
     /// An uplink node (Iroh/Veilid) — wires only to a Network (the net it extends).
     Uplink,
+    /// A Screen Capture node — wires only to an app (granting it frames).
+    Capture,
     Other,
 }
 
@@ -45,6 +47,9 @@ pub fn classify(a: NodeId, b: NodeId, ca: NodeClass, cb: NodeClass) -> Option<Wi
         // The app (or uplink) is the first element; the network the second.
         (Net, Other) | (Net, Uplink) => Some(Wire::Net(b, a)),
         (Other, Net) | (Uplink, Net) => Some(Wire::Net(a, b)),
+        // The app is the first element; the capture source the second.
+        (Capture, Other) => Some(Wire::Capture(b, a)),
+        (Other, Capture) => Some(Wire::Capture(a, b)),
         (Other, Other) => Some(Wire::Midi(a, b)),
         _ => None,
     }
@@ -212,6 +217,7 @@ mod tests {
             Just(NodeClass::Port),
             Just(NodeClass::Net),
             Just(NodeClass::Uplink),
+            Just(NodeClass::Capture),
             Just(NodeClass::Other),
         ]
     }
@@ -222,7 +228,11 @@ mod tests {
 
     fn wire_ends(w: Wire) -> (NodeId, NodeId) {
         match w {
-            Wire::File(a, b) | Wire::Midi(a, b) | Wire::Serve(a, b) | Wire::Net(a, b) => (a, b),
+            Wire::File(a, b)
+            | Wire::Midi(a, b)
+            | Wire::Serve(a, b)
+            | Wire::Net(a, b)
+            | Wire::Capture(a, b) => (a, b),
         }
     }
 

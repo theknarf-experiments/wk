@@ -1,0 +1,20 @@
+// vim: set filetype=kdl :
+// Screen capture as a capability. Run from the repo root:
+//   wk run example/capture.wk
+import "../workspace.wk"
+workspace "01KXKGE000000000000000WS00" {
+    note "01KXKGE000000000000000NT03" {
+        pos 60.0 60.0
+        size 360.0 260.0
+        text "Screen capture — a capability.\n\nThe Screen Capture node is the\nonly path to captured frames; an\napp sees them only while wired\nto it (like a Gateway granting\nnetwork). The wire IS the\npermission — delete it to revoke.\n\nscreenview shows the captured\ncanvas: the workspace inside\nthe workspace."
+    }
+    node "screenview" "01KXKGE000000000000000SV01" {
+        pos 480.0 60.0
+        size 420.0 300.0
+    }
+    capture "01KXKGE000000000000000CP02" {
+        pos 480.0 420.0
+        size 130.0 44.0
+    }
+    capturelink "01KXKGE000000000000000SV01" "01KXKGE000000000000000CP02"
+}

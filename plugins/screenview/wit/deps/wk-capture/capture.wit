@@ -1,0 +1,23 @@
+package wk:capture;
+
+/// Captured frames, granted by wiring a node to a Screen Capture node on the
+/// canvas. The *host* does the capturing (a wasm node can never reach the
+/// screen itself); a node only sees frames while a capture wire exists, making
+/// screen access an explicit, visible, revocable capability — the same model
+/// as a Gateway granting network access. The MVP source is wk's own canvas;
+/// OS display capture can back the same interface later.
+interface frames {
+    /// One captured frame: tightly packed RGBA8, plus a sequence number that
+    /// increases with every new capture.
+    record frame {
+        seq: u64,
+        width: u32,
+        height: u32,
+        data: list<u8>,
+    }
+
+    /// The newest frame this node hasn't seen yet. `none` when the node isn't
+    /// wired to a Screen Capture node, or no new frame arrived since the last
+    /// call — poll it from the render loop, like wk:midi's `receive`.
+    next-frame: func() -> option<frame>;
+}

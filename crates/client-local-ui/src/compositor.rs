@@ -418,6 +418,7 @@ enum PaletteCmd {
     AddIroh,
     AddVeilid,
     AddNote,
+    AddCapture,
     NewWorkspace,
     CloseWorkspace,
     /// Jump the camera to this zoom factor.
@@ -494,6 +495,10 @@ const FILE_BORDER: [f32; 4] = [0.55, 0.45, 0.25, 1.0];
 /// from in-memory VirtualFiles.
 const HOSTFILE_BG: [f32; 4] = [0.10, 0.14, 0.22, 1.0];
 const HOSTFILE_BORDER: [f32; 4] = [0.30, 0.45, 0.65, 1.0];
+/// Screen Capture nodes: recording-red chrome (a capability, like Network).
+const CAPTURE_BG: [f32; 4] = [0.22, 0.10, 0.12, 1.0];
+const CAPTURE_BORDER: [f32; 4] = [0.80, 0.30, 0.35, 1.0];
+
 /// Note nodes: a warm yellow sticky, dark text, for annotations.
 const NOTE_BG: [f32; 4] = [0.93, 0.86, 0.42, 1.0];
 const NOTE_BORDER: [f32; 4] = [0.72, 0.62, 0.18, 1.0];
@@ -761,6 +766,8 @@ struct App {
     editing_args: Option<(NodeId, String)>,
     /// When editing a note's text: its id and the in-progress text.
     editing_note: Option<(NodeId, String)>,
+    /// Frame counter for throttling canvas readback (Screen Capture nodes).
+    capture_tick: u64,
     /// When inspecting a node's virtual filesystem (a modal overlay).
     inspect: Option<Inspector>,
     /// System clipboard, for pasting into the args/ticket field and the
@@ -827,6 +834,7 @@ impl App {
             kbd_focus: None,
             editing_args: None,
             editing_note: None,
+            capture_tick: 0,
             inspect: None,
             clipboard: arboard::Clipboard::new().ok(),
             drag: None,
@@ -1062,6 +1070,7 @@ impl App {
             Wire::Midi(s, d) => (s, d),
             Wire::Serve(h, hp) => (h, hp),
             Wire::Net(app, net) => (app, net),
+            Wire::Capture(app, cap) => (app, cap),
         };
         if self.view.win_pos.contains_key(&a) && self.view.win_pos.contains_key(&b) {
             // Source's output port (right) to target's input port (left), so the
@@ -1109,6 +1118,7 @@ impl App {
             .iter()
             .map(|&(f, a)| Wire::File(f, a))
             .chain(s.midi_links.iter().map(|&(s, d)| Wire::Midi(s, d)))
+            .chain(s.capture_links.iter().map(|&(a, c)| Wire::Capture(a, c)))
             .chain(s.serves.iter().map(|(&h, &hp)| Wire::Serve(h, hp)))
             .chain(s.net_links.iter().map(|&(a, n)| Wire::Net(a, n)));
         let mut best: Option<(f32, Wire)> = None;
@@ -1183,6 +1193,11 @@ impl App {
             "Add Note",
             d("a yellow sticky note for annotations"),
             PaletteCmd::AddNote,
+        ));
+        v.push(PaletteRow::new(
+            "Add Screen Capture",
+            d("grants wired apps the captured canvas (frames)"),
+            PaletteCmd::AddCapture,
         ));
         v.push(PaletteRow::new(
             "New Workspace  (Cmd+T)",
@@ -1449,6 +1464,14 @@ impl App {
                 let pos = self.view_center([NOTE_W, NOTE_H], self.view.notes.len());
                 self.conn.send(Command::Create(Resource::Node {
                     kind: NodeKind::Note,
+                    pos,
+                    ws,
+                }));
+            }
+            PaletteCmd::AddCapture => {
+                let pos = self.view_center([FILE_W, FILE_H], self.view.capture_feeds.len());
+                self.conn.send(Command::Create(Resource::Node {
+                    kind: NodeKind::Capture,
                     pos,
                     ws,
                 }));
@@ -2231,6 +2254,7 @@ impl App {
                     let is_net = self.view.net_nodes.contains(&id);
                     let is_uplink = self.view.uplinks.contains_key(&id);
                     let is_note = self.view.notes.contains_key(&id);
+                    let is_capture = self.view.capture_feeds.contains_key(&id);
                     if is_note {
                         // Note: close (top-right), drag from the top strip, or
                         // click the body to edit the text.
@@ -2250,7 +2274,7 @@ impl App {
                             let cur = self.view.notes.get(&id).cloned().unwrap_or_default();
                             self.editing_note = Some((id, cur));
                         }
-                    } else if is_file || is_port || is_net || is_uplink {
+                    } else if is_file || is_port || is_net || is_uplink || is_capture {
                         // Canvas widget nodes (file / HostPort / Network / Iroh):
                         // close, adjust port (HostPort −/+ buttons), edit the
                         // peer ticket (Iroh, lower half), or move.
@@ -2523,6 +2547,13 @@ impl App {
             }
         }
         // Network membership wires (app node — Network node).
+        for &(app, cap) in &self.view.capture_links {
+            if let Some((a, b)) = self.wire_endpoints(Wire::Capture(app, cap)) {
+                let sel = self.wire_sel == Some(Wire::Capture(app, cap));
+                let col = CAPTURE_BORDER;
+                draw_connection(&mut quads, white, a, b, sel, col, zf, full);
+            }
+        }
         for &(app, net) in &self.view.net_links {
             if let Some((a, b)) = self.wire_endpoints(Wire::Net(app, net)) {
                 let sel = self.wire_sel == Some(Wire::Net(app, net));
@@ -2721,6 +2752,40 @@ impl App {
                         title: meta.kind.label(),
                         title_col: TEXT,
                         status: &status,
+                        status_col,
+                        status_scale: 0.7,
+                    },
+                );
+                continue;
+            }
+
+            // A Screen Capture node: a capability widget (like Network) whose
+            // status shows whether it's granting frames and capturing.
+            if let Some(feed) = self.view.capture_feeds.get(&id) {
+                let wired = self.view.capture_links.iter().any(|&(_, c)| c == id);
+                let live = feed.lock().unwrap().seq > 0;
+                let (status, status_col) = if wired && live {
+                    ("● recording", [0.95, 0.45, 0.5, 1.0])
+                } else if wired {
+                    ("wired — waiting for frames", [0.8, 0.65, 0.5, 1.0])
+                } else {
+                    ("wire an app to grant capture", [0.55, 0.7, 0.72, 1.0])
+                };
+                self.draw_widget(
+                    &mut quads,
+                    &mut gfx,
+                    white,
+                    zf,
+                    mp,
+                    clip,
+                    full,
+                    WidgetChrome {
+                        r,
+                        border: CAPTURE_BORDER,
+                        bg: CAPTURE_BG,
+                        title: "screen capture",
+                        title_col: TEXT,
+                        status,
                         status_col,
                         status_scale: 0.7,
                     },
@@ -3575,7 +3640,91 @@ impl App {
             gfx.renderer
                 .draw(&gfx.device, &gfx.queue, &mut rpass, fb, &quads);
         }
+        // Screen Capture: when a capture node has a wired app, read the canvas
+        // back (throttled to ~every 6th frame) and publish it to the node's
+        // frame slot for guests to poll via wk:capture.
+        self.capture_tick = self.capture_tick.wrapping_add(1);
+        let feeds: Vec<_> = if self.capture_tick.is_multiple_of(6) {
+            self.view
+                .capture_feeds
+                .iter()
+                .filter(|(id, _)| self.view.capture_links.iter().any(|(_, c)| c == *id))
+                .map(|(_, f)| f.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let staging = if feeds.is_empty() {
+            None
+        } else {
+            let (w, h) = (gfx.surface_desc.width, gfx.surface_desc.height);
+            let bpr = (w * 4).div_ceil(256) * 256;
+            let buf = gfx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("canvas capture"),
+                size: (bpr * h) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &frame.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buf,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(bpr),
+                        rows_per_image: Some(h),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            Some((buf, bpr, w, h))
+        };
         gfx.queue.submit([encoder.finish()]);
+        if let Some((buf, bpr, w, h)) = staging {
+            let slice = buf.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            let _ = gfx.device.poll(wgpu::PollType::wait_indefinitely());
+            if matches!(rx.try_recv(), Ok(Ok(()))) {
+                let data = slice.get_mapped_range();
+                // Tightly pack, converting the surface's BGRA to RGBA.
+                let bgra = matches!(
+                    gfx.surface_desc.format,
+                    wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+                );
+                let mut pixels = vec![0u8; (w * h * 4) as usize];
+                for row in 0..h as usize {
+                    let src = &data[row * bpr as usize..row * bpr as usize + (w * 4) as usize];
+                    let dst = &mut pixels[row * (w * 4) as usize..(row + 1) * (w * 4) as usize];
+                    dst.copy_from_slice(src);
+                    if bgra {
+                        for px in dst.chunks_exact_mut(4) {
+                            px.swap(0, 2);
+                        }
+                    }
+                }
+                drop(data);
+                buf.unmap();
+                for feed in &feeds {
+                    let mut slot = feed.lock().unwrap();
+                    slot.seq = slot.seq.wrapping_add(1).max(1);
+                    slot.width = w;
+                    slot.height = h;
+                    slot.data.clone_from(&pixels);
+                }
+            }
+        }
         frame.present();
 
         // ---- quit closed nodes ----

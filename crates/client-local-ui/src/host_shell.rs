@@ -62,7 +62,8 @@ impl Gfx {
                 .map_err(|e| e.to_string())?;
 
         let surface_desc = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // COPY_SRC so the canvas can be read back for Screen Capture nodes.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format: wgpu::TextureFormat::Bgra8UnormSrgb,
             width: lw,
             height: lh,

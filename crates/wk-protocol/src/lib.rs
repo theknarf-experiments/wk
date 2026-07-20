@@ -28,6 +28,9 @@ pub enum Wire {
     Serve(NodeId, NodeId),
     /// An app node's membership of a Network/Gateway node (app, net).
     Net(NodeId, NodeId),
+    /// An app node's grant from a Screen Capture node (app, capture) — the app
+    /// may read captured frames while wired.
+    Capture(NodeId, NodeId),
 }
 
 /// The kinds of resource a [`Command`] acts on. Together with an [`Action`] this
@@ -124,6 +127,9 @@ pub enum NodeKind {
     Veilid,
     /// A yellow sticky note — a purely visual annotation, wired to nothing.
     Note,
+    /// A Screen Capture node: a capability source granting wired apps access
+    /// to captured frames (the host does the capturing).
+    Capture,
 }
 
 /// A resource to create.

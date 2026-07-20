@@ -239,6 +239,9 @@ pub enum SnapKind {
     },
     /// A yellow sticky note: purely visual annotation, wired to nothing.
     Note { text: String },
+    /// A Screen Capture capability node: apps wired to it may read captured
+    /// frames (see the `capturelink` pairs).
+    Capture,
 }
 
 /// Hex-encode an uplink secret for persistence.
@@ -298,6 +301,8 @@ pub struct Workspace {
     pub serves: Vec<(NodeId, NodeId)>,
     /// Network membership as (member id, Network id).
     pub net_links: Vec<(NodeId, NodeId)>,
+    /// Screen-capture grants as (app id, Capture node id).
+    pub capture_links: Vec<(NodeId, NodeId)>,
 }
 
 impl Workspace {
@@ -310,6 +315,7 @@ impl Workspace {
             midi: Vec::new(),
             serves: Vec::new(),
             net_links: Vec::new(),
+            capture_links: Vec::new(),
         }
     }
 }
@@ -596,6 +602,7 @@ fn parse_workspace(n: &KdlNode) -> Option<Workspace> {
             "midi" => ws.midi.extend(pair(c)),
             "serve" => ws.serves.extend(pair(c)),
             "netlink" => ws.net_links.extend(pair(c)),
+            "capturelink" => ws.capture_links.extend(pair(c)),
             _ => ws.nodes.extend(parse_snap(c)),
         }
     }
@@ -620,6 +627,9 @@ fn workspace_kdl(ws: &Workspace) -> KdlNode {
     }
     for &(member, net) in &ws.net_links {
         ch.nodes_mut().push(pair_kdl("netlink", member, net));
+    }
+    for &(app, cap) in &ws.capture_links {
+        ch.nodes_mut().push(pair_kdl("capturelink", app, cap));
     }
     node.set_children(ch);
     node
@@ -678,6 +688,7 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
                 .and_then(uint)
                 .and_then(|n| u16::try_from(n).ok())?,
         },
+        "capture" => SnapKind::Capture,
         "network" => SnapKind::Net { gateway: false },
         "gateway" => SnapKind::Net { gateway: true },
         "iroh" => SnapKind::Iroh {
@@ -712,6 +723,7 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         SnapKind::Iroh { .. } => "iroh",
         SnapKind::Veilid { .. } => "veilid",
         SnapKind::Note { .. } => "note",
+        SnapKind::Capture => "capture",
     };
     let mut node = KdlNode::new(name);
     // Named kinds lead with the name (or note text), then the id.
@@ -1100,6 +1112,7 @@ mod tests {
                     midi: vec![(msrc, mdst)],
                     serves: vec![(synth, port)],
                     net_links: vec![(synth, net)],
+                    capture_links: vec![(synth, chan)],
                 },
                 Workspace {
                     id: wb,
@@ -1243,6 +1256,7 @@ mod tests {
             uplink_fields().prop_map(|(secret, peer)| SnapKind::Iroh { secret, peer }),
             uplink_fields().prop_map(|(secret, peer)| SnapKind::Veilid { secret, peer }),
             value_str().prop_map(|text| SnapKind::Note { text }),
+            Just(SnapKind::Capture),
         ]
     }
 
@@ -1277,6 +1291,7 @@ mod tests {
             prop::collection::vec(pair(), 0..3),
         )
             .prop_map(|(id, nodes, conns, midi, serves, netlinks)| Workspace {
+                capture_links: netlinks.clone(),
                 id,
                 nodes,
                 connections: conns,
