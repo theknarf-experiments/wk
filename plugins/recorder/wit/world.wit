@@ -1,0 +1,19 @@
+package wk:recorder;
+
+/// A screen recorder. It polls frames granted through a Screen Capture wire
+/// (wk:capture), JPEG-encodes each, and appends it to an output file as an
+/// MJPEG stream (concatenated JPEG frames — append-only, no finalization,
+/// playable by ffmpeg/mpv/VLC). Wire a file node in to choose where it lands
+/// (a HostFile writes to disk); otherwise it records to its own in-memory
+/// filesystem. A small surface shows the recording status.
+///
+/// Recording is gated on the capture grant: the wire IS the on switch —
+/// disconnect it to stop, exactly like every other wk capability.
+world recorder {
+    import wasi:surface/surface@0.0.1;
+    import wasi:graphics-context/graphics-context@0.0.1;
+    import wasi:frame-buffer/frame-buffer@0.0.1;
+    import wk:capture/frames;
+
+    export run: func();
+}

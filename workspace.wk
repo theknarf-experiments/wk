@@ -9,6 +9,9 @@ dependencies {
     screenview "plugins/screenview/target/wasm32-wasip1/debug/screenview.wasm" {
         description "views frames from a Screen Capture node (wire one in)"
     }
+    recorder "plugins/recorder/target/wasm32-wasip1/debug/recorder.wasm" {
+        description "records Screen Capture frames to an MJPEG file (wire a file out)"
+    }
     paint "plugins/paint/target/wasm32-wasip1/debug/paint.wasm" {
         description "self-driving animated gradient canvas"
     }

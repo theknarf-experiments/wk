@@ -101,3 +101,6 @@ plugins/echo6/echo6.wasm
 # when wk runs from here. Ignore them until that's fixed to resolve against the
 # workspace file's directory.
 /host[0-9]*
+
+# recorder example output (written at runtime)
+example/out.mjpeg

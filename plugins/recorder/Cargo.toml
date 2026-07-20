@@ -1,0 +1,23 @@
+[package]
+name = "recorder"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+jpeg-encoder = "0.7"
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.component]
+package = "wk:recorder"
+
+[package.metadata.component.dependencies]
+
+[package.metadata.component.target.dependencies]
+"wasi:surface" = { path = "wit/deps/wasi-surface" }
+"wasi:graphics-context" = { path = "wit/deps/wasi-graphics-context" }
+"wasi:frame-buffer" = { path = "wit/deps/wasi-frame-buffer" }
+"wasi:io" = { path = "wit/deps/wasi-io" }
+"wk:capture" = { path = "wit/deps/wk-capture" }
