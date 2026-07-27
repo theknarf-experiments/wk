@@ -3,3 +3,20 @@
 " termcap can't know that, so declare it — defaults.vim then turns syntax
 " highlighting on.
 set t_Co=256
+
+" Write files in place instead of vim's default rename-based save. A wk file
+" node is a single-file mount (like a Docker bind-mount of one file): the
+" default save writes a fresh file and renames it over the original, which
+" severs the mount — the new bytes land in a throwaway vfs file and never reach
+" the backing file (or any node sharing it). This is the exact Docker
+" single-file bind-mount gotcha, and the same fix applies: backupcopy=yes
+" truncates and rewrites the original in place, so edits persist and propagate;
+" nowritebackup skips the intermediate backup entirely.
+set backupcopy=yes
+set nowritebackup
+
+" wk's vfs reports no POSIX permission bits (wasi has none), so vim flags every
+" file [readonly] via its `!(perm & 0222)` check. Every file here is in fact
+" writable (even image-layer files, which copy-up on first write), so clear the
+" spurious flag; a genuinely unwritable backing file still fails at :w time.
+autocmd BufReadPost,BufNewFile * setlocal noreadonly
