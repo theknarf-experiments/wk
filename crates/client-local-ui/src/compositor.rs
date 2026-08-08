@@ -25,6 +25,21 @@ use wk_server::runtime::ServerHandle;
 use wk_server::server::{View, FILE_H, FILE_W, NOTE_H, NOTE_W};
 use wk_server::terminal::CellView;
 
+mod camera;
+use camera::*;
+mod geometry;
+use geometry::*;
+mod input;
+use input::{encode_term_key, key_event};
+mod modals;
+use modals::*;
+mod palette;
+use palette::*;
+mod ports;
+use ports::*;
+mod text_cache;
+use text_cache::TextCache;
+
 const FRAME: Duration = Duration::from_nanos(1_000_000_000 / 60);
 const SCROLL_PAN_SPEED: f32 = 30.0;
 /// Fraction of the remaining pan distance covered each frame.
@@ -70,335 +85,6 @@ fn rgba(c: [u8; 3]) -> [f32; 4] {
     ]
 }
 
-/// Encode a key press as the bytes a terminal app expects on stdin. `text` is
-/// winit's resolved character(s) for the key (handles shift/layout).
-fn encode_term_key(code: KeyCode, text: Option<&str>, mods: ModifiersState) -> Option<Vec<u8>> {
-    use KeyCode as C;
-    // Ctrl+letter -> control byte (Ctrl-A = 0x01 ... Ctrl-Z = 0x1a).
-    if mods.control_key() {
-        if let Some(n) = letter_index(code) {
-            return Some(vec![n + 1]);
-        }
-    }
-    Some(match code {
-        C::Enter | C::NumpadEnter => vec![b'\r'],
-        C::Backspace => vec![0x7f],
-        C::Tab => vec![b'\t'],
-        C::Escape => vec![0x1b],
-        C::ArrowUp => vec![0x1b, b'[', b'A'],
-        C::ArrowDown => vec![0x1b, b'[', b'B'],
-        C::ArrowRight => vec![0x1b, b'[', b'C'],
-        C::ArrowLeft => vec![0x1b, b'[', b'D'],
-        C::Home => vec![0x1b, b'[', b'H'],
-        C::End => vec![0x1b, b'[', b'F'],
-        _ => match text {
-            Some(t) if !t.is_empty() => t.as_bytes().to_vec(),
-            _ => return None,
-        },
-    })
-}
-
-fn letter_index(code: KeyCode) -> Option<u8> {
-    use KeyCode as C;
-    let n = match code {
-        C::KeyA => 0,
-        C::KeyB => 1,
-        C::KeyC => 2,
-        C::KeyD => 3,
-        C::KeyE => 4,
-        C::KeyF => 5,
-        C::KeyG => 6,
-        C::KeyH => 7,
-        C::KeyI => 8,
-        C::KeyJ => 9,
-        C::KeyK => 10,
-        C::KeyL => 11,
-        C::KeyM => 12,
-        C::KeyN => 13,
-        C::KeyO => 14,
-        C::KeyP => 15,
-        C::KeyQ => 16,
-        C::KeyR => 17,
-        C::KeyS => 18,
-        C::KeyT => 19,
-        C::KeyU => 20,
-        C::KeyV => 21,
-        C::KeyW => 22,
-        C::KeyX => 23,
-        C::KeyY => 24,
-        C::KeyZ => 25,
-        _ => return None,
-    };
-    Some(n)
-}
-
-/// Map a winit physical key to the wasi-gfx W3C `key` code.
-fn map_key(code: KeyCode) -> Option<Key> {
-    use KeyCode as C;
-    Some(match code {
-        C::KeyA => Key::KeyA,
-        C::KeyB => Key::KeyB,
-        C::KeyC => Key::KeyC,
-        C::KeyD => Key::KeyD,
-        C::KeyE => Key::KeyE,
-        C::KeyF => Key::KeyF,
-        C::KeyG => Key::KeyG,
-        C::KeyH => Key::KeyH,
-        C::KeyI => Key::KeyI,
-        C::KeyJ => Key::KeyJ,
-        C::KeyK => Key::KeyK,
-        C::KeyL => Key::KeyL,
-        C::KeyM => Key::KeyM,
-        C::KeyN => Key::KeyN,
-        C::KeyO => Key::KeyO,
-        C::KeyP => Key::KeyP,
-        C::KeyQ => Key::KeyQ,
-        C::KeyR => Key::KeyR,
-        C::KeyS => Key::KeyS,
-        C::KeyT => Key::KeyT,
-        C::KeyU => Key::KeyU,
-        C::KeyV => Key::KeyV,
-        C::KeyW => Key::KeyW,
-        C::KeyX => Key::KeyX,
-        C::KeyY => Key::KeyY,
-        C::KeyZ => Key::KeyZ,
-        C::Digit0 => Key::Digit0,
-        C::Digit1 => Key::Digit1,
-        C::Digit2 => Key::Digit2,
-        C::Digit3 => Key::Digit3,
-        C::Digit4 => Key::Digit4,
-        C::Digit5 => Key::Digit5,
-        C::Digit6 => Key::Digit6,
-        C::Digit7 => Key::Digit7,
-        C::Digit8 => Key::Digit8,
-        C::Digit9 => Key::Digit9,
-        C::ArrowUp => Key::ArrowUp,
-        C::ArrowDown => Key::ArrowDown,
-        C::ArrowLeft => Key::ArrowLeft,
-        C::ArrowRight => Key::ArrowRight,
-        C::Space => Key::Space,
-        C::Enter => Key::Enter,
-        C::Tab => Key::Tab,
-        C::Escape => Key::Escape,
-        C::Backspace => Key::Backspace,
-        C::ShiftLeft => Key::ShiftLeft,
-        C::ShiftRight => Key::ShiftRight,
-        C::ControlLeft => Key::ControlLeft,
-        C::ControlRight => Key::ControlRight,
-        C::AltLeft => Key::AltLeft,
-        C::AltRight => Key::AltRight,
-        C::SuperLeft => Key::MetaLeft,
-        C::SuperRight => Key::MetaRight,
-        _ => return None,
-    })
-}
-
-fn key_event(code: KeyCode, mods: ModifiersState) -> KeyEvent {
-    KeyEvent {
-        key: map_key(code),
-        text: None,
-        alt_key: mods.alt_key(),
-        ctrl_key: mods.control_key(),
-        meta_key: mods.super_key(),
-        shift_key: mods.shift_key(),
-    }
-}
-
-/// The infinite-canvas camera: windows live in canvas space and map to screen
-/// space by panning (scroll) and zooming (Cmd/Ctrl + scroll).
-#[derive(Clone, Copy)]
-struct Camera {
-    pan: [f32; 2],
-    zoom: f32,
-}
-
-impl Camera {
-    fn to_screen(self, p: [f32; 2]) -> [f32; 2] {
-        [
-            self.pan[0] + p[0] * self.zoom,
-            self.pan[1] + p[1] * self.zoom,
-        ]
-    }
-    fn to_canvas(self, p: [f32; 2]) -> [f32; 2] {
-        [
-            (p[0] - self.pan[0]) / self.zoom,
-            (p[1] - self.pan[1]) / self.zoom,
-        ]
-    }
-    fn zoom_at(&mut self, factor: f32, focus: [f32; 2]) {
-        let anchor = self.to_canvas(focus);
-        self.zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
-        self.pan = [
-            focus[0] - anchor[0] * self.zoom,
-            focus[1] - anchor[1] * self.zoom,
-        ];
-    }
-}
-
-/// Zoom limits and the fixed presets offered by the corner zoom menu.
-const ZOOM_MIN: f32 = 0.2;
-const ZOOM_MAX: f32 = 2.0;
-const ZOOM_PRESETS: [f32; 4] = [2.0, 1.5, 1.0, 0.5];
-
-fn ease(current: f32, target: f32) -> f32 {
-    let d = target - current;
-    if d.abs() < 0.5 {
-        target
-    } else {
-        current + d * PAN_SMOOTH
-    }
-}
-
-fn contains(r: [f32; 4], p: [f32; 2]) -> bool {
-    p[0] >= r[0] && p[0] < r[2] && p[1] >= r[1] && p[1] < r[3]
-}
-
-fn intersect(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
-    [
-        a[0].max(b[0]),
-        a[1].max(b[1]),
-        a[2].min(b[2]),
-        a[3].min(b[3]),
-    ]
-}
-
-fn win_rect(cam: Camera, pos: [f32; 2], size: [f32; 2]) -> [f32; 4] {
-    let s = cam.to_screen(pos);
-    [
-        s[0],
-        s[1],
-        s[0] + size[0] * cam.zoom,
-        s[1] + size[1] * cam.zoom,
-    ]
-}
-
-fn title_bar(r: [f32; 4], z: f32) -> [f32; 4] {
-    [r[0], r[1], r[2], r[1] + TITLE_H * z]
-}
-/// The close box at the right of a workspace tab rect.
-fn tab_close_btn(r: [f32; 4]) -> [f32; 4] {
-    let s = (TAB_H - 12.0).max(8.0);
-    let x1 = r[2] - 5.0;
-    let y0 = (TAB_H - s) * 0.5;
-    [x1 - s, y0, x1, y0 + s]
-}
-fn close_btn(r: [f32; 4], z: f32) -> [f32; 4] {
-    let s = (TITLE_H - 8.0) * z;
-    let x1 = r[2] - 4.0 * z;
-    let y0 = r[1] + 4.0 * z;
-    [x1 - s, y0, x1, y0 + s]
-}
-/// The detach button, just left of the close button. Pops the node out into its
-/// own OS window (and, when already detached, reattaches it). Shown on app nodes.
-fn detach_btn(r: [f32; 4], z: f32) -> [f32; 4] {
-    let cb = close_btn(r, z);
-    let w = cb[2] - cb[0];
-    let gap = 4.0 * z;
-    [cb[0] - w - gap, cb[1], cb[0] - gap, cb[3]]
-}
-/// The Files button, just left of the detach button. Opens the node's virtual
-/// filesystem inspector. Shown on app nodes (which have a per-node fs).
-fn files_btn(r: [f32; 4], z: f32) -> [f32; 4] {
-    let db = detach_btn(r, z);
-    let w = db[2] - db[0];
-    let gap = 4.0 * z;
-    [db[0] - w - gap, db[1], db[0] - gap, db[3]]
-}
-/// The Logs button, just left of the Files button. Opens the node's output-log
-/// panel (its captured stdout/stderr scrollback). Shown on app nodes.
-fn logs_btn(r: [f32; 4], z: f32) -> [f32; 4] {
-    let fb = files_btn(r, z);
-    let w = fb[2] - fb[0];
-    let gap = 4.0 * z;
-    [fb[0] - w - gap, fb[1], fb[0] - gap, fb[3]]
-}
-/// The Run/▶ button, just left of the Logs button. Shown only on an idle or
-/// exited node so it can be (re)started after wiring.
-fn run_btn(r: [f32; 4], z: f32) -> [f32; 4] {
-    let lb = logs_btn(r, z);
-    let w = lb[2] - lb[0];
-    let gap = 4.0 * z;
-    [lb[0] - w - gap, lb[1], lb[0] - gap, lb[3]]
-}
-/// The editable launch-args bar along the bottom of an idle node's body (a
-/// one-line input strip, so it doesn't paint over the node's output above).
-fn args_bar(r: [f32; 4], z: f32) -> [f32; 4] {
-    let ca = content_rect(r, z);
-    let h = (TITLE_H * z).min((ca[3] - ca[1]).max(0.0));
-    [ca[0], ca[3] - h, ca[2], ca[3]]
-}
-fn resize_grip(r: [f32; 4], z: f32) -> [f32; 4] {
-    let g = 16.0 * z;
-    [r[2] - g, r[3] - g, r[2], r[3]]
-}
-/// The "−" and "+" port-step buttons on a HostPort node (bottom-right).
-fn port_step_btns(r: [f32; 4], z: f32) -> ([f32; 4], [f32; 4]) {
-    let s = 14.0 * z;
-    let gap = 3.0 * z;
-    let y0 = r[3] - s - 4.0 * z;
-    let px = r[2] - 4.0 * z;
-    let plus = [px - s, y0, px, y0 + s];
-    let minus = [px - 2.0 * s - gap, y0, px - s - gap, y0 + s];
-    (minus, plus)
-}
-fn content_rect(r: [f32; 4], z: f32) -> [f32; 4] {
-    [
-        r[0] + BORDER * z,
-        r[1] + TITLE_H * z,
-        r[2] - BORDER * z,
-        r[3] - BORDER * z,
-    ]
-}
-
-/// Caches rasterized strings as textures (white glyphs, tinted at draw time).
-#[derive(Default)]
-struct TextCache {
-    map: HashMap<String, (TextureId, f32, f32)>,
-}
-
-impl TextCache {
-    #[allow(clippy::too_many_arguments)]
-    fn draw(
-        &mut self,
-        quads: &mut Vec<Quad>,
-        r: &mut Renderer,
-        fonts: &Fonts,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        s: &str,
-        x: f32,
-        y: f32,
-        scale: f32,
-        color: [f32; 4],
-        clip: [f32; 4],
-    ) {
-        let (tex, w, h) = match self.map.get(s) {
-            Some(e) => *e,
-            None => {
-                let Some(g) = fonts.rasterize(s) else {
-                    return;
-                };
-                if self.map.len() >= 1024 {
-                    for (_, (tex, _, _)) in self.map.drain() {
-                        r.remove_texture(tex);
-                    }
-                }
-                let tex = r.create_texture(device, queue, g.width, g.height, &g.rgba);
-                let e = (tex, g.width as f32, g.height as f32);
-                self.map.insert(s.to_string(), e);
-                e
-            }
-        };
-        quads.push(Quad::tex(
-            [x, y, x + w * scale, y + h * scale],
-            [0.0, 0.0, 1.0, 1.0],
-            color,
-            tex,
-            clip,
-        ));
-    }
-}
-
 enum DragMode {
     Move,
     Resize,
@@ -412,169 +98,6 @@ struct Drag {
     grab: [f32; 2],
 }
 
-/// An action runnable from the Cmd/Ctrl+K command palette.
-#[derive(Clone, Copy)]
-enum PaletteCmd {
-    /// Launch the dependency at this index in `available`.
-    Launch(usize),
-    /// Centre the camera on this node.
-    GoTo(NodeId),
-    AddVolume,
-    AddBindMount,
-    AddPort,
-    AddNetwork,
-    AddGateway,
-    AddIroh,
-    AddVeilid,
-    AddNote,
-    AddCapture,
-    NewWorkspace,
-    CloseWorkspace,
-    /// Jump the camera to this zoom factor.
-    Zoom(f32),
-    Quit,
-}
-
-/// One command-palette row: a label, an optional dim description drawn after
-/// it, and the command the row runs.
-struct PaletteRow {
-    label: String,
-    desc: Option<String>,
-    cmd: PaletteCmd,
-}
-
-impl PaletteRow {
-    fn new(label: impl Into<String>, desc: Option<String>, cmd: PaletteCmd) -> Self {
-        PaletteRow {
-            label: label.into(),
-            desc,
-            cmd,
-        }
-    }
-}
-
-/// Most filtered command-palette rows shown at once.
-const PALETTE_MAX: usize = 9;
-
-/// Modal state for inspecting one node's virtual filesystem. The listing and
-/// any file preview are read live from the node's `fs` each frame, so this
-/// holds only the navigation cursor.
-struct Inspector {
-    /// The node whose filesystem is being browsed.
-    node: NodeId,
-    /// Current directory, as an absolute path (`""`/`"/"` = root).
-    dir: String,
-    /// A file within `dir` being previewed, if any.
-    file: Option<String>,
-    /// Scroll offset into the current listing, in rows. An `f32` so trackpad
-    /// pixel deltas accumulate; floored when mapping to entries.
-    scroll: f32,
-}
-
-impl Inspector {
-    /// Join `dir` and a child `name` into an absolute path.
-    fn child_path(&self, name: &str) -> String {
-        if self.dir.is_empty() {
-            format!("/{name}")
-        } else {
-            format!("{}/{name}", self.dir)
-        }
-    }
-    /// Ascend to the parent directory.
-    fn go_up(&mut self) {
-        self.file = None;
-        self.scroll = 0.0;
-        match self.dir.rfind('/') {
-            Some(0) | None => self.dir.clear(),
-            Some(i) => self.dir.truncate(i),
-        }
-    }
-}
-
-/// Modal state for viewing one node's output log — its captured stdout/stderr
-/// ring (what `wk logs` streams). Content is read live from the node's
-/// `term_io` each frame, so this holds only the scroll cursor.
-struct LogView {
-    /// The node whose output is being shown.
-    node: NodeId,
-    /// Lines scrolled up from the bottom. `0` pins the newest line to the
-    /// bottom edge (a tail); increasing it reveals older output.
-    scroll: f32,
-}
-
-/// Strip ANSI/terminal control sequences from raw log bytes and split the
-/// result into display lines, hard-wrapped at `cols` characters. The output
-/// ring captures a node's raw stdout/stderr — for a terminal app that includes
-/// escape codes — so the panel renders it as plain, readable text.
-fn log_lines(bytes: &[u8], cols: usize) -> Vec<String> {
-    let cols = cols.max(1);
-    let text = String::from_utf8_lossy(bytes);
-    let mut cleaned = String::new();
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\u{1b}' => match chars.next() {
-                // CSI: ESC [ params… final-byte (0x40..=0x7e).
-                Some('[') => {
-                    for n in chars.by_ref() {
-                        if ('\u{40}'..='\u{7e}').contains(&n) {
-                            break;
-                        }
-                    }
-                }
-                // OSC: ESC ] … terminated by BEL or ST (ESC \).
-                Some(']') => {
-                    while let Some(n) = chars.next() {
-                        if n == '\u{7}' {
-                            break;
-                        }
-                        if n == '\u{1b}' {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                // Other two-byte escapes (charset selects, etc.): drop the pair.
-                _ => {}
-            },
-            '\r' => {} // line breaks come from '\n'; drop bare carriage returns
-            '\n' => cleaned.push('\n'),
-            '\t' => cleaned.push(' '),
-            c if c.is_control() => {} // drop remaining control bytes
-            c => cleaned.push(c),
-        }
-    }
-    if cleaned.is_empty() {
-        return Vec::new(); // no output → the panel shows its own placeholder
-    }
-    // A trailing newline would otherwise add a spurious blank final line.
-    if cleaned.ends_with('\n') {
-        cleaned.pop();
-    }
-    let mut out = Vec::new();
-    for raw in cleaned.split('\n') {
-        let chs: Vec<char> = raw.chars().collect();
-        if chs.is_empty() {
-            out.push(String::new());
-            continue;
-        }
-        let mut i = 0;
-        while i < chs.len() {
-            let end = (i + cols).min(chs.len());
-            out.push(chs[i..end].iter().collect());
-            i = end;
-        }
-    }
-    out
-}
-
-/// Rows of the inspector listing visible at once.
-const INSPECT_ROWS: usize = 14;
-/// Max bytes previewed of a file.
-const INSPECT_PREVIEW_CAP: usize = 64 * 1024;
-
-/// Connection port radius, in canvas pixels.
-const PORT_R: f32 = 6.0;
 const FILE_BG: [f32; 4] = [0.20, 0.17, 0.10, 1.0];
 const FILE_BORDER: [f32; 4] = [0.55, 0.45, 0.25, 1.0];
 /// BindMount nodes are tinted (blue/grey) to distinguish disk-backed binds
@@ -596,8 +119,6 @@ const NOTE_GRAB: f32 = 16.0;
 /// Muted grey for overlay text (a node's "compiling…" / "detached" message).
 /// Ports are coloured by their [`PortKind`], not this.
 const MUTED_TEXT: [f32; 4] = [0.70, 0.72, 0.80, 1.0];
-/// A port lights up when the cursor is over it (hover / valid drop target).
-const PORT_HOT: [f32; 4] = [0.55, 0.80, 1.0, 1.0];
 /// HostPort node colours and wire (exposes a wasi:http node to localhost).
 const HOSTPORT_BG: [f32; 4] = [0.10, 0.18, 0.20, 1.0];
 const HOSTPORT_BORDER: [f32; 4] = [0.30, 0.62, 0.66, 1.0];
@@ -612,77 +133,6 @@ const NET_WIRE_COL: [f32; 4] = [0.62, 0.50, 0.86, 1.0];
 /// A selected wire is drawn thicker in this highlight colour.
 const WIRE_SEL_COL: [f32; 4] = [1.0, 0.85, 0.4, 1.0];
 
-/// A connection kind a node can carry on a typed port. Maps 1:1 to a [`Wire`]
-/// variant and gives the port (and its wire) a distinct colour, so the canvas
-/// shows *what* a connection carries rather than a single generic in/out dot.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PortKind {
-    Bind,
-    Midi,
-    Serve,
-    Net,
-    Capture,
-}
-
-impl PortKind {
-    /// The dot / wire colour for this kind.
-    fn color(self) -> [f32; 4] {
-        match self {
-            PortKind::Bind => WIRE_COL,
-            PortKind::Midi => MIDI_WIRE_COL,
-            PortKind::Serve => HOSTPORT_WIRE,
-            PortKind::Net => NET_WIRE_COL,
-            PortKind::Capture => CAPTURE_BORDER,
-        }
-    }
-}
-
-/// Whether a node is the source (`Out`, right edge) or target (`In`, left edge)
-/// of a typed connection.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PortDir {
-    In,
-    Out,
-}
-
-/// One typed connection point on a node.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Port {
-    kind: PortKind,
-    dir: PortDir,
-}
-
-/// The y-centres for `n` ports stacked down a node edge (screen rect `r`),
-/// evenly spaced with margins so a single port sits at the middle and none
-/// overflow the node.
-fn port_slots_y(r: [f32; 4], n: usize) -> Vec<f32> {
-    let h = r[3] - r[1];
-    (0..n)
-        .map(|i| r[1] + h * (i as f32 + 1.0) / (n as f32 + 1.0))
-        .collect()
-}
-
-/// Anchor points for a node's typed ports: inputs down the left edge, outputs
-/// down the right edge, in `ports` order. Pure geometry — shared by the draw,
-/// the hit-test, and the wire-endpoint lookup so they never diverge.
-fn port_anchors(r: [f32; 4], ports: &[Port]) -> Vec<[f32; 2]> {
-    let ins: Vec<usize> = (0..ports.len())
-        .filter(|&i| ports[i].dir == PortDir::In)
-        .collect();
-    let outs: Vec<usize> = (0..ports.len())
-        .filter(|&i| ports[i].dir == PortDir::Out)
-        .collect();
-    let in_y = port_slots_y(r, ins.len());
-    let out_y = port_slots_y(r, outs.len());
-    let mut anchors = vec![[0.0, 0.0]; ports.len()];
-    for (slot, &pi) in ins.iter().enumerate() {
-        anchors[pi] = [r[0], in_y[slot]];
-    }
-    for (slot, &pi) in outs.iter().enumerate() {
-        anchors[pi] = [r[2], out_y[slot]];
-    }
-    anchors
-}
 /// What varies between the small "widget" nodes (file / HostPort / Network /
 /// uplink) when drawing their shared chrome — see [`App::draw_widget`].
 struct WidgetChrome<'a> {
@@ -697,144 +147,6 @@ struct WidgetChrome<'a> {
     status_col: [f32; 4],
     /// Text scale of the status line relative to the title.
     status_scale: f32,
-}
-
-/// The inspector's interactive regions for a listing: `(panel, close_btn,
-/// up_row, entry_rows, preview)`. `entry_rows` pairs a row rect with its entry
-/// index (after `scroll`). Pure geometry, shared by the click hit-test and the
-/// draw so they never diverge, and unit-testable without a live `App`.
-type InspectRegions = (
-    [f32; 4],
-    [f32; 4],
-    Option<[f32; 4]>,
-    Vec<([f32; 4], usize)>,
-    [f32; 4],
-);
-
-/// How many listing rows fit between the inspector's title and preview strip.
-fn inspect_rows_fit(fb: [f32; 2]) -> usize {
-    let (_x, y, _w, h, row_h) = App::inspect_layout(fb);
-    let preview_h = (h * 0.34).max(row_h * 3.0);
-    let list_top = y + row_h;
-    let list_bottom = y + h - preview_h;
-    (((list_bottom - list_top) / row_h).floor() as usize).max(1)
-}
-
-/// The largest useful scroll offset: past it the last entry has already
-/// reached the last row (the ".." row costs one slot of capacity).
-fn inspect_max_scroll(fb: [f32; 2], n_entries: usize, has_up: bool) -> usize {
-    let visible = inspect_rows_fit(fb).saturating_sub(has_up as usize).max(1);
-    n_entries.saturating_sub(visible)
-}
-
-fn inspect_geom(fb: [f32; 2], n_entries: usize, has_up: bool, scroll: usize) -> InspectRegions {
-    let (x, y, w, h, row_h) = App::inspect_layout(fb);
-    let panel = [x, y, x + w, y + h];
-    let close = {
-        let s = row_h - 8.0;
-        [x + w - s - 6.0, y + 4.0, x + w - 6.0, y + 4.0 + s]
-    };
-    // Bottom third is the preview strip; the listing fills the middle.
-    let preview_h = (h * 0.34).max(row_h * 3.0);
-    let list_top = y + row_h;
-    let list_bottom = y + h - preview_h;
-    let preview = [x, list_bottom, x + w, y + h];
-    let rows_fit = inspect_rows_fit(fb);
-
-    let up = has_up.then_some([x, list_top, x + w, list_top + row_h]);
-    let mut rows = Vec::new();
-    // The ".." row takes the first slot when present.
-    let mut slot = if has_up { 1 } else { 0 };
-    let mut idx = scroll;
-    while slot < rows_fit && idx < n_entries {
-        let ry = list_top + slot as f32 * row_h;
-        rows.push(([x, ry, x + w, ry + row_h], idx));
-        slot += 1;
-        idx += 1;
-    }
-    (panel, close, up, rows, preview)
-}
-
-/// A compact human-readable byte count for the inspector.
-fn human_size(n: usize) -> String {
-    if n < 1024 {
-        format!("{n} B")
-    } else if n < 1024 * 1024 {
-        format!("{:.1} K", n as f64 / 1024.0)
-    } else {
-        format!("{:.1} M", n as f64 / (1024.0 * 1024.0))
-    }
-}
-
-fn near(a: [f32; 2], b: [f32; 2], radius: f32) -> bool {
-    let (dx, dy) = (a[0] - b[0], a[1] - b[1]);
-    dx * dx + dy * dy <= radius * radius
-}
-
-fn dist_to_segment(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
-    let (abx, aby) = (b[0] - a[0], b[1] - a[1]);
-    let (apx, apy) = (p[0] - a[0], p[1] - a[1]);
-    let len2 = abx * abx + aby * aby;
-    let t = if len2 > 0.0 {
-        ((apx * abx + apy * aby) / len2).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let (cx, cy) = (a[0] + abx * t, a[1] + aby * t);
-    let (dx, dy) = (p[0] - cx, p[1] - cy);
-    (dx * dx + dy * dy).sqrt()
-}
-
-/// How close (screen px) a click must be to a wire to select it.
-const WIRE_PICK: f32 = 6.0;
-
-/// The curved arrow (perfect-arrows) for a connection from output port `a` to
-/// input port `b`. Shared by drawing and hit-testing so they agree.
-fn connection_arrow(a: [f32; 2], b: [f32; 2], zf: f32) -> crate::arrows::Arrow {
-    let opts = crate::arrows::ArrowOptions {
-        // End the curve a touch before the input port so the arrowhead sits there.
-        pad_end: (6.0 * zf).max(4.0),
-        ..Default::default()
-    };
-    crate::arrows::get_arrow(a[0], a[1], b[0], b[1], &opts)
-}
-
-/// Draw a connection as a curved arrow with a head at the target end, so a wire
-/// looks smooth and shows its direction (source output -> target input).
-#[allow(clippy::too_many_arguments)]
-fn draw_connection(
-    quads: &mut Vec<Quad>,
-    white: TextureId,
-    a: [f32; 2],
-    b: [f32; 2],
-    sel: bool,
-    color: [f32; 4],
-    zf: f32,
-    clip: [f32; 4],
-) {
-    let th = if sel {
-        (3.5 * zf).max(2.5)
-    } else {
-        (2.0 * zf).max(1.5)
-    };
-    let arrow = connection_arrow(a, b, zf);
-    // The curved shaft, tessellated into short segments.
-    let pts = crate::arrows::polyline(&arrow, 24);
-    for s in pts.windows(2) {
-        quads.push(Quad::line(white, s[0], s[1], th, color, clip));
-    }
-    // Arrowhead at the end, pointing along the arrival angle.
-    let size = (7.0 * zf).max(5.0);
-    let end = [arrow.end.0, arrow.end.1];
-    let ang = arrow.end_angle;
-    let spread = 0.5;
-    for wing in [
-        ang + std::f32::consts::PI - spread,
-        ang + std::f32::consts::PI + spread,
-    ] {
-        let p = [end[0] + wing.cos() * size, end[1] + wing.sin() * size];
-        quads.push(Quad::line(white, end, p, th.max(1.5), color, clip));
-    }
 }
 
 /// A node popped out into its own OS window. Purely client-local view state:
@@ -1806,17 +1118,6 @@ impl App {
         (x, y, w, row_h)
     }
 
-    /// The inspector panel `(x, y, w, h, row_h)` centered on screen `fb`.
-    fn inspect_layout(fb: [f32; 2]) -> (f32, f32, f32, f32, f32) {
-        let row_h = MENU_H + 2.0;
-        let w = (fb[0] * 0.6).clamp(360.0, 720.0);
-        // Title + a listing + a preview strip; bounded to the screen.
-        let h = (row_h * (INSPECT_ROWS as f32 + 6.0) + 8.0).min(fb[1] - 80.0);
-        let x = (fb[0] - w) * 0.5;
-        let y = (fb[1] - h) * 0.5;
-        (x, y, w, h, row_h)
-    }
-
     /// The inspector's interactive regions for the current node's listing of
     /// `n_entries` rows — see [`inspect_geom`] (this just supplies the modal's
     /// current `dir`/`scroll`).
@@ -2423,7 +1724,7 @@ impl App {
             // The output-log panel is modal too: dismiss on its close box or a
             // click outside it (there's nothing to click inside).
             if let Some(lv) = &self.logs {
-                let (x, y, w, h, row_h) = Self::inspect_layout(fb);
+                let (x, y, w, h, row_h) = inspect_layout(fb);
                 let panel = [x, y, x + w, y + h];
                 let close = {
                     let s = row_h - 8.0;
@@ -3645,7 +2946,7 @@ impl App {
                 .map(|n| n.fs.lock().unwrap().list_dir(&insp.dir).unwrap_or_default())
                 .unwrap_or_default();
             let (panel, close, up, rows, preview) = self.inspect_regions(fb, entries.len());
-            let (_, _, _, _, row_h) = Self::inspect_layout(fb);
+            let (_, _, _, _, row_h) = inspect_layout(fb);
             let dim = [0.55, 0.58, 0.64, 1.0];
 
             quads.push(Quad::solid(white, full, [0.0, 0.0, 0.0, 0.45], full));
@@ -3935,7 +3236,7 @@ impl App {
             let node_name = node.map(|n| n.name.clone()).unwrap_or_default();
             let bytes = node.map(|n| n.term_io.log_read(0).0).unwrap_or_default();
             let dim = [0.55, 0.58, 0.64, 1.0];
-            let (x, y, w, h, row_h) = Self::inspect_layout(fb);
+            let (x, y, w, h, row_h) = inspect_layout(fb);
             let panel = [x, y, x + w, y + h];
             let close = {
                 let s = row_h - 8.0;
