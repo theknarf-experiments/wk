@@ -229,17 +229,27 @@ impl CreateKind {
 
 #[derive(Subcommand)]
 enum ImagesCmd {
-    /// List stored images (id, entrypoint, layers)
+    /// List stored images (tags, id, entrypoint, layers)
     List,
-    /// Remove a stored image by id (layer tars stay; they're shared)
+    /// Remove a stored image by tag or id (layer tars stay; they're shared)
     Rm {
-        /// Image id (sha256-<hex>)
-        id: String,
+        /// Image reference: a tag (name:tag) or an id / id-prefix
+        image: String,
     },
     /// Build a Dockerfile into the image store (wasm RUN steps execute)
     Build {
         /// Path to the Dockerfile (context = its directory)
         dockerfile: PathBuf,
+        /// Name the built image (e.g. myapp:1.0); a bare name implies :latest
+        #[arg(long)]
+        tag: Option<String>,
+    },
+    /// Name a stored image so it can be referenced as image://<tag>
+    Tag {
+        /// Existing image: a tag or an id / id-prefix
+        image: String,
+        /// New tag (e.g. myapp:1.0); a bare name implies :latest
+        tag: String,
     },
 }
 
@@ -252,25 +262,45 @@ fn images_cmd(cmd: &ImagesCmd) -> Result<(), String> {
                 println!("(no images; build one with `wk images build <Dockerfile>`)");
             }
             for (id, m) in all {
+                let tags = images::tags_for(&id);
+                let names = if tags.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    tags.join(", ")
+                };
                 println!(
-                    "  {id}  entrypoint={}  layers={}",
+                    "  {names}\n    {id}  entrypoint={}  layers={}",
                     m.entrypoint.join(" "),
                     m.layers.len()
                 );
             }
             Ok(())
         }
-        ImagesCmd::Rm { id } => {
-            if images::remove_image(id) {
-                println!("removed {id}");
-                Ok(())
-            } else {
-                Err(format!("no image {id}"))
-            }
+        ImagesCmd::Rm { image } => {
+            let id = images::resolve_ref(image).ok_or_else(|| format!("no image {image:?}"))?;
+            images::remove_image(&id);
+            println!("removed {id}");
+            Ok(())
         }
-        ImagesCmd::Build { dockerfile } => {
+        ImagesCmd::Build { dockerfile, tag } => {
             let id = images::build_and_alias(dockerfile)?;
-            println!("built {} -> {id}", dockerfile.display());
+            if let Some(tag) = tag {
+                images::set_tag(tag, &id)?;
+                println!(
+                    "built {} -> {} ({})",
+                    dockerfile.display(),
+                    id,
+                    images::normalize_tag(tag)
+                );
+            } else {
+                println!("built {} -> {id}", dockerfile.display());
+            }
+            Ok(())
+        }
+        ImagesCmd::Tag { image, tag } => {
+            let id = images::resolve_ref(image).ok_or_else(|| format!("no image {image:?}"))?;
+            images::set_tag(tag, &id)?;
+            println!("tagged {} as {}", id, images::normalize_tag(tag));
             Ok(())
         }
     }

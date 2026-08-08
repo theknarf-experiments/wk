@@ -158,13 +158,87 @@ pub fn list_images() -> Vec<(String, ImageManifest)> {
     out
 }
 
-/// Remove a stored image: its manifest and extracted entrypoint. Layer tars
-/// stay (they are content-addressed and may be shared by other images).
-/// Returns whether anything was removed.
+/// Remove a stored image: its manifest, extracted entrypoint, and any tags
+/// pointing at it. Layer tars stay (they are content-addressed and may be
+/// shared by other images). Returns whether anything was removed.
 pub fn remove_image(id: &str) -> bool {
     let removed = std::fs::remove_file(image_path(id)).is_ok();
     let _ = std::fs::remove_file(entrypoint_path(id));
+    let mut tags = load_tags();
+    if tags.iter().any(|(_, v)| v == id) {
+        tags.retain(|_, v| v != id);
+        let _ = save_tags(&tags);
+    }
     removed
+}
+
+/// Path of the local tag → image-id map (Docker-style names for local images).
+fn tags_path() -> PathBuf {
+    store_dir().join("tags.json")
+}
+
+/// The stored tag → image-id map.
+pub fn load_tags() -> std::collections::BTreeMap<String, String> {
+    std::fs::read(tags_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn save_tags(tags: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
+    let json = serde_json::to_vec_pretty(tags).map_err(|e| format!("encode tags: {e}"))?;
+    write_creating_dirs(&tags_path(), &json)
+}
+
+/// Normalize a user-supplied tag: a bare name gets an implicit `:latest`
+/// (as Docker does).
+pub fn normalize_tag(tag: &str) -> String {
+    if tag.contains(':') {
+        tag.to_string()
+    } else {
+        format!("{tag}:latest")
+    }
+}
+
+/// Point a tag at an image id, creating or moving it.
+pub fn set_tag(tag: &str, id: &str) -> Result<(), String> {
+    let mut tags = load_tags();
+    tags.insert(normalize_tag(tag), id.to_string());
+    save_tags(&tags)
+}
+
+/// The tags currently pointing at image `id`.
+pub fn tags_for(id: &str) -> Vec<String> {
+    load_tags()
+        .into_iter()
+        .filter(|(_, v)| v == id)
+        .map(|(k, _)| k)
+        .collect()
+}
+
+/// Resolve a reference — a tag, or an image id (or unique id-prefix) — to an
+/// image id in the store.
+pub fn resolve_ref(reference: &str) -> Option<String> {
+    let tags = load_tags();
+    if let Some(id) = tags
+        .get(reference)
+        .or_else(|| tags.get(&normalize_tag(reference)))
+    {
+        return Some(id.clone());
+    }
+    let ids: Vec<String> = list_images().into_iter().map(|(id, _)| id).collect();
+    if ids.iter().any(|id| id == reference) {
+        return Some(reference.to_string());
+    }
+    match ids
+        .iter()
+        .filter(|id| id.starts_with(reference))
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [one] => Some((*one).clone()),
+        _ => None,
+    }
 }
 
 /// Normalize an in-image destination path against the current workdir: an
@@ -861,6 +935,38 @@ mod tests {
         .unwrap();
         let err = build_with_runner(&ctx.join("Dockerfile"), Some(&runner)).unwrap_err();
         assert!(err.contains("wasm"), "err was: {err}");
+    }
+
+    #[test]
+    fn tags_resolve_images_and_drop_on_remove() {
+        isolated_store("tags");
+        let id = "sha256-deadbeef";
+        save_image(
+            id,
+            &ImageManifest {
+                layers: vec![],
+                entrypoint: vec!["/app.wasm".into()],
+                cmd: vec![],
+                env: vec![],
+                workdir: None,
+                labels: BTreeMap::new(),
+            },
+        )
+        .unwrap();
+
+        // A bare tag implies `:latest`; resolves by tag and by id-prefix.
+        set_tag("myapp", id).unwrap();
+        assert_eq!(resolve_ref("myapp").as_deref(), Some(id));
+        assert_eq!(resolve_ref("myapp:latest").as_deref(), Some(id));
+        assert_eq!(resolve_ref("sha256-dead").as_deref(), Some(id), "id prefix");
+        assert_eq!(tags_for(id), vec!["myapp:latest".to_string()]);
+
+        // A second tag; removing the image drops every tag pointing at it.
+        set_tag("myapp:1.0", id).unwrap();
+        assert_eq!(tags_for(id).len(), 2);
+        remove_image(id);
+        assert!(resolve_ref("myapp").is_none());
+        assert!(tags_for(id).is_empty());
     }
 
     #[test]

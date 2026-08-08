@@ -161,17 +161,24 @@ pub enum Source {
     /// A Dockerfile to build into a local OCI image (`docker://<path>`): the
     /// entrypoint wasm runs as the node, the image's layers become its rootfs.
     Dockerfile(PathBuf),
+    /// A locally-built/pulled image referenced by name (`image://<tag-or-id>`),
+    /// resolved against the local image store's tags.
+    Image(String),
 }
 
 impl Source {
-    /// Parse the string form stored in the workspace file: an `oci://` prefix
-    /// means a registry artifact, `docker://` a Dockerfile to build locally.
+    /// Parse the string form stored in the workspace file: `oci://` = a registry
+    /// artifact, `docker://` = a Dockerfile to build, `image://` = a local image
+    /// by tag/id, else a plain wasm path.
     pub fn parse(s: &str) -> Self {
         if let Some(reference) = s.strip_prefix("oci://") {
             return Source::Oci(reference.to_string());
         }
         if let Some(path) = s.strip_prefix("docker://") {
             return Source::Dockerfile(PathBuf::from(path));
+        }
+        if let Some(reference) = s.strip_prefix("image://") {
+            return Source::Image(reference.to_string());
         }
         Source::Path(PathBuf::from(s))
     }
@@ -181,6 +188,7 @@ impl Source {
             Source::Path(p) => p.to_string_lossy().into_owned(),
             Source::Oci(reference) => format!("oci://{reference}"),
             Source::Dockerfile(p) => format!("docker://{}", p.to_string_lossy()),
+            Source::Image(reference) => format!("image://{reference}"),
         }
     }
 
@@ -194,12 +202,15 @@ impl Source {
             Source::Dockerfile(p) => crate::images::aliased_image(p)
                 .map(|(id, _)| crate::images::entrypoint_path(&id))
                 .unwrap_or_else(|| crate::images::entrypoint_path("unbuilt")),
+            Source::Image(reference) => crate::images::resolve_ref(reference)
+                .map(|id| crate::images::entrypoint_path(&id))
+                .unwrap_or_else(|| crate::images::entrypoint_path("unresolved")),
         }
     }
 
-    /// Make the source runnable: pull + cache an OCI artifact, or (re)build a
-    /// Dockerfile image — a content-addressed cache hit when unchanged. A no-op
-    /// for local paths.
+    /// Make the source runnable: pull + cache an OCI artifact, (re)build a
+    /// Dockerfile image, or verify a local `image://` ref resolves. A no-op for
+    /// local paths.
     pub fn ensure(&self) -> Result<(), String> {
         match self {
             Source::Oci(reference) => {
@@ -214,6 +225,9 @@ impl Source {
                 println!("built {} -> {id}", p.display());
                 Ok(())
             }
+            Source::Image(reference) => crate::images::resolve_ref(reference)
+                .map(|_| ())
+                .ok_or_else(|| format!("no local image {reference:?} (see `wk images list`)")),
             Source::Path(_) => Ok(()),
         }
     }
@@ -250,6 +264,9 @@ impl Dependency {
             // plain wasm artifact has no stored image and mounts nothing.
             Source::Oci(reference) => crate::images::load_image(&crate::oci::sanitize(reference))
                 .map(|m| m.container_setup()),
+            Source::Image(reference) => crate::images::resolve_ref(reference)
+                .and_then(|id| crate::images::load_image(&id))
+                .map(|m| m.container_setup()),
             Source::Path(_) => None,
         }
     }
@@ -265,6 +282,10 @@ impl Dependency {
                 .map(|(_, m)| m.default_args())
                 .unwrap_or_default(),
             Source::Oci(reference) => crate::images::load_image(&crate::oci::sanitize(reference))
+                .map(|m| m.default_args())
+                .unwrap_or_default(),
+            Source::Image(reference) => crate::images::resolve_ref(reference)
+                .and_then(|id| crate::images::load_image(&id))
                 .map(|m| m.default_args())
                 .unwrap_or_default(),
             Source::Path(_) => Vec::new(),
@@ -998,6 +1019,16 @@ pub fn add(target: String, path: &Path) -> Result<(), String> {
             .and_then(|d| d.file_name())
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "image".to_string()),
+        // A local image ref: the tag's repo segment (registry/myapp:1.0 -> myapp).
+        Source::Image(reference) => reference
+            .rsplit('/')
+            .next()
+            .unwrap_or(reference)
+            .split(':')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("image")
+            .to_string(),
     };
     source.ensure()?;
     if doc.dependencies.iter().any(|d| d.name == name) {
@@ -1176,6 +1207,14 @@ mod tests {
         assert_eq!(
             Source::Dockerfile("plugins/vim/Dockerfile".into()).to_kdl(),
             "docker://plugins/vim/Dockerfile"
+        );
+        match Source::parse("image://myapp:1.0") {
+            Source::Image(r) => assert_eq!(r, "myapp:1.0"),
+            other => panic!("expected image source, got {other:?}"),
+        }
+        assert_eq!(
+            Source::Image("myapp:1.0".into()).to_kdl(),
+            "image://myapp:1.0"
         );
     }
 

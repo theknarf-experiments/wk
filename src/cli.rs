@@ -238,44 +238,32 @@ fn node_report<'a>(snap: &'a Snapshot, node: &'a wk_protocol::ipc::NodeInfo) -> 
     }
 }
 
-/// Resolve an image reference (a full id or any distinguishing substring) to
-/// exactly one stored image. Mirrors [`resolve`] for nodes.
-fn resolve_image(
-    images: &[(String, wk_server::images::ImageManifest)],
-    query: &str,
-) -> Option<usize> {
-    let matches: Vec<usize> = images
-        .iter()
-        .enumerate()
-        .filter(|(_, (id, _))| id.contains(query))
-        .map(|(i, _)| i)
-        .collect();
-    match matches.as_slice() {
-        [one] => Some(*one),
-        _ => None,
-    }
-}
-
 /// `wk inspect <ref>`: print a node's or image's full detail as pretty JSON
-/// (like `docker inspect`). An image id/prefix in the local store wins; anything
-/// else is resolved as a node against the running server.
+/// (like `docker inspect`). An image tag or id/prefix in the local store wins;
+/// anything else is resolved as a node against the running server.
 pub fn inspect(workspace: &Path, target: &str) -> Result<(), String> {
-    // Images are a local store (no server needed), so check them first.
-    let images = wk_server::images::list_images();
-    if let Some(i) = resolve_image(&images, target) {
-        let (id, manifest) = &images[i];
-        #[derive(serde::Serialize)]
-        struct ImageReport<'a> {
-            id: &'a str,
-            #[serde(flatten)]
-            manifest: &'a wk_server::images::ImageManifest,
+    // Images are a local store (no server needed), so check them first — by tag
+    // or by id/prefix.
+    if let Some(id) = wk_server::images::resolve_ref(target) {
+        if let Some(manifest) = wk_server::images::load_image(&id) {
+            #[derive(serde::Serialize)]
+            struct ImageReport<'a> {
+                id: &'a str,
+                tags: Vec<String>,
+                #[serde(flatten)]
+                manifest: &'a wk_server::images::ImageManifest,
+            }
+            let report = ImageReport {
+                id: &id,
+                tags: wk_server::images::tags_for(&id),
+                manifest: &manifest,
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+            );
+            return Ok(());
         }
-        let report = ImageReport { id, manifest };
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
-        );
-        return Ok(());
     }
     // Otherwise it's a live node: resolve it against the running server.
     let mut stream = connect(workspace)?;
