@@ -59,6 +59,23 @@ enum Commands {
     /// List the nodes of a running workspace (connects to `wk run`)
     Ps,
 
+    /// Manage nodes of a running workspace live (connects to `wk run`)
+    Node {
+        #[command(subcommand)]
+        cmd: NodeCmd,
+    },
+
+    /// Connect two nodes in a running workspace (kind inferred)
+    Wire {
+        /// First node (name, or any part of its id)
+        a: String,
+        /// Second node
+        b: String,
+    },
+
+    /// Remove the wire between two nodes in a running workspace
+    Unwire { a: String, b: String },
+
     /// Manage wk's local OCI image store
     Images {
         #[command(subcommand)]
@@ -74,6 +91,31 @@ enum Commands {
         /// alive, and exit on Ctrl-C. No rendering or OS input.
         #[arg(long)]
         headless: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum NodeCmd {
+    /// Launch a dependency as a new node
+    Add {
+        /// Dependency name (see the workspace's `dependencies`)
+        name: String,
+        /// Launch args passed to the node
+        args: Vec<String>,
+    },
+    /// Delete a node
+    Rm {
+        /// Node reference: its name, or any part of its id
+        node: String,
+    },
+    /// (Re)start an idle/exited node's guest
+    Start { node: String },
+    /// Set a node's launch args
+    Set {
+        node: String,
+        /// The full argument string (quote it)
+        #[arg(long)]
+        args: String,
     },
 }
 
@@ -140,6 +182,14 @@ fn main() -> Result<(), String> {
         }
         Some(Commands::List) => workspace::list(file),
         Some(Commands::Ps) => cli::ps(file),
+        Some(Commands::Node { cmd }) => match cmd {
+            NodeCmd::Add { name, args } => cli::add(file, name, args),
+            NodeCmd::Rm { node } => cli::rm(file, node),
+            NodeCmd::Start { node } => cli::start(file, node),
+            NodeCmd::Set { node, args } => cli::set_args(file, node, args),
+        },
+        Some(Commands::Wire { a, b }) => cli::wire(file, a, b),
+        Some(Commands::Unwire { a, b }) => cli::unwire(file, a, b),
         Some(Commands::Images { cmd }) => images_cmd(cmd),
         Some(Commands::Remove { plugin }) => workspace::remove(plugin.clone(), file),
         Some(Commands::Run {
