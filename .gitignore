@@ -81,6 +81,12 @@ plugins/vim/compat/*.o
 plugins/vim/compat/libwktcap.a
 plugins/vim/compat/wasi_snapshot_preview1.command.wasm
 
+# python (upstream CPython wasm32-wasi, fetched by build.sh; component + stdlib
+# tree derived from it — only build.sh/Dockerfile/mise.toml/app are tracked)
+plugins/python/bin/
+plugins/python/usr/
+plugins/python/python.wasm
+
 # fetch (networked C client) build artifact
 plugins/fetch/fetch.wasm
 
