@@ -206,6 +206,39 @@ pub struct View {
     pub workspaces: Vec<NodeId>,
 }
 
+/// Keep the entries of an id-keyed map whose key satisfies `keep`.
+fn keep_map<V: Clone>(
+    m: &HashMap<NodeId, V>,
+    keep: impl Fn(&NodeId) -> bool,
+) -> HashMap<NodeId, V> {
+    m.iter()
+        .filter(|(id, _)| keep(id))
+        .map(|(&k, v)| (k, v.clone()))
+        .collect()
+}
+
+/// Keep the members of an id set that satisfy `keep`.
+fn keep_set(s: &HashSet<NodeId>, keep: impl Fn(&NodeId) -> bool) -> HashSet<NodeId> {
+    s.iter().copied().filter(|id| keep(id)).collect()
+}
+
+/// Keep the wires of a `(source, dest)` list whose *source* satisfies `keep`.
+fn keep_pairs(v: &[(NodeId, NodeId)], keep: impl Fn(&NodeId) -> bool) -> Vec<(NodeId, NodeId)> {
+    v.iter().copied().filter(|(a, _)| keep(a)).collect()
+}
+
+/// Keep the entries of a `(source, dest)`-keyed map whose *source* satisfies
+/// `keep` (per-wire overrides: mount paths, container ports).
+fn keep_pair_map<V: Clone>(
+    m: &HashMap<(NodeId, NodeId), V>,
+    keep: impl Fn(&NodeId) -> bool,
+) -> HashMap<(NodeId, NodeId), V> {
+    m.iter()
+        .filter(|((a, _), _)| keep(a))
+        .map(|(&k, v)| (k, v.clone()))
+        .collect()
+}
+
 impl View {
     /// The live app node with id `id`, if it is an app (not a file) node.
     pub fn app_node(&self, id: NodeId) -> Option<SharedNode> {
@@ -217,112 +250,26 @@ impl View {
     /// runs all workspaces; a client renders just the one it is looking at.
     pub fn for_workspace(&self, ws: NodeId) -> View {
         let mine = |id: &NodeId| self.node_ws.get(id).copied() == Some(ws);
-        let keep = |m: &HashMap<NodeId, [f32; 2]>| -> HashMap<NodeId, [f32; 2]> {
-            m.iter()
-                .filter(|(id, _)| mine(id))
-                .map(|(&k, &v)| (k, v))
-                .collect()
-        };
         View {
-            node_ids: self
-                .node_ids
-                .iter()
-                .copied()
-                .filter(|id| mine(id))
-                .collect(),
-            win_pos: keep(&self.win_pos),
-            win_size: keep(&self.win_size),
-            file_nodes: self
-                .file_nodes
-                .iter()
-                .filter(|(id, _)| mine(id))
-                .map(|(&k, v)| (k, v.clone()))
-                .collect(),
-            host_ports: self
-                .host_ports
-                .iter()
-                .filter(|(id, _)| mine(id))
-                .map(|(&k, &v)| (k, v))
-                .collect(),
-            notes: self
-                .notes
-                .iter()
-                .filter(|(id, _)| mine(id))
-                .map(|(&k, v)| (k, v.clone()))
-                .collect(),
-            net_nodes: self
-                .net_nodes
-                .iter()
-                .copied()
-                .filter(|id| mine(id))
-                .collect(),
-            gateways: self
-                .gateways
-                .iter()
-                .copied()
-                .filter(|id| mine(id))
-                .collect(),
-            uplinks: self
-                .uplinks
-                .iter()
-                .filter(|(id, _)| mine(id))
-                .map(|(&k, v)| (k, v.clone()))
-                .collect(),
-            connections: self
-                .connections
-                .iter()
-                .copied()
-                .filter(|(f, _)| mine(f))
-                .collect(),
-            mount_paths: self
-                .mount_paths
-                .iter()
-                .filter(|((f, _), _)| mine(f))
-                .map(|(&k, v)| (k, v.clone()))
-                .collect(),
-            midi_links: self
-                .midi_links
-                .iter()
-                .copied()
-                .filter(|(s, _)| mine(s))
-                .collect(),
-            net_links: self
-                .net_links
-                .iter()
-                .copied()
-                .filter(|(a, _)| mine(a))
-                .collect(),
-            capture_links: self
-                .capture_links
-                .iter()
-                .copied()
-                .filter(|(a, _)| mine(a))
-                .collect(),
-            serve_ports: self
-                .serve_ports
-                .iter()
-                .filter(|((s, _), _)| mine(s))
-                .map(|(&k, &v)| (k, v))
-                .collect(),
-            capture_feeds: self
-                .capture_feeds
-                .iter()
-                .filter(|(id, _)| mine(id))
-                .map(|(&k, v)| (k, v.clone()))
-                .collect(),
-            attached: self.attached.iter().copied().filter(mine).collect(),
-            serves: self
-                .serves
-                .iter()
-                .filter(|(http, _)| mine(http))
-                .map(|(&k, &v)| (k, v))
-                .collect(),
-            node_args: self
-                .node_args
-                .iter()
-                .filter(|(id, _)| mine(id))
-                .map(|(&k, v)| (k, v.clone()))
-                .collect(),
+            node_ids: self.node_ids.iter().copied().filter(mine).collect(),
+            win_pos: keep_map(&self.win_pos, mine),
+            win_size: keep_map(&self.win_size, mine),
+            file_nodes: keep_map(&self.file_nodes, mine),
+            host_ports: keep_map(&self.host_ports, mine),
+            notes: keep_map(&self.notes, mine),
+            net_nodes: keep_set(&self.net_nodes, mine),
+            gateways: keep_set(&self.gateways, mine),
+            uplinks: keep_map(&self.uplinks, mine),
+            connections: keep_pairs(&self.connections, mine),
+            mount_paths: keep_pair_map(&self.mount_paths, mine),
+            midi_links: keep_pairs(&self.midi_links, mine),
+            net_links: keep_pairs(&self.net_links, mine),
+            capture_links: keep_pairs(&self.capture_links, mine),
+            serve_ports: keep_pair_map(&self.serve_ports, mine),
+            capture_feeds: keep_map(&self.capture_feeds, mine),
+            attached: keep_set(&self.attached, mine),
+            serves: keep_map(&self.serves, mine),
+            node_args: keep_map(&self.node_args, mine),
             available: self.available.clone(),
             nodes: self.nodes.iter().filter(|n| mine(&n.id)).cloned().collect(),
             surfaces: self.surfaces.clone(),
@@ -2545,6 +2492,42 @@ mod model_tests {
             "undo restored the displaced net1 membership"
         );
         assert!(!s.graph.net_links.contains(&(uplink, net2)));
+    }
+
+    /// `View::for_workspace` keeps only the nodes belonging to that tab (across
+    /// the id-keyed maps and node-set projections).
+    #[test]
+    fn for_workspace_isolates_each_tab() {
+        let mut s = fresh_server();
+        let ws1 = s.graph.workspaces[0];
+        let ws2 = NodeId::new();
+        s.apply(Command::Create(Resource::Workspace { id: ws2 }));
+        let add = |s: &mut Server, kind, ws| {
+            s.apply(Command::Create(Resource::Node {
+                kind,
+                pos: [0.0, 0.0],
+                ws,
+            }));
+        };
+        add(&mut s, NodeKind::Port, ws1);
+        add(&mut s, NodeKind::Network, ws1);
+        add(&mut s, NodeKind::Port, ws2);
+
+        let full = s.view();
+        assert_eq!(
+            full.host_ports.len(),
+            2,
+            "both tabs' hostports in full view"
+        );
+
+        let v1 = full.for_workspace(ws1);
+        assert_eq!(v1.host_ports.len(), 1, "only ws1's hostport");
+        assert_eq!(v1.net_nodes.len(), 1, "only ws1's network");
+        assert!(v1.node_ids.iter().all(|id| full.node_ws[id] == ws1));
+
+        let v2 = full.for_workspace(ws2);
+        assert_eq!(v2.host_ports.len(), 1);
+        assert_eq!(v2.net_nodes.len(), 0, "ws2 has no network");
     }
 
     /// `SetServePort` records a serve wire's container port in the graph and
