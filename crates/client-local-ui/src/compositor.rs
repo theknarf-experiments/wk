@@ -593,7 +593,9 @@ const NOTE_TEXT: [f32; 4] = [0.14, 0.12, 0.05, 1.0];
 const NOTE_GRIP: [f32; 4] = [0.86, 0.76, 0.30, 1.0];
 /// Height (canvas units) of a note's top drag strip; below it, the body edits.
 const NOTE_GRAB: f32 = 16.0;
-const PORT_COL: [f32; 4] = [0.70, 0.72, 0.80, 1.0];
+/// Muted grey for overlay text (a node's "compiling…" / "detached" message).
+/// Ports are coloured by their [`PortKind`], not this.
+const MUTED_TEXT: [f32; 4] = [0.70, 0.72, 0.80, 1.0];
 /// A port lights up when the cursor is over it (hover / valid drop target).
 const PORT_HOT: [f32; 4] = [0.55, 0.80, 1.0, 1.0];
 /// HostPort node colours and wire (exposes a wasi:http node to localhost).
@@ -3291,7 +3293,7 @@ impl App {
                     (ca[0] + ca[2]) * 0.5 - w * 0.5,
                     (ca[1] + ca[3]) * 0.5 - lh * 0.5,
                     zf,
-                    PORT_COL,
+                    MUTED_TEXT,
                     ca_clip,
                 );
             }
@@ -3320,7 +3322,7 @@ impl App {
                     (ca[0] + ca[2]) * 0.5 - w * 0.5,
                     (ca[1] + ca[3]) * 0.5 - lh * 0.5,
                     zf,
-                    PORT_COL,
+                    MUTED_TEXT,
                     ca_clip,
                 );
             } else if let Some(sid) = node_surface.get(&id).map(|s| s.lock().unwrap().id) {

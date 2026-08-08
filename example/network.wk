@@ -1,4 +1,6 @@
 // vim: set filetype=kdl :
+// The userspace network fabric. Run from the repo root:
+//   wk run example/network.wk
 import "../workspace.wk"
 workspace "01KXKGD000000000000000WS00" {
     node "netserve" "01KXKGD000000000000000NS01" {

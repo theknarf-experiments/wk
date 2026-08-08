@@ -36,35 +36,36 @@ pub struct Volume {
     pub persist: bool,
 }
 
-/// A canvas file node backed by a real file on the host disk.
-pub struct HostMappedFile {
-    /// In-app mount name (the file's base name).
+/// A canvas file node backed by a real host path (a file or a folder).
+pub struct BindMount {
+    /// Default in-app mount name (the path's base name); a bind may override the
+    /// mount point per connection (see `Graph.mount_paths`).
     pub name: String,
     pub path: PathBuf,
 }
 
-/// A canvas file node, wired into app nodes as a shared file `/name`.
+/// A canvas volume node, bind-mounted into app nodes (at a per-connection path).
 pub enum FileNode {
-    Virtual(Volume),
-    HostMapped(HostMappedFile),
+    /// An in-memory named volume.
+    Volume(Volume),
+    /// A host-path bind mount.
+    Bind(BindMount),
 }
 
 impl FileNode {
     /// The in-app file name this node mounts as.
     pub fn name(&self) -> &str {
         match self {
-            FileNode::Virtual(f) => &f.name,
-            FileNode::HostMapped(f) => &f.name,
+            FileNode::Volume(f) => &f.name,
+            FileNode::Bind(f) => &f.name,
         }
     }
 
     /// Current size in bytes (in-memory length, or the host file's size).
     pub fn size(&self) -> usize {
         match self {
-            FileNode::Virtual(f) => f.data.lock().unwrap().len(),
-            FileNode::HostMapped(f) => {
-                std::fs::metadata(&f.path).map(|m| m.len()).unwrap_or(0) as usize
-            }
+            FileNode::Volume(f) => f.data.lock().unwrap().len(),
+            FileNode::Bind(f) => std::fs::metadata(&f.path).map(|m| m.len()).unwrap_or(0) as usize,
         }
     }
 
@@ -72,8 +73,8 @@ impl FileNode {
     /// BindMount pointing at a host directory mirrors the whole tree.
     pub fn mount(&self, fs: &crate::vfs::SharedFs, at: &str) {
         match self {
-            FileNode::Virtual(f) => crate::vfs::mount_file(fs, at, f.data.clone()),
-            FileNode::HostMapped(f) => crate::vfs::mount_host(fs, at, f.path.clone()),
+            FileNode::Volume(f) => crate::vfs::mount_file(fs, at, f.data.clone()),
+            FileNode::Bind(f) => crate::vfs::mount_host(fs, at, f.path.clone()),
         }
     }
 }
@@ -363,6 +364,14 @@ fn wire_ends(w: Wire) -> (NodeId, NodeId) {
         | Wire::Net(a, b)
         | Wire::Capture(a, b) => (a, b),
     }
+}
+
+/// Drop entries of a `(NodeId, NodeId)`-keyed side map whose key is no longer a
+/// live wire — called after a wire relation changes so per-wire overrides
+/// (mount paths, container ports) don't outlive their connection.
+fn prune_side_map<V>(map: &mut HashMap<(NodeId, NodeId), V>, live: &[(NodeId, NodeId)]) {
+    let live: HashSet<(NodeId, NodeId)> = live.iter().copied().collect();
+    map.retain(|pair, _| live.contains(pair));
 }
 
 /// The in-app mount name for a host-mapped file: the path's base name.
@@ -744,7 +753,7 @@ impl Server {
         self.place(id, Kind::File, ws, pos, [FILE_W, FILE_H]);
         self.graph.file_nodes.insert(
             id,
-            FileNode::Virtual(Volume {
+            FileNode::Volume(Volume {
                 name: format!("file{}", self.file_seq),
                 data: Arc::new(Mutex::new(Vec::new())),
                 persist: false,
@@ -752,7 +761,7 @@ impl Server {
         );
     }
 
-    /// Create a HostMappedFile node backed by a fresh host file (`host<n>`).
+    /// Create a BindMount node backed by a fresh host file (`host<n>`).
     fn add_host_mapped_file(&mut self, pos: [f32; 2], ws: NodeId) {
         self.host_seq += 1;
         let id = self.alloc_id();
@@ -769,7 +778,7 @@ impl Server {
         self.place(id, Kind::File, ws, pos, [FILE_W, FILE_H]);
         self.graph
             .file_nodes
-            .insert(id, FileNode::HostMapped(HostMappedFile { name, path }));
+            .insert(id, FileNode::Bind(BindMount { name, path }));
     }
 
     /// Create a HostPort node at `pos` (auto-assigned localhost port).
@@ -920,7 +929,7 @@ impl Server {
             .graph
             .file_nodes
             .get(&id)
-            .map(|f| matches!(f, FileNode::Virtual(_)))
+            .map(|f| matches!(f, FileNode::Volume(_)))
         {
             Some(true) => return self.add_virtual_file(off, ws),
             Some(false) => return self.add_host_mapped_file(off, ws),
@@ -1242,16 +1251,16 @@ impl Server {
             self.start_serve(http, hostport);
         }
         // Drop container-port mappings for serve wires that no longer exist.
-        let live: HashSet<(NodeId, NodeId)> = self.graph.serve_links.iter().copied().collect();
-        self.graph.serve_ports.retain(|pair, _| live.contains(pair));
+        prune_side_map(&mut self.graph.serve_ports, &self.graph.serve_links);
     }
 
     /// Try to bind the server for one desired serve link. A wasi:http node gets
     /// an HTTP server dispatching into its handler; a fabric (wasi:sockets) node
-    /// gets a TCP+UDP forward from the localhost port to its fabric address at the
-    /// same port number. Silently does nothing if the node isn't ready yet or
-    /// its port is already served (both are transient during async compile /
-    /// port conflicts); only a real bind failure is logged.
+    /// gets a TCP+UDP forward from the localhost port to its fabric address at
+    /// the wire's mapped guest port (`host:container`, the same by default).
+    /// Silently does nothing if the node isn't ready yet or its port is already
+    /// served (both are transient during async compile / port conflicts); only a
+    /// real bind failure is logged.
     fn start_serve(&mut self, http_id: NodeId, hostport_id: NodeId) {
         let Some(node) = self.app_node(http_id) else {
             return;
@@ -1338,15 +1347,15 @@ impl Server {
 
     /// The in-app path a bind mounts at: the per-connection override if set,
     /// else the volume's own name at the filesystem root (the default).
-    fn mount_path_for(&self, file: NodeId, app: NodeId) -> String {
+    fn mount_path_for(&self, volume: NodeId, app: NodeId) -> String {
         self.graph
             .mount_paths
-            .get(&(file, app))
+            .get(&(volume, app))
             .cloned()
             .unwrap_or_else(|| {
                 self.graph
                     .file_nodes
-                    .get(&file)
+                    .get(&volume)
                     .map(|f| f.name().to_string())
                     .unwrap_or_default()
             })
@@ -1374,8 +1383,22 @@ impl Server {
             self.mounted.insert((file, app), (path, node.fs.clone()));
         }
         // Drop mount-path overrides for binds that no longer exist.
-        let live: HashSet<(NodeId, NodeId)> = self.graph.connections.iter().copied().collect();
-        self.graph.mount_paths.retain(|pair, _| live.contains(pair));
+        prune_side_map(&mut self.graph.mount_paths, &self.graph.connections);
+    }
+
+    /// Re-apply the live mount for `(volume, app)` at its current effective path
+    /// — used after the mount path or the volume's own source changes. A no-op
+    /// if the bind isn't currently mounted.
+    fn remount(&mut self, pair: (NodeId, NodeId)) {
+        let Some((old, fs)) = self.mounted.remove(&pair) else {
+            return;
+        };
+        crate::vfs::unmount_file(&fs, &old);
+        let at = self.mount_path_for(pair.0, pair.1);
+        if let Some(f) = self.graph.file_nodes.get(&pair.0) {
+            f.mount(&fs, &at);
+            self.mounted.insert(pair, (at, fs));
+        }
     }
 
     /// Point a BindMount node at a host path (a file or folder), updating its
@@ -1384,13 +1407,12 @@ impl Server {
         let path = PathBuf::from(host_path.trim());
         let name = host_file_name(&path);
         match self.graph.file_nodes.get_mut(&id) {
-            Some(FileNode::HostMapped(f)) => {
+            Some(FileNode::Bind(f)) => {
                 f.path = path;
                 f.name = name;
             }
             _ => return, // only BindMount nodes have a host path
         }
-        // Remount this node's live binds at their effective paths.
         let binds: Vec<(NodeId, NodeId)> = self
             .mounted
             .keys()
@@ -1398,14 +1420,7 @@ impl Server {
             .filter(|(vol, _)| *vol == id)
             .collect();
         for pair in binds {
-            if let Some((old, fs)) = self.mounted.remove(&pair) {
-                crate::vfs::unmount_file(&fs, &old);
-                let at = self.mount_path_for(pair.0, pair.1);
-                if let Some(f) = self.graph.file_nodes.get(&id) {
-                    f.mount(&fs, &at);
-                    self.mounted.insert(pair, (at, fs));
-                }
-            }
+            self.remount(pair);
         }
     }
 
@@ -1424,15 +1439,7 @@ impl Server {
                 .mount_paths
                 .insert((volume, app), path.to_string());
         }
-        // Remount at the new path if this bind is currently mounted.
-        if let Some((old, fs)) = self.mounted.remove(&(volume, app)) {
-            crate::vfs::unmount_file(&fs, &old);
-            let at = self.mount_path_for(volume, app);
-            if let Some(f) = self.graph.file_nodes.get(&volume) {
-                f.mount(&fs, &at);
-                self.mounted.insert((volume, app), (at, fs));
-            }
-        }
+        self.remount((volume, app));
     }
 
     /// Wire (or unwire) app node `src`'s MIDI output into app node `dst`'s input.
@@ -1577,7 +1584,6 @@ impl Server {
         self.forget(id);
     }
 
-    /// Snapshot every workspace into a [`Document`] and write it back to disk.
     /// The sidecar directory holding persisted volume bytes, beside the `.wk`
     /// file (e.g. `workspace.wk` → `workspace.wk.volumes/`).
     fn volume_dir(&self) -> PathBuf {
@@ -1591,30 +1597,40 @@ impl Server {
         self.volume_dir().join(id.to_string())
     }
 
-    /// Write every opted-in volume's bytes to its sidecar file. Called by
-    /// [`Self::save`]; ephemeral volumes are skipped.
+    /// Write every opted-in volume's bytes to its sidecar file and prune stale
+    /// sidecars (volumes since made ephemeral or removed). Called by
+    /// [`Self::save`].
     fn save_persisted_volumes(&self) {
         let persisted: Vec<(NodeId, Vec<u8>)> = self
             .graph
             .file_nodes
             .iter()
             .filter_map(|(&id, f)| match f {
-                FileNode::Virtual(v) if v.persist => Some((id, v.data.lock().unwrap().clone())),
+                FileNode::Volume(v) if v.persist => Some((id, v.data.lock().unwrap().clone())),
                 _ => None,
             })
             .collect();
-        if persisted.is_empty() {
-            return;
-        }
         let dir = self.volume_dir();
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            eprintln!("failed to create volume dir {}: {e}", dir.display());
-            return;
+        if !persisted.is_empty() {
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                eprintln!("failed to create volume dir {}: {e}", dir.display());
+                return;
+            }
+            for (id, bytes) in &persisted {
+                let path = self.volume_sidecar(*id);
+                if let Err(e) = std::fs::write(&path, bytes) {
+                    eprintln!("failed to persist volume {}: {e}", path.display());
+                }
+            }
         }
-        for (id, bytes) in persisted {
-            let path = self.volume_sidecar(id);
-            if let Err(e) = std::fs::write(&path, &bytes) {
-                eprintln!("failed to persist volume {}: {e}", path.display());
+        // Remove sidecars whose volume no longer persists (a no-op if the dir
+        // doesn't exist yet).
+        let keep: HashSet<String> = persisted.iter().map(|(id, _)| id.to_string()).collect();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if !keep.contains(&*entry.file_name().to_string_lossy()) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
             }
         }
     }
@@ -1647,55 +1663,26 @@ impl Server {
                         .filter(|(w, _)| *w == ws_id)
                         .map(|(_, s)| s.clone()),
                 );
-                // Orphan wires (touching an unplaced node) for this workspace,
-                // re-added to their relation so they round-trip.
-                let orphan = |rel: WireRel| -> Vec<(NodeId, NodeId)> {
-                    self.unplaced_wires
-                        .iter()
-                        .filter(|(w, r, ..)| *w == ws_id && *r == rel)
-                        .map(|&(_, _, a, b)| (a, b))
-                        .collect()
-                };
-                let mut connections: Vec<(NodeId, NodeId)> = self
-                    .graph
-                    .connections
-                    .iter()
-                    .filter(|(f, _)| mine(f))
-                    .copied()
-                    .collect();
-                connections.extend(orphan(WireRel::Connection));
-                let mut midi: Vec<(NodeId, NodeId)> = self
-                    .graph
-                    .midi_links
-                    .iter()
-                    .filter(|(s, _)| mine(s))
-                    .copied()
-                    .collect();
-                midi.extend(orphan(WireRel::Midi));
-                let mut serves: Vec<(NodeId, NodeId)> = self
-                    .graph
-                    .serve_links
-                    .iter()
-                    .filter(|(served, _)| mine(served))
-                    .copied()
-                    .collect();
-                serves.extend(orphan(WireRel::Serve));
-                let mut net_links: Vec<(NodeId, NodeId)> = self
-                    .graph
-                    .net_links
-                    .iter()
-                    .filter(|(a, _)| mine(a))
-                    .copied()
-                    .collect();
-                net_links.extend(orphan(WireRel::NetLink));
-                let mut capture_links: Vec<(NodeId, NodeId)> = self
-                    .graph
-                    .capture_links
-                    .iter()
-                    .filter(|(a, _)| mine(a))
-                    .copied()
-                    .collect();
-                capture_links.extend(orphan(WireRel::CaptureLink));
+                // This workspace's wires of one relation: the ones whose source
+                // node lives here, plus any orphan wires (touching a node that
+                // never materialized) recorded against it — so both round-trip.
+                let ws_wires =
+                    |links: &[(NodeId, NodeId)], rel: WireRel| -> Vec<(NodeId, NodeId)> {
+                        let mut v: Vec<(NodeId, NodeId)> =
+                            links.iter().filter(|(a, _)| mine(a)).copied().collect();
+                        v.extend(
+                            self.unplaced_wires
+                                .iter()
+                                .filter(|(w, r, ..)| *w == ws_id && *r == rel)
+                                .map(|&(_, _, a, b)| (a, b)),
+                        );
+                        v
+                    };
+                let connections = ws_wires(&self.graph.connections, WireRel::Connection);
+                let midi = ws_wires(&self.graph.midi_links, WireRel::Midi);
+                let serves = ws_wires(&self.graph.serve_links, WireRel::Serve);
+                let net_links = ws_wires(&self.graph.net_links, WireRel::NetLink);
+                let capture_links = ws_wires(&self.graph.capture_links, WireRel::CaptureLink);
                 // Persist mount-path overrides for this workspace's binds.
                 let mount_paths = connections
                     .iter()
@@ -1900,7 +1887,7 @@ impl Server {
                     self.set_bind_path(id, host_path);
                 }
                 if let Some(persist) = patch.persist {
-                    if let Some(FileNode::Virtual(v)) = self.graph.file_nodes.get_mut(&id) {
+                    if let Some(FileNode::Volume(v)) = self.graph.file_nodes.get_mut(&id) {
                         v.persist = persist;
                     }
                 }
@@ -2025,11 +2012,11 @@ impl Server {
                 }
             }
             Kind::File => match self.graph.file_nodes.get(&id)? {
-                FileNode::Virtual(v) => SnapKind::Volume {
+                FileNode::Volume(v) => SnapKind::Volume {
                     name: v.name.clone(),
                     persist: v.persist,
                 },
-                FileNode::HostMapped(h) => SnapKind::BindMount {
+                FileNode::Bind(h) => SnapKind::BindMount {
                     path: h.path.clone(),
                 },
             },
@@ -2075,7 +2062,7 @@ impl Server {
         // A Volume's bytes are runtime-only state: carried for undo,
         // never persisted.
         let file_data = match self.graph.file_nodes.get(&id) {
-            Some(FileNode::Virtual(v)) => v.data.lock().unwrap().clone(),
+            Some(FileNode::Volume(v)) => v.data.lock().unwrap().clone(),
             _ => Vec::new(),
         };
         let mut wires: Vec<(NodeId, NodeId)> = Vec::new();
@@ -2184,7 +2171,7 @@ impl Server {
                 self.place(s.id, Kind::File, ws, s.pos, s.size);
                 self.graph.file_nodes.insert(
                     s.id,
-                    FileNode::Virtual(Volume {
+                    FileNode::Volume(Volume {
                         name: name.clone(),
                         data: Arc::new(Mutex::new(data)),
                         persist: *persist,
@@ -2202,7 +2189,7 @@ impl Server {
                 self.place(s.id, Kind::File, ws, s.pos, s.size);
                 self.graph.file_nodes.insert(
                     s.id,
-                    FileNode::HostMapped(HostMappedFile {
+                    FileNode::Bind(BindMount {
                         name,
                         path: path.clone(),
                     }),
@@ -2314,9 +2301,9 @@ impl Server {
                     FileMeta {
                         name: f.name().to_string(),
                         size: f.size(),
-                        host_mapped: matches!(f, FileNode::HostMapped(_)),
-                        is_dir: matches!(f, FileNode::HostMapped(h) if h.path.is_dir()),
-                        persist: matches!(f, FileNode::Virtual(v) if v.persist),
+                        host_mapped: matches!(f, FileNode::Bind(_)),
+                        is_dir: matches!(f, FileNode::Bind(h) if h.path.is_dir()),
+                        persist: matches!(f, FileNode::Volume(v) if v.persist),
                     },
                 )
             })
@@ -2655,7 +2642,7 @@ mod model_tests {
             },
         });
         match s.graph.file_nodes.get(&id) {
-            Some(FileNode::HostMapped(f)) => {
+            Some(FileNode::Bind(f)) => {
                 assert_eq!(f.path, PathBuf::from("/srv/data/logs"));
                 assert_eq!(f.name, "logs", "mount name follows the new basename");
             }
@@ -2689,7 +2676,7 @@ mod model_tests {
                     ..Default::default()
                 },
             });
-            if let Some(FileNode::Virtual(v)) = s.graph.file_nodes.get(&vol) {
+            if let Some(FileNode::Volume(v)) = s.graph.file_nodes.get(&vol) {
                 v.data.lock().unwrap().extend_from_slice(b"remember me");
             }
             s.save();
@@ -2700,7 +2687,7 @@ mod model_tests {
         let doc = crate::workspace::Document::load_resolved(&path).expect("reload");
         let s2 = Server::new(&doc, path.clone()).expect("server");
         match s2.graph.file_nodes.get(&vol) {
-            Some(FileNode::Virtual(v)) => {
+            Some(FileNode::Volume(v)) => {
                 assert!(v.persist, "persist flag round-trips");
                 assert_eq!(&*v.data.lock().unwrap(), b"remember me");
             }
@@ -2708,6 +2695,55 @@ mod model_tests {
         }
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(PathBuf::from(&sidecar));
+    }
+
+    /// Turning off a volume's persistence removes its sidecar on the next save,
+    /// so stale bytes don't linger.
+    #[test]
+    fn unpersisting_a_volume_prunes_its_sidecar() {
+        let path = std::env::temp_dir().join("wk-vol-prune-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let mut sidecar_dir = path.clone().into_os_string();
+        sidecar_dir.push(".volumes");
+        let sidecar_dir = PathBuf::from(&sidecar_dir);
+        let _ = std::fs::remove_dir_all(&sidecar_dir);
+
+        let mut s = Server::new(&Document::empty(), path.clone()).expect("server");
+        let ws = s.graph.workspaces[0];
+        s.apply(Command::Create(Resource::Node {
+            kind: NodeKind::Volume,
+            pos: [0.0, 0.0],
+            ws,
+        }));
+        let vol = *s.graph.file_nodes.keys().next().expect("a volume");
+        s.apply(Command::Update {
+            id: vol,
+            patch: NodePatch {
+                persist: Some(true),
+                ..Default::default()
+            },
+        });
+        s.save();
+        assert!(
+            s.volume_sidecar(vol).exists(),
+            "persisted → sidecar written"
+        );
+
+        // Turn persistence back off; the sidecar is pruned on the next save.
+        s.apply(Command::Update {
+            id: vol,
+            patch: NodePatch {
+                persist: Some(false),
+                ..Default::default()
+            },
+        });
+        s.save();
+        assert!(
+            !s.volume_sidecar(vol).exists(),
+            "unpersisted → sidecar removed"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&sidecar_dir);
     }
 
     /// A bind's mount path survives a save→reload cycle (it persists as the

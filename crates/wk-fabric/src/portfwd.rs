@@ -4,8 +4,9 @@
 //! (rather than exporting `wasi:http`), the host binds `127.0.0.1:port` — both
 //! protocols; the guest's own protocol decides which side carries traffic —
 //! and joins the node's virtual network as a peer of its own. Each accepted
-//! TCP connection dials the node over the fabric at the *same* port number
-//! with a pump thread shuttling bytes; UDP datagrams are NAT'd — each distinct
+//! TCP connection dials the node over the fabric at its mapped guest port
+//! (`host:container`, the same as the host port by default) with a pump thread
+//! shuttling bytes; UDP datagrams are NAT'd — each distinct
 //! host client gets its own fabric socket, so replies route back to the right
 //! client. Because the bridge is a real fabric peer, its traffic is ordinary
 //! IP packets on the node's network: middlebox nodes in the path see it like
