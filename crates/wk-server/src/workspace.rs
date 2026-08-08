@@ -18,6 +18,7 @@
 //! ```
 
 use kdl::{KdlDocument, KdlEntry, KdlEntryFormat, KdlNode, KdlValue};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use wk_protocol::NodeId;
 
@@ -294,8 +295,12 @@ pub struct Workspace {
     /// Every placed node, of any kind (each serializes under its kind's KDL
     /// node name). File order is preserved.
     pub nodes: Vec<NodeSnap>,
-    /// File mounts as (file id, app node id).
+    /// Volume binds as (volume id, app node id).
     pub connections: Vec<(NodeId, NodeId)>,
+    /// Where a bind mounts inside its app, keyed by (volume, app). Absent = the
+    /// default (the volume's name at the filesystem root). Only overrides are
+    /// stored, so a fresh bind adds nothing here.
+    pub mount_paths: BTreeMap<(NodeId, NodeId), String>,
     /// MIDI links as (source, destination).
     pub midi: Vec<(NodeId, NodeId)>,
     /// Serve wiring as (served node id, HostPort id).
@@ -313,6 +318,7 @@ impl Workspace {
             id: NodeId::new(),
             nodes: Vec::new(),
             connections: Vec::new(),
+            mount_paths: BTreeMap::new(),
             midi: Vec::new(),
             serves: Vec::new(),
             net_links: Vec::new(),
@@ -599,7 +605,15 @@ fn parse_workspace(n: &KdlNode) -> Option<Workspace> {
     };
     for c in n.children().map(|ch| ch.nodes()).unwrap_or(&[]) {
         match c.name().value() {
-            "connection" => ws.connections.extend(pair(c)),
+            "connection" => {
+                if let Some((a, b)) = pair(c) {
+                    ws.connections.push((a, b));
+                    // Optional 3rd arg: the in-app mount path for this bind.
+                    if let Some(p) = c.get(2).and_then(|v| v.as_string()) {
+                        ws.mount_paths.insert((a, b), p.to_string());
+                    }
+                }
+            }
             "midi" => ws.midi.extend(pair(c)),
             "serve" => ws.serves.extend(pair(c)),
             "netlink" => ws.net_links.extend(pair(c)),
@@ -618,7 +632,12 @@ fn workspace_kdl(ws: &Workspace) -> KdlNode {
         ch.nodes_mut().push(snap_kdl(n));
     }
     for &(file, node) in &ws.connections {
-        ch.nodes_mut().push(pair_kdl("connection", file, node));
+        let mut c = pair_kdl("connection", file, node);
+        // A non-default mount path rides along as a 3rd arg.
+        if let Some(path) = ws.mount_paths.get(&(file, node)) {
+            c.push(str_entry(path));
+        }
+        ch.nodes_mut().push(c);
     }
     for &(src, dst) in &ws.midi {
         ch.nodes_mut().push(pair_kdl("midi", src, dst));
@@ -1114,6 +1133,7 @@ mod tests {
                         },
                     ],
                     connections: vec![(chan, synth)],
+                    mount_paths: BTreeMap::from([((chan, synth), "/data/notes.txt".to_string())]),
                     midi: vec![(msrc, mdst)],
                     serves: vec![(synth, port)],
                     net_links: vec![(synth, net)],
@@ -1326,6 +1346,12 @@ mod tests {
                 capture_links: netlinks.clone(),
                 id,
                 nodes,
+                // Give every generated bind an explicit mount path so the 3rd-arg
+                // round-trip is exercised across the whole document space.
+                mount_paths: conns
+                    .iter()
+                    .map(|&p| (p, "/mnt/data".to_string()))
+                    .collect(),
                 connections: conns,
                 midi,
                 serves,

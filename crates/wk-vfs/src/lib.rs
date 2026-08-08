@@ -149,6 +149,9 @@ impl Fs {
     }
 
     /// Insert `node` as a child named `name` under `parent` (a directory).
+    /// Insert `node` as a child of directory `parent`. Only tests build trees
+    /// this directly now — mounts go through the path-based [`mount_file`].
+    #[cfg(test)]
     fn add_child(&mut self, parent: u64, name: &str, node: Node) {
         let id = self.alloc(node);
         if let Some(Node::Dir(children)) = self.nodes.get_mut(&parent) {
@@ -402,30 +405,44 @@ impl Fs {
     }
 }
 
-/// Connect a canvas file node into `fs` as the shared file `/name`.
-pub fn mount_file(fs: &SharedFs, name: &str, data: SharedFile) {
-    unmount_file(fs, name);
-    fs.lock().unwrap().add_child(ROOT, name, Node::Shared(data));
+/// Bind-mount a Volume's shared bytes into `fs` at `at` (an absolute-ish path
+/// like `/data/notes.txt`; a bare name mounts at the root). Missing parent
+/// directories are created; any existing entry at that path is replaced.
+pub fn mount_file(fs: &SharedFs, at: &str, data: SharedFile) {
+    mount_node_at(fs, at, Node::Shared(data));
 }
 
-/// Connect a canvas HostMappedFile node into `fs` as `/name`, backed by the
-/// real host file at `path`. Reads and writes go straight to disk.
-pub fn mount_host_file(fs: &SharedFs, name: &str, path: std::path::PathBuf) {
-    unmount_file(fs, name);
-    fs.lock().unwrap().add_child(ROOT, name, Node::Host(path));
+/// Bind-mount a real host file into `fs` at `at`, backed by the disk file at
+/// `path`. Reads and writes go straight to disk. Path semantics as [`mount_file`].
+pub fn mount_host_file(fs: &SharedFs, at: &str, path: std::path::PathBuf) {
+    mount_node_at(fs, at, Node::Host(path));
 }
 
-/// Disconnect the shared file `/name` from `fs` (leaves the file node's bytes
-/// intact for any other app still connected).
-pub fn unmount_file(fs: &SharedFs, name: &str) {
+/// Place `node` at `at`, creating parent dirs and replacing any existing entry.
+fn mount_node_at(fs: &SharedFs, at: &str, node: Node) {
     let mut g = fs.lock().unwrap();
-    let removed = match g.nodes.get_mut(&ROOT) {
-        Some(Node::Dir(children)) => children.remove(name),
-        _ => None,
+    let comps = components(at);
+    let Some((name, dirs)) = comps.split_last() else {
+        return; // empty path: nothing to mount
     };
-    if let Some(id) = removed {
-        g.nodes.remove(&id);
+    let Some(parent) = g.ensure_dir_path(&dirs.join("/")) else {
+        return; // a path component collided with a file
+    };
+    if g.at_capacity() {
+        return;
     }
+    g.remove_path_in(parent, name);
+    let id = g.alloc(node);
+    if let Some(Node::Dir(children)) = g.nodes.get_mut(&parent) {
+        children.insert((*name).to_string(), id);
+    }
+}
+
+/// Disconnect a bind mounted at `at` from `fs` (leaves the volume's bytes intact
+/// for any other app still connected). Parent directories created for the mount
+/// are left in place — harmless empty dirs.
+pub fn unmount_file(fs: &SharedFs, at: &str) {
+    fs.lock().unwrap().remove_path(at);
 }
 
 /// Split a path into normal components (ignoring empty and `.`).
@@ -1379,6 +1396,24 @@ mod tests {
         unmount_file(&a, "chan");
         assert!(resolve(&a.lock().unwrap(), ROOT, "/chan").is_none());
         assert!(resolve(&b.lock().unwrap(), ROOT, "/chan").is_some());
+    }
+
+    #[test]
+    fn mounts_at_a_nested_path_creating_parents() {
+        let fs = new_fs();
+        let data: SharedFile = Arc::new(Mutex::new(b"hi".to_vec()));
+        // A volume can bind at a chosen path deep in the tree; parents appear.
+        mount_file(&fs, "/data/inputs/notes.txt", data.clone());
+        let id = resolve(&fs.lock().unwrap(), ROOT, "/data/inputs/notes.txt")
+            .expect("mounted at the nested path");
+        assert_eq!(stat_node(&fs.lock().unwrap(), id).unwrap().size, 2);
+        // Same bytes are shared: an external write is visible through the mount.
+        data.lock().unwrap().extend_from_slice(b" there");
+        assert_eq!(stat_node(&fs.lock().unwrap(), id).unwrap().size, 8);
+        // Unmounting removes the leaf (the parent dirs are harmless leftovers).
+        unmount_file(&fs, "/data/inputs/notes.txt");
+        assert!(resolve(&fs.lock().unwrap(), ROOT, "/data/inputs/notes.txt").is_none());
+        assert!(resolve(&fs.lock().unwrap(), ROOT, "/data/inputs").is_some());
     }
 
     #[test]

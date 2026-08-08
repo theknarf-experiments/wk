@@ -393,6 +393,40 @@ pub fn set_args(workspace: &Path, node: &str, args: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// `wk mount <volume> <app> [path]`: set where a volume bind mounts inside an
+/// app (e.g. `/data/notes.txt`). Omitting the path resets it to the default
+/// (the volume's name at the filesystem root).
+pub fn mount(workspace: &Path, volume: &str, app: &str, path: &str) -> Result<(), String> {
+    let mut stream = connect(workspace)?;
+    let snap = get_snapshot(&mut stream)?;
+    let vol = resolve(&snap, volume)?.id;
+    let app_id = resolve(&snap, app)?.id;
+    if !snap
+        .wires
+        .iter()
+        .any(|w| w.kind == "bind" && w.a == vol && w.b == app_id)
+    {
+        return Err(format!(
+            "{volume} is not bound into {app} — wire them first with `wk wire`"
+        ));
+    }
+    send_command(
+        &mut stream,
+        Command::SetMount {
+            volume: vol,
+            app: app_id,
+            path: path.to_string(),
+        },
+    )?;
+    let where_ = if path.trim().is_empty() {
+        "(default)"
+    } else {
+        path
+    };
+    println!("mounted {} into {} at {where_}", short(vol), short(app_id));
+    Ok(())
+}
+
 /// `wk wire <a> <b>`: connect two nodes (the server infers the wire kind).
 pub fn wire(workspace: &Path, a: &str, b: &str) -> Result<(), String> {
     let mut stream = connect(workspace)?;
@@ -418,7 +452,7 @@ pub fn unwire(workspace: &Path, a: &str, b: &str) -> Result<(), String> {
         .find(|w| (w.a == ida && w.b == idb) || (w.a == idb && w.b == ida))
         .ok_or_else(|| format!("no wire between {a} and {b}"))?;
     let wire = match w.kind.as_str() {
-        "file" => Wire::Bind(w.a, w.b),
+        "bind" => Wire::Bind(w.a, w.b),
         "midi" => Wire::Midi(w.a, w.b),
         "serve" => Wire::Serve(w.a, w.b),
         "net" => Wire::Net(w.a, w.b),
@@ -527,7 +561,7 @@ mod tests {
             workspaces: vec![NodeId::from_u128(1)],
             nodes: vec![vim.clone(), notes.clone()],
             wires: vec![WireInfo {
-                kind: "file".into(),
+                kind: "bind".into(),
                 a: notes.id,
                 b: vim.id,
             }],
@@ -537,7 +571,7 @@ mod tests {
         assert_eq!(report.name, "vim");
         assert_eq!(report.status, "running");
         assert_eq!(report.connections.len(), 1);
-        assert_eq!(report.connections[0].kind, "file");
+        assert_eq!(report.connections[0].kind, "bind");
         assert_eq!(report.connections[0].peer_name, "notes.txt");
         // Serializes to JSON (what the command prints).
         let json = serde_json::to_string(&report).unwrap();

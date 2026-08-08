@@ -77,6 +77,16 @@ enum Commands {
     /// Remove the wire between two nodes in a running workspace
     Unwire { a: String, b: String },
 
+    /// Set where a volume bind mounts inside an app (like docker `-v`)
+    Mount {
+        /// Volume node (name, or any part of its id)
+        volume: String,
+        /// App node the volume is bound into
+        app: String,
+        /// In-app mount path, e.g. /data/notes.txt (omit to reset to default)
+        path: Option<String>,
+    },
+
     /// Attach to a running terminal node's I/O (like `docker attach`)
     Attach {
         /// Node reference: its name, or any part of its id
@@ -224,6 +234,9 @@ fn main() -> Result<(), String> {
         },
         Some(Commands::Wire { a, b }) => cli::wire(file, a, b),
         Some(Commands::Unwire { a, b }) => cli::unwire(file, a, b),
+        Some(Commands::Mount { volume, app, path }) => {
+            cli::mount(file, volume, app, path.as_deref().unwrap_or(""))
+        }
         Some(Commands::Attach { node }) => attach::attach(file, node),
         Some(Commands::Logs { node, follow }) => cli::logs(file, node, *follow),
         Some(Commands::Inspect { target }) => cli::inspect(file, target),

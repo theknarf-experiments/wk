@@ -191,6 +191,14 @@ pub enum Command {
         patch: NodePatch,
     },
     Delete(ResourceRef),
+    /// Set where a volume bind (`volume` → `app`) mounts inside the app, e.g.
+    /// `/data`. An empty path resets it to the default (the volume's name at the
+    /// filesystem root).
+    SetMount {
+        volume: NodeId,
+        app: NodeId,
+        path: String,
+    },
     /// (Re)run an idle/exited app node's guest.
     Run(NodeId),
     /// Stop a running app node's guest (it stays placed and can be re-run).
@@ -223,6 +231,8 @@ impl Command {
             }
             Command::Delete(ResourceRef::Node(_)) => (ResourceKind::Node, Action::Delete),
             Command::Delete(ResourceRef::Wire(_)) => (ResourceKind::Wire, Action::Delete),
+            // Reconfiguring a bind's mount path modifies that wire.
+            Command::SetMount { .. } => (ResourceKind::Wire, Action::Update),
             Command::Delete(ResourceRef::Workspace(_)) => (ResourceKind::Workspace, Action::Delete),
             Command::Run(_) | Command::Stop(_) => (ResourceKind::Node, Action::Run),
             Command::Duplicate(_) => (ResourceKind::Node, Action::Create),

@@ -65,11 +65,11 @@ impl FileNode {
         }
     }
 
-    /// Mount this file into app filesystem `fs` (by kind).
-    pub fn mount(&self, fs: &crate::vfs::SharedFs) {
+    /// Bind this volume into app filesystem `fs` at the path `at` (by kind).
+    pub fn mount(&self, fs: &crate::vfs::SharedFs, at: &str) {
         match self {
-            FileNode::Virtual(f) => crate::vfs::mount_file(fs, &f.name, f.data.clone()),
-            FileNode::HostMapped(f) => crate::vfs::mount_host_file(fs, &f.name, f.path.clone()),
+            FileNode::Virtual(f) => crate::vfs::mount_file(fs, at, f.data.clone()),
+            FileNode::HostMapped(f) => crate::vfs::mount_host_file(fs, at, f.path.clone()),
         }
     }
 }
@@ -167,6 +167,9 @@ pub struct View {
     pub gateways: HashSet<NodeId>,
     pub uplinks: HashMap<NodeId, UplinkMeta>,
     pub connections: Vec<(NodeId, NodeId)>,
+    /// Per-bind mount-path overrides as (volume, app) → in-app path. Absent = the
+    /// default (the volume's name at the root); the UI shows/edits these.
+    pub mount_paths: HashMap<(NodeId, NodeId), String>,
     pub midi_links: Vec<(NodeId, NodeId)>,
     pub net_links: Vec<(NodeId, NodeId)>,
     /// Screen-capture grants as (app, Capture node).
@@ -258,6 +261,12 @@ impl View {
                 .iter()
                 .copied()
                 .filter(|(f, _)| mine(f))
+                .collect(),
+            mount_paths: self
+                .mount_paths
+                .iter()
+                .filter(|((f, _), _)| mine(f))
+                .map(|(&k, v)| (k, v.clone()))
                 .collect(),
             midi_links: self
                 .midi_links
@@ -457,8 +466,11 @@ pub struct Graph {
     /// Note nodes' text (canvas id -> the sticky-note contents).
     pub note_text: HashMap<NodeId, String>,
 
-    /// File connections as (file id, app node id).
+    /// Volume binds as (volume id, app node id).
     pub connections: Vec<(NodeId, NodeId)>,
+    /// Where a bind mounts inside its app, keyed by (volume, app). Absent = the
+    /// default (the volume's name at the filesystem root).
+    pub mount_paths: HashMap<(NodeId, NodeId), String>,
     /// MIDI connections as (source node id, destination node id).
     pub midi_links: Vec<(NodeId, NodeId)>,
     /// Serve wiring: (http node id, HostPort id).
@@ -629,6 +641,11 @@ impl Server {
             .copied()
             .collect();
         self.rewire(&wires);
+        // Restore per-bind mount paths, then re-apply so mounts land at them.
+        for (&pair, path) in &saved.mount_paths {
+            self.graph.mount_paths.insert(pair, path.clone());
+        }
+        self.sync_mounts();
     }
 
     /// Record a node's base fact: kind, workspace, and canvas geometry.
@@ -1257,25 +1274,71 @@ impl Server {
         self.sync_mounts();
     }
 
+    /// The in-app path a bind mounts at: the per-connection override if set,
+    /// else the volume's own name at the filesystem root (the default).
+    fn mount_path_for(&self, file: NodeId, app: NodeId) -> String {
+        self.graph
+            .mount_paths
+            .get(&(file, app))
+            .cloned()
+            .unwrap_or_else(|| {
+                self.graph
+                    .file_nodes
+                    .get(&file)
+                    .map(|f| f.name().to_string())
+                    .unwrap_or_default()
+            })
+    }
+
     /// Reconcile the actual file mounts against the desired `connections`: mount
-    /// each newly-wired file into its app's fs, unmount ones no longer wired.
-    /// Idempotent; runs after any connection change and once per tick.
+    /// each newly-wired volume into its app's fs at its mount path, unmount ones
+    /// no longer wired. Idempotent; runs after any connection change and once per
+    /// tick.
     fn sync_mounts(&mut self) {
         let active: HashSet<(NodeId, NodeId)> = self.mounted.keys().copied().collect();
         let plan = wiring::reconcile_links(&self.graph.connections, &active);
         for pair in plan.remove {
-            if let Some((name, fs)) = self.mounted.remove(&pair) {
-                crate::vfs::unmount_file(&fs, &name);
+            if let Some((path, fs)) = self.mounted.remove(&pair) {
+                crate::vfs::unmount_file(&fs, &path);
             }
         }
         for (file, app) in plan.add {
+            let path = self.mount_path_for(file, app);
             let (Some(f), Some(node)) = (self.graph.file_nodes.get(&file), self.app_node(app))
             else {
                 continue; // a node isn't resolvable yet — retried next reconcile
             };
-            let name = f.name().to_string();
-            f.mount(&node.fs);
-            self.mounted.insert((file, app), (name, node.fs.clone()));
+            f.mount(&node.fs, &path);
+            self.mounted.insert((file, app), (path, node.fs.clone()));
+        }
+        // Drop mount-path overrides for binds that no longer exist.
+        let live: HashSet<(NodeId, NodeId)> = self.graph.connections.iter().copied().collect();
+        self.graph.mount_paths.retain(|pair, _| live.contains(pair));
+    }
+
+    /// Set (or clear) where a bind mounts inside its app, remounting live. A path
+    /// equal to the default is stored as an override too, so the choice sticks
+    /// even if the volume is later renamed; an empty path resets to the default.
+    fn set_mount(&mut self, volume: NodeId, app: NodeId, path: String) {
+        if !self.graph.connections.contains(&(volume, app)) {
+            return; // not a bind — nothing to mount
+        }
+        let path = path.trim();
+        if path.is_empty() {
+            self.graph.mount_paths.remove(&(volume, app));
+        } else {
+            self.graph
+                .mount_paths
+                .insert((volume, app), path.to_string());
+        }
+        // Remount at the new path if this bind is currently mounted.
+        if let Some((old, fs)) = self.mounted.remove(&(volume, app)) {
+            crate::vfs::unmount_file(&fs, &old);
+            let at = self.mount_path_for(volume, app);
+            if let Some(f) = self.graph.file_nodes.get(&volume) {
+                f.mount(&fs, &at);
+                self.mounted.insert((volume, app), (at, fs));
+            }
         }
     }
 
@@ -1498,10 +1561,16 @@ impl Server {
                     .copied()
                     .collect();
                 capture_links.extend(orphan(WireRel::CaptureLink));
+                // Persist mount-path overrides for this workspace's binds.
+                let mount_paths = connections
+                    .iter()
+                    .filter_map(|pair| self.graph.mount_paths.get(pair).map(|p| (*pair, p.clone())))
+                    .collect();
                 Workspace {
                     id: ws_id,
                     nodes,
                     connections,
+                    mount_paths,
                     midi,
                     serves,
                     net_links,
@@ -1629,8 +1698,8 @@ impl Server {
                     }
                 }
             }
-            // Not undoable: run and undo itself.
-            Command::Run(_) | Command::Stop(_) | Command::Undo => {}
+            // Not undoable: run, mount-path edits, and undo itself.
+            Command::SetMount { .. } | Command::Run(_) | Command::Stop(_) | Command::Undo => {}
         }
         self.dispatch(cmd);
     }
@@ -1686,6 +1755,7 @@ impl Server {
             Command::Delete(ResourceRef::Node(id)) => self.remove_any(id),
             Command::Delete(ResourceRef::Wire(w)) => self.disconnect_wire(w),
             Command::Delete(ResourceRef::Workspace(id)) => self.remove_workspace(id),
+            Command::SetMount { volume, app, path } => self.set_mount(volume, app, path),
             Command::Run(id) => self.run_node(id),
             Command::Stop(id) => self.stop_node(id),
             Command::Duplicate(id) => self.duplicate(id),
@@ -2140,6 +2210,7 @@ impl Server {
             gateways,
             uplinks,
             connections: self.graph.connections.clone(),
+            mount_paths: self.graph.mount_paths.clone(),
             midi_links: self.graph.midi_links.clone(),
             net_links: self.graph.net_links.clone(),
             capture_links: self.graph.capture_links.clone(),
@@ -2181,9 +2252,9 @@ impl Server {
                 Some(Kind::App) => "app",
                 Some(Kind::File) => {
                     if v.file_nodes.get(&id).is_some_and(|f| f.host_mapped) {
-                        "hostfile"
+                        "bindmount"
                     } else {
-                        "virtualfile"
+                        "volume"
                     }
                 }
                 Some(Kind::Port) => "hostport",
@@ -2236,7 +2307,7 @@ impl Server {
                 })
                 .collect()
         };
-        let mut wires = wire("file", &v.connections);
+        let mut wires = wire("bind", &v.connections);
         wires.extend(wire("midi", &v.midi_links));
         wires.extend(wire("net", &v.net_links));
         wires.extend(wire("capture", &v.capture_links));
@@ -2320,6 +2391,87 @@ mod model_tests {
         assert!(!s.graph.net_links.contains(&(uplink, net2)));
     }
 
+    /// `SetMount` overrides where a bind mounts and remembers it in the graph;
+    /// an empty path resets to the default (the volume's name at the root).
+    #[test]
+    fn set_mount_overrides_then_resets_to_default() {
+        let mut s = fresh_server();
+        let ws = s.graph.workspaces[0];
+        s.apply(Command::Create(Resource::Node {
+            kind: NodeKind::Volume,
+            pos: [0.0, 0.0],
+            ws,
+        }));
+        let vol = *s
+            .graph
+            .file_nodes
+            .keys()
+            .next()
+            .expect("a volume was placed");
+        let default = s.graph.file_nodes[&vol].name().to_string();
+        // A bind is (volume, app); a stand-in app id is enough for the path model.
+        let app = NodeId::new();
+        s.graph.connections.push((vol, app));
+        assert_eq!(s.mount_path_for(vol, app), default, "default is the name");
+
+        s.apply(Command::SetMount {
+            volume: vol,
+            app,
+            path: "/data/notes.txt".into(),
+        });
+        assert_eq!(
+            s.graph.mount_paths.get(&(vol, app)).map(String::as_str),
+            Some("/data/notes.txt")
+        );
+        assert_eq!(s.mount_path_for(vol, app), "/data/notes.txt");
+
+        // Blank path clears the override; the default returns.
+        s.apply(Command::SetMount {
+            volume: vol,
+            app,
+            path: "   ".into(),
+        });
+        assert!(!s.graph.mount_paths.contains_key(&(vol, app)));
+        assert_eq!(s.mount_path_for(vol, app), default);
+    }
+
+    /// A bind's mount path survives a save→reload cycle (it persists as the
+    /// connection's 3rd KDL arg).
+    #[test]
+    fn mount_path_survives_save_and_reload() {
+        let path = std::env::temp_dir().join("wk-mount-persist-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let mut s = Server::new(&Document::empty(), path.clone()).expect("server");
+        let ws = s.graph.workspaces[0];
+        s.apply(Command::Create(Resource::Node {
+            kind: NodeKind::Volume,
+            pos: [0.0, 0.0],
+            ws,
+        }));
+        let vol = *s.graph.file_nodes.keys().next().expect("a volume");
+        let app = NodeId::new();
+        s.graph.connections.push((vol, app));
+        s.apply(Command::SetMount {
+            volume: vol,
+            app,
+            path: "/data/notes.txt".into(),
+        });
+        assert_eq!(
+            s.graph.mount_paths.get(&(vol, app)).map(String::as_str),
+            Some("/data/notes.txt"),
+            "set in the live graph"
+        );
+        s.save();
+        let doc = crate::workspace::Document::load_resolved(&path).expect("reload");
+        let saved = doc.workspaces.iter().find(|w| w.id == ws).expect("ws");
+        assert_eq!(
+            saved.mount_paths.get(&(vol, app)).map(String::as_str),
+            Some("/data/notes.txt"),
+            "persisted as the connection's mount path"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A node whose dependency isn't in the list (renamed/removed, or an
     /// offline uplink) can't materialize — but load→save must not silently
     /// delete it or the wire touching it. It round-trips verbatim so re-adding
@@ -2358,6 +2510,7 @@ mod model_tests {
                     },
                 ],
                 connections: vec![(file, ghost)],
+                mount_paths: std::collections::BTreeMap::new(),
                 midi: Vec::new(),
                 serves: Vec::new(),
                 capture_links: Vec::new(),
