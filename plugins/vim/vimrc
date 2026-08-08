@@ -14,9 +14,12 @@ let &t_AB = "\e[48;5;%dm"
 
 " Route :w through writefile() instead of vim's normal save. Two wasi problems
 " this sidesteps at once:
-"   1. Files report no POSIX permission bits (wasi has none), so vim's
-"      write-time recheck (check_readonly -> access(W_OK)) misfires and demands
-"      :w! — and neither 'noreadonly' nor 'writeany' bypasses it.
+"   1. wasi has no file permission bits, and wasi:filesystem has no field to
+"      carry them, so wasi-libc reports every file with st_mode perms = 0. Vim's
+"      write path (buf_write -> check_file_readonly(fname, mch_getperm(fname)))
+"      then hits `(perm & 0222) == 0` == true and declares the file read-only,
+"      demanding :w!. It's the mode bits, not access() (which works) — so
+"      'noreadonly'/'writeany' can't bypass it, and wk can't fix it host-side.
 "   2. The normal save renames a fresh file over the original, which severs a
 "      single-file mount (a wk file node, like a Docker bind-mount of one file)
 "      so the edit never reaches the backing file or nodes sharing it.
