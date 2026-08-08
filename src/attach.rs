@@ -92,14 +92,36 @@ pub fn attach(workspace: &Path, node_ref: &str) -> Result<(), String> {
     let interactive = raw.is_some();
     if interactive {
         eprintln!("wk: attached to {name} — detach with Ctrl-P Ctrl-Q\r");
-        if let Some((cols, rows)) = term_size() {
-            let _ = write_msg(&mut stream, &ClientMsg::Resize { cols, rows });
-        }
     }
+
+    let done = Arc::new(AtomicBool::new(false));
+
+    // Follow the local terminal size: send it now (the node likely started at a
+    // different default), and again whenever the window is resized. A poll loop
+    // keeps this dependency-free; ~150 ms latency on a resize is imperceptible.
+    let resizer = interactive.then(|| {
+        let mut wstream = stream.try_clone();
+        let done = done.clone();
+        std::thread::spawn(move || {
+            let Ok(wstream) = &mut wstream else { return };
+            let mut last: Option<(u16, u16)> = None;
+            while !done.load(Ordering::Relaxed) {
+                let sz = term_size();
+                if sz != last {
+                    if let Some((cols, rows)) = sz {
+                        if write_msg(wstream, &ClientMsg::Resize { cols, rows }).is_err() {
+                            break;
+                        }
+                    }
+                    last = sz;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+        })
+    });
 
     // Forward local stdin to the node on its own thread; the main thread pumps
     // the node's output to stdout. `done` ends both when either side finishes.
-    let done = Arc::new(AtomicBool::new(false));
     let input = {
         let mut wstream = stream.try_clone().map_err(|e| e.to_string())?;
         let done = done.clone();
@@ -133,6 +155,9 @@ pub fn attach(workspace: &Path, node_ref: &str) -> Result<(), String> {
     let _ = write_msg(&mut stream, &ClientMsg::Detach);
     drop(raw); // restore the terminal before the parting message
     let _ = input.join();
+    if let Some(r) = resizer {
+        let _ = r.join();
+    }
     if interactive {
         eprintln!("\r\nwk: detached from {name}");
     }

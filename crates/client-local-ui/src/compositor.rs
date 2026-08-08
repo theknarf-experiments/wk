@@ -2975,11 +2975,19 @@ impl App {
                     ca_clip,
                 );
             }
-            if self.detached.contains_key(&id) {
-                // Popped out into its own OS window: the live content renders
-                // there; here we just show a "detached" placeholder in place.
+            if self.detached.contains_key(&id) || self.view.attached.contains(&id) {
+                // Popped out into its own OS window, or attached by a CLI client
+                // (`docker attach`) — either way the live content isn't ours to
+                // render here. Crucially we must NOT resize an attached node's
+                // terminal below: the CLI owns its size, and re-deriving it from
+                // this canvas rect each frame would clobber the client's resize.
+                let remote = self.view.attached.contains(&id) && !self.detached.contains_key(&id);
                 quads.push(Quad::solid(white, ca, DETACHED_BG, ca_clip));
-                let msg = "detached";
+                let msg = if remote {
+                    "detached (remote)"
+                } else {
+                    "detached"
+                };
                 let lh = gfx.fonts.line_height() as f32 * zf;
                 let w = gfx.fonts.measure(msg) as f32 * zf;
                 self.text_cache.draw(
