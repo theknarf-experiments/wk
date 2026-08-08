@@ -44,7 +44,7 @@ dependencies {
         description "sqlite3 shell"
     }
     python "docker://plugins/python/Dockerfile" {
-        description "CPython 3.12 interpreter (a wasm container: python.wasm + full stdlib)"
+        description "CPython 3.14 (a wasm container: python.wasm + stdlib; sockets work over the fabric)"
     }
     fetch "plugins/fetch/fetch.wasm" {
         description "TCP client: fetches host port over the fabric"

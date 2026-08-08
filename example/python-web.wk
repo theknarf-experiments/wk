@@ -1,0 +1,33 @@
+// vim: set filetype=kdl :
+// A real CPython webserver as a wasm container on the userspace fabric.
+// From the repo root:
+//   wk run example/python-web.wk      # then, in another shell:  curl localhost:8088
+import "../workspace.wk"
+workspace "01KZJWA000000000000000WS00" {
+    note "01KZJWA000000000000000NT00" {
+        text "CPython webserver on the fabric.\n\nplugins/python is real CPython 3.14\nbuilt for wasm32-wasip2, so its socket\nmodule works over wk's network.\n\nserver.py (bind-mounted at /app) runs\nhttp.server on 0.0.0.0:8088, joined to\na Network and published by the HostPort.\n\nClick the python node's play button\n(networked nodes stay idle until run),\nthen:  curl localhost:8088"
+        pos 40.0 40.0
+        size 360.0 300.0
+    }
+    node "python" "01KZHNH599EG88Z1QN7669GB1R" {
+        pos 40.0 380.0
+        size 380.0 240.0
+        args "/app/server.py" "8088"
+    }
+    bindmount "example/python-web" "01KZHNH57ZFP0VB0Y3R3JH19PR" {
+        pos 470.0 40.0
+        size 150.0 44.0
+    }
+    hostport "01KZHNH5A1FHSRDWZXYTH8CAHP" {
+        port 8088
+        pos 500.0 460.0
+        size 130.0 44.0
+    }
+    network "01KZHNH5BBE388DF463F33H35W" {
+        pos 500.0 560.0
+        size 130.0 44.0
+    }
+    connection "01KZHNH57ZFP0VB0Y3R3JH19PR" "01KZHNH599EG88Z1QN7669GB1R" "/app"
+    serve "01KZHNH599EG88Z1QN7669GB1R" "01KZHNH5A1FHSRDWZXYTH8CAHP"
+    netlink "01KZHNH599EG88Z1QN7669GB1R" "01KZHNH5BBE388DF463F33H35W"
+}
