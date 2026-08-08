@@ -304,13 +304,21 @@ fn files_btn(r: [f32; 4], z: f32) -> [f32; 4] {
     let gap = 4.0 * z;
     [db[0] - w - gap, db[1], db[0] - gap, db[3]]
 }
-/// The Run/▶ button, just left of the Files button. Shown only on an idle or
-/// exited node so it can be (re)started after wiring.
-fn run_btn(r: [f32; 4], z: f32) -> [f32; 4] {
+/// The Logs button, just left of the Files button. Opens the node's output-log
+/// panel (its captured stdout/stderr scrollback). Shown on app nodes.
+fn logs_btn(r: [f32; 4], z: f32) -> [f32; 4] {
     let fb = files_btn(r, z);
     let w = fb[2] - fb[0];
     let gap = 4.0 * z;
     [fb[0] - w - gap, fb[1], fb[0] - gap, fb[3]]
+}
+/// The Run/▶ button, just left of the Logs button. Shown only on an idle or
+/// exited node so it can be (re)started after wiring.
+fn run_btn(r: [f32; 4], z: f32) -> [f32; 4] {
+    let lb = logs_btn(r, z);
+    let w = lb[2] - lb[0];
+    let gap = 4.0 * z;
+    [lb[0] - w - gap, lb[1], lb[0] - gap, lb[3]]
 }
 /// The editable launch-args bar along the bottom of an idle node's body (a
 /// one-line input strip, so it doesn't paint over the node's output above).
@@ -480,6 +488,83 @@ impl Inspector {
             Some(i) => self.dir.truncate(i),
         }
     }
+}
+
+/// Modal state for viewing one node's output log — its captured stdout/stderr
+/// ring (what `wk logs` streams). Content is read live from the node's
+/// `term_io` each frame, so this holds only the scroll cursor.
+struct LogView {
+    /// The node whose output is being shown.
+    node: NodeId,
+    /// Lines scrolled up from the bottom. `0` pins the newest line to the
+    /// bottom edge (a tail); increasing it reveals older output.
+    scroll: f32,
+}
+
+/// Strip ANSI/terminal control sequences from raw log bytes and split the
+/// result into display lines, hard-wrapped at `cols` characters. The output
+/// ring captures a node's raw stdout/stderr — for a terminal app that includes
+/// escape codes — so the panel renders it as plain, readable text.
+fn log_lines(bytes: &[u8], cols: usize) -> Vec<String> {
+    let cols = cols.max(1);
+    let text = String::from_utf8_lossy(bytes);
+    let mut cleaned = String::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                // CSI: ESC [ params… final-byte (0x40..=0x7e).
+                Some('[') => {
+                    for n in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: ESC ] … terminated by BEL or ST (ESC \).
+                Some(']') => {
+                    while let Some(n) = chars.next() {
+                        if n == '\u{7}' {
+                            break;
+                        }
+                        if n == '\u{1b}' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // Other two-byte escapes (charset selects, etc.): drop the pair.
+                _ => {}
+            },
+            '\r' => {} // line breaks come from '\n'; drop bare carriage returns
+            '\n' => cleaned.push('\n'),
+            '\t' => cleaned.push(' '),
+            c if c.is_control() => {} // drop remaining control bytes
+            c => cleaned.push(c),
+        }
+    }
+    if cleaned.is_empty() {
+        return Vec::new(); // no output → the panel shows its own placeholder
+    }
+    // A trailing newline would otherwise add a spurious blank final line.
+    if cleaned.ends_with('\n') {
+        cleaned.pop();
+    }
+    let mut out = Vec::new();
+    for raw in cleaned.split('\n') {
+        let chs: Vec<char> = raw.chars().collect();
+        if chs.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut i = 0;
+        while i < chs.len() {
+            let end = (i + cols).min(chs.len());
+            out.push(chs[i..end].iter().collect());
+            i = end;
+        }
+    }
+    out
 }
 
 /// Rows of the inspector listing visible at once.
@@ -770,6 +855,12 @@ struct App {
     capture_tick: u64,
     /// When inspecting a node's virtual filesystem (a modal overlay).
     inspect: Option<Inspector>,
+    /// When viewing a node's output log (a modal overlay). Mutually exclusive
+    /// with `inspect` — one panel at a time.
+    logs: Option<LogView>,
+    /// Largest useful log scroll, recomputed each frame the log panel draws (it
+    /// needs the font/width to wrap), so the wheel handler can clamp against it.
+    log_max_scroll: f32,
     /// System clipboard, for pasting into the args/ticket field and the
     /// command palette. `None` if the platform has no clipboard.
     clipboard: Option<arboard::Clipboard>,
@@ -836,6 +927,8 @@ impl App {
             editing_note: None,
             capture_tick: 0,
             inspect: None,
+            logs: None,
+            log_max_scroll: 0.0,
             clipboard: arboard::Clipboard::new().ok(),
             drag: None,
             wire_sel: None,
@@ -2170,6 +2263,21 @@ impl App {
                 }
                 consumed = true;
             }
+            // The output-log panel is modal too: dismiss on its close box or a
+            // click outside it (there's nothing to click inside).
+            if let Some(lv) = &self.logs {
+                let (x, y, w, h, row_h) = Self::inspect_layout(fb);
+                let panel = [x, y, x + w, y + h];
+                let close = {
+                    let s = row_h - 8.0;
+                    [x + w - s - 6.0, y + 4.0, x + w - 6.0, y + 4.0 + s]
+                };
+                let _ = lv;
+                if contains(close, mp) || !contains(panel, mp) {
+                    self.logs = None;
+                }
+                consumed = true;
+            }
             // The command palette is modal: click a row to run it, click
             // anywhere else to dismiss it.
             if !consumed && self.palette_open {
@@ -2335,12 +2443,23 @@ impl App {
                             self.toggle_detach(id);
                         } else if contains(files_btn(r, zf), mp) {
                             // Open (or toggle) the node's filesystem inspector.
+                            self.logs = None; // one modal panel at a time
                             self.inspect = match self.inspect.take() {
                                 Some(insp) if insp.node == id => None,
                                 _ => Some(Inspector {
                                     node: id,
                                     dir: String::new(),
                                     file: None,
+                                    scroll: 0.0,
+                                }),
+                            };
+                        } else if contains(logs_btn(r, zf), mp) {
+                            // Open (or toggle) the node's output-log panel.
+                            self.inspect = None; // one modal panel at a time
+                            self.logs = match self.logs.take() {
+                                Some(lv) if lv.node == id => None,
+                                _ => Some(LogView {
+                                    node: id,
                                     scroll: 0.0,
                                 }),
                             };
@@ -2928,6 +3047,30 @@ impl App {
                         white,
                         [doc[0] + lh, ly, doc[0] + lh + lw, ly + lh],
                         lc,
+                        clip,
+                    ));
+                }
+            }
+
+            // Logs button: opens the node's output-log panel. Drawn as a few
+            // left-aligned "log lines" of varying length.
+            let lbn = logs_btn(r, zf);
+            let logs_open = matches!(&self.logs, Some(l) if l.node == id);
+            if logs_open || contains(lbn, mp) {
+                quads.push(Quad::solid(white, lbn, TITLE_FOCUS, clip));
+            }
+            {
+                let pad = (lbn[2] - lbn[0]) * 0.28;
+                let inner = [lbn[0] + pad, lbn[1] + pad, lbn[2] - pad, lbn[3] - pad];
+                let lh = (inner[3] - inner[1]) * 0.14;
+                let full_w = inner[2] - inner[0];
+                // Three rows of "text", the middle one shorter.
+                for (k, frac) in [1.0_f32, 0.6, 0.85].into_iter().enumerate() {
+                    let ly = inner[1] + (inner[3] - inner[1]) * (0.12 + 0.38 * k as f32);
+                    quads.push(Quad::solid(
+                        white,
+                        [inner[0], ly, inner[0] + full_w * frac, ly + lh],
+                        TEXT,
                         clip,
                     ));
                 }
@@ -3615,6 +3758,139 @@ impl App {
             }
         }
 
+        // Output-log panel (Logs button): dim the canvas, then a centred panel
+        // showing the node's captured stdout/stderr scrollback, tailed.
+        if let Some((log_node, scroll)) = self.logs.as_ref().map(|l| (l.node, l.scroll.max(0.0))) {
+            let node = node_by_id.get(&log_node);
+            let node_name = node.map(|n| n.name.clone()).unwrap_or_default();
+            let bytes = node.map(|n| n.term_io.log_read(0).0).unwrap_or_default();
+            let dim = [0.55, 0.58, 0.64, 1.0];
+            let (x, y, w, h, row_h) = Self::inspect_layout(fb);
+            let panel = [x, y, x + w, y + h];
+            let close = {
+                let s = row_h - 8.0;
+                [x + w - s - 6.0, y + 4.0, x + w - 6.0, y + 4.0 + s]
+            };
+
+            quads.push(Quad::solid(white, full, [0.0, 0.0, 0.0, 0.45], full));
+            quads.push(Quad::solid(white, panel, BORDER_COL, full));
+            let inset = [
+                panel[0] + 1.0,
+                panel[1] + 1.0,
+                panel[2] - 1.0,
+                panel[3] - 1.0,
+            ];
+            quads.push(Quad::solid(white, inset, BODY, full));
+
+            // Wrap the log to the panel width (monospace estimate from a sample).
+            let char_w = (gfx.fonts.measure("mmmmmmmmmm") as f32 / 10.0).max(1.0);
+            let cols = (((w - 2.0 * PAD) / char_w).floor() as usize).max(1);
+            let lines = log_lines(&bytes, cols);
+            let list_top = panel[1] + row_h;
+            let visible = (((panel[3] - list_top - PAD) / lh).floor() as usize).max(1);
+            let max_scroll = lines.len().saturating_sub(visible);
+            self.log_max_scroll = max_scroll as f32;
+            let scroll_i = (scroll.floor() as usize).min(max_scroll);
+            let end = lines.len().saturating_sub(scroll_i);
+            let start = end.saturating_sub(visible);
+
+            // Title row: node name + line count (and a "tailing" hint at bottom).
+            let title = if scroll_i == 0 {
+                format!("logs: {node_name}    {} lines", lines.len())
+            } else {
+                format!(
+                    "logs: {node_name}    {} lines  ·  +{scroll_i} up",
+                    lines.len()
+                )
+            };
+            self.text_cache.draw(
+                &mut quads,
+                &mut gfx.renderer,
+                &gfx.fonts,
+                &gfx.device,
+                &gfx.queue,
+                &title,
+                panel[0] + PAD,
+                panel[1] + (row_h - lh) * 0.5,
+                1.0,
+                TEXT,
+                [panel[0], panel[1], close[0] - 4.0, panel[1] + row_h],
+            );
+            if contains(close, mp) {
+                quads.push(Quad::solid(white, close, TITLE_FOCUS, full));
+            }
+            self.text_cache.draw(
+                &mut quads,
+                &mut gfx.renderer,
+                &gfx.fonts,
+                &gfx.device,
+                &gfx.queue,
+                "x",
+                close[0] + (close[2] - close[0]) * 0.28,
+                close[1] + (close[3] - close[1]) * 0.02,
+                0.8,
+                TEXT,
+                full,
+            );
+
+            if lines.is_empty() {
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    "(no output yet)",
+                    panel[0] + PAD,
+                    list_top + 4.0,
+                    1.0,
+                    dim,
+                    full,
+                );
+            }
+            for (i, line) in lines[start..end].iter().enumerate() {
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    line,
+                    panel[0] + PAD,
+                    list_top + i as f32 * lh,
+                    1.0,
+                    TEXT,
+                    [panel[0], list_top, panel[2] - PAD, panel[3]],
+                );
+            }
+            // Scrollbar: where the visible window sits within the whole log.
+            if lines.len() > visible {
+                let list_bottom = panel[3] - PAD;
+                let track_h = (list_bottom - list_top).max(1.0);
+                let frac_pos = start as f32 / lines.len() as f32;
+                let frac_len = visible as f32 / lines.len() as f32;
+                let ty = list_top + track_h * frac_pos;
+                let th = (track_h * frac_len).max(12.0);
+                quads.push(Quad::solid(
+                    white,
+                    [panel[2] - 6.0, list_top, panel[2] - 3.0, list_bottom],
+                    [0.16, 0.17, 0.21, 1.0],
+                    full,
+                ));
+                quads.push(Quad::solid(
+                    white,
+                    [
+                        panel[2] - 6.0,
+                        ty,
+                        panel[2] - 3.0,
+                        (ty + th).min(list_bottom),
+                    ],
+                    [0.45, 0.48, 0.56, 1.0],
+                    full,
+                ));
+            }
+        }
+
         // ---- render ----
         let frame = match gfx.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
@@ -3893,6 +4169,15 @@ impl ApplicationHandler for App {
                     self.palette_scroll = (self.palette_scroll - dy).clamp(0.0, max);
                     return;
                 }
+                // The (modal) log panel: the wheel scrolls its scrollback (up =
+                // older), clamped by the max computed when it last drew.
+                if self.logs.is_some() {
+                    let max = self.log_max_scroll;
+                    if let Some(lv) = &mut self.logs {
+                        lv.scroll = (lv.scroll + dy).clamp(0.0, max);
+                    }
+                    return;
+                }
                 // Likewise the (modal) file inspector: the wheel scrolls its
                 // listing, clamped so the tail stays reachable but no further.
                 if let Some(insp) = &self.inspect {
@@ -4021,6 +4306,13 @@ impl ApplicationHandler for App {
                         }
                         return;
                     }
+                    // The log panel is modal: Escape closes it.
+                    if self.logs.is_some() {
+                        if pressed && code == KeyCode::Escape {
+                            self.logs = None;
+                        }
+                        return;
+                    }
                     // While the palette is open it captures all keystrokes.
                     if self.palette_open {
                         if pressed {
@@ -4098,6 +4390,31 @@ impl wk_protocol::Client<ServerHandle> for WindowClient {
 #[cfg(test)]
 mod inspect_tests {
     use super::*;
+
+    /// The log panel strips ANSI escapes, normalises control bytes, and hard-
+    /// wraps long lines to the column width.
+    #[test]
+    fn log_lines_strips_ansi_normalises_and_wraps() {
+        // SGR colour codes around text are removed; \r\n collapses to one break.
+        let raw = b"\x1b[32mhello\x1b[0m world\r\nsecond\tline";
+        assert_eq!(
+            log_lines(raw, 80),
+            vec!["hello world".to_string(), "second line".to_string()]
+        );
+        // Hard wrap at the column width.
+        assert_eq!(
+            log_lines(b"abcdef", 3),
+            vec!["abc".to_string(), "def".to_string()]
+        );
+        // A trailing newline doesn't add a spurious blank line; a blank line in
+        // the middle is preserved.
+        assert_eq!(
+            log_lines(b"a\n\nb\n", 80),
+            vec!["a".to_string(), String::new(), "b".to_string()]
+        );
+        // Empty input yields no lines (the panel shows its own placeholder).
+        assert!(log_lines(b"", 80).is_empty());
+    }
 
     /// Scrolling offsets which entries are visible, is clamped so the last
     /// entry lands in the last row at max scroll, and the ".." slot costs one
