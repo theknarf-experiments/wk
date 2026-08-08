@@ -937,12 +937,20 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
             (s.handle, s.family, s.bound_port, s.gen)
         };
         // A peer has connected once the listening socket reaches Established.
-        let conn_handle = {
+        let (conn_handle, conn_local, conn_remote) = {
             let mut g = stack.lock().unwrap();
-            let st = g.sockets.get::<tcp::Socket>(listen_handle).state();
+            let sock = g.sockets.get::<tcp::Socket>(listen_handle);
+            let st = sock.state();
             if st != tcp::State::Established {
                 return Ok(Err(ErrorCode::WouldBlock));
             }
+            // Capture the connection's endpoints so `local-address` /
+            // `remote-address` (getsockname/getpeername) work on the accepted
+            // socket — wasi-libc's accept() calls remote-address to fill the
+            // sockaddr, and a runtime like CPython treats a failure there as a
+            // failed accept, silently dropping the connection.
+            let local = sock.local_endpoint().map(|ep| from_smol(ep.addr, ep.port));
+            let remote = sock.remote_endpoint().map(|ep| from_smol(ep.addr, ep.port));
             // Keep accepting: add a fresh listening socket on the same port and
             // hand the established one out as the accepted connection.
             let fresh = tcp::Socket::new(
@@ -964,15 +972,15 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
             let sm = self.table().get_mut(&this)?;
             sm.handle = new_listen;
             sm.gen = new_gen;
-            listen_handle
+            (listen_handle, local, remote)
         };
         let conn = self.table().push(TcpSock {
             handle: conn_handle,
             gen: listen_gen,
             family,
             bound_port: port,
-            local: None,
-            remote: None,
+            local: conn_local,
+            remote: conn_remote,
             listening: false,
             host: None,
         })?;
