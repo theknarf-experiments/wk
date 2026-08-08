@@ -12,19 +12,36 @@ set t_Co=256
 let &t_AF = "\e[38;5;%dm"
 let &t_AB = "\e[48;5;%dm"
 
-" Write files in place instead of vim's default rename-based save. A wk file
-" node is a single-file mount (like a Docker bind-mount of one file): the
-" default save writes a fresh file and renames it over the original, which
-" severs the mount — the new bytes land in a throwaway vfs file and never reach
-" the backing file (or any node sharing it). This is the exact Docker
-" single-file bind-mount gotcha, and the same fix applies: backupcopy=yes
-" truncates and rewrites the original in place, so edits persist and propagate;
-" nowritebackup skips the intermediate backup entirely.
-set backupcopy=yes
-set nowritebackup
+" Route :w through writefile() instead of vim's normal save. Two wasi problems
+" this sidesteps at once:
+"   1. Files report no POSIX permission bits (wasi has none), so vim's
+"      write-time recheck (check_readonly -> access(W_OK)) misfires and demands
+"      :w! — and neither 'noreadonly' nor 'writeany' bypasses it.
+"   2. The normal save renames a fresh file over the original, which severs a
+"      single-file mount (a wk file node, like a Docker bind-mount of one file)
+"      so the edit never reaches the backing file or nodes sharing it.
+" writefile() writes the buffer straight to the file, in place, with no readonly
+" check and no rename — so :w just works and propagates. BufWriteCmd covers the
+" buffer's own file; FileWriteCmd covers `:w {file}` and range writes.
+" (Line endings are always unix here, which is what wk files use.)
+function! s:WkWrite(fname) abort
+    if a:fname ==# ''
+        echohl ErrorMsg | echo 'E32: No file name' | echohl NONE
+        return
+    endif
+    if writefile(getline(1, '$'), a:fname, &binary ? 'b' : '') == 0
+        if a:fname ==# expand('%:p')
+            setlocal nomodified
+        endif
+    else
+        echohl ErrorMsg | echo 'wk: could not write ' . a:fname | echohl NONE
+    endif
+endfunction
+autocmd BufWriteCmd  * call s:WkWrite(expand('<afile>'))
+autocmd FileWriteCmd * call s:WkWrite(expand('<afile>'))
 
-" wk's vfs reports no POSIX permission bits (wasi has none), so vim flags every
-" file [readonly] via its `!(perm & 0222)` check. Every file here is in fact
-" writable (even image-layer files, which copy-up on first write), so clear the
-" spurious flag; a genuinely unwritable backing file still fails at :w time.
+" wk's vfs reports no permission bits, so vim also flags every file [readonly]
+" via its read-time `!(perm & 0222)` check. Every file here is writable (layer
+" files copy-up on write), so clear the spurious flag — cosmetic, now that the
+" write itself goes through writefile() above.
 autocmd BufReadPost,BufNewFile * setlocal noreadonly
