@@ -68,6 +68,11 @@ impl Default for TtyMode {
 /// line-discipline mode the guest requests via `wk:tty/control`.
 pub struct TermIo {
     out: Mutex<VecDeque<u8>>,
+    /// A bounded scrollback of everything the guest has written, kept so a
+    /// client can read a node's output *without* draining the live stream —
+    /// backs `wk logs` and the UI logs panel. Unlike `out`, reading it is
+    /// non-destructive, so it never competes with the terminal renderer.
+    log: Mutex<LogRing>,
     inp: Mutex<InpState>,
     tty: Mutex<TtyMode>,
     /// The grid size (cols, rows) the client has sized this terminal to. The
@@ -78,10 +83,42 @@ pub struct TermIo {
 
 pub type SharedTermIo = Arc<TermIo>;
 
+/// Largest amount of guest output the log ring retains. Older bytes are
+/// dropped; a reader that falls behind resumes from the earliest kept byte.
+const LOG_CAP: usize = 256 * 1024;
+
+/// A bounded ring of output bytes with an absolute write cursor, so a reader
+/// can resume from any offset (older-than-retained resumes at the earliest).
+#[derive(Default)]
+struct LogRing {
+    data: VecDeque<u8>,
+    /// Total bytes ever written (the offset just past the newest byte).
+    total: u64,
+}
+
+impl LogRing {
+    fn push(&mut self, b: &[u8]) {
+        self.data.extend(b.iter().copied());
+        self.total += b.len() as u64;
+        while self.data.len() > LOG_CAP {
+            self.data.pop_front();
+        }
+    }
+
+    /// The bytes written since offset `from` (clamped to the earliest retained
+    /// byte), and the new cursor to pass next time.
+    fn read(&self, from: u64) -> (Vec<u8>, u64) {
+        let earliest = self.total - self.data.len() as u64;
+        let skip = from.max(earliest).saturating_sub(earliest) as usize;
+        (self.data.iter().skip(skip).copied().collect(), self.total)
+    }
+}
+
 impl TermIo {
     pub fn new() -> SharedTermIo {
         Arc::new(TermIo {
             out: Mutex::new(VecDeque::new()),
+            log: Mutex::new(LogRing::default()),
             inp: Mutex::new(InpState {
                 buf: VecDeque::new(),
                 waker: None,
@@ -90,6 +127,13 @@ impl TermIo {
             tty: Mutex::new(TtyMode::default()),
             size: Mutex::new((COLS as u16, ROWS as u16)),
         })
+    }
+
+    /// Read the output log from offset `from` (0 = from the earliest retained
+    /// byte). Returns the bytes and the cursor to pass on the next poll —
+    /// non-destructive, so it never disturbs the live terminal.
+    pub fn log_read(&self, from: u64) -> (Vec<u8>, u64) {
+        self.log.lock().unwrap().read(from)
     }
 
     /// The current grid size (cols, rows).
@@ -127,6 +171,9 @@ impl TermIo {
         if o.len() < (4 << 20) {
             o.extend(b.iter().copied());
         }
+        drop(o);
+        // Also retain it in the (bounded) log ring for non-destructive reads.
+        self.log.lock().unwrap().push(b);
     }
 
     /// Take everything the guest has written to stdout since the last call.
@@ -539,6 +586,40 @@ fn xterm256(i: u8) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_ring_is_non_destructive_and_cursor_based() {
+        let io = TermIo::new();
+        // Guest output accumulates in the log without draining the live stream.
+        io.write_out(b"hello ");
+        io.write_out(b"world");
+        let (all, cur) = io.log_read(0);
+        assert_eq!(all, b"hello world");
+        assert_eq!(cur, 11);
+        // The live stream is untouched by log reads.
+        assert_eq!(io.drain_out(), b"hello world");
+        // Reading from a cursor returns only what's new since.
+        io.write_out(b"!");
+        let (delta, cur2) = io.log_read(cur);
+        assert_eq!(delta, b"!");
+        assert_eq!(cur2, 12);
+    }
+
+    #[test]
+    fn log_ring_caps_and_resumes_from_earliest() {
+        let io = TermIo::new();
+        let chunk = vec![b'x'; LOG_CAP];
+        io.write_out(&chunk); // fills the ring exactly
+        io.write_out(b"TAIL"); // pushes 4 bytes past the cap
+        let (kept, cur) = io.log_read(0);
+        // Total written is LOG_CAP + 4; the ring holds the last LOG_CAP bytes.
+        assert_eq!(cur, LOG_CAP as u64 + 4);
+        assert_eq!(kept.len(), LOG_CAP);
+        assert_eq!(&kept[kept.len() - 4..], b"TAIL");
+        // A stale cursor (before the earliest retained byte) resumes at earliest.
+        let (from_stale, _) = io.log_read(0);
+        assert_eq!(from_stale.len(), LOG_CAP);
+    }
 
     #[test]
     fn parses_text_and_sgr_into_grid() {

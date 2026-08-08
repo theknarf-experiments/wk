@@ -216,6 +216,36 @@ fn serve_client(
                 }
                 send(&writer, &ServerMsg::Detached)?;
             }
+            ClientMsg::Logs { node, follow } => {
+                let Some(term) = handle.term_io(node) else {
+                    send(&writer, &ServerMsg::Error("no such node".into()))?;
+                    continue;
+                };
+                // Send the current scrollback, then either finish or follow.
+                let (bytes, mut cursor) = term.log_read(0);
+                if !bytes.is_empty() {
+                    send(&writer, &ServerMsg::LogChunk(bytes))?;
+                }
+                if !follow {
+                    send(&writer, &ServerMsg::LogEnd)?;
+                    continue;
+                }
+                // Follow: poll for new output (non-destructive) until disconnect.
+                loop {
+                    let (chunk, next) = term.log_read(cursor);
+                    if !chunk.is_empty() {
+                        if send(&writer, &ServerMsg::LogChunk(chunk)).is_err() {
+                            break;
+                        }
+                        cursor = next;
+                    } else if term.is_closed() {
+                        let _ = send(&writer, &ServerMsg::LogEnd);
+                        break;
+                    } else {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
         }
     }
     // Client disconnected — release any attach so the UI reclaims the node.

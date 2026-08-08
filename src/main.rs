@@ -83,6 +83,15 @@ enum Commands {
         node: String,
     },
 
+    /// Show a node's output log (like `docker logs`)
+    Logs {
+        /// Node reference: its name, or any part of its id
+        node: String,
+        /// Keep streaming new output until the node exits or Ctrl-C
+        #[arg(long)]
+        follow: bool,
+    },
+
     /// Manage wk's local OCI image store
     Images {
         #[command(subcommand)]
@@ -198,6 +207,7 @@ fn main() -> Result<(), String> {
         Some(Commands::Wire { a, b }) => cli::wire(file, a, b),
         Some(Commands::Unwire { a, b }) => cli::unwire(file, a, b),
         Some(Commands::Attach { node }) => attach::attach(file, node),
+        Some(Commands::Logs { node, follow }) => cli::logs(file, node, *follow),
         Some(Commands::Images { cmd }) => images_cmd(cmd),
         Some(Commands::Remove { plugin }) => workspace::remove(plugin.clone(), file),
         Some(Commands::Run {

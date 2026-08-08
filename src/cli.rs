@@ -135,6 +135,31 @@ pub fn add(workspace: &Path, name: &str, args: &[String]) -> Result<(), String> 
     Ok(())
 }
 
+/// `wk logs [-f] <ref>`: print a node's output log (non-destructive; doesn't
+/// steal the live stream the way `attach` does). `follow` streams new output
+/// until the node exits or Ctrl-C.
+pub fn logs(workspace: &Path, node: &str, follow: bool) -> Result<(), String> {
+    use std::io::Write;
+    let mut stream = connect(workspace)?;
+    let snap = get_snapshot(&mut stream)?;
+    let id = resolve(&snap, node)?.id;
+    write_msg(&mut stream, &ClientMsg::Logs { node: id, follow }).map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+    let mut stdout = std::io::stdout();
+    loop {
+        match read_msg::<_, ServerMsg>(&mut reader).map_err(|e| e.to_string())? {
+            Some(ServerMsg::LogChunk(bytes)) => {
+                let _ = stdout.write_all(&bytes);
+                let _ = stdout.flush();
+            }
+            Some(ServerMsg::LogEnd) | None => break,
+            Some(ServerMsg::Error(e)) => return Err(e),
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// `wk node rm <ref>`: delete a node.
 pub fn rm(workspace: &Path, node: &str) -> Result<(), String> {
     let mut stream = connect(workspace)?;

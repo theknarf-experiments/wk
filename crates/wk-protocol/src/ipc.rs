@@ -84,6 +84,9 @@ pub enum ClientMsg {
     Resize { cols: u16, rows: u16 },
     /// Stop attaching (the node keeps running).
     Detach,
+    /// Read a node's output log (a non-destructive scrollback). `follow` keeps
+    /// the connection open, streaming new output as it arrives.
+    Logs { node: NodeId, follow: bool },
 }
 
 /// A message from the server to a client.
@@ -103,6 +106,10 @@ pub enum ServerMsg {
     Term(Vec<u8>),
     /// The attach ended (the node exited, or the client detached).
     Detached,
+    /// A chunk of a node's output log (in response to [`ClientMsg::Logs`]).
+    LogChunk(Vec<u8>),
+    /// End of the log stream (a non-following `Logs` request is complete).
+    LogEnd,
 }
 
 /// Write one message as a single JSON line. The newline frames it, so the peer
