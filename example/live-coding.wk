@@ -14,7 +14,7 @@ workspace "01KXKG7000000000000000WS00" {
         size 470.0 420.0
         args "shader.wgsl"
     }
-    hostfile "example/shader.wgsl" "01KXKG7000000000000000HF04" {
+    bindmount "example/shader.wgsl" "01KXKG7000000000000000HF04" {
         pos 487.3367919921875 584.0228271484375
         size 150.0 44.0
     }

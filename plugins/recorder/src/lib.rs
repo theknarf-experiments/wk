@@ -13,7 +13,7 @@ use std::io::Write;
 use jpeg_encoder::{ColorType, Encoder};
 
 /// The output file: the first regular file in `/` — a wired-in file node
-/// (a HostFile writes to disk) — else a private path in the plugin's own vfs.
+/// (a BindMount writes to disk) — else a private path in the plugin's own vfs.
 fn output_path() -> String {
     if let Ok(rd) = fs::read_dir("/") {
         for entry in rd.flatten() {

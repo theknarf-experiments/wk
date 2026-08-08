@@ -39,8 +39,8 @@ pub enum NodeClass {
 pub fn classify(a: NodeId, b: NodeId, ca: NodeClass, cb: NodeClass) -> Option<Wire> {
     use NodeClass::*;
     match (ca, cb) {
-        (File, Other) => Some(Wire::File(a, b)),
-        (Other, File) => Some(Wire::File(b, a)),
+        (File, Other) => Some(Wire::Bind(a, b)),
+        (Other, File) => Some(Wire::Bind(b, a)),
         // The http node is the app side; the HostPort is the second element.
         (Port, Other) => Some(Wire::Serve(b, a)),
         (Other, Port) => Some(Wire::Serve(a, b)),
@@ -184,7 +184,7 @@ mod tests {
             (File, Port, None),
             (File, Net, None),
             (File, Uplink, None),
-            (File, Other, Some(Wire::File(a, b))),
+            (File, Other, Some(Wire::Bind(a, b))),
             (Port, File, None),
             (Port, Port, None),
             (Port, Net, None),
@@ -200,7 +200,7 @@ mod tests {
             (Uplink, Net, Some(Wire::Net(a, b))),
             (Uplink, Uplink, None),
             (Uplink, Other, None),
-            (Other, File, Some(Wire::File(b, a))),
+            (Other, File, Some(Wire::Bind(b, a))),
             (Other, Port, Some(Wire::Serve(a, b))),
             (Other, Net, Some(Wire::Net(a, b))),
             (Other, Uplink, None),
@@ -228,7 +228,7 @@ mod tests {
 
     fn wire_ends(w: Wire) -> (NodeId, NodeId) {
         match w {
-            Wire::File(a, b)
+            Wire::Bind(a, b)
             | Wire::Midi(a, b)
             | Wire::Serve(a, b)
             | Wire::Net(a, b)

@@ -99,7 +99,7 @@ pub enum PathKind {
 enum Node {
     File(Vec<u8>),
     Dir(BTreeMap<String, u64>),
-    /// A file whose bytes live in a canvas VirtualFile node connected to this
+    /// A file whose bytes live in a canvas Volume node connected to this
     /// app (in-memory, shared between connected apps).
     Shared(SharedFile),
     /// A file backed by a real file on the host disk (a canvas HostMappedFile

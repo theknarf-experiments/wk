@@ -418,8 +418,8 @@ enum PaletteCmd {
     Launch(usize),
     /// Centre the camera on this node.
     GoTo(NodeId),
-    AddVirtualFile,
-    AddHostFile,
+    AddVolume,
+    AddBindMount,
     AddPort,
     AddNetwork,
     AddGateway,
@@ -576,8 +576,8 @@ const INSPECT_PREVIEW_CAP: usize = 64 * 1024;
 const PORT_R: f32 = 6.0;
 const FILE_BG: [f32; 4] = [0.20, 0.17, 0.10, 1.0];
 const FILE_BORDER: [f32; 4] = [0.55, 0.45, 0.25, 1.0];
-/// HostMappedFile nodes are tinted (blue/grey) to distinguish disk-backed files
-/// from in-memory VirtualFiles.
+/// BindMount nodes are tinted (blue/grey) to distinguish disk-backed binds
+/// from in-memory Volumes.
 const HOSTFILE_BG: [f32; 4] = [0.10, 0.14, 0.22, 1.0];
 const HOSTFILE_BORDER: [f32; 4] = [0.30, 0.45, 0.65, 1.0];
 /// Screen Capture nodes: recording-red chrome (a capability, like Network).
@@ -1159,7 +1159,7 @@ impl App {
     /// The screen-space endpoints of a wire (both nodes must still be placed).
     fn wire_endpoints(&self, w: Wire) -> Option<([f32; 2], [f32; 2])> {
         let (a, b) = match w {
-            Wire::File(f, a) => (f, a),
+            Wire::Bind(f, a) => (f, a),
             Wire::Midi(s, d) => (s, d),
             Wire::Serve(h, hp) => (h, hp),
             Wire::Net(app, net) => (app, net),
@@ -1181,7 +1181,7 @@ impl App {
         s.connections
             .iter()
             .find(|&&(f, n)| pair(f, n))
-            .map(|&(f, n)| Wire::File(f, n))
+            .map(|&(f, n)| Wire::Bind(f, n))
             .or_else(|| {
                 s.midi_links
                     .iter()
@@ -1209,7 +1209,7 @@ impl App {
         let all = s
             .connections
             .iter()
-            .map(|&(f, a)| Wire::File(f, a))
+            .map(|&(f, a)| Wire::Bind(f, a))
             .chain(s.midi_links.iter().map(|&(s, d)| Wire::Midi(s, d)))
             .chain(s.capture_links.iter().map(|&(a, c)| Wire::Capture(a, c)))
             .chain(s.serves.iter().map(|(&h, &hp)| Wire::Serve(h, hp)))
@@ -1250,12 +1250,12 @@ impl App {
         v.push(PaletteRow::new(
             "Add Virtual File",
             d("an in-memory shared file"),
-            PaletteCmd::AddVirtualFile,
+            PaletteCmd::AddVolume,
         ));
         v.push(PaletteRow::new(
             "Add Host File",
             d("a disk-backed file"),
-            PaletteCmd::AddHostFile,
+            PaletteCmd::AddBindMount,
         ));
         v.push(PaletteRow::new(
             "Add Port",
@@ -1497,18 +1497,18 @@ impl App {
                     self.pan_target = [fb[0] * 0.5 - c[0] * z, fb[1] * 0.5 - c[1] * z];
                 }
             }
-            PaletteCmd::AddVirtualFile => {
+            PaletteCmd::AddVolume => {
                 let pos = self.next_file_pos();
                 self.conn.send(Command::Create(Resource::Node {
-                    kind: NodeKind::VirtualFile,
+                    kind: NodeKind::Volume,
                     pos,
                     ws,
                 }));
             }
-            PaletteCmd::AddHostFile => {
+            PaletteCmd::AddBindMount => {
                 let pos = self.next_file_pos();
                 self.conn.send(Command::Create(Resource::Node {
-                    kind: NodeKind::HostFile,
+                    kind: NodeKind::BindMount,
                     pos,
                     ws,
                 }));
@@ -2650,8 +2650,8 @@ impl App {
         // port to a target's input port. The selected wire is drawn thicker in the
         // highlight colour.
         for &(file_id, app_id) in &self.view.connections {
-            if let Some((a, b)) = self.wire_endpoints(Wire::File(file_id, app_id)) {
-                let sel = self.wire_sel == Some(Wire::File(file_id, app_id));
+            if let Some((a, b)) = self.wire_endpoints(Wire::Bind(file_id, app_id)) {
+                let sel = self.wire_sel == Some(Wire::Bind(file_id, app_id));
                 let col = if sel { WIRE_SEL_COL } else { WIRE_COL };
                 draw_connection(&mut quads, white, a, b, sel, col, zf, full);
             }
@@ -2698,8 +2698,8 @@ impl App {
             }
             let clip = intersect(r, full);
 
-            // A file node renders as a small labelled box with a port.
-            // VirtualFiles show their byte count; HostMappedFiles show the
+            // A volume node renders as a small labelled box with a port.
+            // Volumes show their byte count; BindMounts show the
             // size plus a "disk" marker so they read as backed by a path.
             if let Some(file) = self.view.file_nodes.get(&id) {
                 let name = file.name.clone();

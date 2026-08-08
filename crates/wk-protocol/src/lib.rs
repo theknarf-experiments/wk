@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 /// A connection wire, identified by the two node ids it joins (by kind).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Wire {
-    /// A file node (`file_id`) mounted into an app node (`app_id`).
-    File(NodeId, NodeId),
+    /// A volume node (`volume_id`) bind-mounted into an app node (`app_id`).
+    Bind(NodeId, NodeId),
     /// A MIDI link from source node to destination node.
     Midi(NodeId, NodeId),
     /// A wasi:http node served on a HostPort node.
@@ -115,10 +115,10 @@ impl Action {
 pub enum NodeKind {
     /// Launch the dependency at this index in the document's list.
     App { dep: usize },
-    /// An in-memory shared file.
-    VirtualFile,
-    /// A disk-backed file.
-    HostFile,
+    /// An in-memory named volume (shared across the apps it binds into).
+    Volume,
+    /// A bind mount backed by a real host path (a file or a folder).
+    BindMount,
     /// A localhost HostPort.
     Port,
     /// An isolated virtual network.

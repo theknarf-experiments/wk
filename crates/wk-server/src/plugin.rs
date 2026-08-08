@@ -937,7 +937,7 @@ impl PluginHost {
         //
         // FOLLOW-UP: 0.3 guests get wasmtime's real (sandboxed, no-preopen)
         // filesystem here rather than our in-memory vfs — so they effectively see
-        // no files and can't reach VirtualFile/HostMappedFile nodes. Backing 0.3
+        // no files and can't reach Volume/HostMappedFile nodes. Backing 0.3
         // with the vfs means a from-scratch host impl of `wasi:filesystem@0.3.0`'s
         // ~26 async (`stream`/`future`, component-model-async) methods over
         // `crate::vfs::Fs` — comparable in size to the 0.2 vfs. Deferred until a

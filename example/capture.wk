@@ -18,7 +18,7 @@ workspace "01KXKGE000000000000000WS00" {
         pos 940.0 60.0
         size 300.0 160.0
     }
-    hostfile "example/out.mjpeg" "01KXKGE000000000000000HF05" {
+    bindmount "example/out.mjpeg" "01KXKGE000000000000000HF05" {
         pos 960.0 300.0
         size 150.0 44.0
     }

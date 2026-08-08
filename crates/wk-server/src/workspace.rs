@@ -201,8 +201,9 @@ pub struct NodeSnap {
 }
 
 /// The kind-specific part of a [`NodeSnap`]. Each variant serializes under its
-/// own KDL node name (`node`, `virtualfile`, `hostfile`, `hostport`,
-/// `network`/`gateway`, `iroh`, `veilid`).
+/// own KDL node name (`node`, `volume`, `bindmount`, `hostport`,
+/// `network`/`gateway`, `iroh`, `veilid`). The legacy names `virtualfile`
+/// and `hostfile` are still accepted on read.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SnapKind {
     /// An app node; `name` resolves against the dependency list.
@@ -216,9 +217,9 @@ pub enum SnapKind {
     },
     /// An in-memory shared file. Its *bytes* are runtime state: undo carries
     /// them alongside the snap, the `.wk` file does not persist them.
-    VirtualFile { name: String },
+    Volume { name: String },
     /// A disk-backed file node (its mount name derives from the path).
-    HostFile { path: PathBuf },
+    BindMount { path: PathBuf },
     /// A localhost HostPort.
     Port { port: u16 },
     /// A Network node (or Gateway — a Network granting host access).
@@ -640,7 +641,10 @@ fn workspace_kdl(ws: &Workspace) -> KdlNode {
 fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
     // Named kinds (`node "<name>" <id>`) carry the name first; the rest are
     // `<kind> <id>`.
-    let named = matches!(n.name().value(), "node" | "virtualfile" | "hostfile");
+    let named = matches!(
+        n.name().value(),
+        "node" | "volume" | "virtualfile" | "bindmount" | "hostfile"
+    );
     let id = node_id(n.get(if named { 1 } else { 0 })?)?;
     let ch = n.children()?;
     let text = |name: &str| {
@@ -670,10 +674,11 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
                 args,
             }
         }
-        "virtualfile" => SnapKind::VirtualFile {
+        // `virtualfile`/`hostfile` are the legacy names, still accepted on read.
+        "volume" | "virtualfile" => SnapKind::Volume {
             name: n.get(0)?.as_string()?.to_string(),
         },
-        "hostfile" => SnapKind::HostFile {
+        "bindmount" | "hostfile" => SnapKind::BindMount {
             path: PathBuf::from(n.get(0)?.as_string()?),
         },
         "note" => SnapKind::Note {
@@ -715,8 +720,8 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
 fn snap_kdl(s: &NodeSnap) -> KdlNode {
     let name = match &s.kind {
         SnapKind::App { .. } => "node",
-        SnapKind::VirtualFile { .. } => "virtualfile",
-        SnapKind::HostFile { .. } => "hostfile",
+        SnapKind::Volume { .. } => "volume",
+        SnapKind::BindMount { .. } => "bindmount",
         SnapKind::Port { .. } => "hostport",
         SnapKind::Net { gateway: false } => "network",
         SnapKind::Net { gateway: true } => "gateway",
@@ -728,10 +733,10 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
     let mut node = KdlNode::new(name);
     // Named kinds lead with the name (or note text), then the id.
     match &s.kind {
-        SnapKind::App { name, .. } | SnapKind::VirtualFile { name } => {
+        SnapKind::App { name, .. } | SnapKind::Volume { name } => {
             node.push(str_entry(name));
         }
-        SnapKind::HostFile { path } => {
+        SnapKind::BindMount { path } => {
             node.push(str_entry(&path.to_string_lossy()));
         }
         _ => {}
@@ -965,7 +970,7 @@ mod tests {
         assert_eq!(doc.workspaces.len(), 1);
         let ws = &doc.workspaces[0];
         assert!(ws.nodes.iter().any(
-            |n| matches!(&n.kind, SnapKind::HostFile { path } if path.ends_with("shader.wgsl"))
+            |n| matches!(&n.kind, SnapKind::BindMount { path } if path.ends_with("shader.wgsl"))
         ));
         assert_eq!(ws.connections.len(), 2, "host file wired to shader + vim");
         assert_eq!(ws.midi.len(), 1, "piano wired to shader");
@@ -1059,7 +1064,7 @@ mod tests {
                             id: chan,
                             pos: [200.0, 120.0],
                             size: [130.0, 44.0],
-                            kind: SnapKind::VirtualFile {
+                            kind: SnapKind::Volume {
                                 name: "chan".into(),
                             },
                         },
@@ -1067,7 +1072,7 @@ mod tests {
                             id: notes,
                             pos: [200.0, 200.0],
                             size: [130.0, 44.0],
-                            kind: SnapKind::HostFile {
+                            kind: SnapKind::BindMount {
                                 path: "notes.txt".into(),
                             },
                         },
@@ -1159,6 +1164,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_file_node_keywords_still_parse() {
+        // `virtualfile`/`hostfile` were renamed to `volume`/`bindmount`; a
+        // workspace saved before the rename must still load.
+        let ws = NodeId::from_u128(1);
+        let v = NodeId::from_u128(2);
+        let h = NodeId::from_u128(3);
+        let text = format!(
+            "workspace \"{ws}\" {{\n    \
+             virtualfile \"notes.txt\" \"{v}\" {{ pos 0 0; size 10 10 }}\n    \
+             hostfile \"data/log.txt\" \"{h}\" {{ pos 0 0; size 10 10 }}\n}}"
+        );
+        let doc = Document::from_kdl(&text).expect("legacy keywords parse");
+        let kinds: Vec<_> = doc.workspaces[0].nodes.iter().map(|n| &n.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                &SnapKind::Volume {
+                    name: "notes.txt".into()
+                },
+                &SnapKind::BindMount {
+                    path: PathBuf::from("data/log.txt")
+                },
+            ]
+        );
+    }
+
     // ---- property-based round-trip ----
     //
     // For every document the generator can produce, `parse(format(doc)) == doc`.
@@ -1247,8 +1279,8 @@ mod tests {
                     options,
                     args
                 }),
-            value_str().prop_map(|name| SnapKind::VirtualFile { name }),
-            value_str().prop_map(|p| SnapKind::HostFile {
+            value_str().prop_map(|name| SnapKind::Volume { name }),
+            value_str().prop_map(|p| SnapKind::BindMount {
                 path: PathBuf::from(p)
             }),
             any::<u16>().prop_map(|port| SnapKind::Port { port }),

@@ -418,7 +418,7 @@ pub fn unwire(workspace: &Path, a: &str, b: &str) -> Result<(), String> {
         .find(|w| (w.a == ida && w.b == idb) || (w.a == idb && w.b == ida))
         .ok_or_else(|| format!("no wire between {a} and {b}"))?;
     let wire = match w.kind.as_str() {
-        "file" => Wire::File(w.a, w.b),
+        "file" => Wire::Bind(w.a, w.b),
         "midi" => Wire::Midi(w.a, w.b),
         "serve" => Wire::Serve(w.a, w.b),
         "net" => Wire::Net(w.a, w.b),

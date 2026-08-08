@@ -30,7 +30,7 @@ workspace "01KXKGB000000000000000WS00" {
         pos 990.0 350.0
         size 360.0 260.0
     }
-    virtualfile "notes.txt" "01KXKGB000000000000000FL06" {
+    volume "notes.txt" "01KXKGB000000000000000FL06" {
         pos 430.0 690.0
         size 130.0 44.0
     }

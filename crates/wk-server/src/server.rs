@@ -28,7 +28,7 @@ pub const NOTE_W: f32 = 220.0;
 pub const NOTE_H: f32 = 130.0;
 
 /// An in-memory canvas file node: a named shared buffer you wire into app nodes.
-pub struct VirtualFile {
+pub struct Volume {
     pub name: String,
     pub data: crate::vfs::SharedFile,
 }
@@ -42,7 +42,7 @@ pub struct HostMappedFile {
 
 /// A canvas file node, wired into app nodes as a shared file `/name`.
 pub enum FileNode {
-    Virtual(VirtualFile),
+    Virtual(Volume),
     HostMapped(HostMappedFile),
 }
 
@@ -307,7 +307,7 @@ impl View {
     /// Whether a given connection currently exists.
     pub fn wire_exists(&self, w: Wire) -> bool {
         match w {
-            Wire::File(f, a) => self.connections.contains(&(f, a)),
+            Wire::Bind(f, a) => self.connections.contains(&(f, a)),
             Wire::Midi(s, d) => self.midi_links.contains(&(s, d)),
             Wire::Serve(h, hp) => self.serves.get(&h) == Some(&hp),
             Wire::Capture(a, c) => self.capture_links.contains(&(a, c)),
@@ -331,7 +331,7 @@ enum WireRel {
 /// The two node ids a [`Wire`] joins.
 fn wire_ends(w: Wire) -> (NodeId, NodeId) {
     match w {
-        Wire::File(a, b)
+        Wire::Bind(a, b)
         | Wire::Midi(a, b)
         | Wire::Serve(a, b)
         | Wire::Net(a, b)
@@ -392,7 +392,7 @@ struct Snapshot {
     /// ([`crate::workspace::NodeSnap`]) — undo and load-time restore
     /// materialize through the same path.
     node: NodeSnap,
-    /// A VirtualFile's in-memory bytes: undo restores them; the `.wk` file
+    /// A Volume's in-memory bytes: undo restores them; the `.wk` file
     /// deliberately does not persist content. Empty for every other kind.
     file_data: Vec<u8>,
     /// Every connection the node was part of, as raw node pairs.
@@ -694,14 +694,14 @@ impl Server {
         self.graph.node_args.insert(id, dep.args.clone());
     }
 
-    /// Create a new, empty in-memory VirtualFile node at `pos` in workspace `ws`.
+    /// Create a new, empty in-memory Volume node at `pos` in workspace `ws`.
     fn add_virtual_file(&mut self, pos: [f32; 2], ws: NodeId) {
         self.file_seq += 1;
         let id = self.alloc_id();
         self.place(id, Kind::File, ws, pos, [FILE_W, FILE_H]);
         self.graph.file_nodes.insert(
             id,
-            FileNode::Virtual(VirtualFile {
+            FileNode::Virtual(Volume {
                 name: format!("file{}", self.file_seq),
                 data: Arc::new(Mutex::new(Vec::new())),
             }),
@@ -1048,7 +1048,7 @@ impl Server {
     /// [`wiring::classify`]; this only runs the effect for whichever it returns.
     fn connect_toggle(&mut self, a: NodeId, b: NodeId) {
         match wiring::classify(a, b, self.class_of(a), self.class_of(b)) {
-            Some(Wire::File(file, app)) => self.toggle_file(file, app),
+            Some(Wire::Bind(file, app)) => self.toggle_file(file, app),
             Some(Wire::Serve(http, hostport)) => self.toggle_serve(http, hostport),
             Some(Wire::Net(app, net)) => self.toggle_net(app, net),
             Some(Wire::Capture(app, cap)) => self.toggle_capture(app, cap),
@@ -1330,7 +1330,7 @@ impl Server {
     /// Whether the given wire still connects two live nodes.
     pub fn wire_exists(&self, w: Wire) -> bool {
         match w {
-            Wire::File(f, a) => self.graph.connections.contains(&(f, a)),
+            Wire::Bind(f, a) => self.graph.connections.contains(&(f, a)),
             Wire::Midi(s, d) => self.graph.midi_links.contains(&(s, d)),
             Wire::Serve(h, hp) => self.graph.serve_links.contains(&(h, hp)),
             Wire::Capture(a, c) => self.graph.capture_links.contains(&(a, c)),
@@ -1341,7 +1341,7 @@ impl Server {
     /// Remove the given connection (the same effect as toggling it off).
     fn disconnect_wire(&mut self, w: Wire) {
         match w {
-            Wire::File(f, a) => {
+            Wire::Bind(f, a) => {
                 if self.graph.connections.contains(&(f, a)) {
                     self.toggle_file(f, a);
                 }
@@ -1644,8 +1644,8 @@ impl Server {
                         self.launch(&dep, pos, ws);
                     }
                 }
-                NodeKind::VirtualFile => self.add_virtual_file(pos, ws),
-                NodeKind::HostFile => self.add_host_mapped_file(pos, ws),
+                NodeKind::Volume => self.add_virtual_file(pos, ws),
+                NodeKind::BindMount => self.add_host_mapped_file(pos, ws),
                 NodeKind::Port => self.add_host_port(pos, ws),
                 NodeKind::Network => {
                     self.add_net_node(pos, ws);
@@ -1797,10 +1797,10 @@ impl Server {
                 }
             }
             Kind::File => match self.graph.file_nodes.get(&id)? {
-                FileNode::Virtual(v) => SnapKind::VirtualFile {
+                FileNode::Virtual(v) => SnapKind::Volume {
                     name: v.name.clone(),
                 },
-                FileNode::HostMapped(h) => SnapKind::HostFile {
+                FileNode::HostMapped(h) => SnapKind::BindMount {
                     path: h.path.clone(),
                 },
             },
@@ -1843,7 +1843,7 @@ impl Server {
     fn snapshot(&self, id: NodeId) -> Option<Snapshot> {
         let ws = self.graph.nodes.get(&id)?.ws;
         let node = self.node_snap(id)?;
-        // A VirtualFile's bytes are runtime-only state: carried for undo,
+        // A Volume's bytes are runtime-only state: carried for undo,
         // never persisted.
         let file_data = match self.graph.file_nodes.get(&id) {
             Some(FileNode::Virtual(v)) => v.data.lock().unwrap().clone(),
@@ -1897,7 +1897,7 @@ impl Server {
 
     /// Materialize a node from its persisted shape into workspace `ws` — the
     /// single creation path shared by load-time restore and undo. `file_data`
-    /// seeds a VirtualFile's bytes (undo has them; the `.wk` file doesn't).
+    /// seeds a Volume's bytes (undo has them; the `.wk` file doesn't).
     fn materialize(&mut self, ws: NodeId, s: &NodeSnap, file_data: &[u8]) {
         match &s.kind {
             SnapKind::App {
@@ -1939,7 +1939,7 @@ impl Server {
                 self.place(s.id, Kind::App, ws, s.pos, s.size);
                 self.graph.node_args.insert(s.id, args);
             }
-            SnapKind::VirtualFile { name } => {
+            SnapKind::Volume { name } => {
                 if let Some(num) = name
                     .strip_prefix("file")
                     .and_then(|s| s.parse::<u32>().ok())
@@ -1949,13 +1949,13 @@ impl Server {
                 self.place(s.id, Kind::File, ws, s.pos, s.size);
                 self.graph.file_nodes.insert(
                     s.id,
-                    FileNode::Virtual(VirtualFile {
+                    FileNode::Virtual(Volume {
                         name: name.clone(),
                         data: Arc::new(Mutex::new(file_data.to_vec())),
                     }),
                 );
             }
-            SnapKind::HostFile { path } => {
+            SnapKind::BindMount { path } => {
                 let name = host_file_name(path);
                 if let Some(num) = name
                     .strip_prefix("host")
@@ -2352,7 +2352,7 @@ mod model_tests {
                         id: file,
                         pos: [20.0, 20.0],
                         size: [130.0, 44.0],
-                        kind: SnapKind::VirtualFile {
+                        kind: SnapKind::Volume {
                             name: "file1".into(),
                         },
                     },
@@ -2570,7 +2570,7 @@ mod model_tests {
             })
         };
         match op {
-            Op::CreateFile => s.apply(create(NodeKind::VirtualFile)),
+            Op::CreateFile => s.apply(create(NodeKind::Volume)),
             Op::CreatePort => s.apply(create(NodeKind::Port)),
             Op::CreateNet => s.apply(create(NodeKind::Network)),
             Op::CreateGateway => s.apply(create(NodeKind::Gateway)),
