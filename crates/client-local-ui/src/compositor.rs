@@ -2029,6 +2029,11 @@ impl App {
             if node_surface.contains_key(&node.id) {
                 continue;
             }
+            // A CLI client attached to this node owns its terminal I/O; the UI
+            // treats it as detached and doesn't drain (or later feed) it.
+            if self.view.attached.contains(&node.id) {
+                continue;
+            }
             let bytes = node.term_io.drain_out();
             let term = self
                 .terminals
@@ -2443,7 +2448,7 @@ impl App {
                         s.key_up.push_back(ev.clone());
                     }
                 }
-            } else if !self.term_input.is_empty() {
+            } else if !self.term_input.is_empty() && !self.view.attached.contains(&fid) {
                 if let (Some(term), Some(node)) =
                     (self.terminals.get_mut(&fid), node_by_id.get(&fid))
                 {

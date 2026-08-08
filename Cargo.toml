@@ -20,3 +20,4 @@ wk-token-service = { path = "crates/wk-token-service" }
 client-local-ui = { path = "crates/client-local-ui" }
 env_logger = "0.11.11"
 clap = { version = "4.6.1", features = ["derive"] }
+libc = "0.2.189"

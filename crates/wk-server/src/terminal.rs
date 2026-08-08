@@ -151,6 +151,12 @@ impl TermIo {
             w.wake();
         }
     }
+
+    /// Whether the terminal has been closed (the node is shutting down) — an
+    /// attached CLI client uses this to end its stream.
+    pub fn is_closed(&self) -> bool {
+        self.inp.lock().unwrap().closed
+    }
 }
 
 /// `WasiCtxBuilder` stdout/stderr handle for a terminal node.

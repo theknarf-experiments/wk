@@ -171,6 +171,9 @@ pub struct View {
     pub net_links: Vec<(NodeId, NodeId)>,
     /// Screen-capture grants as (app, Capture node).
     pub capture_links: Vec<(NodeId, NodeId)>,
+    /// Nodes a CLI client has attached to — the UI treats these as detached
+    /// (it stops draining/feeding their terminal).
+    pub attached: std::collections::HashSet<NodeId>,
     /// Each Capture node's frame slot — the local client writes captured
     /// canvas frames into these (only while the node has a wired app).
     pub capture_feeds: HashMap<NodeId, crate::capture::SharedFrameSlot>,
@@ -280,6 +283,7 @@ impl View {
                 .filter(|(id, _)| mine(id))
                 .map(|(&k, v)| (k, v.clone()))
                 .collect(),
+            attached: self.attached.iter().copied().filter(mine).collect(),
             serves: self
                 .serves
                 .iter()
@@ -511,6 +515,10 @@ pub struct Server {
     /// Each Capture node's frame slot (the client fills it; wired apps read
     /// it through their `capture_src`, kept in sync by [`Self::sync_captures`]).
     capture_feeds: HashMap<NodeId, crate::capture::SharedFrameSlot>,
+    /// Nodes a CLI client has `attach`ed to (owning their terminal I/O). The
+    /// windowed UI treats these as detached: it stops draining/feeding their
+    /// terminal so the two don't fight over the stream. Pure runtime state.
+    attached: std::collections::HashSet<NodeId>,
 
     /// Nodes present in the loaded `.wk` file that couldn't be materialized —
     /// an app whose dependency isn't in the list (renamed/removed), or an
@@ -560,6 +568,7 @@ impl Server {
             serves: HashMap::new(),
             uplinks: HashMap::new(),
             capture_feeds: HashMap::new(),
+            attached: std::collections::HashSet::new(),
             unplaced: Vec::new(),
             unplaced_wires: Vec::new(),
             undo: Vec::new(),
@@ -2110,6 +2119,7 @@ impl Server {
             net_links: self.graph.net_links.clone(),
             capture_links: self.graph.capture_links.clone(),
             capture_feeds: self.capture_feeds.clone(),
+            attached: self.attached.clone(),
             serves,
             node_args: self.graph.node_args.clone(),
             available: self.graph.available.clone(),
@@ -2118,6 +2128,21 @@ impl Server {
             node_ws,
             workspaces: self.graph.workspaces.clone(),
         }
+    }
+
+    /// Mark (or clear) a node as externally attached by a CLI client. Returns
+    /// whether it is a terminal node the client can actually stream (so an
+    /// attach to a non-terminal node is rejected without leaving it flagged).
+    pub fn set_attached(&mut self, id: NodeId, on: bool) -> bool {
+        let is_terminal = self.app_node(id).is_some_and(|n| n.is_command());
+        if on {
+            if is_terminal {
+                self.attached.insert(id);
+            }
+        } else {
+            self.attached.remove(&id);
+        }
+        is_terminal
     }
 
     /// A serializable projection of the state for a remote (CLI) client — the
@@ -2172,6 +2197,7 @@ impl Server {
                         .unwrap_or(false),
                     runnable: app.as_ref().map(|n| n.is_runnable()).unwrap_or(false),
                     terminal: app.as_ref().map(|n| n.is_command()).unwrap_or(false),
+                    attached: self.attached.contains(&id),
                 }
             })
             .collect();

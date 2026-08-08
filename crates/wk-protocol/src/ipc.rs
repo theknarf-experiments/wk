@@ -44,6 +44,8 @@ pub struct NodeInfo {
     pub runnable: bool,
     /// A terminal (wasi:cli) node a client may `attach` to.
     pub terminal: bool,
+    /// A terminal node currently attached by a CLI client.
+    pub attached: bool,
 }
 
 /// One wire between two nodes.
@@ -177,6 +179,7 @@ mod tests {
                 running: true,
                 runnable: false,
                 terminal: true,
+                attached: false,
             }],
             wires: vec![WireInfo {
                 kind: "file".into(),

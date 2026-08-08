@@ -77,6 +77,12 @@ impl ServerHandle {
             .app_node(id)
             .map(|n| n.term_io.clone())
     }
+
+    /// Mark (or clear) a node as externally attached by a CLI client, so the UI
+    /// yields its terminal. Returns whether it is a streamable terminal node.
+    pub fn set_attached(&self, id: wk_protocol::NodeId, on: bool) -> bool {
+        self.server.lock().unwrap().set_attached(id, on)
+    }
 }
 
 /// Owns the server thread. Hand out [`handle`](Self::handle)s to attach clients;

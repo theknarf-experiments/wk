@@ -9,6 +9,7 @@ use clap::Parser;
 use clap::Subcommand;
 use std::path::{Path, PathBuf};
 
+mod attach;
 mod cli;
 
 #[derive(Parser)]
@@ -75,6 +76,12 @@ enum Commands {
 
     /// Remove the wire between two nodes in a running workspace
     Unwire { a: String, b: String },
+
+    /// Attach to a running terminal node's I/O (like `docker attach`)
+    Attach {
+        /// Node reference: its name, or any part of its id
+        node: String,
+    },
 
     /// Manage wk's local OCI image store
     Images {
@@ -190,6 +197,7 @@ fn main() -> Result<(), String> {
         },
         Some(Commands::Wire { a, b }) => cli::wire(file, a, b),
         Some(Commands::Unwire { a, b }) => cli::unwire(file, a, b),
+        Some(Commands::Attach { node }) => attach::attach(file, node),
         Some(Commands::Images { cmd }) => images_cmd(cmd),
         Some(Commands::Remove { plugin }) => workspace::remove(plugin.clone(), file),
         Some(Commands::Run {

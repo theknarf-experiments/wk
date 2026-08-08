@@ -12,7 +12,7 @@ use wk_protocol::{Command, NodeKind, NodePatch, Resource, ResourceRef};
 use wk_server::ipc_server::socket_path;
 
 /// Connect to the running server for `workspace`, or a helpful error if none.
-fn connect(workspace: &Path) -> Result<UnixStream, String> {
+pub(crate) fn connect(workspace: &Path) -> Result<UnixStream, String> {
     let sock = socket_path(workspace);
     UnixStream::connect(&sock).map_err(|_| {
         format!(
@@ -28,7 +28,7 @@ fn connect(workspace: &Path) -> Result<UnixStream, String> {
 }
 
 /// Fetch a fresh snapshot from the connected server.
-fn get_snapshot(stream: &mut UnixStream) -> Result<Snapshot, String> {
+pub(crate) fn get_snapshot(stream: &mut UnixStream) -> Result<Snapshot, String> {
     write_msg(stream, &ClientMsg::GetSnapshot).map_err(|e| e.to_string())?;
     let mut r = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     match read_msg::<_, ServerMsg>(&mut r).map_err(|e| e.to_string())? {
@@ -57,7 +57,10 @@ fn send_command(stream: &mut UnixStream, cmd: Command) -> Result<(), String> {
 /// Resolve a user-supplied node reference to exactly one node. A reference
 /// matches by node name, or by any substring of its id (so a short id prefix
 /// *or* the distinguishing suffix both work). Ambiguous or absent → error.
-fn resolve<'a>(snap: &'a Snapshot, query: &str) -> Result<&'a wk_protocol::ipc::NodeInfo, String> {
+pub(crate) fn resolve<'a>(
+    snap: &'a Snapshot,
+    query: &str,
+) -> Result<&'a wk_protocol::ipc::NodeInfo, String> {
     let q = query.to_lowercase();
     let matches: Vec<_> = snap
         .nodes
@@ -224,7 +227,9 @@ pub fn ps(workspace: &Path) -> Result<(), String> {
         "ID", "KIND", "NAME", "STATUS"
     );
     for n in &snap.nodes {
-        let status = if !n.runnable {
+        let status = if n.attached {
+            "attached".to_string()
+        } else if !n.runnable {
             "-".to_string()
         } else if n.running {
             "running".to_string()
@@ -262,6 +267,7 @@ mod tests {
             running: false,
             runnable: true,
             terminal: false,
+            attached: false,
         }
     }
 

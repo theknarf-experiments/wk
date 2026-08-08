@@ -131,37 +131,123 @@ fn accept_loop(listener: UnixListener, handle: ServerHandle, stop: Arc<AtomicBoo
     }
 }
 
+/// A live terminal attach: the node id (so the UI-detach flag can be cleared)
+/// and the pump thread streaming its output to the client.
+struct Attach {
+    node: wk_protocol::NodeId,
+    term: crate::terminal::SharedTermIo,
+    stop: Arc<AtomicBool>,
+    pump: Option<JoinHandle<()>>,
+}
+
+impl Attach {
+    /// Stop the pump and clear the server-side attach flag.
+    fn end(mut self, handle: &ServerHandle) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.pump.take() {
+            let _ = t.join();
+        }
+        handle.set_attached(self.node, false);
+    }
+}
+
 /// Serve one connected client: read framed [`ClientMsg`]s and reply with
-/// [`ServerMsg`]s until the client disconnects.
+/// [`ServerMsg`]s until the client disconnects. While attached to a node, a
+/// pump thread streams that node's terminal output; this loop feeds its input.
 fn serve_client(
     stream: UnixStream,
     handle: ServerHandle,
     _stop: Arc<AtomicBool>,
 ) -> io::Result<()> {
     stream.set_nonblocking(false)?;
-    let mut writer = stream.try_clone()?;
+    // Both this loop (acks) and the attach pump (terminal output) write to the
+    // socket; share one locked writer so their JSON lines never interleave.
+    let writer = Arc::new(std::sync::Mutex::new(stream.try_clone()?));
     let mut reader = BufReader::new(stream);
+    let send = |w: &std::sync::Mutex<UnixStream>, m: &ServerMsg| -> io::Result<()> {
+        write_msg(&mut *w.lock().unwrap(), m)
+    };
 
+    let mut attach: Option<Attach> = None;
     while let Some(msg) = read_msg::<_, ClientMsg>(&mut reader)? {
         match msg {
-            ClientMsg::GetSnapshot => {
-                write_msg(&mut writer, &ServerMsg::Snapshot(handle.snapshot()))?;
-            }
+            ClientMsg::GetSnapshot => send(&writer, &ServerMsg::Snapshot(handle.snapshot()))?,
             ClientMsg::Command(cmd) => {
                 handle.send(cmd);
-                write_msg(&mut writer, &ServerMsg::Ok)?;
+                send(&writer, &ServerMsg::Ok)?;
             }
-            // Terminal attach arrives in a later phase.
-            ClientMsg::Attach { .. } | ClientMsg::Input(_) | ClientMsg::Resize { .. } => {
-                write_msg(
-                    &mut writer,
-                    &ServerMsg::Error("attach is not supported yet".into()),
-                )?;
+            ClientMsg::Attach { node } => {
+                if let Some(a) = attach.take() {
+                    a.end(&handle);
+                }
+                match handle.term_io(node) {
+                    Some(term) if handle.set_attached(node, true) => {
+                        let (cols, rows) = term.size();
+                        send(&writer, &ServerMsg::Attached { cols, rows })?;
+                        let stop = Arc::new(AtomicBool::new(false));
+                        let pump = spawn_pump(term.clone(), writer.clone(), stop.clone());
+                        attach = Some(Attach {
+                            node,
+                            term,
+                            stop,
+                            pump: Some(pump),
+                        });
+                    }
+                    Some(_) => {
+                        handle.set_attached(node, false);
+                        send(&writer, &ServerMsg::Error("node is not a terminal".into()))?;
+                    }
+                    None => send(&writer, &ServerMsg::Error("no such node".into()))?,
+                }
             }
-            ClientMsg::Detach => {}
+            ClientMsg::Input(bytes) => {
+                if let Some(a) = &attach {
+                    a.term.feed_in(&bytes);
+                }
+            }
+            ClientMsg::Resize { cols, rows } => {
+                if let Some(a) = &attach {
+                    a.term.set_size(cols, rows);
+                }
+            }
+            ClientMsg::Detach => {
+                if let Some(a) = attach.take() {
+                    a.end(&handle);
+                }
+                send(&writer, &ServerMsg::Detached)?;
+            }
         }
     }
+    // Client disconnected — release any attach so the UI reclaims the node.
+    if let Some(a) = attach.take() {
+        a.end(&handle);
+    }
     Ok(())
+}
+
+/// Stream a node's terminal output to the client until stopped or the node
+/// exits. Drains `term` and writes [`ServerMsg::Term`]; on node exit sends
+/// [`ServerMsg::Detached`] so the client returns to its shell.
+fn spawn_pump(
+    term: crate::terminal::SharedTermIo,
+    writer: Arc<std::sync::Mutex<UnixStream>>,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            let out = term.drain_out();
+            if !out.is_empty() {
+                if write_msg(&mut *writer.lock().unwrap(), &ServerMsg::Term(out)).is_err() {
+                    break;
+                }
+            } else if term.is_closed() {
+                let _ = write_msg(&mut *writer.lock().unwrap(), &ServerMsg::Detached);
+                break;
+            } else {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    })
 }
 
 #[cfg(test)]
