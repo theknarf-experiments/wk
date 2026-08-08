@@ -3,6 +3,8 @@
 use std::fmt;
 use std::str::FromStr;
 
+use serde::de::{self, Deserialize, Deserializer};
+use serde::{Serialize, Serializer};
 use uuid::Uuid;
 
 /// The Crockford base32 alphabet (no I, L, O, U), used for the textual form.
@@ -99,6 +101,20 @@ fn crockford_value(c: char) -> Option<u8> {
         other => other,
     };
     CROCKFORD.iter().position(|&d| d == up).map(|p| p as u8)
+}
+
+impl Serialize for NodeId {
+    /// As the 26-char base32 text (human-readable + round-trips via `FromStr`).
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeId {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(de::Error::custom)
+    }
 }
 
 #[cfg(test)]

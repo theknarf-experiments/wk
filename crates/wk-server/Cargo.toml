@@ -37,3 +37,4 @@ wit-component = "0.253.0"
 
 [dev-dependencies]
 proptest = "1"
+wk-token-service = { path = "../wk-token-service" }

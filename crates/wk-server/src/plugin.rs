@@ -191,6 +191,14 @@ impl Node {
     pub fn is_runnable(&self) -> bool {
         self.setup.get().is_some_and(|s| s.run.is_some())
     }
+    /// A `wasi:cli/command` guest (a terminal app), as opposed to a graphical or
+    /// http node — the nodes a CLI client can `attach` to.
+    pub fn is_command(&self) -> bool {
+        self.setup
+            .get()
+            .and_then(|s| s.run.as_ref())
+            .is_some_and(|r| r.is_command)
+    }
 }
 
 pub type SharedNode = Arc<Node>;

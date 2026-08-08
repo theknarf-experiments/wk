@@ -63,6 +63,20 @@ impl ServerHandle {
     pub fn view(&self) -> View {
         self.server.lock().unwrap().view()
     }
+
+    /// A serializable projection of the state, for a remote (CLI) client.
+    pub fn snapshot(&self) -> wk_protocol::ipc::Snapshot {
+        self.server.lock().unwrap().ipc_snapshot()
+    }
+
+    /// Look up a node's terminal I/O by id (for `attach`), if it's an app node.
+    pub fn term_io(&self, id: wk_protocol::NodeId) -> Option<crate::terminal::SharedTermIo> {
+        self.server
+            .lock()
+            .unwrap()
+            .app_node(id)
+            .map(|n| n.term_io.clone())
+    }
 }
 
 /// Owns the server thread. Hand out [`handle`](Self::handle)s to attach clients;

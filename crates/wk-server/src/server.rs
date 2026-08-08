@@ -2119,6 +2119,88 @@ impl Server {
             workspaces: self.graph.workspaces.clone(),
         }
     }
+
+    /// A serializable projection of the state for a remote (CLI) client — the
+    /// wire form of [`Self::view`], carrying only plain data (no shared runtime
+    /// handles). See [`wk_protocol::ipc::Snapshot`].
+    pub fn ipc_snapshot(&self) -> wk_protocol::ipc::Snapshot {
+        use wk_protocol::ipc::{NodeInfo, Snapshot, WireInfo};
+        let v = self.view();
+        let kind_str = |id: NodeId| -> &'static str {
+            match self.kind_of(id) {
+                Some(Kind::App) => "app",
+                Some(Kind::File) => {
+                    if v.file_nodes.get(&id).is_some_and(|f| f.host_mapped) {
+                        "hostfile"
+                    } else {
+                        "virtualfile"
+                    }
+                }
+                Some(Kind::Port) => "hostport",
+                Some(Kind::Network) => "network",
+                Some(Kind::Gateway) => "gateway",
+                Some(Kind::Iroh) => "iroh",
+                Some(Kind::Veilid) => "veilid",
+                Some(Kind::Note) => "note",
+                Some(Kind::Capture) => "capture",
+                None => "unknown",
+            }
+        };
+        let nodes = v
+            .node_ids
+            .iter()
+            .map(|&id| {
+                let app = v.app_node(id);
+                let name = if let Some(n) = &app {
+                    n.name.clone()
+                } else if let Some(f) = v.file_nodes.get(&id) {
+                    f.name.clone()
+                } else {
+                    String::new()
+                };
+                NodeInfo {
+                    id,
+                    kind: kind_str(id).to_string(),
+                    name,
+                    ws: v.node_ws.get(&id).copied().unwrap_or_default(),
+                    pos: v.win_pos.get(&id).copied().unwrap_or([0.0, 0.0]),
+                    size: v.win_size.get(&id).copied().unwrap_or([0.0, 0.0]),
+                    args: v.node_args.get(&id).cloned().unwrap_or_default(),
+                    running: app
+                        .as_ref()
+                        .map(|n| n.running.load(Ordering::Relaxed))
+                        .unwrap_or(false),
+                    runnable: app.as_ref().map(|n| n.is_runnable()).unwrap_or(false),
+                    terminal: app.as_ref().map(|n| n.is_command()).unwrap_or(false),
+                }
+            })
+            .collect();
+        let wire = |kind: &'static str, pairs: &[(NodeId, NodeId)]| -> Vec<WireInfo> {
+            pairs
+                .iter()
+                .map(|&(a, b)| WireInfo {
+                    kind: kind.to_string(),
+                    a,
+                    b,
+                })
+                .collect()
+        };
+        let mut wires = wire("file", &v.connections);
+        wires.extend(wire("midi", &v.midi_links));
+        wires.extend(wire("net", &v.net_links));
+        wires.extend(wire("capture", &v.capture_links));
+        wires.extend(v.serves.iter().map(|(&http, &hp)| WireInfo {
+            kind: "serve".to_string(),
+            a: http,
+            b: hp,
+        }));
+        Snapshot {
+            workspaces: v.workspaces.clone(),
+            nodes,
+            wires,
+            available: v.available.iter().map(|d| d.name.clone()).collect(),
+        }
+    }
 }
 
 #[cfg(test)]

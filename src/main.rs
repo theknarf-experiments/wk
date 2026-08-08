@@ -9,6 +9,8 @@ use clap::Parser;
 use clap::Subcommand;
 use std::path::{Path, PathBuf};
 
+mod cli;
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
@@ -53,6 +55,9 @@ enum Commands {
         /// Dependency name
         plugin: String,
     },
+
+    /// List the nodes of a running workspace (connects to `wk run`)
+    Ps,
 
     /// Manage wk's local OCI image store
     Images {
@@ -134,6 +139,7 @@ fn main() -> Result<(), String> {
             workspace::publish(plugin.clone(), reference.clone(), file)
         }
         Some(Commands::List) => workspace::list(file),
+        Some(Commands::Ps) => cli::ps(file),
         Some(Commands::Images { cmd }) => images_cmd(cmd),
         Some(Commands::Remove { plugin }) => workspace::remove(plugin.clone(), file),
         Some(Commands::Run {
@@ -166,6 +172,21 @@ fn run(file: &Path, headless: bool) -> Result<(), String> {
     //  3. the client is handed a minted token and bears it with every action.
     let tokens = TokenService::new();
     let runtime = ServerRuntime::spawn(&doc, file.to_path_buf(), tokens.public_key())?;
+    // Start the CLI socket (wk's "docker daemon") so a separate `wk` process can
+    // attach and drive this server live — for both windowed and headless runs.
+    let _ipc = match tokens.mint_admin().and_then(|tok| {
+        wk_server::ipc_server::IpcServer::start(runtime.handle().with_token(tok), file)
+            .map_err(|e| e.to_string())
+    }) {
+        Ok(s) => {
+            eprintln!("wk: CLI socket at {}", s.path().display());
+            Some(s)
+        }
+        Err(e) => {
+            eprintln!("wk: CLI socket unavailable: {e}");
+            None
+        }
+    };
     if headless {
         // No client attached; run the server until Ctrl-C, then save + stop.
         runtime.block_until_ctrl_c();

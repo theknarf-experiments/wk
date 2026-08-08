@@ -17,8 +17,12 @@
 mod node_id;
 pub use node_id::NodeId;
 
+pub mod ipc;
+
+use serde::{Deserialize, Serialize};
+
 /// A connection wire, identified by the two node ids it joins (by kind).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Wire {
     /// A file node (`file_id`) mounted into an app node (`app_id`).
     File(NodeId, NodeId),
@@ -107,6 +111,7 @@ impl Action {
 }
 
 /// What kind of node to create (the create payload for [`Resource::Node`]).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum NodeKind {
     /// Launch the dependency at this index in the document's list.
     App { dep: usize },
@@ -133,6 +138,7 @@ pub enum NodeKind {
 }
 
 /// A resource to create.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Resource {
     /// A node of `kind` at `pos` in workspace `ws`. Positions come *from* the
     /// client (it knows its camera) so the server never needs a view.
@@ -151,6 +157,7 @@ pub enum Resource {
 }
 
 /// A reference to an existing resource (for deletes).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum ResourceRef {
     Node(NodeId),
     Wire(Wire),
@@ -160,7 +167,7 @@ pub enum ResourceRef {
 }
 
 /// A partial update to a node; only the present fields change.
-#[derive(Default)]
+#[derive(Default, Clone, Debug, Serialize, Deserialize)]
 pub struct NodePatch {
     /// Move to a new canvas position (requires only `Arrange`).
     pub pos: Option<[f32; 2]>,
@@ -176,6 +183,7 @@ pub struct NodePatch {
 
 /// A mutation a client asks the server to perform: create/update/delete on a
 /// resource, plus the non-CRUD actions (run, duplicate, undo).
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Command {
     Create(Resource),
     Update {

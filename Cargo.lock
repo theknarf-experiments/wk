@@ -10857,6 +10857,8 @@ dependencies = [
 name = "wk-protocol"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "uuid",
 ]
 
@@ -10893,6 +10895,7 @@ dependencies = [
  "wk-dockerfile",
  "wk-fabric",
  "wk-protocol",
+ "wk-token-service",
  "wk-vfs",
 ]
 
