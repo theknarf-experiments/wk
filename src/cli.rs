@@ -374,8 +374,17 @@ pub fn up(workspace: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// `wk node set <ref> --args "..."`: set a node's launch args.
-pub fn set_args(workspace: &Path, node: &str, args: &str) -> Result<(), String> {
+/// `wk node set <ref> [--args "..."] [--host-path P]`: reconfigure a node's
+/// launch args and/or (for a BindMount) the host file/folder it exposes.
+pub fn set_node(
+    workspace: &Path,
+    node: &str,
+    args: Option<&str>,
+    host_path: Option<&str>,
+) -> Result<(), String> {
+    if args.is_none() && host_path.is_none() {
+        return Err("nothing to set — pass --args and/or --host-path".into());
+    }
     let mut stream = connect(workspace)?;
     let snap = get_snapshot(&mut stream)?;
     let id = resolve(&snap, node)?.id;
@@ -384,12 +393,13 @@ pub fn set_args(workspace: &Path, node: &str, args: &str) -> Result<(), String> 
         Command::Update {
             id,
             patch: NodePatch {
-                args: Some(args.to_string()),
+                args: args.map(str::to_string),
+                host_path: host_path.map(str::to_string),
                 ..Default::default()
             },
         },
     )?;
-    println!("set args on {}", short(id));
+    println!("updated {}", short(id));
     Ok(())
 }
 

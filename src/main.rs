@@ -154,12 +154,15 @@ enum NodeCmd {
     },
     /// (Re)start an idle/exited node's guest
     Start { node: String },
-    /// Set a node's launch args
+    /// Reconfigure a node: its launch args and/or a BindMount's host path
     Set {
         node: String,
         /// The full argument string (quote it)
         #[arg(long)]
-        args: String,
+        args: Option<String>,
+        /// For a BindMount: the host file or folder to expose
+        #[arg(long)]
+        host_path: Option<String>,
     },
 }
 
@@ -230,7 +233,11 @@ fn main() -> Result<(), String> {
             NodeCmd::Add { name, args } => cli::add(file, name, args),
             NodeCmd::Rm { node } => cli::rm(file, node),
             NodeCmd::Start { node } => cli::start(file, node),
-            NodeCmd::Set { node, args } => cli::set_args(file, node, args),
+            NodeCmd::Set {
+                node,
+                args,
+                host_path,
+            } => cli::set_node(file, node, args.as_deref(), host_path.as_deref()),
         },
         Some(Commands::Wire { a, b }) => cli::wire(file, a, b),
         Some(Commands::Unwire { a, b }) => cli::unwire(file, a, b),

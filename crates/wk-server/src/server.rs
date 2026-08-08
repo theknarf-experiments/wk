@@ -65,11 +65,12 @@ impl FileNode {
         }
     }
 
-    /// Bind this volume into app filesystem `fs` at the path `at` (by kind).
+    /// Bind this volume into app filesystem `fs` at the path `at` (by kind). A
+    /// BindMount pointing at a host directory mirrors the whole tree.
     pub fn mount(&self, fs: &crate::vfs::SharedFs, at: &str) {
         match self {
             FileNode::Virtual(f) => crate::vfs::mount_file(fs, at, f.data.clone()),
-            FileNode::HostMapped(f) => crate::vfs::mount_host_file(fs, at, f.path.clone()),
+            FileNode::HostMapped(f) => crate::vfs::mount_host(fs, at, f.path.clone()),
         }
     }
 }
@@ -1316,6 +1317,37 @@ impl Server {
         self.graph.mount_paths.retain(|pair, _| live.contains(pair));
     }
 
+    /// Point a BindMount node at a host path (a file or folder), updating its
+    /// default mount name from the new basename and remounting any live binds.
+    fn set_bind_path(&mut self, id: NodeId, host_path: String) {
+        let path = PathBuf::from(host_path.trim());
+        let name = host_file_name(&path);
+        match self.graph.file_nodes.get_mut(&id) {
+            Some(FileNode::HostMapped(f)) => {
+                f.path = path;
+                f.name = name;
+            }
+            _ => return, // only BindMount nodes have a host path
+        }
+        // Remount this node's live binds at their effective paths.
+        let binds: Vec<(NodeId, NodeId)> = self
+            .mounted
+            .keys()
+            .copied()
+            .filter(|(vol, _)| *vol == id)
+            .collect();
+        for pair in binds {
+            if let Some((old, fs)) = self.mounted.remove(&pair) {
+                crate::vfs::unmount_file(&fs, &old);
+                let at = self.mount_path_for(pair.0, pair.1);
+                if let Some(f) = self.graph.file_nodes.get(&id) {
+                    f.mount(&fs, &at);
+                    self.mounted.insert(pair, (at, fs));
+                }
+            }
+        }
+    }
+
     /// Set (or clear) where a bind mounts inside its app, remounting live. A path
     /// equal to the default is stored as an override too, so the choice sticks
     /// even if the volume is later renamed; an empty path resets to the default.
@@ -1750,6 +1782,9 @@ impl Server {
                     if self.graph.note_text.contains_key(&id) {
                         self.graph.note_text.insert(id, text);
                     }
+                }
+                if let Some(host_path) = patch.host_path {
+                    self.set_bind_path(id, host_path);
                 }
             }
             Command::Delete(ResourceRef::Node(id)) => self.remove_any(id),
@@ -2435,6 +2470,34 @@ mod model_tests {
         assert_eq!(s.mount_path_for(vol, app), default);
     }
 
+    /// `--host-path` (a BindMount patch) repoints the node at a host path and
+    /// derives its default mount name from the new basename.
+    #[test]
+    fn set_bind_path_repoints_a_bindmount() {
+        let mut s = fresh_server();
+        let ws = s.graph.workspaces[0];
+        s.apply(Command::Create(Resource::Node {
+            kind: NodeKind::BindMount,
+            pos: [0.0, 0.0],
+            ws,
+        }));
+        let id = *s.graph.file_nodes.keys().next().expect("a bind mount");
+        s.apply(Command::Update {
+            id,
+            patch: NodePatch {
+                host_path: Some("/srv/data/logs".into()),
+                ..Default::default()
+            },
+        });
+        match s.graph.file_nodes.get(&id) {
+            Some(FileNode::HostMapped(f)) => {
+                assert_eq!(f.path, PathBuf::from("/srv/data/logs"));
+                assert_eq!(f.name, "logs", "mount name follows the new basename");
+            }
+            _ => panic!("expected a BindMount node"),
+        }
+    }
+
     /// A bind's mount path survives a save→reload cycle (it persists as the
     /// connection's 3rd KDL arg).
     #[test]
@@ -2778,6 +2841,7 @@ mod model_tests {
                     args: Some("ghost".into()),
                     port_delta: None,
                     text: None,
+                    host_path: None,
                 },
             }),
             Op::Undo => s.apply(Command::Undo),

@@ -418,6 +418,40 @@ pub fn mount_host_file(fs: &SharedFs, at: &str, path: std::path::PathBuf) {
     mount_node_at(fs, at, Node::Host(path));
 }
 
+/// Bind a real host path into `fs` at `at`: a file mounts as one host-backed
+/// file; a directory is mirrored — each file inside it mounts as a host-backed
+/// file at the matching sub-path, so existing files stay live (reads and writes
+/// hit disk). The tree is a snapshot taken at mount time: files the host adds
+/// afterwards don't appear until the next mount, and files the guest creates
+/// inside a bound directory are private (in-memory), not written back to disk.
+/// Symlinks are not followed (so a directory cycle can't loop the walk).
+pub fn mount_host(fs: &SharedFs, at: &str, path: std::path::PathBuf) {
+    if path.is_dir() {
+        mount_host_dir(fs, at, &path);
+    } else {
+        mount_host_file(fs, at, path);
+    }
+}
+
+/// Mirror the host directory `dir` into `fs` under `at` (see [`mount_host`]).
+fn mount_host_dir(fs: &SharedFs, at: &str, dir: &std::path::Path) {
+    fs.lock().unwrap().ensure_dir_path(at);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let child_at = format!("{at}/{}", entry.file_name().to_string_lossy());
+        if is_dir {
+            mount_host_dir(fs, &child_at, &entry.path());
+        } else {
+            // Regular files (and, deliberately, symlinks treated as their target
+            // file) mount live; a broken link just reads empty.
+            mount_host_file(fs, &child_at, entry.path());
+        }
+    }
+}
+
 /// Place `node` at `at`, creating parent dirs and replacing any existing entry.
 fn mount_node_at(fs: &SharedFs, at: &str, node: Node) {
     let mut g = fs.lock().unwrap();
@@ -1536,6 +1570,39 @@ mod tests {
         assert!(resolve(&fs.lock().unwrap(), ROOT, "/h").is_none());
         assert_eq!(std::fs::read(&path).unwrap(), b"changed!");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mount_host_mirrors_a_directory_tree() {
+        // A host dir with a top file and a nested subdir/file.
+        let root = std::env::temp_dir().join("wk_host_dir_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("top.txt"), b"top").unwrap();
+        std::fs::write(root.join("sub/deep.txt"), b"deep!").unwrap();
+
+        let fs = new_fs();
+        mount_host(&fs, "/vol", root.clone());
+
+        // The tree is mirrored: files appear at their sub-paths, backed by disk.
+        let top = resolve(&fs.lock().unwrap(), ROOT, "/vol/top.txt").expect("top mounted");
+        let deep = resolve(&fs.lock().unwrap(), ROOT, "/vol/sub/deep.txt").expect("nested mounted");
+        assert_eq!(stat_node(&fs.lock().unwrap(), top).unwrap().size, 3);
+        assert_eq!(stat_node(&fs.lock().unwrap(), deep).unwrap().size, 5);
+        // Reads are live: an external write to the disk file is seen through it.
+        host_write_at(&root.join("sub/deep.txt"), 0, b"DEEP.").unwrap();
+        assert_eq!(
+            fs.lock()
+                .unwrap()
+                .read_file("/vol/sub/deep.txt", 64)
+                .as_deref(),
+            Some(&b"DEEP."[..])
+        );
+
+        // Unmounting the mount root removes the whole subtree.
+        unmount_file(&fs, "/vol");
+        assert!(resolve(&fs.lock().unwrap(), ROOT, "/vol").is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ---- property-based: the guest-controlled offset/len arithmetic ----
