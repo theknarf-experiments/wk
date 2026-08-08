@@ -46,6 +46,10 @@ pub struct NodeInfo {
     pub terminal: bool,
     /// A terminal node currently attached by a CLI client.
     pub attached: bool,
+    /// A problem the server wants surfaced for this node — e.g. a HostPort whose
+    /// localhost port is already in use. `None` when healthy.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// One wire between two nodes.
@@ -187,6 +191,7 @@ mod tests {
                 runnable: false,
                 terminal: true,
                 attached: false,
+                error: None,
             }],
             wires: vec![WireInfo {
                 kind: "file".into(),

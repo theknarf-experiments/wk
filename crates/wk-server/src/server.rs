@@ -194,6 +194,9 @@ pub struct View {
     pub capture_feeds: HashMap<NodeId, crate::capture::SharedFrameSlot>,
     /// http node id -> HostPort node id.
     pub serves: HashMap<NodeId, NodeId>,
+    /// HostPort node id -> a bind-failure message (localhost port unavailable),
+    /// for the client to surface as a warning.
+    pub port_errors: HashMap<NodeId, String>,
     /// Per-node launch args (argv after the program name).
     pub node_args: HashMap<NodeId, Vec<String>>,
     /// The launchable dependencies (for the command palette).
@@ -269,6 +272,7 @@ impl View {
             capture_feeds: keep_map(&self.capture_feeds, mine),
             attached: keep_set(&self.attached, mine),
             serves: keep_map(&self.serves, mine),
+            port_errors: keep_map(&self.port_errors, mine),
             node_args: keep_map(&self.node_args, mine),
             available: self.available.clone(),
             nodes: self.nodes.iter().filter(|n| mine(&n.id)).cloned().collect(),
@@ -498,6 +502,11 @@ pub struct Server {
     /// TCP+UDP forward into its network) and the port bound. Reconciled by
     /// `sync_serves`.
     pub serves: HashMap<NodeId, (NodeId, Arc<AtomicBool>)>,
+    /// HostPorts whose last bind attempt failed — keyed by HostPort node id, the
+    /// value a human message (e.g. the localhost port is already in use by
+    /// another process). Surfaced in the snapshot so `wk ps`/the UI can warn;
+    /// cleared once the port binds or the serve wire is removed.
+    port_errors: HashMap<NodeId, String>,
     /// Running uplinks (Iroh or Veilid), one per uplink node. Dropping one
     /// closes its endpoint and detaches its trunk.
     uplinks: HashMap<NodeId, UplinkHandle>,
@@ -555,6 +564,7 @@ impl Server {
             mounted: HashMap::new(),
             routed: HashSet::new(),
             serves: HashMap::new(),
+            port_errors: HashMap::new(),
             uplinks: HashMap::new(),
             capture_feeds: HashMap::new(),
             attached: std::collections::HashSet::new(),
@@ -963,10 +973,43 @@ impl Server {
 
     /// (Re)run an idle or exited node's guest with its current args.
     fn run_node(&mut self, id: NodeId) {
+        // A container's rootfs is mounted asynchronously on the compile thread
+        // (see `PluginHost::spawn`), so a bind mounted at load — before the
+        // rootfs landed — gets shadowed by it. Re-lay this app's binds now, on
+        // top of the rootfs, right before the guest reads its filesystem.
+        self.reapply_binds(id);
         if let Some(node) = self.app_node(id) {
             let args = self.graph.node_args.get(&id).cloned().unwrap_or_default();
             if let Err(e) = self.host.run_node(&node, &args) {
                 eprintln!("failed to run {}: {e:#}", node.name);
+            }
+        }
+    }
+
+    /// Re-mount every bind wired into app `id` at its current path, over whatever
+    /// is already in the app's fs (its container rootfs). Idempotent: unmounts
+    /// any stale mount for the pair first. Ensures a guest sees its mounts even
+    /// when the bind was recorded before the async rootfs mount clobbered it.
+    fn reapply_binds(&mut self, app: NodeId) {
+        let Some(node) = self.app_node(app) else {
+            return;
+        };
+        let files: Vec<NodeId> = self
+            .graph
+            .connections
+            .iter()
+            .filter(|(_, a)| *a == app)
+            .map(|(f, _)| *f)
+            .collect();
+        for file in files {
+            let pair = (file, app);
+            let path = self.mount_path_for(file, app);
+            if let Some((old, fs)) = self.mounted.remove(&pair) {
+                crate::vfs::unmount_file(&fs, &old);
+            }
+            if let Some(f) = self.graph.file_nodes.get(&file) {
+                f.mount(&node.fs, &path);
+                self.mounted.insert(pair, (path, node.fs.clone()));
             }
         }
     }
@@ -1190,15 +1233,19 @@ impl Server {
         // Kill the servers to stop, then (re)bind the ones to start. `start_serve`
         // applies its own readiness/port-conflict guards.
         for http in plan.stop {
-            if let Some((_, kill)) = self.serves.remove(&http) {
+            if let Some((hostport, kill)) = self.serves.remove(&http) {
                 kill.store(true, Ordering::Relaxed);
+                self.port_errors.remove(&hostport);
             }
         }
         for (http, hostport) in plan.start {
             self.start_serve(http, hostport);
         }
-        // Drop container-port mappings for serve wires that no longer exist.
+        // Drop container-port mappings for serve wires that no longer exist, and
+        // any bind-error against a HostPort no longer on the receiving end of one.
         prune_side_map(&mut self.graph.serve_ports, &self.graph.serve_links);
+        let served: HashSet<NodeId> = self.graph.serve_links.iter().map(|&(_, hp)| hp).collect();
+        self.port_errors.retain(|hp, _| served.contains(hp));
     }
 
     /// Try to bind the server for one desired serve link. A wasi:http node gets
@@ -1234,9 +1281,15 @@ impl Server {
             return; // still compiling, or a node with nothing to serve
         };
         if let Err(e) = bound {
+            // Most often the localhost port is already taken (by another process
+            // — Docker, another server — or a stale wk). Record it against the
+            // HostPort so the client can warn, and log the detail once.
             eprintln!("failed to serve {} on :{port}: {e:#}", node.name);
+            self.port_errors
+                .insert(hostport_id, format!("localhost:{port} unavailable: {e}"));
             return;
         }
+        self.port_errors.remove(&hostport_id);
         self.serves.insert(http_id, (hostport_id, kill));
     }
 
@@ -2330,6 +2383,7 @@ impl Server {
             capture_feeds: self.capture_feeds.clone(),
             attached: self.attached.clone(),
             serves,
+            port_errors: self.port_errors.clone(),
             node_args: self.graph.node_args.clone(),
             available: self.graph.available.clone(),
             nodes,
@@ -2407,6 +2461,7 @@ impl Server {
                     runnable: app.as_ref().map(|n| n.is_runnable()).unwrap_or(false),
                     terminal: app.as_ref().map(|n| n.is_command()).unwrap_or(false),
                     attached: self.attached.contains(&id),
+                    error: v.port_errors.get(&id).cloned(),
                 }
             })
             .collect();

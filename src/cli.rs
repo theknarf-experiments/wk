@@ -175,6 +175,8 @@ struct NodeReport<'a> {
     kind: &'a str,
     name: &'a str,
     status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
     running: bool,
     runnable: bool,
     terminal: bool,
@@ -188,7 +190,9 @@ struct NodeReport<'a> {
 
 /// Status label for an inspected node, matching `wk ps`'s vocabulary.
 fn status_of(n: &wk_protocol::ipc::NodeInfo) -> &'static str {
-    if n.attached {
+    if n.error.is_some() {
+        "error"
+    } else if n.attached {
         "attached"
     } else if !n.runnable {
         "-"
@@ -226,6 +230,7 @@ fn node_report<'a>(snap: &'a Snapshot, node: &'a wk_protocol::ipc::NodeInfo) -> 
         kind: &node.kind,
         name: &node.name,
         status: status_of(node),
+        error: node.error.as_deref(),
         running: node.running,
         runnable: node.runnable,
         terminal: node.terminal,
@@ -620,7 +625,9 @@ pub fn ps(workspace: &Path) -> Result<(), String> {
         "ID", "KIND", "NAME", "STATUS"
     );
     for n in &snap.nodes {
-        let status = if n.attached {
+        let status = if n.error.is_some() {
+            "error".to_string()
+        } else if n.attached {
             "attached".to_string()
         } else if !n.runnable {
             "-".to_string()
@@ -630,13 +637,19 @@ pub fn ps(workspace: &Path) -> Result<(), String> {
             "idle".to_string()
         };
         let name = if n.name.is_empty() { "-" } else { &n.name };
+        // The trailing column carries the error message when there is one (a
+        // HostPort has no args of its own), else the launch args.
+        let detail = match &n.error {
+            Some(e) => e.clone(),
+            None => n.args.join(" "),
+        };
         println!(
             "{:<12}  {:<11}  {:<16}  {:<9}  {}",
             short(n.id),
             n.kind,
             name,
             status,
-            n.args.join(" ")
+            detail
         );
     }
     Ok(())
@@ -661,6 +674,7 @@ mod tests {
             runnable: true,
             terminal: false,
             attached: false,
+            error: None,
         }
     }
 
