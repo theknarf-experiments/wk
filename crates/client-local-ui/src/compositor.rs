@@ -2905,24 +2905,25 @@ impl App {
             if let Some(&port) = self.view.host_ports.get(&id) {
                 let serving = self.view.serves.values().any(|&hp| hp == id);
                 let conflict = self.port_conflicts.contains(&port);
-                let (status, status_col) = if conflict {
+                // The live/idle state is the compact, colour-coded title; the
+                // port (and any host→container map) is the roomy status line,
+                // clear of the close button.
+                let (state, state_col) = if conflict {
                     ("port in use", WARN)
                 } else if serving {
                     ("live ●", [0.4, 0.85, 0.5, 1.0])
                 } else {
                     ("idle", [0.55, 0.7, 0.72, 1.0])
                 };
-                // Show `host→container` when a serve wire maps to a different
-                // guest port, else just `:host`.
                 let container = self
                     .view
                     .serves
                     .iter()
                     .find(|(_, &hp)| hp == id)
                     .and_then(|(&served, _)| self.view.serve_ports.get(&(served, id)).copied());
-                let title = match container {
-                    Some(c) if c != port => format!("HostPort :{port}→{c}"),
-                    _ => format!("HostPort :{port}"),
+                let port_label = match container {
+                    Some(c) if c != port => format!(":{port}→{c}"),
+                    _ => format!(":{port}"),
                 };
                 self.draw_widget(
                     &mut quads,
@@ -2937,11 +2938,11 @@ impl App {
                         r,
                         border: HOSTPORT_BORDER,
                         bg: HOSTPORT_BG,
-                        title: &title,
-                        title_col: if conflict { WARN } else { TEXT },
-                        status,
-                        status_col,
-                        status_scale: 0.7,
+                        title: state,
+                        title_col: state_col,
+                        status: &port_label,
+                        status_col: TEXT,
+                        status_scale: 0.85,
                     },
                 );
                 // Port −/+ buttons (also: scroll over the node to change fast).
