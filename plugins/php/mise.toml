@@ -1,0 +1,5 @@
+# Build this plugin: `mise run build`
+[tasks.build]
+description = "Build upstream PHP 8.2 from source for wasm32-wasip2 (php -S sockets)"
+dir = "{{config_root}}"
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build.sh"

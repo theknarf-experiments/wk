@@ -89,6 +89,13 @@ plugins/python/stage/
 plugins/python/lib/
 plugins/python/python.wasm
 
+# php (upstream PHP built from source for wasm32-wasip2 by build.sh; source +
+# fetched upstream patches derived — only build.sh/Dockerfile/mise.toml/patches/
+# and the example are tracked)
+plugins/php/php-8.2.6/
+plugins/php/.patches/
+plugins/php/php.wasm
+
 # fetch (networked C client) build artifact
 plugins/fetch/fetch.wasm
 

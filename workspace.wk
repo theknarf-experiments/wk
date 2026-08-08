@@ -46,6 +46,9 @@ dependencies {
     python "docker://plugins/python/Dockerfile" {
         description "CPython 3.14 (a wasm container: python.wasm + stdlib; sockets work over the fabric)"
     }
+    php "docker://plugins/php/Dockerfile" {
+        description "PHP 8.2 (a wasm container; php -S built-in webserver over the fabric)"
+    }
     fetch "plugins/fetch/fetch.wasm" {
         description "TCP client: fetches host port over the fabric"
         args "example.com" "80"

@@ -1,0 +1,33 @@
+// vim: set filetype=kdl :
+// A real PHP webserver (php -S) as a wasm container on the userspace fabric.
+// From the repo root:
+//   wk run example/php-web.wk        # then, in another shell:  curl localhost:8091
+import "../workspace.wk"
+workspace "01KZK1AB00000000000000WS01" {
+    note "01KZK1AC00000000000000NT02" {
+        text "PHP webserver on the fabric.\n\nplugins/php is real PHP 8.2 built for\nwasm32-wasip2, so php -S binds real\nsockets over wk's network.\n\nindex.php (bind-mounted at /app) is\nserved by `php -S 0.0.0.0:8091 -t /app`,\njoined to a Network and published by\nthe HostPort.\n\nClick the php node's play button\n(networked nodes stay idle until run),\nthen:  curl localhost:8091"
+        pos 40.0 40.0
+        size 360.0 300.0
+    }
+    node "php" "01KZK1AD00000000000000AP03" {
+        pos 40.0 380.0
+        size 380.0 240.0
+        args "-S" "0.0.0.0:8091" "-t" "/app"
+    }
+    bindmount "example/php-web" "01KZK1AE00000000000000BM04" {
+        pos 470.0 40.0
+        size 150.0 44.0
+    }
+    hostport "01KZK1AF00000000000000HP05" {
+        port 8091
+        pos 500.0 460.0
+        size 130.0 44.0
+    }
+    network "01KZK1AG00000000000000NW06" {
+        pos 500.0 560.0
+        size 130.0 44.0
+    }
+    connection "01KZK1AE00000000000000BM04" "01KZK1AD00000000000000AP03" "/app"
+    serve "01KZK1AD00000000000000AP03" "01KZK1AF00000000000000HP05"
+    netlink "01KZK1AD00000000000000AP03" "01KZK1AG00000000000000NW06"
+}
