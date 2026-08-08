@@ -306,6 +306,10 @@ pub struct Workspace {
     pub midi: Vec<(NodeId, NodeId)>,
     /// Serve wiring as (served node id, HostPort id).
     pub serves: Vec<(NodeId, NodeId)>,
+    /// The guest (container) port a serve wire forwards to, keyed by
+    /// (served, hostport). Absent = the HostPort's own port. Only overrides are
+    /// stored (a `host:container` mapping where the two differ).
+    pub serve_ports: BTreeMap<(NodeId, NodeId), u16>,
     /// Network membership as (member id, Network id).
     pub net_links: Vec<(NodeId, NodeId)>,
     /// Screen-capture grants as (app id, Capture node id).
@@ -322,6 +326,7 @@ impl Workspace {
             mount_paths: BTreeMap::new(),
             midi: Vec::new(),
             serves: Vec::new(),
+            serve_ports: BTreeMap::new(),
             net_links: Vec::new(),
             capture_links: Vec::new(),
         }
@@ -616,7 +621,17 @@ fn parse_workspace(n: &KdlNode) -> Option<Workspace> {
                 }
             }
             "midi" => ws.midi.extend(pair(c)),
-            "serve" => ws.serves.extend(pair(c)),
+            "serve" => {
+                if let Some((a, b)) = pair(c) {
+                    ws.serves.push((a, b));
+                    // Optional 3rd arg: the guest (container) port for this serve.
+                    if let Some(p) = c.get(2).and_then(uint) {
+                        if let Ok(p) = u16::try_from(p) {
+                            ws.serve_ports.insert((a, b), p);
+                        }
+                    }
+                }
+            }
             "netlink" => ws.net_links.extend(pair(c)),
             "capturelink" => ws.capture_links.extend(pair(c)),
             _ => ws.nodes.extend(parse_snap(c)),
@@ -644,7 +659,12 @@ fn workspace_kdl(ws: &Workspace) -> KdlNode {
         ch.nodes_mut().push(pair_kdl("midi", src, dst));
     }
     for &(served, hostport) in &ws.serves {
-        ch.nodes_mut().push(pair_kdl("serve", served, hostport));
+        let mut s = pair_kdl("serve", served, hostport);
+        // A non-default container port rides along as a 3rd arg.
+        if let Some(&port) = ws.serve_ports.get(&(served, hostport)) {
+            s.push(KdlEntry::new(port as i128));
+        }
+        ch.nodes_mut().push(s);
     }
     for &(member, net) in &ws.net_links {
         ch.nodes_mut().push(pair_kdl("netlink", member, net));
@@ -1149,6 +1169,7 @@ mod tests {
                     mount_paths: BTreeMap::from([((chan, synth), "/data/notes.txt".to_string())]),
                     midi: vec![(msrc, mdst)],
                     serves: vec![(synth, port)],
+                    serve_ports: BTreeMap::from([((synth, port), 3000u16)]),
                     net_links: vec![(synth, net)],
                     capture_links: vec![(synth, chan)],
                 },
@@ -1367,6 +1388,8 @@ mod tests {
                     .iter()
                     .map(|&p| (p, "/mnt/data".to_string()))
                     .collect(),
+                // Likewise a container port on every generated serve.
+                serve_ports: serves.iter().map(|&p| (p, 3000u16)).collect(),
                 connections: conns,
                 midi,
                 serves,

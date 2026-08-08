@@ -439,6 +439,47 @@ pub fn mount(workspace: &Path, volume: &str, app: &str, path: &str) -> Result<()
     Ok(())
 }
 
+/// `wk port <served> <hostport> <container>`: set the guest (container) port a
+/// serve wire forwards to — the container side of a Docker `host:container` map
+/// (the host side is the HostPort's own port). `0` resets to forward verbatim.
+pub fn port(workspace: &Path, served: &str, hostport: &str, container: u16) -> Result<(), String> {
+    let mut stream = connect(workspace)?;
+    let snap = get_snapshot(&mut stream)?;
+    let served_id = resolve(&snap, served)?.id;
+    let hp_id = resolve(&snap, hostport)?.id;
+    if !snap
+        .wires
+        .iter()
+        .any(|w| w.kind == "serve" && w.a == served_id && w.b == hp_id)
+    {
+        return Err(format!(
+            "{served} is not served on {hostport} — wire them first with `wk wire`"
+        ));
+    }
+    send_command(
+        &mut stream,
+        Command::SetServePort {
+            served: served_id,
+            hostport: hp_id,
+            container,
+        },
+    )?;
+    if container == 0 {
+        println!(
+            "reset {} → {} to forward verbatim",
+            short(served_id),
+            short(hp_id)
+        );
+    } else {
+        println!(
+            "mapped {} → {} to container port {container}",
+            short(served_id),
+            short(hp_id)
+        );
+    }
+    Ok(())
+}
+
 /// `wk wire <a> <b>`: connect two nodes (the server infers the wire kind).
 pub fn wire(workspace: &Path, a: &str, b: &str) -> Result<(), String> {
     let mut stream = connect(workspace)?;

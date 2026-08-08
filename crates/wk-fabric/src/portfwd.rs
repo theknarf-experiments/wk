@@ -44,18 +44,20 @@ fn udp_socket() -> udp::Socket<'static> {
     udp::Socket::new(buf(), buf())
 }
 
-/// Forward `127.0.0.1:port` (TCP and UDP) to `target`'s fabric address at the
-/// same port. Binds synchronously (so a bind failure is reported to the
-/// caller), then serves on background threads until `kill` is set. The bridge
-/// NIC follows the target's *current* network, so rewiring the node onto
+/// Forward `127.0.0.1:host_port` (TCP and UDP) to `target`'s fabric address at
+/// `guest_port` — Docker-style `host:container` mapping (pass the same value for
+/// both to forward verbatim). Binds synchronously (so a bind failure is reported
+/// to the caller), then serves on background threads until `kill` is set. The
+/// bridge NIC follows the target's *current* network, so rewiring the node onto
 /// another Network applies to new traffic without restarting the forward.
 pub fn forward(
     hub: Arc<NetHub>,
     target: SharedStack,
-    port: u16,
+    host_port: u16,
+    guest_port: u16,
     kill: Arc<AtomicBool>,
 ) -> Result<()> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::from(([127, 0, 0, 1], host_port));
     let listener = TcpListener::bind(addr).map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
     let udp_sock = UdpSocket::bind(addr).map_err(|e| anyhow::anyhow!("bind {addr}/udp: {e}"))?;
     // Nonblocking / short timeouts so both loops can poll the kill flag.
@@ -68,7 +70,7 @@ pub fn forward(
     let bridge = hub.attach(net, hub.alloc_ip(2), "");
 
     let tcp_thread = std::thread::Builder::new()
-        .name(format!("wk-portfwd-tcp-{port}"))
+        .name(format!("wk-portfwd-tcp-{host_port}"))
         .spawn({
             let (target, bridge, kill) = (target.clone(), bridge.clone(), kill.clone());
             move || {
@@ -88,7 +90,7 @@ pub fn forward(
                             local_port = local_port.checked_add(1).unwrap_or(49152);
                             let lp = local_port;
                             std::thread::spawn(move || {
-                                pump(stream, bridge, dst.into(), port, lp, kill)
+                                pump(stream, bridge, dst.into(), guest_port, lp, kill)
                             });
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -102,16 +104,16 @@ pub fn forward(
         .expect("spawn portfwd tcp thread");
 
     let udp_thread = std::thread::Builder::new()
-        .name(format!("wk-portfwd-udp-{port}"))
+        .name(format!("wk-portfwd-udp-{host_port}"))
         .spawn({
             let (target, bridge, kill) = (target.clone(), bridge.clone(), kill.clone());
-            move || udp_pump(udp_sock, bridge, target, port, kill)
+            move || udp_pump(udp_sock, bridge, target, guest_port, kill)
         })
         .expect("spawn portfwd udp thread");
 
     // Detach the bridge NIC only once both protocol loops are done with it.
     std::thread::Builder::new()
-        .name(format!("wk-portfwd-{port}"))
+        .name(format!("wk-portfwd-{host_port}"))
         .spawn(move || {
             let _ = tcp_thread.join();
             let _ = udp_thread.join();
@@ -404,7 +406,7 @@ mod tests {
         });
 
         let kill = Arc::new(AtomicBool::new(false));
-        forward(hub.clone(), server.clone(), port, kill.clone()).unwrap();
+        forward(hub.clone(), server.clone(), port, port, kill.clone()).unwrap();
 
         let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -421,6 +423,66 @@ mod tests {
         }
         assert_eq!(&got, b"ping over the fabric");
 
+        kill.store(true, Ordering::Relaxed);
+    }
+
+    /// `host:container` mapping: the host binds one port and the guest listens
+    /// on a *different* one; a client on the host port reaches the guest port.
+    #[test]
+    fn host_port_maps_to_a_different_guest_port() {
+        let hub = NetHub::new();
+        let net = NodeId::nil();
+        let server = hub.attach(net, Ipv4Address::new(10, 0, 0, 2), "server");
+        let host_port = free_port();
+        let guest_port = free_port();
+        assert_ne!(host_port, guest_port);
+
+        // The "guest" listens on guest_port and echoes.
+        let server_h = {
+            let mut g = server.lock().unwrap();
+            let h = g.sockets.add(tcp_socket());
+            g.sockets
+                .get_mut::<tcp::Socket>(h)
+                .listen(guest_port)
+                .unwrap();
+            h
+        };
+        let echo_stack = server.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            for _ in 0..5000 {
+                {
+                    let mut g = echo_stack.lock().unwrap();
+                    let s = g.sockets.get_mut::<tcp::Socket>(server_h);
+                    if s.can_recv() {
+                        if let Ok(n) = s.recv_slice(&mut buf) {
+                            if n > 0 && s.can_send() {
+                                s.send_slice(&buf[..n]).unwrap();
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        let kill = Arc::new(AtomicBool::new(false));
+        forward(hub, server, host_port, guest_port, kill.clone()).unwrap();
+
+        // Connecting to the *host* port reaches the guest on its *own* port.
+        let mut c = TcpStream::connect(("127.0.0.1", host_port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.write_all(b"mapped").unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 64];
+        while got.len() < 6 {
+            match c.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(e) => panic!("read from mapped connection: {e}"),
+            }
+        }
+        assert_eq!(&got, b"mapped");
         kill.store(true, Ordering::Relaxed);
     }
 
@@ -458,7 +520,7 @@ mod tests {
         });
 
         let kill = Arc::new(AtomicBool::new(false));
-        forward(hub.clone(), server.clone(), port, kill.clone()).unwrap();
+        forward(hub.clone(), server.clone(), port, port, kill.clone()).unwrap();
 
         let recv_echo = |c: &UdpSocket, sent: &[u8]| {
             let mut buf = [0u8; 256];
@@ -488,7 +550,7 @@ mod tests {
         let server = hub.attach(NodeId::nil(), Ipv4Address::new(10, 0, 0, 2), "server");
         let port = free_port();
         let kill = Arc::new(AtomicBool::new(false));
-        forward(hub, server, port, kill.clone()).unwrap();
+        forward(hub, server, port, port, kill.clone()).unwrap();
         kill.store(true, Ordering::Relaxed);
         // Both loops notice the kill within one poll interval.
         let mut rebound = false;

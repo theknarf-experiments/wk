@@ -1045,11 +1045,12 @@ impl PluginHost {
     pub fn forward(
         &self,
         target: wk_fabric::netstack::SharedStack,
-        port: u16,
+        host_port: u16,
+        guest_port: u16,
         kill: Arc<AtomicBool>,
     ) -> Result<()> {
         // The fabric crate reports plain anyhow errors; bridge into wasmtime's.
-        wk_fabric::portfwd::forward(self.hub.clone(), target, port, kill)
+        wk_fabric::portfwd::forward(self.hub.clone(), target, host_port, guest_port, kill)
             .map_err(wasmtime::Error::from_anyhow)
     }
 

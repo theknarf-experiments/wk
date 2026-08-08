@@ -87,6 +87,16 @@ enum Commands {
         path: Option<String>,
     },
 
+    /// Map a serve wire's guest port (the container side of `host:container`)
+    Port {
+        /// Served node (name, or any part of its id)
+        served: String,
+        /// HostPort node it's served on
+        hostport: String,
+        /// Guest/container port to forward to (0 = forward verbatim)
+        container: u16,
+    },
+
     /// Attach to a running terminal node's I/O (like `docker attach`)
     Attach {
         /// Node reference: its name, or any part of its id
@@ -248,6 +258,11 @@ fn main() -> Result<(), String> {
         Some(Commands::Mount { volume, app, path }) => {
             cli::mount(file, volume, app, path.as_deref().unwrap_or(""))
         }
+        Some(Commands::Port {
+            served,
+            hostport,
+            container,
+        }) => cli::port(file, served, hostport, *container),
         Some(Commands::Attach { node }) => attach::attach(file, node),
         Some(Commands::Logs { node, follow }) => cli::logs(file, node, *follow),
         Some(Commands::Inspect { target }) => cli::inspect(file, target),

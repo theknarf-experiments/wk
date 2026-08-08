@@ -477,8 +477,12 @@ pub struct Graph {
     pub mount_paths: HashMap<(NodeId, NodeId), String>,
     /// MIDI connections as (source node id, destination node id).
     pub midi_links: Vec<(NodeId, NodeId)>,
-    /// Serve wiring: (http node id, HostPort id).
+    /// Serve wiring: (served node id, HostPort id).
     pub serve_links: Vec<(NodeId, NodeId)>,
+    /// The guest (container) port a serve wire forwards to, keyed by
+    /// (served, hostport). Absent = the HostPort's own port (forward verbatim).
+    /// Only meaningful for the wasi:sockets forward path; http serve ignores it.
+    pub serve_ports: HashMap<(NodeId, NodeId), u16>,
     /// Network membership wires, as (app node id, Network node id).
     pub net_links: Vec<(NodeId, NodeId)>,
     /// Screen-capture grants, as (app node id, Capture node id).
@@ -650,6 +654,11 @@ impl Server {
             self.graph.mount_paths.insert(pair, path.clone());
         }
         self.sync_mounts();
+        // Restore per-serve container ports, then re-bind so they take effect.
+        for (&pair, &port) in &saved.serve_ports {
+            self.graph.serve_ports.insert(pair, port);
+        }
+        self.sync_serves();
     }
 
     /// Record a node's base fact: kind, workspace, and canvas geometry.
@@ -1170,6 +1179,35 @@ impl Server {
         self.sync_serves();
     }
 
+    /// The guest (container) port a serve wire forwards to: the per-wire mapping
+    /// if set, else the HostPort's own `host_port` (forward verbatim).
+    fn serve_port_for(&self, served: NodeId, hostport: NodeId, host_port: u16) -> u16 {
+        self.graph
+            .serve_ports
+            .get(&(served, hostport))
+            .copied()
+            .unwrap_or(host_port)
+    }
+
+    /// Set (or clear) the guest port a serve wire maps to, rebinding it live. A
+    /// `0`/absent container port resets to the HostPort's own port.
+    fn set_serve_port(&mut self, served: NodeId, hostport: NodeId, container: u16) {
+        if !self.graph.serve_links.contains(&(served, hostport)) {
+            return; // not a serve wire
+        }
+        if container == 0 {
+            self.graph.serve_ports.remove(&(served, hostport));
+        } else {
+            self.graph.serve_ports.insert((served, hostport), container);
+        }
+        // Rebind so the new mapping takes effect: stop the running server, then
+        // let the next reconcile (or this call) restart it.
+        if let Some((_, kill)) = self.serves.remove(&served) {
+            kill.store(true, Ordering::Relaxed);
+        }
+        self.sync_serves();
+    }
+
     /// Reconcile the running [`Self::serves`] against the desired
     /// [`Self::serve_links`]: stop servers whose wiring changed or whose node/port
     /// went away, and start desired servers that aren't running yet and are now
@@ -1190,6 +1228,9 @@ impl Server {
         for (http, hostport) in plan.start {
             self.start_serve(http, hostport);
         }
+        // Drop container-port mappings for serve wires that no longer exist.
+        let live: HashSet<(NodeId, NodeId)> = self.graph.serve_links.iter().copied().collect();
+        self.graph.serve_ports.retain(|pair, _| live.contains(pair));
     }
 
     /// Try to bind the server for one desired serve link. A wasi:http node gets
@@ -1216,7 +1257,10 @@ impl Server {
             self.host
                 .serve(&path, port, Some(node.term_io.clone()), kill.clone())
         } else if let Some(stack) = node.net_stack() {
-            self.host.forward(stack, port, kill.clone())
+            // host:container — forward the localhost port to the guest's own port
+            // (defaults to the same number when no mapping is set).
+            let guest_port = self.serve_port_for(http_id, hostport_id, port);
+            self.host.forward(stack, port, guest_port, kill.clone())
         } else {
             return; // still compiling, or a node with nothing to serve
         };
@@ -1644,6 +1688,11 @@ impl Server {
                     .iter()
                     .filter_map(|pair| self.graph.mount_paths.get(pair).map(|p| (*pair, p.clone())))
                     .collect();
+                // Persist container-port overrides for this workspace's serves.
+                let serve_ports = serves
+                    .iter()
+                    .filter_map(|pair| self.graph.serve_ports.get(pair).map(|&p| (*pair, p)))
+                    .collect();
                 Workspace {
                     id: ws_id,
                     nodes,
@@ -1651,6 +1700,7 @@ impl Server {
                     mount_paths,
                     midi,
                     serves,
+                    serve_ports,
                     net_links,
                     capture_links,
                 }
@@ -1776,8 +1826,12 @@ impl Server {
                     }
                 }
             }
-            // Not undoable: run, mount-path edits, and undo itself.
-            Command::SetMount { .. } | Command::Run(_) | Command::Stop(_) | Command::Undo => {}
+            // Not undoable: run, mount-path / serve-port edits, and undo itself.
+            Command::SetMount { .. }
+            | Command::SetServePort { .. }
+            | Command::Run(_)
+            | Command::Stop(_)
+            | Command::Undo => {}
         }
         self.dispatch(cmd);
     }
@@ -1842,6 +1896,11 @@ impl Server {
             Command::Delete(ResourceRef::Wire(w)) => self.disconnect_wire(w),
             Command::Delete(ResourceRef::Workspace(id)) => self.remove_workspace(id),
             Command::SetMount { volume, app, path } => self.set_mount(volume, app, path),
+            Command::SetServePort {
+                served,
+                hostport,
+                container,
+            } => self.set_serve_port(served, hostport, container),
             Command::Run(id) => self.run_node(id),
             Command::Stop(id) => self.stop_node(id),
             Command::Duplicate(id) => self.duplicate(id),
@@ -2485,6 +2544,37 @@ mod model_tests {
         assert!(!s.graph.net_links.contains(&(uplink, net2)));
     }
 
+    /// `SetServePort` records a serve wire's container port in the graph and
+    /// `serve_port_for` reports it; `0` resets to the HostPort's own port.
+    #[test]
+    fn set_serve_port_maps_then_resets() {
+        let mut s = fresh_server();
+        let served = NodeId::new();
+        let hostport = NodeId::new();
+        s.graph.serve_links.push((served, hostport));
+        // Default: forward verbatim (the host port).
+        assert_eq!(s.serve_port_for(served, hostport, 8080), 8080);
+
+        s.apply(Command::SetServePort {
+            served,
+            hostport,
+            container: 3000,
+        });
+        assert_eq!(
+            s.graph.serve_ports.get(&(served, hostport)).copied(),
+            Some(3000)
+        );
+        assert_eq!(s.serve_port_for(served, hostport, 8080), 3000);
+
+        s.apply(Command::SetServePort {
+            served,
+            hostport,
+            container: 0,
+        });
+        assert!(!s.graph.serve_ports.contains_key(&(served, hostport)));
+        assert_eq!(s.serve_port_for(served, hostport, 8080), 8080);
+    }
+
     /// `SetMount` overrides where a bind mounts and remembers it in the graph;
     /// an empty path resets to the default (the volume's name at the root).
     #[test]
@@ -2683,6 +2773,7 @@ mod model_tests {
                 mount_paths: std::collections::BTreeMap::new(),
                 midi: Vec::new(),
                 serves: Vec::new(),
+                serve_ports: std::collections::BTreeMap::new(),
                 capture_links: Vec::new(),
                 net_links: Vec::new(),
             }],

@@ -205,6 +205,14 @@ pub enum Command {
         app: NodeId,
         path: String,
     },
+    /// Set the guest (container) port a serve wire (`served` → `hostport`)
+    /// forwards to — the container side of a Docker `host:container` map. `0`
+    /// resets it to the HostPort's own port (forward verbatim).
+    SetServePort {
+        served: NodeId,
+        hostport: NodeId,
+        container: u16,
+    },
     /// (Re)run an idle/exited app node's guest.
     Run(NodeId),
     /// Stop a running app node's guest (it stays placed and can be re-run).
@@ -241,8 +249,11 @@ impl Command {
             }
             Command::Delete(ResourceRef::Node(_)) => (ResourceKind::Node, Action::Delete),
             Command::Delete(ResourceRef::Wire(_)) => (ResourceKind::Wire, Action::Delete),
-            // Reconfiguring a bind's mount path modifies that wire.
-            Command::SetMount { .. } => (ResourceKind::Wire, Action::Update),
+            // Reconfiguring a bind's mount path or a serve's container port
+            // modifies that wire.
+            Command::SetMount { .. } | Command::SetServePort { .. } => {
+                (ResourceKind::Wire, Action::Update)
+            }
             Command::Delete(ResourceRef::Workspace(_)) => (ResourceKind::Workspace, Action::Delete),
             Command::Run(_) | Command::Stop(_) => (ResourceKind::Node, Action::Run),
             Command::Duplicate(_) => (ResourceKind::Node, Action::Create),
