@@ -10827,6 +10827,8 @@ dependencies = [
  "client-local-ui",
  "env_logger",
  "libc",
+ "serde",
+ "serde_json",
  "wk-protocol",
  "wk-server",
  "wk-token-service",

@@ -92,6 +92,12 @@ enum Commands {
         follow: bool,
     },
 
+    /// Show a node's or image's full detail as JSON (like `docker inspect`)
+    Inspect {
+        /// A node reference (name / id part) or an image id in the local store
+        target: String,
+    },
+
     /// Stop a running node's guest (it stays placed; restart with `wk up`/start)
     Stop { node: String },
 
@@ -220,6 +226,7 @@ fn main() -> Result<(), String> {
         Some(Commands::Unwire { a, b }) => cli::unwire(file, a, b),
         Some(Commands::Attach { node }) => attach::attach(file, node),
         Some(Commands::Logs { node, follow }) => cli::logs(file, node, *follow),
+        Some(Commands::Inspect { target }) => cli::inspect(file, target),
         Some(Commands::Stop { node }) => cli::stop(file, node),
         Some(Commands::Restart { node }) => cli::restart(file, node),
         Some(Commands::Down) => cli::down(file),

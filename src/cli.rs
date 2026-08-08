@@ -160,6 +160,135 @@ pub fn logs(workspace: &Path, node: &str, follow: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// One connection of an inspected node: the wire kind and the peer it joins.
+#[derive(serde::Serialize)]
+struct Connection {
+    kind: String,
+    peer: String,
+    peer_name: String,
+}
+
+/// A node's full detail, as `wk inspect` prints it (pretty JSON, docker-style).
+#[derive(serde::Serialize)]
+struct NodeReport<'a> {
+    id: String,
+    kind: &'a str,
+    name: &'a str,
+    status: &'static str,
+    running: bool,
+    runnable: bool,
+    terminal: bool,
+    attached: bool,
+    args: &'a [String],
+    pos: [f32; 2],
+    size: [f32; 2],
+    workspace: String,
+    connections: Vec<Connection>,
+}
+
+/// Status label for an inspected node, matching `wk ps`'s vocabulary.
+fn status_of(n: &wk_protocol::ipc::NodeInfo) -> &'static str {
+    if n.attached {
+        "attached"
+    } else if !n.runnable {
+        "-"
+    } else if n.running {
+        "running"
+    } else {
+        "idle"
+    }
+}
+
+/// Build the detail report for one node, resolving its wires to the peer nodes.
+fn node_report<'a>(snap: &'a Snapshot, node: &'a wk_protocol::ipc::NodeInfo) -> NodeReport<'a> {
+    let name_of = |id| {
+        snap.nodes
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| n.name.clone())
+            .unwrap_or_default()
+    };
+    let connections = snap
+        .wires
+        .iter()
+        .filter(|w| w.a == node.id || w.b == node.id)
+        .map(|w| {
+            let peer = if w.a == node.id { w.b } else { w.a };
+            Connection {
+                kind: w.kind.clone(),
+                peer: short(peer),
+                peer_name: name_of(peer),
+            }
+        })
+        .collect();
+    NodeReport {
+        id: node.id.to_string(),
+        kind: &node.kind,
+        name: &node.name,
+        status: status_of(node),
+        running: node.running,
+        runnable: node.runnable,
+        terminal: node.terminal,
+        attached: node.attached,
+        args: &node.args,
+        pos: node.pos,
+        size: node.size,
+        workspace: short(node.ws),
+        connections,
+    }
+}
+
+/// Resolve an image reference (a full id or any distinguishing substring) to
+/// exactly one stored image. Mirrors [`resolve`] for nodes.
+fn resolve_image(
+    images: &[(String, wk_server::images::ImageManifest)],
+    query: &str,
+) -> Option<usize> {
+    let matches: Vec<usize> = images
+        .iter()
+        .enumerate()
+        .filter(|(_, (id, _))| id.contains(query))
+        .map(|(i, _)| i)
+        .collect();
+    match matches.as_slice() {
+        [one] => Some(*one),
+        _ => None,
+    }
+}
+
+/// `wk inspect <ref>`: print a node's or image's full detail as pretty JSON
+/// (like `docker inspect`). An image id/prefix in the local store wins; anything
+/// else is resolved as a node against the running server.
+pub fn inspect(workspace: &Path, target: &str) -> Result<(), String> {
+    // Images are a local store (no server needed), so check them first.
+    let images = wk_server::images::list_images();
+    if let Some(i) = resolve_image(&images, target) {
+        let (id, manifest) = &images[i];
+        #[derive(serde::Serialize)]
+        struct ImageReport<'a> {
+            id: &'a str,
+            #[serde(flatten)]
+            manifest: &'a wk_server::images::ImageManifest,
+        }
+        let report = ImageReport { id, manifest };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+    // Otherwise it's a live node: resolve it against the running server.
+    let mut stream = connect(workspace)?;
+    let snap = get_snapshot(&mut stream)?;
+    let node = resolve(&snap, target)?;
+    let report = node_report(&snap, node);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+    );
+    Ok(())
+}
+
 /// `wk node rm <ref>`: delete a node.
 pub fn rm(workspace: &Path, node: &str) -> Result<(), String> {
     let mut stream = connect(workspace)?;
@@ -385,6 +514,35 @@ mod tests {
         let tail: String = piano.id.to_string().chars().rev().take(4).collect();
         let tail: String = tail.chars().rev().collect();
         assert_eq!(resolve(&s, &tail).unwrap().id, piano.id);
+    }
+
+    #[test]
+    fn inspect_report_resolves_a_nodes_connections() {
+        use wk_protocol::ipc::WireInfo;
+        let mut vim = node(0xA1, "vim");
+        vim.terminal = true;
+        vim.running = true;
+        let notes = node(0xB2, "notes.txt");
+        let s = Snapshot {
+            workspaces: vec![NodeId::from_u128(1)],
+            nodes: vec![vim.clone(), notes.clone()],
+            wires: vec![WireInfo {
+                kind: "file".into(),
+                a: notes.id,
+                b: vim.id,
+            }],
+            available: vec![],
+        };
+        let report = node_report(&s, &s.nodes[0]);
+        assert_eq!(report.name, "vim");
+        assert_eq!(report.status, "running");
+        assert_eq!(report.connections.len(), 1);
+        assert_eq!(report.connections[0].kind, "file");
+        assert_eq!(report.connections[0].peer_name, "notes.txt");
+        // Serializes to JSON (what the command prints).
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"connections\""));
+        assert!(json.contains(&vim.id.to_string()), "full id in output");
     }
 
     #[test]
