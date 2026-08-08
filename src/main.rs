@@ -92,6 +92,18 @@ enum Commands {
         follow: bool,
     },
 
+    /// Stop a running node's guest (it stays placed; restart with `wk up`/start)
+    Stop { node: String },
+
+    /// Restart a node (stop, then start)
+    Restart { node: String },
+
+    /// Stop every running node in the workspace
+    Down,
+
+    /// Start every idle runnable node in the workspace
+    Up,
+
     /// Manage wk's local OCI image store
     Images {
         #[command(subcommand)]
@@ -208,6 +220,10 @@ fn main() -> Result<(), String> {
         Some(Commands::Unwire { a, b }) => cli::unwire(file, a, b),
         Some(Commands::Attach { node }) => attach::attach(file, node),
         Some(Commands::Logs { node, follow }) => cli::logs(file, node, *follow),
+        Some(Commands::Stop { node }) => cli::stop(file, node),
+        Some(Commands::Restart { node }) => cli::restart(file, node),
+        Some(Commands::Down) => cli::down(file),
+        Some(Commands::Up) => cli::up(file),
         Some(Commands::Images { cmd }) => images_cmd(cmd),
         Some(Commands::Remove { plugin }) => workspace::remove(plugin.clone(), file),
         Some(Commands::Run {

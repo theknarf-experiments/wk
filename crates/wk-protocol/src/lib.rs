@@ -193,6 +193,8 @@ pub enum Command {
     Delete(ResourceRef),
     /// (Re)run an idle/exited app node's guest.
     Run(NodeId),
+    /// Stop a running app node's guest (it stays placed and can be re-run).
+    Stop(NodeId),
     /// Duplicate a node in place (same workspace, offset position). App nodes
     /// keep their current args and knob settings; wiring is not copied.
     Duplicate(NodeId),
@@ -222,7 +224,7 @@ impl Command {
             Command::Delete(ResourceRef::Node(_)) => (ResourceKind::Node, Action::Delete),
             Command::Delete(ResourceRef::Wire(_)) => (ResourceKind::Wire, Action::Delete),
             Command::Delete(ResourceRef::Workspace(_)) => (ResourceKind::Workspace, Action::Delete),
-            Command::Run(_) => (ResourceKind::Node, Action::Run),
+            Command::Run(_) | Command::Stop(_) => (ResourceKind::Node, Action::Run),
             Command::Duplicate(_) => (ResourceKind::Node, Action::Create),
             // Undo can restore or remove anything it previously recorded, so it
             // needs document-wide write authority.

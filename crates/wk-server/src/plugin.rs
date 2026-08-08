@@ -1224,6 +1224,8 @@ impl PluginHost {
         }
         node.finished.store(false, Ordering::Relaxed);
         node.kill.store(false, Ordering::Relaxed);
+        // Re-open stdin in case a previous `stop` closed it (EOF).
+        node.term_io.reopen();
 
         let linker = self.build_linker()?;
         // Reuse the already-compiled component (cheap Arc clone) — never recompile.

@@ -204,6 +204,12 @@ impl TermIo {
     pub fn is_closed(&self) -> bool {
         self.inp.lock().unwrap().closed
     }
+
+    /// Re-open stdin after a `close()` so a restarted guest can read again. The
+    /// old guest saw EOF and exited; the new one starts from a clean stream.
+    pub fn reopen(&self) {
+        self.inp.lock().unwrap().closed = false;
+    }
 }
 
 /// `WasiCtxBuilder` stdout/stderr handle for a terminal node.

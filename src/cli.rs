@@ -182,6 +182,69 @@ pub fn start(workspace: &Path, node: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `wk stop <ref>`: stop a running node's guest (it stays placed, restartable).
+pub fn stop(workspace: &Path, node: &str) -> Result<(), String> {
+    let mut stream = connect(workspace)?;
+    let snap = get_snapshot(&mut stream)?;
+    let id = resolve(&snap, node)?.id;
+    send_command(&mut stream, Command::Stop(id))?;
+    println!("stopped {}", short(id));
+    Ok(())
+}
+
+/// `wk restart <ref>`: stop the node, wait for it to exit, then start it again.
+pub fn restart(workspace: &Path, node: &str) -> Result<(), String> {
+    let mut stream = connect(workspace)?;
+    let snap = get_snapshot(&mut stream)?;
+    let id = resolve(&snap, node)?.id;
+    send_command(&mut stream, Command::Stop(id))?;
+    // The guest exits asynchronously; wait until it's idle before re-running
+    // (Run is a no-op while it's still marked running).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let snap = get_snapshot(&mut stream)?;
+        if snap
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .is_none_or(|n| !n.running)
+        {
+            break;
+        }
+    }
+    send_command(&mut stream, Command::Run(id))?;
+    println!("restarted {}", short(id));
+    Ok(())
+}
+
+/// `wk down`: stop every running app node in the workspace (leaves them placed;
+/// bring them back with `wk up`).
+pub fn down(workspace: &Path) -> Result<(), String> {
+    let mut stream = connect(workspace)?;
+    let snap = get_snapshot(&mut stream)?;
+    let mut n = 0;
+    for node in snap.nodes.iter().filter(|n| n.running) {
+        send_command(&mut stream, Command::Stop(node.id))?;
+        n += 1;
+    }
+    println!("stopped {n} node(s)");
+    Ok(())
+}
+
+/// `wk up`: start every idle/exited runnable app node in the workspace.
+pub fn up(workspace: &Path) -> Result<(), String> {
+    let mut stream = connect(workspace)?;
+    let snap = get_snapshot(&mut stream)?;
+    let mut n = 0;
+    for node in snap.nodes.iter().filter(|n| n.runnable && !n.running) {
+        send_command(&mut stream, Command::Run(node.id))?;
+        n += 1;
+    }
+    println!("started {n} node(s)");
+    Ok(())
+}
+
 /// `wk node set <ref> --args "..."`: set a node's launch args.
 pub fn set_args(workspace: &Path, node: &str, args: &str) -> Result<(), String> {
     let mut stream = connect(workspace)?;

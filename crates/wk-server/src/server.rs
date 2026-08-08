@@ -971,6 +971,37 @@ impl Server {
         }
     }
 
+    /// Stop a running app node's guest without removing the node: halt the
+    /// guest but leave the node, its wiring, and its net stack in place, so
+    /// `Run` can re-spawn it (run_node resets the kill/finished flags).
+    fn stop_node(&mut self, id: NodeId) {
+        self.halt_guest(id);
+    }
+
+    /// Signal a node's guest to exit and wake it if it's parked. Sets the kill
+    /// switch (tripped at the next epoch — within ~100ms for a terminal node,
+    /// whose stdin poll is capped) and closes+removes any surface it owns, so a
+    /// guest blocked on `frame.block()` wakes and exits (and no stale surface
+    /// lingers). Shared by `stop_node` and `close_node`; leaves the node record
+    /// and its terminal/net state untouched so it can be re-run.
+    fn halt_guest(&self, id: NodeId) {
+        if let Some(node) = self.app_node(id) {
+            node.kill.store(true, Ordering::Relaxed);
+            // EOF on stdin so a guest parked in a plain blocking read (no tty
+            // poll cap) wakes and exits; run_node reopens it on restart.
+            node.term_io.close();
+        }
+        self.registry.lock().unwrap().retain(|s| {
+            let mut g = s.lock().unwrap();
+            if g.node_id != id {
+                return true;
+            }
+            g.closed = true;
+            g.wake();
+            false
+        });
+    }
+
     /// Set a node's launch args from a whitespace-separated string. Guarded to
     /// existing nodes so an `Update` on an unknown id can't grow `node_args`
     /// without bound. For an uplink the args are its peer ticket — this dials
@@ -1364,22 +1395,15 @@ impl Server {
     /// Kill a node and drop everything referencing it (its wiring, geometry, and
     /// the wasm instance). Used when a client closes a node.
     fn close_node(&mut self, id: NodeId) {
+        // Halt the guest (kill + wake/close its surface), then also close stdin
+        // and detach the fabric — the extra teardown a permanent removal needs
+        // over a restartable `stop`.
+        self.halt_guest(id);
         if let Some(node) = self.app_node(id) {
-            node.kill.store(true, Ordering::Relaxed);
-            node.term_io.close();
             if let Some(stack) = &node.net_stack() {
                 self.host.detach_net(stack);
             }
         }
-        self.registry.lock().unwrap().retain(|s| {
-            let mut g = s.lock().unwrap();
-            if g.node_id != id {
-                return true;
-            }
-            g.closed = true;
-            g.wake();
-            false
-        });
         self.node_reg.lock().unwrap().retain(|x| x.id != id);
         // Drop every wire touching this node from the desired relations, then
         // reconcile so the corresponding effects (mounts, routes, servers) are
@@ -1606,7 +1630,7 @@ impl Server {
                 }
             }
             // Not undoable: run and undo itself.
-            Command::Run(_) | Command::Undo => {}
+            Command::Run(_) | Command::Stop(_) | Command::Undo => {}
         }
         self.dispatch(cmd);
     }
@@ -1663,6 +1687,7 @@ impl Server {
             Command::Delete(ResourceRef::Wire(w)) => self.disconnect_wire(w),
             Command::Delete(ResourceRef::Workspace(id)) => self.remove_workspace(id),
             Command::Run(id) => self.run_node(id),
+            Command::Stop(id) => self.stop_node(id),
             Command::Duplicate(id) => self.duplicate(id),
             Command::Undo => {
                 if let Some(u) = self.undo.pop() {
