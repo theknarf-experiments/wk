@@ -70,6 +70,88 @@ pub const DEFAULT_WORKSPACE: &str = "workspace.wk";
 /// harmlessly (the parser ignores it).
 const MODELINE: &str = "// vim: set filetype=kdl :";
 
+/// The identity that pairs a freshly-generated KDL node with the same node in
+/// the existing file, so a save can carry that node's comment across. Placed
+/// nodes and workspaces key on their stable id; wires on their kind + endpoints.
+#[derive(PartialEq, Eq, Hash)]
+enum NodeIdent {
+    Import(String),
+    Dependencies,
+    Workspace(NodeId),
+    Placed(NodeId),
+    Wire(String, NodeId, NodeId),
+}
+
+/// The identity of a top-level or in-workspace KDL node, if it has one.
+fn node_ident(n: &KdlNode) -> Option<NodeIdent> {
+    let name = n.name().value();
+    match name {
+        "import" => n
+            .get(0)
+            .and_then(|v| v.as_string())
+            .map(|s| NodeIdent::Import(s.to_string())),
+        "dependencies" => Some(NodeIdent::Dependencies),
+        "workspace" => n.get(0).and_then(node_id).map(NodeIdent::Workspace),
+        "connection" | "midi" | "serve" | "netlink" | "capturelink" => {
+            let a = n.get(0).and_then(node_id)?;
+            let b = n.get(1).and_then(node_id)?;
+            Some(NodeIdent::Wire(name.to_string(), a, b))
+        }
+        _ => {
+            // A placed node: named kinds carry the id second, others first.
+            let named = matches!(
+                name,
+                "node" | "volume" | "virtualfile" | "bindmount" | "hostfile"
+            );
+            node_id(n.get(if named { 1 } else { 0 })?).map(NodeIdent::Placed)
+        }
+    }
+}
+
+/// Graft the comments from `old` onto the freshly-built `fresh` document:
+/// the header (document leading trivia) and each node's leading comment,
+/// matched by [`node_ident`], recursing into workspace/dependency children.
+/// `autoformat` (called after) keeps these comments while normalising spacing.
+fn graft_comments(fresh: &mut KdlDocument, old: &KdlDocument) {
+    if let Some(hdr) = old.format().map(|f| f.leading.clone()) {
+        if !hdr.trim().is_empty() {
+            let mut f = fresh.format().cloned().unwrap_or_default();
+            f.leading = hdr;
+            fresh.set_format(f);
+        }
+    }
+    graft_level(fresh, old);
+}
+
+/// Copy leading comments from `old`'s nodes onto `fresh`'s at one nesting level,
+/// recursing into the children of any node paired by identity.
+fn graft_level(fresh: &mut KdlDocument, old: &KdlDocument) {
+    use std::collections::HashMap;
+    let old_by: HashMap<NodeIdent, &KdlNode> = old
+        .nodes()
+        .iter()
+        .filter_map(|n| node_ident(n).map(|i| (i, n)))
+        .collect();
+    for fnode in fresh.nodes_mut() {
+        let Some(ident) = node_ident(fnode) else {
+            continue;
+        };
+        let Some(&onode) = old_by.get(&ident) else {
+            continue;
+        };
+        if let Some(of) = onode.format() {
+            if !of.leading.trim().is_empty() {
+                let mut ff = fnode.format().cloned().unwrap_or_default();
+                ff.leading = of.leading.clone();
+                fnode.set_format(ff);
+            }
+        }
+        if let (Some(oc), Some(fc)) = (onode.children(), fnode.children_mut().as_mut()) {
+            graft_level(fc, oc);
+        }
+    }
+}
+
 /// Where a dependency's wasm comes from.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Source {
@@ -398,8 +480,31 @@ impl Document {
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        std::fs::write(path, self.to_kdl())
-            .map_err(|e| format!("failed to write {}: {e}", path.display()))
+        // A from-scratch `to_kdl` would drop every comment in the file. Instead,
+        // rebuild the body from the model but graft the *existing* file's
+        // comments back onto the matching nodes (kdl-rs is format-preserving, so
+        // `autoformat` keeps them) — the header, per-node notes, and formatting
+        // all survive, and an unchanged node produces byte-identical output.
+        let text = match std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| KdlDocument::parse(&s).ok())
+        {
+            Some(old) => {
+                let mut doc = self.to_kdl_doc();
+                graft_comments(&mut doc, &old);
+                doc.autoformat();
+                let out = doc.to_string();
+                // A file without the modeline (or grafted from one lacking it)
+                // still gets it, so `.wk` keeps its editor highlighting.
+                if out.trim_start().starts_with(MODELINE) {
+                    out
+                } else {
+                    format!("{MODELINE}\n{out}")
+                }
+            }
+            None => self.to_kdl(), // new or unparseable file: fresh rebuild
+        };
+        std::fs::write(path, text).map_err(|e| format!("failed to write {}: {e}", path.display()))
     }
 
     fn from_kdl(text: &str) -> Result<Self, String> {
@@ -469,7 +574,18 @@ impl Document {
         })
     }
 
+    /// Serialize to KDL text: a fresh rebuild from the model (used for a new
+    /// file). [`Self::save`] instead grafts the existing file's comments back on.
     fn to_kdl(&self) -> String {
+        let mut doc = self.to_kdl_doc();
+        doc.autoformat();
+        format!("{MODELINE}\n{doc}")
+    }
+
+    /// Build the KDL document from the model (imports, dependencies, workspaces),
+    /// without the modeline or autoformatting — the shared body of [`Self::to_kdl`]
+    /// and the comment-preserving [`Self::save`].
+    fn to_kdl_doc(&self) -> KdlDocument {
         let mut doc = KdlDocument::new();
 
         // Import lines first, so the file reads top-down: what it pulls in, then
@@ -523,9 +639,7 @@ impl Document {
             doc.nodes_mut().push(workspace_kdl(ws));
         }
 
-        doc.autoformat();
-        // Lead with a modeline so `.wk` files highlight as KDL in editors.
-        format!("{MODELINE}\n{doc}")
+        doc
     }
 }
 
@@ -1244,6 +1358,44 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn save_preserves_comments_and_is_idempotent() {
+        let path = std::env::temp_dir().join("wk-comments-preserve-test.wk");
+        let ws = NodeId::from_u128(1);
+        let hp = NodeId::from_u128(2);
+        // A documented workspace: a header comment and an inline note on a node.
+        let original = format!(
+            "{MODELINE}\n\
+             // A demo. Run:\n\
+             //   wk run x.wk\n\
+             workspace \"{ws}\" {{\n    \
+             // the published port\n    \
+             hostport \"{hp}\" {{ port 8080; pos 0 0; size 10 10 }}\n\
+             }}\n"
+        );
+        std::fs::write(&path, &original).unwrap();
+
+        let doc = Document::from_kdl(&original).expect("parses");
+        doc.save(&path).expect("saves");
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert!(first.starts_with(MODELINE));
+        assert!(first.contains("// A demo. Run:"), "header kept:\n{first}");
+        assert!(first.contains("//   wk run x.wk"));
+        assert!(
+            first.contains("// the published port"),
+            "node note kept:\n{first}"
+        );
+        assert!(first.contains("port 8080"));
+
+        // Idempotent: re-parsing and saving the same model is byte-identical —
+        // an unchanged workspace produces no diff churn.
+        let doc2 = Document::from_kdl(&first).expect("re-parses");
+        doc2.save(&path).unwrap();
+        let second = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(first, second, "a no-op save churned the file");
+        let _ = std::fs::remove_file(&path);
     }
 
     // ---- property-based round-trip ----
