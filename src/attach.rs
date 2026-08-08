@@ -182,6 +182,10 @@ fn forward_stdin(stream: &mut UnixStream, interactive: bool, done: &AtomicBool) 
         for &b in &buf[..n] {
             if interactive {
                 if armed && b == CTRL_Q {
+                    // Detach: tell the server so it replies `Detached`, which
+                    // wakes the output loop (it's blocked reading the socket and
+                    // wouldn't notice a local flag while the node is idle).
+                    let _ = write_msg(stream, &ClientMsg::Detach);
                     done.store(true, Ordering::Relaxed);
                     break;
                 }

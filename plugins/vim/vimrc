@@ -4,6 +4,14 @@
 " highlighting on.
 set t_Co=256
 
+" That builtin termcap also leaves the ANSI colour-set entries (t_AF/t_AB)
+" empty, so vim can't emit ANY foreground/background colour — syntax
+" highlighting and the Visual selection would show nothing. Declare the
+" standard xterm-256colour sequences (\e = ESC); the Visual group's ctermbg
+" then renders, as do syntax colours.
+let &t_AF = "\e[38;5;%dm"
+let &t_AB = "\e[48;5;%dm"
+
 " Write files in place instead of vim's default rename-based save. A wk file
 " node is a single-file mount (like a Docker bind-mount of one file): the
 " default save writes a fresh file and renames it over the original, which
