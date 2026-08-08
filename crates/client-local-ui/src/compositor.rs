@@ -2859,17 +2859,21 @@ impl App {
             if let Some(file) = self.view.file_nodes.get(&id) {
                 let name = file.name.clone();
                 let (border, bg, status, status_col) = if file.host_mapped {
+                    // A bind: a folder mirrors a tree, a file maps one path.
+                    let kind = if file.is_dir { "dir" } else { "disk" };
                     (
                         HOSTFILE_BORDER,
                         HOSTFILE_BG,
-                        format!("{} B · disk", file.size),
+                        format!("{} B · {kind}", file.size),
                         [0.55, 0.68, 0.85, 1.0],
                     )
                 } else {
+                    // A named volume: mark it when persistence is on.
+                    let tail = if file.persist { " · persist" } else { "" };
                     (
                         FILE_BORDER,
                         FILE_BG,
-                        format!("{} B", file.size),
+                        format!("{} B{tail}", file.size),
                         [0.65, 0.6, 0.5, 1.0],
                     )
                 };
@@ -2908,6 +2912,18 @@ impl App {
                 } else {
                     ("idle", [0.55, 0.7, 0.72, 1.0])
                 };
+                // Show `host→container` when a serve wire maps to a different
+                // guest port, else just `:host`.
+                let container = self
+                    .view
+                    .serves
+                    .iter()
+                    .find(|(_, &hp)| hp == id)
+                    .and_then(|(&served, _)| self.view.serve_ports.get(&(served, id)).copied());
+                let title = match container {
+                    Some(c) if c != port => format!("HostPort :{port}→{c}"),
+                    _ => format!("HostPort :{port}"),
+                };
                 self.draw_widget(
                     &mut quads,
                     &mut gfx,
@@ -2921,7 +2937,7 @@ impl App {
                         r,
                         border: HOSTPORT_BORDER,
                         bg: HOSTPORT_BG,
-                        title: &format!("HostPort :{port}"),
+                        title: &title,
                         title_col: if conflict { WARN } else { TEXT },
                         status,
                         status_col,

@@ -85,6 +85,10 @@ pub struct FileMeta {
     pub name: String,
     pub size: usize,
     pub host_mapped: bool,
+    /// A BindMount whose host path is a directory (mirrored as a tree).
+    pub is_dir: bool,
+    /// A Volume with persistence turned on (bytes saved to a sidecar).
+    pub persist: bool,
 }
 
 /// Which p2p transport an uplink node tunnels over.
@@ -178,6 +182,9 @@ pub struct View {
     pub net_links: Vec<(NodeId, NodeId)>,
     /// Screen-capture grants as (app, Capture node).
     pub capture_links: Vec<(NodeId, NodeId)>,
+    /// Per-serve container-port overrides as (served, hostport) → guest port, so
+    /// the UI can show a HostPort's `host→container` mapping.
+    pub serve_ports: HashMap<(NodeId, NodeId), u16>,
     /// Nodes a CLI client has attached to — the UI treats these as detached
     /// (it stops draining/feeding their terminal).
     pub attached: std::collections::HashSet<NodeId>,
@@ -289,6 +296,12 @@ impl View {
                 .iter()
                 .copied()
                 .filter(|(a, _)| mine(a))
+                .collect(),
+            serve_ports: self
+                .serve_ports
+                .iter()
+                .filter(|((s, _), _)| mine(s))
+                .map(|(&k, &v)| (k, v))
                 .collect(),
             capture_feeds: self
                 .capture_feeds
@@ -2302,6 +2315,8 @@ impl Server {
                         name: f.name().to_string(),
                         size: f.size(),
                         host_mapped: matches!(f, FileNode::HostMapped(_)),
+                        is_dir: matches!(f, FileNode::HostMapped(h) if h.path.is_dir()),
+                        persist: matches!(f, FileNode::Virtual(v) if v.persist),
                     },
                 )
             })
@@ -2367,6 +2382,7 @@ impl Server {
             midi_links: self.graph.midi_links.clone(),
             net_links: self.graph.net_links.clone(),
             capture_links: self.graph.capture_links.clone(),
+            serve_ports: self.graph.serve_ports.clone(),
             capture_feeds: self.capture_feeds.clone(),
             attached: self.attached.clone(),
             serves,
