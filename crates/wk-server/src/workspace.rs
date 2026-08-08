@@ -216,9 +216,10 @@ pub enum SnapKind {
         /// dependency's default args at materialization.
         args: Vec<String>,
     },
-    /// An in-memory shared file. Its *bytes* are runtime state: undo carries
-    /// them alongside the snap, the `.wk` file does not persist them.
-    Volume { name: String },
+    /// An in-memory named volume. Its *bytes* are runtime state — undo carries
+    /// them alongside the snap; the `.wk` file persists them (to a sidecar) only
+    /// when `persist` is set, otherwise the volume is empty each run.
+    Volume { name: String, persist: bool },
     /// A disk-backed file node (its mount name derives from the path).
     BindMount { path: PathBuf },
     /// A localhost HostPort.
@@ -696,6 +697,11 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
         // `virtualfile`/`hostfile` are the legacy names, still accepted on read.
         "volume" | "virtualfile" => SnapKind::Volume {
             name: n.get(0)?.as_string()?.to_string(),
+            persist: ch
+                .get("persist")
+                .and_then(|p| p.get(0))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         },
         "bindmount" | "hostfile" => SnapKind::BindMount {
             path: PathBuf::from(n.get(0)?.as_string()?),
@@ -752,7 +758,7 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
     let mut node = KdlNode::new(name);
     // Named kinds lead with the name (or note text), then the id.
     match &s.kind {
-        SnapKind::App { name, .. } | SnapKind::Volume { name } => {
+        SnapKind::App { name, .. } | SnapKind::Volume { name, .. } => {
             node.push(str_entry(name));
         }
         SnapKind::BindMount { path } => {
@@ -783,6 +789,12 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
             ch.nodes_mut().push(p);
         }
         SnapKind::Note { text } => child_str("text", text),
+        // Only a persisted volume writes the flag; the default is ephemeral.
+        SnapKind::Volume { persist: true, .. } => {
+            let mut p = KdlNode::new("persist");
+            p.push(KdlEntry::new(true));
+            ch.nodes_mut().push(p);
+        }
         _ => {}
     }
     ch.nodes_mut().push(node2("pos", s.pos[0], s.pos[1]));
@@ -1085,6 +1097,7 @@ mod tests {
                             size: [130.0, 44.0],
                             kind: SnapKind::Volume {
                                 name: "chan".into(),
+                                persist: true,
                             },
                         },
                         NodeSnap {
@@ -1202,7 +1215,8 @@ mod tests {
             kinds,
             vec![
                 &SnapKind::Volume {
-                    name: "notes.txt".into()
+                    name: "notes.txt".into(),
+                    persist: false,
                 },
                 &SnapKind::BindMount {
                     path: PathBuf::from("data/log.txt")
@@ -1299,7 +1313,8 @@ mod tests {
                     options,
                     args
                 }),
-            value_str().prop_map(|name| SnapKind::Volume { name }),
+            (value_str(), any::<bool>())
+                .prop_map(|(name, persist)| SnapKind::Volume { name, persist }),
             value_str().prop_map(|p| SnapKind::BindMount {
                 path: PathBuf::from(p)
             }),

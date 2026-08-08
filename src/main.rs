@@ -163,6 +163,9 @@ enum NodeCmd {
         /// For a BindMount: the host file or folder to expose
         #[arg(long)]
         host_path: Option<String>,
+        /// For a Volume: persist its bytes across restarts (true/false)
+        #[arg(long)]
+        persist: Option<bool>,
     },
 }
 
@@ -237,7 +240,8 @@ fn main() -> Result<(), String> {
                 node,
                 args,
                 host_path,
-            } => cli::set_node(file, node, args.as_deref(), host_path.as_deref()),
+                persist,
+            } => cli::set_node(file, node, args.as_deref(), host_path.as_deref(), *persist),
         },
         Some(Commands::Wire { a, b }) => cli::wire(file, a, b),
         Some(Commands::Unwire { a, b }) => cli::unwire(file, a, b),

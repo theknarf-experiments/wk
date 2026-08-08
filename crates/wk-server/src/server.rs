@@ -31,6 +31,9 @@ pub const NOTE_H: f32 = 130.0;
 pub struct Volume {
     pub name: String,
     pub data: crate::vfs::SharedFile,
+    /// When set, the bytes are saved to a sidecar beside the `.wk` file and
+    /// restored on load; otherwise the volume is ephemeral (empty each run).
+    pub persist: bool,
 }
 
 /// A canvas file node backed by a real file on the host disk.
@@ -722,6 +725,7 @@ impl Server {
             FileNode::Virtual(Volume {
                 name: format!("file{}", self.file_seq),
                 data: Arc::new(Mutex::new(Vec::new())),
+                persist: false,
             }),
         );
     }
@@ -1517,9 +1521,51 @@ impl Server {
     }
 
     /// Snapshot every workspace into a [`Document`] and write it back to disk.
+    /// The sidecar directory holding persisted volume bytes, beside the `.wk`
+    /// file (e.g. `workspace.wk` → `workspace.wk.volumes/`).
+    fn volume_dir(&self) -> PathBuf {
+        let mut s = self.workspace_path.clone().into_os_string();
+        s.push(".volumes");
+        PathBuf::from(s)
+    }
+
+    /// Where one persisted volume's bytes live: `<volume_dir>/<node-id>`.
+    fn volume_sidecar(&self, id: NodeId) -> PathBuf {
+        self.volume_dir().join(id.to_string())
+    }
+
+    /// Write every opted-in volume's bytes to its sidecar file. Called by
+    /// [`Self::save`]; ephemeral volumes are skipped.
+    fn save_persisted_volumes(&self) {
+        let persisted: Vec<(NodeId, Vec<u8>)> = self
+            .graph
+            .file_nodes
+            .iter()
+            .filter_map(|(&id, f)| match f {
+                FileNode::Virtual(v) if v.persist => Some((id, v.data.lock().unwrap().clone())),
+                _ => None,
+            })
+            .collect();
+        if persisted.is_empty() {
+            return;
+        }
+        let dir = self.volume_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("failed to create volume dir {}: {e}", dir.display());
+            return;
+        }
+        for (id, bytes) in persisted {
+            let path = self.volume_sidecar(id);
+            if let Err(e) = std::fs::write(&path, &bytes) {
+                eprintln!("failed to persist volume {}: {e}", path.display());
+            }
+        }
+    }
+
     /// Each node projects through [`Self::node_snap`] — the same shape undo
     /// captures — ordered by kind then id, so saves are deterministic.
     pub fn save(&self) {
+        self.save_persisted_volumes();
         let workspaces = self
             .graph
             .workspaces
@@ -1786,6 +1832,11 @@ impl Server {
                 if let Some(host_path) = patch.host_path {
                     self.set_bind_path(id, host_path);
                 }
+                if let Some(persist) = patch.persist {
+                    if let Some(FileNode::Virtual(v)) = self.graph.file_nodes.get_mut(&id) {
+                        v.persist = persist;
+                    }
+                }
             }
             Command::Delete(ResourceRef::Node(id)) => self.remove_any(id),
             Command::Delete(ResourceRef::Wire(w)) => self.disconnect_wire(w),
@@ -1904,6 +1955,7 @@ impl Server {
             Kind::File => match self.graph.file_nodes.get(&id)? {
                 FileNode::Virtual(v) => SnapKind::Volume {
                     name: v.name.clone(),
+                    persist: v.persist,
                 },
                 FileNode::HostMapped(h) => SnapKind::BindMount {
                     path: h.path.clone(),
@@ -2044,19 +2096,26 @@ impl Server {
                 self.place(s.id, Kind::App, ws, s.pos, s.size);
                 self.graph.node_args.insert(s.id, args);
             }
-            SnapKind::Volume { name } => {
+            SnapKind::Volume { name, persist } => {
                 if let Some(num) = name
                     .strip_prefix("file")
                     .and_then(|s| s.parse::<u32>().ok())
                 {
                     self.file_seq = self.file_seq.max(num);
                 }
+                // A persisted volume with no undo bytes seeds from its sidecar.
+                let data = if *persist && file_data.is_empty() {
+                    std::fs::read(self.volume_sidecar(s.id)).unwrap_or_default()
+                } else {
+                    file_data.to_vec()
+                };
                 self.place(s.id, Kind::File, ws, s.pos, s.size);
                 self.graph.file_nodes.insert(
                     s.id,
                     FileNode::Virtual(Volume {
                         name: name.clone(),
-                        data: Arc::new(Mutex::new(file_data.to_vec())),
+                        data: Arc::new(Mutex::new(data)),
+                        persist: *persist,
                     }),
                 );
             }
@@ -2498,6 +2557,53 @@ mod model_tests {
         }
     }
 
+    /// A persisted volume's bytes survive a save→reload (written to a sidecar
+    /// beside the `.wk`); an ephemeral one comes back empty.
+    #[test]
+    fn persisted_volume_bytes_survive_reload() {
+        let path = std::env::temp_dir().join("wk-vol-persist-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let mut sidecar = path.clone().into_os_string();
+        sidecar.push(".volumes");
+        let _ = std::fs::remove_dir_all(PathBuf::from(&sidecar));
+
+        let vol = {
+            let mut s = Server::new(&Document::empty(), path.clone()).expect("server");
+            let ws = s.graph.workspaces[0];
+            s.apply(Command::Create(Resource::Node {
+                kind: NodeKind::Volume,
+                pos: [0.0, 0.0],
+                ws,
+            }));
+            let vol = *s.graph.file_nodes.keys().next().expect("a volume");
+            s.apply(Command::Update {
+                id: vol,
+                patch: NodePatch {
+                    persist: Some(true),
+                    ..Default::default()
+                },
+            });
+            if let Some(FileNode::Virtual(v)) = s.graph.file_nodes.get(&vol) {
+                v.data.lock().unwrap().extend_from_slice(b"remember me");
+            }
+            s.save();
+            vol
+        };
+
+        // Reload from disk: the sidecar restores the bytes.
+        let doc = crate::workspace::Document::load_resolved(&path).expect("reload");
+        let s2 = Server::new(&doc, path.clone()).expect("server");
+        match s2.graph.file_nodes.get(&vol) {
+            Some(FileNode::Virtual(v)) => {
+                assert!(v.persist, "persist flag round-trips");
+                assert_eq!(&*v.data.lock().unwrap(), b"remember me");
+            }
+            _ => panic!("expected the volume to reload"),
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(PathBuf::from(&sidecar));
+    }
+
     /// A bind's mount path survives a save→reload cycle (it persists as the
     /// connection's 3rd KDL arg).
     #[test]
@@ -2569,6 +2675,7 @@ mod model_tests {
                         size: [130.0, 44.0],
                         kind: SnapKind::Volume {
                             name: "file1".into(),
+                            persist: false,
                         },
                     },
                 ],
@@ -2842,6 +2949,7 @@ mod model_tests {
                     port_delta: None,
                     text: None,
                     host_path: None,
+                    persist: None,
                 },
             }),
             Op::Undo => s.apply(Command::Undo),

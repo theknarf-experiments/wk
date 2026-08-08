@@ -182,6 +182,9 @@ pub struct NodePatch {
     /// Point a BindMount node at a host path — a file or a folder (requires
     /// `Update`).
     pub host_path: Option<String>,
+    /// Toggle a Volume node's persistence (bytes saved to a sidecar and
+    /// restored on load) (requires `Update`).
+    pub persist: Option<bool>,
 }
 
 /// A mutation a client asks the server to perform: create/update/delete on a
@@ -226,7 +229,11 @@ impl Command {
             // A patch touching args/port reconfigures the node; pos/size alone
             // is cosmetic layout.
             Command::Update { patch, .. } => {
-                if patch.args.is_some() || patch.port_delta.is_some() || patch.host_path.is_some() {
+                if patch.args.is_some()
+                    || patch.port_delta.is_some()
+                    || patch.host_path.is_some()
+                    || patch.persist.is_some()
+                {
                     (ResourceKind::Node, Action::Update)
                 } else {
                     (ResourceKind::Node, Action::Arrange)

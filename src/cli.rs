@@ -381,9 +381,10 @@ pub fn set_node(
     node: &str,
     args: Option<&str>,
     host_path: Option<&str>,
+    persist: Option<bool>,
 ) -> Result<(), String> {
-    if args.is_none() && host_path.is_none() {
-        return Err("nothing to set — pass --args and/or --host-path".into());
+    if args.is_none() && host_path.is_none() && persist.is_none() {
+        return Err("nothing to set — pass --args, --host-path, and/or --persist".into());
     }
     let mut stream = connect(workspace)?;
     let snap = get_snapshot(&mut stream)?;
@@ -395,6 +396,7 @@ pub fn set_node(
             patch: NodePatch {
                 args: args.map(str::to_string),
                 host_path: host_path.map(str::to_string),
+                persist,
                 ..Default::default()
             },
         },
