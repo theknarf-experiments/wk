@@ -1,5 +1,5 @@
 use client_local_ui::WindowClient;
-use wk_protocol::Client;
+use wk_protocol::{Client, NodeKind};
 use wk_server::runtime::ServerRuntime;
 use wk_server::workspace;
 use wk_token_service::TokenService;
@@ -64,6 +64,19 @@ enum Commands {
     Node {
         #[command(subcommand)]
         cmd: NodeCmd,
+    },
+
+    /// Create a non-app node headlessly: a volume, bind mount, host port,
+    /// network, gateway, uplink, capture, or note (apps are `wk node add`)
+    Create {
+        /// What kind of node to create
+        kind: CreateKind,
+        /// Kind-specific value: a bind's host path, a port number, or a note's
+        /// text (ignored for the others)
+        value: Option<String>,
+        /// For a volume: turn on persistence
+        #[arg(long)]
+        persist: bool,
     },
 
     /// Connect two nodes in a running workspace (kind inferred)
@@ -164,7 +177,8 @@ enum NodeCmd {
     },
     /// (Re)start an idle/exited node's guest
     Start { node: String },
-    /// Reconfigure a node: its launch args and/or a BindMount's host path
+    /// Reconfigure a node: launch args, a BindMount's host path, a Volume's
+    /// persistence, or a HostPort's localhost port
     Set {
         node: String,
         /// The full argument string (quote it)
@@ -176,7 +190,41 @@ enum NodeCmd {
         /// For a Volume: persist its bytes across restarts (true/false)
         #[arg(long)]
         persist: Option<bool>,
+        /// For a HostPort: set its localhost port
+        #[arg(long)]
+        port: Option<u16>,
     },
+}
+
+/// A node kind creatable headlessly with `wk create` (everything but an app,
+/// which is `wk node add <dependency>`).
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum CreateKind {
+    Volume,
+    Bind,
+    Port,
+    Network,
+    Gateway,
+    Iroh,
+    Veilid,
+    Capture,
+    Note,
+}
+
+impl CreateKind {
+    fn node_kind(self) -> NodeKind {
+        match self {
+            CreateKind::Volume => NodeKind::Volume,
+            CreateKind::Bind => NodeKind::BindMount,
+            CreateKind::Port => NodeKind::Port,
+            CreateKind::Network => NodeKind::Network,
+            CreateKind::Gateway => NodeKind::Gateway,
+            CreateKind::Iroh => NodeKind::Iroh,
+            CreateKind::Veilid => NodeKind::Veilid,
+            CreateKind::Capture => NodeKind::Capture,
+            CreateKind::Note => NodeKind::Note,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -251,8 +299,21 @@ fn main() -> Result<(), String> {
                 args,
                 host_path,
                 persist,
-            } => cli::set_node(file, node, args.as_deref(), host_path.as_deref(), *persist),
+                port,
+            } => cli::set_node(
+                file,
+                node,
+                args.as_deref(),
+                host_path.as_deref(),
+                *persist,
+                *port,
+            ),
         },
+        Some(Commands::Create {
+            kind,
+            value,
+            persist,
+        }) => cli::create(file, kind.node_kind(), value.as_deref(), *persist),
         Some(Commands::Wire { a, b }) => cli::wire(file, a, b),
         Some(Commands::Unwire { a, b }) => cli::unwire(file, a, b),
         Some(Commands::Mount { volume, app, path }) => {

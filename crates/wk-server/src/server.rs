@@ -1256,12 +1256,19 @@ impl Server {
     }
 
     /// Change a HostPort's localhost port by `delta`, live-rebinding any server.
+    /// Nudge a HostPort's localhost port by `delta` (the GUI's −/+ buttons).
     fn change_port(&mut self, id: NodeId, delta: i32) {
+        if let Some(&cur) = self.graph.host_ports.get(&id) {
+            self.set_host_port(id, (cur as i32 + delta).clamp(1, 65535) as u16);
+        }
+    }
+
+    /// Set a HostPort's localhost port absolutely, live-rebinding any server.
+    fn set_host_port(&mut self, id: NodeId, new: u16) {
         let Some(&cur) = self.graph.host_ports.get(&id) else {
-            return;
+            return; // not a HostPort node
         };
-        let new = (cur as i32 + delta).clamp(1, 65535) as u16;
-        if new == cur {
+        if new == cur || new == 0 {
             return;
         }
         self.graph.host_ports.insert(id, new);
@@ -1824,6 +1831,9 @@ impl Server {
                 }
                 if let Some(delta) = patch.port_delta {
                     self.change_port(id, delta);
+                }
+                if let Some(port) = patch.port_set {
+                    self.set_host_port(id, port);
                 }
                 if let Some(text) = patch.text {
                     if self.graph.note_text.contains_key(&id) {
@@ -2530,6 +2540,28 @@ mod model_tests {
         assert_eq!(v2.net_nodes.len(), 0, "ws2 has no network");
     }
 
+    /// A HostPort's localhost port can be set absolutely via `port_set` (what
+    /// `wk create port <n>` / `wk node set --port` use).
+    #[test]
+    fn set_host_port_sets_the_port_absolutely() {
+        let mut s = fresh_server();
+        let ws = s.graph.workspaces[0];
+        s.apply(Command::Create(Resource::Node {
+            kind: NodeKind::Port,
+            pos: [0.0, 0.0],
+            ws,
+        }));
+        let id = *s.graph.host_ports.keys().next().expect("a hostport");
+        s.apply(Command::Update {
+            id,
+            patch: NodePatch {
+                port_set: Some(3000),
+                ..Default::default()
+            },
+        });
+        assert_eq!(s.graph.host_ports.get(&id).copied(), Some(3000));
+    }
+
     /// `SetServePort` records a serve wire's container port in the graph and
     /// `serve_port_for` reports it; `0` resets to the HostPort's own port.
     #[test]
@@ -3073,6 +3105,7 @@ mod model_tests {
                     size: Some([3.0, 4.0]),
                     args: Some("ghost".into()),
                     port_delta: None,
+                    port_set: None,
                     text: None,
                     host_path: None,
                     persist: None,

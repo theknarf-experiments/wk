@@ -177,6 +177,8 @@ pub struct NodePatch {
     pub args: Option<String>,
     /// Nudge a HostPort's localhost port by this delta (requires `Update`).
     pub port_delta: Option<i32>,
+    /// Set a HostPort's localhost port to this value (requires `Update`).
+    pub port_set: Option<u16>,
     /// Set a note node's text (requires `Update`).
     pub text: Option<String>,
     /// Point a BindMount node at a host path — a file or a folder (requires
@@ -239,6 +241,7 @@ impl Command {
             Command::Update { patch, .. } => {
                 if patch.args.is_some()
                     || patch.port_delta.is_some()
+                    || patch.port_set.is_some()
                     || patch.host_path.is_some()
                     || patch.persist.is_some()
                 {

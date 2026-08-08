@@ -376,15 +376,17 @@ pub fn up(workspace: &Path) -> Result<(), String> {
 
 /// `wk node set <ref> [--args "..."] [--host-path P]`: reconfigure a node's
 /// launch args and/or (for a BindMount) the host file/folder it exposes.
+#[allow(clippy::too_many_arguments)]
 pub fn set_node(
     workspace: &Path,
     node: &str,
     args: Option<&str>,
     host_path: Option<&str>,
     persist: Option<bool>,
+    port: Option<u16>,
 ) -> Result<(), String> {
-    if args.is_none() && host_path.is_none() && persist.is_none() {
-        return Err("nothing to set — pass --args, --host-path, and/or --persist".into());
+    if args.is_none() && host_path.is_none() && persist.is_none() && port.is_none() {
+        return Err("nothing to set — pass --args, --host-path, --persist, and/or --port".into());
     }
     let mut stream = connect(workspace)?;
     let snap = get_snapshot(&mut stream)?;
@@ -397,12 +399,111 @@ pub fn set_node(
                 args: args.map(str::to_string),
                 host_path: host_path.map(str::to_string),
                 persist,
+                port_set: port,
                 ..Default::default()
             },
         },
     )?;
     println!("updated {}", short(id));
     Ok(())
+}
+
+/// A short human label for a creatable node kind (for CLI output).
+fn kind_label(kind: NodeKind) -> &'static str {
+    match kind {
+        NodeKind::App { .. } => "app",
+        NodeKind::Volume => "volume",
+        NodeKind::BindMount => "bindmount",
+        NodeKind::Port => "hostport",
+        NodeKind::Network => "network",
+        NodeKind::Gateway => "gateway",
+        NodeKind::Iroh => "iroh",
+        NodeKind::Veilid => "veilid",
+        NodeKind::Note => "note",
+        NodeKind::Capture => "capture",
+    }
+}
+
+/// `wk create <kind> [value]`: create a non-app node headlessly. `value` seeds
+/// the kind's key config — a bind's host path, a host port number, or a note's
+/// text — mirroring how `wk node add` sets an app's args.
+pub fn create(
+    workspace: &Path,
+    kind: NodeKind,
+    value: Option<&str>,
+    persist: bool,
+) -> Result<(), String> {
+    let mut stream = connect(workspace)?;
+    let snap = get_snapshot(&mut stream)?;
+    let ws = *snap.workspaces.first().ok_or("the workspace has no tabs")?;
+    let before: std::collections::HashSet<_> = snap.nodes.iter().map(|n| n.id).collect();
+    // Cascade so successive nodes don't stack exactly on top of each other.
+    let n = snap.nodes.len() as f32;
+    let pos = [60.0 + 24.0 * (n % 8.0), 60.0 + 24.0 * (n % 8.0)];
+    send_command(
+        &mut stream,
+        Command::Create(Resource::Node { kind, pos, ws }),
+    )?;
+
+    // The create is applied asynchronously on the server's tick, so poll until
+    // the new node (the id absent from the prior snapshot) appears before
+    // seeding its config.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let id = loop {
+        let snap = get_snapshot(&mut stream)?;
+        if let Some(id) = snap
+            .nodes
+            .iter()
+            .map(|n| n.id)
+            .find(|id| !before.contains(id))
+        {
+            break id;
+        }
+        if std::time::Instant::now() >= deadline {
+            println!("created a {} node", kind_label(kind));
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let patch = match kind {
+        NodeKind::BindMount => NodePatch {
+            host_path: value.map(str::to_string),
+            ..Default::default()
+        },
+        NodeKind::Port => NodePatch {
+            port_set: value
+                .map(|v| v.parse::<u16>().map_err(|_| format!("invalid port {v:?}")))
+                .transpose()?,
+            ..Default::default()
+        },
+        NodeKind::Note => NodePatch {
+            text: value.map(str::to_string),
+            ..Default::default()
+        },
+        NodeKind::Volume if persist => NodePatch {
+            persist: Some(true),
+            ..Default::default()
+        },
+        _ => NodePatch::default(),
+    };
+    // Only send a follow-up if there's actually something to configure.
+    if !is_empty_patch(&patch) {
+        send_command(&mut stream, Command::Update { id, patch })?;
+    }
+    println!("created {} ({})", short(id), kind_label(kind));
+    Ok(())
+}
+
+/// Whether a patch would change nothing (all fields `None`/absent).
+fn is_empty_patch(p: &NodePatch) -> bool {
+    p.args.is_none()
+        && p.host_path.is_none()
+        && p.persist.is_none()
+        && p.port_set.is_none()
+        && p.port_delta.is_none()
+        && p.text.is_none()
+        && p.pos.is_none()
+        && p.size.is_none()
 }
 
 /// `wk mount <volume> <app> [path]`: set where a volume bind mounts inside an
