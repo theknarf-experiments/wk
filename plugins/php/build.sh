@@ -10,8 +10,10 @@
 #   * define WASM_WASI so those patches stub the POSIX bits WASI omits, but leave
 #     the CLI server's own socket()/bind()/listen()/accept() calls untouched —
 #     they resolve to wasi-libc's wasip2 sockets → the fabric;
-#   * un-stub php_network_getaddresses so the server can resolve its bind host
-#     (patches/wk-0001-wasip2-real-sockets.patch);
+#   * un-stub php_network_getaddresses so the server can resolve its bind host,
+#     and make is_writable() true on WASI (access(2) has no meaning on wk's vfs,
+#     so WordPress's writability check would wrongly fail) — both in
+#     patches/wk-0001-wasip2-fixes.patch;
 #   * compile setjmp/longjmp (Zend's zend_bailout) via the WebAssembly exception
 #     proposal, like the lua/sqlite plugins (host enables Config::wasm_exceptions).
 # The wasip2 link step emits a component directly — no wasm-tools adapter.
@@ -58,7 +60,7 @@ if [ ! -d "$SRC" ]; then
           patch -p1 --forward --silent < "../.patches/$p"
       done
       # wk: keep real sockets under WASM_WASI (see header).
-      patch -p1 --forward < ../patches/wk-0001-wasip2-real-sockets.patch
+      patch -p1 --forward < ../patches/wk-0001-wasip2-fixes.patch
     )
 fi
 
@@ -73,8 +75,12 @@ if [ ! -f "$DEPS/lib/libsqlite3.a" ]; then
         unzip -oq sqlite-amalg.zip && rm -f sqlite-amalg.zip
     fi
     mkdir -p "$DEPS/lib/pkgconfig" "$DEPS/include"
+    # unix-none VFS: no POSIX file locking. WASI has no fcntl locks, and SQLite's
+    # WASI default (unix-dotfile) deadlocks WordPress ("database is locked"); a
+    # single-process embedded DB needs no locking, so unix-none is correct.
     PATH="$BUILD_PATH" clang --target=wasm32-wasip2 -O2 \
         -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_WAL -DSQLITE_DISABLE_LFS \
+        -DSQLITE_DEFAULT_UNIX_VFS='"unix-none"' \
         -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_GETPID \
         -c "sqlite-amalgamation-$SQLITE_VER/sqlite3.c" -o "$DEPS/sqlite3.o"
     "$WASI_SDK/bin/llvm-ar" rcs "$DEPS/lib/libsqlite3.a" "$DEPS/sqlite3.o"

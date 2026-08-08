@@ -1,0 +1,38 @@
+// vim: set filetype=kdl :
+// WordPress running inside wk: the PHP container (php -S) serving WordPress on a
+// SQLite database, over the userspace network fabric.
+//
+// One-time setup (fetches WordPress + the SQLite plugin into example/wordpress/app):
+//   ./example/wordpress/setup.sh
+// Then, from the repo root:
+//   wk run example/wordpress.wk        # open http://localhost:8092 and run the
+//                                        5-minute install (writes the SQLite DB)
+import "../workspace.wk"
+workspace "01KZK2AB00000000000000WS01" {
+    note "01KZK2AC00000000000000NT02" {
+        text "WordPress on wk.\n\nThe php container runs\n`php -S 0.0.0.0:8092 -t /app`\nserving WordPress (bind-mounted at\n/app) on a SQLite database — real\nPHP 8.2 + SQLite compiled to\nwasm32-wasip2, on the fabric.\n\nFirst: ./example/wordpress/setup.sh\nThen click php's play button and open\nhttp://localhost:8092 to install."
+        pos 40.0 40.0
+        size 360.0 320.0
+    }
+    node "php" "01KZK2AD00000000000000AP03" {
+        pos 40.0 400.0
+        size 420.0 240.0
+        args "-S" "0.0.0.0:8092" "-t" "/app"
+    }
+    bindmount "example/wordpress/app" "01KZK2AE00000000000000BM04" {
+        pos 500.0 40.0
+        size 180.0 44.0
+    }
+    hostport "01KZK2AF00000000000000HP05" {
+        port 8092
+        pos 520.0 480.0
+        size 130.0 44.0
+    }
+    network "01KZK2AG00000000000000NW06" {
+        pos 520.0 580.0
+        size 130.0 44.0
+    }
+    connection "01KZK2AE00000000000000BM04" "01KZK2AD00000000000000AP03" "/app"
+    serve "01KZK2AD00000000000000AP03" "01KZK2AF00000000000000HP05"
+    netlink "01KZK2AD00000000000000AP03" "01KZK2AG00000000000000NW06"
+}

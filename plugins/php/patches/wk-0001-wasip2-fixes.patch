@@ -1,0 +1,58 @@
+--- a/main/network.c	2026-08-09 00:50:39
++++ b/main/network.c	2026-08-09 00:52:25
+@@ -155,7 +155,8 @@
+  */
+ PHPAPI int php_network_getaddresses(const char *host, int socktype, struct sockaddr ***sal, zend_string **error_string)
+ {
+-#ifndef WASM_WASI
++/* wk: keep real address resolution even under WASM_WASI — wasi-libc wasip2
++ * provides getaddrinfo/inet_pton, and php -S needs to resolve its bind host. */
+ 	struct sockaddr **sap;
+ 	int n;
+ #if HAVE_GETADDRINFO
+@@ -278,9 +279,6 @@
+ 
+ 	*sap = NULL;
+ 	return n;
+-#else
+-	return 0;
+-#endif // WASM_WASI
+ }
+ /* }}} */
+ 
+@@ -985,7 +983,9 @@
+ 				fatal = 1;
+ 			} else {
+ 				/* work out remaining time */
++#ifndef WASM_WASI
+ 				sub_times(limit_time, time_now, &working_timeout);
++#endif // WASM_WASI
+ 			}
+ 		}
+ #else
+--- a/ext/standard/filestat.c	2026-08-09 01:26:52
++++ b/ext/standard/filestat.c	2026-08-09 01:23:49
+@@ -783,17 +783,20 @@
+ 					RETURN_BOOL(VCWD_ACCESS(local, F_OK) == 0);
+ 					break;
+ #endif
+-#ifdef W_OK
++/* wk: WASI has no access(2) permission model; wasi-libc's access(W_OK/R_OK/X_OK)
++ * doesn't reflect real writability of an in-memory/host-backed vfs, so skip it
++ * here and fall through to the __wasi__ RETURN_TRUE below (matches patch 0017). */
++#if defined(W_OK) && !defined(__wasi__)
+ 				case FS_IS_W:
+ 					RETURN_BOOL(VCWD_ACCESS(local, W_OK) == 0);
+ 					break;
+ #endif
+-#ifdef R_OK
++#if defined(R_OK) && !defined(__wasi__)
+ 				case FS_IS_R:
+ 					RETURN_BOOL(VCWD_ACCESS(local, R_OK) == 0);
+ 					break;
+ #endif
+-#ifdef X_OK
++#if defined(X_OK) && !defined(__wasi__)
+ 				case FS_IS_X:
+ 					RETURN_BOOL(VCWD_ACCESS(local, X_OK) == 0);
+ 					break;

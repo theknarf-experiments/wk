@@ -121,3 +121,7 @@ plugins/echo6/echo6.wasm
 
 # recorder example output (written at runtime)
 example/out.mjpeg
+
+# WordPress demo: fetched + installed by example/wordpress/setup.sh (large,
+# machine-specific) — only setup.sh is tracked
+example/wordpress/app/
