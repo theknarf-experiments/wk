@@ -402,8 +402,9 @@ impl TextCache {
 enum DragMode {
     Move,
     Resize,
-    /// Dragging a connection wire out of a node's port toward another node.
-    Connect,
+    /// Dragging a connection wire out of a node's typed output port (of this
+    /// kind) toward a compatible input port on another node.
+    Connect(PortKind),
 }
 struct Drag {
     id: NodeId,
@@ -593,8 +594,6 @@ const NOTE_GRIP: [f32; 4] = [0.86, 0.76, 0.30, 1.0];
 /// Height (canvas units) of a note's top drag strip; below it, the body edits.
 const NOTE_GRAB: f32 = 16.0;
 const PORT_COL: [f32; 4] = [0.70, 0.72, 0.80, 1.0];
-/// Input-port (left, target) dot — dimmer than the output port you drag from.
-const PORT_IN_COL: [f32; 4] = [0.42, 0.44, 0.52, 1.0];
 /// A port lights up when the cursor is over it (hover / valid drop target).
 const PORT_HOT: [f32; 4] = [0.55, 0.80, 1.0, 1.0];
 /// HostPort node colours and wire (exposes a wasi:http node to localhost).
@@ -611,39 +610,82 @@ const NET_WIRE_COL: [f32; 4] = [0.62, 0.50, 0.86, 1.0];
 /// A selected wire is drawn thicker in this highlight colour.
 const WIRE_SEL_COL: [f32; 4] = [1.0, 0.85, 0.4, 1.0];
 
-/// The **output** port (a node as a source), on the right edge, vertically
-/// centred — drag a wire out of here.
-fn port_out(r: [f32; 4]) -> [f32; 2] {
-    [r[2], (r[1] + r[3]) * 0.5]
+/// A connection kind a node can carry on a typed port. Maps 1:1 to a [`Wire`]
+/// variant and gives the port (and its wire) a distinct colour, so the canvas
+/// shows *what* a connection carries rather than a single generic in/out dot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PortKind {
+    Bind,
+    Midi,
+    Serve,
+    Net,
+    Capture,
 }
-/// The **input** port (a node as a target), on the left edge — drop a wire here.
-fn port_in(r: [f32; 4]) -> [f32; 2] {
-    [r[0], (r[1] + r[3]) * 0.5]
-}
-/// Draw a node's input (left) and output (right) connection ports as dots. The
-/// output is brighter (you drag from it); the input is dimmer (you drop onto it).
-/// The port under the cursor `mp` lights up and grows a bit (hover feedback).
-fn draw_ports(
-    quads: &mut Vec<Quad>,
-    circle: TextureId,
-    r: [f32; 4],
-    zf: f32,
-    mp: [f32; 2],
-    clip: [f32; 4],
-) {
-    let pr = PORT_R * zf;
-    for (center, base) in [(port_in(r), PORT_IN_COL), (port_out(r), PORT_COL)] {
-        let (col, rad) = if near(mp, center, pr + 3.0) {
-            (PORT_HOT, pr * 1.4)
-        } else {
-            (base, pr)
-        };
-        quads.push(Quad::disc(circle, center, rad, col, clip));
+
+impl PortKind {
+    /// The dot / wire colour for this kind.
+    fn color(self) -> [f32; 4] {
+        match self {
+            PortKind::Bind => WIRE_COL,
+            PortKind::Midi => MIDI_WIRE_COL,
+            PortKind::Serve => HOSTPORT_WIRE,
+            PortKind::Net => NET_WIRE_COL,
+            PortKind::Capture => CAPTURE_BORDER,
+        }
     }
+}
+
+/// Whether a node is the source (`Out`, right edge) or target (`In`, left edge)
+/// of a typed connection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PortDir {
+    In,
+    Out,
+}
+
+/// One typed connection point on a node.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Port {
+    kind: PortKind,
+    dir: PortDir,
+}
+
+/// The y-centres for `n` ports stacked down a node edge (screen rect `r`),
+/// evenly spaced with margins so a single port sits at the middle and none
+/// overflow the node.
+fn port_slots_y(r: [f32; 4], n: usize) -> Vec<f32> {
+    let h = r[3] - r[1];
+    (0..n)
+        .map(|i| r[1] + h * (i as f32 + 1.0) / (n as f32 + 1.0))
+        .collect()
+}
+
+/// Anchor points for a node's typed ports: inputs down the left edge, outputs
+/// down the right edge, in `ports` order. Pure geometry — shared by the draw,
+/// the hit-test, and the wire-endpoint lookup so they never diverge.
+fn port_anchors(r: [f32; 4], ports: &[Port]) -> Vec<[f32; 2]> {
+    let ins: Vec<usize> = (0..ports.len())
+        .filter(|&i| ports[i].dir == PortDir::In)
+        .collect();
+    let outs: Vec<usize> = (0..ports.len())
+        .filter(|&i| ports[i].dir == PortDir::Out)
+        .collect();
+    let in_y = port_slots_y(r, ins.len());
+    let out_y = port_slots_y(r, outs.len());
+    let mut anchors = vec![[0.0, 0.0]; ports.len()];
+    for (slot, &pi) in ins.iter().enumerate() {
+        anchors[pi] = [r[0], in_y[slot]];
+    }
+    for (slot, &pi) in outs.iter().enumerate() {
+        anchors[pi] = [r[2], out_y[slot]];
+    }
+    anchors
 }
 /// What varies between the small "widget" nodes (file / HostPort / Network /
 /// uplink) when drawing their shared chrome — see [`App::draw_widget`].
 struct WidgetChrome<'a> {
+    /// The node id, so shared chrome can draw its typed ports.
+    id: NodeId,
     r: [f32; 4],
     border: [f32; 4],
     bg: [f32; 4],
@@ -965,25 +1007,119 @@ impl App {
             .find(|&id| contains(self.rect_of(id), mp))
     }
 
-    /// The topmost node whose **output** port (right edge) is under `mp` — where a
-    /// wire is dragged out. Ports sit on the node edge, so half the circle is
-    /// outside the rect; hit-test the whole disc separately.
-    fn output_port_under(&self, mp: [f32; 2], zf: f32) -> Option<NodeId> {
-        self.z
-            .iter()
-            .rev()
-            .copied()
-            .find(|&id| near(mp, port_out(self.rect_of(id)), PORT_R * zf + 3.0))
+    /// The typed connection ports a node exposes, derived from its kind. An app
+    /// can mount volumes (bind in), send/receive MIDI, serve to a HostPort, join
+    /// a Network, and receive capture frames; the small widget nodes each expose
+    /// the single port their kind participates in.
+    fn node_ports(&self, id: NodeId) -> Vec<Port> {
+        use PortDir::{In, Out};
+        use PortKind::{Bind, Capture, Midi, Net, Serve};
+        let v = &self.view;
+        let one = |kind, dir| vec![Port { kind, dir }];
+        if v.notes.contains_key(&id) {
+            Vec::new()
+        } else if v.file_nodes.contains_key(&id) {
+            one(Bind, Out) // a volume/bind mounts into apps
+        } else if v.host_ports.contains_key(&id) {
+            one(Serve, In) // apps serve to a HostPort
+        } else if v.net_nodes.contains(&id) {
+            one(Net, In) // members join a Network
+        } else if v.uplinks.contains_key(&id) {
+            one(Net, Out) // an uplink dials into a Network
+        } else if v.capture_feeds.contains_key(&id) {
+            one(Capture, Out) // a Capture node grants apps
+        } else {
+            // An app node.
+            vec![
+                Port {
+                    kind: Bind,
+                    dir: In,
+                },
+                Port {
+                    kind: Midi,
+                    dir: In,
+                },
+                Port {
+                    kind: Capture,
+                    dir: In,
+                },
+                Port {
+                    kind: Midi,
+                    dir: Out,
+                },
+                Port {
+                    kind: Serve,
+                    dir: Out,
+                },
+                Port {
+                    kind: Net,
+                    dir: Out,
+                },
+            ]
+        }
     }
 
-    /// The topmost node whose **input** port (left edge) is under `mp` — where a
-    /// dragged wire is dropped.
-    fn input_port_under(&self, mp: [f32; 2], zf: f32) -> Option<NodeId> {
-        self.z
+    /// The screen anchor of a node's port of a given kind + direction, falling
+    /// back to the edge centre if the node has no such port.
+    fn port_pos(&self, id: NodeId, kind: PortKind, dir: PortDir) -> [f32; 2] {
+        let r = self.rect_of(id);
+        let ports = self.node_ports(id);
+        let anchors = port_anchors(r, &ports);
+        ports
             .iter()
-            .rev()
-            .copied()
-            .find(|&id| near(mp, port_in(self.rect_of(id)), PORT_R * zf + 3.0))
+            .zip(&anchors)
+            .find(|(p, _)| p.kind == kind && p.dir == dir)
+            .map(|(_, &a)| a)
+            .unwrap_or_else(|| {
+                let x = if dir == PortDir::Out { r[2] } else { r[0] };
+                [x, (r[1] + r[3]) * 0.5]
+            })
+    }
+
+    /// The topmost node + port of direction `dir` whose dot is under `mp`. Ports
+    /// sit on the node edge (half the disc outside the rect), so they're
+    /// hit-tested against the whole disc.
+    fn port_under(&self, mp: [f32; 2], zf: f32, dir: PortDir) -> Option<(NodeId, PortKind)> {
+        for &id in self.z.iter().rev() {
+            let r = self.rect_of(id);
+            let ports = self.node_ports(id);
+            let anchors = port_anchors(r, &ports);
+            for (p, a) in ports.iter().zip(&anchors) {
+                if p.dir == dir && near(mp, *a, PORT_R * zf + 3.0) {
+                    return Some((id, p.kind));
+                }
+            }
+        }
+        None
+    }
+
+    /// Draw a node's typed connection ports as coloured dots — inputs down the
+    /// left edge, outputs down the right — each in its wire kind's colour, lit
+    /// when hovered (inputs a touch dimmer, as drop targets).
+    fn draw_typed_ports(
+        &self,
+        quads: &mut Vec<Quad>,
+        circle: TextureId,
+        id: NodeId,
+        zf: f32,
+        mp: [f32; 2],
+        clip: [f32; 4],
+    ) {
+        let r = self.rect_of(id);
+        let ports = self.node_ports(id);
+        let anchors = port_anchors(r, &ports);
+        let pr = PORT_R * zf;
+        for (p, a) in ports.iter().zip(anchors) {
+            let (col, rad) = if near(mp, a, pr + 3.0) {
+                (PORT_HOT, pr * 1.4)
+            } else if p.dir == PortDir::In {
+                let c = p.kind.color();
+                ([c[0] * 0.7, c[1] * 0.7, c[2] * 0.7, 1.0], pr)
+            } else {
+                (p.kind.color(), pr)
+            };
+            quads.push(Quad::disc(circle, a, rad, col, clip));
+        }
     }
 
     /// A canvas position that centres a node of `size` in the current view, with
@@ -1156,19 +1292,24 @@ impl App {
         }
     }
 
-    /// The screen-space endpoints of a wire (both nodes must still be placed).
+    /// The screen-space endpoints of a wire (both nodes must still be placed):
+    /// the source's typed **output** port to the target's typed **input** port
+    /// of the wire's kind, so each wire leaves and lands on its matching dot.
+    /// `(src, dst)` is the flow direction, which for Capture is the reverse of
+    /// the variant's `(app, cap)` tuple (frames flow cap → app).
     fn wire_endpoints(&self, w: Wire) -> Option<([f32; 2], [f32; 2])> {
-        let (a, b) = match w {
-            Wire::Bind(f, a) => (f, a),
-            Wire::Midi(s, d) => (s, d),
-            Wire::Serve(h, hp) => (h, hp),
-            Wire::Net(app, net) => (app, net),
-            Wire::Capture(app, cap) => (app, cap),
+        let (src, dst, kind) = match w {
+            Wire::Bind(vol, app) => (vol, app, PortKind::Bind),
+            Wire::Midi(s, d) => (s, d, PortKind::Midi),
+            Wire::Serve(http, hp) => (http, hp, PortKind::Serve),
+            Wire::Net(app, net) => (app, net, PortKind::Net),
+            Wire::Capture(app, cap) => (cap, app, PortKind::Capture),
         };
-        if self.view.win_pos.contains_key(&a) && self.view.win_pos.contains_key(&b) {
-            // Source's output port (right) to target's input port (left), so the
-            // wire flows left-to-right and lines up with the visible dots.
-            Some((port_out(self.rect_of(a)), port_in(self.rect_of(b))))
+        if self.view.win_pos.contains_key(&src) && self.view.win_pos.contains_key(&dst) {
+            Some((
+                self.port_pos(src, kind, PortDir::Out),
+                self.port_pos(dst, kind, PortDir::In),
+            ))
         } else {
             None
         }
@@ -1199,6 +1340,12 @@ impl App {
                     .iter()
                     .find(|&&(x, y)| pair(x, y))
                     .map(|&(x, y)| Wire::Net(x, y))
+            })
+            .or_else(|| {
+                s.capture_links
+                    .iter()
+                    .find(|&&(x, y)| pair(x, y))
+                    .map(|&(x, y)| Wire::Capture(x, y))
             })
     }
 
@@ -1746,7 +1893,7 @@ impl App {
             TEXT,
             clip,
         );
-        draw_ports(quads, gfx.renderer.circle, w.r, zf, mp, full);
+        self.draw_typed_ports(quads, gfx.renderer.circle, w.id, zf, mp, full);
     }
 
     /// Draw a yellow sticky note: word-wrapped text on a warm panel, with a close
@@ -2195,16 +2342,24 @@ impl App {
                     });
                     self.drag = Some(d);
                 }
-                DragMode::Connect if lmb => self.drag = Some(d),
-                // Released: wire to the target node — its input port (left), or
-                // anywhere on its body for convenience. Dragging over an existing
-                // wire removes it (the client decides create vs delete; the
-                // server's create never disconnects).
-                DragMode::Connect => {
-                    if let Some(target) = self
-                        .input_port_under(mp, zf)
-                        .or_else(|| self.topmost_under(mp))
-                    {
+                DragMode::Connect(_) if lmb => self.drag = Some(d),
+                // Released: wire to a target that accepts this kind — its matching
+                // input port, or anywhere on a node that has one, for convenience.
+                // Dragging over an existing wire removes it (the client decides
+                // create vs delete; the server's create never disconnects).
+                DragMode::Connect(kind) => {
+                    let target = self
+                        .port_under(mp, zf, PortDir::In)
+                        .filter(|&(_, k)| k == kind)
+                        .map(|(t, _)| t)
+                        .or_else(|| {
+                            self.topmost_under(mp).filter(|&t| {
+                                self.node_ports(t)
+                                    .iter()
+                                    .any(|p| p.kind == kind && p.dir == PortDir::In)
+                            })
+                        });
+                    if let Some(target) = target {
                         if target != d.id {
                             match self.wire_between(d.id, target) {
                                 Some(w) => self.conn.send(Command::Delete(ResourceRef::Wire(w))),
@@ -2342,16 +2497,16 @@ impl App {
                     consumed = true;
                 }
             }
-            // Dragging a wire out of a node's output port (right edge). Checked
-            // before the node-body hit-test so the port's outer half (past the
-            // edge) is grabbable too.
+            // Dragging a wire out of a node's typed output port (right edge).
+            // Checked before the node-body hit-test so the port's outer half
+            // (past the edge) is grabbable too.
             if !consumed {
-                if let Some(id) = self.output_port_under(mp, zf) {
+                if let Some((id, kind)) = self.port_under(mp, zf, PortDir::Out) {
                     self.z.retain(|&x| x != id);
                     self.z.push(id);
                     self.drag = Some(Drag {
                         id,
-                        mode: DragMode::Connect,
+                        mode: DragMode::Connect(kind),
                         grab: [0.0, 0.0],
                     });
                     consumed = true;
@@ -2727,6 +2882,7 @@ impl App {
                     clip,
                     full,
                     WidgetChrome {
+                        id,
                         r,
                         border,
                         bg,
@@ -2761,6 +2917,7 @@ impl App {
                     clip,
                     full,
                     WidgetChrome {
+                        id,
                         r,
                         border: HOSTPORT_BORDER,
                         bg: HOSTPORT_BG,
@@ -2821,6 +2978,7 @@ impl App {
                     clip,
                     full,
                     WidgetChrome {
+                        id,
                         r,
                         border: NET_BORDER,
                         bg: NET_BG,
@@ -2870,6 +3028,7 @@ impl App {
                     clip,
                     full,
                     WidgetChrome {
+                        id,
                         r,
                         border: NET_BORDER,
                         bg: NET_BG,
@@ -2904,6 +3063,7 @@ impl App {
                     clip,
                     full,
                     WidgetChrome {
+                        id,
                         r,
                         border: CAPTURE_BORDER,
                         bg: CAPTURE_BG,
@@ -3224,24 +3384,15 @@ impl App {
                 );
             }
 
-            draw_ports(&mut quads, gfx.renderer.circle, r, zf, mp, full);
+            self.draw_typed_ports(&mut quads, gfx.renderer.circle, id, zf, mp, full);
         }
 
-        // The wire being dragged out of an output port toward the cursor — same
-        // curved arrow as a finished connection.
+        // The wire being dragged out of a typed output port toward the cursor —
+        // same curved arrow as a finished connection, in that kind's colour.
         if let Some(d) = &self.drag {
-            if matches!(d.mode, DragMode::Connect) {
-                let from = port_out(self.rect_of(d.id));
-                draw_connection(
-                    &mut quads,
-                    white,
-                    from,
-                    mp,
-                    false,
-                    [0.80, 0.85, 1.0, 1.0],
-                    zf,
-                    full,
-                );
+            if let DragMode::Connect(kind) = d.mode {
+                let from = self.port_pos(d.id, kind, PortDir::Out);
+                draw_connection(&mut quads, white, from, mp, false, kind.color(), zf, full);
             }
         }
 
@@ -4390,6 +4541,49 @@ impl wk_protocol::Client<ServerHandle> for WindowClient {
 #[cfg(test)]
 mod inspect_tests {
     use super::*;
+
+    /// Port slots are evenly spaced with margins: one sits at the middle, and
+    /// N stay strictly inside the node's vertical span in order.
+    #[test]
+    fn port_slots_are_spaced_and_inside_the_node() {
+        let r = [10.0, 100.0, 60.0, 200.0]; // height 100, spans y ∈ [100, 200]
+        assert_eq!(port_slots_y(r, 1), vec![150.0], "one port centres");
+        let two = port_slots_y(r, 2);
+        assert!((two[0] - 133.333).abs() < 0.01 && (two[1] - 166.666).abs() < 0.01);
+        // Always inside the node and monotonically increasing.
+        let five = port_slots_y(r, 5);
+        assert!(five.windows(2).all(|w| w[0] < w[1]));
+        assert!(five.iter().all(|&y| y > r[1] && y < r[3]));
+    }
+
+    /// Typed ports anchor on the correct edge: inputs on the left (x = r[0]),
+    /// outputs on the right (x = r[2]), each in `ports` order.
+    #[test]
+    fn port_anchors_split_left_and_right_by_direction() {
+        let r = [10.0, 100.0, 60.0, 200.0];
+        let ports = vec![
+            Port {
+                kind: PortKind::Bind,
+                dir: PortDir::In,
+            },
+            Port {
+                kind: PortKind::Midi,
+                dir: PortDir::Out,
+            },
+            Port {
+                kind: PortKind::Midi,
+                dir: PortDir::In,
+            },
+        ];
+        let a = port_anchors(r, &ports);
+        assert_eq!(a[0][0], r[0], "bind-in on the left edge");
+        assert_eq!(a[2][0], r[0], "midi-in on the left edge");
+        assert_eq!(a[1][0], r[2], "midi-out on the right edge");
+        // The two left-edge inputs share the left edge but sit at distinct heights.
+        assert_ne!(a[0][1], a[2][1]);
+        // The single output centres vertically.
+        assert!((a[1][1] - 150.0).abs() < 0.01);
+    }
 
     /// The log panel strips ANSI escapes, normalises control bytes, and hard-
     /// wraps long lines to the column width.
