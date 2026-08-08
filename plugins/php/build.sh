@@ -62,6 +62,41 @@ if [ ! -d "$SRC" ]; then
     )
 fi
 
+# --- libsqlite3.a for wasm32-wasip2: pdo_sqlite/sqlite3 link against it, so
+# PHP (and WordPress via its SQLite Database Integration plugin) has a database.
+SQLITE_VER=3530300
+SQLITE_YEAR=2026
+DEPS="$PWD/deps"
+if [ ! -f "$DEPS/lib/libsqlite3.a" ]; then
+    if [ ! -d "sqlite-amalgamation-$SQLITE_VER" ]; then
+        curl -fsSL "https://www.sqlite.org/$SQLITE_YEAR/sqlite-amalgamation-$SQLITE_VER.zip" -o sqlite-amalg.zip
+        unzip -oq sqlite-amalg.zip && rm -f sqlite-amalg.zip
+    fi
+    mkdir -p "$DEPS/lib/pkgconfig" "$DEPS/include"
+    PATH="$BUILD_PATH" clang --target=wasm32-wasip2 -O2 \
+        -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_WAL -DSQLITE_DISABLE_LFS \
+        -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_GETPID \
+        -c "sqlite-amalgamation-$SQLITE_VER/sqlite3.c" -o "$DEPS/sqlite3.o"
+    "$WASI_SDK/bin/llvm-ar" rcs "$DEPS/lib/libsqlite3.a" "$DEPS/sqlite3.o"
+    cp "sqlite-amalgamation-$SQLITE_VER/sqlite3.h" "$DEPS/include/"
+    cat > "$DEPS/lib/pkgconfig/sqlite3.pc" <<PC
+prefix=$DEPS
+libdir=\${prefix}/lib
+includedir=\${prefix}/include
+Name: SQLite
+Description: SQL database engine
+Version: 3.53.3
+Libs: -L\${libdir} -lsqlite3
+Cflags: -I\${includedir}
+PC
+fi
+# pkg-config (from the host) locates our sqlite3.pc; keep its dir on the configure
+# PATH and point PKG_CONFIG_PATH at deps.
+PKG_CONFIG_BIN="$(command -v pkg-config || true)"
+[ -n "$PKG_CONFIG_BIN" ] || { echo "pkg-config not found (needed for --with-sqlite3)" >&2; exit 1; }
+export PKG_CONFIG_PATH="$DEPS/lib/pkgconfig"
+CONFIGURE_PATH="$BUILD_PATH:$(dirname "$PKG_CONFIG_BIN")"
+
 cd "$SRC"
 
 # The patches touch configure.ac, so regenerate configure (release tarballs ship
@@ -79,10 +114,15 @@ export CXXFLAGS="$CFLAGS"
 export LDFLAGS="$EH -lwasi-emulated-signal -lwasi-emulated-getpid -lwasi-emulated-process-clocks"
 
 if [ ! -f Makefile ]; then
-    PATH="$BUILD_PATH" ./configure \
+    # Extensions: pdo_sqlite/sqlite3 for the database; the rest is the set a
+    # stock WordPress needs that has no external-library dependency.
+    PATH="$CONFIGURE_PATH" ./configure \
         --host=wasm32-wasip2 host_alias=wasm32-wasi \
         --target=wasm32-wasip2 target_alias=wasm32-wasi \
         --disable-all --enable-cli \
+        --enable-pdo --with-pdo-sqlite --with-sqlite3 \
+        --enable-filter --enable-ctype --enable-tokenizer --enable-session \
+        --enable-fileinfo --enable-exif --enable-calendar \
         --without-pcre-jit --disable-fiber-asm --disable-zend-signals \
         --without-pear --disable-phar --without-iconv --without-openssl --disable-opcache \
         --config-cache

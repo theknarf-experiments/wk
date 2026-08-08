@@ -95,6 +95,8 @@ plugins/python/python.wasm
 plugins/php/php-8.2.6/
 plugins/php/.patches/
 plugins/php/php.wasm
+plugins/php/deps/
+plugins/php/sqlite-amalgamation-*/
 
 # fetch (networked C client) build artifact
 plugins/fetch/fetch.wasm
