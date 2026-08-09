@@ -107,6 +107,8 @@ const HOSTFILE_BORDER: [f32; 4] = [0.30, 0.45, 0.65, 1.0];
 /// Screen Capture nodes: recording-red chrome (a capability, like Network).
 const CAPTURE_BG: [f32; 4] = [0.22, 0.10, 0.12, 1.0];
 const CAPTURE_BORDER: [f32; 4] = [0.80, 0.30, 0.35, 1.0];
+const MIDI_BG: [f32; 4] = [0.10, 0.20, 0.13, 1.0];
+const MIDI_BORDER: [f32; 4] = [0.35, 0.75, 0.45, 1.0];
 
 /// Note nodes: a warm yellow sticky, dark text, for annotations.
 const NOTE_BG: [f32; 4] = [0.93, 0.86, 0.42, 1.0];
@@ -342,6 +344,8 @@ impl App {
             one(Net, Out) // an uplink dials into a Network
         } else if v.capture_feeds.contains_key(&id) {
             one(Capture, Out) // a Capture node grants apps
+        } else if v.midi_ins.contains_key(&id) {
+            one(Midi, Out) // a hardware MIDI input drives apps
         } else {
             // An app node.
             vec![
@@ -754,6 +758,11 @@ impl App {
             PaletteCmd::AddCapture,
         ));
         v.push(PaletteRow::new(
+            "Add MIDI In",
+            d("a hardware MIDI input device — wire it to a synth or the piano"),
+            PaletteCmd::AddMidiIn,
+        ));
+        v.push(PaletteRow::new(
             "New Workspace  (Cmd+T)",
             None,
             PaletteCmd::NewWorkspace,
@@ -798,6 +807,8 @@ impl App {
             "network".into()
         } else if let Some(u) = self.view.uplinks.get(&id) {
             u.kind.label().to_lowercase()
+        } else if self.view.midi_ins.contains_key(&id) {
+            "midi in".into()
         } else {
             "node".into()
         }
@@ -1026,6 +1037,14 @@ impl App {
                 let pos = self.view_center([FILE_W, FILE_H], self.view.capture_feeds.len());
                 self.conn.send(Command::Create(Resource::Node {
                     kind: NodeKind::Capture,
+                    pos,
+                    ws,
+                }));
+            }
+            PaletteCmd::AddMidiIn => {
+                let pos = self.view_center([FILE_W, FILE_H], self.view.midi_ins.len());
+                self.conn.send(Command::Create(Resource::Node {
+                    kind: NodeKind::MidiIn,
                     pos,
                     ws,
                 }));
@@ -2390,6 +2409,40 @@ impl App {
                         title: "screen capture",
                         title_col: TEXT,
                         status,
+                        status_col,
+                        status_scale: 0.7,
+                    },
+                );
+                continue;
+            }
+
+            // A hardware MIDI input node: a capability widget whose status shows
+            // the connected device (or that it's waiting for one).
+            if let Some(device) = self.view.midi_ins.get(&id).cloned() {
+                let (status, status_col): (String, [f32; 4]) = if device.is_empty() {
+                    (
+                        "no MIDI device — plug one in".to_string(),
+                        [0.8, 0.65, 0.5, 1.0],
+                    )
+                } else {
+                    (device, [0.5, 0.85, 0.6, 1.0])
+                };
+                self.draw_widget(
+                    &mut quads,
+                    &mut gfx,
+                    white,
+                    zf,
+                    mp,
+                    clip,
+                    full,
+                    WidgetChrome {
+                        id,
+                        r,
+                        border: MIDI_BORDER,
+                        bg: MIDI_BG,
+                        title: "MIDI in",
+                        title_col: TEXT,
+                        status: &status,
                         status_col,
                         status_scale: 0.7,
                     },
