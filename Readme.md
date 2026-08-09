@@ -100,6 +100,21 @@ Under the hood, Rust plugins build with
 compile with [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) and `wasm-tools`
 — all mise-managed, so `WASI_SDK` and friends are wired up for you.
 
+### CLAP audio plugins
+
+`wk` can host [CLAP](https://cleveraudio.org/) audio plugins. `wk:clap`
+(`crates/wk-server/wit-clap/`) re-expresses the CLAP C ABI as a WIT world, and a
+small C shim (`plugins/clap/`) links an **unmodified** CLAP plugin's source into
+a wk component — porting is "recompile + link", not a rewrite. `wk` drives it as
+a live audio node: it runs the plugin's `process()` from the audio callback,
+feeds a wired MIDI connection in as CLAP events, forwards the plugin's output
+events downstream, and plays its audio to the speakers. See
+[`plugins/clap/README.md`](plugins/clap/README.md) — the bundled examples include
+a polyphonic synth, a subtractive synth, a gain effect and a note effect, and
+`./fetch-third-party.sh` ports a real third-party plugin (nakst's HelloCLAP).
+Try `wk run example/clap.wk` (build the components first: `cd plugins/clap &&
+mise run build`).
+
 ## OCI registries
 
 `wk` can depend on plugins published to an OCI registry as Wasm OCI Artifacts.
