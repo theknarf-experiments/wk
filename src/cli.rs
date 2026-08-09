@@ -192,6 +192,8 @@ struct NodeReport<'a> {
 fn status_of(n: &wk_protocol::ipc::NodeInfo) -> &'static str {
     if n.error.is_some() {
         "error"
+    } else if n.compiling {
+        "compiling"
     } else if n.attached {
         "attached"
     } else if !n.runnable {
@@ -627,6 +629,8 @@ pub fn ps(workspace: &Path) -> Result<(), String> {
     for n in &snap.nodes {
         let status = if n.error.is_some() {
             "error".to_string()
+        } else if n.compiling {
+            "compiling".to_string()
         } else if n.attached {
             "attached".to_string()
         } else if !n.runnable {
@@ -674,6 +678,7 @@ mod tests {
             runnable: true,
             terminal: false,
             attached: false,
+            compiling: false,
             error: None,
         }
     }

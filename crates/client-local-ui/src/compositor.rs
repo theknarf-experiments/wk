@@ -2434,7 +2434,7 @@ impl App {
                 // Idle (offer Run/args) only once compiled and not running.
                 node_idle = !loading && !running && runnable;
                 let label = if loading {
-                    format!("{} (loading…)", node.name)
+                    format!("{} (compiling…)", node.name)
                 } else if running {
                     node.name.clone()
                 } else if node.finished.load(Ordering::Relaxed) {

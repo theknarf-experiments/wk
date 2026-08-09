@@ -502,6 +502,10 @@ pub struct Server {
     /// TCP+UDP forward into its network) and the port bound. Reconciled by
     /// `sync_serves`.
     pub serves: HashMap<NodeId, (NodeId, Arc<AtomicBool>)>,
+    /// Nodes whose run was requested while their component was still compiling.
+    /// The tick loop starts each one as soon as it's ready — so clicking play on
+    /// a big container that's mid-compile is never lost to a race.
+    pending_run: HashSet<NodeId>,
     /// HostPorts whose last bind attempt failed — keyed by HostPort node id, the
     /// value a human message (e.g. the localhost port is already in use by
     /// another process). Surfaced in the snapshot so `wk ps`/the UI can warn;
@@ -564,6 +568,7 @@ impl Server {
             mounted: HashMap::new(),
             routed: HashSet::new(),
             serves: HashMap::new(),
+            pending_run: HashSet::new(),
             port_errors: HashMap::new(),
             uplinks: HashMap::new(),
             capture_feeds: HashMap::new(),
@@ -973,15 +978,48 @@ impl Server {
 
     /// (Re)run an idle or exited node's guest with its current args.
     fn run_node(&mut self, id: NodeId) {
-        // A container's rootfs is mounted asynchronously on the compile thread
-        // (see `PluginHost::spawn`), so a bind mounted at load — before the
-        // rootfs landed — gets shadowed by it. Re-lay this app's binds now, on
-        // top of the rootfs, right before the guest reads its filesystem.
+        let Some(node) = self.app_node(id) else {
+            return;
+        };
+        // Still compiling? Remember the intent and start it the moment its
+        // component (and container rootfs) is ready — the tick loop drains
+        // `pending_run`. Clicking play on a big container mid-compile must not be
+        // a lost no-op: `host.run_node` would silently do nothing here.
+        if node.is_loading() {
+            self.pending_run.insert(id);
+            return;
+        }
+        self.pending_run.remove(&id);
+        // A container's rootfs is mounted on the compile thread (see
+        // `PluginHost::spawn`) — done by the time the node stops loading — so a
+        // bind mounted at load would be shadowed by it. Re-lay this app's binds
+        // now, on top of the rootfs, right before the guest reads its filesystem.
         self.reapply_binds(id);
-        if let Some(node) = self.app_node(id) {
-            let args = self.graph.node_args.get(&id).cloned().unwrap_or_default();
-            if let Err(e) = self.host.run_node(&node, &args) {
-                eprintln!("failed to run {}: {e:#}", node.name);
+        let args = self.graph.node_args.get(&id).cloned().unwrap_or_default();
+        if let Err(e) = self.host.run_node(&node, &args) {
+            eprintln!("failed to run {}: {e:#}", node.name);
+        }
+    }
+
+    /// Start any node whose run was requested while it was still compiling, now
+    /// that it's ready. Drops entries whose node vanished or failed to compile.
+    fn drain_pending_run(&mut self) {
+        if self.pending_run.is_empty() {
+            return;
+        }
+        for id in self.pending_run.iter().copied().collect::<Vec<_>>() {
+            match self.app_node(id) {
+                // Still compiling — keep waiting, unless the compile failed (setup
+                // never published but the thread finished), in which case give up.
+                Some(node) if node.is_loading() => {
+                    if node.finished.load(Ordering::Relaxed) {
+                        self.pending_run.remove(&id);
+                    }
+                }
+                Some(_) => self.run_node(id), // ready → run (clears pending)
+                None => {
+                    self.pending_run.remove(&id); // node gone
+                }
             }
         }
     }
@@ -1227,19 +1265,44 @@ impl Server {
     /// change and once per tick (so a wire made before its node finished
     /// compiling is honored as soon as the node comes up).
     fn sync_serves(&mut self) {
-        let active: HashMap<NodeId, NodeId> =
-            self.serves.iter().map(|(&h, &(hp, _))| (h, hp)).collect();
-        let plan = wiring::reconcile_serves(&self.graph.serve_links, &active);
-        // Kill the servers to stop, then (re)bind the ones to start. `start_serve`
-        // applies its own readiness/port-conflict guards.
-        for http in plan.stop {
+        // Which serve links are serviceable *right now*: a wasi:http node can be
+        // served as soon as it's compiled (its handler is invoked per request);
+        // a fabric (wasi:sockets) node only once its guest is actually running and
+        // thus listening. Gating on `running` means a HostPort publishes exactly
+        // when its node is live — never dialing a not-yet-listening guest, and it
+        // unbinds automatically when the node stops or exits.
+        let desired: HashMap<NodeId, NodeId> = self
+            .graph
+            .serve_links
+            .iter()
+            .filter(|&&(http, _)| {
+                self.app_node(http).is_some_and(|n| {
+                    n.http_path().is_some()
+                        || (n.net_stack().is_some() && n.running.load(Ordering::Relaxed))
+                })
+            })
+            .map(|&(h, hp)| (h, hp))
+            .collect();
+        // Stop forwards no longer desired: the wire was cut, the node stopped or
+        // exited, or it's now published on a different HostPort.
+        let stale: Vec<NodeId> = self
+            .serves
+            .iter()
+            .filter(|(http, (hp, _))| desired.get(http) != Some(hp))
+            .map(|(&http, _)| http)
+            .collect();
+        for http in stale {
             if let Some((hostport, kill)) = self.serves.remove(&http) {
                 kill.store(true, Ordering::Relaxed);
                 self.port_errors.remove(&hostport);
             }
         }
-        for (http, hostport) in plan.start {
-            self.start_serve(http, hostport);
+        // (Re)bind the newly-serviceable ones. `start_serve` applies its own
+        // port-conflict guard and records any bind failure.
+        for (&http, &hostport) in &desired {
+            if !self.serves.contains_key(&http) {
+                self.start_serve(http, hostport);
+            }
         }
         // Drop container-port mappings for serve wires that no longer exist, and
         // any bind-error against a HostPort no longer on the receiving end of one.
@@ -1556,6 +1619,10 @@ impl Server {
     /// One server step: reconcile any wiring that was pending on a still-loading
     /// node. Cheap; a client calls it each frame, headless in its tick loop.
     pub fn tick(&mut self) {
+        // Start nodes whose run was requested while they were still compiling,
+        // before reconciling serves so a just-started node gets published this
+        // same tick.
+        self.drain_pending_run();
         self.sync_mounts();
         self.sync_midi();
         self.sync_net_membership();
@@ -2458,6 +2525,9 @@ impl Server {
                         .as_ref()
                         .map(|n| n.running.load(Ordering::Relaxed))
                         .unwrap_or(false),
+                    compiling: app
+                        .as_ref()
+                        .is_some_and(|n| n.is_loading() && !n.finished.load(Ordering::Relaxed)),
                     runnable: app.as_ref().map(|n| n.is_runnable()).unwrap_or(false),
                     terminal: app.as_ref().map(|n| n.is_command()).unwrap_or(false),
                     attached: self.attached.contains(&id),

@@ -1135,11 +1135,15 @@ impl PluginHost {
                 if let Some(c) = &container {
                     if let Err(e) = crate::images::mount(&node.fs, c) {
                         eprintln!("failed to mount image for {name:?}: {e}");
+                        // Publishing never happens, so mark the node finished
+                        // rather than leaving it "compiling" forever.
+                        node.finished.store(true, Ordering::Relaxed);
                         return;
                     }
                 }
                 if let Err(e) = host.load_and_setup(&node, &path, &name, &args, surfaces) {
                     eprintln!("failed to load plugin {name:?}: {e:#}");
+                    node.finished.store(true, Ordering::Relaxed);
                 }
             })
             .expect("spawn compile thread");

@@ -40,6 +40,10 @@ pub struct NodeInfo {
     pub args: Vec<String>,
     /// An app node with a live guest.
     pub running: bool,
+    /// An app node whose component is still compiling (not yet runnable). A run
+    /// requested now is deferred and applied automatically once it's ready.
+    #[serde(default)]
+    pub compiling: bool,
     /// An app node that can be (re)started.
     pub runnable: bool,
     /// A terminal (wasi:cli) node a client may `attach` to.
@@ -188,6 +192,7 @@ mod tests {
                 size: [400.0, 300.0],
                 args: vec!["notes.txt".into()],
                 running: true,
+                compiling: false,
                 runnable: false,
                 terminal: true,
                 attached: false,
