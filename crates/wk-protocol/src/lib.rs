@@ -135,6 +135,10 @@ pub enum NodeKind {
     /// A Screen Capture node: a capability source granting wired apps access
     /// to captured frames (the host does the capturing).
     Capture,
+    /// A hardware MIDI input node: the host opens a physical MIDI input device
+    /// and routes its messages to the app nodes it's wired to (a MIDI source,
+    /// like the piano plugin).
+    MidiIn,
 }
 
 /// A resource to create.
@@ -184,6 +188,9 @@ pub struct NodePatch {
     /// Point a BindMount node at a host path — a file or a folder (requires
     /// `Update`).
     pub host_path: Option<String>,
+    /// Point a MidiIn node at a hardware MIDI input device by name (empty =
+    /// the first available) (requires `Update`).
+    pub midi_device: Option<String>,
     /// Toggle a Volume node's persistence (bytes saved to a sidecar and
     /// restored on load) (requires `Update`).
     pub persist: Option<bool>,

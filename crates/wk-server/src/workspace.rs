@@ -101,7 +101,7 @@ fn node_ident(n: &KdlNode) -> Option<NodeIdent> {
             // A placed node: named kinds carry the id second, others first.
             let named = matches!(
                 name,
-                "node" | "volume" | "virtualfile" | "bindmount" | "hostfile"
+                "node" | "volume" | "virtualfile" | "bindmount" | "hostfile" | "midiin"
             );
             node_id(n.get(if named { 1 } else { 0 })?).map(NodeIdent::Placed)
         }
@@ -348,6 +348,9 @@ pub enum SnapKind {
     /// A Screen Capture capability node: apps wired to it may read captured
     /// frames (see the `capturelink` pairs).
     Capture,
+    /// A hardware MIDI input node: the host opens the named device (empty = the
+    /// first available) and routes its messages to the apps it's wired to.
+    MidiIn { device: String },
 }
 
 /// Hex-encode an uplink secret for persistence.
@@ -818,7 +821,7 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
     // `<kind> <id>`.
     let named = matches!(
         n.name().value(),
-        "node" | "volume" | "virtualfile" | "bindmount" | "hostfile"
+        "node" | "volume" | "virtualfile" | "bindmount" | "hostfile" | "midiin"
     );
     let id = node_id(n.get(if named { 1 } else { 0 })?)?;
     let ch = n.children()?;
@@ -874,6 +877,13 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
                 .and_then(|n| u16::try_from(n).ok())?,
         },
         "capture" => SnapKind::Capture,
+        "midiin" => SnapKind::MidiIn {
+            device: n
+                .get(0)
+                .and_then(|v| v.as_string())
+                .unwrap_or("")
+                .to_string(),
+        },
         "network" => SnapKind::Net { gateway: false },
         "gateway" => SnapKind::Net { gateway: true },
         "iroh" => SnapKind::Iroh {
@@ -909,6 +919,7 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         SnapKind::Veilid { .. } => "veilid",
         SnapKind::Note { .. } => "note",
         SnapKind::Capture => "capture",
+        SnapKind::MidiIn { .. } => "midiin",
     };
     let mut node = KdlNode::new(name);
     // Named kinds lead with the name (or note text), then the id.
@@ -918,6 +929,9 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         }
         SnapKind::BindMount { path } => {
             node.push(str_entry(&path.to_string_lossy()));
+        }
+        SnapKind::MidiIn { device } => {
+            node.push(str_entry(device));
         }
         _ => {}
     }

@@ -36,6 +36,12 @@ wk-dockerfile = { path = "../wk-dockerfile" }
 wk-vfs = { path = "../wk-vfs" }
 wit-component = "0.253.0"
 
+# Hardware MIDI. The cross-platform crate (midir) pulls an ALSA version that
+# clashes with cpal's (via web-audio-api) at resolve time, so we bind CoreMIDI
+# directly on macOS; other platforms stub out (see midihw's cfg gates).
+[target.'cfg(target_os = "macos")'.dependencies]
+coremidi = "0.8"
+
 [dev-dependencies]
 proptest = "1"
 wk-token-service = { path = "../wk-token-service" }

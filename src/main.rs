@@ -149,6 +149,12 @@ enum Commands {
         cmd: ImagesCmd,
     },
 
+    /// Hardware MIDI
+    Midi {
+        #[command(subcommand)]
+        cmd: MidiCmd,
+    },
+
     /// Open a workspace (default workspace.wk)
     Run {
         /// Workspace file to open. Overrides the global `--file`; defaults to
@@ -208,6 +214,8 @@ enum CreateKind {
     Iroh,
     Veilid,
     Capture,
+    /// A hardware MIDI input node (value = device name; omit for the default)
+    Midi,
     Note,
 }
 
@@ -222,9 +230,16 @@ impl CreateKind {
             CreateKind::Iroh => NodeKind::Iroh,
             CreateKind::Veilid => NodeKind::Veilid,
             CreateKind::Capture => NodeKind::Capture,
+            CreateKind::Midi => NodeKind::MidiIn,
             CreateKind::Note => NodeKind::Note,
         }
     }
+}
+
+#[derive(Subcommand)]
+enum MidiCmd {
+    /// List connected hardware MIDI input devices (their port names)
+    Devices,
 }
 
 #[derive(Subcommand)]
@@ -370,6 +385,18 @@ fn main() -> Result<(), String> {
         Some(Commands::Down) => cli::down(file),
         Some(Commands::Up) => cli::up(file),
         Some(Commands::Images { cmd }) => images_cmd(cmd),
+        Some(Commands::Midi { cmd }) => {
+            let MidiCmd::Devices = cmd;
+            let devices = wk_server::midihw::input_devices();
+            if devices.is_empty() {
+                println!("(no MIDI input devices connected)");
+            } else {
+                for d in devices {
+                    println!("{d}");
+                }
+            }
+            Ok(())
+        }
         Some(Commands::Remove { plugin }) => workspace::remove(plugin.clone(), file),
         Some(Commands::Run {
             file: run_file,

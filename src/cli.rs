@@ -416,6 +416,7 @@ fn kind_label(kind: NodeKind) -> &'static str {
         NodeKind::Veilid => "veilid",
         NodeKind::Note => "note",
         NodeKind::Capture => "capture",
+        NodeKind::MidiIn => "midiin",
     }
 }
 
@@ -473,6 +474,11 @@ pub fn create(
         },
         NodeKind::Note => NodePatch {
             text: value.map(str::to_string),
+            ..Default::default()
+        },
+        NodeKind::MidiIn => NodePatch {
+            // A specific device name; None keeps the default the node opened.
+            midi_device: value.map(str::to_string),
             ..Default::default()
         },
         NodeKind::Volume if persist => NodePatch {

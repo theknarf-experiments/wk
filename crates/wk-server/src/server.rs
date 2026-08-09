@@ -172,6 +172,9 @@ pub struct View {
     pub host_ports: HashMap<NodeId, u16>,
     /// Note nodes (canvas id -> the sticky-note text).
     pub notes: HashMap<NodeId, String>,
+    /// MidiIn nodes (canvas id -> the resolved/target device name), for the UI
+    /// to label them.
+    pub midi_ins: HashMap<NodeId, String>,
     pub net_nodes: HashSet<NodeId>,
     pub gateways: HashSet<NodeId>,
     pub uplinks: HashMap<NodeId, UplinkMeta>,
@@ -260,6 +263,7 @@ impl View {
             file_nodes: keep_map(&self.file_nodes, mine),
             host_ports: keep_map(&self.host_ports, mine),
             notes: keep_map(&self.notes, mine),
+            midi_ins: keep_map(&self.midi_ins, mine),
             net_nodes: keep_set(&self.net_nodes, mine),
             gateways: keep_set(&self.gateways, mine),
             uplinks: keep_map(&self.uplinks, mine),
@@ -402,6 +406,9 @@ pub enum Kind {
     Note,
     /// A Screen Capture node: grants wired apps captured frames.
     Capture,
+    /// A hardware MIDI input node: the host opens a physical MIDI device and
+    /// routes its messages to the app nodes it's wired to (a MIDI source).
+    MidiIn,
 }
 
 impl Kind {
@@ -442,6 +449,9 @@ pub struct Graph {
     pub host_ports: HashMap<NodeId, u16>,
     /// Note nodes' text (canvas id -> the sticky-note contents).
     pub note_text: HashMap<NodeId, String>,
+    /// MidiIn nodes' target device name (canvas id -> device; empty = default),
+    /// persisted so the node reconnects to the same hardware on reload.
+    pub midi_ins: HashMap<NodeId, String>,
 
     /// Volume binds as (volume id, app node id).
     pub connections: Vec<(NodeId, NodeId)>,
@@ -517,6 +527,11 @@ pub struct Server {
     /// Each Capture node's frame slot (the client fills it; wired apps read
     /// it through their `capture_src`, kept in sync by [`Self::sync_captures`]).
     capture_feeds: HashMap<NodeId, crate::capture::SharedFrameSlot>,
+    /// Open hardware MIDI inputs, one per MidiIn node: holds the device
+    /// connection alive (dropping it closes the device); its callback feeds the
+    /// MIDI router as the node. Pure runtime state, rebuilt from `graph.midi_ins`
+    /// on load.
+    midi_devices: HashMap<NodeId, crate::midihw::MidiDevice>,
     /// Nodes a CLI client has `attach`ed to (owning their terminal I/O). The
     /// windowed UI treats these as detached: it stops draining/feeding their
     /// terminal so the two don't fight over the stream. Pure runtime state.
@@ -572,6 +587,7 @@ impl Server {
             port_errors: HashMap::new(),
             uplinks: HashMap::new(),
             capture_feeds: HashMap::new(),
+            midi_devices: HashMap::new(),
             attached: std::collections::HashSet::new(),
             unplaced: Vec::new(),
             unplaced_wires: Vec::new(),
@@ -767,6 +783,49 @@ impl Server {
         self.capture_feeds.insert(id, crate::capture::new_slot());
     }
 
+    /// Add a hardware MIDI input node, opening the first available device now.
+    fn add_midi_in_node(&mut self, pos: [f32; 2], ws: NodeId) {
+        let id = self.alloc_id();
+        self.place(id, Kind::MidiIn, ws, pos, [FILE_W, FILE_H]);
+        self.graph.midi_ins.insert(id, String::new());
+        self.open_midi_device(id, "");
+    }
+
+    /// Point a MidiIn node at a device by name (empty = first available),
+    /// (re)opening its hardware connection.
+    fn set_midi_device(&mut self, id: NodeId, want: String) {
+        if self.kind_of(id) != Some(Kind::MidiIn) {
+            return; // only MidiIn nodes have a device
+        }
+        self.graph.midi_ins.insert(id, want.clone());
+        self.open_midi_device(id, &want);
+    }
+
+    /// Open (or reopen) the hardware device for MidiIn node `id`, feeding the
+    /// MIDI router as `id`. On success the persisted name is set to the resolved
+    /// device so it reconnects to the same one; a failure is logged and leaves
+    /// the node placed-but-disconnected.
+    fn open_midi_device(&mut self, id: NodeId, want: &str) {
+        self.midi_devices.remove(&id); // drop any existing connection (closes it)
+        match crate::midihw::open(id, want, self.host.midi()) {
+            Ok(dev) => {
+                self.graph.midi_ins.insert(id, dev.name.clone());
+                self.midi_devices.insert(id, dev);
+            }
+            Err(e) => eprintln!("MIDI input node {id}: {e}"),
+        }
+    }
+
+    fn remove_midi_in_node(&mut self, id: NodeId) {
+        self.midi_devices.remove(&id); // close the device
+        self.graph.midi_ins.remove(&id);
+        // Drop it from MIDI routing (as a source) and its desired wires.
+        self.host.midi().lock().unwrap().remove_node(id);
+        self.graph.midi_links.retain(|&(s, d)| s != id && d != id);
+        self.routed.retain(|&(s, d)| s != id && d != id);
+        self.forget(id);
+    }
+
     /// Create a Network node at `pos`; returns its id.
     fn add_net_node(&mut self, pos: [f32; 2], ws: NodeId) -> NodeId {
         let id = self.alloc_id();
@@ -922,6 +981,7 @@ impl Server {
             // A note wires to nothing and runs nothing; just drop it.
             Some(Kind::Note) => self.forget(id),
             Some(Kind::Capture) => self.remove_capture_node(id),
+            Some(Kind::MidiIn) => self.remove_midi_in_node(id),
             None => {}
         }
     }
@@ -1119,6 +1179,7 @@ impl Server {
             Some(Kind::Network | Kind::Gateway) => NodeClass::Net,
             Some(Kind::Iroh | Kind::Veilid) => NodeClass::Uplink,
             Some(Kind::Capture) => NodeClass::Capture,
+            Some(Kind::MidiIn) => NodeClass::MidiSource,
             Some(Kind::App) | Some(Kind::Note) | None => NodeClass::Other,
         }
     }
@@ -1930,6 +1991,7 @@ impl Server {
                 NodeKind::Veilid => self.add_veilid_node(pos, ws),
                 NodeKind::Note => self.add_note(pos, ws),
                 NodeKind::Capture => self.add_capture_node(pos, ws),
+                NodeKind::MidiIn => self.add_midi_in_node(pos, ws),
             },
             // Create is create only: a wire that already exists is left alone
             // (removal is Delete, so a create-only token can never disconnect).
@@ -1962,6 +2024,9 @@ impl Server {
                 }
                 if let Some(host_path) = patch.host_path {
                     self.set_bind_path(id, host_path);
+                }
+                if let Some(device) = patch.midi_device {
+                    self.set_midi_device(id, device);
                 }
                 if let Some(persist) = patch.persist {
                     if let Some(FileNode::Volume(v)) = self.graph.file_nodes.get_mut(&id) {
@@ -2114,6 +2179,9 @@ impl Server {
                 text: self.graph.note_text.get(&id).cloned().unwrap_or_default(),
             },
             Kind::Capture => SnapKind::Capture,
+            Kind::MidiIn => SnapKind::MidiIn {
+                device: self.graph.midi_ins.get(&id).cloned().unwrap_or_default(),
+            },
         };
         Some(NodeSnap {
             id,
@@ -2308,6 +2376,12 @@ impl Server {
                     .entry(s.id)
                     .or_insert_with(crate::capture::new_slot);
             }
+            SnapKind::MidiIn { device } => {
+                self.place(s.id, Kind::MidiIn, ws, s.pos, s.size);
+                self.graph.midi_ins.insert(s.id, device.clone());
+                // Reconnect to the saved device (or the first available).
+                self.open_midi_device(s.id, device);
+            }
         }
     }
 
@@ -2438,6 +2512,7 @@ impl Server {
             file_nodes,
             host_ports: self.graph.host_ports.clone(),
             notes: self.graph.note_text.clone(),
+            midi_ins: self.graph.midi_ins.clone(),
             net_nodes,
             gateways,
             uplinks,
@@ -2498,6 +2573,7 @@ impl Server {
                 Some(Kind::Veilid) => "veilid",
                 Some(Kind::Note) => "note",
                 Some(Kind::Capture) => "capture",
+                Some(Kind::MidiIn) => "midiin",
                 None => "unknown",
             }
         };
@@ -3233,6 +3309,7 @@ mod model_tests {
                     port_set: None,
                     text: None,
                     host_path: None,
+                    midi_device: None,
                     persist: None,
                 },
             }),

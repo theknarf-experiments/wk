@@ -806,6 +806,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "block"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d8c1fef690941d3e7788d328517591fecc684c084084702d6ff1641e993699a"
+
+[[package]]
 name = "block-buffer"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1456,6 +1462,27 @@ dependencies = [
  "objc2-core-audio",
  "objc2-core-audio-types",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "coremidi"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "964eb3e10ea8b0d29c797086aab3ca730f75e06dced0cb980642fd274a5cca30"
+dependencies = [
+ "block",
+ "core-foundation 0.9.4",
+ "core-foundation-sys",
+ "coremidi-sys",
+]
+
+[[package]]
+name = "coremidi-sys"
+version = "3.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a2b8c2cefa9a8f712213c5a1383ffe428efc8f1a1fd1e2f757be94daf7e256a"
+dependencies = [
+ "core-foundation-sys",
 ]
 
 [[package]]
@@ -10885,6 +10912,7 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "biscuit-auth",
+ "coremidi",
  "flate2",
  "http-body-util",
  "hyper",

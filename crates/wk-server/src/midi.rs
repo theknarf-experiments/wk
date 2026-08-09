@@ -87,6 +87,13 @@ impl Routes {
             }
         }
     }
+
+    /// Inject a message from a non-guest source (a hardware MIDI device node),
+    /// routed to that node's connected destinations exactly like a guest's
+    /// `output.send`.
+    pub fn send_from(&self, src: NodeId, msg: &Message) {
+        self.send(src, msg);
+    }
 }
 
 pub type Router = Arc<Mutex<Routes>>;

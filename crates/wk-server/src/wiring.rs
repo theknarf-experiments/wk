@@ -23,6 +23,9 @@ pub enum NodeClass {
     Uplink,
     /// A Screen Capture node — wires only to an app (granting it frames).
     Capture,
+    /// A hardware MIDI input node — a MIDI *source* only (wires to an app's MIDI
+    /// input, never a destination).
+    MidiSource,
     Other,
 }
 
@@ -50,6 +53,10 @@ pub fn classify(a: NodeId, b: NodeId, ca: NodeClass, cb: NodeClass) -> Option<Wi
         // The app is the first element; the capture source the second.
         (Capture, Other) => Some(Wire::Capture(b, a)),
         (Other, Capture) => Some(Wire::Capture(a, b)),
+        // A hardware MIDI source drives an app's MIDI input: the source is always
+        // the first element of the MIDI link (it can't be a destination).
+        (MidiSource, Other) => Some(Wire::Midi(a, b)),
+        (Other, MidiSource) => Some(Wire::Midi(b, a)),
         (Other, Other) => Some(Wire::Midi(a, b)),
         _ => None,
     }
@@ -205,6 +212,12 @@ mod tests {
             (Other, Net, Some(Wire::Net(a, b))),
             (Other, Uplink, None),
             (Other, Other, Some(Wire::Midi(a, b))),
+            // A hardware MIDI source drives an app; it's always the link's source
+            // and never wires to another special node.
+            (MidiSource, Other, Some(Wire::Midi(a, b))),
+            (Other, MidiSource, Some(Wire::Midi(b, a))),
+            (MidiSource, MidiSource, None),
+            (MidiSource, Net, None),
         ];
         for (ca, cb, want) in cases {
             assert_eq!(classify(a, b, ca, cb), want, "classify({ca:?}, {cb:?})");
@@ -218,6 +231,7 @@ mod tests {
             Just(NodeClass::Net),
             Just(NodeClass::Uplink),
             Just(NodeClass::Capture),
+            Just(NodeClass::MidiSource),
             Just(NodeClass::Other),
         ]
     }
