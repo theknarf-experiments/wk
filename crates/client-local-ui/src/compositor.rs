@@ -347,14 +347,20 @@ impl App {
         } else if v.midi_ins.contains_key(&id) {
             one(Midi, Out) // a hardware MIDI input drives apps
         } else {
-            // An app node. Every app can mount a volume, receive capture frames,
-            // and serve http; the MIDI and Network ports appear only on apps
-            // whose component actually imports those capabilities (`wk:midi` /
-            // `wasi:sockets`). While the component is still compiling both read
-            // false, so the capability ports appear once it's ready.
+            // An app node. Every app can mount a volume (Bind); the other ports
+            // appear only on apps whose component actually imports the matching
+            // capability: MIDI (`wk:midi`), Capture (`wk:capture`), Network
+            // (`wasi:sockets`), and Serve (a `wasi:http` server, or a networked
+            // node whose port a HostPort can forward). While the component is
+            // still compiling these all read false, so the ports appear once it's
+            // ready.
             let node = v.app_node(id);
             let midi = node.as_ref().is_some_and(|n| n.imports_midi());
             let net = node.as_ref().is_some_and(|n| n.imports_net());
+            let capture = node.as_ref().is_some_and(|n| n.imports_capture());
+            let serve = node
+                .as_ref()
+                .is_some_and(|n| n.http_path().is_some() || n.imports_net());
             let mut ports = vec![Port {
                 kind: Bind,
                 dir: In,
@@ -365,20 +371,24 @@ impl App {
                     dir: In,
                 });
             }
-            ports.push(Port {
-                kind: Capture,
-                dir: In,
-            });
+            if capture {
+                ports.push(Port {
+                    kind: Capture,
+                    dir: In,
+                });
+            }
             if midi {
                 ports.push(Port {
                     kind: Midi,
                     dir: Out,
                 });
             }
-            ports.push(Port {
-                kind: Serve,
-                dir: Out,
-            });
+            if serve {
+                ports.push(Port {
+                    kind: Serve,
+                    dir: Out,
+                });
+            }
             if net {
                 ports.push(Port {
                     kind: Net,

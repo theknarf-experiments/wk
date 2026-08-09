@@ -174,6 +174,9 @@ pub struct NodeSetup {
     /// Whether the component imports `wasi:sockets` — the UI only draws a Network
     /// port on nodes that actually do networking.
     pub net: bool,
+    /// Whether the component imports `wk:capture` — the UI only draws a Capture
+    /// port on nodes that actually consume captured frames.
+    pub capture: bool,
 }
 
 /// What [`PluginHost::run_node`] needs to (re)start a node's guest, reused across
@@ -203,6 +206,11 @@ impl Node {
     /// the component has finished compiling.
     pub fn imports_net(&self) -> bool {
         self.setup.get().is_some_and(|s| s.net)
+    }
+    /// Whether this node consumes captured canvas frames (imports `wk:capture`).
+    /// `false` until the component has finished compiling.
+    pub fn imports_capture(&self) -> bool {
+        self.setup.get().is_some_and(|s| s.capture)
     }
     pub fn is_runnable(&self) -> bool {
         self.setup.get().is_some_and(|s| s.run.is_some())
@@ -797,6 +805,15 @@ fn component_imports_midi(component: &Component, engine: &Engine) -> bool {
         .any(|(name, _)| name == "wk:midi/midi" || name.starts_with("wk:midi/"))
 }
 
+/// Whether a component imports `wk:capture` — i.e. it consumes captured canvas
+/// frames, so the UI should offer it a Capture port.
+fn component_imports_capture(component: &Component, engine: &Engine) -> bool {
+    component
+        .component_type()
+        .imports(engine)
+        .any(|(name, _)| name.starts_with("wk:capture/"))
+}
+
 /// Whether a component is a `wasi:http` server (exports `incoming-handler`).
 fn component_is_proxy(component: &Component, engine: &Engine) -> bool {
     component
@@ -1197,6 +1214,7 @@ impl PluginHost {
         // until the server wires it to a Network node.
         let imports_sockets = component_imports_sockets(&component, &self.engine);
         let imports_midi = component_imports_midi(&component, &self.engine);
+        let imports_capture = component_imports_capture(&component, &self.engine);
         let net_stack = if !is_http && imports_sockets {
             // Seeded from the node id so a node keeps its address across
             // re-runs; alloc_ip skips octets already taken by other stacks.
@@ -1216,6 +1234,7 @@ impl PluginHost {
             }),
             midi: imports_midi,
             net: imports_sockets,
+            capture: imports_capture,
         };
         // Publish; the server now sees a ready node.
         let _ = node.setup.set(setup);
