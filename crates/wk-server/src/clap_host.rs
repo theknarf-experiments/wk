@@ -457,6 +457,23 @@ mod tests {
         assert!(midi_to_event(&[]).is_none());
     }
 
+    /// The subtractive synth (saw → resonant filter → envelope, 5 params) sounds
+    /// on a note-on and stays finite — a richer instrument through wk:clap.
+    #[test]
+    fn subsynth_sounds_and_stays_finite() {
+        let bytes = include_bytes!("../testdata/subsynth.wasm");
+        let engine = ClapEngine::new().unwrap();
+        let component = engine.compile(bytes).unwrap();
+        let mut inst = engine.instantiate(&component, 48_000.0, 512).unwrap();
+        assert_eq!(inst.param_count().unwrap(), 5);
+        assert_eq!(inst.param_info(0).unwrap().unwrap().name, "Cutoff");
+
+        let out = inst.process(512, &[note_on(57, 0)], None, &[]).unwrap();
+        let ch = &out.audio_out[0][0];
+        assert!(ch.iter().all(|s| s.is_finite()), "no NaN/inf");
+        assert!(peak(ch) > 0.01, "should sound");
+    }
+
     /// A note-on delivered as a raw MIDI message (the wire format) drives the
     /// polysynth — proving the inbox→event→process path the audio node uses.
     #[test]

@@ -30,6 +30,9 @@ dependencies {
     clap_synth "plugins/clap/build/polysynth.wasm" {
         description "a real CLAP plugin (polyphonic synth) hosted via wk:clap — wire MIDI in; audio to speakers (mise run build in plugins/clap first)"
     }
+    clap_subsynth "plugins/clap/build/subsynth.wasm" {
+        description "a CLAP subtractive synth (saw + resonant filter + envelope) hosted via wk:clap (mise run build in plugins/clap first)"
+    }
     clap_gain "plugins/clap/build/gain.wasm" {
         description "a CLAP gain effect hosted via wk:clap (mise run build in plugins/clap first)"
     }

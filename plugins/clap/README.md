@@ -25,6 +25,7 @@ so wk can host the CLAP ecosystem. wk drives them from the host side
 | `examples/template.c` | official minimal CLAP plugin (free-audio/clap, MIT); L/R-swap effect | audio-ports, note-ports, state |
 | `examples/gain.c` | stereo gain effect with one automatable parameter | audio-ports, params |
 | `examples/polysynth.c` | polyphonic sine synth (note-on → voice, AR envelope) | note-ports, audio-ports, params |
+| `examples/subsynth.c` | subtractive polysynth: saw → resonant TPT filter → envelope | note-ports, audio-ports, params |
 | `examples/octaver.c` | note effect: doubles each note an octave up (CLAP output events) | note-ports |
 
 Each builds to a reactor component exporting only `wk:clap/plugins`. They double
