@@ -10913,6 +10913,7 @@ dependencies = [
  "alacritty_terminal",
  "biscuit-auth",
  "coremidi",
+ "cpal",
  "flate2",
  "http-body-util",
  "hyper",

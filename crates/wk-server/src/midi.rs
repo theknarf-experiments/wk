@@ -41,6 +41,13 @@ impl Inbox {
             self.queue.push_back(msg);
         }
     }
+
+    /// Take the oldest queued message, if any. Used by the guest's `input`
+    /// resource and by the host-side CLAP pump (which drains a node's inbox
+    /// directly rather than through a guest).
+    pub fn pop(&mut self) -> Option<Message> {
+        self.queue.pop_front()
+    }
 }
 
 pub type SharedInbox = Arc<Mutex<Inbox>>;

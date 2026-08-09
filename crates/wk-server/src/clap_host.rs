@@ -1,5 +1,5 @@
 //! Host runtime for CLAP plugins compiled to `wk:clap` components (see
-//! `plugins/clap-template`). wk drives such a component the way a CLAP host
+//! `plugins/clap`). wk drives such a component the way a CLAP host
 //! drives a native plugin: instantiate → create → init → activate →
 //! start-processing → `process()` per block. This module owns a dedicated,
 //! **synchronous** wasmtime engine (the audio pump calls `process` on a normal
@@ -234,6 +234,110 @@ impl ClapInstance {
     }
 }
 
+/// Convert a raw MIDI message (as it arrives on a node's inbox) into a CLAP
+/// input event — a passthrough `CLAP_EVENT_MIDI`, which CLAP instruments handle
+/// alongside native note events. Short messages are zero-padded to three bytes.
+pub fn midi_to_event(msg: &[u8]) -> Option<Event> {
+    if msg.is_empty() {
+        return None;
+    }
+    Some(Event::Midi(Midi {
+        time: 0,
+        port_index: 0,
+        data: (
+            msg[0],
+            msg.get(1).copied().unwrap_or(0),
+            msg.get(2).copied().unwrap_or(0),
+        ),
+    }))
+}
+
+/// Run a CLAP component as a live audio node: open the default output device and,
+/// each audio callback, drain the node's MIDI inbox into CLAP events, `process()`
+/// a block, and write it to the speakers. Blocks until `kill` is set, then drops
+/// the stream. Best-effort: with no output device (e.g. headless) it returns an
+/// error and the node simply produces no sound.
+fn run_audio_node(
+    wasm: &[u8],
+    midi_in: &crate::midi::SharedInbox,
+    kill: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use std::sync::atomic::Ordering;
+
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or_else(|| wasmtime::Error::msg("no default audio output device"))?;
+    let supported = device.default_output_config()?;
+    if supported.sample_format() != cpal::SampleFormat::F32 {
+        return Err(wasmtime::Error::msg(format!(
+            "unsupported output sample format {:?} (only f32)",
+            supported.sample_format()
+        )));
+    }
+    let config: cpal::StreamConfig = supported.config();
+    let sample_rate = config.sample_rate as f64;
+    let channels = config.channels.max(1) as usize;
+
+    let engine = ClapEngine::new()?;
+    let component = engine.compile(wasm)?;
+    let mut inst = engine.instantiate(&component, sample_rate, 4096)?;
+
+    let midi = midi_in.clone();
+    let stream = device.build_output_stream(
+        config,
+        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            let frames = data.len() / channels;
+            let mut events = Vec::new();
+            if let Ok(mut q) = midi.lock() {
+                while let Some(m) = q.pop() {
+                    if let Some(e) = midi_to_event(&m) {
+                        events.push(e);
+                    }
+                }
+            }
+            let out = inst.process(frames as u32, &events, None, &[]);
+            for f in 0..frames {
+                for c in 0..channels {
+                    let s = out
+                        .as_ref()
+                        .ok()
+                        .and_then(|o| o.audio_out.first())
+                        .and_then(|p| p.get(c.min(p.len().saturating_sub(1))))
+                        .and_then(|ch| ch.get(f).copied())
+                        .unwrap_or(0.0);
+                    data[f * channels + c] = s;
+                }
+            }
+        },
+        |err| eprintln!("wk clap: audio stream error: {err}"),
+        None,
+    )?;
+    stream.play()?;
+    while !kill.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+/// Spawn a CLAP component as a live audio node on its own thread (it owns the
+/// non-`Send` cpal stream). Drains `midi_in`, plays to the default output, and
+/// stops when `kill` is set, marking `finished`.
+pub fn spawn_audio_node(
+    wasm: Vec<u8>,
+    midi_in: crate::midi::SharedInbox,
+    kill: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        if let Err(e) = run_audio_node(&wasm, &midi_in, &kill) {
+            eprintln!("wk clap node: {e:#}");
+        }
+        finished.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +369,33 @@ mod tests {
 
     fn peak(chan: &[f32]) -> f32 {
         chan.iter().fold(0.0, |m, &x| m.max(x.abs()))
+    }
+
+    #[test]
+    fn midi_passthrough_becomes_a_clap_midi_event() {
+        match midi_to_event(&[0x90, 60, 100]) {
+            Some(Event::Midi(m)) => assert_eq!(m.data, (0x90, 60, 100)),
+            _ => panic!("expected a midi event"),
+        }
+        // Short messages zero-pad; empty yields nothing.
+        match midi_to_event(&[0xB0, 7]) {
+            Some(Event::Midi(m)) => assert_eq!(m.data, (0xB0, 7, 0)),
+            _ => panic!("expected a midi event"),
+        }
+        assert!(midi_to_event(&[]).is_none());
+    }
+
+    /// A note-on delivered as a raw MIDI message (the wire format) drives the
+    /// polysynth — proving the inbox→event→process path the audio node uses.
+    #[test]
+    fn polysynth_sounds_from_raw_midi() {
+        let bytes = include_bytes!("../testdata/polysynth.wasm");
+        let engine = ClapEngine::new().unwrap();
+        let component = engine.compile(bytes).unwrap();
+        let mut inst = engine.instantiate(&component, 48_000.0, 512).unwrap();
+        let ev = midi_to_event(&[0x90, 69, 100]).unwrap();
+        let out = inst.process(512, &[ev], None, &[]).unwrap();
+        assert!(peak(&out.audio_out[0][0]) > 0.05);
     }
 
     /// The vendored `plugin-template.c` is an L/R-swap stereo effect with one
