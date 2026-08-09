@@ -1,0 +1,369 @@
+// DRAFT — wk:clap. A WIT re-expression of the CLAP audio-plugin C ABI, shaped so
+// a small C shim can bridge an unmodified CLAP plugin to a wk component: the shim
+// implements the CLAP `clap_host`/`clap_plugin` vtables toward the plugin and
+// this WIT world toward wk. Not yet wired to any host code — a design artifact to
+// react to.
+//
+// Mapping choices vs. the C ABI:
+//   * POD event/info structs  -> `record`s (clap/events.h transcribed).
+//   * `clap_plugin` vtable     -> the `plugin` `resource` (methods == fn ptrs).
+//   * `clap_host` callbacks    -> the imported `host` interface.
+//   * `get_extension(id)`      -> gone. The core extensions (params, audio-ports,
+//                                 note-ports, state) are folded into the `plugin`
+//                                 resource as methods; `features()` reports which
+//                                 the underlying plugin actually implements.
+//                                 Unmodeled / draft / vendor extensions simply
+//                                 aren't available (graceful degradation).
+//   * `clap_process` audio     -> `list<list<f32>>` per port (channels x frames),
+//                                 copied across the boundary. A shared-memory
+//                                 fast path can replace this later without
+//                                 changing the event model.
+package wk:clap;
+
+/// Event and descriptor types, transcribed from clap/events.h and the core
+/// extension headers. Wildcards follow CLAP: `-1` means "all" for channel/key,
+/// and note-id `-1` means "unspecified".
+interface types {
+    /// Per-event flags (clap_event_flags): live vs. recorded automation.
+    flags event-flags {
+        is-live,
+        dont-record,
+    }
+
+    /// clap_note_expression.
+    enum note-expression {
+        volume,
+        pan,
+        tuning,
+        vibrato,
+        expression,
+        brightness,
+        pressure,
+    }
+
+    /// clap_event_note (note-on / note-off / note-choke / note-end).
+    record note {
+        time: u32,
+        flag-set: event-flags,
+        note-id: s32,
+        port-index: s16,
+        channel: s16,
+        key: s16,
+        velocity: f64,
+    }
+
+    /// clap_event_note_expression.
+    record note-expr {
+        time: u32,
+        flag-set: event-flags,
+        expression: note-expression,
+        note-id: s32,
+        port-index: s16,
+        channel: s16,
+        key: s16,
+        value: f64,
+    }
+
+    /// clap_event_param_value.
+    record param-value {
+        time: u32,
+        flag-set: event-flags,
+        param-id: u32,
+        note-id: s32,
+        port-index: s16,
+        channel: s16,
+        key: s16,
+        value: f64,
+    }
+
+    /// clap_event_param_mod (polyphonic modulation).
+    record param-mod {
+        time: u32,
+        flag-set: event-flags,
+        param-id: u32,
+        note-id: s32,
+        port-index: s16,
+        channel: s16,
+        key: s16,
+        amount: f64,
+    }
+
+    /// clap_event_param_gesture (begin/end adjustment).
+    record param-gesture {
+        time: u32,
+        param-id: u32,
+    }
+
+    /// clap_event_midi (raw 3-byte message).
+    record midi {
+        time: u32,
+        port-index: u16,
+        data: tuple<u8, u8, u8>,
+    }
+
+    /// clap_event_midi_sysex.
+    record midi-sysex {
+        time: u32,
+        port-index: u16,
+        buffer: list<u8>,
+    }
+
+    /// clap_event_midi2 (four 32-bit UMP words).
+    record midi2 {
+        time: u32,
+        port-index: u16,
+        data: tuple<u32, u32, u32, u32>,
+    }
+
+    /// A single event in a process block. Replaces the C `clap_event_header` +
+    /// downcast with a tagged union; `time` (sample offset) lives on each arm.
+    variant event {
+        note-on(note),
+        note-off(note),
+        note-choke(note),
+        note-end(note),
+        note-expression(note-expr),
+        param-value(param-value),
+        param-mod(param-mod),
+        param-gesture-begin(param-gesture),
+        param-gesture-end(param-gesture),
+        midi(midi),
+        midi-sysex(midi-sysex),
+        midi2(midi2),
+    }
+
+    /// clap_event_transport (all fixed-point times widened to f64).
+    record transport {
+        is-playing: bool,
+        is-recording: bool,
+        is-looping: bool,
+        song-pos-beats: f64,
+        song-pos-seconds: f64,
+        tempo: f64,
+        tempo-inc: f64,
+        bar-start-beats: f64,
+        bar-number: s32,
+        loop-start-beats: f64,
+        loop-end-beats: f64,
+        tsig-num: u16,
+        tsig-denom: u16,
+    }
+
+    /// clap_process_status.
+    enum process-status {
+        error,
+        continue,
+        continue-if-not-quiet,
+        tail,
+        sleep,
+    }
+
+    /// One audio port's samples for a block: channels x frames.
+    type audio-buffer = list<list<f32>>;
+
+    /// clap_plugin_descriptor.
+    record descriptor {
+        id: string,
+        name: string,
+        vendor: string,
+        version: string,
+        // CLAP feature strings, e.g. "instrument", "audio-effect", "stereo".
+        features: list<string>,
+    }
+
+    /// Which core extensions a plugin instance actually implements (the WIT stand-
+    /// in for `get_extension` returning non-null).
+    flags supported {
+        params,
+        audio-ports,
+        note-ports,
+        state,
+        // The plugin implements clap.gui with CLAP_WINDOW_API_WEBVIEW.
+        gui-webview,
+    }
+
+    /// clap_param_info flags (subset).
+    flags param-flags {
+        is-stepped,
+        is-periodic,
+        is-hidden,
+        is-readonly,
+        is-bypass,
+        is-automatable,
+        is-modulatable,
+        is-modulatable-per-note-id,
+        is-modulatable-per-key,
+        requires-process,
+    }
+
+    /// clap_param_info.
+    record param-info {
+        id: u32,
+        name: string,
+        module: string,
+        flag-set: param-flags,
+        min-value: f64,
+        max-value: f64,
+        default-value: f64,
+    }
+
+    /// clap_audio_port_info flags (subset).
+    flags audio-port-flags {
+        is-main,
+        supports-64bits,
+        prefers-64bits,
+        requires-common-sample-size,
+    }
+
+    /// clap_audio_port_info.
+    record audio-port-info {
+        id: u32,
+        name: string,
+        channel-count: u32,
+        flag-set: audio-port-flags,
+        // "mono" | "stereo" | "surround" | "ambisonic" | ...
+        port-type: string,
+    }
+
+    /// Note-port dialects (clap_note_dialect).
+    flags note-dialects {
+        clap,
+        midi,
+        midi-mpe,
+        midi2,
+    }
+
+    /// clap_note_port_info.
+    record note-port-info {
+        id: u32,
+        name: string,
+        supported-dialects: note-dialects,
+        preferred-dialect: note-dialects,
+    }
+
+    /// clap_log_severity.
+    enum log-severity {
+        debug,
+        info,
+        warning,
+        error,
+        fatal,
+    }
+}
+
+/// Host services a plugin may call — a WIT form of `clap_host` plus the handful
+/// of core host extensions we support. Realtime-safe requests just set a flag the
+/// host acts on later, exactly as in CLAP.
+interface host {
+    use types.{log-severity};
+
+    /// clap_host.log / host-log extension.
+    log: func(severity: log-severity, message: string);
+
+    /// clap_host.request-restart — reactivate the plugin (e.g. latency changed).
+    request-restart: func();
+    /// clap_host.request-process — start processing.
+    request-process: func();
+    /// clap_host.request-callback — run on-main-thread soon.
+    request-callback: func();
+
+    /// host-params.rescan / .clear — the plugin's parameters changed.
+    params-rescan: func(rescan-flags: u32);
+    params-clear: func(param-id: u32, clear-flags: u32);
+
+    /// host-state.mark-dirty — the plugin's state changed and should be saved.
+    state-mark-dirty: func();
+
+    /// host-latency.changed — re-query get-latency after the next activate.
+    latency-changed: func();
+}
+
+/// The plugin side of a wk:clap component: a factory that lists and creates the
+/// plugins in the module, and the plugin instance whose methods mirror the
+/// `clap_plugin` vtable and the core extensions.
+interface plugins {
+    use types.{
+        event, transport, process-status, audio-buffer, descriptor, supported,
+        param-info, audio-port-info, note-port-info,
+    };
+
+    /// A live plugin instance. Dropping the resource is `clap_plugin.destroy`.
+    resource plugin {
+        // ---- lifecycle (clap_plugin vtable) ----
+        /// clap_plugin.init — returns false on failure.
+        init: func() -> bool;
+        /// clap_plugin.activate.
+        activate: func(sample-rate: f64, min-frames: u32, max-frames: u32) -> bool;
+        /// clap_plugin.deactivate.
+        deactivate: func();
+        /// clap_plugin.start-processing.
+        start-processing: func() -> bool;
+        /// clap_plugin.stop-processing.
+        stop-processing: func();
+        /// clap_plugin.reset.
+        reset: func();
+        /// clap_plugin.on-main-thread (host runs this after request-callback).
+        on-main-thread: func();
+
+        /// clap_plugin.process. `audio-in` is one buffer per input port; the
+        /// result carries one buffer per output port plus any emitted events.
+        process: func(
+            steady-time: s64,
+            frames: u32,
+            transport: option<transport>,
+            in-events: list<event>,
+            audio-in: list<audio-buffer>,
+        ) -> process-result;
+
+        /// Which core extensions this instance implements.
+        features: func() -> supported;
+
+        // ---- ext: params ----
+        param-count: func() -> u32;
+        param-info-at: func(index: u32) -> option<param-info>;
+        param-get: func(id: u32) -> option<f64>;
+        param-value-to-text: func(id: u32, value: f64) -> option<string>;
+        param-text-to-value: func(id: u32, text: string) -> option<f64>;
+        /// clap_plugin_params.flush outside the audio thread.
+        params-flush: func(in-events: list<event>) -> list<event>;
+
+        // ---- ext: audio-ports ----
+        audio-port-count: func(is-input: bool) -> u32;
+        audio-port-info-at: func(index: u32, is-input: bool) -> option<audio-port-info>;
+
+        // ---- ext: note-ports ----
+        note-port-count: func(is-input: bool) -> u32;
+        note-port-info-at: func(index: u32, is-input: bool) -> option<note-port-info>;
+
+        // ---- ext: state ----
+        /// clap_plugin_state.save — serialized plugin state (none on failure).
+        state-save: func() -> option<list<u8>>;
+        /// clap_plugin_state.load.
+        state-load: func(data: list<u8>) -> bool;
+    }
+
+    /// clap_plugin.process result: status, one buffer per output port, and the
+    /// events the plugin emitted this block.
+    record process-result {
+        status: process-status,
+        audio-out: list<audio-buffer>,
+        out-events: list<event>,
+    }
+
+    // ---- factory (clap_plugin_entry -> clap_plugin_factory) ----
+    /// Number of plugins in this module (clap_plugin_factory.get_plugin_count).
+    count: func() -> u32;
+    /// Descriptor by index (clap_plugin_factory.get_plugin_descriptor).
+    get: func(index: u32) -> option<descriptor>;
+    /// Instantiate by plugin id (clap_plugin_factory.create_plugin). The returned
+    /// instance still needs `init()` before use, mirroring CLAP.
+    create: func(plugin-id: string) -> option<plugin>;
+}
+
+/// A wk:clap guest component: it imports host callbacks and exports the plugin
+/// factory. Unlike other wk nodes it has no `run` loop — the wk host drives it by
+/// calling `process` from the audio path.
+world plugin {
+    import host;
+    export plugins;
+}
