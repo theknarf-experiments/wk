@@ -221,7 +221,7 @@ impl Source {
                 Ok(())
             }
             Source::Dockerfile(p) => {
-                let id = crate::images::build_and_alias(p)?;
+                let id = crate::images::build_and_alias(p, false)?;
                 println!("built {} -> {id}", p.display());
                 Ok(())
             }

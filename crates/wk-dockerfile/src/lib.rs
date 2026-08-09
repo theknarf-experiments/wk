@@ -19,8 +19,11 @@ use chumsky::prelude::*;
 pub enum Instr {
     /// `FROM <image>` — the base image (`scratch` = empty rootfs).
     From { image: String },
-    /// `COPY <src>... <dest>` (or `ADD` without url/tar semantics).
+    /// `COPY <src>... <dest>` — sources are build-context paths only.
     Copy { srcs: Vec<String>, dest: String },
+    /// `ADD <src>... <dest>` — like COPY, but a source may be an http(s):// URL
+    /// (fetched at build time) and archive sources are auto-extracted.
+    Add { srcs: Vec<String>, dest: String },
     /// `ENTRYPOINT [...]` or shell form.
     Entrypoint(Vec<String>),
     /// `CMD [...]` or shell form.
@@ -260,7 +263,11 @@ pub fn parse(source: &str) -> Result<Dockerfile, String> {
                     }
                 }
                 let dest = w.pop().expect("at_least(2) guarantees a destination");
-                Instr::Copy { srcs: w, dest }
+                if kw == "ADD" {
+                    Instr::Add { srcs: w, dest }
+                } else {
+                    Instr::Copy { srcs: w, dest }
+                }
             }
             "ENTRYPOINT" | "CMD" => {
                 let argv = exec_array()

@@ -243,6 +243,10 @@ enum ImagesCmd {
         /// Name the built image (e.g. myapp:1.0); a bare name implies :latest
         #[arg(long)]
         tag: Option<String>,
+        /// Allow build-time network so ADD <url> can fetch. Off by default
+        /// (builds are otherwise hermetic).
+        #[arg(long)]
+        network: bool,
     },
     /// Name a stored image so it can be referenced as image://<tag>
     Tag {
@@ -282,8 +286,12 @@ fn images_cmd(cmd: &ImagesCmd) -> Result<(), String> {
             println!("removed {id}");
             Ok(())
         }
-        ImagesCmd::Build { dockerfile, tag } => {
-            let id = images::build_and_alias(dockerfile)?;
+        ImagesCmd::Build {
+            dockerfile,
+            tag,
+            network,
+        } => {
+            let id = images::build_and_alias(dockerfile, *network)?;
             if let Some(tag) = tag {
                 images::set_tag(tag, &id)?;
                 println!(

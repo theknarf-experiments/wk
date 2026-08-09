@@ -370,6 +370,162 @@ fn copy_layer(
     b.into_inner().map_err(|e| format!("finish layer: {e}"))
 }
 
+fn is_url(src: &str) -> bool {
+    src.starts_with("http://") || src.starts_with("https://")
+}
+
+/// Fetch a URL at build time via the host's `curl` (as the OCI adapter fetch
+/// does) — reuses the host's TLS/proxy config without a client dependency.
+fn fetch_url(url: &str) -> Result<Vec<u8>, String> {
+    let out = std::process::Command::new("curl")
+        .args(["-fsSL", url])
+        .output()
+        .map_err(|e| format!("ADD {url}: running curl: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "ADD {url}: curl failed ({})",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(out.stdout)
+}
+
+/// Append an archive's entries into the layer, re-rooted under `dest` (the
+/// archive's own structure is preserved, Docker-style). Returns false if the
+/// bytes aren't a recognized archive (gzip/tar or zip).
+fn extract_archive_into(
+    b: &mut tar::Builder<Vec<u8>>,
+    data: &[u8],
+    dest: &str,
+) -> Result<bool, String> {
+    use std::io::Read;
+    let under = |name: &str| -> String {
+        let name = name.trim_start_matches("./").trim_end_matches('/');
+        if dest.is_empty() {
+            name.to_string()
+        } else {
+            format!("{dest}/{name}")
+        }
+    };
+    if data.starts_with(&[0x1f, 0x8b]) || data.len() > 262 && &data[257..262] == b"ustar" {
+        // gzip'd or plain tar.
+        let mut plain = Vec::new();
+        if data.starts_with(&[0x1f, 0x8b]) {
+            flate2::read::GzDecoder::new(data)
+                .read_to_end(&mut plain)
+                .map_err(|e| format!("ADD: gunzip: {e}"))?;
+        } else {
+            plain = data.to_vec();
+        }
+        let mut ar = tar::Archive::new(plain.as_slice());
+        for entry in ar.entries().map_err(|e| format!("ADD: read tar: {e}"))? {
+            let mut entry = entry.map_err(|e| format!("ADD: tar entry: {e}"))?;
+            let path = entry
+                .path()
+                .map_err(|e| format!("ADD: tar path: {e}"))?
+                .to_string_lossy()
+                .to_string();
+            if path.is_empty() {
+                continue;
+            }
+            if entry.header().entry_type().is_dir() {
+                tar_dir_entry(b, under(&path).trim_end_matches('/'))?;
+            } else if entry.header().entry_type().is_file() {
+                let mut bytes = Vec::new();
+                entry
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| format!("ADD: read {path}: {e}"))?;
+                tar_file(b, &under(&path), &bytes)?;
+            }
+        }
+        return Ok(true);
+    }
+    if data.starts_with(b"PK\x03\x04") || data.starts_with(b"PK\x05\x06") {
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(data))
+            .map_err(|e| format!("ADD: zip: {e}"))?;
+        for i in 0..zip.len() {
+            let mut f = zip
+                .by_index(i)
+                .map_err(|e| format!("ADD: zip entry: {e}"))?;
+            let name = f.name().to_string();
+            if name.is_empty() {
+                continue;
+            }
+            if f.is_dir() {
+                tar_dir_entry(b, under(&name).trim_end_matches('/'))?;
+            } else {
+                let mut bytes = Vec::new();
+                f.read_to_end(&mut bytes)
+                    .map_err(|e| format!("ADD: read {name}: {e}"))?;
+                tar_file(b, &under(&name), &bytes)?;
+            }
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Build one ADD instruction into a layer tarball. Like COPY for context paths,
+/// but an http(s):// source is fetched at build time (requires `network`) and an
+/// archive source (`.tar.gz`/`.zip`/…) is auto-extracted under the destination.
+fn add_layer(
+    context: &Path,
+    workdir: &str,
+    srcs: &[String],
+    dest: &str,
+    network: bool,
+) -> Result<Vec<u8>, String> {
+    let mut b = tar::Builder::new(Vec::new());
+    let dest_base = dest_path(workdir, dest);
+    let multi = srcs.len() > 1;
+    let dir_dest = multi || dest.ends_with('/');
+    for src in srcs {
+        if is_url(src) {
+            if !network {
+                return Err(format!(
+                    "ADD {src}: fetching a URL needs build-time network access \
+                     (build with --network)"
+                ));
+            }
+            let data = fetch_url(src)?;
+            if !extract_archive_into(&mut b, &data, &dest_base)? {
+                // Not an archive: drop the file at the destination (dest/basename
+                // when the destination is a directory).
+                let base = src.rsplit('/').next().unwrap_or(src);
+                let target = match (dir_dest, dest_base.is_empty()) {
+                    (true, true) => base.to_string(),
+                    (true, false) => format!("{dest_base}/{base}"),
+                    (false, _) => dest_base.clone(),
+                };
+                tar_file(&mut b, &target, &data)?;
+            }
+        } else {
+            // A context path — identical to COPY.
+            let from = context_path(context, src)?;
+            if from.is_dir() {
+                tar_dir_contents(&mut b, &from, &dest_base)?;
+            } else {
+                let data = std::fs::read(&from).map_err(|e| format!("read {src}: {e}"))?;
+                let target = if dir_dest {
+                    let base = from
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| src.clone());
+                    if dest_base.is_empty() {
+                        base
+                    } else {
+                        format!("{dest_base}/{base}")
+                    }
+                } else {
+                    dest_base.clone()
+                };
+                tar_file(&mut b, &target, &data)?;
+            }
+        }
+    }
+    b.into_inner().map_err(|e| format!("finish layer: {e}"))
+}
+
 /// Turns pulled wasm into loadable wasm (componentizes a core module; see
 /// `crate::oci::ensure_component`). A seam so image ingestion is testable.
 pub type AdaptFn = dyn Fn(&[u8]) -> Result<Vec<u8>, String>;
@@ -483,16 +639,16 @@ fn alias_path(dockerfile: &Path) -> PathBuf {
 /// Build the Dockerfile and record a source→image alias, so later lookups
 /// (without rebuilding) resolve the entrypoint and manifest. A Dockerfile with
 /// RUN steps gets a real wasm runner (a scratch plugin host).
-pub fn build_and_alias(dockerfile: &Path) -> Result<String, String> {
+pub fn build_and_alias(dockerfile: &Path, network: bool) -> Result<String, String> {
     let needs_runner = std::fs::read_to_string(dockerfile)
         .ok()
         .and_then(|src| dockerfile::parse(&src).ok())
         .is_some_and(|df| df.instructions.iter().any(|i| matches!(i, Instr::Run(_))));
     let id = if needs_runner {
         let host = crate::plugin::PluginHost::new().map_err(|e| format!("build runner: {e:#}"))?;
-        build_with_runner(dockerfile, Some(&host))?
+        build_with_runner(dockerfile, Some(&host), network)?
     } else {
-        build(dockerfile)?
+        build_with_runner(dockerfile, None, network)?
     };
     write_creating_dirs(&alias_path(dockerfile), id.as_bytes())?;
     Ok(id)
@@ -510,7 +666,7 @@ pub fn aliased_image(dockerfile: &Path) -> Option<(String, ImageManifest)> {
 /// layer contents + config, so an unchanged build is a cache hit. RUN
 /// instructions error without a runner; use [`build_with_runner`].
 pub fn build(dockerfile_path: &Path) -> Result<String, String> {
-    build_with_runner(dockerfile_path, None)
+    build_with_runner(dockerfile_path, None, false)
 }
 
 /// Executes a build-time `RUN` step: run the wasm CLI `wasm` with `argv` and
@@ -589,6 +745,7 @@ fn diff_layer(
 pub fn build_with_runner(
     dockerfile_path: &Path,
     runner: Option<&dyn BuildRunner>,
+    network: bool,
 ) -> Result<String, String> {
     let source = std::fs::read_to_string(dockerfile_path)
         .map_err(|e| format!("read {}: {e}", dockerfile_path.display()))?;
@@ -654,6 +811,10 @@ pub fn build_with_runner(
             }
             Instr::Copy { srcs, dest } => {
                 let tar = copy_layer(&context, &workdir, srcs, dest)?;
+                apply_tar(&mut manifest, &tar)?;
+            }
+            Instr::Add { srcs, dest } => {
+                let tar = add_layer(&context, &workdir, srcs, dest, network)?;
                 apply_tar(&mut manifest, &tar)?;
             }
             Instr::Run(argv) => {
@@ -831,7 +992,7 @@ mod tests {
         isolated_store("alias");
         let ctx = vim_like_context("alias");
         let df = ctx.join("Dockerfile");
-        let id = build_and_alias(&df).expect("builds");
+        let id = build_and_alias(&df, false).expect("builds");
         let (aid, manifest) = aliased_image(&df).expect("alias resolves");
         assert_eq!(aid, id);
         assert_eq!(manifest.entrypoint, vec!["/app.wasm"]);
@@ -886,7 +1047,7 @@ mod tests {
         let runner = MockRunner {
             called: std::sync::atomic::AtomicUsize::new(0),
         };
-        let id = build_with_runner(&ctx.join("Dockerfile"), Some(&runner)).expect("builds");
+        let id = build_with_runner(&ctx.join("Dockerfile"), Some(&runner), false).expect("builds");
         assert_eq!(runner.called.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         let m = load_image(&id).expect("stored");
@@ -936,7 +1097,7 @@ mod tests {
             "FROM scratch\nCOPY app.wasm /g.wasm\nRUN /missing.wasm\nENTRYPOINT [\"/g.wasm\"]\n",
         )
         .unwrap();
-        let err = build_with_runner(&ctx.join("Dockerfile"), Some(&runner)).unwrap_err();
+        let err = build_with_runner(&ctx.join("Dockerfile"), Some(&runner), false).unwrap_err();
         assert!(err.contains("missing.wasm"), "err was: {err}");
 
         std::fs::write(ctx.join("notwasm.txt"), b"plain text").unwrap();
@@ -945,7 +1106,7 @@ mod tests {
             "FROM scratch\nCOPY notwasm.txt /t\nRUN /t\nENTRYPOINT [\"/t\"]\n",
         )
         .unwrap();
-        let err = build_with_runner(&ctx.join("Dockerfile"), Some(&runner)).unwrap_err();
+        let err = build_with_runner(&ctx.join("Dockerfile"), Some(&runner), false).unwrap_err();
         assert!(err.contains("wasm"), "err was: {err}");
     }
 
@@ -985,7 +1146,7 @@ mod tests {
     fn list_and_remove_images() {
         isolated_store("listrm");
         let ctx = vim_like_context("listrm");
-        let id = build_and_alias(&ctx.join("Dockerfile")).expect("builds");
+        let id = build_and_alias(&ctx.join("Dockerfile"), false).expect("builds");
 
         let listed = list_images();
         assert!(listed
@@ -1149,6 +1310,59 @@ mod tests {
         .unwrap();
         let err = build(&ctx.join("Dockerfile")).unwrap_err();
         assert!(err.contains("base image"), "err was: {err}");
+    }
+
+    #[test]
+    fn add_url_without_network_is_rejected() {
+        isolated_store("addnet");
+        let ctx = vim_like_context("addnet");
+        std::fs::write(
+            ctx.join("Dockerfile"),
+            "FROM scratch\n\
+             ADD https://example.com/x.tar.gz /app\n\
+             COPY app.wasm /a.wasm\n\
+             ENTRYPOINT [\"/a.wasm\"]\n",
+        )
+        .unwrap();
+        // Default build is hermetic: the URL fetch must be refused, not attempted.
+        let err = build(&ctx.join("Dockerfile")).unwrap_err();
+        assert!(err.contains("network"), "err was: {err}");
+    }
+
+    #[test]
+    fn add_extracts_archives_rerooted_under_dest() {
+        use std::io::Read;
+        // A .tar.gz with a nested file.
+        let mut tar_buf = tar::Builder::new(Vec::new());
+        tar_file(&mut tar_buf, "wordpress/wp-load.php", b"<?php").unwrap();
+        let plain = tar_buf.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut gz, &plain).unwrap();
+        let targz = gz.finish().unwrap();
+
+        let mut b = tar::Builder::new(Vec::new());
+        assert!(extract_archive_into(&mut b, &targz, "var/www").unwrap());
+        let out = b.into_inner().unwrap();
+        let mut ar = tar::Archive::new(out.as_slice());
+        let mut found = None;
+        for e in ar.entries().unwrap() {
+            let mut e = e.unwrap();
+            let p = e.path().unwrap().to_string_lossy().to_string();
+            if p.ends_with("wp-load.php") {
+                let mut s = String::new();
+                e.read_to_string(&mut s).unwrap();
+                found = Some((p, s));
+            }
+        }
+        assert_eq!(
+            found,
+            Some(("var/www/wordpress/wp-load.php".into(), "<?php".into())),
+            "archive entries land under the ADD destination, structure preserved"
+        );
+
+        // Non-archive bytes are reported as such (caller stores them as a file).
+        let mut b2 = tar::Builder::new(Vec::new());
+        assert!(!extract_archive_into(&mut b2, b"just text", "d").unwrap());
     }
 
     #[test]
