@@ -1,0 +1,5 @@
+# Build this plugin: `mise run build`
+[tasks.build]
+description = "Build + tag the php and wordpress images (fetches WordPress via ADD)"
+dir = "{{config_root}}"
+run = "./build.sh"
