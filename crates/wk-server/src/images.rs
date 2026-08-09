@@ -622,13 +622,18 @@ pub fn build_with_runner(
             Instr::From { image } => {
                 if image != "scratch" {
                     // A non-scratch base must already be in the local store
-                    // (built earlier, or pulled). Layers stack under ours.
-                    let base = load_image(&crate::oci::sanitize(image)).ok_or_else(|| {
-                        format!(
-                            "base image {image:?} is not in the local store \
-                             (FROM scratch, or pull/build it first)"
-                        )
-                    })?;
+                    // (built earlier, or pulled). Resolve it the same way the CLI
+                    // does — by tag, full id, or id-prefix — so `FROM wk-base`
+                    // finds a locally-built+tagged image, not just a pulled ref.
+                    // Its layers stack under ours; its config is inherited.
+                    let base = resolve_ref(image)
+                        .and_then(|id| load_image(&id))
+                        .ok_or_else(|| {
+                            format!(
+                                "base image {image:?} is not in the local store \
+                                 (FROM scratch, or pull/build+tag it first)"
+                            )
+                        })?;
                     for digest in &base.layers {
                         let bytes = std::fs::read(layer_path(digest))
                             .map_err(|e| format!("read layer {digest}: {e}"))?;
@@ -638,6 +643,13 @@ pub fn build_with_runner(
                     manifest.env.extend(base.env);
                     manifest.entrypoint = base.entrypoint;
                     manifest.cmd = base.cmd;
+                    manifest.labels.extend(base.labels);
+                    // Inherit the base's working directory so later COPY/ADD dests
+                    // resolve under it (until a WORKDIR overrides).
+                    if let Some(wd) = base.workdir {
+                        workdir = wd.clone();
+                        manifest.workdir = Some(wd);
+                    }
                 }
             }
             Instr::Copy { srcs, dest } => {
@@ -1137,5 +1149,48 @@ mod tests {
         .unwrap();
         let err = build(&ctx.join("Dockerfile")).unwrap_err();
         assert!(err.contains("base image"), "err was: {err}");
+    }
+
+    #[test]
+    fn from_a_tagged_base_stacks_and_inherits() {
+        isolated_store("frombase");
+        // Build a base image and tag it, the way a `wk-base` would be published.
+        let base_ctx = vim_like_context("frombase");
+        let base_id = build(&base_ctx.join("Dockerfile")).expect("base builds");
+        set_tag("wk-base", &base_id).unwrap();
+        let base = load_image(&base_id).unwrap();
+
+        // A derived image resolves the base by tag, stacks a layer on top, and
+        // inherits the base's config (env here; entrypoint overridden).
+        let dir = std::env::temp_dir().join("wk-build-ctx-frombase-derived");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("extra.wasm"), b"\0asm-derived").unwrap();
+        std::fs::write(
+            dir.join("Dockerfile"),
+            "FROM wk-base\n\
+             COPY extra.wasm /extra.wasm\n\
+             ENTRYPOINT [\"/extra.wasm\"]\n",
+        )
+        .unwrap();
+        let id = build(&dir.join("Dockerfile")).expect("derived builds from tagged base");
+
+        let m = load_image(&id).expect("derived manifest");
+        assert_eq!(
+            m.layers.len(),
+            base.layers.len() + 1,
+            "base layers plus the derived COPY"
+        );
+        assert!(
+            m.layers.starts_with(&base.layers),
+            "base layers stacked underneath"
+        );
+        assert_eq!(m.env, base.env, "base ENV inherited");
+        assert_eq!(m.entrypoint, vec!["/extra.wasm"], "own ENTRYPOINT wins");
+        assert_eq!(
+            std::fs::read(entrypoint_path(&id)).unwrap(),
+            b"\0asm-derived",
+            "entrypoint extracted from the stacked rootfs"
+        );
     }
 }
