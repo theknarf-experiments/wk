@@ -250,6 +250,23 @@ mod tests {
         })
     }
 
+    fn set_param(id: u32, value: f64) -> Event {
+        Event::ParamValue(wk::clap::types::ParamValue {
+            time: 0,
+            flag_set: wk::clap::types::EventFlags::empty(),
+            param_id: id,
+            note_id: -1,
+            port_index: -1,
+            channel: -1,
+            key: -1,
+            value,
+        })
+    }
+
+    fn peak(chan: &[f32]) -> f32 {
+        chan.iter().fold(0.0, |m, &x| m.max(x.abs()))
+    }
+
     /// The vendored `plugin-template.c` is an L/R-swap stereo effect with one
     /// note input and the audio-ports/note-ports/state extensions. Drive it
     /// through the whole lifecycle and confirm it swaps channels — proving the
@@ -276,5 +293,58 @@ mod tests {
         assert_eq!(res.audio_out.len(), 1);
         assert_eq!(res.audio_out[0][0], vec![5.0, 6.0, 7.0, 8.0]);
         assert_eq!(res.audio_out[0][1], vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    /// The gain effect exposes one automatable parameter and scales its input by
+    /// it — proving the params extension and PARAM_VALUE automation in process().
+    #[test]
+    fn gain_applies_its_parameter() {
+        let bytes = include_bytes!("../testdata/gain.wasm");
+        let engine = ClapEngine::new().unwrap();
+        let component = engine.compile(bytes).unwrap();
+        let mut inst = engine.instantiate(&component, 48_000.0, 128).unwrap();
+
+        assert!(inst.features().unwrap().contains(Supported::PARAMS));
+        assert_eq!(inst.param_count().unwrap(), 1);
+        assert_eq!(inst.param_info(0).unwrap().unwrap().name, "Gain");
+
+        let ones = vec![vec![vec![1.0f32; 4], vec![1.0f32; 4]]];
+        // Default gain is 1.0 → passthrough.
+        let res = inst.process(4, &[], None, &ones).unwrap();
+        assert_eq!(res.audio_out[0][0], vec![1.0; 4]);
+        // Automate to 0.5 → halved.
+        let res = inst.process(4, &[set_param(0, 0.5)], None, &ones).unwrap();
+        assert_eq!(res.audio_out[0][0], vec![0.5; 4]);
+    }
+
+    /// The polysynth is silent until a note-on, then produces audio on its stereo
+    /// output — proving the instrument path (note-ports in, audio-ports out).
+    #[test]
+    fn polysynth_sounds_on_note_on() {
+        let bytes = include_bytes!("../testdata/polysynth.wasm");
+        let engine = ClapEngine::new().unwrap();
+        let component = engine.compile(bytes).unwrap();
+        let mut inst = engine.instantiate(&component, 48_000.0, 512).unwrap();
+
+        let feats = inst.features().unwrap();
+        assert!(feats.contains(Supported::NOTE_PORTS));
+        assert!(feats.contains(Supported::AUDIO_PORTS));
+        assert_eq!(inst.note_input_count().unwrap(), 1);
+        assert_eq!(inst.out_channels, vec![2]);
+
+        // No notes yet → silence.
+        let quiet = inst.process(256, &[], None, &[]).unwrap();
+        assert_eq!(peak(&quiet.audio_out[0][0]), 0.0);
+
+        // Note-on A4 → audible output on both channels.
+        let loud = inst.process(512, &[note_on(69, 0)], None, &[]).unwrap();
+        assert!(
+            peak(&loud.audio_out[0][0]) > 0.05,
+            "left channel should sound"
+        );
+        assert!(
+            peak(&loud.audio_out[0][1]) > 0.05,
+            "right channel should sound"
+        );
     }
 }
