@@ -1,0 +1,32 @@
+// vim: set filetype=kdl :
+// A chain of CLAP plugins in wk. The piano feeds a CLAP note effect (Octaver,
+// which doubles each note an octave up), whose MIDI output drives a CLAP
+// polyphonic synth. All three are wired with plain `midi` connections; the wk
+// host forwards the octaver's emitted events downstream.
+//
+// Build the CLAP components first:  cd plugins/clap && mise run build
+// Then from the repo root:          wk run example/clap-chain.wk
+//
+// Play a single note on the piano — you hear it and its octave from the synth.
+import "../workspace.wk"
+workspace "01KZSCHN00000000000000WS01" {
+    note "01KZSCHN00000000000000NT02" {
+        text "A CLAP chain.\n\npiano -> Octaver (CLAP note effect)\n-> PolySynth (CLAP instrument).\n\nThe octaver doubles each note an\noctave up; its MIDI output drives\nthe synth. Play one key, hear two."
+        pos 40.0 40.0
+        size 340.0 230.0
+    }
+    node "piano" "01KZSCHN00000000000000PN03" {
+        pos 420.0 40.0
+        size 560.0 220.0
+    }
+    node "clap_octaver" "01KZSCHN00000000000000CV04" {
+        pos 420.0 300.0
+        size 200.0 84.0
+    }
+    node "clap_synth" "01KZSCHN00000000000000CS05" {
+        pos 700.0 300.0
+        size 200.0 84.0
+    }
+    midi "01KZSCHN00000000000000PN03" "01KZSCHN00000000000000CV04"
+    midi "01KZSCHN00000000000000CV04" "01KZSCHN00000000000000CS05"
+}

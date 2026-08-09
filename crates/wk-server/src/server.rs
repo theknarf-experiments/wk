@@ -2604,7 +2604,12 @@ impl Server {
                     compiling: app
                         .as_ref()
                         .is_some_and(|n| n.is_loading() && !n.finished.load(Ordering::Relaxed)),
-                    runnable: app.as_ref().map(|n| n.is_runnable()).unwrap_or(false),
+                    // A CLAP node has no run-loop guest but is a live audio node,
+                    // so report it as runnable/running rather than "-".
+                    runnable: app
+                        .as_ref()
+                        .map(|n| n.is_runnable() || n.is_clap())
+                        .unwrap_or(false),
                     terminal: app.as_ref().map(|n| n.is_command()).unwrap_or(false),
                     attached: self.attached.contains(&id),
                     error: v.port_errors.get(&id).cloned(),
