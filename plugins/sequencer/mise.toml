@@ -1,0 +1,5 @@
+# Build this plugin: `mise run build`
+[tasks.build]
+description = "Build this plugin into a wasm component"
+dir = "{{config_root}}"
+run = "cargo component build"

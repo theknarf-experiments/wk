@@ -1,0 +1,33 @@
+// vim: set filetype=kdl :
+// A step sequencer driving a synth. Click cells in the piano roll to place
+// notes, then press Play (or Space) to loop them into the synth.
+//
+// To record: press Record (or R) and play the on-screen piano — each note you
+// play is quantised onto the moving playhead and passed through to the synth so
+// you hear it. Wire a hardware `midiin` node to the sequencer to record a
+// physical keyboard instead.
+//
+// From the repo root:  wk run example/sequencer.wk
+import "../workspace.wk"
+workspace "01KZSQNC00000000000000WS01" {
+    note "01KZSQNC00000000000000NT05" {
+        text "Step sequencer -> synth.\n\nClick cells to place notes, then\nPlay (or Space) to loop them.\n\nRecord (or R) captures what you\nplay on the piano onto the\nplayhead, passing it through to\nthe synth as you go."
+        pos 40.0 40.0
+        size 340.0 250.0
+    }
+    node "piano" "01KZSQNC00000000000000PN02" {
+        pos 420.0 40.0
+        size 560.0 220.0
+    }
+    node "sequencer" "01KZSQNC00000000000000SQ03" {
+        pos 420.0 300.0
+        size 560.0 320.0
+    }
+    node "synth" "01KZSQNC00000000000000SY04" {
+        pos 1010.0 300.0
+        size 360.0 260.0
+        options 0.30000001192092896 2.0 0.0 1800.0 3.0 0.019999999552965164 0.3499999940395355
+    }
+    midi "01KZSQNC00000000000000PN02" "01KZSQNC00000000000000SQ03"
+    midi "01KZSQNC00000000000000SQ03" "01KZSQNC00000000000000SY04"
+}
