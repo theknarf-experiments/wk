@@ -210,8 +210,8 @@ interface types {
     /// clap_audio_port_info flags (subset).
     flags audio-port-flags {
         is-main,
-        supports-64bits,
-        prefers-64bits,
+        supports-f64,
+        prefers-f64,
         requires-common-sample-size,
     }
 

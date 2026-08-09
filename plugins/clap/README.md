@@ -40,7 +40,21 @@ wit-bindgen, wasm-tools).
 ## Porting another plugin
 
 Drop its `clap_entry` source(s) into `examples/` (C or C++), then
-`./build.sh <name>`. C++ plugins compile with `clang++`. Plugins that use only
-the core extensions (audio-ports, note-ports, params, state) work as-is;
-unmodeled/draft/vendor extensions degrade to unavailable. GUI (CLAP's webview
-extension) is not wired up yet.
+`./build.sh <name>`. Each source is compiled with the right front-end and linked
+with the (C) shim + bindings. Plugins that use only the core extensions
+(audio-ports, note-ports, params, state) work as-is; unmodeled/draft/vendor
+extensions degrade to unavailable. GUI (CLAP's webview extension) is not wired up
+yet.
+
+### Real third-party example: nakst's HelloCLAP
+
+`./fetch-third-party.sh` downloads a genuine third-party CLAP plugin — nakst's
+[HelloCLAP tutorial synth](https://nakst.gitlab.io/tutorial/clap-part-2.html), a
+single-file C++ instrument — into `examples/` (git-ignored; not redistributed
+here). Then:
+
+    ./build.sh nakst-hello        # -> build/nakst-hello.wasm, a wk:clap component
+
+This has been verified end to end: the unmodified plugin builds, and the wk:clap
+host runtime instantiates it and plays it on a note-on — a real CLAP plugin
+running in wk with no source changes.

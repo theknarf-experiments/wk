@@ -22,23 +22,30 @@ gen_bindings() {
 }
 
 build_one() {
-    local name="$1" src cc
+    local name="$1" src ld
+    # The plugin may be C or C++; the shim and bindings are always C. Compile
+    # each to an object with the right front-end, then link (C++ driver if the
+    # plugin is C++, so libc++ is pulled in).
     if [ -f "examples/$name.cpp" ]; then
         src="examples/$name.cpp"
-        cc="$WASI_SDK/bin/clang++"
+        ld="$WASI_SDK/bin/clang++"
     elif [ -f "examples/$name.c" ]; then
         src="examples/$name.c"
-        cc="$WASI_SDK/bin/clang"
+        ld="$WASI_SDK/bin/clang"
     else
         echo "no examples/$name.c or .cpp" >&2
         return 1
     fi
     mkdir -p build
+    local cflags="--target=wasm32-wasip2 -O2 -I . -I clap-include"
+    env PATH="$CLANG_PATH" "$WASI_SDK/bin/clang" $cflags -c shim.c -o "build/$name.shim.o"
+    env PATH="$CLANG_PATH" "$WASI_SDK/bin/clang" $cflags -c gen/plugin.c -o "build/$name.bind.o"
+    env PATH="$CLANG_PATH" "$ld" $cflags -c "$src" -o "build/$name.plugin.o"
     # -mexec-model=reactor: a library of exports the host drives (no main/run).
-    env PATH="$CLANG_PATH" "$cc" --target=wasm32-wasip2 -O2 \
-        -mexec-model=reactor -I . -I clap-include \
-        shim.c "$src" gen/plugin.c gen/plugin_component_type.o \
-        -o "build/$name.wasm"
+    env PATH="$CLANG_PATH" "$ld" --target=wasm32-wasip2 -mexec-model=reactor \
+        "build/$name.shim.o" "build/$name.bind.o" "build/$name.plugin.o" \
+        gen/plugin_component_type.o -o "build/$name.wasm"
+    rm -f "build/$name.shim.o" "build/$name.bind.o" "build/$name.plugin.o"
     echo "built plugins/clap/build/$name.wasm"
 }
 
