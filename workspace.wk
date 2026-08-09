@@ -33,6 +33,9 @@ dependencies {
     clap_gain "plugins/clap/build/gain.wasm" {
         description "a CLAP gain effect hosted via wk:clap (mise run build in plugins/clap first)"
     }
+    clap_octaver "plugins/clap/build/octaver.wasm" {
+        description "a CLAP note effect: doubles each note an octave up, MIDI out to downstream nodes (mise run build in plugins/clap first)"
+    }
     synth "plugins/synth/target/wasm32-wasip1/debug/synth.wasm" {
         description "MIDI synth with tweakable knobs"
     }

@@ -252,14 +252,35 @@ pub fn midi_to_event(msg: &[u8]) -> Option<Event> {
     }))
 }
 
+/// Convert a CLAP event the plugin emitted into a raw MIDI message, so a CLAP
+/// MIDI-effect (e.g. an arpeggiator) can drive downstream wk nodes. Note events
+/// become MIDI note-on/off; raw MIDI passes through; other events are dropped.
+pub fn event_to_midi(e: &Event) -> Option<Vec<u8>> {
+    let chan = |c: i16| (c.max(0) as u8) & 0x0f;
+    let key = |k: i16| k.clamp(0, 127) as u8;
+    match e {
+        Event::NoteOn(n) => Some(vec![
+            0x90 | chan(n.channel),
+            key(n.key),
+            ((n.velocity * 127.0).round() as i64).clamp(1, 127) as u8,
+        ]),
+        Event::NoteOff(n) => Some(vec![0x80 | chan(n.channel), key(n.key), 0]),
+        Event::Midi(m) => Some(vec![m.data.0, m.data.1, m.data.2]),
+        _ => None,
+    }
+}
+
 /// Run a CLAP component as a live audio node: open the default output device and,
 /// each audio callback, drain the node's MIDI inbox into CLAP events, `process()`
-/// a block, and write it to the speakers. Blocks until `kill` is set, then drops
-/// the stream. Best-effort: with no output device (e.g. headless) it returns an
-/// error and the node simply produces no sound.
+/// a block, write audio to the speakers, and forward any events the plugin
+/// emitted to the node's downstream MIDI connections. Blocks until `kill` is set,
+/// then drops the stream. Best-effort: with no output device (e.g. headless) it
+/// returns an error and the node simply produces no sound.
 fn run_audio_node(
     wasm: &[u8],
+    node_id: wk_protocol::NodeId,
     midi_in: &crate::midi::SharedInbox,
+    router: &crate::midi::Router,
     kill: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -285,6 +306,7 @@ fn run_audio_node(
     let mut inst = engine.instantiate(&component, sample_rate, 4096)?;
 
     let midi = midi_in.clone();
+    let router = router.clone();
     let stream = device.build_output_stream(
         config,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -298,6 +320,18 @@ fn run_audio_node(
                 }
             }
             let out = inst.process(frames as u32, &events, None, &[]);
+            if let Ok(res) = &out {
+                // Forward the plugin's emitted events downstream (a MIDI effect).
+                if !res.out_events.is_empty() {
+                    if let Ok(r) = router.lock() {
+                        for ev in &res.out_events {
+                            if let Some(bytes) = event_to_midi(ev) {
+                                r.send_from(node_id, &bytes);
+                            }
+                        }
+                    }
+                }
+            }
             for f in 0..frames {
                 for c in 0..channels {
                     let s = out
@@ -326,12 +360,14 @@ fn run_audio_node(
 /// stops when `kill` is set, marking `finished`.
 pub fn spawn_audio_node(
     wasm: Vec<u8>,
+    node_id: wk_protocol::NodeId,
     midi_in: crate::midi::SharedInbox,
+    router: crate::midi::Router,
     kill: std::sync::Arc<std::sync::atomic::AtomicBool>,
     finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     std::thread::spawn(move || {
-        if let Err(e) = run_audio_node(&wasm, &midi_in, &kill) {
+        if let Err(e) = run_audio_node(&wasm, node_id, &midi_in, &router, &kill) {
             eprintln!("wk clap node: {e:#}");
         }
         finished.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -369,6 +405,42 @@ mod tests {
 
     fn peak(chan: &[f32]) -> f32 {
         chan.iter().fold(0.0, |m, &x| m.max(x.abs()))
+    }
+
+    #[test]
+    fn note_events_convert_to_raw_midi() {
+        let on = Event::NoteOn(Note {
+            time: 0,
+            flag_set: wk::clap::types::EventFlags::empty(),
+            note_id: -1,
+            port_index: 0,
+            channel: 0,
+            key: 60,
+            velocity: 1.0,
+        });
+        assert_eq!(event_to_midi(&on), Some(vec![0x90, 60, 127]));
+    }
+
+    /// The octaver is a note-in/note-out CLAP effect: every note it receives is
+    /// echoed plus a copy an octave up, via CLAP output events. Proves the
+    /// out-events path the host forwards downstream.
+    #[test]
+    fn octaver_doubles_notes_an_octave_up() {
+        let bytes = include_bytes!("../testdata/octaver.wasm");
+        let engine = ClapEngine::new().unwrap();
+        let component = engine.compile(bytes).unwrap();
+        let mut inst = engine.instantiate(&component, 48_000.0, 128).unwrap();
+
+        let ev = midi_to_event(&[0x90, 60, 100]).unwrap();
+        let res = inst.process(16, &[ev], None, &[]).unwrap();
+        let notes: Vec<u8> = res
+            .out_events
+            .iter()
+            .filter_map(event_to_midi)
+            .map(|m| m[1])
+            .collect();
+        assert!(notes.contains(&60), "echoes the original note");
+        assert!(notes.contains(&72), "adds an octave up");
     }
 
     #[test]

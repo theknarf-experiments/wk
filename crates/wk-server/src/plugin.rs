@@ -1281,7 +1281,9 @@ impl PluginHost {
             match std::fs::read(path) {
                 Ok(bytes) => crate::clap_host::spawn_audio_node(
                     bytes,
+                    node.id,
                     node.midi_in.clone(),
+                    self.midi.clone(),
                     node.kill.clone(),
                     node.finished.clone(),
                 ),
