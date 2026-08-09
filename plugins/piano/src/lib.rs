@@ -4,7 +4,7 @@ mod bindings;
 use bindings::wasi::frame_buffer::frame_buffer::{Buffer, Device};
 use bindings::wasi::graphics_context::graphics_context::Context as GfxContext;
 use bindings::wasi::surface::surface::{CreateDesc, Key, Surface};
-use bindings::wk::midi::midi::Output;
+use bindings::wk::midi::midi::{Input, Output};
 use bindings::Guest;
 
 /// The 13 chromatic notes from C to C (one octave). White keys are the natural
@@ -40,19 +40,47 @@ fn key_to_note(k: Key) -> Option<usize> {
     })
 }
 
-/// A MIDI keyboard: ref-counts how many inputs (mouse + keyboard) hold each note
-/// so overlapping presses don't send a spurious note-off, and emits note-on/off
-/// MIDI messages out of its output port.
+/// A MIDI keyboard: ref-counts how many local inputs (mouse + keyboard) hold each
+/// note so overlapping presses don't send a spurious note-off, emits note-on/off
+/// out of its output port, and receives MIDI on its input port — lighting up the
+/// notes an upstream source (e.g. a hardware keyboard) plays and passing every
+/// message through to its output.
 struct Keyboard {
     out: Output,
+    input: Input,
     held: [u32; 13],
+    /// Which notes an upstream MIDI source is currently holding (for highlight).
+    ext: [bool; 13],
 }
 
 impl Keyboard {
     fn new() -> Self {
         Keyboard {
             out: Output::new(),
+            input: Input::new(),
             held: [0; 13],
+            ext: [false; 13],
+        }
+    }
+
+    /// Drain MIDI arriving on the input port: light up note-ons within our
+    /// octave, and pass every message straight through to the output so wired
+    /// downstream nodes see it (a MIDI thru).
+    fn pump_input(&mut self) {
+        while let Some(msg) = self.input.receive() {
+            if msg.len() >= 3 {
+                let status = msg[0] & 0xF0;
+                let note = msg[1] as i32 - 60; // our octave is MIDI 60..=72
+                if (0..=12).contains(&note) {
+                    let n = note as usize;
+                    if status == 0x90 && msg[2] > 0 {
+                        self.ext[n] = true;
+                    } else if status == 0x80 || (status == 0x90 && msg[2] == 0) {
+                        self.ext[n] = false;
+                    }
+                }
+            }
+            self.out.send(&msg);
         }
     }
 
@@ -158,11 +186,17 @@ impl Guest for Component {
                 }
             }
 
+            // MIDI in from a wired source (e.g. a hardware keyboard): highlight +
+            // pass through.
+            keyboard.pump_input();
+
             // Paint the keyboard.
             let buffer = Buffer::from_graphics_buffer(ctx.get_current_buffer());
             let mut active = [false; 13];
-            for (n, a) in active.iter_mut().enumerate() {
-                *a = keyboard.active(n);
+            let mut ext = [false; 13];
+            for n in 0..13 {
+                active[n] = keyboard.active(n);
+                ext[n] = keyboard.ext[n];
             }
             let mut pixels = vec![0u8; (w * h * 4) as usize];
             let white_w = w as f32 / 8.0;
@@ -185,8 +219,11 @@ impl Guest for Component {
                         }
                     }
 
+                    // Upstream (hardware) notes light green; local presses blue.
                     let (r, g, b) = if let Some(note) = black {
-                        if active[note] {
+                        if ext[note] {
+                            (110, 210, 140)
+                        } else if active[note] {
                             (110, 140, 210)
                         } else {
                             (16, 16, 22)
@@ -197,6 +234,8 @@ impl Guest for Component {
                         let edge = (fx % white_w) < 1.5 || (fx % white_w) > white_w - 1.5;
                         if edge {
                             (60, 60, 70)
+                        } else if ext[note] {
+                            (150, 255, 180)
                         } else if active[note] {
                             (150, 190, 255)
                         } else {
