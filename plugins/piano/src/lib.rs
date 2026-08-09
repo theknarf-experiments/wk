@@ -7,20 +7,40 @@ use bindings::wasi::surface::surface::{CreateDesc, Key, Surface};
 use bindings::wk::midi::midi::{Input, Output};
 use bindings::Guest;
 
-/// The 13 chromatic notes from C to C (one octave). White keys are the natural
-/// notes; the rest are the black keys.
-const WHITE: [usize; 8] = [0, 2, 4, 5, 7, 9, 11, 12];
-/// Black keys: (white-boundary the key sits on, semitone). They sit between
-/// white keys C-D, D-E, F-G, G-A, A-B.
-const BLACK: [(f32, usize); 5] = [(1.0, 1), (2.0, 3), (4.0, 6), (5.0, 8), (6.0, 10)];
+/// Two octaves of keys. White-key semitone offsets (C D E F G A B, twice, plus
+/// the closing C); the black keys sit on the white-key boundaries.
+const WHITE: [usize; 15] = [0, 2, 4, 5, 7, 9, 11, 12, 14, 16, 17, 19, 21, 23, 24];
+/// Black keys: (white-boundary the key straddles, semitone). None on B–C.
+const BLACK: [(f32, usize); 10] = [
+    (1.0, 1),
+    (2.0, 3),
+    (4.0, 6),
+    (5.0, 8),
+    (6.0, 10),
+    (8.0, 13),
+    (9.0, 15),
+    (11.0, 18),
+    (12.0, 20),
+    (13.0, 22),
+];
+/// Total keys drawn (two octaves + the closing C).
+const NKEYS: usize = 25;
+/// Number of white keys.
+const NW: usize = 15;
 
-/// MIDI note number of key `i` (semitones above C4 = MIDI note 60).
-fn midi_note(i: usize) -> u8 {
-    60 + i as u8
+/// Height of the top strip holding the octave-shift buttons.
+const CTRL_H: f32 = 24.0;
+/// Width of each octave button (left = down, right = up).
+const BTN_W: f32 = 48.0;
+
+/// MIDI note number of key `i` above the keyboard's base note.
+fn midi_note(base: i32, i: usize) -> u8 {
+    (base + i as i32).clamp(0, 127) as u8
 }
 
 /// Computer-keyboard piano mapping (FL-Studio style): the home row plays the
-/// white keys, the row above the black keys.
+/// lower displayed octave's white keys, the row above its black keys. The
+/// on-screen buttons shift which octaves the whole keyboard covers.
 fn key_to_note(k: Key) -> Option<usize> {
     Some(match k {
         Key::KeyA => 0,
@@ -40,17 +60,17 @@ fn key_to_note(k: Key) -> Option<usize> {
     })
 }
 
-/// A MIDI keyboard: ref-counts how many local inputs (mouse + keyboard) hold each
-/// note so overlapping presses don't send a spurious note-off, emits note-on/off
-/// out of its output port, and receives MIDI on its input port — lighting up the
-/// notes an upstream source (e.g. a hardware keyboard) plays and passing every
-/// message through to its output.
+/// A two-octave MIDI keyboard, shiftable by the octave buttons. Ref-counts local
+/// presses (mouse + keyboard) so overlapping presses don't send a spurious
+/// note-off, emits note-on/off relative to a base MIDI note, and receives MIDI on
+/// its input port — lighting up incoming notes and passing them through.
 struct Keyboard {
     out: Output,
     input: Input,
-    held: [u32; 13],
-    /// Which notes an upstream MIDI source is currently holding (for highlight).
-    ext: [bool; 13],
+    held: [u32; NKEYS],
+    ext: [bool; NKEYS],
+    /// MIDI note of key 0 (C of the lower displayed octave). Default C4 = 60.
+    base: i32,
 }
 
 impl Keyboard {
@@ -58,20 +78,61 @@ impl Keyboard {
         Keyboard {
             out: Output::new(),
             input: Input::new(),
-            held: [0; 13],
-            ext: [false; 13],
+            held: [0; NKEYS],
+            ext: [false; NKEYS],
+            base: 60,
         }
     }
 
-    /// Drain MIDI arriving on the input port: light up note-ons within our
-    /// octave, and pass every message straight through to the output so wired
-    /// downstream nodes see it (a MIDI thru).
+    fn press(&mut self, note: usize) {
+        self.held[note] += 1;
+        if self.held[note] == 1 {
+            self.out.send(&[0x90, midi_note(self.base, note), 100]);
+        }
+    }
+
+    fn release(&mut self, note: usize) {
+        if self.held[note] == 0 {
+            return;
+        }
+        self.held[note] -= 1;
+        if self.held[note] == 0 {
+            self.out.send(&[0x80, midi_note(self.base, note), 0]);
+        }
+    }
+
+    fn active(&self, note: usize) -> bool {
+        self.held[note] > 0
+    }
+
+    /// Release every held key at the current pitch (so nothing sticks across an
+    /// octave shift).
+    fn all_off(&mut self) {
+        for note in 0..NKEYS {
+            if self.held[note] > 0 {
+                self.out.send(&[0x80, midi_note(self.base, note), 0]);
+                self.held[note] = 0;
+            }
+        }
+    }
+
+    /// Shift the whole keyboard by `delta` octaves, clamped so MIDI stays valid.
+    fn shift_octave(&mut self, delta: i32) {
+        let new_base = (self.base + delta * 12).clamp(24, 96);
+        if new_base != self.base {
+            self.all_off();
+            self.base = new_base;
+        }
+    }
+
+    /// Drain MIDI arriving on the input port: light up note-ons within the
+    /// displayed range, and pass every message through to the output (MIDI thru).
     fn pump_input(&mut self) {
         while let Some(msg) = self.input.receive() {
             if msg.len() >= 3 {
                 let status = msg[0] & 0xF0;
-                let note = msg[1] as i32 - 60; // our octave is MIDI 60..=72
-                if (0..=12).contains(&note) {
+                let note = msg[1] as i32 - self.base;
+                if (0..NKEYS as i32).contains(&note) {
                     let n = note as usize;
                     if status == 0x90 && msg[2] > 0 {
                         self.ext[n] = true;
@@ -83,35 +144,13 @@ impl Keyboard {
             self.out.send(&msg);
         }
     }
-
-    fn press(&mut self, note: usize) {
-        self.held[note] += 1;
-        if self.held[note] == 1 {
-            // Note-on, channel 0, velocity 100.
-            self.out.send(&[0x90, midi_note(note), 100]);
-        }
-    }
-
-    fn release(&mut self, note: usize) {
-        if self.held[note] == 0 {
-            return;
-        }
-        self.held[note] -= 1;
-        if self.held[note] == 0 {
-            // Note-off, channel 0.
-            self.out.send(&[0x80, midi_note(note), 0]);
-        }
-    }
-
-    fn active(&self, note: usize) -> bool {
-        self.held[note] > 0
-    }
 }
 
-/// Which note is under the cursor, given the surface size.
-fn hit_test(x: f32, y: f32, w: f32, h: f32) -> usize {
-    let white_w = w / 8.0;
-    let black_h = h * 0.55;
+/// Which note is under the cursor in the keyboard area (`y` measured from the
+/// top of the keys, i.e. below the control strip).
+fn hit_test(x: f32, y: f32, w: f32, kb_h: f32) -> usize {
+    let white_w = w / NW as f32;
+    let black_h = kb_h * 0.55;
     let black_w = white_w * 0.6;
     if y < black_h {
         for &(mult, note) in &BLACK {
@@ -121,7 +160,7 @@ fn hit_test(x: f32, y: f32, w: f32, h: f32) -> usize {
             }
         }
     }
-    let wi = ((x / white_w) as usize).min(7);
+    let wi = ((x / white_w) as usize).min(NW - 1);
     WHITE[wi]
 }
 
@@ -130,8 +169,8 @@ struct Component;
 impl Guest for Component {
     fn run() {
         let surface = Surface::new(CreateDesc {
-            width: Some(560),
-            height: Some(200),
+            width: Some(660),
+            height: Some(220),
         });
         let ctx = GfxContext::new();
         surface.connect_graphics_context(&ctx);
@@ -141,7 +180,7 @@ impl Guest for Component {
 
         let mut keyboard = Keyboard::new();
         // Keyboard de-bounce (the host re-sends key-down while a key is held).
-        let mut key_held = [false; 13];
+        let mut key_held = [false; NKEYS];
         let mut mouse_note: Option<usize> = None;
 
         loop {
@@ -149,10 +188,26 @@ impl Guest for Component {
             let _ = surface.get_frame();
             let w = surface.width().max(1);
             let h = surface.height().max(1);
+            let wf = w as f32;
+            let hf = h as f32;
+            let kb_h = (hf - CTRL_H).max(1.0);
 
-            // Mouse: press the key under the cursor on down, release on up.
+            // Mouse: the top strip holds the octave buttons; below it, the keys.
             while let Some(ev) = surface.get_pointer_down() {
-                let note = hit_test(ev.x as f32, ev.y as f32, w as f32, h as f32);
+                let (px, py) = (ev.x as f32, ev.y as f32);
+                if py < CTRL_H {
+                    if px < BTN_W {
+                        keyboard.shift_octave(-1);
+                    } else if px >= wf - BTN_W {
+                        keyboard.shift_octave(1);
+                    }
+                    // A click on the strip shouldn't leave a key mouse-held.
+                    if let Some(prev) = mouse_note.take() {
+                        keyboard.release(prev);
+                    }
+                    continue;
+                }
+                let note = hit_test(px, py - CTRL_H, wf, kb_h);
                 if mouse_note != Some(note) {
                     if let Some(prev) = mouse_note.take() {
                         keyboard.release(prev);
@@ -190,56 +245,79 @@ impl Guest for Component {
             // pass through.
             keyboard.pump_input();
 
-            // Paint the keyboard.
+            // Paint the control strip and the two-octave keyboard.
             let buffer = Buffer::from_graphics_buffer(ctx.get_current_buffer());
-            let mut active = [false; 13];
-            let mut ext = [false; 13];
-            for n in 0..13 {
+            let mut active = [false; NKEYS];
+            let mut ext = [false; NKEYS];
+            for n in 0..NKEYS {
                 active[n] = keyboard.active(n);
                 ext[n] = keyboard.ext[n];
             }
             let mut pixels = vec![0u8; (w * h * 4) as usize];
-            let white_w = w as f32 / 8.0;
-            let black_h = h as f32 * 0.55;
+            let white_w = wf / NW as f32;
+            let black_h = kb_h * 0.55;
             let black_w = white_w * 0.6;
+            // Octave-button glyph geometry.
+            let cy = CTRL_H / 2.0;
+            let dcx = BTN_W / 2.0; // down (−) button centre
+            let ucx = wf - BTN_W / 2.0; // up (+) button centre
+            let gr = 7.0; // glyph half-extent
             for y in 0..h {
                 for x in 0..w {
                     let i = ((y * w + x) * 4) as usize;
                     let (fx, fy) = (x as f32, y as f32);
 
-                    // Black key?
-                    let mut black = None;
-                    if fy < black_h {
-                        for &(mult, note) in &BLACK {
-                            let cx = mult * white_w;
-                            if fx >= cx - black_w / 2.0 && fx < cx + black_w / 2.0 {
-                                black = Some(note);
-                                break;
-                            }
-                        }
-                    }
-
-                    // Upstream (hardware) notes light green; local presses blue.
-                    let (r, g, b) = if let Some(note) = black {
-                        if ext[note] {
-                            (110, 210, 140)
-                        } else if active[note] {
-                            (110, 140, 210)
+                    let (r, g, b) = if fy < CTRL_H {
+                        // Control strip: octave-down button (left), up (right).
+                        let on_down = fx < BTN_W;
+                        let on_up = fx >= wf - BTN_W;
+                        let minus =
+                            on_down && (fy - cy).abs() < 1.6 && (fx - dcx).abs() < gr;
+                        let plus = on_up
+                            && (((fy - cy).abs() < 1.6 && (fx - ucx).abs() < gr)
+                                || ((fx - ucx).abs() < 1.6 && (fy - cy).abs() < gr));
+                        if minus || plus {
+                            (210, 215, 225)
+                        } else if on_down || on_up {
+                            (46, 48, 58)
                         } else {
-                            (16, 16, 22)
+                            (28, 28, 34)
                         }
                     } else {
-                        let wi = ((fx / white_w) as usize).min(7);
-                        let note = WHITE[wi];
-                        let edge = (fx % white_w) < 1.5 || (fx % white_w) > white_w - 1.5;
-                        if edge {
-                            (60, 60, 70)
-                        } else if ext[note] {
-                            (150, 255, 180)
-                        } else if active[note] {
-                            (150, 190, 255)
+                        // Keyboard area. Green = an upstream (hardware) note;
+                        // blue = a local mouse/keyboard press.
+                        let ky = fy - CTRL_H;
+                        let mut black = None;
+                        if ky < black_h {
+                            for &(mult, note) in &BLACK {
+                                let cx = mult * white_w;
+                                if fx >= cx - black_w / 2.0 && fx < cx + black_w / 2.0 {
+                                    black = Some(note);
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(note) = black {
+                            if ext[note] {
+                                (110, 210, 140)
+                            } else if active[note] {
+                                (110, 140, 210)
+                            } else {
+                                (16, 16, 22)
+                            }
                         } else {
-                            (242, 242, 246)
+                            let wi = ((fx / white_w) as usize).min(NW - 1);
+                            let note = WHITE[wi];
+                            let edge = (fx % white_w) < 1.5 || (fx % white_w) > white_w - 1.5;
+                            if edge {
+                                (60, 60, 70)
+                            } else if ext[note] {
+                                (150, 255, 180)
+                            } else if active[note] {
+                                (150, 190, 255)
+                            } else {
+                                (242, 242, 246)
+                            }
                         }
                     };
                     pixels[i] = r;

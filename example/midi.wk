@@ -7,6 +7,15 @@
 // From the repo root:  wk run example/midi.wk   — then play your MIDI keyboard.
 import "../workspace.wk"
 workspace "01KZKMAB00000000000000WS01" {
+    node "piano" "01KZKMAE00000000000000PN04" {
+        pos 260.0 330.0
+        size 560.0 220.0
+    }
+    node "synth" "01KZKMAF00000000000000SY05" {
+        pos 860.0 330.0
+        size 360.0 260.0
+        options 0.30000001192092896 2.0 0.0 1800.0 3.0 0.019999999552965164 0.3499999940395355
+    }
     note "01KZKMAC00000000000000NT02" {
         text "Hardware MIDI on the fabric.\n\nThe MIDI In node opens a physical\nkeyboard (a built-in host node —\nlike Screen Capture). It's wired to\nthe piano, which lights the notes\nyou play (green) and passes them\nthrough to the synth.\n\nPlay your MIDI keyboard; you can\nalso click/type on the piano."
         pos 40.0 40.0
@@ -15,15 +24,6 @@ workspace "01KZKMAB00000000000000WS01" {
     midiin "" "01KZKMAD00000000000000MD03" {
         pos 60.0 340.0
         size 130.0 44.0
-    }
-    node "piano" "01KZKMAE00000000000000PN04" {
-        pos 260.0 330.0
-        size 380.0 200.0
-    }
-    node "synth" "01KZKMAF00000000000000SY05" {
-        pos 720.0 330.0
-        size 360.0 260.0
-        options 0.30000001192092896 2.0 0.0 1800.0 3.0 0.019999999552965164 0.3499999940395355
     }
     midi "01KZKMAD00000000000000MD03" "01KZKMAE00000000000000PN04"
     midi "01KZKMAE00000000000000PN04" "01KZKMAF00000000000000SY05"
