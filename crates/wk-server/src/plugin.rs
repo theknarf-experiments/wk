@@ -168,6 +168,12 @@ pub struct NodeSetup {
     /// Present for a runnable node (not an http server): the compiled component
     /// and how to instantiate it, reused across runs.
     pub run: Option<RunInfo>,
+    /// Whether the component imports `wk:midi` — the UI only draws MIDI ports on
+    /// nodes that actually transport MIDI.
+    pub midi: bool,
+    /// Whether the component imports `wasi:sockets` — the UI only draws a Network
+    /// port on nodes that actually do networking.
+    pub net: bool,
 }
 
 /// What [`PluginHost::run_node`] needs to (re)start a node's guest, reused across
@@ -187,6 +193,16 @@ impl Node {
     }
     pub fn http_path(&self) -> Option<std::path::PathBuf> {
         self.setup.get().and_then(|s| s.http_path.clone())
+    }
+    /// Whether this node transports MIDI (imports `wk:midi`). `false` until the
+    /// component has finished compiling.
+    pub fn imports_midi(&self) -> bool {
+        self.setup.get().is_some_and(|s| s.midi)
+    }
+    /// Whether this node does networking (imports `wasi:sockets`). `false` until
+    /// the component has finished compiling.
+    pub fn imports_net(&self) -> bool {
+        self.setup.get().is_some_and(|s| s.net)
     }
     pub fn is_runnable(&self) -> bool {
         self.setup.get().is_some_and(|s| s.run.is_some())
@@ -772,6 +788,15 @@ fn component_imports_sockets(component: &Component, engine: &Engine) -> bool {
         .any(|(name, _)| name.starts_with("wasi:sockets/"))
 }
 
+/// Whether a component imports `wk:midi` — i.e. it sends and/or receives MIDI,
+/// so the UI should offer it MIDI ports.
+fn component_imports_midi(component: &Component, engine: &Engine) -> bool {
+    component
+        .component_type()
+        .imports(engine)
+        .any(|(name, _)| name == "wk:midi/midi" || name.starts_with("wk:midi/"))
+}
+
 /// Whether a component is a `wasi:http` server (exports `incoming-handler`).
 fn component_is_proxy(component: &Component, engine: &Engine) -> bool {
     component
@@ -1170,7 +1195,9 @@ impl PluginHost {
         // A node that imports wasi:sockets gets a NIC on the fabric. By default
         // it's alone on its own virtual network (net id = node id) — isolated —
         // until the server wires it to a Network node.
-        let net_stack = if !is_http && component_imports_sockets(&component, &self.engine) {
+        let imports_sockets = component_imports_sockets(&component, &self.engine);
+        let imports_midi = component_imports_midi(&component, &self.engine);
+        let net_stack = if !is_http && imports_sockets {
             // Seeded from the node id so a node keeps its address across
             // re-runs; alloc_ip skips octets already taken by other stacks.
             let ip = self.hub.alloc_ip((2 + (node.id.as_u128() % 250)) as u8);
@@ -1187,6 +1214,8 @@ impl PluginHost {
                 is_command,
                 surfaces,
             }),
+            midi: imports_midi,
+            net: imports_sockets,
         };
         // Publish; the server now sees a ready node.
         let _ = node.setup.set(setup);

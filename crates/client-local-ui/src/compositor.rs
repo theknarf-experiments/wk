@@ -347,33 +347,45 @@ impl App {
         } else if v.midi_ins.contains_key(&id) {
             one(Midi, Out) // a hardware MIDI input drives apps
         } else {
-            // An app node.
-            vec![
-                Port {
-                    kind: Bind,
-                    dir: In,
-                },
-                Port {
+            // An app node. Every app can mount a volume, receive capture frames,
+            // and serve http; the MIDI and Network ports appear only on apps
+            // whose component actually imports those capabilities (`wk:midi` /
+            // `wasi:sockets`). While the component is still compiling both read
+            // false, so the capability ports appear once it's ready.
+            let node = v.app_node(id);
+            let midi = node.as_ref().is_some_and(|n| n.imports_midi());
+            let net = node.as_ref().is_some_and(|n| n.imports_net());
+            let mut ports = vec![Port {
+                kind: Bind,
+                dir: In,
+            }];
+            if midi {
+                ports.push(Port {
                     kind: Midi,
                     dir: In,
-                },
-                Port {
-                    kind: Capture,
-                    dir: In,
-                },
-                Port {
+                });
+            }
+            ports.push(Port {
+                kind: Capture,
+                dir: In,
+            });
+            if midi {
+                ports.push(Port {
                     kind: Midi,
                     dir: Out,
-                },
-                Port {
-                    kind: Serve,
-                    dir: Out,
-                },
-                Port {
+                });
+            }
+            ports.push(Port {
+                kind: Serve,
+                dir: Out,
+            });
+            if net {
+                ports.push(Port {
                     kind: Net,
                     dir: Out,
-                },
-            ]
+                });
+            }
+            ports
         }
     }
 
