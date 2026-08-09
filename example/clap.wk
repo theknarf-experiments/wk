@@ -1,0 +1,27 @@
+// vim: set filetype=kdl :
+// A real CLAP plugin running in wk. The on-screen piano feeds a CLAP polyphonic
+// synth (compiled from C to a wk:clap component); the wk host drives the plugin
+// and plays its audio to the speakers.
+//
+// Build the CLAP components first:  cd plugins/clap && mise run build
+// Then from the repo root:          wk run example/clap.wk
+//
+// Play the piano (or wire a hardware `midiin` node to the synth). You can also
+// swap clap_synth for any other CLAP plugin dropped into plugins/clap/examples.
+import "../workspace.wk"
+workspace "01KZSNAP00000000000000WS01" {
+    note "01KZSNAP00000000000000NT02" {
+        text "CLAP in wk.\n\nThe piano feeds a CLAP polyphonic\nsynth — a real CLAP plugin compiled\nto a wk:clap component. The host\ndrives its process() and plays the\naudio to your speakers.\n\nPlay the piano to hear it."
+        pos 40.0 40.0
+        size 340.0 240.0
+    }
+    node "piano" "01KZSNAP00000000000000PN03" {
+        pos 420.0 60.0
+        size 560.0 220.0
+    }
+    node "clap_synth" "01KZSNAP00000000000000CS04" {
+        pos 420.0 330.0
+        size 220.0 90.0
+    }
+    midi "01KZSNAP00000000000000PN03" "01KZSNAP00000000000000CS04"
+}

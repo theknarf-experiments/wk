@@ -177,6 +177,9 @@ pub struct NodeSetup {
     /// Whether the component imports `wk:capture` — the UI only draws a Capture
     /// port on nodes that actually consume captured frames.
     pub capture: bool,
+    /// Whether the component is a CLAP plugin (exports `wk:clap/plugins`), driven
+    /// as a live audio node instead of a `run`-loop guest.
+    pub clap: bool,
 }
 
 /// What [`PluginHost::run_node`] needs to (re)start a node's guest, reused across
@@ -211,6 +214,11 @@ impl Node {
     /// `false` until the component has finished compiling.
     pub fn imports_capture(&self) -> bool {
         self.setup.get().is_some_and(|s| s.capture)
+    }
+    /// Whether this node is a CLAP plugin (exports `wk:clap/plugins`), driven as
+    /// a live audio node. `false` until the component has finished compiling.
+    pub fn is_clap(&self) -> bool {
+        self.setup.get().is_some_and(|s| s.clap)
     }
     pub fn is_runnable(&self) -> bool {
         self.setup.get().is_some_and(|s| s.run.is_some())
@@ -814,6 +822,15 @@ fn component_imports_capture(component: &Component, engine: &Engine) -> bool {
         .any(|(name, _)| name.starts_with("wk:capture/"))
 }
 
+/// Whether a component is a CLAP plugin (exports `wk:clap/plugins`) — wk drives
+/// it as a live audio node rather than a `run`-loop guest.
+fn component_exports_clap(component: &Component, engine: &Engine) -> bool {
+    component
+        .component_type()
+        .exports(engine)
+        .any(|(name, _)| name.starts_with("wk:clap/plugins"))
+}
+
 /// Whether a component is a `wasi:http` server (exports `incoming-handler`).
 fn component_is_proxy(component: &Component, engine: &Engine) -> bool {
     component
@@ -1215,6 +1232,7 @@ impl PluginHost {
         let imports_sockets = component_imports_sockets(&component, &self.engine);
         let imports_midi = component_imports_midi(&component, &self.engine);
         let imports_capture = component_imports_capture(&component, &self.engine);
+        let exports_clap = component_exports_clap(&component, &self.engine);
         let net_stack = if !is_http && imports_sockets {
             // Seeded from the node id so a node keeps its address across
             // re-runs; alloc_ip skips octets already taken by other stacks.
@@ -1227,7 +1245,8 @@ impl PluginHost {
         let setup = NodeSetup {
             net_stack,
             http_path: is_http.then(|| path.to_path_buf()),
-            run: (!is_http).then(|| RunInfo {
+            // A CLAP plugin isn't a `run`-loop guest; the audio thread drives it.
+            run: (!is_http && !exports_clap).then(|| RunInfo {
                 component,
                 is_command,
                 surfaces,
@@ -1235,6 +1254,7 @@ impl PluginHost {
             midi: imports_midi,
             net: imports_sockets,
             capture: imports_capture,
+            clap: exports_clap,
         };
         // Publish; the server now sees a ready node.
         let _ = node.setup.set(setup);
@@ -1251,6 +1271,22 @@ impl PluginHost {
                 self.hub.detach(&stack);
             }
             node.finished.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+
+        // A CLAP plugin runs as a live audio node on its own thread (owning the
+        // cpal stream); it drains the node's MIDI inbox and plays to the speakers.
+        if exports_clap {
+            node.running.store(true, Ordering::Relaxed);
+            match std::fs::read(path) {
+                Ok(bytes) => crate::clap_host::spawn_audio_node(
+                    bytes,
+                    node.midi_in.clone(),
+                    node.kill.clone(),
+                    node.finished.clone(),
+                ),
+                Err(e) => eprintln!("wk clap: can't read {}: {e}", path.display()),
+            }
             return Ok(());
         }
 

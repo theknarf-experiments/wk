@@ -355,7 +355,13 @@ impl App {
             // still compiling these all read false, so the ports appear once it's
             // ready.
             let node = v.app_node(id);
-            let midi = node.as_ref().is_some_and(|n| n.imports_midi());
+            let imports_midi = node.as_ref().is_some_and(|n| n.imports_midi());
+            // A CLAP plugin has no wk:midi import — the host pumps MIDI into it —
+            // but it still takes note input, so give it a MIDI-in port. Its
+            // out-events aren't routed yet, so no MIDI-out.
+            let is_clap = node.as_ref().is_some_and(|n| n.is_clap());
+            let midi_in = imports_midi || is_clap;
+            let midi_out = imports_midi;
             let net = node.as_ref().is_some_and(|n| n.imports_net());
             let capture = node.as_ref().is_some_and(|n| n.imports_capture());
             let serve = node
@@ -365,7 +371,7 @@ impl App {
                 kind: Bind,
                 dir: In,
             }];
-            if midi {
+            if midi_in {
                 ports.push(Port {
                     kind: Midi,
                     dir: In,
@@ -377,7 +383,7 @@ impl App {
                     dir: In,
                 });
             }
-            if midi {
+            if midi_out {
                 ports.push(Port {
                     kind: Midi,
                     dir: Out,
