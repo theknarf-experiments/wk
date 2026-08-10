@@ -743,6 +743,31 @@ mod tests {
         );
     }
 
+    /// The synth is a Rust wk:clap instrument with no `run` loop and no host Web
+    /// Audio graph: it synthesises its own stereo audio in `process` from incoming
+    /// MIDI. One stereo output port; silent until a note-on, then it sounds.
+    #[test]
+    fn synth_synthesizes_its_own_audio() {
+        let mut synth = instance(include_bytes!("../testdata/synth.wasm"), 48_000.0, 512);
+        assert!(synth.has_gui(), "the synth draws a knob panel");
+        assert_eq!(synth.out_channels, vec![2], "one stereo output port");
+
+        // Silent with no note.
+        let quiet = synth.process(512, &[], None, &[]).unwrap();
+        assert_eq!(peak(&quiet.audio_out[0][0]), 0.0);
+
+        // A note-on makes it sound after the attack ramps up.
+        let ev = midi_to_event(&[0x90, 69, 100]).unwrap();
+        let mut loud = 0.0f32;
+        for _ in 0..16 {
+            let res = synth
+                .process(512, std::slice::from_ref(&ev), None, &[])
+                .unwrap();
+            loud = loud.max(peak(&res.audio_out[0][0]));
+        }
+        assert!(loud > 0.01, "sounds on note-on, peak {loud}");
+    }
+
     #[test]
     fn midi_passthrough_becomes_a_clap_midi_event() {
         match midi_to_event(&[0x90, 60, 100]) {

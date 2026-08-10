@@ -1,17 +1,23 @@
+// A small polyphonic synth, as a wk:clap plugin. No `run` loop and no host Web
+// Audio graph: it synthesises its own samples in `process` (two detuned
+// oscillators -> resonant TPT lowpass -> AR envelope, per voice) from the notes
+// arriving on its wk:clap note input, and paints its knob panel in `gui-render`.
+// Knob settings persist via wk:options — a wk:clap node freely using another wk
+// interface. Combines wasi-gfx (knob UI) with wk:clap audio + note ports.
 #[allow(warnings)]
 mod bindings;
 
 use std::collections::HashMap;
 use std::f32::consts::PI;
 
+use bindings::exports::wk::clap::plugins::{
+    AudioBuffer, AudioPortInfo, Descriptor, Event, Guest, GuestPlugin, NotePortInfo, ParamInfo,
+    Plugin, ProcessResult, ProcessStatus, Supported, Transport,
+};
 use bindings::wasi::frame_buffer::frame_buffer::{Buffer, Device};
 use bindings::wasi::graphics_context::graphics_context::Context as GfxContext;
 use bindings::wasi::surface::surface::{CreateDesc, Surface};
-use bindings::wk::midi::midi::Input;
-use bindings::wk::webaudio::audio::{
-    BiquadFilter, Context as Audio, FilterType, Gain, Oscillator, OscillatorType,
-};
-use bindings::Guest;
+use bindings::wk::clap::types::{AudioPortFlags, NoteDialects};
 
 // Knob indices.
 const VOL: usize = 0;
@@ -31,18 +37,8 @@ fn freq(note: u8, tune: f32) -> f32 {
     440.0 * 2.0f32.powf((note as f32 - 69.0 + tune) / 12.0)
 }
 
-/// Map the wave knob (0..3) to an oscillator waveform.
-fn osc_type(wave: f32) -> OscillatorType {
-    match wave.round() as i32 {
-        0 => OscillatorType::Sine,
-        1 => OscillatorType::Square,
-        2 => OscillatorType::Sawtooth,
-        _ => OscillatorType::Triangle,
-    }
-}
-
-/// One cycle of waveform `idx` at `phase` in 0..1, returning -1..1 (for the
-/// mini waveform drawn on the wave knob).
+/// One cycle of waveform `idx` at `phase` in 0..1, returning -1..1 (used both for
+/// synthesis and for the mini waveform drawn on the wave knob).
 fn wave_sample(idx: i32, phase: f32) -> f32 {
     match idx {
         0 => (phase * 2.0 * PI).sin(),
@@ -66,6 +62,7 @@ fn wave_sample(idx: i32, phase: f32) -> f32 {
 
 /// A knob: a value in `[min, max]` (mapped linearly, or logarithmically for
 /// frequency/time controls) with a label and colour.
+#[derive(Clone, Copy)]
 struct Knob {
     label: &'static str,
     value: f32,
@@ -93,21 +90,56 @@ impl Knob {
     }
 }
 
-/// A sounding note: two detuned oscillators -> low-pass filter -> envelope gain
-/// -> speakers. `release_end` marks when the release ramp finishes so the voice
-/// can be reaped.
+#[derive(PartialEq, Clone, Copy)]
+enum Stage {
+    Attack,
+    Sustain,
+    Release,
+}
+
+/// A sounding note: two detuned oscillators summed into a resonant lowpass (TPT
+/// state-variable filter), shaped by an AR envelope. Phases and filter state
+/// integrate per sample; the voice is reaped when its release ramp reaches zero.
 struct Voice {
-    osc_a: Oscillator,
-    osc_b: Oscillator,
-    filter: BiquadFilter,
-    gain: Gain,
-    release_end: Option<f64>,
+    note: u8,
+    phase_a: f32,
+    phase_b: f32,
+    env: f32,
+    stage: Stage,
+    // TPT SVF integrator state.
+    ic1: f32,
+    ic2: f32,
+}
+
+impl Voice {
+    fn new(note: u8) -> Self {
+        Voice {
+            note,
+            phase_a: 0.0,
+            phase_b: 0.0,
+            env: 0.0,
+            stage: Stage::Attack,
+            ic1: 0.0,
+            ic2: 0.0,
+        }
+    }
 }
 
 /// The synth: a bank of voices keyed by MIDI note, plus knobs whose values are
-/// applied live to every sounding voice.
+/// read live each block by the DSP.
 struct Synth {
-    audio: Audio,
+    // Lazily created on the first `gui-render` (the host composites the surface).
+    surface: Option<Surface>,
+    ctx: Option<GfxContext>,
+    device: Option<Device>,
+    px: Vec<u8>,
+    loaded: bool,
+    // Knob drag state (across frames): which knob, plus the drag anchor.
+    grab: Option<usize>,
+    start_y: f32,
+    start_norm: f32,
+
+    sample_rate: f32,
     voices: HashMap<u8, Voice>,
     knobs: [Knob; NUM_KNOBS],
 }
@@ -115,135 +147,38 @@ struct Synth {
 impl Synth {
     fn new() -> Self {
         Synth {
-            audio: Audio::new(),
+            surface: None,
+            ctx: None,
+            device: None,
+            px: Vec::new(),
+            loaded: false,
+            grab: None,
+            start_y: 0.0,
+            start_norm: 0.0,
+            sample_rate: 48_000.0,
             voices: HashMap::new(),
             knobs: [
-                Knob {
-                    label: "VOL",
-                    value: 0.3,
-                    min: 0.0,
-                    max: 1.0,
-                    log: false,
-                    color: [90, 150, 240],
-                },
-                Knob {
-                    label: "WAVE",
-                    value: 2.0,
-                    min: 0.0,
-                    max: 3.0,
-                    log: false,
-                    color: [90, 230, 160],
-                },
-                Knob {
-                    label: "TUNE",
-                    value: 0.0,
-                    min: -12.0,
-                    max: 12.0,
-                    log: false,
-                    color: [240, 170, 80],
-                },
-                Knob {
-                    label: "CUT",
-                    value: 1800.0,
-                    min: 80.0,
-                    max: 10000.0,
-                    log: true,
-                    color: [200, 130, 240],
-                },
-                Knob {
-                    label: "RES",
-                    value: 3.0,
-                    min: 0.1,
-                    max: 18.0,
-                    log: false,
-                    color: [240, 110, 140],
-                },
-                Knob {
-                    label: "ATK",
-                    value: 0.02,
-                    min: 0.003,
-                    max: 1.5,
-                    log: true,
-                    color: [110, 210, 230],
-                },
-                Knob {
-                    label: "REL",
-                    value: 0.35,
-                    min: 0.02,
-                    max: 2.5,
-                    log: true,
-                    color: [230, 210, 100],
-                },
+                Knob { label: "VOL", value: 0.3, min: 0.0, max: 1.0, log: false, color: [90, 150, 240] },
+                Knob { label: "WAVE", value: 2.0, min: 0.0, max: 3.0, log: false, color: [90, 230, 160] },
+                Knob { label: "TUNE", value: 0.0, min: -12.0, max: 12.0, log: false, color: [240, 170, 80] },
+                Knob { label: "CUT", value: 1800.0, min: 80.0, max: 10000.0, log: true, color: [200, 130, 240] },
+                Knob { label: "RES", value: 3.0, min: 0.1, max: 18.0, log: false, color: [240, 110, 140] },
+                Knob { label: "ATK", value: 0.02, min: 0.003, max: 1.5, log: true, color: [110, 210, 230] },
+                Knob { label: "REL", value: 0.35, min: 0.02, max: 2.5, log: true, color: [230, 210, 100] },
             ],
         }
     }
 
     fn note_on(&mut self, note: u8) {
-        let peak = self.knobs[VOL].value;
-        let attack = self.knobs[ATK].value;
-        if let Some(v) = self.voices.get_mut(&note) {
-            // Retrigger a still-releasing voice instead of stacking a new one.
-            v.release_end = None;
-            v.gain.ramp_to(peak, attack);
-            return;
-        }
-
-        let osc_a = self.audio.create_oscillator();
-        let osc_b = self.audio.create_oscillator();
-        let filter = self.audio.create_biquad_filter();
-        let gain = self.audio.create_gain();
-
-        filter.set_type(FilterType::Lowpass);
-        filter.set_frequency(self.knobs[CUT].value);
-        filter.set_q(self.knobs[RES].value);
-        filter.connect(&gain);
-        gain.set_gain(0.0);
-        gain.connect_destination();
-
-        let f = freq(note, self.knobs[TUNE].value);
-        let wave = osc_type(self.knobs[WAVE].value);
-        for (osc, sign) in [(&osc_a, -1.0f32), (&osc_b, 1.0)] {
-            osc.set_type(wave);
-            osc.set_frequency(f);
-            osc.set_detune(sign * UNISON_CENTS);
-            osc.connect_filter(&filter);
-            osc.start(0.0);
-        }
-        // Attack: ramp from silence to the volume peak.
-        gain.ramp_to(peak, attack);
-
-        self.voices.insert(
-            note,
-            Voice {
-                osc_a,
-                osc_b,
-                filter,
-                gain,
-                release_end: None,
-            },
-        );
+        // Retrigger a still-sounding voice instead of stacking a new one.
+        let v = self.voices.entry(note).or_insert_with(|| Voice::new(note));
+        v.stage = Stage::Attack;
     }
 
     fn note_off(&mut self, note: u8) {
-        let release = self.knobs[REL].value;
-        let end = self.audio.current_time() + release as f64;
         if let Some(v) = self.voices.get_mut(&note) {
-            v.gain.ramp_to(0.0, release);
-            v.release_end = Some(end);
+            v.stage = Stage::Release;
         }
-    }
-
-    /// Reap voices whose release ramp has finished.
-    fn reap(&mut self) {
-        let now = self.audio.current_time();
-        self.voices.retain(|_, v| match v.release_end {
-            Some(end) if now >= end => {
-                v.osc_a.stop(0.0);
-                v.osc_b.stop(0.0);
-                false
-            }
-            _ => true,
-        });
     }
 
     /// Apply host-saved option values (knob settings) if they match our layout.
@@ -260,26 +195,75 @@ impl Synth {
         self.knobs.iter().map(|k| k.value).collect()
     }
 
-    /// Re-apply live-tweakable knob values to every sounding voice.
-    fn apply_knobs(&mut self) {
-        let wave = osc_type(self.knobs[WAVE].value);
-        let tune = self.knobs[TUNE].value;
-        let cut = self.knobs[CUT].value;
-        let res = self.knobs[RES].value;
+    /// Synthesise `frames` samples into a mono buffer (the caller mirrors it to
+    /// both stereo channels).
+    fn render(&mut self, frames: usize) -> Vec<f32> {
+        let sr = self.sample_rate;
         let vol = self.knobs[VOL].value;
-        for (note, v) in &self.voices {
-            let f = freq(*note, tune);
-            v.osc_a.set_type(wave);
-            v.osc_b.set_type(wave);
-            v.osc_a.set_frequency(f);
-            v.osc_b.set_frequency(f);
-            v.filter.set_frequency(cut);
-            v.filter.set_q(res);
-            // Volume tracks the sustaining level; don't fight an active release.
-            if v.release_end.is_none() {
-                v.gain.set_gain(vol);
+        let wave = self.knobs[WAVE].value.round() as i32;
+        let tune = self.knobs[TUNE].value;
+        let atk = (sr * self.knobs[ATK].value).max(1.0);
+        let rel = (sr * self.knobs[REL].value).max(1.0);
+        // TPT state-variable filter coefficients (shared cutoff/res across voices).
+        let fc = self.knobs[CUT].value.min(sr * 0.45);
+        let g = (PI * fc / sr).tan();
+        // Map resonance (Q ~0.1..18) to the SVF damping term k = 1/Q.
+        let k = (1.0 / self.knobs[RES].value).clamp(0.05, 2.0);
+        let a1 = 1.0 / (1.0 + g * (g + k));
+        let a2 = g * a1;
+        let a3 = g * a2;
+        // Per-voice oscillator detune factors (±UNISON_CENTS).
+        let det = 2.0f32.powf(UNISON_CENTS / 1200.0);
+
+        let mut out = vec![0.0f32; frames];
+        for s in out.iter_mut() {
+            let mut mix = 0.0f32;
+            for v in self.voices.values_mut() {
+                match v.stage {
+                    Stage::Attack => {
+                        v.env += 1.0 / atk;
+                        if v.env >= 1.0 {
+                            v.env = 1.0;
+                            v.stage = Stage::Sustain;
+                        }
+                    }
+                    Stage::Release => {
+                        v.env -= 1.0 / rel;
+                        if v.env <= 0.0 {
+                            v.env = 0.0;
+                            continue;
+                        }
+                    }
+                    Stage::Sustain => {}
+                }
+                let f = freq(v.note, tune);
+                let osc = 0.5 * (wave_sample(wave, v.phase_a) + wave_sample(wave, v.phase_b));
+                v.phase_a += f / det / sr;
+                if v.phase_a >= 1.0 {
+                    v.phase_a -= 1.0;
+                }
+                v.phase_b += f * det / sr;
+                if v.phase_b >= 1.0 {
+                    v.phase_b -= 1.0;
+                }
+                // TPT SVF lowpass.
+                let v3 = osc - v.ic2;
+                let v1 = a1 * v.ic1 + a2 * v3;
+                let v2 = v.ic2 + a2 * v.ic1 + a3 * v3;
+                v.ic1 = 2.0 * v1 - v.ic1;
+                v.ic2 = 2.0 * v2 - v.ic2;
+                mix += v2 * v.env;
             }
+            let mut y = mix * vol;
+            if !y.is_finite() {
+                y = 0.0;
+            }
+            *s = y.clamp(-1.0, 1.0);
         }
+        // Reap finished-release voices.
+        self.voices
+            .retain(|_, v| !(v.stage == Stage::Release && v.env <= 0.0));
+        out
     }
 }
 
@@ -384,14 +368,7 @@ fn text(buf: &mut [u8], w: u32, h: u32, x: i32, y: i32, s: &str, scale: i32, c: 
                 if bits & (1 << (2 - col)) != 0 {
                     for sy in 0..scale {
                         for sx in 0..scale {
-                            put(
-                                buf,
-                                w,
-                                h,
-                                cx + col * scale + sx,
-                                y + row as i32 * scale + sy,
-                                c,
-                            );
+                            put(buf, w, h, cx + col * scale + sx, y + row as i32 * scale + sy, c);
                         }
                     }
                 }
@@ -423,109 +400,256 @@ fn draw_knob(buf: &mut [u8], w: u32, h: u32, cx: i32, cy: i32, r: i32, k: &Knob)
     text(buf, w, h, lx, cy + r + 3, k.label, scale, [190, 190, 200]);
 }
 
+/// A wk:clap plugin instance.
+struct SynthPlugin {
+    st: std::cell::RefCell<Synth>,
+}
+
+impl SynthPlugin {
+    fn new() -> Self {
+        SynthPlugin {
+            st: std::cell::RefCell::new(Synth::new()),
+        }
+    }
+}
+
+impl GuestPlugin for SynthPlugin {
+    fn init(&self) -> bool {
+        let mut st = self.st.borrow_mut();
+        if !st.loaded {
+            let saved = bindings::wk::options::options::load();
+            st.apply_options(&saved);
+            st.loaded = true;
+        }
+        true
+    }
+    fn activate(&self, sample_rate: f64, _min_frames: u32, _max_frames: u32) -> bool {
+        self.st.borrow_mut().sample_rate = sample_rate as f32;
+        true
+    }
+    fn deactivate(&self) {}
+    fn start_processing(&self) -> bool {
+        true
+    }
+    fn stop_processing(&self) {}
+    fn reset(&self) {
+        self.st.borrow_mut().voices.clear();
+    }
+    fn on_main_thread(&self) {}
+
+    /// Trigger/release voices from incoming MIDI, then synthesise a stereo block.
+    fn process(
+        &self,
+        _steady_time: i64,
+        frames: u32,
+        _transport: Option<Transport>,
+        in_events: Vec<Event>,
+        _audio_in: Vec<AudioBuffer>,
+    ) -> ProcessResult {
+        let mut st = self.st.borrow_mut();
+        for ev in &in_events {
+            if let Event::Midi(m) = ev {
+                let (status, note, vel) = m.data;
+                match status & 0xF0 {
+                    0x90 if vel > 0 => st.note_on(note),
+                    0x80 | 0x90 => st.note_off(note),
+                    _ => {}
+                }
+            }
+        }
+        let mono = st.render(frames as usize);
+        // One stereo output port: both channels carry the mono mix.
+        ProcessResult {
+            status: ProcessStatus::Continue,
+            audio_out: vec![vec![mono.clone(), mono]],
+            out_events: Vec::new(),
+        }
+    }
+
+    fn features(&self) -> Supported {
+        Supported::AUDIO_PORTS | Supported::NOTE_PORTS
+    }
+
+    // ---- params (none exposed; the GUI knobs drive the DSP directly) ----
+    fn param_count(&self) -> u32 {
+        0
+    }
+    fn param_info_at(&self, _index: u32) -> Option<ParamInfo> {
+        None
+    }
+    fn param_get(&self, _id: u32) -> Option<f64> {
+        None
+    }
+    fn param_value_to_text(&self, _id: u32, _value: f64) -> Option<String> {
+        None
+    }
+    fn param_text_to_value(&self, _id: u32, _text: String) -> Option<f64> {
+        None
+    }
+    fn params_flush(&self, _in_events: Vec<Event>) -> Vec<Event> {
+        Vec::new()
+    }
+
+    // ---- audio ports (one stereo output) ----
+    fn audio_port_count(&self, is_input: bool) -> u32 {
+        if is_input { 0 } else { 1 }
+    }
+    fn audio_port_info_at(&self, index: u32, is_input: bool) -> Option<AudioPortInfo> {
+        if is_input || index != 0 {
+            return None;
+        }
+        Some(AudioPortInfo {
+            id: 0,
+            name: "Out".into(),
+            channel_count: 2,
+            flag_set: AudioPortFlags::IS_MAIN,
+            port_type: "stereo".into(),
+        })
+    }
+
+    // ---- note ports (one input) ----
+    fn note_port_count(&self, is_input: bool) -> u32 {
+        if is_input { 1 } else { 0 }
+    }
+    fn note_port_info_at(&self, index: u32, is_input: bool) -> Option<NotePortInfo> {
+        if !is_input || index != 0 {
+            return None;
+        }
+        Some(NotePortInfo {
+            id: 0,
+            name: "In".into(),
+            supported_dialects: NoteDialects::MIDI,
+            preferred_dialect: NoteDialects::MIDI,
+        })
+    }
+
+    // ---- state (knobs persist via wk:options instead) ----
+    fn state_save(&self) -> Option<Vec<u8>> {
+        Some(Vec::new())
+    }
+    fn state_load(&self, _data: Vec<u8>) -> bool {
+        true
+    }
+
+    // ---- wk GUI ----
+    fn has_gui(&self) -> bool {
+        true
+    }
+
+    /// Paint the knob panel and handle knob drags.
+    fn gui_render(&self) {
+        let mut st = self.st.borrow_mut();
+        if st.surface.is_none() {
+            let surface = Surface::new(CreateDesc {
+                width: Some(420),
+                height: Some(240),
+            });
+            let ctx = GfxContext::new();
+            surface.connect_graphics_context(&ctx);
+            let device = Device::new();
+            device.connect_graphics_context(&ctx);
+            st.surface = Some(surface);
+            st.ctx = Some(ctx);
+            st.device = Some(device);
+        }
+        let (w, h) = {
+            let surface = st.surface.as_ref().unwrap();
+            let _ = surface.get_frame();
+            (surface.width().max(1), surface.height().max(1))
+        };
+        let (centers, r) = layout(w, h);
+
+        // Mouse: grab a knob on press, turn it by dragging vertically.
+        while let Some(ev) = st.surface.as_ref().unwrap().get_pointer_down() {
+            let (mx, my) = (ev.x as f32, ev.y as f32);
+            for (i, &(cx, cy)) in centers.iter().enumerate() {
+                let (dx, dy) = (mx - cx as f32, my - cy as f32);
+                if dx * dx + dy * dy <= ((r + 6) as f32).powi(2) {
+                    st.grab = Some(i);
+                    st.start_y = my;
+                    st.start_norm = st.knobs[i].norm();
+                    break;
+                }
+            }
+        }
+        while let Some(ev) = st.surface.as_ref().unwrap().get_pointer_move() {
+            if let Some(i) = st.grab {
+                let n = st.start_norm + (st.start_y - ev.y as f32) / 160.0;
+                st.knobs[i].set_norm(n);
+            }
+        }
+        let mut released = false;
+        while st.surface.as_ref().unwrap().get_pointer_up().is_some() {
+            st.grab = None;
+            released = true;
+        }
+        // Persist knob settings when a drag ends (the host saves them per node).
+        if released {
+            bindings::wk::options::options::store(&st.options());
+        }
+
+        // Paint the panel: background, then each knob with its label.
+        let n = (w * h * 4) as usize;
+        st.px.clear();
+        st.px.resize(n, 0);
+        for px in st.px.chunks_exact_mut(4) {
+            px.copy_from_slice(&[22, 22, 28, 255]);
+        }
+        for (i, &(cx, cy)) in centers.iter().enumerate() {
+            let k = st.knobs[i];
+            draw_knob(&mut st.px, w, h, cx, cy, r, &k);
+        }
+
+        // A mini view of the current waveform across the WAVE knob body.
+        let (wcx, wcy) = centers[WAVE];
+        let wave_idx = st.knobs[WAVE].value.round() as i32;
+        let span = (r as f32 * 0.6) as i32;
+        let amp = r as f32 * 0.32;
+        let mut prev: Option<(i32, i32)> = None;
+        for dx in -span..=span {
+            let phase = ((dx + span) as f32 / (2 * span) as f32) * 2.0 % 1.0;
+            let y = wcy - (wave_sample(wave_idx, phase) * amp) as i32;
+            let x = wcx + dx;
+            if let Some((px, py)) = prev {
+                line(&mut st.px, w, h, px, py, x, y, [225, 225, 230]);
+            }
+            prev = Some((x, y));
+        }
+
+        let ctx = st.ctx.as_ref().unwrap();
+        let buffer = Buffer::from_graphics_buffer(ctx.get_current_buffer());
+        buffer.set(&st.px);
+        ctx.present();
+    }
+}
+
 struct Component;
 
 impl Guest for Component {
-    fn run() {
-        let surface = Surface::new(CreateDesc {
-            width: Some(420),
-            height: Some(240),
-        });
-        let ctx = GfxContext::new();
-        surface.connect_graphics_context(&ctx);
-        let device = Device::new();
-        device.connect_graphics_context(&ctx);
-        let frame = surface.subscribe_frame();
-        let input = Input::new();
+    type Plugin = SynthPlugin;
 
-        let mut synth = Synth::new();
-        // Restore knob settings saved by the host (no-op on a fresh launch).
-        synth.apply_options(&bindings::wk::options::options::load());
-        // Knob drag state (across frames): which knob, and the drag anchor.
-        let mut grab: Option<usize> = None;
-        let mut start_y = 0.0f32;
-        let mut start_norm = 0.0f32;
+    fn count() -> u32 {
+        1
+    }
 
-        loop {
-            frame.block();
-            let _ = surface.get_frame();
-            let w = surface.width().max(1);
-            let h = surface.height().max(1);
-            let (centers, r) = layout(w, h);
-
-            synth.reap();
-
-            // Incoming MIDI: note-on (status 0x90, vel>0) / note-off (0x80, or
-            // 0x90 vel 0).
-            while let Some(msg) = input.receive() {
-                if msg.len() >= 3 {
-                    let status = msg[0] & 0xF0;
-                    let note = msg[1];
-                    let vel = msg[2];
-                    match status {
-                        0x90 if vel > 0 => synth.note_on(note),
-                        0x80 | 0x90 => synth.note_off(note),
-                        _ => {}
-                    }
-                }
-            }
-
-            // Mouse: grab a knob on press, turn it by dragging vertically.
-            while let Some(ev) = surface.get_pointer_down() {
-                let (mx, my) = (ev.x as f32, ev.y as f32);
-                for (i, &(cx, cy)) in centers.iter().enumerate() {
-                    let (dx, dy) = (mx - cx as f32, my - cy as f32);
-                    if dx * dx + dy * dy <= ((r + 6) as f32).powi(2) {
-                        grab = Some(i);
-                        start_y = my;
-                        start_norm = synth.knobs[i].norm();
-                        break;
-                    }
-                }
-            }
-            while let Some(ev) = surface.get_pointer_move() {
-                if let Some(i) = grab {
-                    let n = start_norm + (start_y - ev.y as f32) / 160.0;
-                    synth.knobs[i].set_norm(n);
-                    synth.apply_knobs();
-                }
-            }
-            while surface.get_pointer_up().is_some() {
-                grab = None;
-            }
-
-            // Persist the current knob settings (the host saves them per node).
-            bindings::wk::options::options::store(&synth.options());
-
-            // Paint the panel: background, then each knob with its label.
-            let buffer = Buffer::from_graphics_buffer(ctx.get_current_buffer());
-            let mut pixels = vec![0u8; (w * h * 4) as usize];
-            for px in pixels.chunks_exact_mut(4) {
-                px.copy_from_slice(&[22, 22, 28, 255]);
-            }
-            for (i, &(cx, cy)) in centers.iter().enumerate() {
-                draw_knob(&mut pixels, w, h, cx, cy, r, &synth.knobs[i]);
-            }
-
-            // A mini view of the current waveform across the WAVE knob body.
-            let (wcx, wcy) = centers[WAVE];
-            let wave_idx = synth.knobs[WAVE].value.round() as i32;
-            let span = (r as f32 * 0.6) as i32;
-            let amp = r as f32 * 0.32;
-            let mut prev: Option<(i32, i32)> = None;
-            for dx in -span..=span {
-                let phase = ((dx + span) as f32 / (2 * span) as f32) * 2.0 % 1.0;
-                let y = wcy - (wave_sample(wave_idx, phase) * amp) as i32;
-                let x = wcx + dx;
-                if let Some((px, py)) = prev {
-                    line(&mut pixels, w, h, px, py, x, y, [225, 225, 230]);
-                }
-                prev = Some((x, y));
-            }
-
-            buffer.set(&pixels);
-            ctx.present();
+    fn get(index: u32) -> Option<Descriptor> {
+        if index != 0 {
+            return None;
         }
+        Some(Descriptor {
+            id: "wk.synth".into(),
+            name: "Synth".into(),
+            vendor: "wk".into(),
+            version: "1.0.0".into(),
+            features: vec!["instrument".into(), "synthesizer".into(), "stereo".into()],
+        })
+    }
+
+    fn create(plugin_id: String) -> Option<Plugin> {
+        if plugin_id != "wk.synth" {
+            return None;
+        }
+        Some(Plugin::new(SynthPlugin::new()))
     }
 }
 
