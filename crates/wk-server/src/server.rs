@@ -1128,6 +1128,10 @@ impl Server {
     fn halt_guest(&self, id: NodeId) {
         if let Some(node) = self.app_node(id) {
             node.kill.store(true, Ordering::Relaxed);
+            // A CLAP node has no guest to signal — remove it from the audio engine.
+            if node.is_clap() {
+                self.host.clap_stop(&node);
+            }
             // EOF on stdin so a guest parked in a plain blocking read (no tty
             // poll cap) wakes and exits; run_node reopens it on restart.
             node.term_io.close();

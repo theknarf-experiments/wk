@@ -270,108 +270,266 @@ pub fn event_to_midi(e: &Event) -> Option<Vec<u8>> {
     }
 }
 
-/// Run a CLAP component as a live audio node: open the default output device and,
-/// each audio callback, drain the node's MIDI inbox into CLAP events, `process()`
-/// a block, write audio to the speakers, and forward any events the plugin
-/// emitted to the node's downstream MIDI connections. Blocks until `kill` is set,
-/// then drops the stream. Best-effort: with no output device (e.g. headless) it
-/// returns an error and the node simply produces no sound.
-fn run_audio_node(
-    wasm: &[u8],
-    node_id: wk_protocol::NodeId,
-    midi_in: &crate::midi::SharedInbox,
-    router: &crate::midi::Router,
-    kill: &std::sync::atomic::AtomicBool,
-) -> Result<()> {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    use std::sync::atomic::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use wk_protocol::NodeId;
 
-    let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| wasmtime::Error::msg("no default audio output device"))?;
-    let supported = device.default_output_config()?;
-    if supported.sample_format() != cpal::SampleFormat::F32 {
-        return Err(wasmtime::Error::msg(format!(
-            "unsupported output sample format {:?} (only f32)",
-            supported.sample_format()
-        )));
+/// Max block size a node is activated for (cpal callbacks are far smaller).
+const MAX_FRAMES: u32 = 8192;
+
+/// The shared CLAP audio engine: one output stream for the whole process, into
+/// which every live CLAP node is mixed. Each audio callback runs the nodes in
+/// topological order over the audio edges — draining each node's MIDI inbox,
+/// `process()`-ing a block, threading a source's output into its destinations'
+/// input, forwarding emitted events downstream, and summing the sinks (nodes with
+/// no downstream audio wire) to the speakers.
+///
+/// Held by the `PluginHost` and shared with the audio thread. `add`/`remove` are
+/// device-independent, so a node's start/stop/restart works even with no output
+/// device (it just makes no sound).
+#[derive(Clone)]
+pub struct ClapAudio {
+    inner: Arc<Mutex<Mixer>>,
+}
+
+struct Mixer {
+    clap: ClapEngine,
+    router: crate::midi::Router,
+    sample_rate: f64,
+    channels: usize,
+    /// The output stream thread has been started (device opened or attempted).
+    stream_started: bool,
+    nodes: HashMap<NodeId, EngineNode>,
+    /// Audio connections: source output -> destination input.
+    edges: Vec<(NodeId, NodeId)>,
+}
+
+struct EngineNode {
+    inst: ClapInstance,
+    inbox: crate::midi::SharedInbox,
+    /// Last block's output, cached so a downstream node can read it as input.
+    last: Vec<AudioBuffer>,
+}
+
+impl ClapAudio {
+    pub fn new(router: crate::midi::Router) -> Result<Self> {
+        let mixer = Mixer {
+            clap: ClapEngine::new()?,
+            router,
+            sample_rate: 48_000.0,
+            channels: 2,
+            stream_started: false,
+            nodes: HashMap::new(),
+            edges: Vec::new(),
+        };
+        Ok(ClapAudio {
+            inner: Arc::new(Mutex::new(mixer)),
+        })
     }
-    let config: cpal::StreamConfig = supported.config();
-    let sample_rate = config.sample_rate as f64;
-    let channels = config.channels.max(1) as usize;
 
-    let engine = ClapEngine::new()?;
-    let component = engine.compile(wasm)?;
-    let mut inst = engine.instantiate(&component, sample_rate, 4096)?;
+    /// Add (or replace) a live CLAP node: compile + instantiate its component and
+    /// insert it into the mix. Opens the output stream on the first node.
+    pub fn add(&self, id: NodeId, wasm: &[u8], inbox: crate::midi::SharedInbox) -> Result<()> {
+        self.ensure_stream();
+        let mut e = self.inner.lock().unwrap();
+        let sr = e.sample_rate;
+        let component = e.clap.compile(wasm)?;
+        let inst = e.clap.instantiate(&component, sr, MAX_FRAMES)?;
+        e.nodes.insert(
+            id,
+            EngineNode {
+                inst,
+                inbox,
+                last: Vec::new(),
+            },
+        );
+        Ok(())
+    }
 
-    let midi = midi_in.clone();
-    let router = router.clone();
-    let stream = device.build_output_stream(
-        config,
-        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            let frames = data.len() / channels;
-            let mut events = Vec::new();
-            if let Ok(mut q) = midi.lock() {
-                while let Some(m) = q.pop() {
-                    if let Some(e) = midi_to_event(&m) {
-                        events.push(e);
-                    }
-                }
+    pub fn remove(&self, id: NodeId) {
+        if let Ok(mut e) = self.inner.lock() {
+            e.nodes.remove(&id);
+        }
+    }
+
+    /// Set the audio connections (source output -> destination input).
+    pub fn set_edges(&self, edges: Vec<(NodeId, NodeId)>) {
+        if let Ok(mut e) = self.inner.lock() {
+            e.edges = edges;
+        }
+    }
+
+    /// Open the default output device and start the mixing stream (once). The
+    /// stream lives on its own thread (cpal streams are !Send). Best-effort: with
+    /// no device we keep default sample settings and never render.
+    fn ensure_stream(&self) {
+        if self.inner.lock().unwrap().stream_started {
+            return;
+        }
+        use cpal::traits::{DeviceTrait, HostTrait};
+        let picked = cpal::default_host()
+            .default_output_device()
+            .and_then(|d| d.default_output_config().ok().map(|c| (d, c)));
+
+        let mut e = self.inner.lock().unwrap();
+        e.stream_started = true;
+        let Some((device, supported)) = picked else {
+            eprintln!("wk clap: no audio output device; CLAP nodes will be silent");
+            return;
+        };
+        if supported.sample_format() != cpal::SampleFormat::F32 {
+            eprintln!("wk clap: output is not f32; CLAP nodes will be silent");
+            return;
+        }
+        let cfg: cpal::StreamConfig = supported.config();
+        e.sample_rate = cfg.sample_rate as f64;
+        e.channels = cfg.channels.max(1) as usize;
+        drop(e);
+
+        let inner = self.inner.clone();
+        std::thread::spawn(move || {
+            use cpal::traits::{DeviceTrait, StreamTrait};
+            let stream = device.build_output_stream(
+                cfg,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| match inner.lock() {
+                    Ok(mut e) => e.render(data),
+                    Err(_) => data.fill(0.0),
+                },
+                |err| eprintln!("wk clap: audio stream error: {err}"),
+                None,
+            );
+            match stream {
+                Ok(s) => match s.play() {
+                    Ok(()) => std::thread::park(), // keep the stream alive for the process life
+                    Err(err) => eprintln!("wk clap: can't start audio: {err}"),
+                },
+                Err(err) => eprintln!("wk clap: can't open audio stream: {err}"),
             }
-            let out = inst.process(frames as u32, &events, None, &[]);
-            if let Ok(res) = &out {
-                // Forward the plugin's emitted events downstream (a MIDI effect).
-                if !res.out_events.is_empty() {
-                    if let Ok(r) = router.lock() {
-                        for ev in &res.out_events {
-                            if let Some(bytes) = event_to_midi(ev) {
-                                r.send_from(node_id, &bytes);
+        });
+    }
+}
+
+impl Mixer {
+    /// Render one block: run every node in dependency order and mix the sinks.
+    fn render(&mut self, data: &mut [f32]) {
+        let channels = self.channels.max(1);
+        let frames = data.len() / channels;
+        data.fill(0.0);
+        if self.nodes.is_empty() || frames == 0 {
+            return;
+        }
+        // Nodes that feed another node aren't sinks; only sinks reach the speakers.
+        let has_downstream: HashSet<NodeId> = self.edges.iter().map(|&(s, _)| s).collect();
+
+        for id in self.topo_order() {
+            // Sum any upstream nodes' cached output as this node's audio input.
+            let inputs: Vec<NodeId> = self
+                .edges
+                .iter()
+                .filter(|&&(_, d)| d == id)
+                .map(|&(s, _)| s)
+                .collect();
+            let audio_in: Vec<AudioBuffer> = if inputs.is_empty() {
+                Vec::new()
+            } else {
+                let mut buf: AudioBuffer = vec![vec![0.0; frames]; channels];
+                for src in &inputs {
+                    if let Some(port) = self.nodes.get(src).and_then(|n| n.last.first()) {
+                        for (c, dst) in buf.iter_mut().enumerate() {
+                            if let Some(ch) = port.get(c.min(port.len().saturating_sub(1))) {
+                                for (f, v) in dst.iter_mut().enumerate().take(ch.len().min(frames))
+                                {
+                                    *v += ch[f];
+                                }
                             }
                         }
                     }
                 }
-            }
-            for f in 0..frames {
-                for c in 0..channels {
-                    let s = out
-                        .as_ref()
-                        .ok()
-                        .and_then(|o| o.audio_out.first())
-                        .and_then(|p| p.get(c.min(p.len().saturating_sub(1))))
-                        .and_then(|ch| ch.get(f).copied())
-                        .unwrap_or(0.0);
-                    data[f * channels + c] = s;
+                vec![buf]
+            };
+
+            // Drain this node's MIDI inbox into events.
+            let mut events = Vec::new();
+            if let Some(n) = self.nodes.get(&id) {
+                if let Ok(mut q) = n.inbox.lock() {
+                    while let Some(m) = q.pop() {
+                        if let Some(ev) = midi_to_event(&m) {
+                            events.push(ev);
+                        }
+                    }
                 }
             }
-        },
-        |err| eprintln!("wk clap: audio stream error: {err}"),
-        None,
-    )?;
-    stream.play()?;
-    while !kill.load(Ordering::Relaxed) {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    Ok(())
-}
 
-/// Spawn a CLAP component as a live audio node on its own thread (it owns the
-/// non-`Send` cpal stream). Drains `midi_in`, plays to the default output, and
-/// stops when `kill` is set, marking `finished`.
-pub fn spawn_audio_node(
-    wasm: Vec<u8>,
-    node_id: wk_protocol::NodeId,
-    midi_in: crate::midi::SharedInbox,
-    router: crate::midi::Router,
-    kill: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
-    std::thread::spawn(move || {
-        if let Err(e) = run_audio_node(&wasm, node_id, &midi_in, &router, &kill) {
-            eprintln!("wk clap node: {e:#}");
+            let out = self
+                .nodes
+                .get_mut(&id)
+                .map(|n| n.inst.process(frames as u32, &events, None, &audio_in));
+            let Some(Ok(res)) = out else { continue };
+
+            // Forward emitted events downstream (a MIDI effect / arp).
+            if !res.out_events.is_empty() {
+                if let Ok(router) = self.router.lock() {
+                    for ev in &res.out_events {
+                        if let Some(bytes) = event_to_midi(ev) {
+                            router.send_from(id, &bytes);
+                        }
+                    }
+                }
+            }
+            // Sinks reach the speakers.
+            if !has_downstream.contains(&id) {
+                if let Some(port) = res.audio_out.first() {
+                    for f in 0..frames {
+                        for c in 0..channels {
+                            data[f * channels + c] += port
+                                .get(c.min(port.len().saturating_sub(1)))
+                                .and_then(|ch| ch.get(f).copied())
+                                .unwrap_or(0.0);
+                        }
+                    }
+                }
+            }
+            if let Some(n) = self.nodes.get_mut(&id) {
+                n.last = res.audio_out;
+            }
         }
-        finished.store(true, std::sync::atomic::Ordering::Relaxed);
-    });
+    }
+
+    /// Topological order over the audio edges (Kahn); any nodes left in a cycle
+    /// are appended so they still render.
+    fn topo_order(&self) -> Vec<NodeId> {
+        let ids: Vec<NodeId> = self.nodes.keys().copied().collect();
+        let mut indeg: HashMap<NodeId, usize> = ids.iter().map(|&id| (id, 0)).collect();
+        for &(s, d) in &self.edges {
+            if self.nodes.contains_key(&s) && self.nodes.contains_key(&d) {
+                *indeg.entry(d).or_insert(0) += 1;
+            }
+        }
+        let mut queue: Vec<NodeId> = ids.iter().copied().filter(|id| indeg[id] == 0).collect();
+        let mut order = Vec::new();
+        let mut i = 0;
+        while i < queue.len() {
+            let id = queue[i];
+            i += 1;
+            order.push(id);
+            for &(s, d) in &self.edges {
+                if s == id && self.nodes.contains_key(&d) {
+                    if let Some(x) = indeg.get_mut(&d) {
+                        *x = x.saturating_sub(1);
+                        if *x == 0 {
+                            queue.push(d);
+                        }
+                    }
+                }
+            }
+        }
+        for id in ids {
+            if !order.contains(&id) {
+                order.push(id);
+            }
+        }
+        order
+    }
 }
 
 #[cfg(test)]

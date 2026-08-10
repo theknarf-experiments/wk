@@ -180,6 +180,9 @@ pub struct NodeSetup {
     /// Whether the component is a CLAP plugin (exports `wk:clap/plugins`), driven
     /// as a live audio node instead of a `run`-loop guest.
     pub clap: bool,
+    /// A CLAP node's component bytes, kept so the audio engine can (re)instantiate
+    /// it on start/restart. `None` for non-CLAP nodes.
+    pub clap_wasm: Option<Arc<Vec<u8>>>,
 }
 
 /// What [`PluginHost::run_node`] needs to (re)start a node's guest, reused across
@@ -931,6 +934,8 @@ pub struct PluginHost {
     gpu: Arc<wgpu_core::global::Global>,
     midi: crate::midi::Router,
     hub: Arc<wk_fabric::netstack::NetHub>,
+    /// The shared CLAP audio engine: one output stream mixing every CLAP node.
+    clap: crate::clap_host::ClapAudio,
 }
 
 impl PluginHost {
@@ -956,17 +961,51 @@ impl PluginHost {
             }
             Err(e) => eprintln!("wk: compile cache unavailable, compiling fresh: {e}"),
         }
+        let midi = crate::midi::new_router();
+        let clap = crate::clap_host::ClapAudio::new(midi.clone())?;
         Ok(Self {
             engine: Engine::new(&config)?,
             gpu: new_gpu_instance(),
-            midi: crate::midi::new_router(),
+            midi,
             hub: wk_fabric::netstack::NetHub::new(),
+            clap,
         })
     }
 
     /// The shared MIDI router, so the server can wire MIDI connections.
     pub fn midi(&self) -> crate::midi::Router {
         self.midi.clone()
+    }
+
+    /// The shared CLAP audio engine, so the server can reconcile audio edges.
+    pub fn clap(&self) -> &crate::clap_host::ClapAudio {
+        &self.clap
+    }
+
+    /// Add a CLAP node to the shared audio engine (start or restart). No-op if it
+    /// is already live; on failure the node reverts to not-running.
+    fn start_clap(&self, node: &SharedNode) {
+        if node.running.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        node.kill.store(false, Ordering::Relaxed);
+        node.finished.store(false, Ordering::Relaxed);
+        let Some(wasm) = node.setup.get().and_then(|s| s.clap_wasm.clone()) else {
+            node.running.store(false, Ordering::Relaxed);
+            return;
+        };
+        if let Err(e) = self.clap.add(node.id, &wasm, node.midi_in.clone()) {
+            eprintln!("wk clap: {e:#}");
+            node.running.store(false, Ordering::Relaxed);
+            node.finished.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Remove a CLAP node from the audio engine (stop).
+    pub fn clap_stop(&self, node: &SharedNode) {
+        self.clap.remove(node.id);
+        node.running.store(false, Ordering::Relaxed);
+        node.finished.store(true, Ordering::Relaxed);
     }
 
     pub fn detach_net(&self, stack: &wk_fabric::netstack::SharedStack) {
@@ -1242,10 +1281,22 @@ impl PluginHost {
             None
         };
         let networked = net_stack.is_some();
+        // Keep a CLAP node's bytes so the audio engine can (re)instantiate it.
+        let clap_wasm = if exports_clap {
+            match std::fs::read(path) {
+                Ok(b) => Some(Arc::new(b)),
+                Err(e) => {
+                    eprintln!("wk clap: can't read {}: {e}", path.display());
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let setup = NodeSetup {
             net_stack,
             http_path: is_http.then(|| path.to_path_buf()),
-            // A CLAP plugin isn't a `run`-loop guest; the audio thread drives it.
+            // A CLAP plugin isn't a `run`-loop guest; the audio engine drives it.
             run: (!is_http && !exports_clap).then(|| RunInfo {
                 component,
                 is_command,
@@ -1255,6 +1306,7 @@ impl PluginHost {
             net: imports_sockets,
             capture: imports_capture,
             clap: exports_clap,
+            clap_wasm,
         };
         // Publish; the server now sees a ready node.
         let _ = node.setup.set(setup);
@@ -1274,21 +1326,10 @@ impl PluginHost {
             return Ok(());
         }
 
-        // A CLAP plugin runs as a live audio node on its own thread (owning the
-        // cpal stream); it drains the node's MIDI inbox and plays to the speakers.
+        // A CLAP plugin is added to the shared audio engine (which owns the one
+        // output stream), drains the node's MIDI inbox and plays to the speakers.
         if exports_clap {
-            node.running.store(true, Ordering::Relaxed);
-            match std::fs::read(path) {
-                Ok(bytes) => crate::clap_host::spawn_audio_node(
-                    bytes,
-                    node.id,
-                    node.midi_in.clone(),
-                    self.midi.clone(),
-                    node.kill.clone(),
-                    node.finished.clone(),
-                ),
-                Err(e) => eprintln!("wk clap: can't read {}: {e}", path.display()),
-            }
+            self.start_clap(node);
             return Ok(());
         }
 
@@ -1306,6 +1347,11 @@ impl PluginHost {
     /// No-op if the node is already running or isn't runnable (an HTTP server).
     /// `args` are the launch args (argv after the program name).
     pub fn run_node(&self, node: &SharedNode, args: &[String]) -> Result<()> {
+        // A CLAP node re-enters the audio engine rather than running a guest.
+        if node.is_clap() {
+            self.start_clap(node);
+            return Ok(());
+        }
         // Still compiling, or an http server node — nothing to run.
         let Some(run) = node.setup.get().and_then(|s| s.run.as_ref()) else {
             return Ok(());
