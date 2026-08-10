@@ -21,7 +21,7 @@ use winit::window::{Window, WindowId};
 
 use crate::host_shell::Gfx;
 use crate::render2d::{Quad, Renderer, TextureId};
-use crate::render3d::{Quad3, Renderer3d};
+use crate::render3d::{MeshDraw, MeshGpu, Quad3, Renderer3d};
 use crate::text::Fonts;
 use wk_protocol::{Command, NodeId, NodeKind, NodePatch, Resource, ResourceRef, Wire};
 use wk_server::plugin::{Key, KeyEvent, PointerEvent, ResizeEvent, SharedNode, SharedSurface};
@@ -85,6 +85,8 @@ const GROUND_COL: [f32; 4] = [0.085, 0.085, 0.115, 1.0];
 /// World-space height of a panel's floating name label (also its lift above
 /// the panel's top edge).
 const LABEL_H: f32 = 0.05;
+/// The 3D world's light: xyz = direction toward the light, w = ambient floor.
+const WORLD_LIGHT: [f32; 4] = [0.35, 0.85, 0.4, 0.45];
 /// Connection-port disc radius in the 3D view, world units.
 const PORT3D_R: f32 = 0.028;
 /// Rasterization size for 3D text: world-space quads are metres tall on
@@ -229,6 +231,9 @@ struct App {
     /// High-res font + its own string cache for world-space (3D) text.
     fonts3d: Fonts,
     text_cache3d: TextCache,
+    /// The document's loaded 3D world scene: (source path, GPU meshes).
+    /// `Some` with empty meshes = the load failed (don't retry every frame).
+    world_scene: Option<(String, Vec<MeshGpu>)>,
     /// A panel move in progress: the node, the grab distance along the cursor
     /// ray (scroll pushes/pulls it), and the world-space offset from the grab
     /// point to the panel centre.
@@ -330,6 +335,7 @@ impl App {
             term_raster: TermRaster::default(),
             fonts3d: Fonts::new(FONT3D_PX)?,
             text_cache3d: TextCache::default(),
+            world_scene: None,
             drag3d: None,
             wire3d: None,
             look_captured: false,
@@ -2350,6 +2356,50 @@ impl App {
         }
 
         // ---- build the world ----
+        // The renderer is created up front (the world loader needs it too).
+        if self.renderer3d.is_none() {
+            self.renderer3d = Some(Renderer3d::new(
+                &gfx.device,
+                gfx.surface_desc.format,
+                gfx.renderer.texture_layout(),
+            ));
+        }
+        // (Re)load the document's glTF world when its path changes; a failed
+        // load is remembered as empty so it isn't retried every frame.
+        if self.view.world.as_deref() != self.world_scene.as_ref().map(|(p, _)| p.as_str()) {
+            self.world_scene = self.view.world.clone().map(|path| {
+                let meshes = match crate::gltf_scene::load_file(&path) {
+                    Ok(cpu) => {
+                        let r3d = self.renderer3d.as_ref().unwrap();
+                        cpu.iter()
+                            .map(|m| {
+                                let tex = match &m.texture {
+                                    Some((w, h, px)) => gfx.renderer.create_texture(
+                                        &gfx.device,
+                                        &gfx.queue,
+                                        *w,
+                                        *h,
+                                        px,
+                                    ),
+                                    None => gfx.renderer.white,
+                                };
+                                r3d.upload_mesh(&gfx.device, m, tex)
+                            })
+                            .collect()
+                    }
+                    Err(e) => {
+                        eprintln!("world scene: {e}");
+                        Vec::new()
+                    }
+                };
+                (path, meshes)
+            });
+        }
+        let world_loaded = self
+            .world_scene
+            .as_ref()
+            .is_some_and(|(_, m)| !m.is_empty());
+
         let eye = self.cam3d.pos;
         let white = gfx.renderer.white;
         let circle = gfx.renderer.circle;
@@ -2368,15 +2418,18 @@ impl App {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         let mut quads3: Vec<Quad3> = Vec::new();
-        // A ground plane one eye-height below the camera start, for bearings.
-        quads3.push(Quad3::spanned(
-            [0.0, -1.6, 0.0],
-            [60.0, 0.0, 0.0],
-            [0.0, 0.0, -60.0],
-            [0.0, 0.0, 1.0, 1.0],
-            GROUND_COL,
-            white,
-        ));
+        // Without a world scene, a ground plane one eye-height below the
+        // camera start gives some bearings.
+        if !world_loaded {
+            quads3.push(Quad3::spanned(
+                [0.0, -1.6, 0.0],
+                [60.0, 0.0, 0.0],
+                [0.0, 0.0, -60.0],
+                [0.0, 0.0, 1.0, 1.0],
+                GROUND_COL,
+                white,
+            ));
+        }
         // Connection wires, anchored on the panels' typed ports (source's
         // out-port to target's in-port; centre as the fallback), in the wire
         // kind's colour.
@@ -2549,13 +2602,19 @@ impl App {
 
         // ---- render: a depth pass for the world, then a 2D HUD pass ----
         let vp = self.cam3d.view_proj(fb[0] / fb[1].max(1.0));
-        let renderer3d = self.renderer3d.get_or_insert_with(|| {
-            Renderer3d::new(
-                &gfx.device,
-                gfx.surface_desc.format,
-                gfx.renderer.texture_layout(),
-            )
-        });
+        let world_meshes: &[MeshGpu] = self
+            .world_scene
+            .as_ref()
+            .map(|(_, m)| m.as_slice())
+            .unwrap_or(&[]);
+        let world_draws: Vec<MeshDraw> = (0..world_meshes.len())
+            .map(|i| MeshDraw {
+                mesh: i,
+                model: Renderer3d::ident(),
+                color: [1.0, 1.0, 1.0, 1.0],
+            })
+            .collect();
+        let renderer3d = self.renderer3d.as_mut().unwrap();
         let depth =
             renderer3d.depth_view(&gfx.device, gfx.surface_desc.width, gfx.surface_desc.height);
         let frame = match gfx.surface.get_current_texture() {
@@ -2595,12 +2654,15 @@ impl App {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            renderer3d.draw(
+            renderer3d.draw_world(
                 &gfx.device,
                 &gfx.queue,
                 &mut rpass,
                 &gfx.renderer,
                 vp,
+                WORLD_LIGHT,
+                world_meshes,
+                &world_draws,
                 &quads3,
             );
         }

@@ -10,6 +10,7 @@
 
 mod arrows;
 mod compositor;
+mod gltf_scene;
 mod host_shell;
 mod render2d;
 mod render3d;
