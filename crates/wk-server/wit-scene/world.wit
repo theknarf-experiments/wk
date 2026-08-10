@@ -1,0 +1,37 @@
+package wk:scene;
+
+/// Real 3D objects a plugin owns in wk's world. A node is normally a flat
+/// panel (its wasi:surface composited into the scene); with this interface it
+/// can additionally place entities — actual geometry — around itself. An
+/// entity's transform is relative to the node's pose in the world, so moving
+/// the node carries its objects along.
+interface scene {
+    /// A pointer-ray interaction with an entity: the cursor's (or a VR
+    /// controller's) ray touched it, pressed on it, or released over it.
+    enum ray-event {
+        hover,
+        press,
+        release,
+    }
+
+    /// One 3D object. Geometry is a self-contained binary glTF (GLB) blob,
+    /// given once at construction; the transform can change every frame.
+    resource entity {
+        constructor(glb: list<u8>);
+
+        /// Position relative to the node's pose origin, metres.
+        set-position: func(x: f32, y: f32, z: f32);
+        /// Rotation around the +y axis, radians (applied after the node's yaw).
+        set-rotation-y: func(radians: f32);
+        /// Uniform scale (1.0 = authored size).
+        set-scale: func(s: f32);
+
+        /// Pop the next pointer-ray interaction since the last call, if any.
+        poll-event: func() -> option<ray-event>;
+    }
+}
+
+/// The host side: wk implements (imports) the scene interface for plugins.
+world scene-host {
+    import scene;
+}

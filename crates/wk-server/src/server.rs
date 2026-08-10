@@ -172,6 +172,8 @@ pub struct View {
     /// Free 3D poses (`[x, y, z, yaw]`) for nodes placed off the layout
     /// cylinder in the 3D world.
     pub pos3d: HashMap<NodeId, [f32; 4]>,
+    /// Every live wk:scene entity (plugin-owned 3D objects), across all nodes.
+    pub scene_entities: Vec<crate::scene::SharedEntity>,
     /// The document's 3D world scene as an absolute glTF/GLB path, if set.
     pub world: Option<String>,
     pub file_nodes: HashMap<NodeId, FileMeta>,
@@ -267,6 +269,12 @@ impl View {
             win_pos: keep_map(&self.win_pos, mine),
             win_size: keep_map(&self.win_size, mine),
             pos3d: keep_map(&self.pos3d, mine),
+            scene_entities: self
+                .scene_entities
+                .iter()
+                .filter(|e| mine(&e.lock().unwrap().node_id))
+                .cloned()
+                .collect(),
             world: self.world.clone(),
             file_nodes: keep_map(&self.file_nodes, mine),
             host_ports: keep_map(&self.host_ports, mine),
@@ -2538,6 +2546,7 @@ impl Server {
             win_pos,
             win_size,
             pos3d: self.graph.pos3d.clone(),
+            scene_entities: self.host.scene_entities(),
             world: self.world.as_ref().map(|w| {
                 self.workspace_path
                     .parent()

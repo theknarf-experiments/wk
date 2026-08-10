@@ -20,6 +20,7 @@ pub mod oci;
 pub mod options;
 pub mod plugin;
 pub mod runtime;
+pub mod scene;
 pub mod server;
 pub mod sockets;
 pub mod terminal;

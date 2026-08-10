@@ -142,8 +142,70 @@ pub(super) fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
+/// A translation matrix (column-major).
+pub(super) fn mat_translate(p: [f32; 3]) -> [[f32; 4]; 4] {
+    let mut m = mat_ident();
+    m[3][0] = p[0];
+    m[3][1] = p[1];
+    m[3][2] = p[2];
+    m
+}
+
+/// A rotation around +y (column-major).
+pub(super) fn mat_rot_y(yaw: f32) -> [[f32; 4]; 4] {
+    let (s, c) = yaw.sin_cos();
+    let mut m = mat_ident();
+    m[0][0] = c;
+    m[0][2] = -s;
+    m[2][0] = s;
+    m[2][2] = c;
+    m
+}
+
+/// A uniform scale matrix.
+pub(super) fn mat_scale(k: f32) -> [[f32; 4]; 4] {
+    let mut m = mat_ident();
+    m[0][0] = k;
+    m[1][1] = k;
+    m[2][2] = k;
+    m
+}
+
+pub(super) fn mat_ident() -> [[f32; 4]; 4] {
+    let mut m = [[0.0; 4]; 4];
+    for (i, row) in m.iter_mut().enumerate() {
+        row[i] = 1.0;
+    }
+    m
+}
+
+/// Transform a point by a column-major matrix (w = 1).
+pub(super) fn transform_point3(m: [[f32; 4]; 4], p: [f32; 3]) -> [f32; 3] {
+    [
+        m[0][0] * p[0] + m[1][0] * p[1] + m[2][0] * p[2] + m[3][0],
+        m[0][1] * p[0] + m[1][1] * p[1] + m[2][1] * p[2] + m[3][1],
+        m[0][2] * p[0] + m[1][2] * p[1] + m[2][2] * p[2] + m[3][2],
+    ]
+}
+
+/// The nearest positive hit of a ray with a sphere, if any.
+pub(super) fn ray_sphere(o: [f32; 3], d: [f32; 3], c: [f32; 3], r: f32) -> Option<f32> {
+    let oc = sub3(o, c);
+    let b = 2.0 * dot3(oc, d);
+    let cc = dot3(oc, oc) - r * r;
+    let disc = b * b - 4.0 * cc;
+    if disc < 0.0 {
+        return None;
+    }
+    let s = disc.sqrt();
+    let t1 = (-b - s) / 2.0;
+    let t2 = (-b + s) / 2.0;
+    let t = if t1 > 0.0 { t1 } else { t2 };
+    (t > 0.0).then_some(t)
+}
+
 /// Column-major 4×4 multiply: `a * b`.
-fn mat_mul(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+pub(super) fn mat_mul(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     let mut out = [[0.0f32; 4]; 4];
     for (col, out_col) in out.iter_mut().enumerate() {
         for (row, out_cell) in out_col.iter_mut().enumerate() {
@@ -172,6 +234,28 @@ mod tests {
         // Depth must be inside 0..1 clip space after the perspective divide.
         let z = clip[2] / clip[3];
         assert!((0.0..=1.0).contains(&z), "z={z}");
+    }
+
+    #[test]
+    fn trs_compose_and_ray_sphere_agree() {
+        // T(1,2,3) * RotY(pi/2) * S(2) applied to +x: x-axis rotates to -z,
+        // scaled to length 2, then translated.
+        let m = mat_mul(
+            mat_mul(
+                mat_translate([1.0, 2.0, 3.0]),
+                mat_rot_y(std::f32::consts::FRAC_PI_2),
+            ),
+            mat_scale(2.0),
+        );
+        let p = transform_point3(m, [1.0, 0.0, 0.0]);
+        assert!((p[0] - 1.0).abs() < 1e-4, "{p:?}");
+        assert!((p[1] - 2.0).abs() < 1e-4);
+        assert!((p[2] - 1.0).abs() < 1e-4, "{p:?}");
+        // A ray straight at a unit sphere 5 ahead hits at t=4.
+        let t = ray_sphere([0.0; 3], [0.0, 0.0, -1.0], [0.0, 0.0, -5.0], 1.0).unwrap();
+        assert!((t - 4.0).abs() < 1e-4);
+        // Missing ray misses.
+        assert!(ray_sphere([0.0; 3], [0.0, 1.0, 0.0], [0.0, 0.0, -5.0], 1.0).is_none());
     }
 
     #[test]

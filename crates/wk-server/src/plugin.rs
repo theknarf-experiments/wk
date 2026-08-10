@@ -323,6 +323,8 @@ pub struct HostState {
     pub(crate) capture_seq: u64,
     pub(crate) midi_in: crate::midi::SharedInbox,
     pub(crate) midi_router: crate::midi::Router,
+    /// Where this node's wk:scene entities register (shared, host-global).
+    pub(crate) scene_reg: crate::scene::SceneRegistry,
     pub(crate) options: crate::options::SharedOptions,
     /// This node's network context (smoltcp stack on the fabric) — `Some` only
     /// for nodes that import wasi:sockets. Backs wk's own wasi:sockets impl.
@@ -867,6 +869,8 @@ impl crate::images::BuildRunner for PluginHost {
             capture_seq: 0,
             midi_in: crate::midi::new_inbox(),
             midi_router: self.midi.clone(),
+            // A build step registers no visible entities; a throwaway registry.
+            scene_reg: crate::scene::new_registry(),
             options: crate::options::new_options(Vec::new()),
             net: None,
             random_ctx: wasmtime_wasi::random::WasiRandomCtx::default(),
@@ -913,6 +917,7 @@ pub struct PluginHost {
     engine: Engine,
     gpu: Arc<wgpu_core::global::Global>,
     midi: crate::midi::Router,
+    scene: crate::scene::SceneRegistry,
     hub: Arc<wk_fabric::netstack::NetHub>,
 }
 
@@ -943,8 +948,14 @@ impl PluginHost {
             engine: Engine::new(&config)?,
             gpu: new_gpu_instance(),
             midi: crate::midi::new_router(),
+            scene: crate::scene::new_registry(),
             hub: wk_fabric::netstack::NetHub::new(),
         })
+    }
+
+    /// Every live wk:scene entity, snapshot for the client view.
+    pub fn scene_entities(&self) -> Vec<crate::scene::SharedEntity> {
+        self.scene.lock().unwrap().clone()
     }
 
     /// The shared MIDI router, so the server can wire MIDI connections.
@@ -995,6 +1006,7 @@ impl PluginHost {
         crate::vfs::add_to_linker(&mut linker)?;
         crate::audio::add_to_linker(&mut linker)?;
         crate::midi::add_to_linker(&mut linker)?;
+        crate::scene::add_to_linker(&mut linker)?;
         crate::options::add_to_linker(&mut linker)?;
         crate::tty::add_to_linker(&mut linker)?;
         crate::capture::add_to_linker(&mut linker)?;
@@ -1062,6 +1074,7 @@ impl PluginHost {
             capture_seq: 0,
             midi_in: midi_in.clone(),
             midi_router: midi.clone(),
+            scene_reg: crate::scene::new_registry(),
             options: crate::options::new_options(Vec::new()),
             net: None,
             random_ctx: wasmtime_wasi::random::WasiRandomCtx::default(),
@@ -1325,6 +1338,7 @@ impl PluginHost {
             capture_seq: 0,
             midi_in: node.midi_in.clone(),
             midi_router: self.midi.clone(),
+            scene_reg: self.scene.clone(),
             options: node.options.clone(),
             net,
             random_ctx: wasmtime_wasi::random::WasiRandomCtx::default(),

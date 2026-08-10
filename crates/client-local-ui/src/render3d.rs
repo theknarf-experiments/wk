@@ -478,7 +478,7 @@ impl Renderer3d {
         r2d: &'r Renderer,
         view_proj: [[f32; 4]; 4],
         light: [f32; 4],
-        meshes: &'r [MeshGpu],
+        meshes: &[&'r MeshGpu],
         draws: &[MeshDraw],
         quads: &[Quad3],
     ) {
@@ -501,6 +501,7 @@ impl Renderer3d {
                 let color = meshes
                     .get(d.mesh)
                     .map(|m| {
+                        let m = &**m;
                         [
                             m.color[0] * d.color[0],
                             m.color[1] * d.color[1],
@@ -560,7 +561,7 @@ impl Renderer3d {
             rpass.set_pipeline(&self.mesh_pipeline);
             rpass.set_bind_group(0, &self.mesh_frame_bind_group, &[]);
             for (i, d) in draws.iter().enumerate() {
-                let Some(mesh) = meshes.get(d.mesh) else {
+                let Some(&mesh) = meshes.get(d.mesh) else {
                     continue;
                 };
                 let Some(bg) = r2d.bind_group(mesh.tex) else {

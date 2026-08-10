@@ -26,6 +26,7 @@ use crate::text::Fonts;
 use wk_protocol::{Command, NodeId, NodeKind, NodePatch, Resource, ResourceRef, Wire};
 use wk_server::plugin::{Key, KeyEvent, PointerEvent, ResizeEvent, SharedNode, SharedSurface};
 use wk_server::runtime::ServerHandle;
+use wk_server::scene::RayEvent;
 use wk_server::server::{View, FILE_H, FILE_W, NOTE_H, NOTE_W};
 use wk_server::terminal::CellView;
 
@@ -191,6 +192,14 @@ struct Detached {
     term_input: Vec<u8>,
 }
 
+/// A wk:scene entity's GPU-side cache: its meshes, the textures created for
+/// them (to free on removal), and a local-space bounding sphere for ray tests.
+struct EntityGpu {
+    meshes: Vec<MeshGpu>,
+    owned_tex: Vec<TextureId>,
+    bound: ([f32; 3], f32),
+}
+
 struct App {
     /// This client's connection to the independently-running server: send
     /// [`Command`]s, read [`View`] snapshots.
@@ -234,6 +243,9 @@ struct App {
     /// The document's loaded 3D world scene: (source path, GPU meshes).
     /// `Some` with empty meshes = the load failed (don't retry every frame).
     world_scene: Option<(String, Vec<MeshGpu>)>,
+    /// GPU meshes for wk:scene entities, keyed by entity id (loaded from the
+    /// entity's GLB on first sight; empty = failed, don't retry).
+    entity_meshes: HashMap<u64, EntityGpu>,
     /// A panel move in progress: the node, the grab distance along the cursor
     /// ray (scroll pushes/pulls it), and the world-space offset from the grab
     /// point to the panel centre.
@@ -336,6 +348,7 @@ impl App {
             fonts3d: Fonts::new(FONT3D_PX)?,
             text_cache3d: TextCache::default(),
             world_scene: None,
+            entity_meshes: HashMap::new(),
             drag3d: None,
             wire3d: None,
             look_captured: false,
@@ -1791,6 +1804,9 @@ impl App {
 
         let ids = self.view.node_ids.clone();
         let mut panels: Vec<Panel> = Vec::new();
+        // Each node's world pose (origin + yaw), the parent frame for any
+        // wk:scene entities it owns.
+        let mut poses: HashMap<NodeId, ([f32; 3], f32)> = HashMap::new();
         for id in ids {
             let (Some(&pos), Some(&size)) =
                 (self.view.win_pos.get(&id), self.view.win_size.get(&id))
@@ -1828,6 +1844,7 @@ impl App {
                     [-s, 0.0, c],
                 )
             };
+            poses.insert(id, (center, normal[0].atan2(normal[2])));
             let cw = size[0] / PX_PER_M;
             let max_w = cw * 0.92;
 
@@ -2179,6 +2196,126 @@ impl App {
             }
         }
 
+        // ---- wk:scene entities: plugin-owned 3D objects riding their node ----
+        struct Ent {
+            id: u64,
+            model: [[f32; 4]; 4],
+            /// World-space bounding sphere.
+            center: [f32; 3],
+            radius: f32,
+            shared: wk_server::scene::SharedEntity,
+            node: NodeId,
+        }
+        let scene_entities = self.view.scene_entities.clone();
+        let mut ents: Vec<Ent> = Vec::new();
+        let mut live_ents: HashSet<u64> = HashSet::new();
+        for shared in &scene_entities {
+            let (id, node_id, epos, eyaw, escale, glb) = {
+                let e = shared.lock().unwrap();
+                (e.id, e.node_id, e.pos, e.yaw, e.scale, e.glb.clone())
+            };
+            live_ents.insert(id);
+            // Load the entity's GLB into GPU meshes on first sight.
+            if !self.entity_meshes.contains_key(&id) {
+                let gpu = match crate::gltf_scene::load_bytes(&glb) {
+                    Ok(cpu) => {
+                        let r3d = self.renderer3d.as_ref();
+                        let mut meshes = Vec::new();
+                        let mut owned_tex = Vec::new();
+                        let (mut c, mut n) = ([0.0f64; 3], 0usize);
+                        let mut r2 = 0.0f32;
+                        if let Some(r3d) = r3d {
+                            for m in &cpu {
+                                let tex = match &m.texture {
+                                    Some((w, h, px)) => {
+                                        let t = gfx.renderer.create_texture(
+                                            &gfx.device,
+                                            &gfx.queue,
+                                            *w,
+                                            *h,
+                                            px,
+                                        );
+                                        owned_tex.push(t);
+                                        t
+                                    }
+                                    None => gfx.renderer.white,
+                                };
+                                meshes.push(r3d.upload_mesh(&gfx.device, m, tex));
+                                for p in &m.positions {
+                                    for k in 0..3 {
+                                        c[k] += p[k] as f64;
+                                    }
+                                    n += 1;
+                                }
+                            }
+                        }
+                        let center = if n > 0 {
+                            [
+                                (c[0] / n as f64) as f32,
+                                (c[1] / n as f64) as f32,
+                                (c[2] / n as f64) as f32,
+                            ]
+                        } else {
+                            [0.0; 3]
+                        };
+                        for m in &cpu {
+                            for p in &m.positions {
+                                let v = sub3(*p, center);
+                                r2 = r2.max(dot3(v, v));
+                            }
+                        }
+                        EntityGpu {
+                            meshes,
+                            owned_tex,
+                            bound: (center, r2.sqrt().max(0.05)),
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("scene entity {id}: {e}");
+                        EntityGpu {
+                            meshes: Vec::new(),
+                            owned_tex: Vec::new(),
+                            bound: ([0.0; 3], 0.0),
+                        }
+                    }
+                };
+                self.entity_meshes.insert(id, gpu);
+            }
+            let Some(&(origin, nyaw)) = poses.get(&node_id) else {
+                continue;
+            };
+            let model = mat_mul(
+                mat_mul(mat_translate(origin), mat_rot_y(nyaw)),
+                mat_mul(
+                    mat_mul(mat_translate(epos), mat_rot_y(eyaw)),
+                    mat_scale(escale),
+                ),
+            );
+            let cache = &self.entity_meshes[&id];
+            ents.push(Ent {
+                id,
+                model,
+                center: transform_point3(model, cache.bound.0),
+                radius: cache.bound.1 * escale.max(0.01),
+                shared: shared.clone(),
+                node: node_id,
+            });
+        }
+        // Free GPU meshes for entities that vanished.
+        let stale: Vec<u64> = self
+            .entity_meshes
+            .keys()
+            .copied()
+            .filter(|id| !live_ents.contains(id))
+            .collect();
+        for id in stale {
+            if let Some(gpu) = self.entity_meshes.remove(&id) {
+                for t in gpu.owned_tex {
+                    gfx.renderer.remove_texture(t);
+                }
+            }
+        }
+
         // ---- mouse: palette, wire/move drags, else pointer into surfaces ----
         let (o, d) = self.cam3d.pixel_ray(mp, fb);
         let chord = self.mods.super_key() || self.mods.control_key();
@@ -2223,6 +2360,37 @@ impl App {
                 if let Some(z) = zone {
                     if best.is_none_or(|b| t < b.0) {
                         best = Some((t, i, lu, lv, z));
+                    }
+                }
+            }
+        }
+
+        // Entities claim the cursor when their bounding sphere is the nearest
+        // hit: the guest gets hover/press/release, the panel hit is dropped,
+        // and pressing focuses the owning node.
+        let mut ent_claimed = false;
+        if !self.rmb && !self.palette_open && self.drag3d.is_none() && self.wire3d.is_none() {
+            let mut ent_hit: Option<(f32, usize)> = None;
+            for (i, e) in ents.iter().enumerate() {
+                if let Some(t) = ray_sphere(o, d, e.center, e.radius) {
+                    if t > 0.05 && ent_hit.is_none_or(|b| t < b.0) {
+                        ent_hit = Some((t, i));
+                    }
+                }
+            }
+            if let Some((te, i)) = ent_hit {
+                if best.is_none_or(|b| te < b.0) {
+                    ent_claimed = true;
+                    best = None;
+                    let e = &ents[i];
+                    let mut st = e.shared.lock().unwrap();
+                    st.push_event(RayEvent::Hover);
+                    if down_edge {
+                        st.push_event(RayEvent::Press);
+                        drop(st);
+                        self.kbd_focus = Some(e.node);
+                    } else if up_edge {
+                        st.push_event(RayEvent::Release);
                     }
                 }
             }
@@ -2338,7 +2506,7 @@ impl App {
                         }
                     }
                 }
-            } else if down_edge {
+            } else if down_edge && !ent_claimed {
                 // A click on empty space clears the active node (so Escape can
                 // then exit the 3D view, and a focused vim keeps its Escape).
                 self.kbd_focus = None;
@@ -2607,13 +2775,26 @@ impl App {
             .as_ref()
             .map(|(_, m)| m.as_slice())
             .unwrap_or(&[]);
-        let world_draws: Vec<MeshDraw> = (0..world_meshes.len())
+        let mut all_meshes: Vec<&MeshGpu> = world_meshes.iter().collect();
+        let mut world_draws: Vec<MeshDraw> = (0..world_meshes.len())
             .map(|i| MeshDraw {
                 mesh: i,
                 model: Renderer3d::ident(),
                 color: [1.0, 1.0, 1.0, 1.0],
             })
             .collect();
+        for e in &ents {
+            if let Some(gpu) = self.entity_meshes.get(&e.id) {
+                for m in &gpu.meshes {
+                    all_meshes.push(m);
+                    world_draws.push(MeshDraw {
+                        mesh: all_meshes.len() - 1,
+                        model: e.model,
+                        color: [1.0, 1.0, 1.0, 1.0],
+                    });
+                }
+            }
+        }
         let renderer3d = self.renderer3d.as_mut().unwrap();
         let depth =
             renderer3d.depth_view(&gfx.device, gfx.surface_desc.width, gfx.surface_desc.height);
@@ -2661,7 +2842,7 @@ impl App {
                 &gfx.renderer,
                 vp,
                 WORLD_LIGHT,
-                world_meshes,
+                &all_meshes,
                 &world_draws,
                 &quads3,
             );
