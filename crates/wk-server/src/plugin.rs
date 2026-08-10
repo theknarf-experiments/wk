@@ -994,10 +994,20 @@ impl PluginHost {
             node.running.store(false, Ordering::Relaxed);
             return;
         };
-        if let Err(e) = self.clap.add(node.id, &wasm, node.midi_in.clone()) {
-            eprintln!("wk clap: {e:#}");
-            node.running.store(false, Ordering::Relaxed);
-            node.finished.store(true, Ordering::Relaxed);
+        let sr = self.clap.prepare();
+        let state = self.clap_state(
+            node.id,
+            node.fs.clone(),
+            node.midi_in.clone(),
+            node.options.clone(),
+        );
+        match self.clap_instance(state, &wasm, sr, self.clap.max_frames()) {
+            Ok(inst) => self.clap.add(node.id, inst, node.midi_in.clone()),
+            Err(e) => {
+                eprintln!("wk clap: {e:#}");
+                node.running.store(false, Ordering::Relaxed);
+                node.finished.store(true, Ordering::Relaxed);
+            }
         }
     }
 
@@ -1006,6 +1016,60 @@ impl PluginHost {
         self.clap.remove(node.id);
         node.running.store(false, Ordering::Relaxed);
         node.finished.store(true, Ordering::Relaxed);
+    }
+
+    /// A `HostState` for a CLAP node instance on the main engine.
+    fn clap_state(
+        &self,
+        node_id: NodeId,
+        fs: crate::vfs::SharedFs,
+        midi_in: crate::midi::SharedInbox,
+        options: crate::options::SharedOptions,
+    ) -> HostState {
+        HostState {
+            ctx: WasiCtxBuilder::new()
+                .inherit_stdout()
+                .inherit_stderr()
+                .build(),
+            table: ResourceTable::new(),
+            registry: Arc::new(Mutex::new(Vec::new())),
+            node_id,
+            fs,
+            term_io: crate::terminal::TermIo::new(),
+            capture_src: crate::capture::new_src(),
+            capture_seq: 0,
+            midi_in,
+            midi_router: self.midi.clone(),
+            options,
+            net: None,
+            random_ctx: wasmtime_wasi::random::WasiRandomCtx::default(),
+            http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
+            http_hooks: GatedHttpHooks { stack: None },
+            gpu: Arc::clone(&self.gpu),
+        }
+    }
+
+    /// Instantiate a CLAP component on the main engine as a live node instance.
+    pub fn clap_instance(
+        &self,
+        state: HostState,
+        wasm: &[u8],
+        sr: f64,
+        max_frames: u32,
+    ) -> Result<crate::clap_host::ClapInstance> {
+        let linker = self.build_linker()?;
+        let component = Component::new(&self.engine, wasm)?;
+        crate::clap_host::instantiate(&self.engine, &linker, state, &component, sr, max_frames)
+    }
+
+    /// A bare `HostState` (nil node, fresh fs/inbox/options) for tests.
+    pub fn bare_clap_state(&self) -> HostState {
+        self.clap_state(
+            NodeId::nil(),
+            crate::vfs::new_fs(),
+            crate::midi::new_inbox(),
+            crate::options::new_options(Vec::new()),
+        )
     }
 
     pub fn detach_net(&self, stack: &wk_fabric::netstack::SharedStack) {

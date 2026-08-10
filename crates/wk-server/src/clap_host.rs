@@ -1,20 +1,22 @@
 //! Host runtime for CLAP plugins compiled to `wk:clap` components (see
 //! `plugins/clap`). wk drives such a component the way a CLAP host
 //! drives a native plugin: instantiate → create → init → activate →
-//! start-processing → `process()` per block. This module owns a dedicated,
-//! **synchronous** wasmtime engine (the audio pump calls `process` on a normal
-//! thread, so blocking sync calls are simplest) and provides the `wk:clap`
-//! `host` imports the plugin may call.
+//! start-processing → `process()` per block. CLAP components run on the *main*
+//! plugin engine (one engine for every node); the async calls are `block_on`'d so
+//! the audio pump keeps a plain sync API.
 
-use wasmtime::component::{Component, Linker, ResourceAny, ResourceTable};
+use wasmtime::component::{Component, Linker, ResourceAny};
 use wasmtime::Result;
-use wasmtime::{Config, Engine, Store};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
-use wasmtime_wasi_io::IoView;
+use wasmtime::{Engine, Store};
 
 wasmtime::component::bindgen!({
     path: "wit-clap",
     world: "plugin",
+    // Exports are async: CLAP components run on the main engine, which has
+    // async_support on (so every wasm call must be async). The audio pump
+    // `block_on`s them — `process()` never awaits host I/O, so it completes in
+    // one poll.
+    exports: { default: async },
 });
 
 pub use exports::wk::clap::plugins::ProcessResult;
@@ -26,74 +28,11 @@ pub use wk::clap::types::{
 /// One audio port's samples for a block: channels × frames.
 pub type AudioBuffer = Vec<Vec<f32>>;
 
-/// Store data for a CLAP instance: wasi context + the `host` callbacks the
-/// plugin can invoke.
-pub struct ClapHost {
-    table: ResourceTable,
-    wasi: WasiCtx,
-    /// Log lines the plugin emitted (severity, message), newest last.
-    pub logs: Vec<(LogSeverity, String)>,
-    /// The plugin asked to be reactivated (e.g. latency changed).
-    pub restart_requested: bool,
-    /// The plugin marked its state dirty (should be saved).
-    pub state_dirty: bool,
-}
-
-impl ClapHost {
-    fn new() -> Self {
-        ClapHost {
-            table: ResourceTable::new(),
-            wasi: WasiCtxBuilder::new().build(),
-            logs: Vec::new(),
-            restart_requested: false,
-            state_dirty: false,
-        }
-    }
-}
-
-impl IoView for ClapHost {
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
-    }
-}
-impl WasiView for ClapHost {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView {
-            ctx: &mut self.wasi,
-            table: &mut self.table,
-        }
-    }
-}
-
-impl wk::clap::host::Host for ClapHost {
-    fn log(&mut self, severity: LogSeverity, message: String) {
-        self.logs.push((severity, message));
-    }
-    fn request_restart(&mut self) {
-        self.restart_requested = true;
-    }
-    fn request_process(&mut self) {}
-    fn request_callback(&mut self) {}
-    fn params_rescan(&mut self, _flags: u32) {}
-    fn params_clear(&mut self, _param_id: u32, _flags: u32) {}
-    fn state_mark_dirty(&mut self) {
-        self.state_dirty = true;
-    }
-    fn latency_changed(&mut self) {}
-}
-
-struct HasClapHost;
-impl wasmtime::component::HasData for HasClapHost {
-    type Data<'a> = &'a mut ClapHost;
-}
-
-// ---------------------------------------------------------------------------
-// Engine unification (step 1): let the *main* plugin engine also provide the
-// wk:clap `host` import, so a CLAP component can eventually run on the one
-// engine that already links wasi-gfx / wk:midi / sockets — no separate "CLAP
-// node" runtime. This is purely additive; the separate `ClapEngine` above still
-// drives audio for now and is removed in a later step.
-// ---------------------------------------------------------------------------
+// CLAP components run on the *main* plugin engine — the one that already links
+// wasi-gfx / wk:midi / wk:options / sockets — so a node's capabilities come from
+// the interfaces it imports, with no separate "CLAP node" runtime. The store
+// data is the shared `HostState`; the wk:clap `host` import is implemented on it
+// below and added to the main linker.
 struct HasClapHostMain;
 impl wasmtime::component::HasData for HasClapHostMain {
     type Data<'a> = &'a mut crate::plugin::HostState;
@@ -118,87 +57,79 @@ impl wk::clap::host::Host for crate::plugin::HostState {
     fn latency_changed(&mut self) {}
 }
 
-/// A compiled-and-linked CLAP engine, reused across instances.
-pub struct ClapEngine {
-    engine: Engine,
-    linker: Linker<ClapHost>,
-}
+use crate::plugin::HostState;
 
-impl ClapEngine {
-    pub fn new() -> Result<Self> {
-        let mut config = Config::new();
-        config.wasm_component_model(true);
-        let engine = Engine::new(&config)?;
-        let mut linker = Linker::<ClapHost>::new(&engine);
-        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
-        wk::clap::host::add_to_linker::<_, HasClapHost>(&mut linker, |s| s)?;
-        Ok(ClapEngine { engine, linker })
-    }
-
-    pub fn compile(&self, bytes: &[u8]) -> Result<Component> {
-        Component::new(&self.engine, bytes)
-    }
-
-    /// Instantiate a component, create its first plugin, and bring it up to the
-    /// point of processing (`init` → `activate` → `start-processing`).
-    pub fn instantiate(
-        &self,
-        component: &Component,
-        sample_rate: f64,
-        max_frames: u32,
-    ) -> Result<ClapInstance> {
-        let mut store = Store::new(&self.engine, ClapHost::new());
-        let world = Plugin::instantiate(&mut store, component, &self.linker)?;
+/// Instantiate a CLAP component on the main engine, create its first plugin, and
+/// bring it up to the point of processing (create → init → activate → start).
+/// The main engine is async, so this drives the lifecycle with `block_on`; the
+/// resulting `ClapInstance` exposes a plain sync API.
+pub fn instantiate(
+    engine: &Engine,
+    linker: &Linker<HostState>,
+    state: HostState,
+    component: &Component,
+    sample_rate: f64,
+    max_frames: u32,
+) -> Result<ClapInstance> {
+    let mut store = Store::new(engine, state);
+    // A CLAP node is stopped by removing it from the mix, not by the frame-kill
+    // epoch — so its calls just keep going when the epoch ticks (and this avoids
+    // the deadline overflow a huge fixed deadline would hit on a live server).
+    store.set_epoch_deadline(1);
+    store.epoch_deadline_callback(|_| Ok(wasmtime::UpdateDeadline::Continue(1)));
+    let (world, handle, descriptor, out_channels) = pollster::block_on(async {
+        let world = Plugin::instantiate_async(&mut store, component, linker).await?;
         let plugins = world.wk_clap_plugins();
-
-        let count = plugins.call_count(&mut store)?;
-        if count == 0 {
+        if plugins.call_count(&mut store).await? == 0 {
             return Err(wasmtime::Error::msg("component exposes no CLAP plugins"));
         }
         let desc = plugins
-            .call_get(&mut store, 0)?
+            .call_get(&mut store, 0)
+            .await?
             .ok_or_else(|| wasmtime::Error::msg("plugin 0 has no descriptor"))?;
         let handle = plugins
-            .call_create(&mut store, &desc.id)?
+            .call_create(&mut store, &desc.id)
+            .await?
             .ok_or_else(|| wasmtime::Error::msg(format!("create returned none for {}", desc.id)))?;
-
         let p = plugins.plugin();
-        if !p.call_init(&mut store, handle)? {
+        if !p.call_init(&mut store, handle).await? {
             return Err(wasmtime::Error::msg("plugin init failed"));
         }
-        if !p.call_activate(&mut store, handle, sample_rate, 1, max_frames)? {
+        if !p
+            .call_activate(&mut store, handle, sample_rate, 1, max_frames)
+            .await?
+        {
             return Err(wasmtime::Error::msg("plugin activate failed"));
         }
-        if !p.call_start_processing(&mut store, handle)? {
+        if !p.call_start_processing(&mut store, handle).await? {
             return Err(wasmtime::Error::msg("plugin start_processing failed"));
         }
-
-        // Cache output-port channel counts (needed to size the audio the pump
-        // routes on).
-        let n_out = p.call_audio_port_count(&mut store, handle, false)?;
+        let n_out = p.call_audio_port_count(&mut store, handle, false).await?;
         let mut out_channels = Vec::new();
         for i in 0..n_out {
             let ch = p
-                .call_audio_port_info_at(&mut store, handle, i, false)?
+                .call_audio_port_info_at(&mut store, handle, i, false)
+                .await?
                 .map(|info| info.channel_count)
                 .unwrap_or(0);
             out_channels.push(ch);
         }
+        Ok::<_, wasmtime::Error>((world, handle, desc, out_channels))
+    })?;
 
-        Ok(ClapInstance {
-            store,
-            world,
-            handle,
-            descriptor: desc,
-            out_channels,
-            steady: 0,
-        })
-    }
+    Ok(ClapInstance {
+        store,
+        world,
+        handle,
+        descriptor,
+        out_channels,
+        steady: 0,
+    })
 }
 
-/// A live CLAP plugin instance driven by the host.
+/// A live CLAP plugin instance driven by the host, on the main engine.
 pub struct ClapInstance {
-    store: Store<ClapHost>,
+    store: Store<HostState>,
     world: Plugin,
     handle: ResourceAny,
     pub descriptor: Descriptor,
@@ -210,30 +141,38 @@ pub struct ClapInstance {
 impl ClapInstance {
     pub fn features(&mut self) -> Result<Supported> {
         let p = self.world.wk_clap_plugins();
-        p.plugin().call_features(&mut self.store, self.handle)
+        pollster::block_on(p.plugin().call_features(&mut self.store, self.handle))
     }
 
     pub fn note_input_count(&mut self) -> Result<u32> {
         let p = self.world.wk_clap_plugins();
-        p.plugin()
-            .call_note_port_count(&mut self.store, self.handle, true)
+        pollster::block_on(
+            p.plugin()
+                .call_note_port_count(&mut self.store, self.handle, true),
+        )
     }
 
     pub fn param_count(&mut self) -> Result<u32> {
         let p = self.world.wk_clap_plugins();
-        p.plugin().call_param_count(&mut self.store, self.handle)
+        pollster::block_on(p.plugin().call_param_count(&mut self.store, self.handle))
     }
 
     pub fn param_info(&mut self, index: u32) -> Result<Option<ParamInfo>> {
         let p = self.world.wk_clap_plugins();
-        p.plugin()
-            .call_param_info_at(&mut self.store, self.handle, index)
+        pollster::block_on(
+            p.plugin()
+                .call_param_info_at(&mut self.store, self.handle, index),
+        )
     }
 
     pub fn audio_output_info(&mut self, index: u32) -> Result<Option<AudioPortInfo>> {
         let p = self.world.wk_clap_plugins();
-        p.plugin()
-            .call_audio_port_info_at(&mut self.store, self.handle, index, false)
+        pollster::block_on(p.plugin().call_audio_port_info_at(
+            &mut self.store,
+            self.handle,
+            index,
+            false,
+        ))
     }
 
     /// Run one process block. Returns the plugin's status, output audio (one
@@ -248,7 +187,7 @@ impl ClapInstance {
         let steady = self.steady;
         self.steady += frames as i64;
         let p = self.world.wk_clap_plugins();
-        p.plugin().call_process(
+        pollster::block_on(p.plugin().call_process(
             &mut self.store,
             self.handle,
             steady,
@@ -256,12 +195,7 @@ impl ClapInstance {
             transport,
             events,
             audio_in,
-        )
-    }
-
-    /// Drain and return the log lines the plugin emitted so far.
-    pub fn take_logs(&mut self) -> Vec<(LogSeverity, String)> {
-        std::mem::take(&mut self.store.data_mut().logs)
+        ))
     }
 }
 
@@ -324,7 +258,6 @@ pub struct ClapAudio {
 }
 
 struct Mixer {
-    clap: ClapEngine,
     router: crate::midi::Router,
     sample_rate: f64,
     channels: usize,
@@ -345,7 +278,6 @@ struct EngineNode {
 impl ClapAudio {
     pub fn new(router: crate::midi::Router) -> Result<Self> {
         let mixer = Mixer {
-            clap: ClapEngine::new()?,
             router,
             sample_rate: 48_000.0,
             channels: 2,
@@ -358,23 +290,30 @@ impl ClapAudio {
         })
     }
 
-    /// Add (or replace) a live CLAP node: compile + instantiate its component and
-    /// insert it into the mix. Opens the output stream on the first node.
-    pub fn add(&self, id: NodeId, wasm: &[u8], inbox: crate::midi::SharedInbox) -> Result<()> {
+    /// Open the output stream if needed and report the device sample rate, so the
+    /// caller can instantiate a node's plugin at the right rate before `add`.
+    pub fn prepare(&self) -> f64 {
         self.ensure_stream();
-        let mut e = self.inner.lock().unwrap();
-        let sr = e.sample_rate;
-        let component = e.clap.compile(wasm)?;
-        let inst = e.clap.instantiate(&component, sr, MAX_FRAMES)?;
-        e.nodes.insert(
-            id,
-            EngineNode {
-                inst,
-                inbox,
-                last: Vec::new(),
-            },
-        );
-        Ok(())
+        self.inner.lock().unwrap().sample_rate
+    }
+
+    /// The block size a node should be activated for.
+    pub fn max_frames(&self) -> u32 {
+        MAX_FRAMES
+    }
+
+    /// Insert a live, already-instantiated CLAP node into the mix.
+    pub fn add(&self, id: NodeId, inst: ClapInstance, inbox: crate::midi::SharedInbox) {
+        if let Ok(mut e) = self.inner.lock() {
+            e.nodes.insert(
+                id,
+                EngineNode {
+                    inst,
+                    inbox,
+                    last: Vec::new(),
+                },
+            );
+        }
     }
 
     pub fn remove(&self, id: NodeId) {
@@ -587,6 +526,13 @@ impl Mixer {
 mod tests {
     use super::*;
 
+    /// Build a live CLAP instance on the main engine (as the host does).
+    fn instance(bytes: &[u8], sr: f64, max: u32) -> ClapInstance {
+        let host = crate::plugin::PluginHost::new().unwrap();
+        host.clap_instance(host.bare_clap_state(), bytes, sr, max)
+            .unwrap()
+    }
+
     fn note_on(key: i16, time: u32) -> Event {
         Event::NoteOn(Note {
             time,
@@ -636,9 +582,7 @@ mod tests {
     #[test]
     fn octaver_doubles_notes_an_octave_up() {
         let bytes = include_bytes!("../testdata/octaver.wasm");
-        let engine = ClapEngine::new().unwrap();
-        let component = engine.compile(bytes).unwrap();
-        let mut inst = engine.instantiate(&component, 48_000.0, 128).unwrap();
+        let mut inst = instance(bytes, 48_000.0, 128);
 
         let ev = midi_to_event(&[0x90, 60, 100]).unwrap();
         let res = inst.process(16, &[ev], None, &[]).unwrap();
@@ -664,10 +608,16 @@ mod tests {
             inbox.lock().unwrap().push(vec![0x90, 69, 100]);
         };
 
+        let host = crate::plugin::PluginHost::new().unwrap();
+        let mk = || {
+            host.clap_instance(host.bare_clap_state(), synth, 48_000.0, 512)
+                .unwrap()
+        };
+
         // A alone: the note reaches the speakers.
         let solo = ClapAudio::new_headless(crate::midi::new_router()).unwrap();
         let a = crate::midi::new_inbox();
-        solo.add(NodeId::new(), synth, a.clone()).unwrap();
+        solo.add(NodeId::new(), mk(), a.clone());
         note(&a);
         assert!(peak(&solo.render_block(256, 2)) > 0.0);
 
@@ -675,8 +625,8 @@ mod tests {
         let chain = ClapAudio::new_headless(crate::midi::new_router()).unwrap();
         let (ia, ib) = (crate::midi::new_inbox(), crate::midi::new_inbox());
         let (a_id, b_id) = (NodeId::new(), NodeId::new());
-        chain.add(a_id, synth, ia.clone()).unwrap();
-        chain.add(b_id, synth, ib.clone()).unwrap();
+        chain.add(a_id, mk(), ia.clone());
+        chain.add(b_id, mk(), ib.clone());
         chain.set_edges(vec![(a_id, b_id)]);
         note(&ia);
         assert_eq!(peak(&chain.render_block(256, 2)), 0.0);
@@ -703,9 +653,7 @@ mod tests {
     #[test]
     fn delay_produces_a_time_shifted_tap() {
         let bytes = include_bytes!("../testdata/delay.wasm");
-        let engine = ClapEngine::new().unwrap();
-        let component = engine.compile(bytes).unwrap();
-        let mut inst = engine.instantiate(&component, 48_000.0, 512).unwrap();
+        let mut inst = instance(bytes, 48_000.0, 512);
         assert_eq!(inst.param_count().unwrap(), 3);
         assert_eq!(inst.param_info(0).unwrap().unwrap().name, "Time");
 
@@ -727,9 +675,7 @@ mod tests {
     #[test]
     fn subsynth_sounds_and_stays_finite() {
         let bytes = include_bytes!("../testdata/subsynth.wasm");
-        let engine = ClapEngine::new().unwrap();
-        let component = engine.compile(bytes).unwrap();
-        let mut inst = engine.instantiate(&component, 48_000.0, 512).unwrap();
+        let mut inst = instance(bytes, 48_000.0, 512);
         assert_eq!(inst.param_count().unwrap(), 5);
         assert_eq!(inst.param_info(0).unwrap().unwrap().name, "Cutoff");
 
@@ -744,9 +690,7 @@ mod tests {
     #[test]
     fn polysynth_sounds_from_raw_midi() {
         let bytes = include_bytes!("../testdata/polysynth.wasm");
-        let engine = ClapEngine::new().unwrap();
-        let component = engine.compile(bytes).unwrap();
-        let mut inst = engine.instantiate(&component, 48_000.0, 512).unwrap();
+        let mut inst = instance(bytes, 48_000.0, 512);
         let ev = midi_to_event(&[0x90, 69, 100]).unwrap();
         let out = inst.process(512, &[ev], None, &[]).unwrap();
         assert!(peak(&out.audio_out[0][0]) > 0.05);
@@ -759,9 +703,7 @@ mod tests {
     #[test]
     fn clap_template_swaps_channels_and_reports_ports() {
         let bytes = include_bytes!("../testdata/clap-template.wasm");
-        let engine = ClapEngine::new().unwrap();
-        let component = engine.compile(bytes).unwrap();
-        let mut inst = engine.instantiate(&component, 48_000.0, 128).unwrap();
+        let mut inst = instance(bytes, 48_000.0, 128);
 
         // Extensions the plugin implements.
         let feats = inst.features().unwrap();
@@ -785,9 +727,7 @@ mod tests {
     #[test]
     fn gain_applies_its_parameter() {
         let bytes = include_bytes!("../testdata/gain.wasm");
-        let engine = ClapEngine::new().unwrap();
-        let component = engine.compile(bytes).unwrap();
-        let mut inst = engine.instantiate(&component, 48_000.0, 128).unwrap();
+        let mut inst = instance(bytes, 48_000.0, 128);
 
         assert!(inst.features().unwrap().contains(Supported::PARAMS));
         assert_eq!(inst.param_count().unwrap(), 1);
@@ -807,9 +747,7 @@ mod tests {
     #[test]
     fn polysynth_sounds_on_note_on() {
         let bytes = include_bytes!("../testdata/polysynth.wasm");
-        let engine = ClapEngine::new().unwrap();
-        let component = engine.compile(bytes).unwrap();
-        let mut inst = engine.instantiate(&component, 48_000.0, 512).unwrap();
+        let mut inst = instance(bytes, 48_000.0, 512);
 
         let feats = inst.features().unwrap();
         assert!(feats.contains(Supported::NOTE_PORTS));
