@@ -1052,6 +1052,10 @@ impl PluginHost {
         crate::audio::add_to_linker(&mut linker)?;
         crate::midi::add_to_linker(&mut linker)?;
         crate::options::add_to_linker(&mut linker)?;
+        // The wk:clap `host` import, so a CLAP component can run on the main
+        // engine (engine-unification step 1; the node's process()/gui hooks are
+        // driven by the host in later steps).
+        crate::clap_host::add_host_to_linker(&mut linker)?;
         crate::tty::add_to_linker(&mut linker)?;
         crate::capture::add_to_linker(&mut linker)?;
         wasi::surface::surface::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;

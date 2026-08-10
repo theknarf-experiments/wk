@@ -87,6 +87,37 @@ impl wasmtime::component::HasData for HasClapHost {
     type Data<'a> = &'a mut ClapHost;
 }
 
+// ---------------------------------------------------------------------------
+// Engine unification (step 1): let the *main* plugin engine also provide the
+// wk:clap `host` import, so a CLAP component can eventually run on the one
+// engine that already links wasi-gfx / wk:midi / sockets — no separate "CLAP
+// node" runtime. This is purely additive; the separate `ClapEngine` above still
+// drives audio for now and is removed in a later step.
+// ---------------------------------------------------------------------------
+struct HasClapHostMain;
+impl wasmtime::component::HasData for HasClapHostMain {
+    type Data<'a> = &'a mut crate::plugin::HostState;
+}
+
+/// Add the wk:clap `host` import to the main plugin linker.
+pub fn add_host_to_linker(linker: &mut Linker<crate::plugin::HostState>) -> Result<()> {
+    wk::clap::host::add_to_linker::<_, HasClapHostMain>(linker, |s| s)
+}
+
+impl wk::clap::host::Host for crate::plugin::HostState {
+    fn log(&mut self, severity: LogSeverity, message: String) {
+        let _ = severity;
+        eprintln!("[clap] {message}");
+    }
+    fn request_restart(&mut self) {}
+    fn request_process(&mut self) {}
+    fn request_callback(&mut self) {}
+    fn params_rescan(&mut self, _flags: u32) {}
+    fn params_clear(&mut self, _param_id: u32, _flags: u32) {}
+    fn state_mark_dirty(&mut self) {}
+    fn latency_changed(&mut self) {}
+}
+
 /// A compiled-and-linked CLAP engine, reused across instances.
 pub struct ClapEngine {
     engine: Engine,
