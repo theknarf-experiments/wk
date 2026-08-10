@@ -251,6 +251,25 @@ mod tests {
     }
 
     #[test]
+    fn walk_mode_stays_grounded_fly_mode_climbs() {
+        use std::collections::HashSet;
+        let mut keys = HashSet::new();
+        keys.insert(KeyCode::KeyW);
+        // Looking sharply down, walking must still move forward on the plane
+        // and stay at eye height.
+        let mut cam = Camera3d::new();
+        cam.pitch = -1.2;
+        cam.advance(&keys, false, 0.0, true, 1.0);
+        assert_eq!(cam.pos[1], 0.0);
+        assert!(cam.pos[2] < -1.0, "moved ahead: {:?}", cam.pos);
+        // The same input flying descends along the gaze.
+        let mut cam = Camera3d::new();
+        cam.pitch = -1.2;
+        cam.advance(&keys, false, 0.0, false, 1.0);
+        assert!(cam.pos[1] < -0.5, "flew down: {:?}", cam.pos);
+    }
+
+    #[test]
     fn trs_compose_and_ray_sphere_agree() {
         // T(1,2,3) * RotY(pi/2) * S(2) applied to +x: x-axis rotates to -z,
         // scaled to length 2, then translated.
