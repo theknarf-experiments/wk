@@ -700,6 +700,27 @@ mod tests {
         assert!(!synth.has_gui(), "a headless plugin has no GUI");
     }
 
+    /// The piano is a Rust wk:clap plugin with no `run` loop: a GUI node (it
+    /// paints a surface) *and* a note effect (note in + out). It renders on the
+    /// main engine and passes MIDI arriving on its input straight through to its
+    /// output — proving a hand-written Rust plugin drives both host hooks.
+    #[test]
+    fn piano_is_a_gui_note_effect() {
+        let mut piano = instance(include_bytes!("../testdata/piano.wasm"), 48_000.0, 512);
+        assert!(piano.has_gui(), "the piano draws a keyboard");
+        piano.gui_render(); // create the surface + paint a frame
+        piano.gui_render();
+
+        // MIDI thru: a note fed to its input is echoed on its output.
+        let ev = midi_to_event(&[0x90, 60, 100]).unwrap();
+        let res = piano.process(0, &[ev], None, &[]).unwrap();
+        let notes: Vec<Vec<u8>> = res.out_events.iter().filter_map(event_to_midi).collect();
+        assert!(
+            notes.contains(&vec![0x90, 60, 100]),
+            "passes the incoming note through, got {notes:?}"
+        );
+    }
+
     #[test]
     fn midi_passthrough_becomes_a_clap_midi_event() {
         match midi_to_event(&[0x90, 60, 100]) {

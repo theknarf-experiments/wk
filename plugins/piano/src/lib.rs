@@ -1,11 +1,22 @@
+// A two-octave MIDI keyboard, as a wk:clap plugin. It has no `run` loop: the wk
+// host drives it by calling `gui-render` per frame (it paints its surface and
+// polls pointer/key input there) and `process` from the audio path (it emits the
+// notes queued by the UI, and lights up / passes through MIDI arriving on its
+// input port). Combines wasi-gfx (graphics) with wk:clap note ports — the same
+// unified engine every other node runs on.
 #[allow(warnings)]
 mod bindings;
 
+use std::cell::RefCell;
+
+use bindings::exports::wk::clap::plugins::{
+    AudioBuffer, AudioPortInfo, Descriptor, Event, Guest, GuestPlugin, NotePortInfo, ParamInfo,
+    Plugin, ProcessResult, ProcessStatus, Supported, Transport,
+};
 use bindings::wasi::frame_buffer::frame_buffer::{Buffer, Device};
 use bindings::wasi::graphics_context::graphics_context::Context as GfxContext;
 use bindings::wasi::surface::surface::{CreateDesc, Key, Surface};
-use bindings::wk::midi::midi::{Input, Output};
-use bindings::Guest;
+use bindings::wk::clap::types::{Midi, NoteDialects};
 
 /// Two octaves of keys. White-key semitone offsets (C D E F G A B, twice, plus
 /// the closing C); the black keys sit on the white-key boundaries.
@@ -38,6 +49,15 @@ fn midi_note(base: i32, i: usize) -> u8 {
     (base + i as i32).clamp(0, 127) as u8
 }
 
+/// A raw 3-byte MIDI message as a wk:clap event (port 0, no sample offset).
+fn midi_ev(status: u8, note: u8, vel: u8) -> Event {
+    Event::Midi(Midi {
+        time: 0,
+        port_index: 0,
+        data: (status, note, vel),
+    })
+}
+
 /// Computer-keyboard piano mapping (FL-Studio style): the home row plays the
 /// lower displayed octave's white keys, the row above its black keys. The
 /// on-screen buttons shift which octaves the whole keyboard covers.
@@ -60,92 +80,6 @@ fn key_to_note(k: Key) -> Option<usize> {
     })
 }
 
-/// A two-octave MIDI keyboard, shiftable by the octave buttons. Ref-counts local
-/// presses (mouse + keyboard) so overlapping presses don't send a spurious
-/// note-off, emits note-on/off relative to a base MIDI note, and receives MIDI on
-/// its input port — lighting up incoming notes and passing them through.
-struct Keyboard {
-    out: Output,
-    input: Input,
-    held: [u32; NKEYS],
-    ext: [bool; NKEYS],
-    /// MIDI note of key 0 (C of the lower displayed octave). Default C4 = 60.
-    base: i32,
-}
-
-impl Keyboard {
-    fn new() -> Self {
-        Keyboard {
-            out: Output::new(),
-            input: Input::new(),
-            held: [0; NKEYS],
-            ext: [false; NKEYS],
-            base: 60,
-        }
-    }
-
-    fn press(&mut self, note: usize) {
-        self.held[note] += 1;
-        if self.held[note] == 1 {
-            self.out.send(&[0x90, midi_note(self.base, note), 100]);
-        }
-    }
-
-    fn release(&mut self, note: usize) {
-        if self.held[note] == 0 {
-            return;
-        }
-        self.held[note] -= 1;
-        if self.held[note] == 0 {
-            self.out.send(&[0x80, midi_note(self.base, note), 0]);
-        }
-    }
-
-    fn active(&self, note: usize) -> bool {
-        self.held[note] > 0
-    }
-
-    /// Release every held key at the current pitch (so nothing sticks across an
-    /// octave shift).
-    fn all_off(&mut self) {
-        for note in 0..NKEYS {
-            if self.held[note] > 0 {
-                self.out.send(&[0x80, midi_note(self.base, note), 0]);
-                self.held[note] = 0;
-            }
-        }
-    }
-
-    /// Shift the whole keyboard by `delta` octaves, clamped so MIDI stays valid.
-    fn shift_octave(&mut self, delta: i32) {
-        let new_base = (self.base + delta * 12).clamp(24, 96);
-        if new_base != self.base {
-            self.all_off();
-            self.base = new_base;
-        }
-    }
-
-    /// Drain MIDI arriving on the input port: light up note-ons within the
-    /// displayed range, and pass every message through to the output (MIDI thru).
-    fn pump_input(&mut self) {
-        while let Some(msg) = self.input.receive() {
-            if msg.len() >= 3 {
-                let status = msg[0] & 0xF0;
-                let note = msg[1] as i32 - self.base;
-                if (0..NKEYS as i32).contains(&note) {
-                    let n = note as usize;
-                    if status == 0x90 && msg[2] > 0 {
-                        self.ext[n] = true;
-                    } else if status == 0x80 || (status == 0x90 && msg[2] == 0) {
-                        self.ext[n] = false;
-                    }
-                }
-            }
-            self.out.send(&msg);
-        }
-    }
-}
-
 /// Which note is under the cursor in the keyboard area (`y` measured from the
 /// top of the keys, i.e. below the control strip).
 fn hit_test(x: f32, y: f32, w: f32, kb_h: f32) -> usize {
@@ -164,171 +98,400 @@ fn hit_test(x: f32, y: f32, w: f32, kb_h: f32) -> usize {
     WHITE[wi]
 }
 
+/// All the keyboard's mutable state, behind the resource's single `RefCell`.
+/// `gui-render` and `process` never run concurrently (the host serializes a
+/// node's calls), so a `RefCell` is enough.
+struct State {
+    // Lazily created on the first `gui-render` (the host composites the surface).
+    surface: Option<Surface>,
+    ctx: Option<GfxContext>,
+    device: Option<Device>,
+    px: Vec<u8>,
+
+    /// Ref-count of local presses per key (mouse + computer keyboard) so
+    /// overlapping presses don't send a spurious note-off.
+    held: [u32; NKEYS],
+    /// Key lit by an upstream (e.g. hardware) note arriving on the input port.
+    ext: [bool; NKEYS],
+    /// MIDI note of key 0 (C of the lower displayed octave). Default C4 = 60.
+    base: i32,
+    /// Computer-keyboard de-bounce (the host re-sends key-down while held).
+    key_held: [bool; NKEYS],
+    mouse_note: Option<usize>,
+    /// Notes generated by the UI this frame, drained into `process`'s output.
+    pending: Vec<Event>,
+}
+
+impl State {
+    fn new() -> Self {
+        State {
+            surface: None,
+            ctx: None,
+            device: None,
+            px: Vec::new(),
+            held: [0; NKEYS],
+            ext: [false; NKEYS],
+            base: 60,
+            key_held: [false; NKEYS],
+            mouse_note: None,
+            pending: Vec::new(),
+        }
+    }
+
+    fn press(&mut self, note: usize) {
+        self.held[note] += 1;
+        if self.held[note] == 1 {
+            self.pending
+                .push(midi_ev(0x90, midi_note(self.base, note), 100));
+        }
+    }
+
+    fn release(&mut self, note: usize) {
+        if self.held[note] == 0 {
+            return;
+        }
+        self.held[note] -= 1;
+        if self.held[note] == 0 {
+            self.pending
+                .push(midi_ev(0x80, midi_note(self.base, note), 0));
+        }
+    }
+
+    /// Release every held key at the current pitch (so nothing sticks across an
+    /// octave shift).
+    fn all_off(&mut self) {
+        for note in 0..NKEYS {
+            if self.held[note] > 0 {
+                self.pending
+                    .push(midi_ev(0x80, midi_note(self.base, note), 0));
+                self.held[note] = 0;
+            }
+        }
+    }
+
+    /// Shift the whole keyboard by `delta` octaves, clamped so MIDI stays valid.
+    fn shift_octave(&mut self, delta: i32) {
+        let new_base = (self.base + delta * 12).clamp(24, 96);
+        if new_base != self.base {
+            self.all_off();
+            self.base = new_base;
+        }
+    }
+}
+
+/// A wk:clap plugin instance.
+struct Keyboard {
+    st: RefCell<State>,
+}
+
+impl Keyboard {
+    fn new() -> Self {
+        Keyboard {
+            st: RefCell::new(State::new()),
+        }
+    }
+}
+
+impl GuestPlugin for Keyboard {
+    fn init(&self) -> bool {
+        true
+    }
+    fn activate(&self, _sample_rate: f64, _min_frames: u32, _max_frames: u32) -> bool {
+        true
+    }
+    fn deactivate(&self) {}
+    fn start_processing(&self) -> bool {
+        true
+    }
+    fn stop_processing(&self) {}
+    fn reset(&self) {}
+    fn on_main_thread(&self) {}
+
+    /// Emit the notes the UI queued, and light up / pass through incoming MIDI.
+    fn process(
+        &self,
+        _steady_time: i64,
+        _frames: u32,
+        _transport: Option<Transport>,
+        in_events: Vec<Event>,
+        _audio_in: Vec<AudioBuffer>,
+    ) -> ProcessResult {
+        let mut st = self.st.borrow_mut();
+        let mut out = Vec::new();
+        // MIDI in from a wired source (e.g. a hardware keyboard): highlight notes
+        // within the displayed range, and pass every message through (MIDI thru).
+        for ev in in_events {
+            if let Event::Midi(m) = &ev {
+                let (status, d1, d2) = m.data;
+                let note = d1 as i32 - st.base;
+                if (0..NKEYS as i32).contains(&note) {
+                    let n = note as usize;
+                    match status & 0xF0 {
+                        0x90 if d2 > 0 => st.ext[n] = true,
+                        0x80 | 0x90 => st.ext[n] = false,
+                        _ => {}
+                    }
+                }
+            }
+            out.push(ev);
+        }
+        // Notes the UI generated since the last block.
+        out.append(&mut st.pending);
+        ProcessResult {
+            status: ProcessStatus::Continue,
+            audio_out: Vec::new(),
+            out_events: out,
+        }
+    }
+
+    fn features(&self) -> Supported {
+        Supported::NOTE_PORTS
+    }
+
+    // ---- params (none) ----
+    fn param_count(&self) -> u32 {
+        0
+    }
+    fn param_info_at(&self, _index: u32) -> Option<ParamInfo> {
+        None
+    }
+    fn param_get(&self, _id: u32) -> Option<f64> {
+        None
+    }
+    fn param_value_to_text(&self, _id: u32, _value: f64) -> Option<String> {
+        None
+    }
+    fn param_text_to_value(&self, _id: u32, _text: String) -> Option<f64> {
+        None
+    }
+    fn params_flush(&self, _in_events: Vec<Event>) -> Vec<Event> {
+        Vec::new()
+    }
+
+    // ---- audio ports (none) ----
+    fn audio_port_count(&self, _is_input: bool) -> u32 {
+        0
+    }
+    fn audio_port_info_at(&self, _index: u32, _is_input: bool) -> Option<AudioPortInfo> {
+        None
+    }
+
+    // ---- note ports (in + out) ----
+    fn note_port_count(&self, _is_input: bool) -> u32 {
+        1
+    }
+    fn note_port_info_at(&self, index: u32, is_input: bool) -> Option<NotePortInfo> {
+        if index != 0 {
+            return None;
+        }
+        Some(NotePortInfo {
+            id: 0,
+            name: if is_input { "In".into() } else { "Out".into() },
+            supported_dialects: NoteDialects::MIDI,
+            preferred_dialect: NoteDialects::MIDI,
+        })
+    }
+
+    // ---- state (nothing to persist) ----
+    fn state_save(&self) -> Option<Vec<u8>> {
+        Some(Vec::new())
+    }
+    fn state_load(&self, _data: Vec<u8>) -> bool {
+        true
+    }
+
+    // ---- wk GUI ----
+    fn has_gui(&self) -> bool {
+        true
+    }
+
+    /// Paint one frame and poll the surface's pointer/key input.
+    fn gui_render(&self) {
+        let mut st = self.st.borrow_mut();
+        // Create the surface on first render; the host composites it thereafter.
+        if st.surface.is_none() {
+            let surface = Surface::new(CreateDesc {
+                width: Some(660),
+                height: Some(220),
+            });
+            let ctx = GfxContext::new();
+            surface.connect_graphics_context(&ctx);
+            let device = Device::new();
+            device.connect_graphics_context(&ctx);
+            st.surface = Some(surface);
+            st.ctx = Some(ctx);
+            st.device = Some(device);
+        }
+        // Consume the frame event once (never in a loop — it always yields one).
+        let (w, h) = {
+            let surface = st.surface.as_ref().unwrap();
+            let _ = surface.get_frame();
+            (surface.width().max(1), surface.height().max(1))
+        };
+        let wf = w as f32;
+        let hf = h as f32;
+        let kb_h = (hf - CTRL_H).max(1.0);
+
+        // Mouse: the top strip holds the octave buttons; below it, the keys.
+        while let Some(ev) = st.surface.as_ref().unwrap().get_pointer_down() {
+            let (px, py) = (ev.x as f32, ev.y as f32);
+            if py < CTRL_H {
+                if px < BTN_W {
+                    st.shift_octave(-1);
+                } else if px >= wf - BTN_W {
+                    st.shift_octave(1);
+                }
+                // A click on the strip shouldn't leave a key mouse-held.
+                if let Some(prev) = st.mouse_note.take() {
+                    st.release(prev);
+                }
+                continue;
+            }
+            let note = hit_test(px, py - CTRL_H, wf, kb_h);
+            if st.mouse_note != Some(note) {
+                if let Some(prev) = st.mouse_note.take() {
+                    st.release(prev);
+                }
+                st.press(note);
+                st.mouse_note = Some(note);
+            }
+        }
+        while st.surface.as_ref().unwrap().get_pointer_up().is_some() {
+            if let Some(note) = st.mouse_note.take() {
+                st.release(note);
+            }
+        }
+        while st.surface.as_ref().unwrap().get_pointer_move().is_some() {}
+
+        // Keyboard: held-set de-bounces auto-repeat into one note on/off.
+        while let Some(ev) = st.surface.as_ref().unwrap().get_key_down() {
+            if let Some(note) = ev.key.and_then(key_to_note) {
+                if !st.key_held[note] {
+                    st.key_held[note] = true;
+                    st.press(note);
+                }
+            }
+        }
+        while let Some(ev) = st.surface.as_ref().unwrap().get_key_up() {
+            if let Some(note) = ev.key.and_then(key_to_note) {
+                if st.key_held[note] {
+                    st.key_held[note] = false;
+                    st.release(note);
+                }
+            }
+        }
+
+        // Paint the control strip and the two-octave keyboard.
+        let active: [bool; NKEYS] = std::array::from_fn(|n| st.held[n] > 0);
+        let ext = st.ext;
+        let n = (w * h * 4) as usize;
+        st.px.clear();
+        st.px.resize(n, 0);
+        let white_w = wf / NW as f32;
+        let black_h = kb_h * 0.55;
+        let black_w = white_w * 0.6;
+        // Octave-button glyph geometry.
+        let cy = CTRL_H / 2.0;
+        let dcx = BTN_W / 2.0; // down (−) button centre
+        let ucx = wf - BTN_W / 2.0; // up (+) button centre
+        let gr = 7.0; // glyph half-extent
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let (fx, fy) = (x as f32, y as f32);
+
+                let (r, g, b) = if fy < CTRL_H {
+                    // Control strip: octave-down button (left), up (right).
+                    let on_down = fx < BTN_W;
+                    let on_up = fx >= wf - BTN_W;
+                    let minus = on_down && (fy - cy).abs() < 1.6 && (fx - dcx).abs() < gr;
+                    let plus = on_up
+                        && (((fy - cy).abs() < 1.6 && (fx - ucx).abs() < gr)
+                            || ((fx - ucx).abs() < 1.6 && (fy - cy).abs() < gr));
+                    if minus || plus {
+                        (210, 215, 225)
+                    } else if on_down || on_up {
+                        (46, 48, 58)
+                    } else {
+                        (28, 28, 34)
+                    }
+                } else {
+                    // Keyboard area. Green = an upstream (hardware) note;
+                    // blue = a local mouse/keyboard press.
+                    let ky = fy - CTRL_H;
+                    let mut black = None;
+                    if ky < black_h {
+                        for &(mult, note) in &BLACK {
+                            let cx = mult * white_w;
+                            if fx >= cx - black_w / 2.0 && fx < cx + black_w / 2.0 {
+                                black = Some(note);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(note) = black {
+                        if ext[note] {
+                            (110, 210, 140)
+                        } else if active[note] {
+                            (110, 140, 210)
+                        } else {
+                            (16, 16, 22)
+                        }
+                    } else {
+                        let wi = ((fx / white_w) as usize).min(NW - 1);
+                        let note = WHITE[wi];
+                        let edge = (fx % white_w) < 1.5 || (fx % white_w) > white_w - 1.5;
+                        if edge {
+                            (60, 60, 70)
+                        } else if ext[note] {
+                            (150, 255, 180)
+                        } else if active[note] {
+                            (150, 190, 255)
+                        } else {
+                            (242, 242, 246)
+                        }
+                    }
+                };
+                st.px[i] = r;
+                st.px[i + 1] = g;
+                st.px[i + 2] = b;
+                st.px[i + 3] = 255;
+            }
+        }
+        let ctx = st.ctx.as_ref().unwrap();
+        let buffer = Buffer::from_graphics_buffer(ctx.get_current_buffer());
+        buffer.set(&st.px);
+        ctx.present();
+    }
+}
+
 struct Component;
 
 impl Guest for Component {
-    fn run() {
-        let surface = Surface::new(CreateDesc {
-            width: Some(660),
-            height: Some(220),
-        });
-        let ctx = GfxContext::new();
-        surface.connect_graphics_context(&ctx);
-        let device = Device::new();
-        device.connect_graphics_context(&ctx);
-        let frame = surface.subscribe_frame();
+    type Plugin = Keyboard;
 
-        let mut keyboard = Keyboard::new();
-        // Keyboard de-bounce (the host re-sends key-down while a key is held).
-        let mut key_held = [false; NKEYS];
-        let mut mouse_note: Option<usize> = None;
+    fn count() -> u32 {
+        1
+    }
 
-        loop {
-            frame.block();
-            let _ = surface.get_frame();
-            let w = surface.width().max(1);
-            let h = surface.height().max(1);
-            let wf = w as f32;
-            let hf = h as f32;
-            let kb_h = (hf - CTRL_H).max(1.0);
-
-            // Mouse: the top strip holds the octave buttons; below it, the keys.
-            while let Some(ev) = surface.get_pointer_down() {
-                let (px, py) = (ev.x as f32, ev.y as f32);
-                if py < CTRL_H {
-                    if px < BTN_W {
-                        keyboard.shift_octave(-1);
-                    } else if px >= wf - BTN_W {
-                        keyboard.shift_octave(1);
-                    }
-                    // A click on the strip shouldn't leave a key mouse-held.
-                    if let Some(prev) = mouse_note.take() {
-                        keyboard.release(prev);
-                    }
-                    continue;
-                }
-                let note = hit_test(px, py - CTRL_H, wf, kb_h);
-                if mouse_note != Some(note) {
-                    if let Some(prev) = mouse_note.take() {
-                        keyboard.release(prev);
-                    }
-                    keyboard.press(note);
-                    mouse_note = Some(note);
-                }
-            }
-            while surface.get_pointer_up().is_some() {
-                if let Some(note) = mouse_note.take() {
-                    keyboard.release(note);
-                }
-            }
-            while surface.get_pointer_move().is_some() {}
-
-            // Keyboard: held-set de-bounces auto-repeat into one note on/off.
-            while let Some(ev) = surface.get_key_down() {
-                if let Some(note) = ev.key.and_then(key_to_note) {
-                    if !key_held[note] {
-                        key_held[note] = true;
-                        keyboard.press(note);
-                    }
-                }
-            }
-            while let Some(ev) = surface.get_key_up() {
-                if let Some(note) = ev.key.and_then(key_to_note) {
-                    if key_held[note] {
-                        key_held[note] = false;
-                        keyboard.release(note);
-                    }
-                }
-            }
-
-            // MIDI in from a wired source (e.g. a hardware keyboard): highlight +
-            // pass through.
-            keyboard.pump_input();
-
-            // Paint the control strip and the two-octave keyboard.
-            let buffer = Buffer::from_graphics_buffer(ctx.get_current_buffer());
-            let mut active = [false; NKEYS];
-            let mut ext = [false; NKEYS];
-            for n in 0..NKEYS {
-                active[n] = keyboard.active(n);
-                ext[n] = keyboard.ext[n];
-            }
-            let mut pixels = vec![0u8; (w * h * 4) as usize];
-            let white_w = wf / NW as f32;
-            let black_h = kb_h * 0.55;
-            let black_w = white_w * 0.6;
-            // Octave-button glyph geometry.
-            let cy = CTRL_H / 2.0;
-            let dcx = BTN_W / 2.0; // down (−) button centre
-            let ucx = wf - BTN_W / 2.0; // up (+) button centre
-            let gr = 7.0; // glyph half-extent
-            for y in 0..h {
-                for x in 0..w {
-                    let i = ((y * w + x) * 4) as usize;
-                    let (fx, fy) = (x as f32, y as f32);
-
-                    let (r, g, b) = if fy < CTRL_H {
-                        // Control strip: octave-down button (left), up (right).
-                        let on_down = fx < BTN_W;
-                        let on_up = fx >= wf - BTN_W;
-                        let minus =
-                            on_down && (fy - cy).abs() < 1.6 && (fx - dcx).abs() < gr;
-                        let plus = on_up
-                            && (((fy - cy).abs() < 1.6 && (fx - ucx).abs() < gr)
-                                || ((fx - ucx).abs() < 1.6 && (fy - cy).abs() < gr));
-                        if minus || plus {
-                            (210, 215, 225)
-                        } else if on_down || on_up {
-                            (46, 48, 58)
-                        } else {
-                            (28, 28, 34)
-                        }
-                    } else {
-                        // Keyboard area. Green = an upstream (hardware) note;
-                        // blue = a local mouse/keyboard press.
-                        let ky = fy - CTRL_H;
-                        let mut black = None;
-                        if ky < black_h {
-                            for &(mult, note) in &BLACK {
-                                let cx = mult * white_w;
-                                if fx >= cx - black_w / 2.0 && fx < cx + black_w / 2.0 {
-                                    black = Some(note);
-                                    break;
-                                }
-                            }
-                        }
-                        if let Some(note) = black {
-                            if ext[note] {
-                                (110, 210, 140)
-                            } else if active[note] {
-                                (110, 140, 210)
-                            } else {
-                                (16, 16, 22)
-                            }
-                        } else {
-                            let wi = ((fx / white_w) as usize).min(NW - 1);
-                            let note = WHITE[wi];
-                            let edge = (fx % white_w) < 1.5 || (fx % white_w) > white_w - 1.5;
-                            if edge {
-                                (60, 60, 70)
-                            } else if ext[note] {
-                                (150, 255, 180)
-                            } else if active[note] {
-                                (150, 190, 255)
-                            } else {
-                                (242, 242, 246)
-                            }
-                        }
-                    };
-                    pixels[i] = r;
-                    pixels[i + 1] = g;
-                    pixels[i + 2] = b;
-                    pixels[i + 3] = 255;
-                }
-            }
-            buffer.set(&pixels);
-            ctx.present();
+    fn get(index: u32) -> Option<Descriptor> {
+        if index != 0 {
+            return None;
         }
+        Some(Descriptor {
+            id: "wk.piano".into(),
+            name: "Piano".into(),
+            vendor: "wk".into(),
+            version: "1.0.0".into(),
+            features: vec!["instrument".into(), "note-effect".into()],
+        })
+    }
+
+    fn create(plugin_id: String) -> Option<Plugin> {
+        if plugin_id != "wk.piano" {
+            return None;
+        }
+        Some(Plugin::new(Keyboard::new()))
     }
 }
 
