@@ -307,7 +307,11 @@ struct Mixer {
 }
 
 struct EngineNode {
-    inst: ClapInstance,
+    /// Behind its own lock so a node's slow `gui-render` (UI thread) serializes
+    /// only with *its own* `process` (audio thread) — not with the whole mix. The
+    /// audio callback `try_lock`s it and skips the node for a block if it's busy
+    /// rendering, so GUI work never stalls the audio stream.
+    inst: Arc<Mutex<ClapInstance>>,
     inbox: crate::midi::SharedInbox,
     /// Last block's output, cached so a downstream node can read it as input.
     last: Vec<AudioBuffer>,
@@ -349,7 +353,7 @@ impl ClapAudio {
             e.nodes.insert(
                 id,
                 EngineNode {
-                    inst,
+                    inst: Arc::new(Mutex::new(inst)),
                     inbox,
                     last: Vec::new(),
                     has_gui,
@@ -359,13 +363,23 @@ impl ClapAudio {
     }
 
     /// Render one UI frame for every CLAP node that has a GUI. Called by the
-    /// server tick on the UI thread; serialized with audio on the mixer lock.
+    /// server tick on the UI thread. Snapshots the GUI instances under a brief
+    /// mixer lock, then renders each *without* holding it (locking only that
+    /// instance), so a slow GUI frame never blocks the audio callback — which
+    /// `try_lock`s the same per-instance lock and skips a busy node.
     pub fn render_guis(&self) {
-        if let Ok(mut e) = self.inner.lock() {
-            for node in e.nodes.values_mut() {
-                if node.has_gui {
-                    node.inst.gui_render();
-                }
+        let insts: Vec<Arc<Mutex<ClapInstance>>> = match self.inner.lock() {
+            Ok(e) => e
+                .nodes
+                .values()
+                .filter(|n| n.has_gui)
+                .map(|n| n.inst.clone())
+                .collect(),
+            Err(_) => return,
+        };
+        for inst in insts {
+            if let Ok(mut i) = inst.lock() {
+                i.gui_render();
             }
         }
     }
@@ -453,6 +467,19 @@ impl ClapAudio {
     }
 }
 
+/// Add one output port's samples (channels x frames) into the interleaved mix,
+/// broadcasting the last channel if the mix wants more than the port provides.
+fn mix_port_into(data: &mut [f32], port: &[Vec<f32>], frames: usize, channels: usize) {
+    for f in 0..frames {
+        for c in 0..channels {
+            data[f * channels + c] += port
+                .get(c.min(port.len().saturating_sub(1)))
+                .and_then(|ch| ch.get(f).copied())
+                .unwrap_or(0.0);
+        }
+    }
+}
+
 impl Mixer {
     /// Render one block: run every node in dependency order and mix the sinks.
     fn render(&mut self, data: &mut [f32]) {
@@ -492,7 +519,25 @@ impl Mixer {
                 vec![buf]
             };
 
-            // Drain this node's MIDI inbox into events.
+            // Grab this node's instance lock without blocking: if it's mid
+            // `gui-render` on the UI thread, skip it for this block (leaving its
+            // inbox and cached output untouched) rather than stall the stream.
+            let Some(inst) = self.nodes.get(&id).map(|n| n.inst.clone()) else {
+                continue;
+            };
+            let Ok(mut guard) = inst.try_lock() else {
+                // Busy rendering its GUI on the UI thread. Don't stall the stream:
+                // if it's a sink, replay its last block so a sustained sound keeps
+                // flowing (vs a silent gap); leave its inbox for the next block.
+                if !has_downstream.contains(&id) {
+                    if let Some(port) = self.nodes.get(&id).and_then(|n| n.last.first()) {
+                        mix_port_into(data, port, frames, channels);
+                    }
+                }
+                continue;
+            };
+
+            // Drain this node's MIDI inbox into events (only now that we'll run it).
             let mut events = Vec::new();
             if let Some(n) = self.nodes.get(&id) {
                 if let Ok(mut q) = n.inbox.lock() {
@@ -504,11 +549,11 @@ impl Mixer {
                 }
             }
 
-            let out = self
-                .nodes
-                .get_mut(&id)
-                .map(|n| n.inst.process(frames as u32, &events, None, &audio_in));
-            let Some(Ok(res)) = out else { continue };
+            let res = match guard.process(frames as u32, &events, None, &audio_in) {
+                Ok(res) => res,
+                Err(_) => continue,
+            };
+            drop(guard);
 
             // Forward emitted events downstream (a MIDI effect / arp).
             if !res.out_events.is_empty() {
@@ -523,14 +568,7 @@ impl Mixer {
             // Sinks reach the speakers.
             if !has_downstream.contains(&id) {
                 if let Some(port) = res.audio_out.first() {
-                    for f in 0..frames {
-                        for c in 0..channels {
-                            data[f * channels + c] += port
-                                .get(c.min(port.len().saturating_sub(1)))
-                                .and_then(|ch| ch.get(f).copied())
-                                .unwrap_or(0.0);
-                        }
-                    }
+                    mix_port_into(data, port, frames, channels);
                 }
             }
             if let Some(n) = self.nodes.get_mut(&id) {
