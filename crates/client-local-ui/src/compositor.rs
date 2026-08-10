@@ -40,6 +40,8 @@ mod palette;
 use palette::*;
 mod ports;
 use ports::*;
+mod term_raster;
+use term_raster::TermRaster;
 mod text_cache;
 use text_cache::TextCache;
 
@@ -77,6 +79,9 @@ const WARN: [f32; 4] = [0.92, 0.45, 0.40, 1.0];
 const TERM_BG: [f32; 4] = [0.063, 0.063, 0.086, 1.0];
 /// The 3D view's ground plane.
 const GROUND_COL: [f32; 4] = [0.085, 0.085, 0.115, 1.0];
+/// World-space height of a panel's floating name label (also its lift above
+/// the panel's top edge).
+const LABEL_H: f32 = 0.05;
 /// Body fill in the workspace for a node popped out into its own window (behind
 /// the "detached" label).
 const DETACHED_BG: [f32; 4] = [0.10, 0.11, 0.14, 1.0];
@@ -210,6 +215,12 @@ struct App {
     cam3d: Camera3d,
     cyl_anchor: [f32; 2],
     renderer3d: Option<Renderer3d>,
+    /// Terminal grids rasterized as textures for 3D panels, keyed by node.
+    term_views: HashMap<NodeId, (TextureId, u32, u32)>,
+    term_raster: TermRaster,
+    /// A panel move in progress: the node and the canvas-space grab offset
+    /// (cursor's cylinder hit − node position at grab time).
+    drag3d: Option<(NodeId, [f32; 2])>,
     /// Last known viewport size in screen px (updated each frame), so newly
     /// added nodes can be placed at the centre of the current view.
     viewport: [f32; 2],
@@ -299,6 +310,9 @@ impl App {
             cam3d: Camera3d::new(),
             cyl_anchor: [0.0, 0.0],
             renderer3d: None,
+            term_views: HashMap::new(),
+            term_raster: TermRaster::default(),
+            drag3d: None,
             viewport: [1280.0, 800.0],
             z: Vec::new(),
             kbd_focus: None,
@@ -1588,8 +1602,9 @@ impl App {
     }
 
     /// One frame of the 3D view: fly the camera, drive surfaces as usual, lay
-    /// the workspace out as panels on a cylinder around the origin, ray-cast
-    /// the mouse into them for pointer input, and render with depth.
+    /// the workspace out as panels on a cylinder around the origin, route the
+    /// mouse (drag panels back into canvas positions, or pointer input into
+    /// surfaces), and render with depth.
     #[allow(clippy::too_many_arguments)]
     fn frame_3d(
         &mut self,
@@ -1598,6 +1613,7 @@ impl App {
         node_surface: &HashMap<NodeId, SharedSurface>,
         fb: [f32; 2],
         mp: [f32; 2],
+        lmb: bool,
         down_edge: bool,
         up_edge: bool,
     ) {
@@ -1613,9 +1629,32 @@ impl App {
 
         self.drive_surfaces(gfx, surfaces);
 
+        // Drop terminal textures whose node vanished.
+        let stale_terms: Vec<NodeId> = self
+            .term_views
+            .keys()
+            .copied()
+            .filter(|id| !self.terminals.contains_key(id))
+            .collect();
+        for id in stale_terms {
+            if let Some((tex, _, _)) = self.term_views.remove(&id) {
+                gfx.renderer.remove_texture(tex);
+            }
+        }
+
         // Wrap the canvas onto a cylinder: canvas x becomes arc length, canvas
         // y height, so the 2D arrangement survives the trip into space. The
         // anchor (view centre at toggle time) faces the camera's start pose.
+        enum Body {
+            Tex(TextureId),
+            Fill([f32; 4]),
+        }
+        struct Line {
+            tex: TextureId,
+            w: f32,
+            h: f32,
+            color: [f32; 4],
+        }
         struct Panel {
             id: NodeId,
             center: [f32; 3],
@@ -1623,11 +1662,47 @@ impl App {
             normal: [f32; 3],
             w: f32,
             h: f32,
-            tex: Option<(TextureId, u32, u32)>,
-            label: String,
+            border: [f32; 4],
+            body: Body,
+            /// Content pixel size when the panel routes pointer input.
+            surface_px: Option<(u32, u32)>,
+            /// Floating name label above the panel (app nodes).
+            label: Option<Line>,
+            /// Text drawn on the card, stacked from the top (widgets, notes).
+            lines: Vec<Line>,
+            /// Card text alignment: notes read left-aligned, widgets centred.
+            left_text: bool,
+            /// Whether a plain click anywhere on the card starts a move drag
+            /// (widgets/terminals/notes); surface panels drag by their label
+            /// or Cmd/Ctrl+drag so clicks stay app input.
+            body_drag: bool,
         }
+        /// Widget-card chrome: border, bg, title, title colour, status,
+        /// status colour — the 3D analogue of `WidgetChrome`.
+        struct Chrome([f32; 4], [f32; 4], String, [f32; 4], String, [f32; 4]);
+        /// A string as a world-space text line `lh` tall, shrunk to `max_w`.
+        fn mk_line(
+            tc: &mut TextCache,
+            gfx: &mut Gfx,
+            s: &str,
+            color: [f32; 4],
+            lh: f32,
+            max_w: f32,
+        ) -> Option<Line> {
+            let (tex, tw, th) =
+                tc.get(&mut gfx.renderer, &gfx.fonts, &gfx.device, &gfx.queue, s)?;
+            let mut h = lh;
+            let mut w = tw / th * lh;
+            if w > max_w {
+                h *= max_w / w;
+                w = max_w;
+            }
+            Some(Line { tex, w, h, color })
+        }
+
+        let ids = self.view.node_ids.clone();
         let mut panels: Vec<Panel> = Vec::new();
-        for &id in &self.view.node_ids {
+        for id in ids {
             let (Some(&pos), Some(&size)) =
                 (self.view.win_pos.get(&id), self.view.win_size.get(&id))
             else {
@@ -1637,33 +1712,313 @@ impl App {
             let cy = pos[1] + size[1] * 0.5 - self.cyl_anchor[1];
             let theta = cx / (PX_PER_M * CYL_R);
             let (s, c) = theta.sin_cos();
-            let tex = node_surface.get(&id).and_then(|surf| {
+            let center = [CYL_R * s, -cy / PX_PER_M, -CYL_R * c];
+            let right = [c, 0.0, s];
+            let normal = [-s, 0.0, c];
+            let cw = size[0] / PX_PER_M;
+            let max_w = cw * 0.92;
+
+            // A graphical node: its live surface at the surface's aspect.
+            if let Some(view) = node_surface.get(&id).and_then(|surf| {
                 let sid = surf.lock().unwrap().id;
                 self.views.get(&sid).copied()
-            });
-            // A graphical node shows at its surface's aspect; others at their
-            // canvas footprint.
-            let (pw, ph) = match tex {
-                Some((_, w, h)) => (w as f32, h as f32),
-                None => (size[0], size[1]),
+            }) {
+                let (tex, pw, ph) = view;
+                let label = mk_line(
+                    &mut self.text_cache,
+                    gfx,
+                    &self
+                        .view
+                        .app_node(id)
+                        .map(|n| n.name.clone())
+                        .unwrap_or_default(),
+                    TEXT,
+                    LABEL_H,
+                    2.0,
+                );
+                panels.push(Panel {
+                    id,
+                    center,
+                    right,
+                    normal,
+                    w: pw as f32 / PX_PER_M,
+                    h: ph as f32 / PX_PER_M,
+                    border: BORDER_COL,
+                    body: Body::Tex(tex),
+                    surface_px: Some((pw, ph)),
+                    label,
+                    lines: Vec::new(),
+                    left_text: false,
+                    body_drag: false,
+                });
+                continue;
+            }
+
+            // A terminal node: its grid rasterized into a texture. The grid is
+            // sized from the node's canvas rect exactly like the 2D view at
+            // zoom 1, so toggling views doesn't reflow the terminal.
+            if self.terminals.contains_key(&id) {
+                let bw = (gfx.fonts.measure("M") as f32).max(1.0);
+                let bh = (gfx.fonts.line_height() as f32).max(1.0);
+                let cols = (((size[0] - 2.0 * BORDER) / bw).floor() as i32).clamp(1, 500) as u16;
+                let rows =
+                    (((size[1] - TITLE_H - BORDER) / bh).floor() as i32).clamp(1, 300) as u16;
+                let (cells, cursor) = {
+                    let t = self.terminals.get_mut(&id).unwrap();
+                    t.resize(cols, rows);
+                    (t.cells(), t.cursor())
+                };
+                let (tw, th, px) =
+                    self.term_raster
+                        .rasterize(&gfx.fonts, &cells, cursor, (cols, rows));
+                let tex = match self.term_views.get(&id) {
+                    Some(&(tex, w, h)) if w == tw && h == th => {
+                        gfx.renderer.update_texture(&gfx.queue, tex, tw, th, &px);
+                        tex
+                    }
+                    old => {
+                        if let Some(&(tex, _, _)) = old {
+                            gfx.renderer.remove_texture(tex);
+                        }
+                        let tex = gfx
+                            .renderer
+                            .create_texture(&gfx.device, &gfx.queue, tw, th, &px);
+                        self.term_views.insert(id, (tex, tw, th));
+                        tex
+                    }
+                };
+                let name = self.node_label(id);
+                let label = mk_line(&mut self.text_cache, gfx, &name, TEXT, LABEL_H, 2.0);
+                panels.push(Panel {
+                    id,
+                    center,
+                    right,
+                    normal,
+                    w: cw,
+                    h: cw * th as f32 / tw as f32,
+                    border: BORDER_COL,
+                    body: Body::Tex(tex),
+                    surface_px: None,
+                    label,
+                    lines: Vec::new(),
+                    left_text: false,
+                    body_drag: true,
+                });
+                continue;
+            }
+
+            // A note: the yellow annotation card with its text.
+            if let Some(text) = self.view.notes.get(&id).cloned() {
+                let lines = text
+                    .split('\n')
+                    .filter_map(|l| mk_line(&mut self.text_cache, gfx, l, NOTE_TEXT, 0.042, max_w))
+                    .collect();
+                panels.push(Panel {
+                    id,
+                    center,
+                    right,
+                    normal,
+                    w: cw,
+                    h: size[1] / PX_PER_M,
+                    border: NOTE_BORDER,
+                    body: Body::Fill(NOTE_BG),
+                    surface_px: None,
+                    label: None,
+                    lines,
+                    left_text: true,
+                    body_drag: true,
+                });
+                continue;
+            }
+
+            // The widget nodes (files/ports/networks/…): kind colours plus the
+            // same title/status the 2D chrome shows.
+            let widget: Option<Chrome> = if let Some(file) = self.view.file_nodes.get(&id) {
+                let (border, bg, status, status_col) = if file.host_mapped {
+                    let kind = if file.is_dir { "dir" } else { "file" };
+                    (
+                        HOSTFILE_BORDER,
+                        HOSTFILE_BG,
+                        format!("{} B · {kind}", file.size),
+                        [0.55, 0.68, 0.85, 1.0],
+                    )
+                } else {
+                    let tail = if file.persist { " · persist" } else { "" };
+                    (
+                        FILE_BORDER,
+                        FILE_BG,
+                        format!("{} B{tail}", file.size),
+                        [0.65, 0.6, 0.5, 1.0],
+                    )
+                };
+                Some(Chrome(
+                    border,
+                    bg,
+                    file.name.clone(),
+                    TEXT,
+                    status,
+                    status_col,
+                ))
+            } else if let Some(&port) = self.view.host_ports.get(&id) {
+                let serving = self.view.serves.values().any(|&hp| hp == id);
+                let (state, state_col) = if self.port_conflicts.contains(&port) {
+                    ("port in use".to_string(), WARN)
+                } else if serving {
+                    ("live ●".to_string(), [0.4, 0.85, 0.5, 1.0])
+                } else {
+                    ("idle".to_string(), [0.55, 0.7, 0.72, 1.0])
+                };
+                Some(Chrome(
+                    HOSTPORT_BORDER,
+                    HOSTPORT_BG,
+                    state,
+                    state_col,
+                    format!(":{port}"),
+                    TEXT,
+                ))
+            } else if self.view.net_nodes.contains(&id) {
+                let members = self
+                    .view
+                    .net_links
+                    .iter()
+                    .filter(|&&(_, n)| n == id)
+                    .count();
+                let is_gw = self.view.gateways.contains(&id);
+                Some(Chrome(
+                    NET_BORDER,
+                    NET_BG,
+                    if is_gw { "Gateway" } else { "Network" }.to_string(),
+                    TEXT,
+                    if is_gw {
+                        format!("host • {members}")
+                    } else {
+                        format!("{members} node(s)")
+                    },
+                    [0.72, 0.62, 0.9, 1.0],
+                ))
+            } else if let Some(meta) = self.view.uplinks.get(&id) {
+                let (status, status_col) = if meta.peers > 0 {
+                    (format!("● {} peer(s)", meta.peers), [0.4, 0.85, 0.5, 1.0])
+                } else if self.view.node_args.get(&id).is_some_and(|a| !a.is_empty()) {
+                    ("dialing…".to_string(), [0.72, 0.62, 0.9, 1.0])
+                } else {
+                    ("add peer in 2D".to_string(), [0.55, 0.7, 0.72, 1.0])
+                };
+                Some(Chrome(
+                    NET_BORDER,
+                    NET_BG,
+                    meta.kind.label().to_string(),
+                    TEXT,
+                    status,
+                    status_col,
+                ))
+            } else if let Some(feed) = self.view.capture_feeds.get(&id) {
+                let wired = self.view.capture_links.iter().any(|&(_, c)| c == id);
+                let live = feed.lock().unwrap().seq > 0;
+                let (status, status_col) = if wired && live {
+                    ("● recording", [0.95, 0.45, 0.5, 1.0])
+                } else if wired {
+                    ("waiting for frames", [0.8, 0.65, 0.5, 1.0])
+                } else {
+                    ("wire an app", [0.55, 0.7, 0.72, 1.0])
+                };
+                Some(Chrome(
+                    CAPTURE_BORDER,
+                    CAPTURE_BG,
+                    "screen capture".to_string(),
+                    TEXT,
+                    status.to_string(),
+                    status_col,
+                ))
+            } else if let Some(device) = self.view.midi_ins.get(&id) {
+                let (status, status_col) = if device.is_empty() {
+                    ("no device".to_string(), [0.8, 0.65, 0.5, 1.0])
+                } else {
+                    (device.clone(), [0.5, 0.85, 0.6, 1.0])
+                };
+                Some(Chrome(
+                    MIDI_BORDER,
+                    MIDI_BG,
+                    "MIDI in".to_string(),
+                    TEXT,
+                    status,
+                    status_col,
+                ))
+            } else {
+                None
             };
+
+            if let Some(Chrome(border, bg, title, title_col, status, status_col)) = widget {
+                let lines = [
+                    mk_line(&mut self.text_cache, gfx, &title, title_col, 0.05, max_w),
+                    mk_line(&mut self.text_cache, gfx, &status, status_col, 0.04, max_w),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                panels.push(Panel {
+                    id,
+                    center,
+                    right,
+                    normal,
+                    w: cw,
+                    h: size[1] / PX_PER_M,
+                    border,
+                    body: Body::Fill(bg),
+                    surface_px: None,
+                    label: None,
+                    lines,
+                    left_text: false,
+                    body_drag: true,
+                });
+                continue;
+            }
+
+            // An app node that is neither rendering nor a terminal yet (idle /
+            // compiling): a plain dark card with its name.
+            let name = self.node_label(id);
+            let label = mk_line(&mut self.text_cache, gfx, &name, TEXT, LABEL_H, 2.0);
             panels.push(Panel {
                 id,
-                center: [CYL_R * s, -cy / PX_PER_M, -CYL_R * c],
-                right: [c, 0.0, s],
-                normal: [-s, 0.0, c],
-                w: pw / PX_PER_M,
-                h: ph / PX_PER_M,
-                tex,
-                label: self.node_label(id),
+                center,
+                right,
+                normal,
+                w: cw,
+                h: size[1] / PX_PER_M,
+                border: BORDER_COL,
+                body: Body::Fill(BODY),
+                surface_px: None,
+                label,
+                lines: Vec::new(),
+                left_text: false,
+                body_drag: true,
             });
         }
 
-        // Mouse ray → nearest panel → surface-local pointer events (suppressed
-        // while right-dragging the view around).
-        if !self.rmb {
-            let (o, d) = self.cam3d.pixel_ray(mp, fb);
-            let mut best: Option<(f32, usize, f32, f32)> = None;
+        // ---- mouse: drag panels, else route pointer input into surfaces ----
+        let (o, d) = self.cam3d.pixel_ray(mp, fb);
+        let chord = self.mods.super_key() || self.mods.control_key();
+        if let Some((id, grab)) = self.drag3d {
+            // Follow the cylinder under the cursor and write the position back
+            // to the server — the 2D canvas stays the authoritative layout.
+            if !lmb {
+                self.drag3d = None;
+            } else if let Some(cv) = ray_cylinder_canvas(o, d) {
+                let pos = [
+                    cv[0] + self.cyl_anchor[0] - grab[0],
+                    cv[1] + self.cyl_anchor[1] - grab[1],
+                ];
+                self.conn.send(Command::Update {
+                    id,
+                    patch: NodePatch {
+                        pos: Some(pos),
+                        ..Default::default()
+                    },
+                });
+            }
+        } else if !self.rmb {
+            // Nearest hit wins; a hit can be the card itself or its label.
+            let mut best: Option<(f32, usize, f32, f32, bool)> = None; // (t, i, lu, lv, on_label)
             for (i, p) in panels.iter().enumerate() {
                 let denom = dot3(d, p.normal);
                 if denom.abs() < 1e-6 {
@@ -1676,24 +2031,43 @@ impl App {
                 let hit = [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t];
                 let lu = dot3(sub3(hit, p.center), p.right);
                 let lv = hit[1] - p.center[1];
-                if lu.abs() <= p.w * 0.5 && lv.abs() <= p.h * 0.5 && best.is_none_or(|b| t < b.0) {
-                    best = Some((t, i, lu, lv));
+                let on_body = lu.abs() <= p.w * 0.5 && lv.abs() <= p.h * 0.5;
+                let on_label = p.label.as_ref().is_some_and(|l| {
+                    lu.abs() <= l.w * 0.5 && (lv - (p.h * 0.5 + LABEL_H)).abs() <= l.h * 0.5
+                });
+                if (on_body || on_label) && best.is_none_or(|b| t < b.0) {
+                    best = Some((t, i, lu, lv, on_label));
                 }
             }
-            if let Some((_, i, lu, lv)) = best {
+            if let Some((_, i, lu, lv, on_label)) = best {
                 let p = &panels[i];
-                if let (Some((_, pw, ph)), Some(surf)) = (p.tex, node_surface.get(&p.id)) {
-                    let local = PointerEvent {
-                        x: ((lu + p.w * 0.5) / p.w * pw as f32) as f64,
-                        y: ((p.h * 0.5 - lv) / p.h * ph as f32) as f64,
-                    };
-                    let mut s = surf.lock().unwrap();
-                    s.pointer_move.push_back(local);
-                    if down_edge {
-                        s.pointer_down.push_back(local);
+                let grab_here = down_edge && (on_label || p.body_drag || chord);
+                if grab_here {
+                    if let (Some(&pos0), Some(cv)) =
+                        (self.view.win_pos.get(&p.id), ray_cylinder_canvas(o, d))
+                    {
+                        self.drag3d = Some((
+                            p.id,
+                            [
+                                cv[0] + self.cyl_anchor[0] - pos0[0],
+                                cv[1] + self.cyl_anchor[1] - pos0[1],
+                            ],
+                        ));
                     }
-                    if up_edge {
-                        s.pointer_up.push_back(local);
+                } else if !on_label && !chord {
+                    if let (Some((pw, ph)), Some(surf)) = (p.surface_px, node_surface.get(&p.id)) {
+                        let local = PointerEvent {
+                            x: ((lu + p.w * 0.5) / p.w * pw as f32) as f64,
+                            y: ((p.h * 0.5 - lv) / p.h * ph as f32) as f64,
+                        };
+                        let mut s = surf.lock().unwrap();
+                        s.pointer_move.push_back(local);
+                        if down_edge {
+                            s.pointer_down.push_back(local);
+                        }
+                        if up_edge {
+                            s.pointer_up.push_back(local);
+                        }
                     }
                 }
             }
@@ -1744,8 +2118,9 @@ impl App {
                 ));
             }
         }
-        // Panels: a backing plate, the content (live texture or a dark fill),
-        // and a floating name label above.
+        // Panels: a backing plate (highlighted while dragged), the content
+        // (live texture or a kind-coloured fill), stacked card text, and a
+        // floating name label above app nodes.
         for p in &panels {
             let uv = [0.0, 0.0, 1.0, 1.0];
             let back = [
@@ -1753,16 +2128,17 @@ impl App {
                 p.center[1],
                 p.center[2] - p.normal[2] * 0.005,
             ];
+            let dragged = self.drag3d.is_some_and(|(id, _)| id == p.id);
             quads3.push(Quad3::spanned(
                 back,
                 scale3(p.right, p.w * 0.5 + 0.015),
                 [0.0, p.h * 0.5 + 0.015, 0.0],
                 uv,
-                BORDER_COL,
+                if dragged { WIRE_SEL_COL } else { p.border },
                 white,
             ));
-            match p.tex {
-                Some((t, _, _)) => quads3.push(Quad3::spanned(
+            match p.body {
+                Body::Tex(t) => quads3.push(Quad3::spanned(
                     p.center,
                     scale3(p.right, p.w * 0.5),
                     [0.0, p.h * 0.5, 0.0],
@@ -1770,32 +2146,51 @@ impl App {
                     [1.0, 1.0, 1.0, 1.0],
                     t,
                 )),
-                None => quads3.push(Quad3::spanned(
+                Body::Fill(col) => quads3.push(Quad3::spanned(
                     p.center,
                     scale3(p.right, p.w * 0.5),
                     [0.0, p.h * 0.5, 0.0],
                     uv,
-                    TERM_BG,
+                    col,
                     white,
                 )),
             }
-            if let Some((t, tw, th)) = self.text_cache.get(
-                &mut gfx.renderer,
-                &gfx.fonts,
-                &gfx.device,
-                &gfx.queue,
-                &p.label,
-            ) {
-                let lh = 0.05;
-                let lw = tw / th * lh;
-                let lc = [p.center[0], p.center[1] + p.h * 0.5 + lh, p.center[2]];
+            // Card text, stacked from the top, floated just off the body so it
+            // never z-fights it.
+            let mut ty = p.h * 0.5 - 0.045;
+            for l in &p.lines {
+                let tx = if p.left_text {
+                    -p.w * 0.5 + 0.02 + l.w * 0.5
+                } else {
+                    0.0
+                };
+                if ty - l.h * 0.5 < -p.h * 0.5 {
+                    break; // out of card
+                }
+                let lc = [
+                    p.center[0] + p.normal[0] * 0.003 + p.right[0] * tx,
+                    p.center[1] + ty,
+                    p.center[2] + p.normal[2] * 0.003 + p.right[2] * tx,
+                ];
                 quads3.push(Quad3::spanned(
                     lc,
-                    scale3(p.right, lw * 0.5),
-                    [0.0, lh * 0.5, 0.0],
+                    scale3(p.right, l.w * 0.5),
+                    [0.0, l.h * 0.5, 0.0],
                     uv,
-                    TEXT,
-                    t,
+                    l.color,
+                    l.tex,
+                ));
+                ty -= l.h + 0.012;
+            }
+            if let Some(l) = &p.label {
+                let lc = [p.center[0], p.center[1] + p.h * 0.5 + LABEL_H, p.center[2]];
+                quads3.push(Quad3::spanned(
+                    lc,
+                    scale3(p.right, l.w * 0.5),
+                    [0.0, l.h * 0.5, 0.0],
+                    uv,
+                    l.color,
+                    l.tex,
                 ));
             }
         }
@@ -1875,7 +2270,7 @@ impl App {
             &gfx.fonts,
             &gfx.device,
             &gfx.queue,
-            "3D view — WASD/QE move · right-drag look · scroll fly · Esc exits",
+            "3D view — WASD/QE move · right-drag look · scroll fly · drag cards (apps: label or Cmd) · Esc exits",
             PAD,
             fb[1] - MENU_H + PAD,
             1.0,
@@ -2059,6 +2454,7 @@ impl App {
                 &node_surface,
                 fb,
                 mp,
+                lmb,
                 down_edge,
                 up_edge,
             );
