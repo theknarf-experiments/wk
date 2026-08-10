@@ -92,7 +92,7 @@ fn node_ident(n: &KdlNode) -> Option<NodeIdent> {
             .map(|s| NodeIdent::Import(s.to_string())),
         "dependencies" => Some(NodeIdent::Dependencies),
         "workspace" => n.get(0).and_then(node_id).map(NodeIdent::Workspace),
-        "connection" | "midi" | "serve" | "netlink" | "capturelink" => {
+        "connection" | "midi" | "serve" | "netlink" | "capturelink" | "audio" => {
             let a = n.get(0).and_then(node_id)?;
             let b = n.get(1).and_then(node_id)?;
             Some(NodeIdent::Wire(name.to_string(), a, b))
@@ -420,6 +420,8 @@ pub struct Workspace {
     pub net_links: Vec<(NodeId, NodeId)>,
     /// Screen-capture grants as (app id, Capture node id).
     pub capture_links: Vec<(NodeId, NodeId)>,
+    /// Audio links between CLAP nodes as (source output, destination input).
+    pub audio: Vec<(NodeId, NodeId)>,
 }
 
 impl Workspace {
@@ -435,6 +437,7 @@ impl Workspace {
             serve_ports: BTreeMap::new(),
             net_links: Vec::new(),
             capture_links: Vec::new(),
+            audio: Vec::new(),
         }
     }
 }
@@ -772,6 +775,7 @@ fn parse_workspace(n: &KdlNode) -> Option<Workspace> {
             }
             "netlink" => ws.net_links.extend(pair(c)),
             "capturelink" => ws.capture_links.extend(pair(c)),
+            "audio" => ws.audio.extend(pair(c)),
             _ => ws.nodes.extend(parse_snap(c)),
         }
     }
@@ -809,6 +813,9 @@ fn workspace_kdl(ws: &Workspace) -> KdlNode {
     }
     for &(app, cap) in &ws.capture_links {
         ch.nodes_mut().push(pair_kdl("capturelink", app, cap));
+    }
+    for &(src, dst) in &ws.audio {
+        ch.nodes_mut().push(pair_kdl("audio", src, dst));
     }
     node.set_children(ch);
     node
@@ -1339,6 +1346,7 @@ mod tests {
                     serve_ports: BTreeMap::from([((synth, port), 3000u16)]),
                     net_links: vec![(synth, net)],
                     capture_links: vec![(synth, chan)],
+                    audio: vec![(synth, chan)],
                 },
                 Workspace {
                     id: wb,
@@ -1599,6 +1607,7 @@ mod tests {
                 midi,
                 serves,
                 net_links: netlinks,
+                audio: Vec::new(),
             })
     }
 

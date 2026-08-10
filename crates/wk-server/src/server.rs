@@ -312,6 +312,7 @@ enum WireRel {
     Serve,
     NetLink,
     CaptureLink,
+    Audio,
 }
 
 /// The two node ids a [`Wire`] joins.
@@ -656,6 +657,10 @@ impl Server {
             .copied()
             .collect();
         self.rewire(&wires);
+        // Audio links are a passive edge set the engine filters against live
+        // nodes, so they need no class-based reconcile — load them directly.
+        self.graph.audio_links.extend(saved.audio.iter().copied());
+        self.sync_clap();
         // Restore per-bind mount paths, then re-apply so mounts land at them.
         for (&pair, path) in &saved.mount_paths {
             self.graph.mount_paths.insert(pair, path.clone());
@@ -1852,6 +1857,7 @@ impl Server {
                 let serves = ws_wires(&self.graph.serve_links, WireRel::Serve);
                 let net_links = ws_wires(&self.graph.net_links, WireRel::NetLink);
                 let capture_links = ws_wires(&self.graph.capture_links, WireRel::CaptureLink);
+                let audio = ws_wires(&self.graph.audio_links, WireRel::Audio);
                 // Persist mount-path overrides for this workspace's binds.
                 let mount_paths = connections
                     .iter()
@@ -1872,6 +1878,7 @@ impl Server {
                     serve_ports,
                     net_links,
                     capture_links,
+                    audio,
                 }
             })
             .collect();
@@ -3099,6 +3106,7 @@ mod model_tests {
                 serve_ports: std::collections::BTreeMap::new(),
                 capture_links: Vec::new(),
                 net_links: Vec::new(),
+                audio: Vec::new(),
             }],
         };
         let path = std::env::temp_dir().join("wk-unresolvable-test.wk");

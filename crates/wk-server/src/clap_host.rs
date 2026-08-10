@@ -665,6 +665,32 @@ mod tests {
         assert!(midi_to_event(&[]).is_none());
     }
 
+    /// The delay is a CLAP *audio effect*: it transforms its audio input. Feed an
+    /// impulse with a short delay time and full wet mix — the output should be
+    /// silent at first (dry removed) then carry a time-shifted copy of the
+    /// impulse, proving it processes audio input rather than passing it through.
+    #[test]
+    fn delay_produces_a_time_shifted_tap() {
+        let bytes = include_bytes!("../testdata/delay.wasm");
+        let engine = ClapEngine::new().unwrap();
+        let component = engine.compile(bytes).unwrap();
+        let mut inst = engine.instantiate(&component, 48_000.0, 512).unwrap();
+        assert_eq!(inst.param_count().unwrap(), 3);
+        assert_eq!(inst.param_info(0).unwrap().unwrap().name, "Time");
+
+        let mut l = vec![0.0f32; 256];
+        let mut r = vec![0.0f32; 256];
+        l[0] = 1.0;
+        r[0] = 1.0;
+        let audio_in = vec![vec![l, r]];
+        // time = 2 ms (~96 samples @ 48k), mix = 1.0 (pure wet).
+        let events = [set_param(0, 2.0), set_param(2, 1.0)];
+        let out = inst.process(256, &events, None, &audio_in).unwrap();
+        let ch = &out.audio_out[0][0];
+        assert!(ch[0].abs() < 0.01, "dry removed at full wet mix");
+        assert!(peak(&ch[10..]) > 0.5, "a delayed tap appears later");
+    }
+
     /// The subtractive synth (saw → resonant filter → envelope, 5 params) sounds
     /// on a note-on and stays finite — a richer instrument through wk:clap.
     #[test]

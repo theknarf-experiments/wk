@@ -39,6 +39,9 @@ dependencies {
     clap_octaver "plugins/clap/build/octaver.wasm" {
         description "a CLAP note effect: doubles each note an octave up, MIDI out to downstream nodes (mise run build in plugins/clap first)"
     }
+    clap_delay "plugins/clap/build/delay.wasm" {
+        description "a CLAP stereo delay/echo audio effect — wire a CLAP audio source into it (mise run build in plugins/clap first)"
+    }
     synth "plugins/synth/target/wasm32-wasip1/debug/synth.wasm" {
         description "MIDI synth with tweakable knobs"
     }

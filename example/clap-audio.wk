@@ -1,0 +1,33 @@
+// vim: set filetype=kdl :
+// A CLAP audio-effect chain in wk. The piano plays a CLAP subtractive synth
+// (MIDI wire); the synth's audio output feeds a CLAP delay/echo (an *audio*
+// wire, amber); the delay plays to the speakers. wk's audio engine runs the
+// whole graph in one output stream, topologically ordered.
+//
+// Build the CLAP components first:  cd plugins/clap && mise run build
+// Then from the repo root:          wk run example/clap-audio.wk
+//
+// Play the piano — you hear the synth through the echo. The audio wire is the
+// amber one from the synth's audio-out to the delay's audio-in.
+import "../workspace.wk"
+workspace "01KZSFXA00000000000000WS01" {
+    note "01KZSFXA00000000000000NT02" {
+        text "CLAP audio effects.\n\npiano -(midi)-> SubSynth\nSubSynth -(audio)-> Delay -> speakers\n\nThe amber wire is audio; wk's engine\nruns the graph and mixes the sink\n(the delay) to your speakers.\n\nPlay the piano to hear the echo."
+        pos 40.0 40.0
+        size 340.0 250.0
+    }
+    node "piano" "01KZSFXA00000000000000PN03" {
+        pos 420.0 40.0
+        size 560.0 220.0
+    }
+    node "clap_subsynth" "01KZSFXA00000000000000SY04" {
+        pos 420.0 300.0
+        size 220.0 90.0
+    }
+    node "clap_delay" "01KZSFXA00000000000000DY05" {
+        pos 720.0 300.0
+        size 200.0 90.0
+    }
+    midi "01KZSFXA00000000000000PN03" "01KZSFXA00000000000000SY04"
+    audio "01KZSFXA00000000000000SY04" "01KZSFXA00000000000000DY05"
+}
