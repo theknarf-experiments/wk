@@ -142,39 +142,6 @@ pub(super) fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-/// Where a world ray hits the layout cylinder (x² + z² = CYL_R²), as canvas
-/// coordinates **relative to the layout anchor** — the exact inverse of the
-/// panel layout, used to drag panels back into server-side canvas positions.
-pub(super) fn ray_cylinder_canvas(o: [f32; 3], d: [f32; 3]) -> Option<[f32; 2]> {
-    let a = d[0] * d[0] + d[2] * d[2];
-    if a < 1e-9 {
-        return None; // looking straight up/down
-    }
-    let b = 2.0 * (o[0] * d[0] + o[2] * d[2]);
-    let c = o[0] * o[0] + o[2] * o[2] - CYL_R * CYL_R;
-    let disc = b * b - 4.0 * a * c;
-    if disc < 0.0 {
-        return None;
-    }
-    let s = disc.sqrt();
-    let (t1, t2) = ((-b - s) / (2.0 * a), (-b + s) / (2.0 * a));
-    // From inside the cylinder the forward hit is the far root; from outside,
-    // prefer the nearer intersection that lies ahead of the ray.
-    let t = if c < 0.0 {
-        t2
-    } else if t1 > 0.0 {
-        t1
-    } else {
-        t2
-    };
-    if t <= 0.0 {
-        return None;
-    }
-    let hit = [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t];
-    let theta = hit[0].atan2(-hit[2]);
-    Some([theta * PX_PER_M * CYL_R, -hit[1] * PX_PER_M])
-}
-
 /// Column-major 4×4 multiply: `a * b`.
 fn mat_mul(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     let mut out = [[0.0f32; 4]; 4];
@@ -205,21 +172,6 @@ mod tests {
         // Depth must be inside 0..1 clip space after the perspective divide.
         let z = clip[2] / clip[3];
         assert!((0.0..=1.0).contains(&z), "z={z}");
-    }
-
-    #[test]
-    fn cylinder_hit_roundtrips_the_panel_layout() {
-        // A canvas point → its panel-layout world position → a ray at it from
-        // the origin → back to the same canvas point.
-        for (cx, cy) in [(0.0f32, 0.0f32), (600.0, -240.0), (-1500.0, 400.0)] {
-            let theta = cx / (PX_PER_M * CYL_R);
-            let target = [CYL_R * theta.sin(), -cy / PX_PER_M, -CYL_R * theta.cos()];
-            let len = dot3(target, target).sqrt();
-            let d = [target[0] / len, target[1] / len, target[2] / len];
-            let got = ray_cylinder_canvas([0.0; 3], d).expect("hit");
-            assert!((got[0] - cx).abs() < 0.5, "cx {cx} vs {}", got[0]);
-            assert!((got[1] - cy).abs() < 0.5, "cy {cy} vs {}", got[1]);
-        }
     }
 
     #[test]

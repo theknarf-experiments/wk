@@ -175,6 +175,10 @@ pub enum ResourceRef {
 pub struct NodePatch {
     /// Move to a new canvas position (requires only `Arrange`).
     pub pos: Option<[f32; 2]>,
+    /// Place at a free 3D pose in the world — `[x, y, z, yaw]` in world units
+    /// (requires only `Arrange`). Nodes without one sit on the default layout
+    /// cylinder derived from their canvas position.
+    pub pos3d: Option<[f32; 4]>,
     /// Resize (requires only `Arrange`).
     pub size: Option<[f32; 2]>,
     /// Set launch args from a whitespace-separated string (requires `Update`).

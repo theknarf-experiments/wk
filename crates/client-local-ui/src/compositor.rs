@@ -229,9 +229,10 @@ struct App {
     /// High-res font + its own string cache for world-space (3D) text.
     fonts3d: Fonts,
     text_cache3d: TextCache,
-    /// A panel move in progress: the node and the canvas-space grab offset
-    /// (cursor's cylinder hit − node position at grab time).
-    drag3d: Option<(NodeId, [f32; 2])>,
+    /// A panel move in progress: the node, the grab distance along the cursor
+    /// ray (scroll pushes/pulls it), and the world-space offset from the grab
+    /// point to the panel centre.
+    drag3d: Option<(NodeId, f32, [f32; 3])>,
     /// A wire drag in progress in 3D, from a node's typed out-port.
     wire3d: Option<(NodeId, PortKind)>,
     /// Whether the cursor is currently grabbed+hidden for look mode.
@@ -1666,6 +1667,8 @@ impl App {
         self.cam3d
             .look(std::mem::replace(&mut self.look_delta, [0.0, 0.0]));
         let fly = std::mem::take(&mut self.fly_scroll);
+        // While a panel is grabbed the wheel pushes/pulls it instead.
+        let cam_fly = if self.drag3d.is_some() { 0.0 } else { fly };
         let no_keys = HashSet::new();
         let fly_keys = if self.rmb && !self.palette_open {
             &self.keys_down
@@ -1673,7 +1676,7 @@ impl App {
             &no_keys
         };
         self.cam3d
-            .advance(fly_keys, self.mods.shift_key(), fly, 1.0 / 60.0);
+            .advance(fly_keys, self.mods.shift_key(), cam_fly, 1.0 / 60.0);
         // Keyboard → the active node, exactly like the 2D canvas: a graphical
         // node's surface gets wasi-gfx key events, a terminal node the encoded
         // bytes. (window_event only queues these when a node is focused and
@@ -1788,13 +1791,37 @@ impl App {
             else {
                 continue;
             };
-            let cx = pos[0] + size[0] * 0.5 - self.cyl_anchor[0];
-            let cy = pos[1] + size[1] * 0.5 - self.cyl_anchor[1];
-            let theta = cx / (PX_PER_M * CYL_R);
-            let (s, c) = theta.sin_cos();
-            let center = [CYL_R * s, -cy / PX_PER_M, -CYL_R * c];
-            let right = [c, 0.0, s];
-            let normal = [-s, 0.0, c];
+            // A free 3D pose ([x, y, z, yaw], world-absolute) wins; nodes
+            // without one sit on the layout cylinder, each workspace's cluster
+            // rotated into its own sector (the active tab straight ahead).
+            let (center, right, normal) = if let Some(&[x, y, z, yaw]) = self.view.pos3d.get(&id) {
+                let (sy, cy) = yaw.sin_cos();
+                let normal = [sy, 0.0, cy];
+                ([x, y, z], [cy, 0.0, -sy], normal)
+            } else {
+                let n_ws = self.tabs.len().max(1) as f32;
+                let ws_idx = self
+                    .view
+                    .node_ws
+                    .get(&id)
+                    .and_then(|w| self.tabs.iter().position(|t| t == w))
+                    .unwrap_or(0) as f32;
+                let active_idx = self
+                    .tabs
+                    .iter()
+                    .position(|t| *t == self.active_ws)
+                    .unwrap_or(0) as f32;
+                let sector = (ws_idx - active_idx) * (std::f32::consts::TAU / n_ws);
+                let cx = pos[0] + size[0] * 0.5 - self.cyl_anchor[0];
+                let cy = pos[1] + size[1] * 0.5 - self.cyl_anchor[1];
+                let theta = cx / (PX_PER_M * CYL_R) + sector;
+                let (s, c) = theta.sin_cos();
+                (
+                    [CYL_R * s, -cy / PX_PER_M, -CYL_R * c],
+                    [c, 0.0, s],
+                    [-s, 0.0, c],
+                )
+            };
             let cw = size[0] / PX_PER_M;
             let max_w = cw * 0.92;
 
@@ -2241,26 +2268,32 @@ impl App {
                     }
                 }
             }
-        } else if let Some((id, grab)) = self.drag3d {
-            // Follow the cylinder under the cursor and write the position back
-            // to the server — the 2D canvas stays the authoritative layout.
+        } else if let Some((id, dist, off)) = self.drag3d {
+            // The grabbed node rides the cursor ray at its grab distance
+            // (scroll pushes/pulls), turning to face you. Its free 3D pose is
+            // written to the server — promoting it off the layout cylinder
+            // and into the world for good.
             if !lmb {
                 self.drag3d = None;
-            } else if let Some(cv) = ray_cylinder_canvas(o, d) {
-                let pos = [
-                    cv[0] + self.cyl_anchor[0] - grab[0],
-                    cv[1] + self.cyl_anchor[1] - grab[1],
+            } else {
+                let dist = (dist + fly * 0.35).clamp(0.4, 60.0);
+                self.drag3d = Some((id, dist, off));
+                let c = [
+                    o[0] + d[0] * dist + off[0],
+                    o[1] + d[1] * dist + off[1],
+                    o[2] + d[2] * dist + off[2],
                 ];
+                let yaw = (o[0] - c[0]).atan2(o[2] - c[2]);
                 self.conn.send(Command::Update {
                     id,
                     patch: NodePatch {
-                        pos: Some(pos),
+                        pos3d: Some([c[0], c[1], c[2], yaw]),
                         ..Default::default()
                     },
                 });
             }
         } else if !self.rmb {
-            if let Some((_, i, lu, lv, zone)) = best {
+            if let Some((t, i, lu, lv, zone)) = best {
                 let p = &panels[i];
                 match zone {
                     Zone::Port(pi) => {
@@ -2277,17 +2310,8 @@ impl App {
                             // Grabbing a node also makes it the active node —
                             // the one the keyboard goes to.
                             self.kbd_focus = Some(p.id);
-                            if let (Some(&pos0), Some(cv)) =
-                                (self.view.win_pos.get(&p.id), ray_cylinder_canvas(o, d))
-                            {
-                                self.drag3d = Some((
-                                    p.id,
-                                    [
-                                        cv[0] + self.cyl_anchor[0] - pos0[0],
-                                        cv[1] + self.cyl_anchor[1] - pos0[1],
-                                    ],
-                                ));
-                            }
+                            let hit = [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t];
+                            self.drag3d = Some((p.id, t, sub3(p.center, hit)));
                         } else if !on_label && !chord {
                             if let (Some((pw, ph)), Some(surf)) =
                                 (p.surface_px, node_surface.get(&p.id))
@@ -2424,7 +2448,7 @@ impl App {
                 p.center[1],
                 p.center[2] - p.normal[2] * 0.005,
             ];
-            let dragged = self.drag3d.is_some_and(|(id, _)| id == p.id);
+            let dragged = self.drag3d.is_some_and(|(id, _, _)| id == p.id);
             let focused = self.kbd_focus == Some(p.id);
             quads3.push(Quad3::spanned(
                 back,
@@ -2797,7 +2821,13 @@ impl App {
             }
         }
 
-        self.view = full.for_workspace(self.active_ws);
+        // In 3D the whole document is one world — every workspace's nodes are
+        // present (each workspace is just a cluster); 2D keeps per-tab views.
+        self.view = if self.mode_3d {
+            full.clone()
+        } else {
+            full.for_workspace(self.active_ws)
+        };
 
         // Drop keyboard/edit state pointing at a node that's no longer visible
         // (deleted, or in another tab) so keystrokes — including a paste — can't

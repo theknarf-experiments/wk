@@ -303,6 +303,9 @@ pub struct NodeSnap {
     pub id: NodeId,
     pub pos: [f32; 2],
     pub size: [f32; 2],
+    /// Optional free 3D pose in the world: `[x, y, z, yaw]` (world units,
+    /// radians). Absent = the node sits on the default layout cylinder.
+    pub pos3d: Option<[f32; 4]>,
     pub kind: SnapKind,
 }
 
@@ -387,6 +390,10 @@ pub fn secret_bytes(s: &str) -> Option<[u8; 32]> {
 pub struct Document {
     /// Paths (relative to this file) of other `.wk` files to pull in.
     pub imports: Vec<String>,
+    /// Optional world scene for the 3D view: a glTF/GLB path relative to this
+    /// file (the VRChat-style "home world" the workspaces live inside). Only
+    /// the top-level file's world is used when imports are resolved.
+    pub world: Option<String>,
     pub dependencies: Vec<Dependency>,
     /// Always at least one; shown as tabs when there is more than one.
     pub workspaces: Vec<Workspace>,
@@ -452,6 +459,7 @@ impl Document {
     pub fn empty() -> Self {
         Document {
             imports: Vec::new(),
+            world: None,
             dependencies: Vec::new(),
             workspaces: vec![Workspace::new()],
             imported_deps: std::collections::HashSet::new(),
@@ -483,6 +491,7 @@ impl Document {
     pub fn load_resolved(path: &Path) -> Result<Self, String> {
         let mut merged = Document {
             imports: Vec::new(),
+            world: None,
             dependencies: Vec::new(),
             workspaces: Vec::new(),
             imported_deps: std::collections::HashSet::new(),
@@ -535,6 +544,13 @@ impl Document {
 
     fn from_kdl(text: &str) -> Result<Self, String> {
         let doc: KdlDocument = text.parse().map_err(|e| format!("parse error: {e}"))?;
+
+        // `world "scene.glb"` — the 3D view's surrounding scene, if any.
+        let world = doc
+            .get("world")
+            .and_then(|n| n.get(0))
+            .and_then(|v| v.as_string())
+            .map(str::to_string);
 
         // `import "other.wk"` lines (a path per node, resolved by load_resolved).
         let imports = doc
@@ -593,6 +609,7 @@ impl Document {
 
         Ok(Document {
             imports,
+            world,
             dependencies,
             workspaces,
             imported_deps: std::collections::HashSet::new(),
@@ -621,6 +638,12 @@ impl Document {
         for imp in &self.imports {
             let mut node = KdlNode::new("import");
             node.push(str_entry(imp));
+            doc.nodes_mut().push(node);
+        }
+
+        if let Some(w) = &self.world {
+            let mut node = KdlNode::new("world");
+            node.push(str_entry(w));
             doc.nodes_mut().push(node);
         }
 
@@ -689,6 +712,7 @@ fn resolve_into(
     let doc = Document::load(path)?;
     if !is_import {
         merged.imports = doc.imports.clone();
+        merged.world = doc.world.clone();
     }
     for dep in doc.dependencies {
         if dep_names.insert(dep.name.clone()) {
@@ -900,10 +924,19 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
     };
     let pos = ch.get("pos")?;
     let size = ch.get("size")?;
+    let pos3d = ch.get("pos3d").and_then(|p| {
+        Some([
+            p.get(0).and_then(num)?,
+            p.get(1).and_then(num)?,
+            p.get(2).and_then(num)?,
+            p.get(3).and_then(num).unwrap_or(0.0),
+        ])
+    });
     Some(NodeSnap {
         id,
         pos: [pos.get(0).and_then(num)?, pos.get(1).and_then(num)?],
         size: [size.get(0).and_then(num)?, size.get(1).and_then(num)?],
+        pos3d,
         kind,
     })
 }
@@ -970,6 +1003,13 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
     }
     ch.nodes_mut().push(node2("pos", s.pos[0], s.pos[1]));
     ch.nodes_mut().push(node2("size", s.size[0], s.size[1]));
+    if let Some(p3) = s.pos3d {
+        let mut n = KdlNode::new("pos3d");
+        for v in p3 {
+            n.push(KdlEntry::new(v as f64));
+        }
+        ch.nodes_mut().push(n);
+    }
     if let SnapKind::App { options, args, .. } = &s.kind {
         if !options.is_empty() {
             let mut opts = KdlNode::new("options");
@@ -1222,6 +1262,35 @@ mod tests {
     }
 
     #[test]
+    fn pos3d_and_world_round_trip_through_kdl() {
+        let ws = NodeId::from_u128(7);
+        let id = NodeId::from_u128(8);
+        let text = format!(
+            "world \"scenes/home.glb\"\nworkspace \"{ws}\" {{\n  \
+             note \"{id}\" {{ text \"hi\"; pos 1 2; size 30 40; pos3d 0.5 1.5 -2.0 0.7 }}\n}}"
+        );
+        let doc = Document::from_kdl(&text).expect("parses");
+        assert_eq!(doc.world.as_deref(), Some("scenes/home.glb"));
+        let snap = &doc.workspaces[0].nodes[0];
+        assert_eq!(snap.pos3d, Some([0.5, 1.5, -2.0, 0.7]));
+
+        // Round-trip: serialize and parse again; both survive.
+        let back = Document::from_kdl(&doc.to_kdl()).expect("round-trips");
+        assert_eq!(back.world.as_deref(), Some("scenes/home.glb"));
+        assert_eq!(
+            back.workspaces[0].nodes[0].pos3d,
+            Some([0.5, 1.5, -2.0, 0.7])
+        );
+        // A node without one stays without one.
+        let plain = Document::from_kdl(&format!(
+            "workspace \"{ws}\" {{\n  note \"{id}\" {{ text \"x\"; pos 0 0; size 10 10 }}\n}}"
+        ))
+        .expect("parses");
+        assert_eq!(plain.workspaces[0].nodes[0].pos3d, None);
+        assert_eq!(plain.world, None);
+    }
+
+    #[test]
     fn import_merges_for_running_and_save_preserves_the_composition() {
         let dir = std::env::temp_dir().join("wk-import-test");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1353,6 +1422,7 @@ mod tests {
             NodeId::new(),
         );
         let doc = Document {
+            world: None,
             imports: Vec::new(),
             imported_deps: std::collections::HashSet::new(),
             imported_workspaces: std::collections::HashSet::new(),
@@ -1378,6 +1448,7 @@ mod tests {
                             id: synth,
                             pos: [40.0, 56.0],
                             size: [360.0, 260.0],
+                            pos3d: None,
                             kind: SnapKind::App {
                                 name: "synth".into(),
                                 options: vec![8.0, 0.6, 0.0, 1.0],
@@ -1388,6 +1459,7 @@ mod tests {
                             id: chan,
                             pos: [200.0, 120.0],
                             size: [130.0, 44.0],
+                            pos3d: None,
                             kind: SnapKind::Volume {
                                 name: "chan".into(),
                                 persist: true,
@@ -1397,6 +1469,7 @@ mod tests {
                             id: notes,
                             pos: [200.0, 200.0],
                             size: [130.0, 44.0],
+                            pos3d: None,
                             kind: SnapKind::BindMount {
                                 path: "notes.txt".into(),
                             },
@@ -1405,24 +1478,28 @@ mod tests {
                             id: port,
                             pos: [600.0, 100.0],
                             size: [130.0, 44.0],
+                            pos3d: None,
                             kind: SnapKind::Port { port: 8080 },
                         },
                         NodeSnap {
                             id: net,
                             pos: [700.0, 100.0],
                             size: [130.0, 44.0],
+                            pos3d: None,
                             kind: SnapKind::Net { gateway: false },
                         },
                         NodeSnap {
                             id: gw,
                             pos: [700.0, 200.0],
                             size: [130.0, 44.0],
+                            pos3d: None,
                             kind: SnapKind::Net { gateway: true },
                         },
                         NodeSnap {
                             id: mdst,
                             pos: [800.0, 100.0],
                             size: [130.0, 44.0],
+                            pos3d: None,
                             kind: SnapKind::Iroh {
                                 secret: Some(secret_hex(&[7u8; 32])),
                                 peer: Some("endpointabc123".into()),
@@ -1432,6 +1509,7 @@ mod tests {
                             id: msrc,
                             pos: [900.0, 100.0],
                             size: [130.0, 44.0],
+                            pos3d: None,
                             kind: SnapKind::Veilid {
                                 secret: Some("VLD0:pubkey:secretkey".into()),
                                 peer: Some("VLD0:remoterecordkey".into()),
@@ -1672,6 +1750,7 @@ mod tests {
                 id,
                 pos: [px, py],
                 size: [sx, sy],
+                pos3d: None,
                 kind,
             })
     }
@@ -1715,6 +1794,7 @@ mod tests {
             prop::collection::vec(workspace_strat(), 1..3),
         )
             .prop_map(|(dependencies, workspaces)| Document {
+                world: None,
                 imports: Vec::new(),
                 dependencies,
                 workspaces,

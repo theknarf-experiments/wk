@@ -163,11 +163,17 @@ impl UplinkHandle {
 /// surface and node handles, which are `Arc`s a client uses to paint pixels and
 /// forward input (the in-process fast path; a networked client would receive
 /// pixel streams instead).
+#[derive(Clone)]
 pub struct View {
     /// Every canvas node id (app/file/port/network), for draw-order reconcile.
     pub node_ids: Vec<NodeId>,
     pub win_pos: HashMap<NodeId, [f32; 2]>,
     pub win_size: HashMap<NodeId, [f32; 2]>,
+    /// Free 3D poses (`[x, y, z, yaw]`) for nodes placed off the layout
+    /// cylinder in the 3D world.
+    pub pos3d: HashMap<NodeId, [f32; 4]>,
+    /// The document's 3D world scene as an absolute glTF/GLB path, if set.
+    pub world: Option<String>,
     pub file_nodes: HashMap<NodeId, FileMeta>,
     pub host_ports: HashMap<NodeId, u16>,
     /// Note nodes (canvas id -> the sticky-note text).
@@ -260,6 +266,8 @@ impl View {
             node_ids: self.node_ids.iter().copied().filter(mine).collect(),
             win_pos: keep_map(&self.win_pos, mine),
             win_size: keep_map(&self.win_size, mine),
+            pos3d: keep_map(&self.pos3d, mine),
+            world: self.world.clone(),
             file_nodes: keep_map(&self.file_nodes, mine),
             host_ports: keep_map(&self.host_ports, mine),
             notes: keep_map(&self.notes, mine),
@@ -443,6 +451,9 @@ pub struct Graph {
     pub nodes: HashMap<NodeId, NodeRec>,
     /// Per-node launch args (argv after the program name). Side table keyed by id.
     pub node_args: HashMap<NodeId, Vec<String>>,
+    /// Free 3D poses (`[x, y, z, yaw]`, world units) for nodes placed off the
+    /// default layout cylinder. Side table: only posed nodes have entries.
+    pub pos3d: HashMap<NodeId, [f32; 4]>,
     /// Canvas file nodes (in-memory or disk-backed) wired into apps.
     pub file_nodes: HashMap<NodeId, FileNode>,
     /// HostPort nodes (canvas id -> localhost port).
@@ -559,6 +570,8 @@ pub struct Server {
     /// `import` directives from the loaded top-level `.wk` file, re-emitted on
     /// save so the composition is preserved.
     imports: Vec<String>,
+    /// The document's optional 3D world scene (glTF/GLB path, file-relative).
+    world: Option<String>,
     /// Dependency names / workspace ids that came from an import — omitted on
     /// save (they live in the imported files). See [`Document::load_resolved`].
     imported_deps: HashSet<String>,
@@ -596,6 +609,7 @@ impl Server {
             file_seq: 0,
             host_seq: 0,
             imports: doc.imports.clone(),
+            world: doc.world.clone(),
             imported_deps: doc.imported_deps.clone(),
             imported_workspaces: doc.imported_workspaces.clone(),
         };
@@ -1613,6 +1627,7 @@ impl Server {
     /// path can leave an orphan (args/file/port) behind a removed node.
     fn forget(&mut self, id: NodeId) {
         self.graph.nodes.remove(&id);
+        self.graph.pos3d.remove(&id);
         self.graph.node_args.remove(&id);
         self.graph.file_nodes.remove(&id);
         self.graph.host_ports.remove(&id);
@@ -1674,6 +1689,11 @@ impl Server {
     fn set_node_size(&mut self, id: NodeId, size: [f32; 2]) {
         if let Some(rec) = self.graph.nodes.get_mut(&id) {
             rec.size = size;
+        }
+    }
+    fn set_node_pos3d(&mut self, id: NodeId, pose: [f32; 4]) {
+        if self.graph.nodes.contains_key(&id) {
+            self.graph.pos3d.insert(id, pose);
         }
     }
 
@@ -1849,6 +1869,7 @@ impl Server {
             dependencies: self.graph.available.clone(),
             workspaces,
             imported_deps: self.imported_deps.clone(),
+            world: self.world.clone(),
             imported_workspaces: self.imported_workspaces.clone(),
         };
         if let Err(e) = doc.save(&self.workspace_path) {
@@ -2004,6 +2025,9 @@ impl Server {
             Command::Update { id, patch } => {
                 if let Some(pos) = patch.pos {
                     self.set_node_pos(id, pos);
+                }
+                if let Some(pose) = patch.pos3d {
+                    self.set_node_pos3d(id, pose);
                 }
                 if let Some(size) = patch.size {
                     self.set_node_size(id, size);
@@ -2187,6 +2211,7 @@ impl Server {
             id,
             pos,
             size,
+            pos3d: self.graph.pos3d.get(&id).copied(),
             kind,
         })
     }
@@ -2383,6 +2408,9 @@ impl Server {
                 self.open_midi_device(s.id, device);
             }
         }
+        if let Some(p3) = s.pos3d {
+            self.graph.pos3d.insert(s.id, p3);
+        }
     }
 
     /// Whether two nodes are already joined by any connection.
@@ -2509,6 +2537,15 @@ impl Server {
             node_ids: self.node_ids(),
             win_pos,
             win_size,
+            pos3d: self.graph.pos3d.clone(),
+            world: self.world.as_ref().map(|w| {
+                self.workspace_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join(w)
+                    .to_string_lossy()
+                    .into_owned()
+            }),
             file_nodes,
             host_ports: self.graph.host_ports.clone(),
             notes: self.graph.note_text.clone(),
@@ -3011,6 +3048,7 @@ mod model_tests {
         let file = NodeId::new();
         let doc = Document {
             imports: Vec::new(),
+            world: None,
             imported_deps: std::collections::HashSet::new(),
             imported_workspaces: std::collections::HashSet::new(),
             dependencies: Vec::new(), // "ghost" isn't here
@@ -3021,6 +3059,7 @@ mod model_tests {
                         id: ghost,
                         pos: [10.0, 10.0],
                         size: [360.0, 260.0],
+                        pos3d: None,
                         kind: SnapKind::App {
                             name: "ghost".into(),
                             options: vec![1.0, 2.0],
@@ -3031,6 +3070,7 @@ mod model_tests {
                         id: file,
                         pos: [20.0, 20.0],
                         size: [130.0, 44.0],
+                        pos3d: None,
                         kind: SnapKind::Volume {
                             name: "file1".into(),
                             persist: false,
@@ -3302,6 +3342,7 @@ mod model_tests {
             Op::UpdateGhost(n) => s.apply(Command::Update {
                 id: NodeId::from_u128(*n),
                 patch: NodePatch {
+                    pos3d: None,
                     pos: Some([1.0, 2.0]),
                     size: Some([3.0, 4.0]),
                     args: Some("ghost".into()),
