@@ -82,6 +82,9 @@ const GROUND_COL: [f32; 4] = [0.085, 0.085, 0.115, 1.0];
 /// World-space height of a panel's floating name label (also its lift above
 /// the panel's top edge).
 const LABEL_H: f32 = 0.05;
+/// Rasterization size for 3D text: world-space quads are metres tall on
+/// screen, so they need a much larger glyph size than the 2D UI's `FONT_PX`.
+const FONT3D_PX: f32 = 48.0;
 /// Body fill in the workspace for a node popped out into its own window (behind
 /// the "detached" label).
 const DETACHED_BG: [f32; 4] = [0.10, 0.11, 0.14, 1.0];
@@ -218,6 +221,9 @@ struct App {
     /// Terminal grids rasterized as textures for 3D panels, keyed by node.
     term_views: HashMap<NodeId, (TextureId, u32, u32)>,
     term_raster: TermRaster,
+    /// High-res font + its own string cache for world-space (3D) text.
+    fonts3d: Fonts,
+    text_cache3d: TextCache,
     /// A panel move in progress: the node and the canvas-space grab offset
     /// (cursor's cylinder hit − node position at grab time).
     drag3d: Option<(NodeId, [f32; 2])>,
@@ -312,6 +318,8 @@ impl App {
             renderer3d: None,
             term_views: HashMap::new(),
             term_raster: TermRaster::default(),
+            fonts3d: Fonts::new(FONT3D_PX)?,
+            text_cache3d: TextCache::default(),
             drag3d: None,
             viewport: [1280.0, 800.0],
             z: Vec::new(),
@@ -1681,16 +1689,17 @@ impl App {
         /// status colour — the 3D analogue of `WidgetChrome`.
         struct Chrome([f32; 4], [f32; 4], String, [f32; 4], String, [f32; 4]);
         /// A string as a world-space text line `lh` tall, shrunk to `max_w`.
+        /// Rasterized with the high-res 3D font so metre-wide text stays crisp.
         fn mk_line(
             tc: &mut TextCache,
+            fonts: &Fonts,
             gfx: &mut Gfx,
             s: &str,
             color: [f32; 4],
             lh: f32,
             max_w: f32,
         ) -> Option<Line> {
-            let (tex, tw, th) =
-                tc.get(&mut gfx.renderer, &gfx.fonts, &gfx.device, &gfx.queue, s)?;
+            let (tex, tw, th) = tc.get(&mut gfx.renderer, fonts, &gfx.device, &gfx.queue, s)?;
             let mut h = lh;
             let mut w = tw / th * lh;
             if w > max_w {
@@ -1725,7 +1734,8 @@ impl App {
             }) {
                 let (tex, pw, ph) = view;
                 let label = mk_line(
-                    &mut self.text_cache,
+                    &mut self.text_cache3d,
+                    &self.fonts3d,
                     gfx,
                     &self
                         .view
@@ -1788,7 +1798,15 @@ impl App {
                     }
                 };
                 let name = self.node_label(id);
-                let label = mk_line(&mut self.text_cache, gfx, &name, TEXT, LABEL_H, 2.0);
+                let label = mk_line(
+                    &mut self.text_cache3d,
+                    &self.fonts3d,
+                    gfx,
+                    &name,
+                    TEXT,
+                    LABEL_H,
+                    2.0,
+                );
                 panels.push(Panel {
                     id,
                     center,
@@ -1811,7 +1829,17 @@ impl App {
             if let Some(text) = self.view.notes.get(&id).cloned() {
                 let lines = text
                     .split('\n')
-                    .filter_map(|l| mk_line(&mut self.text_cache, gfx, l, NOTE_TEXT, 0.042, max_w))
+                    .filter_map(|l| {
+                        mk_line(
+                            &mut self.text_cache3d,
+                            &self.fonts3d,
+                            gfx,
+                            l,
+                            NOTE_TEXT,
+                            0.042,
+                            max_w,
+                        )
+                    })
                     .collect();
                 panels.push(Panel {
                     id,
@@ -1950,8 +1978,24 @@ impl App {
 
             if let Some(Chrome(border, bg, title, title_col, status, status_col)) = widget {
                 let lines = [
-                    mk_line(&mut self.text_cache, gfx, &title, title_col, 0.05, max_w),
-                    mk_line(&mut self.text_cache, gfx, &status, status_col, 0.04, max_w),
+                    mk_line(
+                        &mut self.text_cache3d,
+                        &self.fonts3d,
+                        gfx,
+                        &title,
+                        title_col,
+                        0.05,
+                        max_w,
+                    ),
+                    mk_line(
+                        &mut self.text_cache3d,
+                        &self.fonts3d,
+                        gfx,
+                        &status,
+                        status_col,
+                        0.04,
+                        max_w,
+                    ),
                 ]
                 .into_iter()
                 .flatten()
@@ -1977,7 +2021,15 @@ impl App {
             // An app node that is neither rendering nor a terminal yet (idle /
             // compiling): a plain dark card with its name.
             let name = self.node_label(id);
-            let label = mk_line(&mut self.text_cache, gfx, &name, TEXT, LABEL_H, 2.0);
+            let label = mk_line(
+                &mut self.text_cache3d,
+                &self.fonts3d,
+                gfx,
+                &name,
+                TEXT,
+                LABEL_H,
+                2.0,
+            );
             panels.push(Panel {
                 id,
                 center,
@@ -2077,6 +2129,19 @@ impl App {
         let eye = self.cam3d.pos;
         let white = gfx.renderer.white;
         let scale3 = |v: [f32; 3], k: f32| [v[0] * k, v[1] * k, v[2] * k];
+        // Panels draw far-to-near, each in its own back-to-front order
+        // (backing, body, text, label). Sorting whole panels — never
+        // individual quads — keeps a card's translucent text from writing
+        // depth before the card body draws and punching a hole through it.
+        let d2 = |p: [f32; 3]| {
+            let v = sub3(p, eye);
+            dot3(v, v)
+        };
+        panels.sort_by(|a, b| {
+            d2(b.center)
+                .partial_cmp(&d2(a.center))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let mut quads3: Vec<Quad3> = Vec::new();
         // A ground plane one eye-height below the camera start, for bearings.
         quads3.push(Quad3::spanned(
@@ -2194,16 +2259,6 @@ impl App {
                 ));
             }
         }
-        // Far-to-near so translucent edges (labels, wires) blend correctly.
-        let d2 = |p: [f32; 3]| {
-            let v = sub3(p, eye);
-            dot3(v, v)
-        };
-        quads3.sort_by(|a, b| {
-            d2(b.center())
-                .partial_cmp(&d2(a.center()))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
 
         // ---- render: a depth pass for the world, then a 2D HUD pass ----
         let vp = self.cam3d.view_proj(fb[0] / fb[1].max(1.0));

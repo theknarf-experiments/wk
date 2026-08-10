@@ -89,17 +89,6 @@ impl Quad3 {
             tex: white,
         }
     }
-
-    /// The quad's centroid, for depth sorting.
-    pub fn center(&self) -> [f32; 3] {
-        let mut c = [0.0f32; 3];
-        for p in &self.corners {
-            c[0] += p[0] * 0.25;
-            c[1] += p[1] * 0.25;
-            c[2] += p[2] * 0.25;
-        }
-        c
-    }
 }
 
 fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
