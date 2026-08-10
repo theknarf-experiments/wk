@@ -38,6 +38,35 @@ instead stand for shared resources a plugin can wire to:
 
 A document can hold several workspaces (shown as tabs); edits are undoable.
 
+## 3D worlds
+
+Every `.wk` file is also a **world**, VRChat-style: open the command palette
+(Cmd+K) and pick **3D View** to walk it. All of the file's workspaces exist in
+the world at once (each is a cluster of nodes); the 2D canvas keeps its
+per-tab views.
+
+- **Controls** — hold the right mouse button to look around (WASD walks,
+  `F` toggles free flight with Q/E for up/down, scroll travels the gaze).
+  Grab a card anywhere — or an app panel by its floating label, or Cmd+drag —
+  to carry it; the wheel pushes/pulls a held card. Grabbing also focuses the
+  node, so the keyboard types into it (terminals and apps both work). Ports
+  and wiring, the palette, and Esc-to-exit all work in 3D.
+- **Poses** — a dragged node gets a free 3D pose, persisted in the file as
+  `pos3d x y z yaw`. Nodes without one sit on a default cylinder derived from
+  their 2D canvas position.
+- **World scenes** — a top-level `world "scene.glb"` line surrounds the
+  workspaces with a glTF scene. `example/home.wk` is a ready-made home world
+  (`scripts/gen-home-world.py` regenerates its plaza):
+
+  ```sh
+  cargo run -- run example/home.wk     # then Cmd+K -> 3D View
+  ```
+
+- **`wk:scene`** — a plugin can be a real 3D object instead of (or as well
+  as) a panel: it hands wk a GLB blob and a live transform, and polls
+  hover/press/release ray events. `plugins/totem` is the reference — a
+  spinning crystal you can click (and Cmd+drag to carry).
+
 ## Setup
 
 The toolchain is pinned to nightly Rust by `rust-toolchain.toml`, so `rustup`

@@ -2403,14 +2403,24 @@ impl App {
                     ent_claimed = true;
                     best = None;
                     let e = &ents[i];
-                    let mut st = e.shared.lock().unwrap();
-                    st.push_event(RayEvent::Hover);
-                    if down_edge {
-                        st.push_event(RayEvent::Press);
-                        drop(st);
+                    if down_edge && chord {
+                        // Cmd/Ctrl+drag carries the object: grab its node,
+                        // same convention as dragging a surface panel.
                         self.kbd_focus = Some(e.node);
-                    } else if up_edge {
-                        st.push_event(RayEvent::Release);
+                        if let Some(&(origin, _)) = poses.get(&e.node) {
+                            let hit = [o[0] + d[0] * te, o[1] + d[1] * te, o[2] + d[2] * te];
+                            self.drag3d = Some((e.node, te, sub3(origin, hit)));
+                        }
+                    } else {
+                        let mut st = e.shared.lock().unwrap();
+                        st.push_event(RayEvent::Hover);
+                        if down_edge {
+                            st.push_event(RayEvent::Press);
+                            drop(st);
+                            self.kbd_focus = Some(e.node);
+                        } else if up_edge {
+                            st.push_event(RayEvent::Release);
+                        }
                     }
                 }
             }
