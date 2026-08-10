@@ -9,6 +9,33 @@ pub(super) struct TextCache {
 }
 
 impl TextCache {
+    /// The cached texture (and its pixel size) for a string, rasterising on
+    /// miss — for callers that draw the text themselves (the 3D view).
+    pub(super) fn get(
+        &mut self,
+        r: &mut Renderer,
+        fonts: &Fonts,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        s: &str,
+    ) -> Option<(TextureId, f32, f32)> {
+        match self.map.get(s) {
+            Some(e) => Some(*e),
+            None => {
+                let g = fonts.rasterize(s)?;
+                if self.map.len() >= 1024 {
+                    for (_, (tex, _, _)) in self.map.drain() {
+                        r.remove_texture(tex);
+                    }
+                }
+                let tex = r.create_texture(device, queue, g.width, g.height, &g.rgba);
+                let e = (tex, g.width as f32, g.height as f32);
+                self.map.insert(s.to_string(), e);
+                Some(e)
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn draw(
         &mut self,
@@ -24,22 +51,8 @@ impl TextCache {
         color: [f32; 4],
         clip: [f32; 4],
     ) {
-        let (tex, w, h) = match self.map.get(s) {
-            Some(e) => *e,
-            None => {
-                let Some(g) = fonts.rasterize(s) else {
-                    return;
-                };
-                if self.map.len() >= 1024 {
-                    for (_, (tex, _, _)) in self.map.drain() {
-                        r.remove_texture(tex);
-                    }
-                }
-                let tex = r.create_texture(device, queue, g.width, g.height, &g.rgba);
-                let e = (tex, g.width as f32, g.height as f32);
-                self.map.insert(s.to_string(), e);
-                e
-            }
+        let Some((tex, w, h)) = self.get(r, fonts, device, queue, s) else {
+            return;
         };
         quads.push(Quad::tex(
             [x, y, x + w * scale, y + h * scale],

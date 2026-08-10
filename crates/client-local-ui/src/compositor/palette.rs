@@ -23,6 +23,8 @@ pub(super) enum PaletteCmd {
     CloseWorkspace,
     /// Jump the camera to this zoom factor.
     Zoom(f32),
+    /// Enter the 3D workspace view (Esc returns to the canvas).
+    View3d,
     Quit,
 }
 

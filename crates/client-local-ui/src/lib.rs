@@ -12,6 +12,7 @@ mod arrows;
 mod compositor;
 mod host_shell;
 mod render2d;
+mod render3d;
 mod text;
 
 pub use compositor::WindowClient;

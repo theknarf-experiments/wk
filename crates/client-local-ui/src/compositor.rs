@@ -18,6 +18,7 @@ use winit::window::{Window, WindowId};
 
 use crate::host_shell::Gfx;
 use crate::render2d::{Quad, Renderer, TextureId};
+use crate::render3d::{Quad3, Renderer3d};
 use crate::text::Fonts;
 use wk_protocol::{Command, NodeId, NodeKind, NodePatch, Resource, ResourceRef, Wire};
 use wk_server::plugin::{Key, KeyEvent, PointerEvent, ResizeEvent, SharedNode, SharedSurface};
@@ -27,6 +28,8 @@ use wk_server::terminal::CellView;
 
 mod camera;
 use camera::*;
+mod camera3d;
+use camera3d::*;
 mod geometry;
 use geometry::*;
 mod input;
@@ -72,6 +75,8 @@ const CLOSE_HOT: [f32; 4] = [0.80, 0.30, 0.30, 1.0];
 /// Warning tint (e.g. a HostPort whose localhost port collides with another).
 const WARN: [f32; 4] = [0.92, 0.45, 0.40, 1.0];
 const TERM_BG: [f32; 4] = [0.063, 0.063, 0.086, 1.0];
+/// The 3D view's ground plane.
+const GROUND_COL: [f32; 4] = [0.085, 0.085, 0.115, 1.0];
 /// Body fill in the workspace for a node popped out into its own window (behind
 /// the "detached" label).
 const DETACHED_BG: [f32; 4] = [0.10, 0.11, 0.14, 1.0];
@@ -199,6 +204,12 @@ struct App {
 
     cam: Camera,
     pan_target: [f32; 2],
+    /// The 3D workspace view (toggled from the palette): its fly camera, the
+    /// canvas point mapped to straight-ahead, and the lazily-built renderer.
+    mode_3d: bool,
+    cam3d: Camera3d,
+    cyl_anchor: [f32; 2],
+    renderer3d: Option<Renderer3d>,
     /// Last known viewport size in screen px (updated each frame), so newly
     /// added nodes can be placed at the centre of the current view.
     viewport: [f32; 2],
@@ -244,6 +255,12 @@ struct App {
     mouse: [f32; 2],
     lmb: bool,
     prev_lmb: bool,
+    /// Right button + accumulated drag (mouse look) and scroll travel, and the
+    /// currently held keys (WASD flight) — all only read in the 3D view.
+    rmb: bool,
+    look_delta: [f32; 2],
+    fly_scroll: f32,
+    keys_down: HashSet<KeyCode>,
     mods: ModifiersState,
     pan_delta: [f32; 2],
     /// Accumulated zoom multiplier this frame (1.0 = none); fed by Cmd/Ctrl +
@@ -278,6 +295,10 @@ impl App {
                 zoom: 1.0,
             },
             pan_target: [0.0, 0.0],
+            mode_3d: false,
+            cam3d: Camera3d::new(),
+            cyl_anchor: [0.0, 0.0],
+            renderer3d: None,
             viewport: [1280.0, 800.0],
             z: Vec::new(),
             kbd_focus: None,
@@ -301,6 +322,10 @@ impl App {
             mouse: [0.0, 0.0],
             lmb: false,
             prev_lmb: false,
+            rmb: false,
+            look_delta: [0.0, 0.0],
+            fly_scroll: 0.0,
+            keys_down: HashSet::new(),
             mods: ModifiersState::empty(),
             pan_delta: [0.0, 0.0],
             zoom_factor: 1.0,
@@ -803,6 +828,11 @@ impl App {
                 PaletteCmd::Zoom(z),
             ));
         }
+        v.push(PaletteRow::new(
+            "3D View",
+            d("walk the workspace — WASD/QE move, right-drag look, Esc exits"),
+            PaletteCmd::View3d,
+        ));
         // Jump to any node in the active workspace (searchable by name).
         for &id in &self.view.node_ids {
             v.push(PaletteRow::new(
@@ -1077,6 +1107,13 @@ impl App {
                 self.cam
                     .zoom_at(z / self.cam.zoom, [fb[0] * 0.5, fb[1] * 0.5]);
                 self.pan_target = self.cam.pan;
+            }
+            PaletteCmd::View3d => {
+                // Anchor the cylinder on the centre of the current view so the
+                // nodes you were looking at appear straight ahead.
+                self.cyl_anchor = self.cam.to_canvas([fb[0] * 0.5, fb[1] * 0.5]);
+                self.cam3d = Camera3d::new();
+                self.mode_3d = true;
             }
             PaletteCmd::Quit => self.request_exit = true,
         }
@@ -1488,6 +1525,387 @@ impl App {
     }
 
     /// One compositor frame: update from input, drive surfaces, render.
+    /// Advance every surface one compositor frame: resize it to its render
+    /// target (in-workspace content or detached window), take its pixels into
+    /// its GPU texture, and signal the guest to produce the next frame.
+    fn drive_surfaces(&mut self, gfx: &mut Gfx, surfaces: &[SharedSurface]) {
+        for shared in surfaces {
+            let (sid, w, h, pixels) = {
+                let mut s = shared.lock().unwrap();
+                // A detached node renders at its own window's size; an attached
+                // one at its in-workspace content size.
+                let target = if let Some(det) = self.detached.get(&s.node_id) {
+                    Some(det.size)
+                } else {
+                    self.view.win_size.get(&s.node_id).map(|size| {
+                        [
+                            (size[0] - 2.0 * BORDER).max(16.0) as u32,
+                            (size[1] - TITLE_H - BORDER).max(16.0) as u32,
+                        ]
+                    })
+                };
+                if let Some([cw, ch]) = target {
+                    if cw != s.width || ch != s.height {
+                        s.width = cw;
+                        s.height = ch;
+                        s.pixels = vec![0; (cw * ch * 4) as usize];
+                        s.resize = Some(ResizeEvent {
+                            width: cw,
+                            height: ch,
+                        });
+                    }
+                }
+                let ready = s.pixels.len() == (s.width * s.height * 4) as usize;
+                let px = ready.then(|| s.pixels.clone());
+                let out = (s.id, s.width, s.height, px);
+                s.frame_ready = true;
+                s.wake();
+                out
+            };
+            if w == 0 || h == 0 {
+                continue;
+            }
+            let stale = self.views.get(&sid).map(|&(_, vw, vh)| vw != w || vh != h);
+            match stale {
+                None | Some(true) => {
+                    if let Some((old, _, _)) = self.views.remove(&sid) {
+                        gfx.renderer.remove_texture(old);
+                    }
+                    let init = pixels.unwrap_or_else(|| vec![0; (w * h * 4) as usize]);
+                    let tex = gfx
+                        .renderer
+                        .create_texture(&gfx.device, &gfx.queue, w, h, &init);
+                    self.views.insert(sid, (tex, w, h));
+                }
+                Some(false) => {
+                    if let Some(px) = &pixels {
+                        gfx.renderer
+                            .update_texture(&gfx.queue, self.views[&sid].0, w, h, px);
+                    }
+                }
+            }
+        }
+    }
+
+    /// One frame of the 3D view: fly the camera, drive surfaces as usual, lay
+    /// the workspace out as panels on a cylinder around the origin, ray-cast
+    /// the mouse into them for pointer input, and render with depth.
+    #[allow(clippy::too_many_arguments)]
+    fn frame_3d(
+        &mut self,
+        gfx: &mut Gfx,
+        surfaces: &[SharedSurface],
+        node_surface: &HashMap<NodeId, SharedSurface>,
+        fb: [f32; 2],
+        mp: [f32; 2],
+        down_edge: bool,
+        up_edge: bool,
+    ) {
+        // Fly camera: right-drag look, WASD/QE move (Shift sprints), wheel
+        // travels along the gaze. Keys never reach nodes in this view.
+        self.cam3d
+            .look(std::mem::replace(&mut self.look_delta, [0.0, 0.0]));
+        let fly = std::mem::take(&mut self.fly_scroll);
+        self.cam3d
+            .advance(&self.keys_down, self.mods.shift_key(), fly, 1.0 / 60.0);
+        self.key_events.clear();
+        self.term_input.clear();
+
+        self.drive_surfaces(gfx, surfaces);
+
+        // Wrap the canvas onto a cylinder: canvas x becomes arc length, canvas
+        // y height, so the 2D arrangement survives the trip into space. The
+        // anchor (view centre at toggle time) faces the camera's start pose.
+        struct Panel {
+            id: NodeId,
+            center: [f32; 3],
+            right: [f32; 3],
+            normal: [f32; 3],
+            w: f32,
+            h: f32,
+            tex: Option<(TextureId, u32, u32)>,
+            label: String,
+        }
+        let mut panels: Vec<Panel> = Vec::new();
+        for &id in &self.view.node_ids {
+            let (Some(&pos), Some(&size)) =
+                (self.view.win_pos.get(&id), self.view.win_size.get(&id))
+            else {
+                continue;
+            };
+            let cx = pos[0] + size[0] * 0.5 - self.cyl_anchor[0];
+            let cy = pos[1] + size[1] * 0.5 - self.cyl_anchor[1];
+            let theta = cx / (PX_PER_M * CYL_R);
+            let (s, c) = theta.sin_cos();
+            let tex = node_surface.get(&id).and_then(|surf| {
+                let sid = surf.lock().unwrap().id;
+                self.views.get(&sid).copied()
+            });
+            // A graphical node shows at its surface's aspect; others at their
+            // canvas footprint.
+            let (pw, ph) = match tex {
+                Some((_, w, h)) => (w as f32, h as f32),
+                None => (size[0], size[1]),
+            };
+            panels.push(Panel {
+                id,
+                center: [CYL_R * s, -cy / PX_PER_M, -CYL_R * c],
+                right: [c, 0.0, s],
+                normal: [-s, 0.0, c],
+                w: pw / PX_PER_M,
+                h: ph / PX_PER_M,
+                tex,
+                label: self.node_label(id),
+            });
+        }
+
+        // Mouse ray → nearest panel → surface-local pointer events (suppressed
+        // while right-dragging the view around).
+        if !self.rmb {
+            let (o, d) = self.cam3d.pixel_ray(mp, fb);
+            let mut best: Option<(f32, usize, f32, f32)> = None;
+            for (i, p) in panels.iter().enumerate() {
+                let denom = dot3(d, p.normal);
+                if denom.abs() < 1e-6 {
+                    continue;
+                }
+                let t = dot3(sub3(p.center, o), p.normal) / denom;
+                if t <= 0.05 {
+                    continue;
+                }
+                let hit = [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t];
+                let lu = dot3(sub3(hit, p.center), p.right);
+                let lv = hit[1] - p.center[1];
+                if lu.abs() <= p.w * 0.5 && lv.abs() <= p.h * 0.5 && best.is_none_or(|b| t < b.0) {
+                    best = Some((t, i, lu, lv));
+                }
+            }
+            if let Some((_, i, lu, lv)) = best {
+                let p = &panels[i];
+                if let (Some((_, pw, ph)), Some(surf)) = (p.tex, node_surface.get(&p.id)) {
+                    let local = PointerEvent {
+                        x: ((lu + p.w * 0.5) / p.w * pw as f32) as f64,
+                        y: ((p.h * 0.5 - lv) / p.h * ph as f32) as f64,
+                    };
+                    let mut s = surf.lock().unwrap();
+                    s.pointer_move.push_back(local);
+                    if down_edge {
+                        s.pointer_down.push_back(local);
+                    }
+                    if up_edge {
+                        s.pointer_up.push_back(local);
+                    }
+                }
+            }
+        }
+
+        // ---- build the world ----
+        let eye = self.cam3d.pos;
+        let white = gfx.renderer.white;
+        let scale3 = |v: [f32; 3], k: f32| [v[0] * k, v[1] * k, v[2] * k];
+        let mut quads3: Vec<Quad3> = Vec::new();
+        // A ground plane one eye-height below the camera start, for bearings.
+        quads3.push(Quad3::spanned(
+            [0.0, -1.6, 0.0],
+            [60.0, 0.0, 0.0],
+            [0.0, 0.0, -60.0],
+            [0.0, 0.0, 1.0, 1.0],
+            GROUND_COL,
+            white,
+        ));
+        // Connection wires between panel centres, coloured by kind.
+        let idx: HashMap<NodeId, usize> =
+            panels.iter().enumerate().map(|(i, p)| (p.id, i)).collect();
+        let mut links: Vec<(NodeId, NodeId, [f32; 4])> = Vec::new();
+        for &(f, a) in &self.view.connections {
+            links.push((f, a, WIRE_COL));
+        }
+        for &(s, d) in &self.view.midi_links {
+            links.push((s, d, MIDI_WIRE_COL));
+        }
+        for (&http, &hp) in &self.view.serves {
+            links.push((http, hp, HOSTPORT_WIRE));
+        }
+        for &(app, net) in &self.view.net_links {
+            links.push((app, net, NET_WIRE_COL));
+        }
+        for &(app, cap) in &self.view.capture_links {
+            links.push((app, cap, CAPTURE_BORDER));
+        }
+        for (a, b, col) in links {
+            if let (Some(&ia), Some(&ib)) = (idx.get(&a), idx.get(&b)) {
+                quads3.push(Quad3::ribbon(
+                    white,
+                    panels[ia].center,
+                    panels[ib].center,
+                    eye,
+                    0.012,
+                    col,
+                ));
+            }
+        }
+        // Panels: a backing plate, the content (live texture or a dark fill),
+        // and a floating name label above.
+        for p in &panels {
+            let uv = [0.0, 0.0, 1.0, 1.0];
+            let back = [
+                p.center[0] - p.normal[0] * 0.005,
+                p.center[1],
+                p.center[2] - p.normal[2] * 0.005,
+            ];
+            quads3.push(Quad3::spanned(
+                back,
+                scale3(p.right, p.w * 0.5 + 0.015),
+                [0.0, p.h * 0.5 + 0.015, 0.0],
+                uv,
+                BORDER_COL,
+                white,
+            ));
+            match p.tex {
+                Some((t, _, _)) => quads3.push(Quad3::spanned(
+                    p.center,
+                    scale3(p.right, p.w * 0.5),
+                    [0.0, p.h * 0.5, 0.0],
+                    uv,
+                    [1.0, 1.0, 1.0, 1.0],
+                    t,
+                )),
+                None => quads3.push(Quad3::spanned(
+                    p.center,
+                    scale3(p.right, p.w * 0.5),
+                    [0.0, p.h * 0.5, 0.0],
+                    uv,
+                    TERM_BG,
+                    white,
+                )),
+            }
+            if let Some((t, tw, th)) = self.text_cache.get(
+                &mut gfx.renderer,
+                &gfx.fonts,
+                &gfx.device,
+                &gfx.queue,
+                &p.label,
+            ) {
+                let lh = 0.05;
+                let lw = tw / th * lh;
+                let lc = [p.center[0], p.center[1] + p.h * 0.5 + lh, p.center[2]];
+                quads3.push(Quad3::spanned(
+                    lc,
+                    scale3(p.right, lw * 0.5),
+                    [0.0, lh * 0.5, 0.0],
+                    uv,
+                    TEXT,
+                    t,
+                ));
+            }
+        }
+        // Far-to-near so translucent edges (labels, wires) blend correctly.
+        let d2 = |p: [f32; 3]| {
+            let v = sub3(p, eye);
+            dot3(v, v)
+        };
+        quads3.sort_by(|a, b| {
+            d2(b.center())
+                .partial_cmp(&d2(a.center()))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // ---- render: a depth pass for the world, then a 2D HUD pass ----
+        let vp = self.cam3d.view_proj(fb[0] / fb[1].max(1.0));
+        let renderer3d = self.renderer3d.get_or_insert_with(|| {
+            Renderer3d::new(
+                &gfx.device,
+                gfx.surface_desc.format,
+                gfx.renderer.texture_layout(),
+            )
+        });
+        let depth =
+            renderer3d.depth_view(&gfx.device, gfx.surface_desc.width, gfx.surface_desc.height);
+        let frame = match gfx.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            _ => return,
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = gfx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame3d"),
+            });
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(CLEAR),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            renderer3d.draw(
+                &gfx.device,
+                &gfx.queue,
+                &mut rpass,
+                &gfx.renderer,
+                vp,
+                &quads3,
+            );
+        }
+        // HUD: the exit hint, drawn flat over the world.
+        let mut hud: Vec<Quad> = Vec::new();
+        self.text_cache.draw(
+            &mut hud,
+            &mut gfx.renderer,
+            &gfx.fonts,
+            &gfx.device,
+            &gfx.queue,
+            "3D view — WASD/QE move · right-drag look · scroll fly · Esc exits",
+            PAD,
+            fb[1] - MENU_H + PAD,
+            1.0,
+            MUTED_TEXT,
+            [0.0, 0.0, fb[0], fb[1]],
+        );
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            gfx.renderer
+                .draw(&gfx.device, &gfx.queue, &mut rpass, fb, &hud);
+        }
+        gfx.queue.submit([encoder.finish()]);
+        frame.present();
+    }
+
     fn frame(&mut self) {
         let Some(mut gfx) = self.gfx.take() else {
             return;
@@ -1629,6 +2047,25 @@ impl App {
         }
         self.terminals
             .retain(|id, _| all_node_ids.contains(id) && !node_surface.contains_key(id));
+
+        // ---- 3D view ----
+        // The palette's "3D View" walks the same workspace as a world of
+        // panels; all the 2D canvas interaction below is bypassed while it's
+        // active (the camera owns the mouse and keyboard, Esc returns).
+        if self.mode_3d {
+            self.frame_3d(
+                &mut gfx,
+                &surfaces,
+                &node_surface,
+                fb,
+                mp,
+                down_edge,
+                up_edge,
+            );
+            self.prev_lmb = lmb;
+            self.gfx = Some(gfx);
+            return;
+        }
 
         // ---- interaction ----
         let mut to_close: Vec<NodeId> = Vec::new();
@@ -2083,62 +2520,7 @@ impl App {
         self.term_input.clear();
 
         // ---- drive surfaces ----
-        for shared in &surfaces {
-            let (sid, w, h, pixels) = {
-                let mut s = shared.lock().unwrap();
-                // A detached node renders at its own window's size; an attached
-                // one at its in-workspace content size.
-                let target = if let Some(det) = self.detached.get(&s.node_id) {
-                    Some(det.size)
-                } else {
-                    self.view.win_size.get(&s.node_id).map(|size| {
-                        [
-                            (size[0] - 2.0 * BORDER).max(16.0) as u32,
-                            (size[1] - TITLE_H - BORDER).max(16.0) as u32,
-                        ]
-                    })
-                };
-                if let Some([cw, ch]) = target {
-                    if cw != s.width || ch != s.height {
-                        s.width = cw;
-                        s.height = ch;
-                        s.pixels = vec![0; (cw * ch * 4) as usize];
-                        s.resize = Some(ResizeEvent {
-                            width: cw,
-                            height: ch,
-                        });
-                    }
-                }
-                let ready = s.pixels.len() == (s.width * s.height * 4) as usize;
-                let px = ready.then(|| s.pixels.clone());
-                let out = (s.id, s.width, s.height, px);
-                s.frame_ready = true;
-                s.wake();
-                out
-            };
-            if w == 0 || h == 0 {
-                continue;
-            }
-            let stale = self.views.get(&sid).map(|&(_, vw, vh)| vw != w || vh != h);
-            match stale {
-                None | Some(true) => {
-                    if let Some((old, _, _)) = self.views.remove(&sid) {
-                        gfx.renderer.remove_texture(old);
-                    }
-                    let init = pixels.unwrap_or_else(|| vec![0; (w * h * 4) as usize]);
-                    let tex = gfx
-                        .renderer
-                        .create_texture(&gfx.device, &gfx.queue, w, h, &init);
-                    self.views.insert(sid, (tex, w, h));
-                }
-                Some(false) => {
-                    if let Some(px) = &pixels {
-                        gfx.renderer
-                            .update_texture(&gfx.queue, self.views[&sid].0, w, h, px);
-                    }
-                }
-            }
-        }
+        self.drive_surfaces(&mut gfx, &surfaces);
 
         // ---- build quads ----
         let white = gfx.renderer.white;
@@ -3696,18 +4078,34 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.mouse = [(position.x / scale) as f32, (position.y / scale) as f32];
+                let new = [(position.x / scale) as f32, (position.y / scale) as f32];
+                // In the 3D view a right-drag is mouse look.
+                if self.mode_3d && self.rmb {
+                    self.look_delta[0] += new[0] - self.mouse[0];
+                    self.look_delta[1] += new[1] - self.mouse[1];
+                }
+                self.mouse = new;
             }
             WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,
                 ..
             } => self.lmb = state == ElementState::Pressed,
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Right,
+                ..
+            } => self.rmb = state == ElementState::Pressed,
             WindowEvent::MouseWheel { delta, .. } => {
                 let (dx, dy) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (x, y),
                     MouseScrollDelta::PixelDelta(p) => (p.x as f32 / 50.0, p.y as f32 / 50.0),
                 };
+                // In the 3D view the wheel flies the camera along its gaze.
+                if self.mode_3d {
+                    self.fly_scroll += dy;
+                    return;
+                }
                 // While the palette is open, the wheel scrolls its list instead
                 // of panning the canvas.
                 if self.palette_open {
@@ -3777,6 +4175,21 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let pressed = event.state == ElementState::Pressed;
+                    // Held-key state for the 3D fly camera (maintained in both
+                    // modes so a key released after leaving 3D isn't stuck).
+                    if pressed {
+                        self.keys_down.insert(code);
+                    } else {
+                        self.keys_down.remove(&code);
+                    }
+                    // The 3D view owns the keyboard: WASD/QE fly (read from
+                    // `keys_down` each frame), Escape returns to the canvas.
+                    if self.mode_3d {
+                        if pressed && code == KeyCode::Escape {
+                            self.mode_3d = false;
+                        }
+                        return;
+                    }
                     // Cmd/Ctrl+K toggles the command palette.
                     // An "app chord" is Cmd (macOS) always, or Ctrl only when no
                     // app/terminal is focused — so a focused terminal keeps its

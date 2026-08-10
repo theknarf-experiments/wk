@@ -371,6 +371,17 @@ impl Renderer {
         self.textures.remove(&id.0);
     }
 
+    /// The bind group of a texture in this renderer's registry, so other
+    /// pipelines (the 3D view) can sample the same textures.
+    pub(crate) fn bind_group(&self, id: TextureId) -> Option<&BindGroup> {
+        self.textures.get(&id.0).map(|t| &t.bind_group)
+    }
+
+    /// The texture bind-group layout, for building compatible pipelines.
+    pub(crate) fn texture_layout(&self) -> &BindGroupLayout {
+        &self.texture_layout
+    }
+
     /// Draw `quads` in order onto the current render pass. `fb` is the
     /// framebuffer size in the same pixel space as the quad coordinates.
     pub fn draw<'r>(
