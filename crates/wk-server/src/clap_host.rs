@@ -82,13 +82,20 @@ pub fn instantiate(
     sample_rate: f64,
     max_frames: u32,
 ) -> Result<ClapInstance> {
+    // A per-instance current-thread runtime drives the async wasm calls. A plain
+    // pollster executor is enough for process() (no host await), but the wasi-gfx
+    // host impls a GUI plugin touches await real futures, so a tokio runtime is
+    // required.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     let mut store = Store::new(engine, state);
     // A CLAP node is stopped by removing it from the mix, not by the frame-kill
     // epoch — so its calls just keep going when the epoch ticks (and this avoids
     // the deadline overflow a huge fixed deadline would hit on a live server).
     store.set_epoch_deadline(1);
     store.epoch_deadline_callback(|_| Ok(wasmtime::UpdateDeadline::Continue(1)));
-    let (world, handle, descriptor, out_channels) = pollster::block_on(async {
+    let (world, handle, descriptor, out_channels) = rt.block_on(async {
         let world = Plugin::instantiate_async(&mut store, component, linker).await?;
         let plugins = world.wk_clap_plugins();
         if plugins.call_count(&mut store).await? == 0 {
@@ -135,6 +142,7 @@ pub fn instantiate(
         descriptor,
         out_channels,
         steady: 0,
+        rt,
     })
 }
 
@@ -147,17 +155,19 @@ pub struct ClapInstance {
     /// Channel count of each output audio port.
     pub out_channels: Vec<u32>,
     steady: i64,
+    rt: tokio::runtime::Runtime,
 }
 
 impl ClapInstance {
     pub fn features(&mut self) -> Result<Supported> {
         let p = self.world.wk_clap_plugins();
-        pollster::block_on(p.plugin().call_features(&mut self.store, self.handle))
+        self.rt
+            .block_on(p.plugin().call_features(&mut self.store, self.handle))
     }
 
     pub fn note_input_count(&mut self) -> Result<u32> {
         let p = self.world.wk_clap_plugins();
-        pollster::block_on(
+        self.rt.block_on(
             p.plugin()
                 .call_note_port_count(&mut self.store, self.handle, true),
         )
@@ -165,12 +175,13 @@ impl ClapInstance {
 
     pub fn param_count(&mut self) -> Result<u32> {
         let p = self.world.wk_clap_plugins();
-        pollster::block_on(p.plugin().call_param_count(&mut self.store, self.handle))
+        self.rt
+            .block_on(p.plugin().call_param_count(&mut self.store, self.handle))
     }
 
     pub fn param_info(&mut self, index: u32) -> Result<Option<ParamInfo>> {
         let p = self.world.wk_clap_plugins();
-        pollster::block_on(
+        self.rt.block_on(
             p.plugin()
                 .call_param_info_at(&mut self.store, self.handle, index),
         )
@@ -178,12 +189,28 @@ impl ClapInstance {
 
     pub fn audio_output_info(&mut self, index: u32) -> Result<Option<AudioPortInfo>> {
         let p = self.world.wk_clap_plugins();
-        pollster::block_on(p.plugin().call_audio_port_info_at(
+        self.rt.block_on(p.plugin().call_audio_port_info_at(
             &mut self.store,
             self.handle,
             index,
             false,
         ))
+    }
+
+    /// Whether this plugin draws a wk GUI (implements the `wk.gui` extension).
+    pub fn has_gui(&mut self) -> bool {
+        let p = self.world.wk_clap_plugins();
+        self.rt
+            .block_on(p.plugin().call_has_gui(&mut self.store, self.handle))
+            .unwrap_or(false)
+    }
+
+    /// Render one UI frame (the plugin polls its surface's input and paints).
+    pub fn gui_render(&mut self) {
+        let p = self.world.wk_clap_plugins();
+        let _ = self
+            .rt
+            .block_on(p.plugin().call_gui_render(&mut self.store, self.handle));
     }
 
     /// Run one process block. Returns the plugin's status, output audio (one
@@ -198,7 +225,7 @@ impl ClapInstance {
         let steady = self.steady;
         self.steady += frames as i64;
         let p = self.world.wk_clap_plugins();
-        pollster::block_on(p.plugin().call_process(
+        self.rt.block_on(p.plugin().call_process(
             &mut self.store,
             self.handle,
             steady,
@@ -284,6 +311,8 @@ struct EngineNode {
     inbox: crate::midi::SharedInbox,
     /// Last block's output, cached so a downstream node can read it as input.
     last: Vec<AudioBuffer>,
+    /// Whether the plugin draws a GUI (so the tick only renders those).
+    has_gui: bool,
 }
 
 impl ClapAudio {
@@ -314,7 +343,8 @@ impl ClapAudio {
     }
 
     /// Insert a live, already-instantiated CLAP node into the mix.
-    pub fn add(&self, id: NodeId, inst: ClapInstance, inbox: crate::midi::SharedInbox) {
+    pub fn add(&self, id: NodeId, mut inst: ClapInstance, inbox: crate::midi::SharedInbox) {
+        let has_gui = inst.has_gui();
         if let Ok(mut e) = self.inner.lock() {
             e.nodes.insert(
                 id,
@@ -322,8 +352,21 @@ impl ClapAudio {
                     inst,
                     inbox,
                     last: Vec::new(),
+                    has_gui,
                 },
             );
+        }
+    }
+
+    /// Render one UI frame for every CLAP node that has a GUI. Called by the
+    /// server tick on the UI thread; serialized with audio on the mixer lock.
+    pub fn render_guis(&self) {
+        if let Ok(mut e) = self.inner.lock() {
+            for node in e.nodes.values_mut() {
+                if node.has_gui {
+                    node.inst.gui_render();
+                }
+            }
         }
     }
 
@@ -641,6 +684,20 @@ mod tests {
         chain.set_edges(vec![(a_id, b_id)]);
         note(&ia);
         assert_eq!(peak(&chain.render_block(256, 2)), 0.0);
+    }
+
+    /// A CLAP plugin with a wk GUI creates a wasi:surface and renders to it on
+    /// the main engine (proving wasi-gfx works for a CLAP node) — while a headless
+    /// plugin reports no GUI. Runs the whole gui-render path without panicking.
+    #[test]
+    fn gui_plugin_renders_on_the_main_engine() {
+        let mut gui = instance(include_bytes!("../testdata/guitest.wasm"), 48_000.0, 512);
+        assert!(gui.has_gui(), "guitest implements wk.gui");
+        gui.gui_render(); // create the surface + paint a frame
+        gui.gui_render(); // and a second frame
+
+        let mut synth = instance(include_bytes!("../testdata/polysynth.wasm"), 48_000.0, 512);
+        assert!(!synth.has_gui(), "a headless plugin has no GUI");
     }
 
     #[test]

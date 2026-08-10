@@ -183,6 +183,9 @@ pub struct NodeSetup {
     /// A CLAP node's component bytes, kept so the audio engine can (re)instantiate
     /// it on start/restart. `None` for non-CLAP nodes.
     pub clap_wasm: Option<Arc<Vec<u8>>>,
+    /// The shared surface registry a CLAP node draws its GUI into (so the
+    /// compositor composites it, like every other node). `None` for non-CLAP.
+    pub clap_surfaces: Option<SurfaceRegistry>,
 }
 
 /// What [`PluginHost::run_node`] needs to (re)start a node's guest, reused across
@@ -995,11 +998,17 @@ impl PluginHost {
             return;
         };
         let sr = self.clap.prepare();
+        let registry = node
+            .setup
+            .get()
+            .and_then(|s| s.clap_surfaces.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(Vec::new())));
         let state = self.clap_state(
             node.id,
             node.fs.clone(),
             node.midi_in.clone(),
             node.options.clone(),
+            registry,
         );
         match self.clap_instance(state, &wasm, sr, self.clap.max_frames()) {
             Ok(inst) => self.clap.add(node.id, inst, node.midi_in.clone()),
@@ -1025,6 +1034,7 @@ impl PluginHost {
         fs: crate::vfs::SharedFs,
         midi_in: crate::midi::SharedInbox,
         options: crate::options::SharedOptions,
+        registry: SurfaceRegistry,
     ) -> HostState {
         HostState {
             ctx: WasiCtxBuilder::new()
@@ -1032,7 +1042,7 @@ impl PluginHost {
                 .inherit_stderr()
                 .build(),
             table: ResourceTable::new(),
-            registry: Arc::new(Mutex::new(Vec::new())),
+            registry,
             node_id,
             fs,
             term_io: crate::terminal::TermIo::new(),
@@ -1069,6 +1079,7 @@ impl PluginHost {
             crate::vfs::new_fs(),
             crate::midi::new_inbox(),
             crate::options::new_options(Vec::new()),
+            Arc::new(Mutex::new(Vec::new())),
         )
     }
 
@@ -1368,13 +1379,14 @@ impl PluginHost {
             run: (!is_http && !exports_clap).then(|| RunInfo {
                 component,
                 is_command,
-                surfaces,
+                surfaces: surfaces.clone(),
             }),
             midi: imports_midi,
             net: imports_sockets,
             capture: imports_capture,
             clap: exports_clap,
             clap_wasm,
+            clap_surfaces: exports_clap.then(|| surfaces.clone()),
         };
         // Publish; the server now sees a ready node.
         let _ = node.setup.set(setup);

@@ -2487,6 +2487,9 @@ impl Server {
     /// them holds a live lock on the server (and so the shape is exactly what a
     /// networked client would receive over the wire).
     pub fn view(&self) -> View {
+        // Let every CLAP GUI node paint its surface just before the compositor
+        // reads it (host-driven frame, in place of a run() loop's frame.block()).
+        self.host.clap().render_guis();
         let nodes: Vec<SharedNode> = self.node_reg.lock().unwrap().clone();
         let surfaces: Vec<SharedSurface> = self.registry.lock().unwrap().clone();
         let file_nodes = self

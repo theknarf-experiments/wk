@@ -42,6 +42,9 @@ dependencies {
     clap_delay "plugins/clap/build/delay.wasm" {
         description "a CLAP stereo delay/echo audio effect — wire a CLAP audio source into it (mise run build in plugins/clap first)"
     }
+    clap_guitest "plugins/clap/build/guitest.wasm" {
+        description "a CLAP plugin with a wk GUI (draws to a surface, click to toggle colour); passes notes through (mise run build in plugins/clap first)"
+    }
     synth "plugins/synth/target/wasm32-wasip1/debug/synth.wasm" {
         description "MIDI synth with tweakable knobs"
     }

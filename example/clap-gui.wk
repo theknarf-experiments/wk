@@ -1,0 +1,30 @@
+// vim: set filetype=kdl :
+// A CLAP plugin with a GUI, running in wk on the one shared engine. The GUI Test
+// node draws to a surface (click it to toggle its colour) and passes notes
+// through: piano -> GUI Test -> CLAP synth. Its UI uses the same wasi-gfx stack
+// every wk node uses — there's no separate "CLAP node".
+//
+// Build the CLAP components first:  cd plugins/clap && mise run build
+// Then from the repo root:          wk run example/clap-gui.wk
+import "../workspace.wk"
+workspace "01KZSGXT00000000000000WS01" {
+    note "01KZSGXT00000000000000NT02" {
+        text "A CLAP plugin with a wk GUI.\n\npiano -> GUI Test -> CLAP synth.\n\nThe GUI Test node draws to a\nsurface (click to toggle colour)\nusing the same wasi-gfx every wk\nnode uses. It also passes notes\nthrough to the synth."
+        pos 40.0 40.0
+        size 340.0 240.0
+    }
+    node "piano" "01KZSGXT00000000000000PN03" {
+        pos 420.0 40.0
+        size 560.0 220.0
+    }
+    node "clap_guitest" "01KZSGXT00000000000000GT04" {
+        pos 420.0 300.0
+        size 320.0 180.0
+    }
+    node "clap_synth" "01KZSGXT00000000000000CS05" {
+        pos 780.0 300.0
+        size 200.0 84.0
+    }
+    midi "01KZSGXT00000000000000PN03" "01KZSGXT00000000000000GT04"
+    midi "01KZSGXT00000000000000GT04" "01KZSGXT00000000000000CS05"
+}

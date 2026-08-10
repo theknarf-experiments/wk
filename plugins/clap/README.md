@@ -28,6 +28,7 @@ so wk can host the CLAP ecosystem. wk drives them from the host side
 | `examples/subsynth.c` | subtractive polysynth: saw → resonant TPT filter → envelope | note-ports, audio-ports, params |
 | `examples/octaver.c` | note effect: doubles each note an octave up (CLAP output events) | note-ports |
 | `examples/delay.c` | stereo feedback delay — a CLAP *audio effect* (wire audio into it) | audio-ports, params |
+| `examples/guitest.c` | a CLAP plugin with a **wk GUI** (draws to a wasi:surface; click toggles colour) | note-ports, wk.gui |
 
 Each builds to a reactor component exporting only `wk:clap/plugins`. They double
 as the host-runtime test fixtures in `crates/wk-server/testdata/`.
