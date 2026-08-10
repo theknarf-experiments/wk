@@ -82,6 +82,8 @@ const GROUND_COL: [f32; 4] = [0.085, 0.085, 0.115, 1.0];
 /// World-space height of a panel's floating name label (also its lift above
 /// the panel's top edge).
 const LABEL_H: f32 = 0.05;
+/// Connection-port disc radius in the 3D view, world units.
+const PORT3D_R: f32 = 0.028;
 /// Rasterization size for 3D text: world-space quads are metres tall on
 /// screen, so they need a much larger glyph size than the 2D UI's `FONT_PX`.
 const FONT3D_PX: f32 = 48.0;
@@ -227,6 +229,8 @@ struct App {
     /// A panel move in progress: the node and the canvas-space grab offset
     /// (cursor's cylinder hit − node position at grab time).
     drag3d: Option<(NodeId, [f32; 2])>,
+    /// A wire drag in progress in 3D, from a node's typed out-port.
+    wire3d: Option<(NodeId, PortKind)>,
     /// Last known viewport size in screen px (updated each frame), so newly
     /// added nodes can be placed at the centre of the current view.
     viewport: [f32; 2],
@@ -321,6 +325,7 @@ impl App {
             fonts3d: Fonts::new(FONT3D_PX)?,
             text_cache3d: TextCache::default(),
             drag3d: None,
+            wire3d: None,
             viewport: [1280.0, 800.0],
             z: Vec::new(),
             kbd_focus: None,
@@ -851,8 +856,12 @@ impl App {
             ));
         }
         v.push(PaletteRow::new(
-            "3D View",
-            d("walk the workspace — WASD/QE move, right-drag look, Esc exits"),
+            if self.mode_3d { "2D View" } else { "3D View" },
+            d(if self.mode_3d {
+                "back to the flat canvas (also Esc)"
+            } else {
+                "walk the workspace — WASD/QE move, right-drag look, Esc exits"
+            }),
             PaletteCmd::View3d,
         ));
         // Jump to any node in the active workspace (searchable by name).
@@ -1039,8 +1048,22 @@ impl App {
                     (self.view.win_pos.get(&id), self.view.win_size.get(&id))
                 {
                     let c = [pos[0] + size[0] * 0.5, pos[1] + size[1] * 0.5];
-                    let z = self.cam.zoom;
-                    self.pan_target = [fb[0] * 0.5 - c[0] * z, fb[1] * 0.5 - c[1] * z];
+                    if self.mode_3d {
+                        // Aim the fly camera at the node's panel on the cylinder.
+                        let theta = (c[0] - self.cyl_anchor[0]) / (PX_PER_M * CYL_R);
+                        let target = [
+                            CYL_R * theta.sin(),
+                            -(c[1] - self.cyl_anchor[1]) / PX_PER_M,
+                            -CYL_R * theta.cos(),
+                        ];
+                        let v = sub3(target, self.cam3d.pos);
+                        self.cam3d.yaw = v[0].atan2(-v[2]);
+                        let hd = (v[0] * v[0] + v[2] * v[2]).sqrt().max(1e-6);
+                        self.cam3d.pitch = (v[1] / hd).atan().clamp(-1.5, 1.5);
+                    } else {
+                        let z = self.cam.zoom;
+                        self.pan_target = [fb[0] * 0.5 - c[0] * z, fb[1] * 0.5 - c[1] * z];
+                    }
                 }
             }
             PaletteCmd::AddVolume => {
@@ -1131,11 +1154,15 @@ impl App {
                 self.pan_target = self.cam.pan;
             }
             PaletteCmd::View3d => {
-                // Anchor the cylinder on the centre of the current view so the
-                // nodes you were looking at appear straight ahead.
-                self.cyl_anchor = self.cam.to_canvas([fb[0] * 0.5, fb[1] * 0.5]);
-                self.cam3d = Camera3d::new();
-                self.mode_3d = true;
+                if self.mode_3d {
+                    self.mode_3d = false;
+                } else {
+                    // Anchor the cylinder on the centre of the current view so
+                    // the nodes you were looking at appear straight ahead.
+                    self.cyl_anchor = self.cam.to_canvas([fb[0] * 0.5, fb[1] * 0.5]);
+                    self.cam3d = Camera3d::new();
+                    self.mode_3d = true;
+                }
             }
             PaletteCmd::Quit => self.request_exit = true,
         }
@@ -1630,8 +1657,11 @@ impl App {
         self.cam3d
             .look(std::mem::replace(&mut self.look_delta, [0.0, 0.0]));
         let fly = std::mem::take(&mut self.fly_scroll);
-        self.cam3d
-            .advance(&self.keys_down, self.mods.shift_key(), fly, 1.0 / 60.0);
+        // While the palette is open, typed WASD belongs to the query.
+        if !self.palette_open {
+            self.cam3d
+                .advance(&self.keys_down, self.mods.shift_key(), fly, 1.0 / 60.0);
+        }
         self.key_events.clear();
         self.term_input.clear();
 
@@ -1684,6 +1714,9 @@ impl App {
             /// (widgets/terminals/notes); surface panels drag by their label
             /// or Cmd/Ctrl+drag so clicks stay app input.
             body_drag: bool,
+            /// Typed connection ports in panel-local coords (port, lu, lv):
+            /// inputs on the left edge, outputs on the right, like 2D.
+            ports: Vec<(Port, f32, f32)>,
         }
         /// Widget-card chrome: border, bg, title, title colour, status,
         /// status colour — the 3D analogue of `WidgetChrome`.
@@ -1760,6 +1793,7 @@ impl App {
                     lines: Vec::new(),
                     left_text: false,
                     body_drag: false,
+                    ports: Vec::new(),
                 });
                 continue;
             }
@@ -1821,6 +1855,7 @@ impl App {
                     lines: Vec::new(),
                     left_text: false,
                     body_drag: true,
+                    ports: Vec::new(),
                 });
                 continue;
             }
@@ -1855,6 +1890,7 @@ impl App {
                     lines,
                     left_text: true,
                     body_drag: true,
+                    ports: Vec::new(),
                 });
                 continue;
             }
@@ -2014,6 +2050,7 @@ impl App {
                     lines,
                     left_text: false,
                     body_drag: true,
+                    ports: Vec::new(),
                 });
                 continue;
             }
@@ -2044,13 +2081,129 @@ impl App {
                 lines: Vec::new(),
                 left_text: false,
                 body_drag: true,
+                ports: Vec::new(),
             });
         }
 
-        // ---- mouse: drag panels, else route pointer input into surfaces ----
+        // Typed connection ports on each panel's edges: inputs down the left,
+        // outputs down the right, matching the 2D slot layout (canvas y down →
+        // world y up).
+        for p in &mut panels {
+            let ports = self.node_ports(p.id);
+            let ins: Vec<usize> = (0..ports.len())
+                .filter(|&i| ports[i].dir == PortDir::In)
+                .collect();
+            let outs: Vec<usize> = (0..ports.len())
+                .filter(|&i| ports[i].dir == PortDir::Out)
+                .collect();
+            let slot =
+                |k: usize, n: usize, h: f32| h * 0.5 - h * (k as f32 + 1.0) / (n as f32 + 1.0);
+            for (k, &pi) in ins.iter().enumerate() {
+                p.ports
+                    .push((ports[pi], -p.w * 0.5, slot(k, ins.len(), p.h)));
+            }
+            for (k, &pi) in outs.iter().enumerate() {
+                p.ports
+                    .push((ports[pi], p.w * 0.5, slot(k, outs.len(), p.h)));
+            }
+        }
+
+        // ---- mouse: palette, wire/move drags, else pointer into surfaces ----
         let (o, d) = self.cam3d.pixel_ray(mp, fb);
         let chord = self.mods.super_key() || self.mods.control_key();
-        if let Some((id, grab)) = self.drag3d {
+        // Nearest panel hit under the cursor: a connection port (checked
+        // first, and reaching slightly past the card edge), the card body, or
+        // its floating label.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Zone {
+            Body,
+            Label,
+            Port(usize),
+        }
+        let mut best: Option<(f32, usize, f32, f32, Zone)> = None;
+        if !self.rmb {
+            for (i, p) in panels.iter().enumerate() {
+                let denom = dot3(d, p.normal);
+                if denom.abs() < 1e-6 {
+                    continue;
+                }
+                let t = dot3(sub3(p.center, o), p.normal) / denom;
+                if t <= 0.05 {
+                    continue;
+                }
+                let hit = [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t];
+                let lu = dot3(sub3(hit, p.center), p.right);
+                let lv = hit[1] - p.center[1];
+                let port = p.ports.iter().position(|&(_, pu, pv)| {
+                    let (du, dv) = (lu - pu, lv - pv);
+                    (du * du + dv * dv).sqrt() <= PORT3D_R * 1.8
+                });
+                let zone = if let Some(pi) = port {
+                    Some(Zone::Port(pi))
+                } else if lu.abs() <= p.w * 0.5 && lv.abs() <= p.h * 0.5 {
+                    Some(Zone::Body)
+                } else if p.label.as_ref().is_some_and(|l| {
+                    lu.abs() <= l.w * 0.5 && (lv - (p.h * 0.5 + LABEL_H)).abs() <= l.h * 0.5
+                }) {
+                    Some(Zone::Label)
+                } else {
+                    None
+                };
+                if let Some(z) = zone {
+                    if best.is_none_or(|b| t < b.0) {
+                        best = Some((t, i, lu, lv, z));
+                    }
+                }
+            }
+        }
+
+        if self.palette_open {
+            // The palette is modal: click a row to run it, click anywhere else
+            // to dismiss it (same as 2D).
+            if down_edge {
+                let (px, py, pw, row_h) = Self::palette_layout(fb);
+                let filtered = self.palette_filtered();
+                let start = (self.palette_scroll.round() as usize).min(filtered.len());
+                for (i, r) in filtered.iter().skip(start).take(PALETTE_MAX).enumerate() {
+                    let y0 = py + (i as f32 + 1.0) * row_h;
+                    if contains([px, y0, px + pw, y0 + row_h], mp) {
+                        self.palette_run = Some(r.cmd);
+                        break;
+                    }
+                }
+                self.palette_open = false;
+                self.palette_query.clear();
+            }
+        } else if let Some((src, kind)) = self.wire3d {
+            // A wire drag: on release, connect to a node that accepts the kind
+            // (its matching input port, or anywhere on such a node); dropping
+            // on an already-wired pair removes the wire — 2D's toggle
+            // semantics exactly.
+            if !lmb {
+                self.wire3d = None;
+                if let Some((_, i, _, _, zone)) = best {
+                    let p = &panels[i];
+                    let accepts = match zone {
+                        Zone::Port(pi) => {
+                            let (port, _, _) = p.ports[pi];
+                            port.kind == kind && port.dir == PortDir::In
+                        }
+                        _ => p
+                            .ports
+                            .iter()
+                            .any(|&(port, _, _)| port.kind == kind && port.dir == PortDir::In),
+                    };
+                    if accepts && p.id != src {
+                        match self.wire_between(src, p.id) {
+                            Some(w) => self.conn.send(Command::Delete(ResourceRef::Wire(w))),
+                            None => self
+                                .conn
+                                .send(Command::Create(Resource::Wire { a: src, b: p.id })),
+                        }
+                    }
+                }
+            }
+        } else if let Some((id, grab)) = self.drag3d {
             // Follow the cylinder under the cursor and write the position back
             // to the server — the 2D canvas stays the authoritative layout.
             if !lmb {
@@ -2069,65 +2222,68 @@ impl App {
                 });
             }
         } else if !self.rmb {
-            // Nearest hit wins; a hit can be the card itself or its label.
-            let mut best: Option<(f32, usize, f32, f32, bool)> = None; // (t, i, lu, lv, on_label)
-            for (i, p) in panels.iter().enumerate() {
-                let denom = dot3(d, p.normal);
-                if denom.abs() < 1e-6 {
-                    continue;
-                }
-                let t = dot3(sub3(p.center, o), p.normal) / denom;
-                if t <= 0.05 {
-                    continue;
-                }
-                let hit = [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t];
-                let lu = dot3(sub3(hit, p.center), p.right);
-                let lv = hit[1] - p.center[1];
-                let on_body = lu.abs() <= p.w * 0.5 && lv.abs() <= p.h * 0.5;
-                let on_label = p.label.as_ref().is_some_and(|l| {
-                    lu.abs() <= l.w * 0.5 && (lv - (p.h * 0.5 + LABEL_H)).abs() <= l.h * 0.5
-                });
-                if (on_body || on_label) && best.is_none_or(|b| t < b.0) {
-                    best = Some((t, i, lu, lv, on_label));
-                }
-            }
-            if let Some((_, i, lu, lv, on_label)) = best {
+            if let Some((_, i, lu, lv, zone)) = best {
                 let p = &panels[i];
-                let grab_here = down_edge && (on_label || p.body_drag || chord);
-                if grab_here {
-                    if let (Some(&pos0), Some(cv)) =
-                        (self.view.win_pos.get(&p.id), ray_cylinder_canvas(o, d))
-                    {
-                        self.drag3d = Some((
-                            p.id,
-                            [
-                                cv[0] + self.cyl_anchor[0] - pos0[0],
-                                cv[1] + self.cyl_anchor[1] - pos0[1],
-                            ],
-                        ));
-                    }
-                } else if !on_label && !chord {
-                    if let (Some((pw, ph)), Some(surf)) = (p.surface_px, node_surface.get(&p.id)) {
-                        let local = PointerEvent {
-                            x: ((lu + p.w * 0.5) / p.w * pw as f32) as f64,
-                            y: ((p.h * 0.5 - lv) / p.h * ph as f32) as f64,
-                        };
-                        let mut s = surf.lock().unwrap();
-                        s.pointer_move.push_back(local);
-                        if down_edge {
-                            s.pointer_down.push_back(local);
+                match zone {
+                    Zone::Port(pi) => {
+                        // Dragging out of an out-port starts a wire.
+                        let (port, _, _) = p.ports[pi];
+                        if down_edge && port.dir == PortDir::Out {
+                            self.wire3d = Some((p.id, port.kind));
                         }
-                        if up_edge {
-                            s.pointer_up.push_back(local);
+                    }
+                    zone => {
+                        let on_label = zone == Zone::Label;
+                        let grab_here = down_edge && (on_label || p.body_drag || chord);
+                        if grab_here {
+                            if let (Some(&pos0), Some(cv)) =
+                                (self.view.win_pos.get(&p.id), ray_cylinder_canvas(o, d))
+                            {
+                                self.drag3d = Some((
+                                    p.id,
+                                    [
+                                        cv[0] + self.cyl_anchor[0] - pos0[0],
+                                        cv[1] + self.cyl_anchor[1] - pos0[1],
+                                    ],
+                                ));
+                            }
+                        } else if !on_label && !chord {
+                            if let (Some((pw, ph)), Some(surf)) =
+                                (p.surface_px, node_surface.get(&p.id))
+                            {
+                                let local = PointerEvent {
+                                    x: ((lu + p.w * 0.5) / p.w * pw as f32) as f64,
+                                    y: ((p.h * 0.5 - lv) / p.h * ph as f32) as f64,
+                                };
+                                let mut s = surf.lock().unwrap();
+                                s.pointer_move.push_back(local);
+                                if down_edge {
+                                    s.pointer_down.push_back(local);
+                                }
+                                if up_edge {
+                                    s.pointer_up.push_back(local);
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+        // The port under the cursor lights up (hover / drop target). Captured
+        // by id + index so the panel sort below can't invalidate it.
+        let hot_port: Option<(NodeId, usize)> = best.and_then(|(_, i, _, _, z)| match z {
+            Zone::Port(pi) => Some((panels[i].id, pi)),
+            _ => None,
+        });
+        // Run a command chosen from the palette.
+        if let Some(cmd) = self.palette_run.take() {
+            self.run_palette(cmd, fb);
+        }
 
         // ---- build the world ----
         let eye = self.cam3d.pos;
         let white = gfx.renderer.white;
+        let circle = gfx.renderer.circle;
         let scale3 = |v: [f32; 3], k: f32| [v[0] * k, v[1] * k, v[2] * k];
         // Panels draw far-to-near, each in its own back-to-front order
         // (backing, body, text, label). Sorting whole panels — never
@@ -2152,35 +2308,65 @@ impl App {
             GROUND_COL,
             white,
         ));
-        // Connection wires between panel centres, coloured by kind.
+        // Connection wires, anchored on the panels' typed ports (source's
+        // out-port to target's in-port; centre as the fallback), in the wire
+        // kind's colour.
         let idx: HashMap<NodeId, usize> =
             panels.iter().enumerate().map(|(i, p)| (p.id, i)).collect();
-        let mut links: Vec<(NodeId, NodeId, [f32; 4])> = Vec::new();
+        let port_world = |p: &Panel, kind: PortKind, dir: PortDir| -> [f32; 3] {
+            match p
+                .ports
+                .iter()
+                .find(|&&(port, _, _)| port.kind == kind && port.dir == dir)
+            {
+                Some(&(_, pu, pv)) => [
+                    p.center[0] + p.right[0] * pu,
+                    p.center[1] + pv,
+                    p.center[2] + p.right[2] * pu,
+                ],
+                None => p.center,
+            }
+        };
+        let mut links: Vec<(NodeId, NodeId, PortKind)> = Vec::new();
         for &(f, a) in &self.view.connections {
-            links.push((f, a, WIRE_COL));
+            links.push((f, a, PortKind::Bind));
         }
         for &(s, d) in &self.view.midi_links {
-            links.push((s, d, MIDI_WIRE_COL));
+            links.push((s, d, PortKind::Midi));
         }
         for (&http, &hp) in &self.view.serves {
-            links.push((http, hp, HOSTPORT_WIRE));
+            links.push((http, hp, PortKind::Serve));
         }
         for &(app, net) in &self.view.net_links {
-            links.push((app, net, NET_WIRE_COL));
+            links.push((app, net, PortKind::Net));
         }
         for &(app, cap) in &self.view.capture_links {
-            links.push((app, cap, CAPTURE_BORDER));
+            links.push((app, cap, PortKind::Capture));
         }
-        for (a, b, col) in links {
+        for (a, b, kind) in links {
             if let (Some(&ia), Some(&ib)) = (idx.get(&a), idx.get(&b)) {
                 quads3.push(Quad3::ribbon(
                     white,
-                    panels[ia].center,
-                    panels[ib].center,
+                    port_world(&panels[ia], kind, PortDir::Out),
+                    port_world(&panels[ib], kind, PortDir::In),
                     eye,
                     0.012,
-                    col,
+                    kind.color(),
                 ));
+            }
+        }
+        // The wire being dragged: from its source port to the cursor (the
+        // hovered panel's depth, or a fixed reach into the room).
+        if let Some((src, kind)) = self.wire3d {
+            if let Some(sp) = panels.iter().find(|p| p.id == src) {
+                let from = port_world(sp, kind, PortDir::Out);
+                let reach = best.map(|(t, ..)| t).unwrap_or(2.5);
+                let to = [
+                    o[0] + d[0] * reach,
+                    o[1] + d[1] * reach,
+                    o[2] + d[2] * reach,
+                ];
+                quads3.push(Quad3::ribbon(white, from, to, eye, 0.012, kind.color()));
             }
         }
         // Panels: a backing plate (highlighted while dragged), the content
@@ -2258,6 +2444,31 @@ impl App {
                     l.tex,
                 ));
             }
+            // Typed ports as discs riding the panel edges (inputs dimmer, the
+            // hovered one lit and enlarged — hover is also the drop target).
+            for (pi, &(port, pu, pv)) in p.ports.iter().enumerate() {
+                let c = port.kind.color();
+                let (col, r) = if hot_port == Some((p.id, pi)) {
+                    (PORT_HOT, PORT3D_R * 1.4)
+                } else if port.dir == PortDir::In {
+                    ([c[0] * 0.7, c[1] * 0.7, c[2] * 0.7, 1.0], PORT3D_R)
+                } else {
+                    (c, PORT3D_R)
+                };
+                let pc = [
+                    p.center[0] + p.right[0] * pu + p.normal[0] * 0.004,
+                    p.center[1] + pv,
+                    p.center[2] + p.right[2] * pu + p.normal[2] * 0.004,
+                ];
+                quads3.push(Quad3::spanned(
+                    pc,
+                    scale3(p.right, r),
+                    [0.0, r, 0.0],
+                    uv,
+                    col,
+                    circle,
+                ));
+            }
         }
 
         // ---- render: a depth pass for the world, then a 2D HUD pass ----
@@ -2332,6 +2543,7 @@ impl App {
             MUTED_TEXT,
             [0.0, 0.0, fb[0], fb[1]],
         );
+        self.draw_palette(&mut hud, gfx, fb, mp);
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
@@ -2354,6 +2566,95 @@ impl App {
         }
         gfx.queue.submit([encoder.finish()]);
         frame.present();
+    }
+
+    /// Draw the command palette overlay (dim, centred panel, typed query,
+    /// filtered rows) — shared by the 2D canvas and the 3D view's HUD pass.
+    fn draw_palette(&mut self, quads: &mut Vec<Quad>, gfx: &mut Gfx, fb: [f32; 2], mp: [f32; 2]) {
+        if !self.palette_open {
+            return;
+        }
+        let white = gfx.renderer.white;
+        let full = [0.0, 0.0, fb[0], fb[1]];
+        let lh = gfx.fonts.line_height() as f32;
+        quads.push(Quad::solid(white, full, [0.0, 0.0, 0.0, 0.45], full));
+        let (px, py, pw, row_h) = Self::palette_layout(fb);
+        let filtered = self.palette_filtered();
+        let rows = filtered.len().min(PALETTE_MAX);
+        let panel = [px, py, px + pw, py + (rows as f32 + 1.0) * row_h];
+        quads.push(Quad::solid(white, panel, BORDER_COL, full));
+        let inset = [
+            panel[0] + 1.0,
+            panel[1] + 1.0,
+            panel[2] - 1.0,
+            panel[3] - 1.0,
+        ];
+        quads.push(Quad::solid(white, inset, BODY, full));
+        // Query row.
+        let q = if self.palette_query.is_empty() {
+            "Type a command…".to_string()
+        } else {
+            self.palette_query.clone()
+        };
+        let q_col = if self.palette_query.is_empty() {
+            [0.5, 0.5, 0.56, 1.0]
+        } else {
+            TEXT
+        };
+        self.text_cache.draw(
+            quads,
+            &mut gfx.renderer,
+            &gfx.fonts,
+            &gfx.device,
+            &gfx.queue,
+            &q,
+            px + PAD,
+            py + (row_h - lh) * 0.5,
+            1.0,
+            q_col,
+            full,
+        );
+        let start = (self.palette_scroll.round() as usize).min(filtered.len());
+        for (i, prow) in filtered.iter().skip(start).take(PALETTE_MAX).enumerate() {
+            let row = start + i;
+            let y0 = py + (i as f32 + 1.0) * row_h;
+            let r = [px, y0, px + pw, y0 + row_h];
+            let hot = contains(r, mp);
+            if row == self.palette_sel || hot {
+                quads.push(Quad::solid(white, r, TITLE_FOCUS, full));
+            }
+            self.text_cache.draw(
+                quads,
+                &mut gfx.renderer,
+                &gfx.fonts,
+                &gfx.device,
+                &gfx.queue,
+                &prow.label,
+                px + PAD,
+                y0 + (row_h - lh) * 0.5,
+                1.0,
+                TEXT,
+                full,
+            );
+            // The description, dimmer, after the label — clipped to the row
+            // so a long one can't spill out of the panel.
+            if let Some(desc) = &prow.desc {
+                let dx = px + PAD + gfx.fonts.measure(&prow.label) as f32 + 14.0;
+                self.text_cache.draw(
+                    quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    desc,
+                    dx,
+                    y0 + (row_h - lh * 0.85) * 0.5,
+                    0.85,
+                    [0.5, 0.54, 0.6, 1.0],
+                    [r[0], r[1], r[2] - PAD, r[3]],
+                );
+            }
+        }
     }
 
     fn frame(&mut self) {
@@ -3764,86 +4065,7 @@ impl App {
 
         // Command palette (Cmd/Ctrl+K): dim the canvas, then a centred panel with
         // the typed query and the filtered commands (selected row highlighted).
-        if self.palette_open {
-            quads.push(Quad::solid(white, full, [0.0, 0.0, 0.0, 0.45], full));
-            let (px, py, pw, row_h) = Self::palette_layout(fb);
-            let filtered = self.palette_filtered();
-            let rows = filtered.len().min(PALETTE_MAX);
-            let panel = [px, py, px + pw, py + (rows as f32 + 1.0) * row_h];
-            quads.push(Quad::solid(white, panel, BORDER_COL, full));
-            let inset = [
-                panel[0] + 1.0,
-                panel[1] + 1.0,
-                panel[2] - 1.0,
-                panel[3] - 1.0,
-            ];
-            quads.push(Quad::solid(white, inset, BODY, full));
-            // Query row.
-            let q = if self.palette_query.is_empty() {
-                "Type a command…".to_string()
-            } else {
-                self.palette_query.clone()
-            };
-            let q_col = if self.palette_query.is_empty() {
-                [0.5, 0.5, 0.56, 1.0]
-            } else {
-                TEXT
-            };
-            self.text_cache.draw(
-                &mut quads,
-                &mut gfx.renderer,
-                &gfx.fonts,
-                &gfx.device,
-                &gfx.queue,
-                &q,
-                px + PAD,
-                py + (row_h - lh) * 0.5,
-                1.0,
-                q_col,
-                full,
-            );
-            let start = (self.palette_scroll.round() as usize).min(filtered.len());
-            for (i, prow) in filtered.iter().skip(start).take(PALETTE_MAX).enumerate() {
-                let row = start + i;
-                let y0 = py + (i as f32 + 1.0) * row_h;
-                let r = [px, y0, px + pw, y0 + row_h];
-                let hot = contains(r, mp);
-                if row == self.palette_sel || hot {
-                    quads.push(Quad::solid(white, r, TITLE_FOCUS, full));
-                }
-                self.text_cache.draw(
-                    &mut quads,
-                    &mut gfx.renderer,
-                    &gfx.fonts,
-                    &gfx.device,
-                    &gfx.queue,
-                    &prow.label,
-                    px + PAD,
-                    y0 + (row_h - lh) * 0.5,
-                    1.0,
-                    TEXT,
-                    full,
-                );
-                // The description, dimmer, after the label — clipped to the row
-                // so a long one can't spill out of the panel.
-                if let Some(desc) = &prow.desc {
-                    let dx = px + PAD + gfx.fonts.measure(&prow.label) as f32 + 14.0;
-                    self.text_cache.draw(
-                        &mut quads,
-                        &mut gfx.renderer,
-                        &gfx.fonts,
-                        &gfx.device,
-                        &gfx.queue,
-                        desc,
-                        dx,
-                        y0 + (row_h - lh * 0.85) * 0.5,
-                        0.85,
-                        [0.5, 0.54, 0.6, 1.0],
-                        [r[0], r[1], r[2] - PAD, r[3]],
-                    );
-                }
-            }
-        }
+        self.draw_palette(&mut quads, &mut gfx, fb, mp);
 
         // Filesystem inspector (Files button): dim the canvas, then a centred
         // panel listing the node's live virtual filesystem with a file preview.
@@ -4552,9 +4774,15 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(x, y) => (x, y),
                     MouseScrollDelta::PixelDelta(p) => (p.x as f32 / 50.0, p.y as f32 / 50.0),
                 };
-                // In the 3D view the wheel flies the camera along its gaze.
+                // In the 3D view the wheel flies the camera along its gaze
+                // (or scrolls the palette list while that's open).
                 if self.mode_3d {
-                    self.fly_scroll += dy;
+                    if self.palette_open {
+                        let max = Self::palette_max_scroll(self.palette_filtered().len());
+                        self.palette_scroll = (self.palette_scroll - dy).clamp(0.0, max);
+                    } else {
+                        self.fly_scroll += dy;
+                    }
                     return;
                 }
                 // While the palette is open, the wheel scrolls its list instead
@@ -4634,8 +4862,30 @@ impl ApplicationHandler for App {
                         self.keys_down.remove(&code);
                     }
                     // The 3D view owns the keyboard: WASD/QE fly (read from
-                    // `keys_down` each frame), Escape returns to the canvas.
+                    // `keys_down` each frame). Cmd/Ctrl+K still opens the
+                    // palette, which then captures keys (incl. paste); Escape
+                    // returns to the canvas.
                     if self.mode_3d {
+                        let app_chord = self.mods.super_key() || self.mods.control_key();
+                        if pressed && !event.repeat && app_chord && code == KeyCode::KeyK {
+                            self.palette_open = !self.palette_open;
+                            self.palette_query.clear();
+                            self.palette_sel = 0;
+                            self.palette_scroll = 0.0;
+                            return;
+                        }
+                        if self.palette_open {
+                            if pressed && app_chord && code == KeyCode::KeyV {
+                                if let Some(text) = self.clipboard_text() {
+                                    self.palette_query.push_str(&text);
+                                    self.palette_sel = 0;
+                                    self.palette_scroll = 0.0;
+                                }
+                            } else if pressed {
+                                self.palette_key(code, event.text.as_deref());
+                            }
+                            return;
+                        }
                         if pressed && code == KeyCode::Escape {
                             self.mode_3d = false;
                         }
