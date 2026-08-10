@@ -22,3 +22,14 @@ run = "git config core.hooksPath .hooks"
 [tasks.test]
 description = "Run the workspace test suite"
 run = "cargo nextest run --workspace"
+
+[tasks.build-plugins]
+description = "Build every plugin via its own `build` task (run after switching branches — built .wasm artifacts are gitignored and go stale)"
+run = """
+set -e
+for d in plugins/*/; do
+  [ -f "$d/mise.toml" ] || continue
+  echo "== $d"
+  (cd "$d" && mise run build)
+done
+"""
