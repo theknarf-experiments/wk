@@ -231,6 +231,8 @@ struct App {
     /// The 3D workspace view (toggled from the palette): its fly camera, the
     /// canvas point mapped to straight-ahead, and the lazily-built renderer.
     mode_3d: bool,
+    /// Fly mode: free 6-DoF flight. Off = walk (grounded at eye height).
+    fly3d: bool,
     cam3d: Camera3d,
     cyl_anchor: [f32; 2],
     renderer3d: Option<Renderer3d>,
@@ -340,6 +342,7 @@ impl App {
             },
             pan_target: [0.0, 0.0],
             mode_3d: false,
+            fly3d: false,
             cam3d: Camera3d::new(),
             cyl_anchor: [0.0, 0.0],
             renderer3d: None,
@@ -881,6 +884,17 @@ impl App {
                 PaletteCmd::Zoom(z),
             ));
         }
+        if self.mode_3d {
+            v.push(PaletteRow::new(
+                if self.fly3d { "Walk Mode" } else { "Fly Mode" },
+                d(if self.fly3d {
+                    "back on the ground (also F)"
+                } else {
+                    "free 6-DoF flight, Q/E down/up (also F)"
+                }),
+                PaletteCmd::ToggleFly,
+            ));
+        }
         v.push(PaletteRow::new(
             if self.mode_3d { "2D View" } else { "3D View" },
             d(if self.mode_3d {
@@ -1179,6 +1193,7 @@ impl App {
                     .zoom_at(z / self.cam.zoom, [fb[0] * 0.5, fb[1] * 0.5]);
                 self.pan_target = self.cam.pan;
             }
+            PaletteCmd::ToggleFly => self.fly3d = !self.fly3d,
             PaletteCmd::View3d => {
                 if self.mode_3d {
                     self.mode_3d = false;
@@ -1694,8 +1709,13 @@ impl App {
         } else {
             &no_keys
         };
-        self.cam3d
-            .advance(fly_keys, self.mods.shift_key(), cam_fly, 1.0 / 60.0);
+        self.cam3d.advance(
+            fly_keys,
+            self.mods.shift_key(),
+            cam_fly,
+            !self.fly3d,
+            1.0 / 60.0,
+        );
         // Keyboard → the active node, exactly like the 2D canvas: a graphical
         // node's surface gets wasi-gfx key events, a terminal node the encoded
         // bytes. (window_event only queues these when a node is focused and
@@ -2855,7 +2875,7 @@ impl App {
             &gfx.fonts,
             &gfx.device,
             &gfx.queue,
-            "3D view — hold right: look + WASD/QE fly · drag card/label: move + focus · click empty: unfocus · Esc exits",
+            "3D — hold right: look + WASD walk (F: fly) · drag card/label: move + focus · click empty: unfocus · Esc exits",
             PAD,
             fb[1] - MENU_H + PAD,
             1.0,
@@ -5275,6 +5295,10 @@ impl ApplicationHandler for App {
                                 }
                             }
                             self.key_events.push((key_event(code, self.mods), pressed));
+                            return;
+                        }
+                        if pressed && !event.repeat && code == KeyCode::KeyF {
+                            self.fly3d = !self.fly3d;
                             return;
                         }
                         if pressed && code == KeyCode::Escape {

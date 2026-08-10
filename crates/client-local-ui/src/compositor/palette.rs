@@ -25,6 +25,8 @@ pub(super) enum PaletteCmd {
     Zoom(f32),
     /// Enter the 3D workspace view (Esc returns to the canvas).
     View3d,
+    /// Toggle the 3D camera between grounded walking and free flight.
+    ToggleFly,
     Quit,
 }
 

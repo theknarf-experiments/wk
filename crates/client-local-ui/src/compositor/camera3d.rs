@@ -51,28 +51,42 @@ impl Camera3d {
     }
 
     /// Advance the camera one frame: held movement keys, plus `fly` units of
-    /// scroll-wheel travel along the view direction.
+    /// scroll-wheel travel along the view direction. In walk mode (the
+    /// VRChat-style default) movement stays on the ground plane at eye height;
+    /// fly mode moves along the full gaze with Q/E for down/up.
     pub(super) fn advance(
         &mut self,
         keys: &std::collections::HashSet<KeyCode>,
         sprint: bool,
         fly: f32,
+        walk: bool,
         dt: f32,
     ) {
         let speed = if sprint { SPRINT * SPEED } else { SPEED } * dt;
-        let f = self.forward();
+        let f = if walk {
+            // Gaze projected onto the ground, so looking down doesn't stall.
+            let (cy, sy) = (self.yaw.cos(), self.yaw.sin());
+            [sy, 0.0, -cy]
+        } else {
+            self.forward()
+        };
         let r = self.right();
         let mut mv = [0.0f32; 3];
         let key = |c| keys.contains(&c) as i32 as f32;
         let ahead = key(KeyCode::KeyW) - key(KeyCode::KeyS);
         let strafe = key(KeyCode::KeyD) - key(KeyCode::KeyA);
-        let rise = key(KeyCode::KeyE) - key(KeyCode::KeyQ);
         for i in 0..3 {
             mv[i] += f[i] * ahead * speed + r[i] * strafe * speed;
         }
-        mv[1] += rise * speed;
+        if !walk {
+            let rise = key(KeyCode::KeyE) - key(KeyCode::KeyQ);
+            mv[1] += rise * speed;
+        }
         for i in 0..3 {
             self.pos[i] += mv[i] + f[i] * fly * SCROLL_FLY;
+        }
+        if walk {
+            self.pos[1] = 0.0; // eye height above the plaza floor
         }
     }
 
