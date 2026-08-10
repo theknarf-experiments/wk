@@ -10,10 +10,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{
+    DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
+use winit::window::CursorGrabMode;
 use winit::window::{Window, WindowId};
 
 use crate::host_shell::Gfx;
@@ -231,6 +234,8 @@ struct App {
     drag3d: Option<(NodeId, [f32; 2])>,
     /// A wire drag in progress in 3D, from a node's typed out-port.
     wire3d: Option<(NodeId, PortKind)>,
+    /// Whether the cursor is currently grabbed+hidden for look mode.
+    look_captured: bool,
     /// Last known viewport size in screen px (updated each frame), so newly
     /// added nodes can be placed at the centre of the current view.
     viewport: [f32; 2],
@@ -326,6 +331,7 @@ impl App {
             text_cache3d: TextCache::default(),
             drag3d: None,
             wire3d: None,
+            look_captured: false,
             viewport: [1280.0, 800.0],
             z: Vec::new(),
             kbd_focus: None,
@@ -2720,6 +2726,31 @@ impl App {
         }
     }
 
+    /// Keep the cursor grab in sync with look mode (3D + right button held):
+    /// grabbed and invisible while looking, normal otherwise. Reconciled every
+    /// loop tick so every exit path (button release, Esc, palette toggle to
+    /// 2D) releases it.
+    fn sync_look_capture(&mut self) {
+        let want = self.mode_3d && self.rmb;
+        if want == self.look_captured {
+            return;
+        }
+        let Some(gfx) = &self.gfx else {
+            return;
+        };
+        if want {
+            // macOS supports Locked; Windows/X11 only Confined — try both.
+            let _ = gfx
+                .window
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| gfx.window.set_cursor_grab(CursorGrabMode::Confined));
+        } else {
+            let _ = gfx.window.set_cursor_grab(CursorGrabMode::None);
+        }
+        gfx.window.set_cursor_visible(!want);
+        self.look_captured = want;
+    }
+
     fn frame(&mut self) {
         let Some(mut gfx) = self.gfx.take() else {
             return;
@@ -4779,6 +4810,17 @@ impl ApplicationHandler for App {
     /// runs *inside* winit's handler (set for the whole pump). Rendering in the
     /// outer loop instead left a window where the handler was unset and a
     /// quit/close event would log "no handler was set".
+    fn device_event(&mut self, _el: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
+        // Raw (unaccelerated-position) mouse deltas: the only usable look
+        // input while the cursor is grabbed and frozen in 3D look mode.
+        if let DeviceEvent::MouseMotion { delta } = event {
+            if self.mode_3d && self.rmb {
+                self.look_delta[0] += delta.0 as f32;
+                self.look_delta[1] += delta.1 as f32;
+            }
+        }
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // A palette "Quit" command asks to exit on the next loop.
         if self.request_exit {
@@ -4786,6 +4828,7 @@ impl ApplicationHandler for App {
             return;
         }
         if self.gfx.is_some() {
+            self.sync_look_capture();
             self.create_pending_detached(event_loop);
             self.frame();
         }
@@ -4815,13 +4858,9 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let new = [(position.x / scale) as f32, (position.y / scale) as f32];
-                // In the 3D view a right-drag is mouse look.
-                if self.mode_3d && self.rmb {
-                    self.look_delta[0] += new[0] - self.mouse[0];
-                    self.look_delta[1] += new[1] - self.mouse[1];
-                }
-                self.mouse = new;
+                // (3D look mode reads raw `DeviceEvent::MouseMotion` deltas —
+                // the cursor is grabbed and frozen while it's held.)
+                self.mouse = [(position.x / scale) as f32, (position.y / scale) as f32];
             }
             WindowEvent::MouseInput {
                 state,
