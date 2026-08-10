@@ -1,0 +1,11 @@
+package wk:totem;
+
+/// The first wk:scene citizen: a node that is a real 3D object, not a panel.
+/// It builds a small crystal (a GLB assembled in code), floats it above its
+/// node, and spins it forever — click the crystal to reverse it with a kick.
+/// A proof that a wasm node can *be* geometry in wk's world.
+world totem {
+    import wk:scene/scene;
+
+    export run: func();
+}

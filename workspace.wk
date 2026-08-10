@@ -30,6 +30,9 @@ dependencies {
     synth "plugins/synth/target/wasm32-wasip1/debug/synth.wasm" {
         description "MIDI synth with tweakable knobs"
     }
+    totem "plugins/totem/target/wasm32-wasip1/debug/totem.wasm" {
+        description "a spinning 3D crystal (wk:scene) — click it in the 3D view"
+    }
     wsh "plugins/wsh/target/wasm32-wasip1/debug/wsh.wasm" {
         description "tiny toy shell in a terminal node"
     }

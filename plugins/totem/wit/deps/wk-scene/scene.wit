@@ -1,0 +1,17 @@
+package wk:scene;
+
+interface scene {
+    enum ray-event {
+        hover,
+        press,
+        release,
+    }
+
+    resource entity {
+        constructor(glb: list<u8>);
+        set-position: func(x: f32, y: f32, z: f32);
+        set-rotation-y: func(radians: f32);
+        set-scale: func(s: f32);
+        poll-event: func() -> option<ray-event>;
+    }
+}

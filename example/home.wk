@@ -25,6 +25,11 @@ workspace "01HQME0000000000000000WS00" {
         size 360.0 260.0
         pos3d 2.7 0.15 0.9 -1.893
     }
+    node "totem" "01HQME0000000000000000TM05" {
+        pos 1010.0 320.0
+        size 200.0 120.0
+        pos3d 0.0 -0.6 3.4 3.14159
+    }
     note "01HQME0000000000000000NT04" {
         text "Welcome home.\n\nThis plaza is example/home.glb —\na glTF world named by the .wk file.\n\nRight-drag: look + WASD fly.\nGrab a card's label to move it\nanywhere; scroll pushes/pulls.\n\nThe piano feeds the synth:\nfocus it and play A W S E D F..."
         pos 40.0 40.0
