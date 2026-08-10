@@ -1,0 +1,35 @@
+// vim: set filetype=kdl :
+// wk's home world — a VRChat-style plaza to exist in. The `world` line names
+// the glTF scene the 3D view surrounds you with (regenerate it with
+// `python3 scripts/gen-home-world.py`); the nodes carry free 3D poses
+// (`pos3d x y z yaw`) placing them around the plaza's centre. Enter with:
+//
+//   wk run example/home.wk        then  Cmd+K -> "3D View"
+//
+// The piano is wired to the synth — walk up and play it.
+import "../workspace.wk"
+world "home.glb"
+workspace "01HQME0000000000000000WS00" {
+    node "piano" "01HQME0000000000000000PN01" {
+        pos 420.0 40.0
+        size 560.0 220.0
+        pos3d -1.3 0.0 -2.3 0.514
+    }
+    node "synth" "01HQME0000000000000000SY02" {
+        pos 1010.0 40.0
+        size 360.0 260.0
+        pos3d 1.3 0.1 -2.3 -0.514
+    }
+    node "paint" "01HQME0000000000000000PT03" {
+        pos 420.0 320.0
+        size 360.0 260.0
+        pos3d 2.7 0.15 0.9 -1.893
+    }
+    note "01HQME0000000000000000NT04" {
+        text "Welcome home.\n\nThis plaza is example/home.glb —\na glTF world named by the .wk file.\n\nRight-drag: look + WASD fly.\nGrab a card's label to move it\nanywhere; scroll pushes/pulls.\n\nThe piano feeds the synth:\nfocus it and play A W S E D F..."
+        pos 40.0 40.0
+        size 340.0 250.0
+        pos3d 0.0 0.75 -2.9 0.0
+    }
+    midi "01HQME0000000000000000PN01" "01HQME0000000000000000SY02"
+}

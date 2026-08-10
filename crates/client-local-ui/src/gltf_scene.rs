@@ -245,6 +245,18 @@ mod tests {
     }
 
     #[test]
+    fn home_world_glb_loads() {
+        // The shipped home world parses and has real geometry in every mesh.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../example/home.glb");
+        let meshes = load_file(path).expect("home.glb loads");
+        assert!(meshes.len() >= 4, "sky/floor/columns/pedestals");
+        for m in &meshes {
+            assert!(!m.positions.is_empty() && !m.indices.is_empty());
+            assert_eq!(m.positions.len(), m.colors.len());
+        }
+    }
+
+    #[test]
     fn glb_triangle_loads_with_baked_transform_and_material() {
         let meshes = load_bytes(&tiny_glb()).expect("parses");
         assert_eq!(meshes.len(), 1);

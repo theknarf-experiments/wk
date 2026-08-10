@@ -1338,6 +1338,25 @@ mod tests {
     }
 
     #[test]
+    fn home_world_example_resolves_with_world_and_poses() {
+        let example = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example/home.wk"
+        ));
+        let doc = Document::load_resolved(example).expect("home.wk resolves");
+        assert_eq!(doc.world.as_deref(), Some("home.glb"));
+        // The home workspace is present with posed nodes and the piano→synth wire.
+        let ws = doc
+            .workspaces
+            .iter()
+            .find(|w| !w.nodes.is_empty())
+            .expect("home workspace");
+        let posed = ws.nodes.iter().filter(|n| n.pos3d.is_some()).count();
+        assert!(posed >= 4, "all home nodes carry 3D poses (got {posed})");
+        assert_eq!(ws.midi.len(), 1);
+    }
+
+    #[test]
     fn repo_example_resolves_against_the_root_deps() {
         // The shipped example imports the repo's deps-only root workspace.
         let example = Path::new(concat!(
