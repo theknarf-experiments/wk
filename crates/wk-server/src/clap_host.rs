@@ -721,6 +721,28 @@ mod tests {
         );
     }
 
+    /// The sequencer is a Rust wk:clap plugin with no `run` loop: a GUI node and
+    /// a note effect whose transport clock lives in `process`. Stopped, it passes
+    /// incoming MIDI through and its per-block clock advance is a no-op; it renders
+    /// on the main engine. (Playback is GUI-started, so it can't fire headlessly.)
+    #[test]
+    fn sequencer_is_a_gui_note_effect() {
+        let mut seq = instance(include_bytes!("../testdata/sequencer.wasm"), 48_000.0, 512);
+        assert!(seq.has_gui(), "the sequencer draws a piano roll");
+        seq.gui_render();
+
+        // Stopped: a note fed in is echoed (MIDI thru), and advancing 512 samples
+        // of clock produces nothing extra.
+        let ev = midi_to_event(&[0x90, 60, 100]).unwrap();
+        let res = seq.process(0, &[ev], None, &[]).unwrap();
+        let notes: Vec<Vec<u8>> = res.out_events.iter().filter_map(event_to_midi).collect();
+        assert_eq!(
+            notes,
+            vec![vec![0x90, 60, 100]],
+            "stopped: passes the note through and nothing else"
+        );
+    }
+
     #[test]
     fn midi_passthrough_becomes_a_clap_midi_event() {
         match midi_to_event(&[0x90, 60, 100]) {
