@@ -14,12 +14,14 @@
 #include <clap/clap.h>
 
 #include "gen/plugin.h"
+#include "wk_gui.h"
 
 // ---------------------------------------------------------------------------
 // The exported resource rep: a live CLAP plugin instance.
 // ---------------------------------------------------------------------------
 struct exports_wk_clap_plugins_plugin_t {
     const clap_plugin_t *clap;
+    bool gui_created;
 };
 
 // ---------------------------------------------------------------------------
@@ -161,6 +163,7 @@ bool exports_wk_clap_plugins_create(plugin_string_t *plugin_id,
     if (!cp) return false;
     exports_wk_clap_plugins_plugin_t *rep = malloc(sizeof(*rep));
     rep->clap = cp;
+    rep->gui_created = false;
     *ret = exports_wk_clap_plugins_plugin_new(rep);
     return true;
 }
@@ -741,4 +744,25 @@ bool exports_wk_clap_plugins_method_plugin_state_load(exports_wk_clap_plugins_bo
     }
     if (data->ptr) free(data->ptr);
     return ok;
+}
+
+// ---------------------------------------------------------------------------
+// wk GUI — bridge the wk:clap gui hooks to the plugin's optional `wk.gui`
+// extension (a headless plugin doesn't implement it, so these are no-ops).
+// ---------------------------------------------------------------------------
+bool exports_wk_clap_plugins_method_plugin_has_gui(exports_wk_clap_plugins_borrow_plugin_t self) {
+    return ext(self->clap, WK_EXT_GUI) != NULL;
+}
+
+void exports_wk_clap_plugins_method_plugin_gui_render(exports_wk_clap_plugins_borrow_plugin_t self) {
+    const wk_gui_t *g = (const wk_gui_t *)ext(self->clap, WK_EXT_GUI);
+    if (!g)
+        return;
+    if (!self->gui_created) {
+        self->gui_created = true;
+        if (g->create && !g->create(self->clap))
+            return;
+    }
+    if (g->render)
+        g->render(self->clap);
 }

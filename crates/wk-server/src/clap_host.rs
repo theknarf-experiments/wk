@@ -17,6 +17,17 @@ wasmtime::component::bindgen!({
     // `block_on`s them — `process()` never awaits host I/O, so it completes in
     // one poll.
     exports: { default: async },
+    // Reuse the main engine's wasi-gfx host types: a GUI plugin's surface is
+    // composited by the same host impl every other node uses (the main linker
+    // provides these; this bindgen only needs the types to line up).
+    with: {
+        "wasi:io/poll.pollable": wasmtime_wasi::p2::DynPollable,
+        "wasi:surface/surface.surface": crate::plugin::SurfaceState,
+        "wasi:graphics-context/graphics-context.context": crate::plugin::ContextState,
+        "wasi:graphics-context/graphics-context.abstract-buffer": crate::plugin::AbstractBufferState,
+        "wasi:frame-buffer/frame-buffer.device": crate::plugin::DeviceState,
+        "wasi:frame-buffer/frame-buffer.buffer": crate::plugin::BufferState,
+    },
 });
 
 pub use exports::wk::clap::plugins::ProcessResult;

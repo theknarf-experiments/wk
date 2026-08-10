@@ -340,6 +340,16 @@ interface plugins {
         state-save: func() -> option<list<u8>>;
         /// clap_plugin_state.load.
         state-load: func(data: list<u8>) -> bool;
+
+        // ---- wk GUI (a wk-native `wk.gui` extension, not CLAP's clap.gui) ----
+        /// Whether this plugin draws a GUI. A GUI plugin creates its own
+        /// `wasi:surface` (which the host composites) and paints it in
+        /// `gui-render`; the surface delivers its own pointer/key input, so no
+        /// separate input path is needed. `false` for a headless plugin.
+        has-gui: func() -> bool;
+        /// Render one UI frame: the host calls this per frame; the plugin polls
+        /// its surface's input and paints. No-op if it has no GUI.
+        gui-render: func();
     }
 
     /// clap_plugin.process result: status, one buffer per output port, and the
@@ -365,5 +375,10 @@ interface plugins {
 /// calling `process` from the audio path.
 world plugin {
     import host;
+    // wasi-gfx, so a plugin can draw a GUI to a surface the host composites — the
+    // same interfaces every other wk node uses. Only GUI plugins call these.
+    import wasi:surface/surface@0.0.1;
+    import wasi:graphics-context/graphics-context@0.0.1;
+    import wasi:frame-buffer/frame-buffer@0.0.1;
     export plugins;
 }
