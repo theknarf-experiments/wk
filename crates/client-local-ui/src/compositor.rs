@@ -1641,26 +1641,58 @@ impl App {
     /// mouse (drag panels back into canvas positions, or pointer input into
     /// surfaces), and render with depth.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn frame_3d(
         &mut self,
         gfx: &mut Gfx,
         surfaces: &[SharedSurface],
         node_surface: &HashMap<NodeId, SharedSurface>,
+        node_by_id: &HashMap<NodeId, SharedNode>,
         fb: [f32; 2],
         mp: [f32; 2],
         lmb: bool,
         down_edge: bool,
         up_edge: bool,
     ) {
-        // Fly camera: right-drag look, WASD/QE move (Shift sprints), wheel
-        // travels along the gaze. Keys never reach nodes in this view.
+        // Fly camera. Holding the right button is "look mode": mouse look plus
+        // WASD/QE flight (Shift sprints). Released, the keyboard belongs to
+        // the active (focused) node instead. The wheel always flies the gaze.
         self.cam3d
             .look(std::mem::replace(&mut self.look_delta, [0.0, 0.0]));
         let fly = std::mem::take(&mut self.fly_scroll);
-        // While the palette is open, typed WASD belongs to the query.
-        if !self.palette_open {
-            self.cam3d
-                .advance(&self.keys_down, self.mods.shift_key(), fly, 1.0 / 60.0);
+        let no_keys = HashSet::new();
+        let fly_keys = if self.rmb && !self.palette_open {
+            &self.keys_down
+        } else {
+            &no_keys
+        };
+        self.cam3d
+            .advance(fly_keys, self.mods.shift_key(), fly, 1.0 / 60.0);
+        // Keyboard → the active node, exactly like the 2D canvas: a graphical
+        // node's surface gets wasi-gfx key events, a terminal node the encoded
+        // bytes. (window_event only queues these when a node is focused and
+        // the camera isn't in look mode.)
+        if let Some(fid) = self.kbd_focus {
+            if let Some(surf) = node_surface.get(&fid) {
+                let mut s = surf.lock().unwrap();
+                for (ev, down) in &self.key_events {
+                    if *down {
+                        s.key_down.push_back(ev.clone());
+                    } else {
+                        s.key_up.push_back(ev.clone());
+                    }
+                }
+            } else if !self.term_input.is_empty() && !self.view.attached.contains(&fid) {
+                if let (Some(term), Some(node)) =
+                    (self.terminals.get_mut(&fid), node_by_id.get(&fid))
+                {
+                    if term.is_raw() {
+                        node.term_io.feed_in(&self.term_input);
+                    } else {
+                        term.key_input(&self.term_input, &node.term_io);
+                    }
+                }
+            }
         }
         self.key_events.clear();
         self.term_input.clear();
@@ -2236,6 +2268,9 @@ impl App {
                         let on_label = zone == Zone::Label;
                         let grab_here = down_edge && (on_label || p.body_drag || chord);
                         if grab_here {
+                            // Grabbing a node also makes it the active node —
+                            // the one the keyboard goes to.
+                            self.kbd_focus = Some(p.id);
                             if let (Some(&pos0), Some(cv)) =
                                 (self.view.win_pos.get(&p.id), ray_cylinder_canvas(o, d))
                             {
@@ -2267,6 +2302,10 @@ impl App {
                         }
                     }
                 }
+            } else if down_edge {
+                // A click on empty space clears the active node (so Escape can
+                // then exit the 3D view, and a focused vim keeps its Escape).
+                self.kbd_focus = None;
             }
         }
         // The port under the cursor lights up (hover / drop target). Captured
@@ -2380,12 +2419,19 @@ impl App {
                 p.center[2] - p.normal[2] * 0.005,
             ];
             let dragged = self.drag3d.is_some_and(|(id, _)| id == p.id);
+            let focused = self.kbd_focus == Some(p.id);
             quads3.push(Quad3::spanned(
                 back,
                 scale3(p.right, p.w * 0.5 + 0.015),
                 [0.0, p.h * 0.5 + 0.015, 0.0],
                 uv,
-                if dragged { WIRE_SEL_COL } else { p.border },
+                if dragged {
+                    WIRE_SEL_COL
+                } else if focused {
+                    TITLE_FOCUS
+                } else {
+                    p.border
+                },
                 white,
             ));
             match p.body {
@@ -2536,13 +2582,30 @@ impl App {
             &gfx.fonts,
             &gfx.device,
             &gfx.queue,
-            "3D view — WASD/QE move · right-drag look · scroll fly · drag cards (apps: label or Cmd) · Esc exits",
+            "3D view — hold right: look + WASD/QE fly · drag card/label: move + focus · click empty: unfocus · Esc exits",
             PAD,
             fb[1] - MENU_H + PAD,
             1.0,
             MUTED_TEXT,
             [0.0, 0.0, fb[0], fb[1]],
         );
+        // Who has the keyboard right now.
+        if let Some(fid) = self.kbd_focus {
+            let who = format!("keyboard → {}", self.node_label(fid));
+            self.text_cache.draw(
+                &mut hud,
+                &mut gfx.renderer,
+                &gfx.fonts,
+                &gfx.device,
+                &gfx.queue,
+                &who,
+                PAD,
+                PAD,
+                1.0,
+                TEXT,
+                [0.0, 0.0, fb[0], fb[1]],
+            );
+        }
         self.draw_palette(&mut hud, gfx, fb, mp);
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2808,6 +2871,7 @@ impl App {
                 &mut gfx,
                 &surfaces,
                 &node_surface,
+                &node_by_id,
                 fb,
                 mp,
                 lmb,
@@ -4884,6 +4948,21 @@ impl ApplicationHandler for App {
                             } else if pressed {
                                 self.palette_key(code, event.text.as_deref());
                             }
+                            return;
+                        }
+                        // With an active node and the camera not in look mode
+                        // (right button), keys queue for that node — including
+                        // Escape (vim lives on it). Unfocus by clicking empty
+                        // space; Escape exits 3D only when nothing is focused.
+                        if self.kbd_focus.is_some() && !self.rmb {
+                            if pressed {
+                                if let Some(bytes) =
+                                    encode_term_key(code, event.text.as_deref(), self.mods)
+                                {
+                                    self.term_input.extend(bytes);
+                                }
+                            }
+                            self.key_events.push((key_event(code, self.mods), pressed));
                             return;
                         }
                         if pressed && code == KeyCode::Escape {
