@@ -589,7 +589,11 @@ pub fn wire(workspace: &Path, a: &str, b: &str) -> Result<(), String> {
     let (ida, idb) = (resolve(&snap, a)?.id, resolve(&snap, b)?.id);
     send_command(
         &mut stream,
-        Command::Create(Resource::Wire { a: ida, b: idb }),
+        Command::Create(Resource::Wire {
+            a: ida,
+            b: idb,
+            audio: false,
+        }),
     )?;
     println!("wired {} <-> {}", short(ida), short(idb));
     Ok(())

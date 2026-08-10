@@ -158,7 +158,11 @@ mod tests {
                 pos: [12.5, -4.0],
                 ws: id(1),
             }),
-            Command::Create(Resource::Wire { a: id(2), b: id(3) }),
+            Command::Create(Resource::Wire {
+                a: id(2),
+                b: id(3),
+                audio: false,
+            }),
             Command::Update {
                 id: id(4),
                 patch: NodePatch {

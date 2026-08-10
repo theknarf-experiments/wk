@@ -128,6 +128,8 @@ const HOSTPORT_WIRE: [f32; 4] = [0.40, 0.78, 0.82, 1.0];
 const WIRE_COL: [f32; 4] = [0.55, 0.60, 0.72, 1.0];
 /// MIDI connection wires get a distinct (teal/green) colour.
 const MIDI_WIRE_COL: [f32; 4] = [0.35, 0.78, 0.62, 1.0];
+/// Audio connection wires between CLAP nodes (warm amber, distinct from MIDI).
+const AUDIO_WIRE_COL: [f32; 4] = [0.95, 0.65, 0.25, 1.0];
 /// Network node colours and membership wire (a virtual network / Docker bridge).
 const NET_BG: [f32; 4] = [0.14, 0.12, 0.20, 1.0];
 const NET_BORDER: [f32; 4] = [0.50, 0.40, 0.72, 1.0];
@@ -329,7 +331,7 @@ impl App {
     /// the single port their kind participates in.
     fn node_ports(&self, id: NodeId) -> Vec<Port> {
         use PortDir::{In, Out};
-        use PortKind::{Bind, Capture, Midi, Net, Serve};
+        use PortKind::{Audio, Bind, Capture, Midi, Net, Serve};
         let v = &self.view;
         let one = |kind, dir| vec![Port { kind, dir }];
         if v.notes.contains_key(&id) {
@@ -398,6 +400,18 @@ impl App {
             if net {
                 ports.push(Port {
                     kind: Net,
+                    dir: Out,
+                });
+            }
+            // A CLAP node exposes audio ports so its output can feed another
+            // CLAP node's input (synth → effect → speakers).
+            if is_clap {
+                ports.push(Port {
+                    kind: Audio,
+                    dir: In,
+                });
+                ports.push(Port {
+                    kind: Audio,
                     dir: Out,
                 });
             }
@@ -650,6 +664,7 @@ impl App {
             Wire::Serve(http, hp) => (http, hp, PortKind::Serve),
             Wire::Net(app, net) => (app, net, PortKind::Net),
             Wire::Capture(app, cap) => (cap, app, PortKind::Capture),
+            Wire::Audio(s, d) => (s, d, PortKind::Audio),
         };
         if self.view.win_pos.contains_key(&src) && self.view.win_pos.contains_key(&dst) {
             Some((
@@ -693,6 +708,12 @@ impl App {
                     .find(|&&(x, y)| pair(x, y))
                     .map(|&(x, y)| Wire::Capture(x, y))
             })
+            .or_else(|| {
+                s.audio_links
+                    .iter()
+                    .find(|&&(x, y)| pair(x, y))
+                    .map(|&(x, y)| Wire::Audio(x, y))
+            })
     }
 
     /// The connection wire nearest to `mp` within the pick radius, if any. Picks
@@ -706,7 +727,8 @@ impl App {
             .chain(s.midi_links.iter().map(|&(s, d)| Wire::Midi(s, d)))
             .chain(s.capture_links.iter().map(|&(a, c)| Wire::Capture(a, c)))
             .chain(s.serves.iter().map(|(&h, &hp)| Wire::Serve(h, hp)))
-            .chain(s.net_links.iter().map(|&(a, n)| Wire::Net(a, n)));
+            .chain(s.net_links.iter().map(|&(a, n)| Wire::Net(a, n)))
+            .chain(s.audio_links.iter().map(|&(s, d)| Wire::Audio(s, d)));
         let mut best: Option<(f32, Wire)> = None;
         for w in all {
             if let Some((a, b)) = self.wire_endpoints(w) {
@@ -1713,9 +1735,11 @@ impl App {
                         if target != d.id {
                             match self.wire_between(d.id, target) {
                                 Some(w) => self.conn.send(Command::Delete(ResourceRef::Wire(w))),
-                                None => self
-                                    .conn
-                                    .send(Command::Create(Resource::Wire { a: d.id, b: target })),
+                                None => self.conn.send(Command::Create(Resource::Wire {
+                                    a: d.id,
+                                    b: target,
+                                    audio: kind == PortKind::Audio,
+                                })),
                             }
                         }
                     }
@@ -2187,6 +2211,14 @@ impl App {
             if let Some((a, b)) = self.wire_endpoints(Wire::Net(app, net)) {
                 let sel = self.wire_sel == Some(Wire::Net(app, net));
                 let col = if sel { WIRE_SEL_COL } else { NET_WIRE_COL };
+                draw_connection(&mut quads, white, a, b, sel, col, zf, full);
+            }
+        }
+        // Audio wires between CLAP nodes.
+        for &(src, dst) in &self.view.audio_links {
+            if let Some((a, b)) = self.wire_endpoints(Wire::Audio(src, dst)) {
+                let sel = self.wire_sel == Some(Wire::Audio(src, dst));
+                let col = if sel { WIRE_SEL_COL } else { AUDIO_WIRE_COL };
                 draw_connection(&mut quads, white, a, b, sel, col, zf, full);
             }
         }

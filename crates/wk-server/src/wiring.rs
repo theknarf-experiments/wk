@@ -246,7 +246,8 @@ mod tests {
             | Wire::Midi(a, b)
             | Wire::Serve(a, b)
             | Wire::Net(a, b)
-            | Wire::Capture(a, b) => (a, b),
+            | Wire::Capture(a, b)
+            | Wire::Audio(a, b) => (a, b),
         }
     }
 

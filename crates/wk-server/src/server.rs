@@ -186,6 +186,8 @@ pub struct View {
     pub net_links: Vec<(NodeId, NodeId)>,
     /// Screen-capture grants as (app, Capture node).
     pub capture_links: Vec<(NodeId, NodeId)>,
+    /// Audio links between CLAP nodes as (source output, destination input).
+    pub audio_links: Vec<(NodeId, NodeId)>,
     /// Per-serve container-port overrides as (served, hostport) → guest port, so
     /// the UI can show a HostPort's `host→container` mapping.
     pub serve_ports: HashMap<(NodeId, NodeId), u16>,
@@ -272,6 +274,7 @@ impl View {
             midi_links: keep_pairs(&self.midi_links, mine),
             net_links: keep_pairs(&self.net_links, mine),
             capture_links: keep_pairs(&self.capture_links, mine),
+            audio_links: keep_pairs(&self.audio_links, mine),
             serve_ports: keep_pair_map(&self.serve_ports, mine),
             capture_feeds: keep_map(&self.capture_feeds, mine),
             attached: keep_set(&self.attached, mine),
@@ -293,6 +296,7 @@ impl View {
             Wire::Midi(s, d) => self.midi_links.contains(&(s, d)),
             Wire::Serve(h, hp) => self.serves.get(&h) == Some(&hp),
             Wire::Capture(a, c) => self.capture_links.contains(&(a, c)),
+            Wire::Audio(a, b) => self.audio_links.contains(&(a, b)),
             Wire::Net(app, net) => self.net_links.contains(&(app, net)),
         }
     }
@@ -317,7 +321,8 @@ fn wire_ends(w: Wire) -> (NodeId, NodeId) {
         | Wire::Midi(a, b)
         | Wire::Serve(a, b)
         | Wire::Net(a, b)
-        | Wire::Capture(a, b) => (a, b),
+        | Wire::Capture(a, b)
+        | Wire::Audio(a, b) => (a, b),
     }
 }
 
@@ -470,6 +475,8 @@ pub struct Graph {
     pub net_links: Vec<(NodeId, NodeId)>,
     /// Screen-capture grants, as (app node id, Capture node id).
     pub capture_links: Vec<(NodeId, NodeId)>,
+    /// Audio links between CLAP nodes, as (source output, destination input).
+    pub audio_links: Vec<(NodeId, NodeId)>,
 
     /// Iroh uplink nodes' ed25519 secrets, so a node's ticket (its dialable
     /// identity) survives restarts. The peer ticket it dials lives in
@@ -822,6 +829,7 @@ impl Server {
         // Drop it from MIDI routing (as a source) and its desired wires.
         self.host.midi().lock().unwrap().remove_node(id);
         self.graph.midi_links.retain(|&(s, d)| s != id && d != id);
+        self.graph.audio_links.retain(|&(s, d)| s != id && d != id);
         self.routed.retain(|&(s, d)| s != id && d != id);
         self.forget(id);
     }
@@ -1199,7 +1207,9 @@ impl Server {
             Some(Wire::Net(app, net)) => self.toggle_net(app, net),
             Some(Wire::Capture(app, cap)) => self.toggle_capture(app, cap),
             Some(Wire::Midi(src, dst)) => self.toggle_midi(src, dst),
-            None => {}
+            // `classify` never yields an audio wire (it's marked on the command,
+            // not inferred from node kinds); handled in the `Resource::Wire` arm.
+            Some(Wire::Audio(..)) | None => {}
         }
     }
 
@@ -1585,6 +1595,19 @@ impl Server {
         self.sync_midi();
     }
 
+    /// Toggle an audio link (source output → destination input) between two CLAP
+    /// nodes and push the new edge set to the audio engine.
+    fn toggle_audio(&mut self, src: NodeId, dst: NodeId) {
+        wiring::toggle_pair(&mut self.graph.audio_links, src, dst);
+        self.sync_clap();
+    }
+
+    /// Reconcile the audio engine's graph against the desired `audio_links`. The
+    /// engine ignores edges whose nodes aren't live, so this is just the edge set.
+    fn sync_clap(&self) {
+        self.host.clap().set_edges(self.graph.audio_links.clone());
+    }
+
     /// Reconcile the MIDI router against the desired `midi_links`: add each new
     /// route (once its destination exists), drop routes no longer wired.
     fn sync_midi(&mut self) {
@@ -1632,6 +1655,7 @@ impl Server {
             Wire::Midi(s, d) => self.graph.midi_links.contains(&(s, d)),
             Wire::Serve(h, hp) => self.graph.serve_links.contains(&(h, hp)),
             Wire::Capture(a, c) => self.graph.capture_links.contains(&(a, c)),
+            Wire::Audio(a, b) => self.graph.audio_links.contains(&(a, b)),
             Wire::Net(app, net) => self.graph.net_links.contains(&(app, net)),
         }
     }
@@ -1652,6 +1676,11 @@ impl Server {
             Wire::Serve(h, hp) => {
                 if self.graph.serve_links.contains(&(h, hp)) {
                     self.toggle_serve(h, hp);
+                }
+            }
+            Wire::Audio(s, d) => {
+                if self.graph.audio_links.contains(&(s, d)) {
+                    self.toggle_audio(s, d);
                 }
             }
             Wire::Net(app, net) => {
@@ -1713,6 +1742,7 @@ impl Server {
         self.graph.connections.retain(|&(_, app)| app != id);
         self.graph.net_links.retain(|&(app, _)| app != id);
         self.graph.midi_links.retain(|&(s, d)| s != id && d != id);
+        self.graph.audio_links.retain(|&(s, d)| s != id && d != id);
         self.graph
             .serve_links
             .retain(|&(h, hp)| h != id && hp != id);
@@ -1880,8 +1910,10 @@ impl Server {
                 }
                 return;
             }
-            Command::Create(Resource::Wire { a, b }) => {
-                // Only record when the create will actually connect.
+            Command::Create(Resource::Wire { a, b, audio: _ }) => {
+                // Only record when the create will actually connect. Audio wires
+                // are a plain pair-toggle (self-inverse), so undo needs no extra
+                // bookkeeping here — only the "one per source" net/serve wires do.
                 if !self.wired(*a, *b) {
                     // Net/serve wires are "one per source": connecting may
                     // displace an existing link, which undo must restore.
@@ -1999,8 +2031,12 @@ impl Server {
             },
             // Create is create only: a wire that already exists is left alone
             // (removal is Delete, so a create-only token can never disconnect).
-            Command::Create(Resource::Wire { a, b }) => {
-                if !self.wired(a, b) {
+            Command::Create(Resource::Wire { a, b, audio }) => {
+                if audio {
+                    if !self.graph.audio_links.contains(&(a, b)) {
+                        self.toggle_audio(a, b);
+                    }
+                } else if !self.wired(a, b) {
                     self.connect_toggle(a, b);
                 }
             }
@@ -2525,6 +2561,7 @@ impl Server {
             midi_links: self.graph.midi_links.clone(),
             net_links: self.graph.net_links.clone(),
             capture_links: self.graph.capture_links.clone(),
+            audio_links: self.graph.audio_links.clone(),
             serve_ports: self.graph.serve_ports.clone(),
             capture_feeds: self.capture_feeds.clone(),
             attached: self.attached.clone(),
@@ -2634,6 +2671,7 @@ impl Server {
         wires.extend(wire("midi", &v.midi_links));
         wires.extend(wire("net", &v.net_links));
         wires.extend(wire("capture", &v.capture_links));
+        wires.extend(wire("audio", &v.audio_links));
         wires.extend(v.serves.iter().map(|(&http, &hp)| WireInfo {
             kind: "serve".to_string(),
             a: http,
@@ -2698,10 +2736,18 @@ mod model_tests {
         nets.sort();
         let (net1, net2) = (nets[0], nets[1]);
 
-        s.apply(Command::Create(Resource::Wire { a: uplink, b: net1 }));
+        s.apply(Command::Create(Resource::Wire {
+            a: uplink,
+            b: net1,
+            audio: false,
+        }));
         assert!(s.graph.net_links.contains(&(uplink, net1)));
         // Move membership to net2 — displaces the net1 link.
-        s.apply(Command::Create(Resource::Wire { a: uplink, b: net2 }));
+        s.apply(Command::Create(Resource::Wire {
+            a: uplink,
+            b: net2,
+            audio: false,
+        }));
         assert!(s.graph.net_links.contains(&(uplink, net2)));
         assert!(!s.graph.net_links.contains(&(uplink, net1)));
 
@@ -3111,7 +3157,11 @@ mod model_tests {
                 .find(|(_, r)| r.kind == Kind::Network)
                 .map(|(&id, _)| id)
                 .expect("network node");
-            s.apply(Command::Create(Resource::Wire { a: iroh, b: net }));
+            s.apply(Command::Create(Resource::Wire {
+                a: iroh,
+                b: net,
+                audio: false,
+            }));
             assert!(s.graph.net_links.contains(&(iroh, net)));
             iroh
         };
@@ -3173,7 +3223,11 @@ mod model_tests {
                 .find(|(_, r)| r.kind == Kind::Network)
                 .map(|(&id, _)| id)
                 .expect("network node");
-            s.apply(Command::Create(Resource::Wire { a: uplink, b: net }));
+            s.apply(Command::Create(Resource::Wire {
+                a: uplink,
+                b: net,
+                audio: false,
+            }));
             uplink
         };
         let va = setup(&mut a);

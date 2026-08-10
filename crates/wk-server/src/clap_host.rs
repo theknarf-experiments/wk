@@ -409,6 +409,26 @@ impl ClapAudio {
     }
 }
 
+#[cfg(test)]
+impl ClapAudio {
+    /// Build an engine that never opens an audio device (for tests): nodes are
+    /// added and `render` can be driven by hand at 48 kHz / stereo.
+    fn new_headless(router: crate::midi::Router) -> Result<Self> {
+        let a = Self::new(router)?;
+        a.inner.lock().unwrap().stream_started = true;
+        Ok(a)
+    }
+
+    /// Render one block synchronously (test-only; the device thread does this).
+    fn render_block(&self, frames: usize, channels: usize) -> Vec<f32> {
+        let mut e = self.inner.lock().unwrap();
+        e.channels = channels;
+        let mut data = vec![0.0f32; frames * channels];
+        e.render(&mut data);
+        data
+    }
+}
+
 impl Mixer {
     /// Render one block: run every node in dependency order and mix the sinks.
     fn render(&mut self, data: &mut [f32]) {
@@ -599,6 +619,36 @@ mod tests {
             .collect();
         assert!(notes.contains(&60), "echoes the original note");
         assert!(notes.contains(&72), "adds an octave up");
+    }
+
+    /// A node with a downstream audio edge is routed *into* its destination, not
+    /// to the speakers. Two synths A and B, edge A→B: a note played on A produces
+    /// audio, but because A feeds B (a synth that ignores audio input and has no
+    /// note of its own), the speakers stay silent — proving the graph routes A's
+    /// output away from the mix. Without the edge, A reaches the speakers.
+    #[test]
+    fn audio_edge_routes_a_node_away_from_the_speakers() {
+        let synth = include_bytes!("../testdata/polysynth.wasm");
+        let note = |inbox: &crate::midi::SharedInbox| {
+            inbox.lock().unwrap().push(vec![0x90, 69, 100]);
+        };
+
+        // A alone: the note reaches the speakers.
+        let solo = ClapAudio::new_headless(crate::midi::new_router()).unwrap();
+        let a = crate::midi::new_inbox();
+        solo.add(NodeId::new(), synth, a.clone()).unwrap();
+        note(&a);
+        assert!(peak(&solo.render_block(256, 2)) > 0.0);
+
+        // A → B: the note on A is routed into B (silent) — speakers stay quiet.
+        let chain = ClapAudio::new_headless(crate::midi::new_router()).unwrap();
+        let (ia, ib) = (crate::midi::new_inbox(), crate::midi::new_inbox());
+        let (a_id, b_id) = (NodeId::new(), NodeId::new());
+        chain.add(a_id, synth, ia.clone()).unwrap();
+        chain.add(b_id, synth, ib.clone()).unwrap();
+        chain.set_edges(vec![(a_id, b_id)]);
+        note(&ia);
+        assert_eq!(peak(&chain.render_block(256, 2)), 0.0);
     }
 
     #[test]

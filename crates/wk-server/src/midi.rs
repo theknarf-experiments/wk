@@ -35,7 +35,7 @@ pub struct Inbox {
 }
 
 impl Inbox {
-    fn push(&mut self, msg: Message) {
+    pub(crate) fn push(&mut self, msg: Message) {
         // Bound the backlog so a node that never reads can't grow it forever.
         if self.queue.len() < 1024 {
             self.queue.push_back(msg);

@@ -35,6 +35,8 @@ pub enum Wire {
     /// An app node's grant from a Screen Capture node (app, capture) — the app
     /// may read captured frames while wired.
     Capture(NodeId, NodeId),
+    /// An audio link between two CLAP nodes (source output → destination input).
+    Audio(NodeId, NodeId),
 }
 
 /// The kinds of resource a [`Command`] acts on. Together with an [`Action`] this
@@ -151,10 +153,12 @@ pub enum Resource {
         pos: [f32; 2],
         ws: NodeId,
     },
-    /// A connection between two nodes (the kind is inferred from them). No-op if
-    /// they are already wired — removal is [`ResourceRef::Wire`] + Delete, never
-    /// a side effect of create.
-    Wire { a: NodeId, b: NodeId },
+    /// A connection between two nodes. The kind is inferred from the two nodes,
+    /// except that `audio` (dragged from an audio port between two CLAP nodes) is
+    /// ambiguous with MIDI by node kind alone, so the client marks it explicitly.
+    /// No-op if they are already wired — removal is [`ResourceRef::Wire`] +
+    /// Delete, never a side effect of create.
+    Wire { a: NodeId, b: NodeId, audio: bool },
     /// A new (empty) workspace with a client-minted id, so the client can switch
     /// its own view to the new tab immediately.
     Workspace { id: NodeId },
