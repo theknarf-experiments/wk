@@ -1747,6 +1747,17 @@ impl App {
 
         self.drive_surfaces(gfx, surfaces);
 
+        // The 3D renderer must exist before anything uploads meshes — the
+        // wk:scene entity loader runs below and caches its result, so a
+        // missing renderer on the first frame would cache entities as empty.
+        if self.renderer3d.is_none() {
+            self.renderer3d = Some(Renderer3d::new(
+                &gfx.device,
+                gfx.surface_desc.format,
+                gfx.renderer.texture_layout(),
+            ));
+        }
+
         // Drop terminal textures whose node vanished.
         let stale_terms: Vec<NodeId> = self
             .term_views
@@ -2235,8 +2246,10 @@ impl App {
                 (e.id, e.node_id, e.pos, e.yaw, e.scale, e.glb.clone())
             };
             live_ents.insert(id);
-            // Load the entity's GLB into GPU meshes on first sight.
-            if !self.entity_meshes.contains_key(&id) {
+            // Load the entity's GLB into GPU meshes on first sight. (Only
+            // once the renderer exists — caching an empty result here is
+            // permanent, by design, for genuinely broken GLBs.)
+            if !self.entity_meshes.contains_key(&id) && self.renderer3d.is_some() {
                 let gpu = match crate::gltf_scene::load_bytes(&glb) {
                     Ok(cpu) => {
                         let r3d = self.renderer3d.as_ref();
@@ -2554,14 +2567,6 @@ impl App {
         }
 
         // ---- build the world ----
-        // The renderer is created up front (the world loader needs it too).
-        if self.renderer3d.is_none() {
-            self.renderer3d = Some(Renderer3d::new(
-                &gfx.device,
-                gfx.surface_desc.format,
-                gfx.renderer.texture_layout(),
-            ));
-        }
         // (Re)load the document's glTF world when its path changes; a failed
         // load is remembered as empty so it isn't retried every frame.
         if self.view.world.as_deref() != self.world_scene.as_ref().map(|(p, _)| p.as_str()) {
