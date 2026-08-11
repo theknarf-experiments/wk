@@ -4,10 +4,17 @@
 //! package-manager path — a dependency in the workspace file can be `oci://<ref>` instead
 //! of a local path, e.g. `oci://ghcr.io/org/name:1.0`.
 //!
-//! Pulled artifacts are cached by reference under `~/.cache/wk/oci/`, so `wk run`
-//! only hits the network the first time.
+//! Pulled artifacts are cached under `~/.cache/wk/oci/` content-addressed:
+//! wasm lives in `blobs/` named by its sha256, and `refs.json` maps each
+//! reference to the digest it currently points at (Docker's repositories.json,
+//! in miniature). Two references to the same bytes share one blob, and
+//! re-pulling a moved tag just repoints the index — so `wk run` only hits the
+//! network the first time.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+use sha2::Digest;
 
 use oci_client::client::{ClientConfig, ClientProtocol, Config, ImageLayer};
 use oci_client::secrets::RegistryAuth;
@@ -72,8 +79,93 @@ pub(crate) fn sanitize(reference: &str) -> String {
         .collect()
 }
 
-/// Where a pulled artifact for `reference` is cached.
-pub fn cache_path(reference: &str) -> PathBuf {
+/// The content digest key for `bytes` (`sha256-<hex>`), the naming scheme the
+/// whole store uses (blobs here, layer tars and image ids in `crate::images`).
+pub(crate) fn digest(bytes: &[u8]) -> String {
+    let hex: String = sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("sha256-{hex}")
+}
+
+/// Where the blob for `digest` lives.
+fn blob_path(digest: &str) -> PathBuf {
+    cache_dir().join("blobs").join(format!("{digest}.wasm"))
+}
+
+/// Store `bytes` in the blob store (a no-op if already stored) and return its
+/// digest key. Written to a temp file and renamed, so a torn write can't leave
+/// wrong content under a digest name.
+pub(crate) fn put_blob(bytes: &[u8]) -> Result<String, String> {
+    let digest = digest(bytes);
+    let path = blob_path(&digest);
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        }
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        std::fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).map_err(|e| format!("store blob {digest}: {e}"))?;
+    }
+    Ok(digest)
+}
+
+/// Path of the reference → blob-digest index.
+fn refs_path() -> PathBuf {
+    cache_dir().join("refs.json")
+}
+
+fn load_refs() -> BTreeMap<String, String> {
+    std::fs::read(refs_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn save_refs(refs: &BTreeMap<String, String>) -> Result<(), String> {
+    let json = serde_json::to_vec_pretty(refs).map_err(|e| format!("encode refs: {e}"))?;
+    let path = refs_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&path, json).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// Store pulled wasm for `reference`: the bytes by content in the blob store,
+/// and a ref-index entry pointing the reference at them. Returns the blob path.
+pub(crate) fn store_artifact(reference: &str, wasm: &[u8]) -> Result<PathBuf, String> {
+    let digest = put_blob(wasm)?;
+    let mut refs = load_refs();
+    if refs.get(reference) != Some(&digest) {
+        refs.insert(reference.to_string(), digest.clone());
+        save_refs(&refs)?;
+    }
+    Ok(blob_path(&digest))
+}
+
+/// The cached wasm for `reference`, if pulled: resolved through the ref index
+/// to its content-addressed blob. A cache file from the pre-index layout
+/// (`<sanitized-ref>.wasm`) is migrated into the blob store on first touch.
+pub fn cached_artifact(reference: &str) -> Option<PathBuf> {
+    if let Some(digest) = load_refs().get(reference) {
+        let path = blob_path(digest);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    let legacy = legacy_ref_path(reference);
+    let bytes = std::fs::read(&legacy).ok()?;
+    let stored = store_artifact(reference, &bytes).ok()?;
+    let _ = std::fs::remove_file(&legacy);
+    Some(stored)
+}
+
+/// The pre-index cache location for `reference` (keyed by sanitized name).
+/// Only read for migration — and as `local_path`'s not-yet-pulled placeholder,
+/// so an unpulled `oci://` dependency still has a stable (nonexistent) path.
+pub(crate) fn legacy_ref_path(reference: &str) -> PathBuf {
     cache_dir().join(format!("{}.wasm", sanitize(reference)))
 }
 
@@ -168,8 +260,8 @@ pub(crate) fn ensure_component(bytes: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("componentize pulled module: {e:#}"))
 }
 
-/// Pull `reference` into the local cache/store: a Wasm OCI Artifact writes its
-/// component to the cache path; a container image stores its layers + config
+/// Pull `reference` into the local cache/store: a Wasm OCI Artifact stores its
+/// component in the blob store; a container image stores its layers + config
 /// via `crate::images` (entrypoint extracted and componentized as needed).
 pub fn pull_into_cache(reference: &str) -> Result<(), String> {
     let image: Reference = reference
@@ -198,11 +290,8 @@ pub fn pull_into_cache(reference: &str) -> Result<(), String> {
             .is_some_and(|l| l.media_type == WASM_LAYER);
     if is_artifact {
         let wasm = ensure_component(&data.layers[0].data)?;
-        let path = cache_path(reference);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        return std::fs::write(&path, wasm).map_err(|e| e.to_string());
+        store_artifact(reference, &wasm)?;
+        return Ok(());
     }
     // A container image: tar layers + config.
     let layers: Vec<(String, Vec<u8>)> = data
@@ -261,12 +350,78 @@ mod tests {
     }
 
     #[test]
-    fn cache_path_is_stable_and_under_cache() {
-        let a = cache_path("ghcr.io/org/foo:1.0");
-        let b = cache_path("ghcr.io/org/foo:1.0");
+    fn legacy_ref_path_is_stable_and_under_cache() {
+        let a = legacy_ref_path("ghcr.io/org/foo:1.0");
+        let b = legacy_ref_path("ghcr.io/org/foo:1.0");
         assert_eq!(a, b);
         assert!(a.to_string_lossy().ends_with(".wasm"));
         // No path separators from the reference leak into the filename.
         assert!(!a.file_name().unwrap().to_string_lossy().contains('/'));
+    }
+
+    /// Point the cache at a fresh temp dir (nextest = one process per test, so
+    /// setting the env var is safe).
+    fn isolated_cache(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wk-oci-cache-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        dir
+    }
+
+    #[test]
+    fn blobs_are_content_addressed_and_deduped() {
+        isolated_cache("blobs");
+        let a = put_blob(b"same bytes").unwrap();
+        let b = put_blob(b"same bytes").unwrap();
+        let c = put_blob(b"other bytes").unwrap();
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a.starts_with("sha256-"));
+        assert!(blob_path(&a).is_file());
+        assert!(blob_path(&c).is_file());
+    }
+
+    #[test]
+    fn two_references_to_the_same_bytes_share_one_blob() {
+        isolated_cache("sharedblob");
+        let a = store_artifact("ghcr.io/org/foo:1.0", b"\0asm-shared").unwrap();
+        let b = store_artifact("ghcr.io/org/bar:2.0", b"\0asm-shared").unwrap();
+        assert_eq!(a, b, "both refs resolve to the same blob");
+        assert_eq!(cached_artifact("ghcr.io/org/foo:1.0"), Some(a.clone()));
+        assert_eq!(cached_artifact("ghcr.io/org/bar:2.0"), Some(a));
+    }
+
+    #[test]
+    fn repulling_a_moved_tag_repoints_the_index() {
+        isolated_cache("movedtag");
+        let old = store_artifact("ghcr.io/org/app:latest", b"\0asm-v1").unwrap();
+        let new = store_artifact("ghcr.io/org/app:latest", b"\0asm-v2").unwrap();
+        assert_ne!(old, new);
+        assert_eq!(cached_artifact("ghcr.io/org/app:latest"), Some(new));
+        // The old blob stays (content-addressed; another ref may point at it).
+        assert!(old.is_file());
+    }
+
+    #[test]
+    fn legacy_ref_keyed_files_migrate_into_the_blob_store() {
+        isolated_cache("migrate");
+        let reference = "ghcr.io/org/old:1.0";
+        let legacy = legacy_ref_path(reference);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, b"\0asm-legacy").unwrap();
+
+        let resolved = cached_artifact(reference).expect("migrates and resolves");
+        assert_eq!(resolved, blob_path(&digest(b"\0asm-legacy")));
+        assert_eq!(std::fs::read(&resolved).unwrap(), b"\0asm-legacy");
+        assert!(!legacy.exists(), "legacy file moved into the blob store");
+        // Second lookup hits the index directly.
+        assert_eq!(cached_artifact(reference), Some(resolved));
+    }
+
+    #[test]
+    fn unpulled_reference_resolves_to_nothing() {
+        isolated_cache("unpulled");
+        assert_eq!(cached_artifact("ghcr.io/org/nope:1.0"), None);
     }
 }

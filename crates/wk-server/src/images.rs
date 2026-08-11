@@ -14,7 +14,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
 
 use wk_dockerfile::{self as dockerfile, Instr};
 
@@ -104,13 +103,6 @@ pub fn entrypoint_path(id: &str) -> PathBuf {
     store_dir().join("images").join(format!("{id}.wasm"))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    sha2::Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
 fn write_creating_dirs(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
@@ -121,7 +113,7 @@ fn write_creating_dirs(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// Store a layer tarball by content digest (a no-op if already stored).
 /// Returns the digest key.
 pub fn put_layer(tar: &[u8]) -> Result<String, String> {
-    let digest = format!("sha256-{}", sha256_hex(tar));
+    let digest = crate::oci::digest(tar);
     let path = layer_path(&digest);
     if !path.exists() {
         write_creating_dirs(&path, tar)?;
@@ -534,9 +526,10 @@ pub type AdaptFn = dyn Fn(&[u8]) -> Result<Vec<u8>, String>;
 /// if compressed) become content-addressed layers, the image config's
 /// Entrypoint/Cmd/Env/WorkingDir/Labels become the manifest, and the
 /// entrypoint wasm is extracted from the rootfs — run through `adapt` (which
-/// componentizes a core module; see `crate::oci`) — and written to the
-/// artifact cache path so `Source::Oci` loads it unchanged. The image is
-/// stored under the sanitized reference, so `FROM <reference>` finds it.
+/// componentizes a core module; see `crate::oci`) — and stored in the
+/// content-addressed blob store under the reference, so `Source::Oci` loads it
+/// unchanged. The image is stored under the sanitized reference, so
+/// `FROM <reference>` finds it.
 pub fn store_pulled_image(
     reference: &str,
     layers: &[(String, Vec<u8>)],
@@ -626,7 +619,7 @@ pub fn store_pulled_image(
 
     let id = crate::oci::sanitize(reference);
     save_image(&id, &manifest)?;
-    write_creating_dirs(&crate::oci::cache_path(reference), &wasm)?;
+    crate::oci::store_artifact(reference, &wasm)?;
     Ok(id)
 }
 
@@ -875,7 +868,7 @@ pub fn build_with_runner(
     // Content-addressed image id over the manifest (layers + config).
     let manifest_json =
         serde_json::to_vec(&manifest).map_err(|e| format!("encode manifest: {e}"))?;
-    let id = format!("sha256-{}", sha256_hex(&manifest_json));
+    let id = crate::oci::digest(&manifest_json);
     save_image(&id, &manifest)?;
     write_creating_dirs(&entrypoint_path(&id), &wasm)?;
     Ok(id)
@@ -1230,12 +1223,10 @@ mod tests {
         let stored = std::fs::read(layer_path(&m.layers[1])).unwrap();
         assert!(!stored.starts_with(&[0x1f, 0x8b]), "stored as plain tar");
 
-        // The entrypoint component landed at the artifact cache path, so
-        // Source::Oci's local_path works unchanged.
-        assert_eq!(
-            std::fs::read(crate::oci::cache_path(reference)).unwrap(),
-            component
-        );
+        // The entrypoint component landed in the blob store under the
+        // reference, so Source::Oci's local_path works unchanged.
+        let cached = crate::oci::cached_artifact(reference).expect("reference resolves");
+        assert_eq!(std::fs::read(cached).unwrap(), component);
     }
 
     #[test]
@@ -1258,10 +1249,8 @@ mod tests {
         let reference = "docker.io/org/mod:1";
         store_pulled_image(reference, &layers, config, &|_| Ok(b"ADAPTED".to_vec()))
             .expect("stores");
-        assert_eq!(
-            std::fs::read(crate::oci::cache_path(reference)).unwrap(),
-            b"ADAPTED"
-        );
+        let cached = crate::oci::cached_artifact(reference).expect("reference resolves");
+        assert_eq!(std::fs::read(cached).unwrap(), b"ADAPTED");
     }
 
     #[test]

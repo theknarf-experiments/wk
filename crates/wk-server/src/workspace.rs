@@ -192,13 +192,15 @@ impl Source {
         }
     }
 
-    /// The local path to load the wasm from. For OCI this is the cache location,
-    /// for a Dockerfile the built image's extracted entrypoint (both populated
-    /// by [`Source::ensure`]); it may not exist until then.
+    /// The local path to load the wasm from. For OCI this is the cached
+    /// content-addressed blob, for a Dockerfile the built image's extracted
+    /// entrypoint (both populated by [`Source::ensure`]); it may not exist
+    /// until then.
     pub fn local_path(&self) -> PathBuf {
         match self {
             Source::Path(p) => p.clone(),
-            Source::Oci(reference) => crate::oci::cache_path(reference),
+            Source::Oci(reference) => crate::oci::cached_artifact(reference)
+                .unwrap_or_else(|| crate::oci::legacy_ref_path(reference)),
             Source::Dockerfile(p) => crate::images::aliased_image(p)
                 .map(|(id, _)| crate::images::entrypoint_path(&id))
                 .unwrap_or_else(|| crate::images::entrypoint_path("unbuilt")),
@@ -214,7 +216,7 @@ impl Source {
     pub fn ensure(&self) -> Result<(), String> {
         match self {
             Source::Oci(reference) => {
-                if !crate::oci::cache_path(reference).exists() {
+                if crate::oci::cached_artifact(reference).is_none() {
                     println!("pulling {reference} ...");
                     crate::oci::pull_into_cache(reference)?;
                 }
