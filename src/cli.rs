@@ -520,6 +520,7 @@ fn kind_label(kind: NodeKind) -> &'static str {
         NodeKind::Veilid => "veilid",
         NodeKind::Note => "note",
         NodeKind::Capture => "capture",
+        NodeKind::Api => "api",
         NodeKind::MidiIn => "midiin",
     }
 }
@@ -716,6 +717,7 @@ pub fn unwire(workspace: &Path, a: &str, b: &str) -> Result<(), String> {
         "serve" => Wire::Serve(w.a, w.b),
         "net" => Wire::Net(w.a, w.b),
         "capture" => Wire::Capture(w.a, w.b),
+        "api" => Wire::Api(w.a, w.b),
         other => return Err(format!("unknown wire kind {other:?}")),
     };
     send_command(&mut stream, Command::Delete(ResourceRef::Wire(wire)))?;

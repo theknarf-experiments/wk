@@ -958,6 +958,11 @@ impl PluginHost {
         self.scene.lock().unwrap().clone()
     }
 
+    /// The fabric hub (for host-side fabric endpoints like the API listener).
+    pub(crate) fn hub(&self) -> Arc<wk_fabric::netstack::NetHub> {
+        self.hub.clone()
+    }
+
     /// The live scene registry itself (tests seed entities through this).
     #[cfg(test)]
     pub(crate) fn scene_registry(&self) -> crate::scene::SceneRegistry {

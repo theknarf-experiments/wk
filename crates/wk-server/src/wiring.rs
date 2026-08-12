@@ -23,6 +23,8 @@ pub enum NodeClass {
     Uplink,
     /// A Screen Capture node — wires only to an app (granting it frames).
     Capture,
+    /// A wk API node — wires only to an app (granting it API access).
+    Api,
     /// A hardware MIDI input node — a MIDI *source* only (wires to an app's MIDI
     /// input, never a destination).
     MidiSource,
@@ -53,6 +55,9 @@ pub fn classify(a: NodeId, b: NodeId, ca: NodeClass, cb: NodeClass) -> Option<Wi
         // The app is the first element; the capture source the second.
         (Capture, Other) => Some(Wire::Capture(b, a)),
         (Other, Capture) => Some(Wire::Capture(a, b)),
+        // The app is the first element; the API node the second.
+        (Api, Other) => Some(Wire::Api(b, a)),
+        (Other, Api) => Some(Wire::Api(a, b)),
         // A hardware MIDI source drives an app's MIDI input: the source is always
         // the first element of the MIDI link (it can't be a destination).
         (MidiSource, Other) => Some(Wire::Midi(a, b)),
@@ -218,6 +223,12 @@ mod tests {
             (Other, MidiSource, Some(Wire::Midi(b, a))),
             (MidiSource, MidiSource, None),
             (MidiSource, Net, None),
+            // An API node grants an app API access; the app is always the
+            // wire's first element, and it never wires to another special node.
+            (Api, Other, Some(Wire::Api(b, a))),
+            (Other, Api, Some(Wire::Api(a, b))),
+            (Api, Api, None),
+            (Api, Net, None),
         ];
         for (ca, cb, want) in cases {
             assert_eq!(classify(a, b, ca, cb), want, "classify({ca:?}, {cb:?})");
@@ -231,6 +242,7 @@ mod tests {
             Just(NodeClass::Net),
             Just(NodeClass::Uplink),
             Just(NodeClass::Capture),
+            Just(NodeClass::Api),
             Just(NodeClass::MidiSource),
             Just(NodeClass::Other),
         ]
@@ -246,7 +258,8 @@ mod tests {
             | Wire::Midi(a, b)
             | Wire::Serve(a, b)
             | Wire::Net(a, b)
-            | Wire::Capture(a, b) => (a, b),
+            | Wire::Capture(a, b)
+            | Wire::Api(a, b) => (a, b),
         }
     }
 

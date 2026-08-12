@@ -75,7 +75,7 @@ enum Commands {
     },
 
     /// Create a non-app node headlessly: a volume, bind mount, host port,
-    /// network, gateway, uplink, capture, or note (apps are `wk node add`)
+    /// network, gateway, uplink, capture, api, or note (apps are `wk node add`)
     Create {
         /// What kind of node to create
         kind: CreateKind,
@@ -229,6 +229,8 @@ enum CreateKind {
     Iroh,
     Veilid,
     Capture,
+    /// The wk API as a node: wire an app to it to let the app drive wk
+    Api,
     /// A hardware MIDI input node (value = device name; omit for the default)
     Midi,
     Note,
@@ -245,6 +247,7 @@ impl CreateKind {
             CreateKind::Iroh => NodeKind::Iroh,
             CreateKind::Veilid => NodeKind::Veilid,
             CreateKind::Capture => NodeKind::Capture,
+            CreateKind::Api => NodeKind::Api,
             CreateKind::Midi => NodeKind::MidiIn,
             CreateKind::Note => NodeKind::Note,
         }
@@ -278,6 +281,14 @@ enum TokenCmd {
     Set { node: String, hex: String },
     /// Reset a node to the workspace default: a node may use what it is wired to
     Reset { node: String },
+    /// Mint a token with the given Datalog authority, signed by this
+    /// workspace's key — for crafting test/scoped tokens. Prints hex for
+    /// `wk token set`. Example: wk token mint 'right("document", "read");
+    /// can_use($k,$t,$a) <- wired($k,$t), operation($k,$t,$a);'
+    Mint {
+        /// The authority block's Datalog (quote it)
+        datalog: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -441,6 +452,13 @@ fn main() -> Result<(), String> {
             TokenCmd::Attenuate { node, block } => cli::token_attenuate(file, node, block),
             TokenCmd::Set { node, hex } => cli::token_set(file, node, hex),
             TokenCmd::Reset { node } => cli::token_reset(file, node),
+            TokenCmd::Mint { datalog } => {
+                // Signs with the workspace's persisted key — no server needed.
+                let svc = TokenService::load_or_create(&key_path(file));
+                let token = svc.mint_code(datalog)?;
+                println!("{}", wk_server::workspace::bytes_hex(&token));
+                Ok(())
+            }
         },
         Some(Commands::Remove { plugin }) => workspace::remove(plugin.clone(), file),
         Some(Commands::Run {
@@ -485,6 +503,22 @@ fn run(file: &Path, headless: bool) -> Result<(), String> {
     let tokens = TokenService::load_or_create(&key_path(file));
     let node_base = tokens.mint_node_base()?;
     let runtime = ServerRuntime::spawn(&doc, file.to_path_buf(), tokens.public_key(), node_base)?;
+    // Put the wk API on the fabric for nodes wired to an Api node: each
+    // accepted connection is served by the same loop as the CLI socket, but
+    // bearing the *node's own* capability token — so what a node may do over
+    // the API is exactly what its token's Datalog grants.
+    let api_base = runtime.handle();
+    runtime.install_api_conn_server(std::sync::Arc::new(move |stream, token| {
+        let handle = api_base.clone().with_token(token);
+        std::thread::spawn(move || {
+            let Ok(read_half) = stream.try_clone() else {
+                return;
+            };
+            let reader = std::io::BufReader::new(read_half);
+            let writer = std::sync::Arc::new(std::sync::Mutex::new(stream));
+            let _ = wk_api::serve_client(handle, reader, writer);
+        });
+    }));
     // Start the CLI socket (wk's "docker daemon") so a separate `wk` process can
     // attach and drive this server live — for both windowed and headless runs.
     let _ipc = match tokens.mint_admin().and_then(|tok| {

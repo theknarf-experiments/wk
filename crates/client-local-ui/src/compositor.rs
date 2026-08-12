@@ -128,6 +128,9 @@ const HOSTFILE_BORDER: [f32; 4] = [0.30, 0.45, 0.65, 1.0];
 /// Screen Capture nodes: recording-red chrome (a capability, like Network).
 const CAPTURE_BG: [f32; 4] = [0.22, 0.10, 0.12, 1.0];
 const CAPTURE_BORDER: [f32; 4] = [0.80, 0.30, 0.35, 1.0];
+/// Api nodes: bright-cyan chrome (wk's own client API as a capability).
+const API_BG: [f32; 4] = [0.08, 0.16, 0.22, 1.0];
+const API_BORDER: [f32; 4] = [0.30, 0.75, 0.90, 1.0];
 const MIDI_BG: [f32; 4] = [0.10, 0.20, 0.13, 1.0];
 const MIDI_BORDER: [f32; 4] = [0.35, 0.75, 0.45, 1.0];
 
@@ -410,7 +413,7 @@ impl App {
     /// the single port their kind participates in.
     fn node_ports(&self, id: NodeId) -> Vec<Port> {
         use PortDir::{In, Out};
-        use PortKind::{Bind, Capture, Midi, Net, Serve};
+        use PortKind::{Api, Bind, Capture, Midi, Net, Serve};
         let v = &self.view;
         let one = |kind, dir| vec![Port { kind, dir }];
         if v.notes.contains_key(&id) {
@@ -425,6 +428,8 @@ impl App {
             one(Net, Out) // an uplink dials into a Network
         } else if v.capture_feeds.contains_key(&id) {
             one(Capture, Out) // a Capture node grants apps
+        } else if v.api_nodes.contains(&id) {
+            one(Api, Out) // an Api node grants apps
         } else if v.midi_ins.contains_key(&id) {
             one(Midi, Out) // a hardware MIDI input drives apps
         } else {
@@ -439,6 +444,9 @@ impl App {
             let midi = node.as_ref().is_some_and(|n| n.imports_midi());
             let net = node.as_ref().is_some_and(|n| n.imports_net());
             let capture = node.as_ref().is_some_and(|n| n.imports_capture());
+            // The API is reached over the app's virtual network, so the port
+            // appears on any app that can speak to a network at all.
+            let api = node.as_ref().is_some_and(|n| n.imports_net());
             let serve = node
                 .as_ref()
                 .is_some_and(|n| n.http_path().is_some() || n.imports_net());
@@ -457,6 +465,9 @@ impl App {
                     kind: Capture,
                     dir: In,
                 });
+            }
+            if api {
+                ports.push(Port { kind: Api, dir: In });
             }
             if midi {
                 ports.push(Port {
@@ -725,6 +736,7 @@ impl App {
             Wire::Serve(http, hp) => (http, hp, PortKind::Serve),
             Wire::Net(app, net) => (app, net, PortKind::Net),
             Wire::Capture(app, cap) => (cap, app, PortKind::Capture),
+            Wire::Api(app, api) => (api, app, PortKind::Api),
         };
         if self.view.win_pos.contains_key(&src) && self.view.win_pos.contains_key(&dst) {
             Some((
@@ -768,6 +780,12 @@ impl App {
                     .find(|&&(x, y)| pair(x, y))
                     .map(|&(x, y)| Wire::Capture(x, y))
             })
+            .or_else(|| {
+                s.api_links
+                    .iter()
+                    .find(|&&(x, y)| pair(x, y))
+                    .map(|&(x, y)| Wire::Api(x, y))
+            })
     }
 
     /// The connection wire nearest to `mp` within the pick radius, if any. Picks
@@ -780,6 +798,7 @@ impl App {
             .map(|&(f, a)| Wire::Bind(f, a))
             .chain(s.midi_links.iter().map(|&(s, d)| Wire::Midi(s, d)))
             .chain(s.capture_links.iter().map(|&(a, c)| Wire::Capture(a, c)))
+            .chain(s.api_links.iter().map(|&(a, n)| Wire::Api(a, n)))
             .chain(s.serves.iter().map(|(&h, &hp)| Wire::Serve(h, hp)))
             .chain(s.net_links.iter().map(|&(a, n)| Wire::Net(a, n)));
         let mut best: Option<(f32, Wire)> = None;
@@ -859,6 +878,11 @@ impl App {
             "Add Screen Capture",
             d("grants wired apps the captured canvas (frames)"),
             PaletteCmd::AddCapture,
+        ));
+        v.push(PaletteRow::new(
+            "Add API",
+            d("wired apps can drive wk over their virtual network"),
+            PaletteCmd::AddApi,
         ));
         v.push(PaletteRow::new(
             "Add MIDI In",
@@ -1174,6 +1198,14 @@ impl App {
                 let pos = self.view_center([FILE_W, FILE_H], self.view.capture_feeds.len());
                 self.conn.send(Command::Create(Resource::Node {
                     kind: NodeKind::Capture,
+                    pos,
+                    ws,
+                }));
+            }
+            PaletteCmd::AddApi => {
+                let pos = self.view_center([FILE_W, FILE_H], self.view.api_nodes.len());
+                self.conn.send(Command::Create(Resource::Node {
+                    kind: NodeKind::Api,
                     pos,
                     ws,
                 }));
@@ -2113,6 +2145,21 @@ impl App {
                     status.to_string(),
                     status_col,
                 ))
+            } else if self.view.api_nodes.contains(&id) {
+                let wired = self.view.api_links.iter().any(|&(_, n)| n == id);
+                let (status, status_col) = if wired {
+                    ("● wired", [0.5, 0.85, 0.9, 1.0])
+                } else {
+                    ("wire an app", [0.55, 0.7, 0.72, 1.0])
+                };
+                Some(Chrome(
+                    API_BORDER,
+                    API_BG,
+                    "wk api".to_string(),
+                    TEXT,
+                    status.to_string(),
+                    status_col,
+                ))
             } else if let Some(device) = self.view.midi_ins.get(&id) {
                 let (status, status_col) = if device.is_empty() {
                     ("no device".to_string(), [0.8, 0.65, 0.5, 1.0])
@@ -2667,6 +2714,9 @@ impl App {
         }
         for &(app, cap) in &self.view.capture_links {
             links.push((app, cap, PortKind::Capture));
+        }
+        for &(app, api) in &self.view.api_links {
+            links.push((app, api, PortKind::Api));
         }
         for (a, b, kind) in links {
             if let (Some(&ia), Some(&ib)) = (idx.get(&a), idx.get(&b)) {
@@ -3459,6 +3509,7 @@ impl App {
                     let is_uplink = self.view.uplinks.contains_key(&id);
                     let is_note = self.view.notes.contains_key(&id);
                     let is_capture = self.view.capture_feeds.contains_key(&id);
+                    let is_api = self.view.api_nodes.contains(&id);
                     if is_note {
                         // Note: close (top-right), drag from the top strip, or
                         // click the body to edit the text.
@@ -3478,7 +3529,7 @@ impl App {
                             let cur = self.view.notes.get(&id).cloned().unwrap_or_default();
                             self.editing_note = Some((id, cur));
                         }
-                    } else if is_file || is_port || is_net || is_uplink || is_capture {
+                    } else if is_file || is_port || is_net || is_uplink || is_capture || is_api {
                         // Canvas widget nodes (file / HostPort / Network / Iroh):
                         // close, adjust port (HostPort −/+ buttons), edit the
                         // peer ticket (Iroh, lower half), or move.
@@ -3711,6 +3762,13 @@ impl App {
             if let Some((a, b)) = self.wire_endpoints(Wire::Capture(app, cap)) {
                 let sel = self.wire_sel == Some(Wire::Capture(app, cap));
                 let col = CAPTURE_BORDER;
+                draw_connection(&mut quads, white, a, b, sel, col, zf, full);
+            }
+        }
+        for &(app, api) in &self.view.api_links {
+            if let Some((a, b)) = self.wire_endpoints(Wire::Api(app, api)) {
+                let sel = self.wire_sel == Some(Wire::Api(app, api));
+                let col = API_BORDER;
                 draw_connection(&mut quads, white, a, b, sel, col, zf, full);
             }
         }
@@ -3966,6 +4024,38 @@ impl App {
                         border: CAPTURE_BORDER,
                         bg: CAPTURE_BG,
                         title: "screen capture",
+                        title_col: TEXT,
+                        status,
+                        status_col,
+                        status_scale: 0.7,
+                    },
+                );
+                continue;
+            }
+
+            // A wk API node: a capability widget (like Network) whose status
+            // shows whether an app is wired to drive wk.
+            if self.view.api_nodes.contains(&id) {
+                let wired = self.view.api_links.iter().any(|&(_, n)| n == id);
+                let (status, status_col) = if wired {
+                    ("● wired", [0.5, 0.85, 0.9, 1.0])
+                } else {
+                    ("wire an app to grant API access", [0.55, 0.7, 0.72, 1.0])
+                };
+                self.draw_widget(
+                    &mut quads,
+                    &mut gfx,
+                    white,
+                    zf,
+                    mp,
+                    clip,
+                    full,
+                    WidgetChrome {
+                        id,
+                        r,
+                        border: API_BORDER,
+                        bg: API_BG,
+                        title: "wk api",
                         title_col: TEXT,
                         status,
                         status_col,

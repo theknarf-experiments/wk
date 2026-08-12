@@ -35,7 +35,17 @@ pub enum Wire {
     /// An app node's grant from a Screen Capture node (app, capture) — the app
     /// may read captured frames while wired.
     Capture(NodeId, NodeId),
+    /// An app node's grant from an Api node (app, api) — the app may drive
+    /// wk's client API over its virtual network while wired.
+    Api(NodeId, NodeId),
 }
+
+/// The TCP port the wk API listens on inside a node's virtual network, when
+/// the node is wired to an Api node. Fabric DNS resolves the endpoint as
+/// `api`, so a guest dials `api:1337` and speaks the [`ipc`] wire protocol
+/// (newline-delimited JSON), presenting nothing — the connection already
+/// bears the node's own capability token.
+pub const API_PORT: u16 = 1337;
 
 /// The kinds of resource a [`Command`] acts on. Together with an [`Action`] this
 /// is the unit of authorization: a token grants `right(resource, action)` pairs
@@ -135,6 +145,9 @@ pub enum NodeKind {
     /// A Screen Capture node: a capability source granting wired apps access
     /// to captured frames (the host does the capturing).
     Capture,
+    /// The wk client API as a node: apps wired to it can drive wk over their
+    /// virtual network.
+    Api,
     /// A hardware MIDI input node: the host opens a physical MIDI input device
     /// and routes its messages to the app nodes it's wired to (a MIDI source,
     /// like the piano plugin).

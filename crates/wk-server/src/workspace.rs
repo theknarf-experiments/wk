@@ -92,7 +92,7 @@ fn node_ident(n: &KdlNode) -> Option<NodeIdent> {
             .map(|s| NodeIdent::Import(s.to_string())),
         "dependencies" => Some(NodeIdent::Dependencies),
         "workspace" => n.get(0).and_then(node_id).map(NodeIdent::Workspace),
-        "connection" | "midi" | "serve" | "netlink" | "capturelink" => {
+        "connection" | "midi" | "serve" | "netlink" | "capturelink" | "apilink" => {
             let a = n.get(0).and_then(node_id)?;
             let b = n.get(1).and_then(node_id)?;
             Some(NodeIdent::Wire(name.to_string(), a, b))
@@ -357,6 +357,9 @@ pub enum SnapKind {
     /// A Screen Capture capability node: apps wired to it may read captured
     /// frames (see the `capturelink` pairs).
     Capture,
+    /// The wk client API as a node: apps wired to it may drive wk over their
+    /// virtual network (see the `apilink` pairs).
+    Api,
     /// A hardware MIDI input node: the host opens the named device (empty = the
     /// first available) and routes its messages to the apps it's wired to.
     MidiIn { device: String },
@@ -449,6 +452,8 @@ pub struct Workspace {
     pub net_links: Vec<(NodeId, NodeId)>,
     /// Screen-capture grants as (app id, Capture node id).
     pub capture_links: Vec<(NodeId, NodeId)>,
+    /// API grants as (app id, Api node id).
+    pub api_links: Vec<(NodeId, NodeId)>,
 }
 
 impl Workspace {
@@ -464,6 +469,7 @@ impl Workspace {
             serve_ports: BTreeMap::new(),
             net_links: Vec::new(),
             capture_links: Vec::new(),
+            api_links: Vec::new(),
         }
     }
 }
@@ -818,6 +824,7 @@ fn parse_workspace(n: &KdlNode) -> Option<Workspace> {
             }
             "netlink" => ws.net_links.extend(pair(c)),
             "capturelink" => ws.capture_links.extend(pair(c)),
+            "apilink" => ws.api_links.extend(pair(c)),
             _ => ws.nodes.extend(parse_snap(c)),
         }
     }
@@ -855,6 +862,9 @@ fn workspace_kdl(ws: &Workspace) -> KdlNode {
     }
     for &(app, cap) in &ws.capture_links {
         ch.nodes_mut().push(pair_kdl("capturelink", app, cap));
+    }
+    for &(app, api) in &ws.api_links {
+        ch.nodes_mut().push(pair_kdl("apilink", app, api));
     }
     node.set_children(ch);
     node
@@ -924,6 +934,7 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
                 .and_then(|n| u16::try_from(n).ok())?,
         },
         "capture" => SnapKind::Capture,
+        "api" => SnapKind::Api,
         "midiin" => SnapKind::MidiIn {
             device: n
                 .get(0)
@@ -975,6 +986,7 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         SnapKind::Veilid { .. } => "veilid",
         SnapKind::Note { .. } => "note",
         SnapKind::Capture => "capture",
+        SnapKind::Api => "api",
         SnapKind::MidiIn { .. } => "midiin",
     };
     let mut node = KdlNode::new(name);
@@ -1575,6 +1587,7 @@ mod tests {
                     serve_ports: BTreeMap::from([((synth, port), 3000u16)]),
                     net_links: vec![(synth, net)],
                     capture_links: vec![(synth, chan)],
+                    api_links: vec![(synth, net)],
                 },
                 Workspace {
                     id: wb,
@@ -1790,6 +1803,7 @@ mod tests {
             uplink_fields().prop_map(|(secret, peer)| SnapKind::Veilid { secret, peer }),
             value_str().prop_map(|text| SnapKind::Note { text }),
             Just(SnapKind::Capture),
+            Just(SnapKind::Api),
         ]
     }
 
@@ -1826,6 +1840,7 @@ mod tests {
         )
             .prop_map(|(id, nodes, conns, midi, serves, netlinks)| Workspace {
                 capture_links: netlinks.clone(),
+                api_links: netlinks.clone(),
                 id,
                 nodes,
                 // Give every generated bind an explicit mount path so the 3rd-arg

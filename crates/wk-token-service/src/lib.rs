@@ -95,6 +95,20 @@ impl TokenService {
             .map_err(|e| format!("biscuit serialize: {e}"))
     }
 
+    /// Mint a token whose authority block is exactly the given Datalog —
+    /// crafted tokens for `wk token mint`: custom rules (a different access
+    /// logic), `right(resource, action)` facts (API/command grants), checks,
+    /// or any mix. The caller writes the policy; this only signs it.
+    pub fn mint_code(&self, datalog: &str) -> Result<Vec<u8>, String> {
+        Biscuit::builder()
+            .code(datalog)
+            .map_err(|e| format!("biscuit datalog: {e}"))?
+            .build(&self.root)
+            .map_err(|e| format!("biscuit build: {e}"))?
+            .to_vec()
+            .map_err(|e| format!("biscuit serialize: {e}"))
+    }
+
     /// The public key a verifier (the server) needs. Safe to copy anywhere; it
     /// cannot mint or attenuate tokens.
     pub fn public_key(&self) -> PublicKey {

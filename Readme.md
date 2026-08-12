@@ -35,6 +35,7 @@ instead stand for shared resources a plugin can wire to:
 | node → node             | a MIDI link (source out → destination in)            |
 | HTTP node → HostPort    | serves the node on `127.0.0.1:<port>`                |
 | node → Network/Gateway  | joins the node to that virtual network               |
+| node → Api              | serves the wk API on the node's network (`api:1337`) |
 
 A document can hold several workspaces (shown as tabs); edits are undoable.
 
@@ -67,6 +68,22 @@ wk token attenuate vim 'check if operation($k, $t, $a), $k != "file" || $a == "r
 wk token attenuate vim 'check if operation($k, $t, $a), $k != "gateway"'             # no host access
 wk token attenuate totem 'check if operation($k, $t, $a), $k != "scene"'             # mute its 3D objects
 wk token reset vim                               # back to wired ⇒ usable
+```
+
+**The API is a node too.** Wire an app to an **Api** node and the wk API
+appears on the app's virtual network as a fabric peer named `api`, serving the
+same newline-JSON protocol as the CLI socket on port `1337`. Each connection
+implicitly bears the *node's own* capability token — so what a node may do
+over the API is exactly what its token's Datalog grants (the default grants no
+`right(...)` facts: connect-but-do-nothing until you say otherwise). The node
+also finds its token at `/run/wk/token`, for presenting elsewhere or
+attenuating offline. Craft test tokens with the workspace key:
+
+```
+wk create api ; wk wire python <api-id>
+wk token mint 'right("document", "read");
+               can_use($k,$t,$a) <- wired($k,$t), operation($k,$t,$a);'
+wk token set python <hex>          # now GetSnapshot works from inside; commands still refused
 ```
 
 A scene mute is *viewer-side*: the guest keeps its entity and keeps updating

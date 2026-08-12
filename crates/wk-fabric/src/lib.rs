@@ -17,6 +17,7 @@
 //! lives with the wasm host (wk-server), not here; this crate's boundary is
 //! [`netstack::SharedStack`].
 
+pub mod listen;
 pub mod netstack;
 pub mod portfwd;
 pub mod uplink;

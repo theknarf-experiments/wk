@@ -28,7 +28,7 @@ use crate::{Command, NodeId};
 pub struct NodeInfo {
     pub id: NodeId,
     /// `app` | `volume` | `bindmount` | `hostport` | `network` | `gateway`
-    /// | `iroh` | `veilid` | `note` | `capture`.
+    /// | `iroh` | `veilid` | `note` | `capture` | `api`.
     pub kind: String,
     /// The dependency/app name, file name, or note preview — else empty.
     pub name: String,
@@ -64,7 +64,7 @@ pub struct NodeInfo {
 /// One wire between two nodes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WireInfo {
-    /// `bind` | `midi` | `serve` | `net` | `capture`.
+    /// `bind` | `midi` | `serve` | `net` | `capture` | `api`.
     pub kind: String,
     pub a: NodeId,
     pub b: NodeId,

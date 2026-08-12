@@ -165,6 +165,13 @@ impl ServerRuntime {
         self.handle.clone()
     }
 
+    /// Install the fabric-API connection server: the callback serving each
+    /// accepted API connection from a node's network (`wk-api`'s
+    /// `serve_client`, injected here because wk-api depends on this crate).
+    pub fn install_api_conn_server(&self, f: crate::server::ApiConnServer) {
+        self.handle.server.lock().unwrap().set_api_conn_server(f);
+    }
+
     /// Stop the loop and join the thread; the loop saves the workspace as it
     /// exits.
     pub fn shutdown(mut self) {

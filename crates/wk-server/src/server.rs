@@ -194,6 +194,8 @@ pub struct View {
     pub net_links: Vec<(NodeId, NodeId)>,
     /// Screen-capture grants as (app, Capture node).
     pub capture_links: Vec<(NodeId, NodeId)>,
+    /// API grants as (app, Api node).
+    pub api_links: Vec<(NodeId, NodeId)>,
     /// Per-serve container-port overrides as (served, hostport) → guest port, so
     /// the UI can show a HostPort's `host→container` mapping.
     pub serve_ports: HashMap<(NodeId, NodeId), u16>,
@@ -203,6 +205,8 @@ pub struct View {
     /// Each Capture node's frame slot — the local client writes captured
     /// canvas frames into these (only while the node has a wired app).
     pub capture_feeds: HashMap<NodeId, crate::capture::SharedFrameSlot>,
+    /// Api nodes on the canvas (wk's client API as a capability source).
+    pub api_nodes: HashSet<NodeId>,
     /// http node id -> HostPort node id.
     pub serves: HashMap<NodeId, NodeId>,
     /// HostPort node id -> a bind-failure message (localhost port unavailable),
@@ -288,8 +292,10 @@ impl View {
             midi_links: keep_pairs(&self.midi_links, mine),
             net_links: keep_pairs(&self.net_links, mine),
             capture_links: keep_pairs(&self.capture_links, mine),
+            api_links: keep_pairs(&self.api_links, mine),
             serve_ports: keep_pair_map(&self.serve_ports, mine),
             capture_feeds: keep_map(&self.capture_feeds, mine),
+            api_nodes: keep_set(&self.api_nodes, mine),
             attached: keep_set(&self.attached, mine),
             serves: keep_map(&self.serves, mine),
             port_errors: keep_map(&self.port_errors, mine),
@@ -309,6 +315,7 @@ impl View {
             Wire::Midi(s, d) => self.midi_links.contains(&(s, d)),
             Wire::Serve(h, hp) => self.serves.get(&h) == Some(&hp),
             Wire::Capture(a, c) => self.capture_links.contains(&(a, c)),
+            Wire::Api(a, n) => self.api_links.contains(&(a, n)),
             Wire::Net(app, net) => self.net_links.contains(&(app, net)),
         }
     }
@@ -324,6 +331,7 @@ enum WireRel {
     Serve,
     NetLink,
     CaptureLink,
+    ApiLink,
 }
 
 /// The two node ids a [`Wire`] joins.
@@ -333,7 +341,8 @@ fn wire_ends(w: Wire) -> (NodeId, NodeId) {
         | Wire::Midi(a, b)
         | Wire::Serve(a, b)
         | Wire::Net(a, b)
-        | Wire::Capture(a, b) => (a, b),
+        | Wire::Capture(a, b)
+        | Wire::Api(a, b) => (a, b),
     }
 }
 
@@ -424,6 +433,9 @@ pub enum Kind {
     Note,
     /// A Screen Capture node: grants wired apps captured frames.
     Capture,
+    /// The wk client API as a node: grants wired apps API access over their
+    /// virtual network.
+    Api,
     /// A hardware MIDI input node: the host opens a physical MIDI device and
     /// routes its messages to the app nodes it's wired to (a MIDI source).
     MidiIn,
@@ -491,6 +503,8 @@ pub struct Graph {
     pub net_links: Vec<(NodeId, NodeId)>,
     /// Screen-capture grants, as (app node id, Capture node id).
     pub capture_links: Vec<(NodeId, NodeId)>,
+    /// API grants, as (app node id, Api node id).
+    pub api_links: Vec<(NodeId, NodeId)>,
 
     /// App nodes' *custom* capability tokens (serialized Biscuits), set via
     /// `wk token`. Absent = the workspace's default node token ("use what
@@ -510,6 +524,13 @@ pub struct Graph {
     /// The workspace's launchable dependencies.
     pub available: Vec<Dependency>,
 }
+
+/// Serves one accepted fabric API connection: `(stream, token)` — the
+/// connection's socketpair end and the wired node's capability token. The
+/// runtime installs this (it closes over `wk-api`'s `serve_client`, which
+/// depends on this crate — a dependency inversion), and `sync_apis` calls it
+/// per connection.
+pub type ApiConnServer = Arc<dyn Fn(std::os::unix::net::UnixStream, Vec<u8>) + Send + Sync>;
 
 /// The authoritative running workspace. See the module docs.
 pub struct Server {
@@ -533,6 +554,16 @@ pub struct Server {
     /// Active MIDI routes: (src, dst) currently in the router. Mirrors
     /// `graph.midi_links`; reconciled by `sync_midi`.
     routed: HashSet<(NodeId, NodeId)>,
+    /// Running fabric API endpoints: app node id -> (Api node id, kill switch,
+    /// fingerprint of the token the listener was started with). A subset of
+    /// `graph.api_links` — an entry exists once the app's stack is up and its
+    /// token allows the wire; a token swap restarts the endpoint so new
+    /// connections carry the new token. Reconciled by `sync_apis`.
+    api_serves: HashMap<NodeId, (NodeId, Arc<AtomicBool>, u64)>,
+    /// The installed API connection server (see [`ApiConnServer`]); `None`
+    /// until the runtime injects it (headless embedding without wk-api simply
+    /// starts no endpoints).
+    api_conn_server: Option<ApiConnServer>,
     /// Currently *running* servers: served node id -> (HostPort id, kill switch).
     /// A subset of `graph.serve_links` — an entry appears only once the node is
     /// ready (a wasi:http node dispatched per request, or a fabric node with a
@@ -623,6 +654,8 @@ impl Server {
             mounted: HashMap::new(),
             routed: HashSet::new(),
             serves: HashMap::new(),
+            api_serves: HashMap::new(),
+            api_conn_server: None,
             pending_run: HashSet::new(),
             port_errors: HashMap::new(),
             uplinks: HashMap::new(),
@@ -676,6 +709,7 @@ impl Server {
             (WireRel::Serve, &saved.serves),
             (WireRel::NetLink, &saved.net_links),
             (WireRel::CaptureLink, &saved.capture_links),
+            (WireRel::ApiLink, &saved.api_links),
         ] {
             for &(a, b) in pairs {
                 if orphan.contains(&a) || orphan.contains(&b) {
@@ -689,6 +723,8 @@ impl Server {
             .chain(&saved.midi)
             .chain(&saved.serves)
             .chain(&saved.net_links)
+            .chain(&saved.capture_links)
+            .chain(&saved.api_links)
             .copied()
             .collect();
         self.rewire(&wires);
@@ -765,6 +801,7 @@ impl Server {
         }
         self.place(id, Kind::App, ws, pos, [360.0, 260.0]);
         self.graph.node_args.insert(id, dep.args.clone());
+        self.write_token_file(id);
     }
 
     /// Create a new, empty in-memory Volume node at `pos` in workspace `ws`.
@@ -824,6 +861,13 @@ impl Server {
         let id = self.alloc_id();
         self.place(id, Kind::Capture, ws, pos, [FILE_W, FILE_H]);
         self.capture_feeds.insert(id, crate::capture::new_slot());
+    }
+
+    /// Add a wk API capability node (apps wired to it can drive wk over their
+    /// virtual network).
+    fn add_api_node(&mut self, pos: [f32; 2], ws: NodeId) {
+        let id = self.alloc_id();
+        self.place(id, Kind::Api, ws, pos, [FILE_W, FILE_H]);
     }
 
     /// Add a hardware MIDI input node, opening the first available device now.
@@ -1024,6 +1068,7 @@ impl Server {
             // A note wires to nothing and runs nothing; just drop it.
             Some(Kind::Note) => self.forget(id),
             Some(Kind::Capture) => self.remove_capture_node(id),
+            Some(Kind::Api) => self.remove_api_node(id),
             Some(Kind::MidiIn) => self.remove_midi_in_node(id),
             None => {}
         }
@@ -1042,6 +1087,18 @@ impl Server {
     fn toggle_capture(&mut self, app: NodeId, cap: NodeId) {
         wiring::toggle_unique(&mut self.graph.capture_links, app, cap);
         self.sync_captures();
+    }
+
+    /// Remove an Api node: revoke every grant through it.
+    fn remove_api_node(&mut self, id: NodeId) {
+        self.graph.api_links.retain(|&(_, api)| api != id);
+        self.forget(id);
+    }
+
+    /// Toggle an API grant (one API node per app).
+    fn toggle_api(&mut self, app: NodeId, api: NodeId) {
+        wiring::toggle_unique(&mut self.graph.api_links, app, api);
+        // effect reconciled by sync_apis (added separately)
     }
 
     /// Point every app node's `capture_src` at its granted Capture node's frame
@@ -1166,6 +1223,8 @@ impl Server {
                 self.mounted.insert(pair, (path, node.fs.clone(), writable));
             }
         }
+        // A container rootfs may have just landed over /run — republish.
+        self.write_token_file(app);
     }
 
     /// Stop a running app node's guest without removing the node: halt the
@@ -1235,6 +1294,7 @@ impl Server {
             Some(Kind::Network | Kind::Gateway) => NodeClass::Net,
             Some(Kind::Iroh | Kind::Veilid) => NodeClass::Uplink,
             Some(Kind::Capture) => NodeClass::Capture,
+            Some(Kind::Api) => NodeClass::Api,
             Some(Kind::MidiIn) => NodeClass::MidiSource,
             Some(Kind::App) | Some(Kind::Note) | None => NodeClass::Other,
         }
@@ -1250,6 +1310,7 @@ impl Server {
             Some(Wire::Serve(http, hostport)) => self.toggle_serve(http, hostport),
             Some(Wire::Net(app, net)) => self.toggle_net(app, net),
             Some(Wire::Capture(app, cap)) => self.toggle_capture(app, cap),
+            Some(Wire::Api(app, api)) => self.toggle_api(app, api),
             Some(Wire::Midi(src, dst)) => self.toggle_midi(src, dst),
             None => {}
         }
@@ -1402,6 +1463,111 @@ impl Server {
     /// ready. Idempotent and cheap when nothing changed; called after any serve
     /// change and once per tick (so a wire made before its node finished
     /// compiling is honored as soon as the node comes up).
+    /// Install the callback that serves accepted fabric API connections.
+    pub fn set_api_conn_server(&mut self, f: ApiConnServer) {
+        self.api_conn_server = Some(f);
+    }
+
+    /// A node's effective capability token bytes: its custom token, else the
+    /// workspace base — empty when node auth is off (allow-all posture; with
+    /// no key configured the API side also verifies nothing).
+    fn effective_node_token(&self, id: NodeId) -> Vec<u8> {
+        self.graph
+            .node_tokens
+            .get(&id)
+            .cloned()
+            .or_else(|| self.node_auth.as_ref().map(|(_, base)| base.clone()))
+            .unwrap_or_default()
+    }
+
+    /// Publish a node's effective capability token into its own filesystem at
+    /// `/run/wk/token` (hex), so a guest can read the credential it acts
+    /// under — to attenuate it offline, or to present it to a *remote* wk.
+    /// (Calls over the local Api wire don't need it: those connections
+    /// implicitly bear this token.) Refreshed on every token change.
+    fn write_token_file(&self, id: NodeId) {
+        let Some(node) = self.app_node(id) else {
+            return;
+        };
+        let token = self.effective_node_token(id);
+        if token.is_empty() {
+            return; // no auth configured — nothing meaningful to publish
+        }
+        let hex = crate::workspace::bytes_hex(&token);
+        node.fs
+            .lock()
+            .unwrap()
+            .put_file_at("run/wk/token", hex.into_bytes());
+    }
+
+    /// Reconcile fabric API endpoints against the desired `api_links`: a node
+    /// wired to an Api node (whose token allows the wire) gets a named `api`
+    /// peer on its network, serving the wk protocol on
+    /// [`wk_protocol::API_PORT`]; each accepted connection bears the node's
+    /// own token. A cut/denied wire kills the endpoint; a token swap restarts
+    /// it so new connections carry the new token (live ones keep the old —
+    /// the same session semantics as any bearer connection).
+    fn sync_apis(&mut self) {
+        use std::hash::{Hash, Hasher};
+        let links = self.graph.api_links.clone();
+        let mut desired: HashMap<NodeId, (NodeId, u64, Vec<u8>, wk_fabric::netstack::SharedStack)> =
+            HashMap::new();
+        for (app, api) in links {
+            let Some(stack) = self.app_node(app).and_then(|n| n.net_stack()) else {
+                continue; // not compiled yet (or no wasi:sockets) — retried next tick
+            };
+            if !self.node_may_use(app, "api", api, "use") {
+                continue;
+            }
+            let token = self.effective_node_token(app);
+            let fp = {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                token.hash(&mut h);
+                h.finish()
+            };
+            desired.insert(app, (api, fp, token, stack));
+        }
+        // Stop endpoints that are stale: unwired/denied, rewired to another Api
+        // node, or started under a different token.
+        let stale: Vec<NodeId> = self
+            .api_serves
+            .iter()
+            .filter(|(app, (api, _, fp))| {
+                desired
+                    .get(app)
+                    .map(|(dapi, dfp, _, _)| dapi != api || dfp != fp)
+                    .unwrap_or(true)
+            })
+            .map(|(&app, _)| app)
+            .collect();
+        for app in stale {
+            if let Some((_, kill, _)) = self.api_serves.remove(&app) {
+                kill.store(true, Ordering::Relaxed);
+            }
+        }
+        // Start the missing ones.
+        for (app, (api, fp, token, stack)) in desired {
+            if self.api_serves.contains_key(&app) {
+                continue;
+            }
+            let Some(serve) = self.api_conn_server.clone() else {
+                continue;
+            };
+            let kill = Arc::new(AtomicBool::new(false));
+            let on_conn: Arc<dyn Fn(std::os::unix::net::UnixStream) + Send + Sync> =
+                Arc::new(move |stream| serve(stream, token.clone()));
+            wk_fabric::listen::listen(
+                self.host.hub(),
+                stack,
+                "api",
+                wk_protocol::API_PORT,
+                kill.clone(),
+                on_conn,
+            );
+            self.api_serves.insert(app, (api, kill, fp));
+        }
+    }
+
     fn sync_serves(&mut self) {
         // Which serve links are serviceable *right now*: a wasi:http node can be
         // served as soon as it's compiled (its handler is invoked per request);
@@ -1590,6 +1756,17 @@ impl Server {
         });
         self.node_auth = Some((public_key, base_token));
         self.auth_cache.clear();
+        // Load-time nodes spawned before auth existed get their token file now.
+        let apps: Vec<NodeId> = self
+            .graph
+            .nodes
+            .iter()
+            .filter(|(_, r)| matches!(r.kind, Kind::App))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in apps {
+            self.write_token_file(id);
+        }
     }
 
     /// The token service's public key, if auth is configured — what a client
@@ -1648,6 +1825,12 @@ impl Server {
                 .iter()
                 .filter(|&&(a, _)| a == id)
                 .map(|&(_, c)| ("capture", c)),
+        );
+        w.extend(
+            g.api_links
+                .iter()
+                .filter(|&&(a, _)| a == id)
+                .map(|&(_, n)| ("api", n)),
         );
         w
     }
@@ -1718,6 +1901,7 @@ impl Server {
             self.graph.node_tokens.insert(id, token);
         }
         self.auth_cache.retain(|&(n, _, _, _), _| n != id);
+        self.write_token_file(id);
     }
 
     /// Reconcile the actual file mounts against the desired `connections`: mount
@@ -1895,6 +2079,7 @@ impl Server {
             Wire::Midi(s, d) => self.graph.midi_links.contains(&(s, d)),
             Wire::Serve(h, hp) => self.graph.serve_links.contains(&(h, hp)),
             Wire::Capture(a, c) => self.graph.capture_links.contains(&(a, c)),
+            Wire::Api(a, n) => self.graph.api_links.contains(&(a, n)),
             Wire::Net(app, net) => self.graph.net_links.contains(&(app, net)),
         }
     }
@@ -1925,6 +2110,11 @@ impl Server {
             Wire::Capture(app, cap) => {
                 if self.graph.capture_links.contains(&(app, cap)) {
                     self.toggle_capture(app, cap);
+                }
+            }
+            Wire::Api(app, api) => {
+                if self.graph.api_links.contains(&(app, api)) {
+                    self.toggle_api(app, api);
                 }
             }
         }
@@ -1961,6 +2151,7 @@ impl Server {
         self.sync_net_membership();
         self.sync_captures();
         self.sync_serves();
+        self.sync_apis();
     }
 
     /// Kill a node and drop everything referencing it (its wiring, geometry, and
@@ -2091,6 +2282,7 @@ impl Server {
                 let serves = ws_wires(&self.graph.serve_links, WireRel::Serve);
                 let net_links = ws_wires(&self.graph.net_links, WireRel::NetLink);
                 let capture_links = ws_wires(&self.graph.capture_links, WireRel::CaptureLink);
+                let api_links = ws_wires(&self.graph.api_links, WireRel::ApiLink);
                 // Persist mount-path overrides for this workspace's binds.
                 let mount_paths = connections
                     .iter()
@@ -2111,6 +2303,7 @@ impl Server {
                     serve_ports,
                     net_links,
                     capture_links,
+                    api_links,
                 }
             })
             .collect();
@@ -2270,6 +2463,7 @@ impl Server {
                 NodeKind::Veilid => self.add_veilid_node(pos, ws),
                 NodeKind::Note => self.add_note(pos, ws),
                 NodeKind::Capture => self.add_capture_node(pos, ws),
+                NodeKind::Api => self.add_api_node(pos, ws),
                 NodeKind::MidiIn => self.add_midi_in_node(pos, ws),
             },
             // Create is create only: a wire that already exists is left alone
@@ -2415,6 +2609,7 @@ impl Server {
                         None => self.graph.node_tokens.remove(&id),
                     };
                     self.auth_cache.retain(|&(n, _, _, _), _| n != id);
+                    self.write_token_file(id);
                 }
             }
             Undo::Uncreate(id) => {
@@ -2478,6 +2673,7 @@ impl Server {
                 text: self.graph.note_text.get(&id).cloned().unwrap_or_default(),
             },
             Kind::Capture => SnapKind::Capture,
+            Kind::Api => SnapKind::Api,
             Kind::MidiIn => SnapKind::MidiIn {
                 device: self.graph.midi_ins.get(&id).cloned().unwrap_or_default(),
             },
@@ -2541,6 +2737,12 @@ impl Server {
                 .capture_links
                 .iter()
                 .filter(|&&(a, c)| a == id || c == id),
+        );
+        wires.extend(
+            self.graph
+                .api_links
+                .iter()
+                .filter(|&&(a, n)| a == id || n == id),
         );
         Some(Snapshot {
             ws,
@@ -2621,6 +2823,7 @@ impl Server {
                         }
                     }
                 }
+                self.write_token_file(s.id);
             }
             SnapKind::Volume { name, persist } => {
                 if let Some(num) = name
@@ -2698,6 +2901,9 @@ impl Server {
                     .entry(s.id)
                     .or_insert_with(crate::capture::new_slot);
             }
+            SnapKind::Api => {
+                self.place(s.id, Kind::Api, ws, s.pos, s.size);
+            }
             SnapKind::MidiIn { device } => {
                 self.place(s.id, Kind::MidiIn, ws, s.pos, s.size);
                 self.graph.midi_ins.insert(s.id, device.clone());
@@ -2717,6 +2923,8 @@ impl Server {
             || self.graph.midi_links.iter().any(|&(x, y)| pair(x, y))
             || self.graph.net_links.iter().any(|&(x, y)| pair(x, y))
             || self.graph.serve_links.iter().any(|&(h, hp)| pair(h, hp))
+            || self.graph.capture_links.iter().any(|&(x, y)| pair(x, y))
+            || self.graph.api_links.iter().any(|&(x, y)| pair(x, y))
     }
 
     /// Re-establish connections between live nodes (idempotent, so a wire listed
@@ -2816,6 +3024,13 @@ impl Server {
             .filter(|(_, r)| r.kind == Kind::Gateway)
             .map(|(&id, _)| id)
             .collect();
+        let api_nodes = self
+            .graph
+            .nodes
+            .iter()
+            .filter(|(_, r)| r.kind == Kind::Api)
+            .map(|(&id, _)| id)
+            .collect();
         let uplinks = self
             .uplinks
             .iter()
@@ -2868,8 +3083,10 @@ impl Server {
             midi_links: self.graph.midi_links.clone(),
             net_links: self.graph.net_links.clone(),
             capture_links: self.graph.capture_links.clone(),
+            api_links: self.graph.api_links.clone(),
             serve_ports: self.graph.serve_ports.clone(),
             capture_feeds: self.capture_feeds.clone(),
+            api_nodes,
             attached: self.attached.clone(),
             serves,
             port_errors: self.port_errors.clone(),
@@ -2920,6 +3137,7 @@ impl Server {
                 Some(Kind::Veilid) => "veilid",
                 Some(Kind::Note) => "note",
                 Some(Kind::Capture) => "capture",
+                Some(Kind::Api) => "api",
                 Some(Kind::MidiIn) => "midiin",
                 None => "unknown",
             }
@@ -2982,6 +3200,7 @@ impl Server {
         wires.extend(wire("midi", &v.midi_links));
         wires.extend(wire("net", &v.net_links));
         wires.extend(wire("capture", &v.capture_links));
+        wires.extend(wire("api", &v.api_links));
         wires.extend(v.serves.iter().map(|(&http, &hp)| WireInfo {
             kind: "serve".to_string(),
             a: http,
@@ -3573,6 +3792,7 @@ mod model_tests {
                 serves: Vec::new(),
                 serve_ports: std::collections::BTreeMap::new(),
                 capture_links: Vec::new(),
+                api_links: Vec::new(),
                 net_links: Vec::new(),
             }],
         };

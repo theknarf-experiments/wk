@@ -18,6 +18,7 @@ pub(super) enum PaletteCmd {
     AddVeilid,
     AddNote,
     AddCapture,
+    AddApi,
     AddMidiIn,
     NewWorkspace,
     CloseWorkspace,
