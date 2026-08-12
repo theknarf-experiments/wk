@@ -1,0 +1,52 @@
+--- a/execute_cmd.c
++++ b/execute_cmd.c
+@@ -5641,7 +5641,49 @@
+ 
+       maybe_make_export_env ();
+       put_command_name_into_env (command);
++    }
++
++#if defined (WK_EXEC)
++  /* wk: this platform has no fork(). Run the command to completion through
++     wk's exec capability and report the status the shell would otherwise have
++     waited for. Everything below (make_child + shell_execve) needs a child
++     process, which cannot exist here.
++
++     Only plain commands take this path: a pipeline needs pipe(), and an
++     asynchronous command needs a process to run in the background, so both
++     fall through and fail as they would without this. */
++  if (pipe_in == NO_PIPE && pipe_out == NO_PIPE && async == 0)
++    {
++      char **wkargs;
++      int wkstat;
++      extern int wk_bash_run PARAMS((const char *, char **, const char *));
++
++      maybe_make_export_env ();
++      /* argv[0] stays as the user typed it — execve semantics, and what a
++         multicall binary dispatches on. */
++      wkargs = strvec_from_word_list (words, 0, 0, (int *)NULL);
++      wkstat = wk_bash_run (command, wkargs, pathname);
++      /* alloc = 0 above: the vector aliases the word list's own strings, so
++	 free the vector only — strvec_dispose would free the words too, and
++	 `pathname` points into them. */
++      free (wkargs);
++      if (wkstat >= 0)
++	{
++	  result = last_command_exit_value = wkstat;
++	  goto parent_return;
++	}
++      if (command == 0)
++	{
++	  /* Not on PATH and not in the multicall table. Say so here: falling
++	     through would reach fork() and report its ENOSYS instead, which
++	     tells the user nothing about the actual problem. */
++	  internal_error (_("%s: command not found"), pathname);
++	  result = last_command_exit_value = EX_NOTFOUND;
++	  goto parent_return;
++	}
++      /* Found on PATH but unrunnable: fall through to bash's own paths. */
+     }
++#endif /* WK_EXEC */
+ 
+   /* We have to make the child before we check for the non-existence
+      of COMMAND, since we want the error messages to be redirected. */

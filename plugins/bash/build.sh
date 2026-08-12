@@ -2,24 +2,29 @@
 # Build UNMODIFIED upstream GNU bash into a wasm component that wk runs in a
 # terminal node — the real bash(1), not a shell-alike.
 #
-# What works: the shell *language*. Variables and expansions, arithmetic,
-# conditionals ([[ ]] and test), for/while/case, functions, aliases, arrays,
-# and every builtin — verified in a node with
-# `echo "hello from real GNU bash $BASH_VERSION"` reporting
-# 5.2.37(1)-release (wasm32-unknown-wasi).
+# What works: the shell language (variables, arithmetic, [[ ]], for/while/case,
+# functions, arrays, every builtin) *and running external commands* — the
+# latter through wk's `wk:exec` capability, since WASI has no fork/exec.
+# patches/wk-0001 replaces the fork+exec in execute_disk_command() with a
+# synchronous run that reports the status the shell would have waited for.
+# Verified in a node: `ls -1 /`, `mkdir -p /work && echo ok` (with the new
+# directory visible to the next command), `$?` propagation, and
+# "command not found" with status 127 for a genuinely missing command.
 #
-# What cannot work, and why: WASI has no process creation and no file
-# descriptor duplication.
-#   * pipelines and external commands need fork/exec — there is no such call;
-#     the build stubs them to ENOSYS (`--disable-job-control`, nojobs.c).
+# Command *names* resolve through /etc/wk-multicall, a plain "applet binary"
+# table this build generates. wk's filesystem has no symlinks, which is how a
+# multicall binary normally provides its hundred names, so the table takes
+# their place: `ls` runs /bin/coreutils.wasm with argv[0]="ls", which is
+# exactly what coreutils' symlink install does.
+#
+# What still cannot work, and why — both are WASI gaps, not port bugs:
+#   * pipelines and command substitution need pipe() and a second process;
+#     they fail cleanly ("pipe error: Function not implemented").
 #   * redirection (`> file`) needs dup()/dup2() to save and restore stdout.
-#     WASI preview1 offers `fd_renumber`, which *moves* a descriptor rather
-#     than copying it, so the save/restore dance bash performs is impossible;
-#     redirections fail with "cannot duplicate fd". This is a WASI gap, not a
-#     port bug — it disappears if WASI ever grows a real dup.
-# So this is a script-language engine, not (yet) a command driver. For running
-# actual commands in wk, give a node the coreutils multicall binary
-# (plugins/coreutils) — one node, one program, which is the shape WASI allows.
+#     preview1 offers `fd_renumber`, which *moves* a descriptor rather than
+#     copying it, so bash's save/restore is impossible. For builtins this
+#     errors ("cannot duplicate fd"); for external commands the output simply
+#     goes to the shell's own stdout.
 #
 # Targets wasm32-wasip1 + the component adapter (bash needs no sockets), which
 # lets it reuse ../tty-compat — the same real termios shim vim uses, mapping
@@ -51,6 +56,9 @@
 #     NO_MAIN_ENV_ARG path is broken upstream — its body still uses `env`).
 #   * dlopen — `enable -f` loads builtins from shared objects; there is no
 #     dynamic linker, so compat.c fails them cleanly.
+#   * strvec_from_word_list(words, 0, ...) *aliases* the word list's strings
+#     rather than copying them, so the patch frees only the vector — freeing
+#     the elements corrupts the command name bash is still holding.
 #
 # Requires wasi-sdk (WASI_SDK), wasm-tools, and wit-bindgen (for tty-compat's
 # bindings). Source is fetched (and cached) under bash-<ver>/ on first run.
@@ -63,6 +71,8 @@ SRC="bash-$BASH_VER"
 COMPAT="$PWD/compat"
 TTY="$PWD/../tty-compat"
 TTYGEN="$TTY/gen"
+EXEC="$PWD/../exec-compat"
+EXECGEN="$EXEC/gen"
 
 BUILD_PATH="$WASI_SDK/bin:/usr/bin:/bin"
 WASMTIME_VER=46.0.1
@@ -79,28 +89,34 @@ if [ ! -d "$SRC" ]; then
     curl -fsSL "https://ftp.gnu.org/gnu/bash/$SRC.tar.gz" -o "$SRC.tar.gz"
     tar xzf "$SRC.tar.gz"
     rm -f "$SRC.tar.gz"
+    # Run external commands through wk:exec instead of fork+exec.
+    ( cd "$SRC" && patch -p1 --forward < ../patches/wk-0001-run-commands-via-wk-exec.patch )
 fi
 
-# The shared termios shim + its wk:tty/control bindings (same as vim's build).
-mkdir -p "$TTYGEN"
+# The shared termios shim + its wk:tty/control bindings (same as vim's build),
+# and the wk:exec bindings + shim that let bash run commands.
+mkdir -p "$TTYGEN" "$EXECGEN"
 wit-bindgen c --world terminal "$TTY/wit/tty.wit" --out-dir "$TTYGEN"
+wit-bindgen c --world exec-host "$EXEC/wit/exec.wit" --out-dir "$EXECGEN"
 
-CFLAGS="--target=wasm32-wasip1 -O2 -I$COMPAT -I$TTY -I$TTYGEN \
+CFLAGS="--target=wasm32-wasip1 -O2 -DWK_EXEC=1 -I$COMPAT -I$EXEC -I$TTY -I$TTYGEN \
     -DF_DUPFD=0 -DHAVE_TERMIOS_H=1 -DHAVE_TCGETATTR=1 \
     -Wno-implicit-function-declaration -Wno-deprecated-non-prototype \
     -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false \
     -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID"
 
-for src in "$COMPAT/compat.c" "$TTY/termios.c" "$TTYGEN/terminal.c"; do
+for src in "$COMPAT/compat.c" "$TTY/termios.c" "$TTYGEN/terminal.c" \
+           "$COMPAT/wkbash.c" "$EXEC/wkexec.c" "$EXECGEN/exec_host.c"; do
     obj="$COMPAT/$(basename "${src%.c}").o"
     "$WASI_SDK/bin/clang" --target=wasm32-wasip1 -O2 \
-        -I"$COMPAT" -I"$TTY" -I"$TTYGEN" \
+        -I"$COMPAT" -I"$EXEC" -I"$EXECGEN" -I"$TTY" -I"$TTYGEN" \
         -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID \
         -c "$src" -o "$obj"
 done
 
 LDFLAGS="$COMPAT/compat.o $COMPAT/termios.o $COMPAT/terminal.o \
-    $TTYGEN/terminal_component_type.o -lsetjmp \
+    $COMPAT/wkbash.o $COMPAT/wkexec.o $COMPAT/exec_host.o \
+    $TTYGEN/terminal_component_type.o $EXECGEN/exec_host_component_type.o -lsetjmp \
     -lwasi-emulated-signal -lwasi-emulated-process-clocks -lwasi-emulated-getpid"
 
 cd "$SRC"
@@ -139,4 +155,26 @@ env PATH="$BUILD_PATH" make \
 
 cd ..
 wasm-tools component new "$SRC/bash" --adapt "wasi_snapshot_preview1=$ADAPTER" -o bash.wasm
+
+# The multicall table + the binary it points at, for the wk-shell image. The
+# applet list is coreutils' own (what its symlink install would create).
+cp ../coreutils/coreutils.wasm coreutils.wasm 2>/dev/null || \
+    echo "note: build plugins/coreutils first for a shell that can run commands"
+{
+    echo "# applet -> multicall binary. wk's filesystem has no symlinks, which is how"
+    echo "# a multicall binary normally provides its names, so this table takes their"
+    echo "# place: bash runs the binary with argv[0] set to the applet."
+    echo
+    for a in "[" b2sum base32 base64 basename basenc cat chcon chgrp chmod chown \
+             cksum comm cp csplit cut date dir dircolors dirname du echo expand \
+             expr factor false fmt fold groups head hostid id join link ln logname \
+             ls md5sum mkdir mkfifo mknod mktemp mv nl nproc numfmt od paste \
+             pathchk pr printenv printf ptx pwd readlink realpath rm rmdir seq \
+             sha1sum sha224sum sha256sum sha384sum sha512sum shred shuf sleep sort \
+             split stat sum sync tac tail tee test touch tr true truncate tsort \
+             tty uname unexpand uniq unlink vdir wc whoami yes; do
+        echo "$a /bin/coreutils.wasm"
+    done
+} > wk-multicall
 echo "built plugins/bash/bash.wasm (GNU bash $BASH_VER, wasm32-wasip1 component)"
+echo "package it with: wk images build plugins/bash/Dockerfile --tag wk-shell"

@@ -16,7 +16,7 @@ interface process {
     }
     run: func(
         path: string,
-        args: list<string>,
+        argv: list<string>,
         env: list<tuple<string, string>>,
         stdin: list<u8>,
     ) -> result<output, string>;

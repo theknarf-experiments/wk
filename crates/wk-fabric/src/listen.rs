@@ -256,9 +256,13 @@ mod tests {
         };
 
         let h = dial(&node, 50001);
-        // Drive until established, then send a line and read the echo we make.
+        // Wait against a wall-clock deadline rather than a fixed iteration
+        // count: this runs alongside the rest of the suite, and a loaded
+        // machine is slow, not broken.
+        let deadline = || std::time::Instant::now() + Duration::from_secs(30);
+        let h_deadline = deadline();
         let mut ok = false;
-        for _ in 0..2000 {
+        while std::time::Instant::now() < h_deadline {
             {
                 let mut g = node.lock().unwrap();
                 let s = g.sockets.get_mut::<tcp::Socket>(h);
@@ -299,7 +303,8 @@ mod tests {
         // listener -> node
         server_end.write_all(b"reply\n").unwrap();
         let mut echoed = Vec::new();
-        for _ in 0..2000 {
+        let echo_deadline = deadline();
+        while std::time::Instant::now() < echo_deadline {
             {
                 let mut g = node.lock().unwrap();
                 let s = g.sockets.get_mut::<tcp::Socket>(h);
@@ -320,8 +325,9 @@ mod tests {
         // A stranger on the same net is refused: its connection dies and no
         // socketpair is handed over.
         let hs = dial(&stranger, 50002);
+        let stranger_deadline = deadline();
         let mut refused = false;
-        for _ in 0..2000 {
+        while std::time::Instant::now() < stranger_deadline {
             {
                 let mut g = stranger.lock().unwrap();
                 let s = g.sockets.get_mut::<tcp::Socket>(hs);

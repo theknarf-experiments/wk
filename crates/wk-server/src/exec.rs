@@ -88,7 +88,7 @@ impl wk::exec::process::Host for HostState {
     fn run(
         &mut self,
         path: String,
-        args: Vec<String>,
+        argv: Vec<String>,
         env: Vec<(String, String)>,
         stdin: Vec<u8>,
     ) -> Result<std::result::Result<Output, String>> {
@@ -116,10 +116,14 @@ impl wk::exec::process::Host for HostState {
         if !wasm.starts_with(b"\0asm") {
             return Ok(Err(format!("{path}: not a wasm program")));
         }
-        // argv[0] is the program itself, as any exec would pass it.
-        let mut argv = Vec::with_capacity(args.len() + 1);
-        argv.push(path.clone());
-        argv.extend(args);
+        // argv arrives whole, `execve`-style: the caller owns argv[0], which is
+        // what multicall binaries dispatch on. An empty argv would leave the
+        // child without a program name, so fall back to the path.
+        let argv = if argv.is_empty() {
+            vec![path.clone()]
+        } else {
+            argv
+        };
         Ok(ctx
             .host
             .run_program(&wasm, &argv, &env, &fs, stdin, ctx.depth + 1))

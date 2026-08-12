@@ -30,13 +30,16 @@ interface process {
     /// composes pipelines itself by feeding one program's `stdout` into the
     /// next one's `stdin`.
     ///
-    /// `path` is resolved in the caller's filesystem. `args` are the child's
-    /// argv *after* the program name. Errors (rather than an `output`) mean the
+    /// `path` is resolved in the caller's filesystem. `argv` is the child's
+    /// argv *in full*, including `argv[0]` — `execve` semantics, and what
+    /// multicall binaries need: GNU coreutils and busybox both dispatch on
+    /// `argv[0]`, so running `/bin/coreutils.wasm` with `argv[0] = "ls"` is
+    /// how one binary provides a hundred commands. Errors (rather than an `output`) mean the
     /// program could not be run at all: no such file, not a component, the
     /// caller's token forbids `exec`, or too many nested `run`s.
     run: func(
         path: string,
-        args: list<string>,
+        argv: list<string>,
         env: list<tuple<string, string>>,
         stdin: list<u8>,
     ) -> result<output, string>;

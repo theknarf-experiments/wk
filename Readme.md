@@ -97,7 +97,26 @@ so it can reach nothing the caller couldn't, and nesting is depth-bounded.
 It's `exec` without the `fork`, so a caller builds a pipeline by feeding one
 program's stdout into the next one's stdin. `plugins/exec-compat` has a C shim
 (`wk_run()`) and a demo that drives the real GNU coreutils this way, pipeline
-included. Like every other capability it is token-gated (kind `exec`, allowed
+included — and `plugins/bash` uses it for real: a one-hunk patch replaces the
+fork+exec in bash's `execute_disk_command()` with a synchronous run, so
+**bash actually runs commands**:
+
+```
+bash-5.2# ls -1 /
+bin  etc  run
+bash-5.2# mkdir -p /work && echo ok
+ok
+bash-5.2# nosuchcommand
+bash: nosuchcommand: command not found     # status 127
+```
+
+Command *names* resolve through `/etc/wk-multicall`, an "applet binary" table
+(wk's filesystem has no symlinks, which is how a multicall binary normally
+provides its hundred names): `ls` runs `/bin/coreutils.wasm` with
+`argv[0]="ls"`, exactly as coreutils' symlink install does. Pipelines and
+command substitution still need `pipe()` and a second process, so they fail
+cleanly; `wk images build plugins/bash/Dockerfile --tag wk-shell` packages the
+lot. Like every other capability it is token-gated (kind `exec`, allowed
 by default): `wk token attenuate <node> 'check if operation($k, $t, $a), $k !=
 "exec"'` revokes it within a tick.
 

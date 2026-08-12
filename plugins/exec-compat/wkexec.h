@@ -28,8 +28,11 @@ typedef struct {
 } wk_result;
 
 /* Run `path` (a wasm component in this node's filesystem) to completion.
- * `argv` is NULL-terminated and holds the arguments *after* the program name;
- * pass NULL for none. `stdin_data`/`stdin_len` feed the child's stdin.
+ * `argv` is NULL-terminated and is the child's argv *in full*, including
+ * argv[0] — execve semantics. That matters for multicall binaries: GNU
+ * coreutils dispatches on argv[0], so running /bin/coreutils.wasm with
+ * argv[0]="ls" is how one binary provides a hundred commands.
+ * `stdin_data`/`stdin_len` feed the child's stdin.
  *
  * Returns 0 if the program ran (check `exit_code`), -1 if it could not be run
  * (check `error`). Blocks until the child exits — these are exec semantics
