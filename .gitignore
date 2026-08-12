@@ -144,3 +144,7 @@ plugins/bash/bash-*/
 plugins/bash/bash.wasm
 plugins/bash/compat/*.o
 plugins/bash/compat/wasi_snapshot_preview1.command.wasm
+
+# wk:exec shim: generated bindings + built artifacts
+plugins/exec-compat/gen/
+plugins/exec-compat/*.wasm

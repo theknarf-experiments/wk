@@ -234,7 +234,8 @@ mod tests {
             .code(
                 "can_use($kind, $target, $action) <- wired($kind, $target), \
                  operation($kind, $target, $action);\n\
-                 can_use(\"scene\", $target, $action) <- operation(\"scene\", $target, $action);",
+                 can_use(\"scene\", $target, $action) <- operation(\"scene\", $target, $action);\n\
+                 can_use(\"exec\", $target, $action) <- operation(\"exec\", $target, $action);",
             )
             .unwrap()
             .build(root)

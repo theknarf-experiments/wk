@@ -1,0 +1,7 @@
+# Build this plugin: `mise run build`
+# The wk:exec guest shim (wkexec.c) + a demo that runs real programs from
+# inside a node. wasi-sdk and wit-bindgen come from the root mise.toml.
+[tasks.build]
+description = "Build the wk:exec C shim and its demo into a wasm component"
+dir = "{{config_root}}"
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build.sh"

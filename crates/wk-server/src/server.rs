@@ -1104,6 +1104,20 @@ impl Server {
     /// Point every app node's `capture_src` at its granted Capture node's frame
     /// slot (or clear it). Mirrors `sync_midi`: the graph's capture links are
     /// the desired state; this makes the runtime match.
+    /// Refresh every app node's `wk:exec` permission from its capability
+    /// token. Unlike the wired capabilities this needs no wire — running a
+    /// program from your own filesystem gains no authority (the child inherits
+    /// the caller's vfs and nothing else) — but it is still a token decision,
+    /// so attenuating `exec` away stops further runs within a tick.
+    fn sync_exec(&mut self) {
+        let nodes: Vec<crate::plugin::SharedNode> = self.node_reg.lock().unwrap().clone();
+        for node in nodes {
+            let allowed = self.node_may_use(node.id, "exec", node.id, "spawn");
+            node.exec_permit
+                .store(allowed, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn sync_captures(&mut self) {
         let nodes: Vec<crate::plugin::SharedNode> = self.node_reg.lock().unwrap().clone();
         for node in nodes {
@@ -2150,6 +2164,7 @@ impl Server {
         self.sync_midi();
         self.sync_net_membership();
         self.sync_captures();
+        self.sync_exec();
         self.sync_serves();
         self.sync_apis();
     }

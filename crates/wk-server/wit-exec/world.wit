@@ -1,0 +1,48 @@
+package wk:exec;
+
+/// Running another program from inside a node.
+///
+/// WASI has no `fork`/`exec`: a guest cannot create a process, which is why a
+/// shell in a sandbox can only ever be a script engine. wk sits a level above
+/// that — the host already instantiates components (that is what a node *is*,
+/// and what a Dockerfile `RUN` step does) — so "run a program" is a capability
+/// the host can offer rather than a syscall WASI has to grow.
+///
+/// The program is a wasm component read from the *calling node's own*
+/// filesystem, so a base image that ships `/bin/coreutils.wasm` can run it.
+/// The child shares the caller's filesystem — writes it makes are visible
+/// afterwards, like a real child process on the same mount — and inherits the
+/// caller's sandbox: it can reach nothing the caller could not, and its
+/// authority is the caller's capability token (the `exec` kind, which
+/// attenuation can withdraw).
+interface process {
+    /// What a finished program left behind.
+    record output {
+        /// The child's exit status (0 = success), as `wasi:cli/exit` reports
+        /// it; a trap or a failure to start is an `err` instead.
+        exit-code: s32,
+        stdout: list<u8>,
+        stderr: list<u8>,
+    }
+
+    /// Run `path` to completion and collect its result. Blocks until the child
+    /// exits — these are `exec` semantics without the `fork`, so the caller
+    /// composes pipelines itself by feeding one program's `stdout` into the
+    /// next one's `stdin`.
+    ///
+    /// `path` is resolved in the caller's filesystem. `args` are the child's
+    /// argv *after* the program name. Errors (rather than an `output`) mean the
+    /// program could not be run at all: no such file, not a component, the
+    /// caller's token forbids `exec`, or too many nested `run`s.
+    run: func(
+        path: string,
+        args: list<string>,
+        env: list<tuple<string, string>>,
+        stdin: list<u8>,
+    ) -> result<output, string>;
+}
+
+/// The host side: wk implements (imports) the process interface for plugins.
+world exec-host {
+    import process;
+}

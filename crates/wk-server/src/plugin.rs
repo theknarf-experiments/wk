@@ -154,6 +154,9 @@ pub struct Node {
     /// The Screen Capture frame slot granted to this node by a capture wire
     /// (`None` while unwired). Set by the server's capture reconciler.
     pub capture_src: crate::capture::SharedCaptureSrc,
+    /// Whether this node may run programs via `wk:exec`, refreshed from its
+    /// capability token each tick so attenuation revokes it live.
+    pub exec_permit: crate::exec::ExecPermit,
 }
 
 /// A node's compiled component plus how to run and wire it — published once the
@@ -321,6 +324,10 @@ pub struct HostState {
     /// node; `None` while unwired) + the last frame sequence this store saw.
     pub(crate) capture_src: crate::capture::SharedCaptureSrc,
     pub(crate) capture_seq: u64,
+    /// What this store needs to serve `wk:exec` (run another program from the
+    /// node's filesystem). `None` for contexts that may not exec at all —
+    /// build steps and children, which keeps `RUN` hermetic.
+    pub(crate) exec: Option<crate::exec::ExecCtx>,
     pub(crate) midi_in: crate::midi::SharedInbox,
     pub(crate) midi_router: crate::midi::Router,
     /// Where this node's wk:scene entities register (shared, host-global).
@@ -840,6 +847,130 @@ fn add_random(l: &mut Linker<HostState>) -> Result<()> {
 /// Build-time `RUN` execution: run a wasi:cli command component against the
 /// build's rootfs (its writes become the RUN's layer). stdout/stderr pass
 /// through to wk's own, like `docker build` streaming a step's output.
+impl PluginHost {
+    /// Run a wasm component to completion, sharing `fs`, with its stdio
+    /// captured — the engine behind `wk:exec` (and the same machinery a
+    /// Dockerfile `RUN` step uses, minus the inherited stdio).
+    ///
+    /// The child is deliberately impoverished: it gets the caller's
+    /// filesystem and nothing else — no surfaces, no MIDI, no capture, no
+    /// network, and no `wk:exec` of its own beyond `depth`. It therefore can't
+    /// reach anything its parent couldn't.
+    pub(crate) fn run_program(
+        &self,
+        wasm: &[u8],
+        argv: &[String],
+        env: &[(String, String)],
+        fs: &crate::vfs::SharedFs,
+        stdin: Vec<u8>,
+        depth: u32,
+    ) -> std::result::Result<crate::exec::Output, String> {
+        use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
+
+        let component = Component::new(&self.engine, wasm)
+            .map_err(|e| format!("{}: not a runnable component: {e:#}", argv[0]))?;
+        let linker = self
+            .build_linker()
+            .map_err(|e| format!("link program: {e:#}"))?;
+
+        let out = MemoryOutputPipe::new(crate::exec::MAX_OUTPUT);
+        let err = MemoryOutputPipe::new(crate::exec::MAX_OUTPUT);
+        let mut b = WasiCtxBuilder::new();
+        b.stdin(MemoryInputPipe::new(stdin))
+            .stdout(out.clone())
+            .stderr(err.clone())
+            .args(argv);
+        for (k, v) in env {
+            b.env(k, v);
+        }
+        let state = HostState {
+            ctx: b.build(),
+            table: ResourceTable::new(),
+            registry: Arc::new(Mutex::new(Vec::new())),
+            node_id: NodeId::nil(),
+            fs: fs.clone(),
+            term_io: crate::terminal::TermIo::new(),
+            capture_src: crate::capture::new_src(),
+            capture_seq: 0,
+            // Children may nest further, up to exec::MAX_DEPTH.
+            exec: Some(crate::exec::ExecCtx {
+                host: Arc::new(self.clone()),
+                depth,
+                permit: crate::exec::new_permit(true),
+            }),
+            midi_in: crate::midi::new_inbox(),
+            midi_router: self.midi.clone(),
+            scene_reg: crate::scene::new_registry(),
+            options: crate::options::new_options(Vec::new()),
+            net: None,
+            random_ctx: wasmtime_wasi::random::WasiRandomCtx::default(),
+            http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
+            http_hooks: GatedHttpHooks { stack: None },
+            gpu: Arc::clone(&self.gpu),
+        };
+        let engine = self.engine.clone();
+        // The caller is *already* inside a tokio runtime (the guest's own
+        // async host call), so the child gets its own thread: nesting
+        // `block_on` in a running runtime panics, and blocking this thread is
+        // exactly the semantics we want — `run` returns when the child exits.
+        let status: std::result::Result<i32, String> = std::thread::Builder::new()
+            .name("wk-exec-child".into())
+            .spawn(move || {
+                let mut store = Store::new(&engine, state);
+                // Epochs kill runaway *nodes*; a child inherits that budget
+                // rather than being cut off by a tick meant for its parent.
+                store.set_epoch_deadline(1);
+                store.epoch_deadline_callback(|_| Ok(wasmtime::UpdateDeadline::Continue(1)));
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .map_err(|e| format!("tokio runtime: {e}"))?;
+                rt.block_on(async move {
+                    let command = wasmtime_wasi::p2::bindings::Command::instantiate_async(
+                        &mut store, &component, &linker,
+                    )
+                    .await
+                    .map_err(|e| format!("instantiate: {e:#}"))?;
+                    match command.wasi_cli_run().call_run(&mut store).await {
+                        Ok(Ok(())) => Ok(0),
+                        Ok(Err(())) => Ok(1),
+                        Err(e) => match e.downcast_ref::<wasmtime_wasi::I32Exit>() {
+                            // exit(n) is how a CLI reports status, not a failure.
+                            Some(wasmtime_wasi::I32Exit(code)) => Ok(*code),
+                            None => Err(format!("trapped: {e:#}")),
+                        },
+                    }
+                })
+            })
+            .map_err(|e| format!("spawn child thread: {e}"))?
+            .join()
+            .map_err(|_| "child panicked".to_string())?;
+        // Drop the writers so the pipes can be drained even on a trap.
+        let stdout = out.contents().to_vec();
+        let stderr = err.contents().to_vec();
+        match status {
+            Ok(exit_code) => Ok(crate::exec::Output {
+                exit_code,
+                stdout,
+                stderr,
+            }),
+            Err(e) => Err(format!("{}: {e}", argv[0])),
+        }
+    }
+}
+
+impl HostState {
+    /// This store's exec context, if it may run programs.
+    pub(crate) fn exec_ctx(&self) -> Option<&crate::exec::ExecCtx> {
+        self.exec.as_ref()
+    }
+
+    /// This store's filesystem (the node's vfs) — a child shares it.
+    pub(crate) fn fs(&self) -> crate::vfs::SharedFs {
+        self.fs.clone()
+    }
+}
+
 impl crate::images::BuildRunner for PluginHost {
     fn run(
         &self,
@@ -867,6 +998,8 @@ impl crate::images::BuildRunner for PluginHost {
             term_io: crate::terminal::TermIo::new(),
             capture_src: crate::capture::new_src(),
             capture_seq: 0,
+            // A build step may not spawn programs: RUN stays hermetic.
+            exec: None,
             midi_in: crate::midi::new_inbox(),
             midi_router: self.midi.clone(),
             // A build step registers no visible entities; a throwaway registry.
@@ -1018,6 +1151,8 @@ impl PluginHost {
         crate::audio::add_to_linker(&mut linker)?;
         crate::midi::add_to_linker(&mut linker)?;
         crate::scene::add_to_linker(&mut linker)?;
+        // wk:exec — running another program from the node's own filesystem.
+        crate::exec::add_to_linker(&mut linker)?;
         crate::options::add_to_linker(&mut linker)?;
         crate::tty::add_to_linker(&mut linker)?;
         crate::capture::add_to_linker(&mut linker)?;
@@ -1060,6 +1195,9 @@ impl PluginHost {
         let midi = self.midi.clone();
         let gpu = self.gpu.clone();
         let make_state = move || HostState {
+            // A wasi:http handler is request-scoped; running programs is a
+            // node-lifetime capability, so it doesn't get one.
+            exec: None,
             ctx: {
                 let mut b = WasiCtxBuilder::new();
                 b.arg("http");
@@ -1186,6 +1324,9 @@ impl PluginHost {
                 .map(|c| c.layers.clone())
                 .unwrap_or_default(),
             capture_src: crate::capture::new_src(),
+            // Allowed until the server's reconciler says otherwise (it runs
+            // before the guest does).
+            exec_permit: crate::exec::new_permit(true),
         });
         nodes.lock().unwrap().push(node.clone());
 
@@ -1347,6 +1488,11 @@ impl PluginHost {
             term_io: node.term_io.clone(),
             capture_src: node.capture_src.clone(),
             capture_seq: 0,
+            exec: Some(crate::exec::ExecCtx {
+                host: Arc::new(self.clone()),
+                depth: 0,
+                permit: node.exec_permit.clone(),
+            }),
             midi_in: node.midi_in.clone(),
             midi_router: self.midi.clone(),
             scene_reg: self.scene.clone(),

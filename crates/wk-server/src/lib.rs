@@ -11,6 +11,7 @@
 pub mod audio;
 pub mod auth;
 pub mod capture;
+pub mod exec;
 pub mod http;
 pub mod images;
 pub mod midi;

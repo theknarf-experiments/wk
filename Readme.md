@@ -86,6 +86,21 @@ wk token mint 'right("document", "read");
 wk token set python <hex>          # now GetSnapshot works from inside; commands still refused
 ```
 
+**Running programs (`wk:exec`).** WASI has no `fork`/`exec`, so a program in
+a sandbox normally cannot start another — which is why a shell there can only
+be a script engine. wk runs components itself (a node *is* one), so it offers
+this as a capability instead: a guest calls `run(path, args, env, stdin)`, wk
+reads that program out of the **node's own filesystem**, runs it to completion
+sharing that filesystem, and returns its exit code and output. The child gets
+the caller's files and nothing else — no surfaces, MIDI, capture, or network —
+so it can reach nothing the caller couldn't, and nesting is depth-bounded.
+It's `exec` without the `fork`, so a caller builds a pipeline by feeding one
+program's stdout into the next one's stdin. `plugins/exec-compat` has a C shim
+(`wk_run()`) and a demo that drives the real GNU coreutils this way, pipeline
+included. Like every other capability it is token-gated (kind `exec`, allowed
+by default): `wk token attenuate <node> 'check if operation($k, $t, $a), $k !=
+"exec"'` revokes it within a tick.
+
 A scene mute is *viewer-side*: the guest keeps its entity and keeps updating
 it; it just stops rendering — the seam where future multi-user policy (shared
 vs. local-only objects, muting someone else's node in your own view) slots in

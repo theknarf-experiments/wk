@@ -24,18 +24,23 @@ pub use wk_protocol::{Action, ResourceKind};
 ///    it can be cut off by matching, since Datalog has no negation),
 ///    `capture`; actions are `read`/`write` (file), `send`/`receive` (midi),
 ///    `read` (capture), and `use` (the rest).
-/// 2. a node may always show its `wk:scene` content — `scene` needs no wire
+/// 2. a node may run programs from its own filesystem (`wk:exec`) and always
+///    show its `wk:scene` content — `scene` needs no wire
 ///    (target = the owning node's id, action = `show`), so the default is
 ///    all-allow. It's a rule rather than baked-in behavior so future policy
 ///    (shared vs. local-only entities, per-viewer muting) is an attenuation or
 ///    a re-mint away: `check if operation($k, $t, $a), $k != "scene"` mutes a
-///    node's objects without touching the node itself.
+///    node's objects without touching the node itself. `exec` is likewise
+///    all-allow and attenuable: a child inherits the parent's filesystem and
+///    nothing more, so running one is not an escalation — but
+///    `$k != "exec"` takes the ability away.
 ///
 /// The rules live in the *token* so attenuation can narrow them — e.g.
 /// read-only files: `check if operation($k, $t, $a), $k != "file" || $a ==
 /// "read"` — and a swapped token can replace the logic wholesale.
 pub const NODE_BASE_RULE: &str = r#"can_use($kind, $target, $action) <- wired($kind, $target), operation($kind, $target, $action);
-can_use("scene", $target, $action) <- operation("scene", $target, $action);"#;
+can_use("scene", $target, $action) <- operation("scene", $target, $action);
+can_use("exec", $target, $action) <- operation("exec", $target, $action);"#;
 
 /// The token-issuing authority. Holds the root keypair; mints tokens.
 pub struct TokenService {

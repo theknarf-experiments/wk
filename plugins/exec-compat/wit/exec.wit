@@ -1,0 +1,27 @@
+// Guest-side view of wk's exec capability. This MUST match
+// crates/wk-server/wit-exec/world.wit exactly (same package and functions) —
+// the host implements it, this shim imports it.
+//
+// WASI has no fork/exec, so a program in a sandbox cannot start another. wk
+// runs components itself (a node *is* one), so it can offer "run a program"
+// as a capability: the child is read from the caller's own filesystem, shares
+// it, and inherits the caller's sandbox and capability token.
+package wk:exec;
+
+interface process {
+    record output {
+        exit-code: s32,
+        stdout: list<u8>,
+        stderr: list<u8>,
+    }
+    run: func(
+        path: string,
+        args: list<string>,
+        env: list<tuple<string, string>>,
+        stdin: list<u8>,
+    ) -> result<output, string>;
+}
+
+world exec-host {
+    import process;
+}
