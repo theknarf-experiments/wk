@@ -95,7 +95,10 @@ void wk_pipe_free(wk_pipe p) {
 
 /* Fill in one of the WIT stdio variants from a wk_stdio. */
 static void set_stdin(wk_exec_process_stdin_from_t *v, const wk_stdio *s) {
-    if (s && s->pipe) {
+    if (s && s->pipe_borrow) {
+        v->tag = WK_EXEC_PROCESS_STDIN_FROM_PIPE_END;
+        v->val.pipe_end = *s->pipe_borrow;
+    } else if (s && s->pipe) {
         v->tag = WK_EXEC_PROCESS_STDIN_FROM_PIPE_END;
         v->val.pipe_end.__handle = s->pipe->h;
     } else if (s && s->len) {
@@ -108,7 +111,10 @@ static void set_stdin(wk_exec_process_stdin_from_t *v, const wk_stdio *s) {
 }
 
 static void set_stdout(wk_exec_process_stdout_to_t *v, const wk_stdio *s) {
-    if (s && s->pipe) {
+    if (s && s->pipe_borrow) {
+        v->tag = WK_EXEC_PROCESS_STDOUT_TO_PIPE_END;
+        v->val.pipe_end = *s->pipe_borrow;
+    } else if (s && s->pipe) {
         v->tag = WK_EXEC_PROCESS_STDOUT_TO_PIPE_END;
         v->val.pipe_end.__handle = s->pipe->h;
     } else {
@@ -189,4 +195,9 @@ int wk_wait(wk_child child, wk_result *out) {
     exec_host_list_u8_free(&res.stdout);
     exec_host_list_u8_free(&res.stderr);
     return 0;
+}
+
+void wk_child_detach(wk_child child) {
+    wk_exec_process_own_child_t own = {child.h};
+    wk_exec_process_child_drop_own(own);
 }

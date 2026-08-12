@@ -26,6 +26,15 @@
 #include "exec_host.h"
 #include "wasilibc_descriptor_table.h"
 
+/* The wk pipe both ends refer to. Held apart from the ends and counted,
+ * because either end may be closed first and the handle has to outlive both:
+ * it is also what `wk_pipe_of_fd` hands back so a caller can wire the pipe to
+ * a spawned program. */
+typedef struct {
+    unsigned refs;
+    wk_exec_process_own_pipe_t pipe;
+} pipe_shared_t;
+
 /* One end of a pipe, as a descriptor. Both ends are the same shape; which one
  * this is depends on which stream handle is set. */
 typedef struct {
@@ -35,9 +44,7 @@ typedef struct {
     /* Storage for the pollable libc caches; it fills these in lazily. */
     poll_own_pollable_t input_pollable;
     poll_own_pollable_t output_pollable;
-    /* Kept only so the last end to close also releases the pipe itself. */
-    wk_exec_process_own_pipe_t pipe;
-    bool owns_pipe;
+    pipe_shared_t *shared;
 } pipe_end_t;
 
 static void pipe_end_free(void *data) {
@@ -52,8 +59,10 @@ static void pipe_end_free(void *data) {
         streams_input_stream_drop_own(e->input);
     if (e->output.__handle != 0)
         streams_output_stream_drop_own(e->output);
-    if (e->owns_pipe)
-        wk_exec_process_pipe_drop_own(e->pipe);
+    if (e->shared && --e->shared->refs == 0) {
+        wk_exec_process_pipe_drop_own(e->shared->pipe);
+        free(e->shared);
+    }
     free(e);
 }
 
@@ -116,8 +125,7 @@ static descriptor_vtable_t pipe_vtable = {
 
 /* Insert one end, taking ownership of the stream handle either way. */
 static int insert_end(streams_own_input_stream_t *in,
-                      streams_own_output_stream_t *out,
-                      wk_exec_process_own_pipe_t pipe, bool owns_pipe) {
+                      streams_own_output_stream_t *out, pipe_shared_t *shared) {
     pipe_end_t *e = calloc(1, sizeof *e);
     if (!e) {
         errno = ENOMEM;
@@ -127,8 +135,8 @@ static int insert_end(streams_own_input_stream_t *in,
         e->input = *in;
     if (out)
         e->output = *out;
-    e->pipe = pipe;
-    e->owns_pipe = owns_pipe;
+    e->shared = shared;
+    shared->refs++;
 
     descriptor_table_entry_t entry = {(descriptor_refcnt_t *)e, &pipe_vtable};
     /* On failure this has already run our destructor, so the streams are
@@ -149,15 +157,22 @@ int pipe(int fds[2]) {
     streams_own_input_stream_t in = {rin.__handle};
     streams_own_output_stream_t out = {rout.__handle};
 
-    /* The read end carries the pipe handle so it is released last-ish; either
-     * end closing only drops its own stream, which is what wk counts. */
-    int rfd = insert_end(&in, NULL, p, true);
+    pipe_shared_t *shared = calloc(1, sizeof *shared);
+    if (!shared) {
+        streams_input_stream_drop_own(in);
+        streams_output_stream_drop_own(out);
+        wk_exec_process_pipe_drop_own(p);
+        errno = ENOMEM;
+        return -1;
+    }
+    shared->pipe = p;
+
+    int rfd = insert_end(&in, NULL, shared);
     if (rfd < 0) {
         streams_output_stream_drop_own(out);
         return -1;
     }
-    wk_exec_process_own_pipe_t none = {0};
-    int wfd = insert_end(NULL, &out, none, false);
+    int wfd = insert_end(NULL, &out, shared);
     if (wfd < 0) {
         close(rfd);
         return -1;
@@ -165,6 +180,28 @@ int pipe(int fds[2]) {
     fds[0] = rfd;
     fds[1] = wfd;
     return 0;
+}
+
+/* If `fd` is one of our pipe ends, hand back a borrow of the wk pipe behind
+ * it. That is what lets a caller wire this very pipe to a program it spawns —
+ * the shell's `a | b`, where the stage's stdio has to be the pipe rather than
+ * a copy of its bytes. Returns false for any other descriptor. */
+bool wk_pipe_of_fd(int fd, wk_exec_process_borrow_pipe_t *out) {
+    descriptor_table_entry_t entry;
+    if (descriptor_table_get(fd, &entry) != 0)
+        return false;
+
+    /* The lookup took a reference; every path below has to give it back, or
+     * the descriptor outlives its close and the pipe never reports EOF. */
+    bool ours = entry.vtable == &pipe_vtable; /* not a file/socket/terminal */
+    if (ours) {
+        pipe_end_t *e = (pipe_end_t *)entry.data;
+        ours = e->shared != NULL;
+        if (ours)
+            *out = wk_exec_process_borrow_pipe(e->shared->pipe);
+    }
+    descriptor_table_entry_dec(entry);
+    return ours;
 }
 
 int pipe2(int fds[2], int flags) {

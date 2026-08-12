@@ -1,26 +1,60 @@
 --- a/execute_cmd.c
 +++ b/execute_cmd.c
-@@ -5641,7 +5641,79 @@
- 
-       maybe_make_export_env ();
-       put_command_name_into_env (command);
-+    }
+@@ -4463,6 +4463,31 @@
+      statements from affecting the parent shell's environment when they
+      should not. */
+   dofork = pipe_in != NO_PIPE || pipe_out != NO_PIPE || async;
++#if defined (WK_EXEC)
++  /* wk: there is no fork() to make a child with, so a pipeline stage cannot
++     be forked here — it is spawned further down, in execute_disk_command,
++     with its stdio wired to the pipe. Forking early is an optimisation for
++     keeping a stage's variable assignments out of the parent shell, and
++     without it `a=1 | b' does leak the assignment; that is the price of
++     having pipelines at all here. Asynchronous commands still need a process
++     of their own and are left to fail as before. */
++  if ((pipe_in != NO_PIPE || pipe_out != NO_PIPE) && async == 0)
++    {
++      /* Only a stage that becomes an external command can take that route.
++	 A builtin runs inside this shell, and with no fork its output would
++	 go to the shell's own stdout rather than into the pipe — `echo hi |
++	 wc -l' would print hi and count nothing. Rather than quietly produce
++	 the wrong answer, leave such a stage to fork and fail loudly.
++	 Redirecting a builtin's stdio into the pipe undoably is the piece
++	 that would lift this. */
++      char *wkname;
 +
++      wkname = (simple_command->words && simple_command->words->word)
++		 ? simple_command->words->word->word : (char *)NULL;
++      if (wkname == 0 || find_shell_builtin (wkname) == 0)
++	dofork = 0;
++    }
++#endif
+ 
+   /* Something like `%2 &' should restart job 2 in the background, not cause
+      the shell to fork here. */
+@@ -5683,6 +5708,88 @@
+       put_command_name_into_env (command);
+     }
+ 
 +#if defined (WK_EXEC)
 +  /* wk: this platform has no fork(). Run the command to completion through
 +     wk's exec capability and report the status the shell would otherwise have
 +     waited for. Everything below (make_child + shell_execve) needs a child
 +     process, which cannot exist here.
 +
-+     Only plain commands take this path: a pipeline needs pipe(), and an
-+     asynchronous command needs a process to run in the background, so both
-+     fall through and fail as they would without this. */
-+  if (pipe_in == NO_PIPE && pipe_out == NO_PIPE && async == 0)
++     A pipeline takes it too: ../pipe-compat gives this build a real pipe(),
++     so the shell's own pipe descriptors exist, and a stage is spawned with its
++     stdio wired to the pipe behind them rather than run to completion. An
++     asynchronous command still needs a process to run in the background, so it
++     falls through and fails as it would without this. */
++  if (async == 0)
 +    {
 +      char **wkargs;
 +      int wkstat;
 +      REDIRECT *wk_undo;
 +      extern int wk_bash_run PARAMS((const char *, char **, const char *));
++      extern int wk_bash_run_stage PARAMS((const char *, char **, const char *,
++					   int, int));
 +
 +      /* The shell normally applies redirections in the child, after the fork
 +	 — which is precisely what we do not have. Apply them here instead,
@@ -48,7 +82,13 @@
 +	 after it — and would go to the wrong place once we undo below. */
 +      fflush (stdout);
 +      fflush (stderr);
-+      wkstat = wk_bash_run (command, wkargs, pathname);
++      /* A stage of a pipeline is spawned and, unless it is the last one,
++	 left running: its output has to be available to the next stage while
++	 it is still producing. Anything else runs to completion. */
++      if (pipe_in != NO_PIPE || pipe_out != NO_PIPE)
++	wkstat = wk_bash_run_stage (command, wkargs, pathname, pipe_in, pipe_out);
++      else
++	wkstat = wk_bash_run (command, wkargs, pathname);
 +      /* alloc = 0 above: the vector aliases the word list's own strings, so
 +	 free the vector only — strvec_dispose would free the words too, and
 +	 `pathname` points into them. */
@@ -75,8 +115,9 @@
 +	  goto parent_return;
 +	}
 +      /* Found on PATH but unrunnable: fall through to bash's own paths. */
-     }
++    }
 +#endif /* WK_EXEC */
- 
++
    /* We have to make the child before we check for the non-existence
       of COMMAND, since we want the error messages to be redirected. */
+   /* If we can get away without forking and there are no pipes to deal with,

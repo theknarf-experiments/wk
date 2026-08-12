@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include "wkexec.h"
+#include "wkpipe.h"
 
 static void write_all(int fd, const char *buf, size_t len) {
     size_t off = 0;
@@ -74,6 +75,81 @@ static char *stdin_bytes(size_t *len) {
     }
     *len = used;
     return buf;
+}
+
+/* Stages of a pipeline that were started but not waited for.
+ *
+ * A pipeline's stages have to run at the same time — the writer fills the pipe
+ * and stops until the reader drains it — so every stage but the last is
+ * spawned and left running. The shell reports the *last* stage's status, so
+ * these are only let go of, never waited for.
+ *
+ * Waiting would deadlock the common case: in `seq 1 200000 | head -1' the
+ * reader leaves early, and seq is then blocked on a full pipe until the last
+ * reader goes — but the shell still holds its own copy of the read descriptor
+ * and does not close it until after this returns. Detaching lets seq fail its
+ * next write and exit on its own, which is what a shell's SIGPIPE does. */
+#define WK_MAX_STAGES 32
+static wk_child pending[WK_MAX_STAGES];
+static int npending;
+
+static void release_pending(void) {
+    for (int i = 0; i < npending; i++)
+        wk_child_detach(pending[i]);
+    npending = 0;
+}
+
+/* Run one stage of a pipeline. `in_fd`/`out_fd` are the shell's pipe
+ * descriptors, or -1; wk_pipe_of_fd turns them back into the pipe itself so
+ * the child's stdio *is* the pipe rather than a copy of its bytes.
+ *
+ * A stage that feeds another must not be waited for here, or the pipeline
+ * deadlocks the moment the pipe fills. So only the last stage — the one with
+ * nothing to write to — is waited for, and its status is the pipeline's, which
+ * is what the shell reports anyway. */
+int wk_bash_run_stage(const char *command, char **argv, const char *typed,
+                      int in_fd, int out_fd) {
+    if (!command || !*command)
+        return -1;
+
+    wk_exec_process_borrow_pipe_t inp, outp;
+    bool has_in = in_fd >= 0 && wk_pipe_of_fd(in_fd, &inp);
+    bool has_out = out_fd >= 0 && wk_pipe_of_fd(out_fd, &outp);
+
+    wk_stdio in_io = {0}, out_io = {0};
+    if (has_in)
+        in_io.pipe_borrow = &inp;
+    if (has_out)
+        out_io.pipe_borrow = &outp;
+
+    wk_child child;
+    char *err = NULL;
+    if (wk_spawn(command, (const char *const *)argv, has_in ? &in_io : NULL,
+                 has_out ? &out_io : NULL, NULL, &child, &err)) {
+        fprintf(stderr, "%s: %s\n", typed ? typed : command, err ? err : "cannot run");
+        free(err);
+        return 126;
+    }
+
+    if (has_out) {
+        /* Feeds another stage: leave it running. */
+        if (npending < WK_MAX_STAGES)
+            pending[npending++] = child;
+        return 0;
+    }
+
+    wk_result r;
+    int status = 126;
+    if (wk_wait(child, &r) == 0) {
+        write_all(STDOUT_FILENO, r.stdout_data, r.stdout_len);
+        write_all(STDERR_FILENO, r.stderr_data, r.stderr_len);
+        status = r.exit_code;
+    } else if (r.error) {
+        fprintf(stderr, "%s: %s\n", typed ? typed : command, r.error);
+    }
+    wk_result_free(&r);
+    release_pending();
+    return status;
 }
 
 /* Run an external command. Returns its exit status, or -1 if it could not be

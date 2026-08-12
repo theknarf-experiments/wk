@@ -15,6 +15,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "exec_host.h" /* for wk_exec_process_borrow_pipe_t */
+
 /* What a finished program left behind. `stdout_data`/`stderr_data` are
  * malloc'd and owned by the caller; free with wk_result_free(). */
 typedef struct {
@@ -67,8 +69,11 @@ void wk_pipe_free(wk_pipe p);
 /* Where a spawned child's stdio goes. Pass NULL for `pipe` to mean
  * "capture it" (readable from wk_wait) for output, or "no input" for stdin. */
 typedef struct {
-    const wk_pipe *pipe;   /* the pipe, or NULL */
-    const char *bytes;     /* stdin only: fixed input, used when pipe is NULL */
+    const wk_pipe *pipe;   /* a pipe this program made, or NULL */
+    /* A pipe that already exists elsewhere — from a file descriptor, say (see
+     * pipe-compat's wk_pipe_of_fd). Takes precedence over `pipe`. */
+    const wk_exec_process_borrow_pipe_t *pipe_borrow;
+    const char *bytes;     /* stdin only: fixed input, used when no pipe */
     size_t len;
 } wk_stdio;
 
@@ -82,5 +87,12 @@ int wk_spawn(const char *path, const char *const *argv,
  * (a stream sent to a pipe has already gone to whoever read it). Consumes the
  * handle. Returns 0 if it ran, -1 otherwise (check `out->error`). */
 int wk_wait(wk_child child, wk_result *out);
+
+/* Let go of a child without waiting for it. It keeps running and is cleaned up
+ * when it ends — the shell equivalent of not caring about an earlier pipeline
+ * stage's status. Waiting for such a stage can deadlock: it may still be
+ * blocked writing into a pipe whose reader has gone but whose descriptor the
+ * shell has not closed yet. */
+void wk_child_detach(wk_child child);
 
 #endif

@@ -161,11 +161,17 @@ in wasi-libc in guest memory, so wasi-sdk 34 could implement `dup`/`dup2`/
 reach). Since the shell has no child to apply redirections in, the patch
 applies them around the `wk:exec` call and undoes them after — the shape bash
 already uses for builtins — and a `< file` stdin is read and handed to the
-child, which takes its input as bytes. Pipelines and command substitution are not wired
-into bash yet: `pipe()` is wasip3-only, but that was never the real blocker —
-bash forks per pipeline stage (`dofork = pipe_in != NO_PIPE || ...`), so what
-was missing is two live processes, which `wk:exec`'s `spawn` now provides.
-Here-documents need a temp file.
+child, which takes its input as bytes. **Pipelines work too**, for external commands: `ls /bin | wc -l` counts 92,
+`seq 1 20 | sort -r | head -1` chains three stages, and
+`seq 1 200000 | head -1` returns at once rather than generating 1.3 MB. Each
+stage is spawned with its stdio wired to the pipe behind the shell's own pipe
+descriptors, and only the last is waited for — the earlier ones are let go of,
+because waiting on a producer whose reader has left would deadlock until the
+shell closes its copy of the descriptor. A stage that is a *builtin*
+(`echo hi | wc -l`) is not handled: with no fork it would write to the shell's
+stdout instead of the pipe, so rather than quietly give a wrong answer it is
+left to fail on `fork`. Command substitution and here-documents are still
+missing (the latter wants a temp file).
 `wk images build plugins/bash/Dockerfile --tag wk-shell` packages the lot. Like every other capability it is token-gated (kind `exec`, allowed
 by default): `wk token attenuate <node> 'check if operation($k, $t, $a), $k !=
 "exec"'` revokes it within a tick.

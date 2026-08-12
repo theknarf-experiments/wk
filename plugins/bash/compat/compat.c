@@ -121,8 +121,8 @@ int setpriority(int which, id_t who, int prio) {
   return -1;
 }
 
-int pipe(int fds[2]) { (void)fds; errno = ENOSYS; return -1; }
-int pipe2(int fds[2], int flags) { (void)fds; (void)flags; errno = ENOSYS; return -1; }
+/* pipe()/pipe2() are real now — see ../pipe-compat, which is linked in and
+   backs them with wk's pipe. They used to be stubbed here. */
 
 pid_t fork(void) { errno = ENOSYS; return -1; }
 pid_t wait(int *status) { (void)status; errno = ECHILD; return -1; }

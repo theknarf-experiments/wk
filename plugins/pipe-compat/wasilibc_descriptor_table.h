@@ -118,4 +118,25 @@ typedef struct {
  * with a reference count of 0; this initialises it. */
 extern int descriptor_table_insert(descriptor_table_entry_t entry);
 
+/* Looks up a descriptor. Returns 0 and fills `entry`, or -1 with errno set.
+ * Comparing `entry.vtable` against our own is how a file descriptor is
+ * identified as one of our pipes — exact, and with no side table to fall out
+ * of step with dup and close.
+ *
+ * IT HANDS BACK A STRONG REFERENCE, which the caller must release with
+ * descriptor_table_entry_dec. Forgetting to means close() on that descriptor
+ * never reaches zero, so the underlying object is never freed — for a pipe,
+ * that means the reader waits for an end-of-file which can no longer come. */
+extern int descriptor_table_get(int fd, descriptor_table_entry_t *entry);
+
+/* The slow path of the decrement below. */
+extern void __wasilibc_descriptor_deallocate(descriptor_table_entry_t entry);
+
+/* Release a reference taken by descriptor_table_get, freeing the descriptor
+ * if it was the last one. */
+static inline void descriptor_table_entry_dec(descriptor_table_entry_t entry) {
+    if (--entry.data->cnt == 0)
+        __wasilibc_descriptor_deallocate(entry);
+}
+
 #endif /* WK_WASILIBC_DESCRIPTOR_TABLE_H */
