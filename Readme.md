@@ -167,10 +167,12 @@ child, which takes its input as bytes. **Pipelines work too**, for external comm
 stage is spawned with its stdio wired to the pipe behind the shell's own pipe
 descriptors, and only the last is waited for — the earlier ones are let go of,
 because waiting on a producer whose reader has left would deadlock until the
-shell closes its copy of the descriptor. A stage that is a *builtin*
-(`echo hi | wc -l`) is not handled: with no fork it would write to the shell's
-stdout instead of the pipe, so rather than quietly give a wrong answer it is
-left to fail on `fork`. Command substitution and here-documents are still
+shell closes its copy of the descriptor. A stage that is a *builtin* works too
+(`echo hi | wc -l` is 1): with no fork to run `do_piping` in, the plumbing is
+said as redirections instead — `0<&pipe_in`, `1>&pipe_out` — and applied with
+the shell's own undoable machinery, so the shell's descriptors are restored
+afterwards. That save-and-restore is exactly what `dup` is for, which is why it
+could not be done before. Command substitution and here-documents are still
 missing (the latter wants a temp file).
 `wk images build plugins/bash/Dockerfile --tag wk-shell` packages the lot. Like every other capability it is token-gated (kind `exec`, allowed
 by default): `wk token attenuate <node> 'check if operation($k, $t, $a), $k !=

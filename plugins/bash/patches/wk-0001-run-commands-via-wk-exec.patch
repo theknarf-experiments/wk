@@ -1,6 +1,17 @@
 --- a/execute_cmd.c
 +++ b/execute_cmd.c
-@@ -4463,6 +4463,31 @@
+@@ -169,6 +169,10 @@
+ static int execute_simple_command PARAMS((SIMPLE_COM *, int, int, int, struct fd_bitmap *));
+ static int execute_builtin PARAMS((sh_builtin_func_t *, WORD_LIST *, int, int));
+ static int execute_function PARAMS((SHELL_VAR *, WORD_LIST *, int, struct fd_bitmap *, int, int));
++#if defined (WK_EXEC)
++static REDIRECT *wk_pipe_redirects PARAMS((int, int, REDIRECT *));
++static void wk_free_pipe_redirects PARAMS((REDIRECT *, REDIRECT *));
++#endif
+ static int execute_builtin_or_function PARAMS((WORD_LIST *, sh_builtin_func_t *,
+ 					    SHELL_VAR *,
+ 					    REDIRECT *, struct fd_bitmap *, int));
+@@ -4463,6 +4467,17 @@
       statements from affecting the parent shell's environment when they
       should not. */
    dofork = pipe_in != NO_PIPE || pipe_out != NO_PIPE || async;
@@ -12,30 +23,114 @@
 +     without it `a=1 | b' does leak the assignment; that is the price of
 +     having pipelines at all here. Asynchronous commands still need a process
 +     of their own and are left to fail as before. */
-+  if ((pipe_in != NO_PIPE || pipe_out != NO_PIPE) && async == 0)
-+    {
-+      /* Only a stage that becomes an external command can take that route.
-+	 A builtin runs inside this shell, and with no fork its output would
-+	 go to the shell's own stdout rather than into the pipe — `echo hi |
-+	 wc -l' would print hi and count nothing. Rather than quietly produce
-+	 the wrong answer, leave such a stage to fork and fail loudly.
-+	 Redirecting a builtin's stdio into the pipe undoably is the piece
-+	 that would lift this. */
-+      char *wkname;
-+
-+      wkname = (simple_command->words && simple_command->words->word)
-+		 ? simple_command->words->word->word : (char *)NULL;
-+      if (wkname == 0 || find_shell_builtin (wkname) == 0)
-+	dofork = 0;
-+    }
++  if (pipe_in != NO_PIPE || pipe_out != NO_PIPE)
++    dofork = async;
 +#endif
  
    /* Something like `%2 &' should restart job 2 in the background, not cause
       the shell to fork here. */
-@@ -5683,6 +5708,88 @@
-       put_command_name_into_env (command);
-     }
+@@ -4777,9 +4792,34 @@
+ 	}
+       else
+ 	{
+-	  result = execute_builtin_or_function
+-	    (words, builtin, func, simple_command->redirects, fds_to_close,
++	  REDIRECT *wk_redirects;
++
++	  wk_redirects = simple_command->redirects;
++#if defined (WK_EXEC)
++	  /* wk: the shell normally hands a pipeline stage its pipe by forking
++	     and calling do_piping() in the child. There is no fork here, so a
++	     builtin would write to the shell's own stdout and `echo hi | wc -l'
++	     would print hi and count nothing.
++
++	     Say the same thing as redirections instead — `0<&pipe_in' and
++	     `1>&pipe_out' — and hand them to execute_builtin_or_function,
++	     which applies them RX_UNDOABLE and restores the shell's own
++	     descriptors afterwards. That save-and-restore is precisely what
++	     dup() is for, and is why this could not be done before.
++
++	     They go first so that an explicit redirection in the command still
++	     wins, which is the order the forked path produces (do_piping runs
++	     before do_redirections). */
++	  if (already_forked == 0 && (pipe_in != NO_PIPE || pipe_out != NO_PIPE))
++	    wk_redirects = wk_pipe_redirects (pipe_in, pipe_out, wk_redirects);
++#endif
++	  result = execute_builtin_or_function
++	    (words, builtin, func, wk_redirects, fds_to_close,
+ 	     cmdflags);
++#if defined (WK_EXEC)
++	  if (wk_redirects != simple_command->redirects)
++	    wk_free_pipe_redirects (wk_redirects, simple_command->redirects);
++#endif
+ 	  if (builtin)
+ 	    {
+ 	      if (result > EX_SHERRBASE)
+@@ -5598,9 +5638,58 @@
  
+       get_original_signal (SIGQUIT);
+       set_signal_handler (SIGQUIT, SIG_IGN);
++    }
++}
++
++#if defined (WK_EXEC)
++/* Express a pipeline stage's plumbing as redirections: `0<&pipe_in' and
++   `1>&pipe_out'. Returns a list whose tail is REST, so the command's own
++   redirections still follow (and so still override). */
++static REDIRECT *
++wk_pipe_redirects (pipe_in, pipe_out, rest)
++     int pipe_in, pipe_out;
++     REDIRECT *rest;
++{
++  REDIRECT *head;
++  REDIRECTEE source, redir;
++
++  head = rest;
++  if (pipe_out != NO_PIPE)
++    {
++      source.dest = 1;
++      redir.dest = pipe_out;
++      head = make_redirection (source, r_duplicating_output, redir, 0);
++      head->next = rest;
+     }
++  if (pipe_in != NO_PIPE)
++    {
++      REDIRECT *in;
++
++      source.dest = 0;
++      redir.dest = pipe_in;
++      in = make_redirection (source, r_duplicating_input, redir, 0);
++      in->next = head;
++      head = in;
++    }
++  return head;
+ }
+ 
++/* Free only the nodes wk_pipe_redirects added, stopping at REST — which the
++   command still owns. */
++static void
++wk_free_pipe_redirects (head, rest)
++     REDIRECT *head, *rest;
++{
++  while (head && head != rest)
++    {
++      REDIRECT *next = head->next;
++      head->next = (REDIRECT *)NULL;
++      dispose_redirects (head);
++      head = next;
++    }
++}
++#endif /* WK_EXEC */
++
+ /* Execute a simple command that is hopefully defined in a disk file
+    somewhere.
+ 
+@@ -5681,7 +5770,89 @@
+ 
+       maybe_make_export_env ();
+       put_command_name_into_env (command);
++    }
++
 +#if defined (WK_EXEC)
 +  /* wk: this platform has no fork(). Run the command to completion through
 +     wk's exec capability and report the status the shell would otherwise have
@@ -115,9 +210,8 @@
 +	  goto parent_return;
 +	}
 +      /* Found on PATH but unrunnable: fall through to bash's own paths. */
-+    }
+     }
 +#endif /* WK_EXEC */
-+
+ 
    /* We have to make the child before we check for the non-existence
       of COMMAND, since we want the error messages to be redirected. */
-   /* If we can get away without forking and there are no pipes to deal with,
