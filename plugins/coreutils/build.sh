@@ -39,6 +39,16 @@
 #     and getrlimit returns modest *finite* values: several tools size their
 #     buffers from these, and RLIM_INFINITY makes that arithmetic produce
 #     absurd numbers ("memory exhausted" before any work happens).
+#   * PTRDIFF_MAX — the one that broke *everything*. A cross build can't run
+#     the type-size probes, so configure recorded BITSIZEOF_PTRDIFF_T as 0 and
+#     substituted gnulib's own <stdint.h>, making PTRDIFF_MAX ~0. gnulib's
+#     rpl_malloc rejects any size for which xalloc_oversized() is true, so
+#     *every* allocation returned NULL and every tool that allocates died with
+#     "memory exhausted" (echo and --help, which don't allocate, worked fine).
+#     wasi-libc's stdint.h is correct: gl_cv_header_working_stdint_h=yes.
+#   * getcwd — gnulib substitutes its own, which walks up the tree with ".."
+#     and readdir; that can't terminate on wk's vfs, so pwd/ls/stat/du hung
+#     allocating. wasi-libc's getcwd is fine: gl_cv_func_getcwd_*=yes.
 #   * processes — fork/exec/pipe/wait/chroot/priority all fail with ENOSYS.
 #     They're referenced by env/nohup/timeout/chroot/nice, which this
 #     configuration keeps out of the single binary (`ls single_binary_progs`
@@ -49,9 +59,8 @@
 # Requires wasi-sdk (WASI_SDK, default ~/wasi-sdk). Source is fetched (and
 # cached) under coreutils-<ver>/ on first run.
 #
-# KNOWN GAP: `ls DIR` currently dies with "memory exhausted" while reading a
-# directory (ls --help/--version and cat/echo/seq-style tools are fine), so the
-# readdir path still needs a look. Everything else here is working.
+# Known cosmetic wart: error messages print "(null):" instead of the tool name,
+# because gnulib's error() resolves the program name differently here.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -73,7 +82,7 @@ fi
 
 CFLAGS="--target=wasm32-wasip2 -O2 -I$COMPAT \
     -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false \
-    -DF_DUPFD=0 -DHAVE_LCHOWN=0 -DHAVE_GETRLIMIT=1 \
+    -DF_DUPFD=0 -DHAVE_GETRLIMIT=1 \
     -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID"
 
 # The shim is linked in as an object (it defines what wasi-libc leaves out).
@@ -104,14 +113,21 @@ if [ ! -f Makefile ]; then
         ac_cv_func_sigprocmask=yes ac_cv_func_sigaction=yes \
         ac_cv_member_struct_sigaction_sa_sigaction=yes \
         ac_cv_func_pipe=yes \
-        ac_cv_header_sys_resource_h=yes ac_cv_func_getrlimit=yes
+        ac_cv_header_sys_resource_h=yes ac_cv_func_getrlimit=yes \
+        gl_cv_func_getcwd_null=yes gl_cv_func_getcwd_posix_signature=yes \
+        gl_cv_func_getcwd_path_max=yes ac_cv_func_getcwd=yes \
+        gl_cv_header_working_stdint_h=yes
 fi
 
-# Only the multicall target: `make all` would also build standalone copies of
-# the excluded programs (stty needs termios, pinky needs utmp).
+# Two passes. The first (-k, failures expected) generates the headers and
+# libraries the tree needs; it also *attempts* standalone copies of the
+# excluded programs, which cannot build here (stty needs termios, pinky needs
+# utmp) — that's fine, we don't link them. The second builds the one target we
+# actually want: the multicall binary.
+JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+env PATH="$BUILD_PATH" make -k CFLAGS="$CFLAGS" LDFLAGS="$LDFLAGS" -j"$JOBS" || true
 env PATH="$BUILD_PATH" make src/coreutils \
-    CFLAGS="$CFLAGS" LDFLAGS="$LDFLAGS" \
-    -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+    CFLAGS="$CFLAGS" LDFLAGS="$LDFLAGS" -j"$JOBS"
 
 cd ..
 cp "$SRC/src/coreutils" coreutils.wasm
