@@ -172,8 +172,11 @@ shell closes its copy of the descriptor. A stage that is a *builtin* works too
 said as redirections instead — `0<&pipe_in`, `1>&pipe_out` — and applied with
 the shell's own undoable machinery, so the shell's descriptors are restored
 afterwards. That save-and-restore is exactly what `dup` is for, which is why it
-could not be done before. Command substitution and here-documents are still
-missing (the latter wants a temp file).
+could not be done before. **Here-documents work**: bash 5.2 writes a short one into a `pipe()`, which
+this build now has, and a child takes such a pipe as its standard input
+directly — so it streams, and a document larger than the pipe's buffer cannot
+deadlock. Command substitution is still missing: `$(...)` is a subshell whose
+output the shell reads back, and there is no fork to make that subshell with.
 `wk images build plugins/bash/Dockerfile --tag wk-shell` packages the lot. Like every other capability it is token-gated (kind `exec`, allowed
 by default): `wk token attenuate <node> 'check if operation($k, $t, $a), $k !=
 "exec"'` revokes it within a tick.

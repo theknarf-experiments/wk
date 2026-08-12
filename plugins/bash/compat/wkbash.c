@@ -158,6 +158,37 @@ int wk_bash_run(const char *command, char **argv, const char *typed) {
     if (!command || !*command)
         return -1; /* not on PATH: let bash report it */
 
+    /* Standard input reaches the child one of three ways. A pipe — a here
+     * document, or `cmd < <(...)` — is handed over as the pipe itself, so it
+     * streams and so a document larger than the pipe's buffer cannot deadlock.
+     * A regular file is read here (see stdin_bytes). Anything else, a terminal
+     * above all, gives the child nothing. */
+    wk_exec_process_borrow_pipe_t inpipe;
+    if (wk_pipe_of_fd(STDIN_FILENO, &inpipe)) {
+        wk_stdio in_io = {0};
+        in_io.pipe_borrow = &inpipe;
+        wk_child child;
+        char *err = NULL;
+        if (wk_spawn(command, (const char *const *)argv, &in_io, NULL, NULL,
+                     &child, &err)) {
+            fprintf(stderr, "%s: %s\n", typed ? typed : command,
+                    err ? err : "cannot run");
+            free(err);
+            return 126;
+        }
+        wk_result pr;
+        int status = 126;
+        if (wk_wait(child, &pr) == 0) {
+            write_all(STDOUT_FILENO, pr.stdout_data, pr.stdout_len);
+            write_all(STDERR_FILENO, pr.stderr_data, pr.stderr_len);
+            status = pr.exit_code;
+        } else if (pr.error) {
+            fprintf(stderr, "%s: %s\n", typed ? typed : command, pr.error);
+        }
+        wk_result_free(&pr);
+        return status;
+    }
+
     size_t in_len;
     char *in = stdin_bytes(&in_len);
     wk_result r;
