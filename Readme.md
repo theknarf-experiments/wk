@@ -52,19 +52,27 @@ can_use($kind, $target, $action) <- wired($kind, $target), operation($kind, $tar
 The server re-checks it every tick, feeding the canvas graph in as
 `wired(kind, target)` facts and each grant as an `operation(kind, target,
 action)`. Kinds: `file`, `midi`, `port`, `net`, `gateway` (host access is its
-own kind, so it can be cut off separately), `capture`. Actions: `read`/`write`
-on files, `send`/`receive` on MIDI, `read` on capture, `use` for the rest.
-Because the policy lives in the token, it can be narrowed offline by
-*attenuation* (appending checks needs no key) or replaced wholesale to make
-access work differently:
+own kind, so it can be cut off separately), `capture`, and `scene` (a node's
+`wk:scene` 3D objects — no wire needed, so a second rule in the base token
+allows it outright). Actions: `read`/`write` on files, `send`/`receive` on
+MIDI, `read` on capture, `show` on scene, `use` for the rest. Because the
+policy lives in the token, it can be narrowed offline by *attenuation*
+(appending checks needs no key) or replaced wholesale to make access work
+differently:
 
 ```
 wk token show vim                                # print the token's Datalog
 wk token attenuate vim 'check if operation($k, $t, $a), $k != "net"'                 # off every network
 wk token attenuate vim 'check if operation($k, $t, $a), $k != "file" || $a == "read"' # files read-only
 wk token attenuate vim 'check if operation($k, $t, $a), $k != "gateway"'             # no host access
+wk token attenuate totem 'check if operation($k, $t, $a), $k != "scene"'             # mute its 3D objects
 wk token reset vim                               # back to wired ⇒ usable
 ```
+
+A scene mute is *viewer-side*: the guest keeps its entity and keeps updating
+it; it just stops rendering — the seam where future multi-user policy (shared
+vs. local-only objects, muting someone else's node in your own view) slots in
+as more Datalog, not new mechanism.
 
 A denied wire stays on the canvas but grants nothing — swap the token back and
 the mount/port/network returns on the next tick. A write-denied file wire

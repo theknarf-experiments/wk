@@ -233,7 +233,8 @@ mod tests {
         Biscuit::builder()
             .code(
                 "can_use($kind, $target, $action) <- wired($kind, $target), \
-                 operation($kind, $target, $action);",
+                 operation($kind, $target, $action);\n\
+                 can_use(\"scene\", $target, $action) <- operation(\"scene\", $target, $action);",
             )
             .unwrap()
             .build(root)
@@ -336,6 +337,49 @@ mod tests {
             "net",
             "lan",
             "use"
+        ));
+    }
+
+    #[test]
+    fn scene_show_is_allowed_without_a_wire_and_mutable_away() {
+        let root = KeyPair::new();
+        let token = mint_node_base(&root);
+        // No wires at all: scene "show" still passes (the default is all-allow;
+        // an entity needs no wire), while everything else stays wire-gated.
+        assert!(authorize_use(
+            root.public(),
+            &token,
+            &[],
+            "scene",
+            "node1",
+            "show"
+        ));
+        assert!(!authorize_use(
+            root.public(),
+            &token,
+            &[],
+            "file",
+            "node1",
+            "read"
+        ));
+        // The mute: one check kills scene output, nothing else.
+        let muted = attenuate(&token, r#"check if operation($k, $t, $a), $k != "scene";"#);
+        let wired = [("file", "vol1".to_string())];
+        assert!(!authorize_use(
+            root.public(),
+            &muted,
+            &[],
+            "scene",
+            "node1",
+            "show"
+        ));
+        assert!(authorize_use(
+            root.public(),
+            &muted,
+            &wired,
+            "file",
+            "vol1",
+            "read"
         ));
     }
 

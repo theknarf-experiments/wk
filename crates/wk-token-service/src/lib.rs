@@ -15,18 +15,27 @@ use biscuit_auth::{Biscuit, KeyPair, PrivateKey};
 pub use biscuit_auth::PublicKey;
 pub use wk_protocol::{Action, ResourceKind};
 
-/// The Datalog policy every node token starts from: a node may use exactly what
-/// it is wired to on the canvas, in every mode. The server supplies
-/// `wired(kind, target)` facts from the graph and checks one
-/// `operation(kind, target, action)` per grant — kinds are `file`, `midi`,
-/// `port`, `net`, `gateway` (host access — its own kind, so it can be cut off
-/// by matching, since Datalog has no negation), `capture`; actions are
-/// `read`/`write` (file), `send`/`receive` (midi), `read` (capture), and `use`
-/// (the rest). The rule lives in the *token* so attenuation can narrow it —
-/// e.g. read-only: `check if operation($k, $t, $a), $k != "file" || $a ==
+/// The Datalog policy every node token starts from, two rules:
+///
+/// 1. a node may use exactly what it is wired to on the canvas, in every mode.
+///    The server supplies `wired(kind, target)` facts from the graph and
+///    checks one `operation(kind, target, action)` per grant — kinds are
+///    `file`, `midi`, `port`, `net`, `gateway` (host access — its own kind, so
+///    it can be cut off by matching, since Datalog has no negation),
+///    `capture`; actions are `read`/`write` (file), `send`/`receive` (midi),
+///    `read` (capture), and `use` (the rest).
+/// 2. a node may always show its `wk:scene` content — `scene` needs no wire
+///    (target = the owning node's id, action = `show`), so the default is
+///    all-allow. It's a rule rather than baked-in behavior so future policy
+///    (shared vs. local-only entities, per-viewer muting) is an attenuation or
+///    a re-mint away: `check if operation($k, $t, $a), $k != "scene"` mutes a
+///    node's objects without touching the node itself.
+///
+/// The rules live in the *token* so attenuation can narrow them — e.g.
+/// read-only files: `check if operation($k, $t, $a), $k != "file" || $a ==
 /// "read"` — and a swapped token can replace the logic wholesale.
-pub const NODE_BASE_RULE: &str =
-    "can_use($kind, $target, $action) <- wired($kind, $target), operation($kind, $target, $action);";
+pub const NODE_BASE_RULE: &str = r#"can_use($kind, $target, $action) <- wired($kind, $target), operation($kind, $target, $action);
+can_use("scene", $target, $action) <- operation("scene", $target, $action);"#;
 
 /// The token-issuing authority. Holds the root keypair; mints tokens.
 pub struct TokenService {

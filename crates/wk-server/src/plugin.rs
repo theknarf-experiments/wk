@@ -958,6 +958,12 @@ impl PluginHost {
         self.scene.lock().unwrap().clone()
     }
 
+    /// The live scene registry itself (tests seed entities through this).
+    #[cfg(test)]
+    pub(crate) fn scene_registry(&self) -> crate::scene::SceneRegistry {
+        self.scene.clone()
+    }
+
     /// The shared MIDI router, so the server can wire MIDI connections.
     pub fn midi(&self) -> crate::midi::Router {
         self.midi.clone()

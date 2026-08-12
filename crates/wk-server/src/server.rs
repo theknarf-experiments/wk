@@ -2764,7 +2764,7 @@ impl Server {
     /// Taken under a single lock by the runtime and handed to clients so none of
     /// them holds a live lock on the server (and so the shape is exactly what a
     /// networked client would receive over the wire).
-    pub fn view(&self) -> View {
+    pub fn view(&mut self) -> View {
         let nodes: Vec<SharedNode> = self.node_reg.lock().unwrap().clone();
         let surfaces: Vec<SharedSurface> = self.registry.lock().unwrap().clone();
         let file_nodes = self
@@ -2835,7 +2835,19 @@ impl Server {
             win_pos,
             win_size,
             pos3d: self.graph.pos3d.clone(),
-            scene_entities: self.host.scene_entities(),
+            // A node's wk:scene objects render only while its token allows
+            // "show" — the deny side is a live per-viewer mute: the guest keeps
+            // its entity (and keeps updating it); it just isn't in the view.
+            scene_entities: {
+                let entities = self.host.scene_entities();
+                entities
+                    .into_iter()
+                    .filter(|e| {
+                        let owner = e.lock().unwrap().node_id;
+                        self.node_may_use(owner, "scene", owner, "show")
+                    })
+                    .collect()
+            },
             world: self.world.as_ref().map(|w| {
                 self.workspace_path
                     .parent()
@@ -2888,7 +2900,7 @@ impl Server {
     /// A serializable projection of the state for a remote (CLI) client — the
     /// wire form of [`Self::view`], carrying only plain data (no shared runtime
     /// handles). See [`wk_protocol::ipc::Snapshot`].
-    pub fn ipc_snapshot(&self) -> wk_protocol::ipc::Snapshot {
+    pub fn ipc_snapshot(&mut self) -> wk_protocol::ipc::Snapshot {
         use wk_protocol::ipc::{NodeInfo, Snapshot, WireInfo};
         let v = self.view();
         let kind_str = |id: NodeId| -> &'static str {
@@ -3118,6 +3130,56 @@ mod model_tests {
             "host access cut"
         );
         assert!(s.node_may_use(app, "net", net, "use"), "plain net survives");
+
+        // wk:scene: allowed by default with no wire at all; the mute
+        // attenuation drops the node's entities out of the *view* (a live,
+        // viewer-side mute — the entity itself stays registered) and reset
+        // brings them back.
+        s.host
+            .scene_registry()
+            .lock()
+            .unwrap()
+            .push(Arc::new(Mutex::new(crate::scene::EntityState {
+                id: 1,
+                node_id: app,
+                glb: Arc::new(Vec::new()),
+                pos: [0.0; 3],
+                yaw: 0.0,
+                scale: 1.0,
+                events: std::collections::VecDeque::new(),
+            })));
+        s.apply(Command::SetToken {
+            id: app,
+            token: Vec::new(), // reset to the default token
+        });
+        assert!(s.node_may_use(app, "scene", app, "show"));
+        assert_eq!(s.view().scene_entities.len(), 1, "entity renders");
+        let mute =
+            biscuit_auth::UnverifiedBiscuit::from(s.node_auth.as_ref().unwrap().1.as_slice())
+                .unwrap()
+                .append(
+                    biscuit_auth::builder::BlockBuilder::new()
+                        .code(r#"check if operation($k, $t, $a), $k != "scene";"#)
+                        .unwrap(),
+                )
+                .unwrap()
+                .to_vec()
+                .unwrap();
+        s.apply(Command::SetToken {
+            id: app,
+            token: mute,
+        });
+        assert_eq!(s.view().scene_entities.len(), 0, "muted out of the view");
+        assert_eq!(
+            s.host.scene_entities().len(),
+            1,
+            "the entity itself stays registered (mute is viewer-side)"
+        );
+        s.apply(Command::SetToken {
+            id: app,
+            token: Vec::new(),
+        });
+        assert_eq!(s.view().scene_entities.len(), 1, "unmuted");
     }
 
     /// Undoing a *moved* one-per-source wire restores the displaced link, not
