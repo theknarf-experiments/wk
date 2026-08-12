@@ -40,6 +40,14 @@ enum Commands {
         target: String,
     },
 
+    /// Re-pull OCI dependencies from their registries (like `docker pull`):
+    /// refreshes moved tags; unchanged content is a cheap no-op
+    Pull {
+        /// A dependency name or an `oci://<ref>`; omit to pull every
+        /// `oci://` dependency of the workspace
+        target: Option<String>,
+    },
+
     /// Publish a plugin to an OCI registry as a Wasm OCI Artifact
     Publish {
         /// Dependency name or local `.wasm` path
@@ -338,6 +346,7 @@ fn main() -> Result<(), String> {
     match &cli.command {
         Some(Commands::Init) => workspace::init(file),
         Some(Commands::Add { target }) => workspace::add(target.clone(), file),
+        Some(Commands::Pull { target }) => workspace::pull(target.clone(), file),
         Some(Commands::Publish { plugin, reference }) => {
             workspace::publish(plugin.clone(), reference.clone(), file)
         }

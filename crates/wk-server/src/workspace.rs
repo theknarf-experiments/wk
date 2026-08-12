@@ -1062,6 +1062,65 @@ pub fn add(target: String, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The OCI references `wk pull` should refresh: every `oci://` dependency of
+/// the document, or — given a target — that dependency's reference (by name),
+/// falling back to reading the target itself as a reference (`oci://` prefix
+/// optional).
+fn refs_to_pull(doc: &Document, target: Option<&str>) -> Result<Vec<String>, String> {
+    let Some(target) = target else {
+        return Ok(doc
+            .dependencies
+            .iter()
+            .filter_map(|d| match &d.source {
+                Source::Oci(reference) => Some(reference.clone()),
+                _ => None,
+            })
+            .collect());
+    };
+    if let Some(dep) = doc.dependencies.iter().find(|d| d.name == target) {
+        return match &dep.source {
+            Source::Oci(reference) => Ok(vec![reference.clone()]),
+            other => Err(format!(
+                "dependency {target:?} is not an OCI artifact (it is {})",
+                other.to_kdl()
+            )),
+        };
+    }
+    let reference = target.strip_prefix("oci://").unwrap_or(target);
+    if !reference.contains('/') {
+        return Err(format!(
+            "no dependency named {target:?}, and it doesn't look like an OCI \
+             reference (expected registry/repo[:tag])"
+        ));
+    }
+    Ok(vec![reference.to_string()])
+}
+
+/// Re-pull OCI dependencies from their registries (like `docker pull`): a moved
+/// tag repoints the cache's ref index at the new content; unchanged content is
+/// a no-op (the blob store dedups). `target` selects one dependency (by name)
+/// or a bare reference; `None` refreshes every `oci://` dependency.
+pub fn pull(target: Option<String>, path: &Path) -> Result<(), String> {
+    let doc = Document::load_resolved(path).unwrap_or_else(|_| Document::empty());
+    let refs = refs_to_pull(&doc, target.as_deref())?;
+    if refs.is_empty() {
+        println!("(no oci:// dependencies to pull)");
+        return Ok(());
+    }
+    for reference in refs {
+        let before = crate::oci::cached_artifact(&reference);
+        println!("pulling {reference} ...");
+        crate::oci::pull_into_cache(&reference)?;
+        let after = crate::oci::cached_artifact(&reference);
+        match (before, after) {
+            (Some(a), Some(b)) if a == b => println!("{reference}: up to date"),
+            (Some(_), Some(_)) => println!("{reference}: updated"),
+            _ => println!("{reference}: pulled"),
+        }
+    }
+    Ok(())
+}
+
 /// Publish a local plugin to an OCI registry as a Wasm OCI Artifact. `plugin` is
 /// a dependency name (resolved to its local wasm) or a `.wasm` path; `reference`
 /// is the target, e.g. `localhost:5000/triangle:1.0`.
@@ -1116,6 +1175,51 @@ pub fn remove(name: String, path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refs_to_pull_selects_by_dep_name_or_reference() {
+        let mut doc = Document::empty();
+        let dep = |name: &str, source: Source| Dependency {
+            name: name.to_string(),
+            source,
+            args: Vec::new(),
+            description: None,
+        };
+        doc.dependencies
+            .push(dep("foo", Source::Oci("ghcr.io/org/foo:1.0".to_string())));
+        doc.dependencies
+            .push(dep("bar", Source::Oci("localhost:5001/bar:2".to_string())));
+        doc.dependencies
+            .push(dep("local", Source::Path(PathBuf::from("a.wasm"))));
+
+        // No target: every oci:// dependency, local paths skipped.
+        assert_eq!(
+            refs_to_pull(&doc, None).unwrap(),
+            vec!["ghcr.io/org/foo:1.0", "localhost:5001/bar:2"]
+        );
+        // A dependency name resolves to its reference.
+        assert_eq!(
+            refs_to_pull(&doc, Some("bar")).unwrap(),
+            vec!["localhost:5001/bar:2"]
+        );
+        // A non-OCI dependency is a clear error.
+        assert!(refs_to_pull(&doc, Some("local"))
+            .unwrap_err()
+            .contains("not an OCI"));
+        // An unmatched target is read as a reference (oci:// prefix optional)...
+        assert_eq!(
+            refs_to_pull(&doc, Some("oci://ghcr.io/other/thing:3")).unwrap(),
+            vec!["ghcr.io/other/thing:3"]
+        );
+        assert_eq!(
+            refs_to_pull(&doc, Some("ghcr.io/other/thing:3")).unwrap(),
+            vec!["ghcr.io/other/thing:3"]
+        );
+        // ...but only if it plausibly is one.
+        assert!(refs_to_pull(&doc, Some("typo"))
+            .unwrap_err()
+            .contains("no dependency"));
+    }
 
     #[test]
     fn import_merges_for_running_and_save_preserves_the_composition() {

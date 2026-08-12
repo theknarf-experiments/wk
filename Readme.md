@@ -113,4 +113,9 @@ cargo run -- add oci://localhost:5001/<name>:1.0
 cargo run -- run
 ```
 
+Pulled wasm is cached content-addressed (`~/.cache/wk/oci/blobs/` plus a
+reference→digest index), so `run` only hits the network the first time.
+`cargo run -- pull` re-pulls like `docker pull`: a moved tag repoints the
+index; unchanged content is a cheap no-op.
+
 `scripts/publish-known-set.sh` publishes the bundled plugins as a ready-made set.
