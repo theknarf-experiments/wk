@@ -613,7 +613,7 @@ impl Shell {
                 let n: usize = flag_value(&args, "-n")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(10);
-                let text = self.slurp(&args, input);
+                let text = self.slurp(&args, input, &["-n"]);
                 let lines: Vec<&str> = text.lines().collect();
                 let picked: Vec<&&str> = if name == "head" {
                     lines.iter().take(n).collect()
@@ -626,7 +626,7 @@ impl Shell {
                 0
             }
             "wc" => {
-                let text = self.slurp(&args, input);
+                let text = self.slurp(&args, input, &[]);
                 let l = text.lines().count();
                 let w = text.split_whitespace().count();
                 let c = text.len();
@@ -652,7 +652,7 @@ impl Shell {
                     return (out, 2);
                 };
                 let pat_l = pat.to_lowercase();
-                let text = self.slurp(&pos[1..].to_vec(), input);
+                let text = self.slurp(&pos[1..].to_vec(), input, &[]);
                 let mut hits = 0;
                 for (i, l) in text.lines().enumerate() {
                     let m = if icase {
@@ -677,7 +677,7 @@ impl Shell {
                 i32::from(hits == 0)
             }
             "sort" => {
-                let text = self.slurp(&args, input);
+                let text = self.slurp(&args, input, &[]);
                 let mut lines: Vec<&str> = text.lines().collect();
                 if args.contains(&"-n") {
                     lines.sort_by_key(|l| l.trim().parse::<i64>().unwrap_or(0));
@@ -696,7 +696,7 @@ impl Shell {
                 0
             }
             "uniq" => {
-                let text = self.slurp(&args, input);
+                let text = self.slurp(&args, input, &[]);
                 let counted = args.contains(&"-c");
                 let mut prev: Option<&str> = None;
                 let mut cnt = 0usize;
@@ -722,11 +722,37 @@ impl Shell {
                 0
             }
             "cut" => {
+                let text = self.slurp(&args, input, &["-d", "-f", "-c"]);
+                // `-c LIST`: character ranges (`1-24`, `3-`, `-8`, `2`), the
+                // form that truncates long output — comma-separated, 1-based.
+                if let Some(spec) = flag_value(&args, "-c") {
+                    for l in text.lines() {
+                        let chars: Vec<char> = l.chars().collect();
+                        let mut picked = String::new();
+                        for range in spec.split(',') {
+                            let (from, to) = match range.split_once('-') {
+                                Some((a, "")) => (num(a).max(1) as usize, chars.len()),
+                                Some(("", b)) => (1, num(b) as usize),
+                                Some((a, b)) => (num(a).max(1) as usize, num(b) as usize),
+                                None => {
+                                    let n = num(range).max(1) as usize;
+                                    (n, n)
+                                }
+                            };
+                            for i in from..=to.min(chars.len()) {
+                                if let Some(c) = chars.get(i - 1) {
+                                    picked.push(*c);
+                                }
+                            }
+                        }
+                        say!("{picked}");
+                    }
+                    return (out, 0);
+                }
                 let delim = flag_value(&args, "-d").unwrap_or("\t");
                 let fields: Vec<usize> = flag_value(&args, "-f")
                     .map(|f| f.split(',').filter_map(|n| n.parse().ok()).collect())
                     .unwrap_or_default();
-                let text = self.slurp(&args, input);
                 for l in text.lines() {
                     let parts: Vec<&str> = l.split(delim).collect();
                     let picked: Vec<&str> = fields
@@ -928,16 +954,18 @@ impl Shell {
         (out, status)
     }
 
-    /// Read the named files (non-flag args, minus flag values), else stdin.
-    fn slurp(&self, args: &[&str], input: &[u8]) -> String {
+    /// Read the named files, else stdin. `value_flags` are this command's
+    /// flags that take a separate value (`head -n 5`), so the value isn't
+    /// mistaken for a filename — which flag takes a value is per-command
+    /// (`wc -c` counts bytes; `cut -c 1-8` selects characters).
+    fn slurp(&self, args: &[&str], input: &[u8], value_flags: &[&str]) -> String {
         let mut files: Vec<&str> = Vec::new();
         let mut i = 0;
         while i < args.len() {
             let a = args[i];
             if a.starts_with('-') {
-                // A value-taking flag consumes the next token.
-                if ["-n", "-d", "-f"].contains(&a) {
-                    i += 2;
+                if value_flags.contains(&a) {
+                    i += 2; // skip the flag and its value
                     continue;
                 }
                 i += 1;
