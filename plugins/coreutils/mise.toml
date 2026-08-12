@@ -1,0 +1,6 @@
+# Build this plugin: `mise run build`
+# wasi-sdk comes from the root mise.toml [tools] (same as the other C plugins).
+[tasks.build]
+description = "Cross-compile upstream GNU coreutils into one wasm multicall component"
+dir = "{{config_root}}"
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build.sh"

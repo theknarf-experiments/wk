@@ -133,3 +133,8 @@ plugins/wsh/wsh.wasm
 # curl (upstream source fetched + built by build.sh; component is derived)
 plugins/curl/curl-*/
 plugins/curl/curl.wasm
+
+# coreutils (upstream source fetched + built by build.sh; artifacts derived)
+plugins/coreutils/coreutils-*/
+plugins/coreutils/coreutils.wasm
+plugins/coreutils/compat/*.o
