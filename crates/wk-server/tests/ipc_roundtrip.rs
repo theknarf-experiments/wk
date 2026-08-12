@@ -35,7 +35,13 @@ fn cli_reads_snapshot_and_applies_a_command() {
 
     let doc = Document::load_resolved(&path).unwrap();
     let tokens = TokenService::new();
-    let runtime = ServerRuntime::spawn(&doc, path.clone(), tokens.public_key()).unwrap();
+    let runtime = ServerRuntime::spawn(
+        &doc,
+        path.clone(),
+        tokens.public_key(),
+        tokens.mint_node_base().unwrap(),
+    )
+    .unwrap();
     let handle = runtime.handle().with_token(tokens.mint_admin().unwrap());
     let ipc = IpcServer::start(handle, &path).unwrap();
 

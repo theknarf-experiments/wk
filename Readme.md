@@ -38,6 +38,27 @@ instead stand for shared resources a plugin can wire to:
 
 A document can hold several workspaces (shown as tabs); edits are undoable.
 
+### Node capability tokens
+
+Wiring says what a node *is connected to*; a node's **capability token** (a
+[Biscuit](https://www.biscuitsec.org/)) decides what those wires actually
+*grant*. Every app node holds a token whose authority block carries one
+Datalog rule — `can_use($kind, $target) <- wired($kind, $target)`, "a node may
+use what it is wired to" — and the server re-checks it every tick, feeding the
+canvas graph in as `wired(...)` facts. Because the policy lives in the token,
+it can be narrowed offline by *attenuation* (appending checks needs no key)
+or replaced wholesale to make access work differently:
+
+```
+wk token show vim                                          # print the token's Datalog
+wk token attenuate vim 'check if operation($k, $t), $k != "net"'   # cut it off every network
+wk token reset vim                                         # back to wired ⇒ usable
+```
+
+A denied wire stays on the canvas but grants nothing — swap the token back and
+the mount/port/network returns on the next tick. Custom tokens persist in the
+`.wk` file; the signing key lives beside it (`workspace.wk.key`, gitignored).
+
 ## 3D worlds
 
 Every `.wk` file is also a **world**, VRChat-style: open the command palette

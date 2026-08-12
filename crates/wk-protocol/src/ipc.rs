@@ -54,6 +54,11 @@ pub struct NodeInfo {
     /// localhost port is already in use. `None` when healthy.
     #[serde(default)]
     pub error: Option<String>,
+    /// An app node's *effective* capability token (custom or the workspace
+    /// default), hex-encoded — what `wk token show/attenuate` operate on.
+    /// `None` for non-app nodes (or a server without node auth configured).
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 /// One wire between two nodes.
@@ -197,6 +202,7 @@ mod tests {
                 terminal: true,
                 attached: false,
                 error: None,
+                token: None,
             }],
             wires: vec![WireInfo {
                 kind: "file".into(),

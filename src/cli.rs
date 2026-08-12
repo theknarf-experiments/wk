@@ -135,6 +135,110 @@ pub fn add(workspace: &Path, name: &str, args: &[String]) -> Result<(), String> 
     Ok(())
 }
 
+/// Fetch a node's effective capability token: (node id, token bytes).
+fn node_token(workspace: &Path, node: &str) -> Result<(wk_protocol::NodeId, Vec<u8>), String> {
+    let mut stream = connect(workspace)?;
+    let snap = get_snapshot(&mut stream)?;
+    let n = resolve(&snap, node)?;
+    let hex = n.token.as_deref().ok_or_else(|| {
+        format!(
+            "node {} has no capability token ({})",
+            short(n.id),
+            if n.kind == "app" {
+                "the server was started without a token service"
+            } else {
+                "only app nodes bear tokens"
+            }
+        )
+    })?;
+    let bytes = wk_server::workspace::hex_bytes(hex)
+        .filter(|b| !b.is_empty())
+        .ok_or("malformed token hex in the server snapshot")?;
+    Ok((n.id, bytes))
+}
+
+/// `wk token show <ref>`: print a node's capability token — each Datalog block
+/// (the authority policy, then any attenuations) and its hex form (the
+/// currency `token set` accepts).
+pub fn token_show(workspace: &Path, node: &str) -> Result<(), String> {
+    let (id, bytes) = node_token(workspace, node)?;
+    let tok =
+        biscuit_auth::UnverifiedBiscuit::from(&bytes).map_err(|e| format!("parse token: {e}"))?;
+    println!("node {}", short(id));
+    for i in 0..tok.block_count() {
+        let source = tok
+            .print_block_source(i)
+            .map_err(|e| format!("block {i}: {e}"))?;
+        let label = if i == 0 { "authority" } else { "attenuation" };
+        println!("block {i} ({label}):");
+        for line in source.lines().filter(|l| !l.trim().is_empty()) {
+            println!("  {}", line.trim());
+        }
+    }
+    println!("hex: {}", wk_server::workspace::bytes_hex(&bytes));
+    Ok(())
+}
+
+/// `wk token attenuate <ref> <block>`: append an attenuation block (Datalog
+/// checks) to the node's current token and swap it in. Attenuation is offline —
+/// it needs no signing key, only the token — and can only *narrow* what the
+/// token grants. E.g. `'check if operation($k, $t), $k != "net"'` keeps a node
+/// off every network while leaving its other wires working.
+pub fn token_attenuate(workspace: &Path, node: &str, block: &str) -> Result<(), String> {
+    let (id, bytes) = node_token(workspace, node)?;
+    let appended = biscuit_auth::UnverifiedBiscuit::from(&bytes)
+        .map_err(|e| format!("parse token: {e}"))?
+        .append(
+            biscuit_auth::builder::BlockBuilder::new()
+                .code(block)
+                .map_err(|e| format!("attenuation datalog: {e}"))?,
+        )
+        .map_err(|e| format!("append block: {e}"))?;
+    let token = appended
+        .to_vec()
+        .map_err(|e| format!("serialize token: {e}"))?;
+    let mut stream = connect(workspace)?;
+    send_command(&mut stream, Command::SetToken { id, token })?;
+    println!(
+        "attenuated {} (token now has {} blocks)",
+        short(id),
+        appended.block_count()
+    );
+    Ok(())
+}
+
+/// `wk token set <ref> <hex>`: replace a node's token wholesale — e.g. one
+/// minted with different authority logic, or a token saved from `token show`.
+/// The server refuses tokens not signed by this workspace's token service.
+pub fn token_set(workspace: &Path, node: &str, hex: &str) -> Result<(), String> {
+    let token = wk_server::workspace::hex_bytes(hex.trim())
+        .filter(|b| !b.is_empty())
+        .ok_or("the token must be non-empty hex (as printed by `wk token show`)")?;
+    let mut stream = connect(workspace)?;
+    let snap = get_snapshot(&mut stream)?;
+    let id = resolve(&snap, node)?.id;
+    send_command(&mut stream, Command::SetToken { id, token })?;
+    println!("set token on {}", short(id));
+    Ok(())
+}
+
+/// `wk token reset <ref>`: return a node to the workspace's default token
+/// ("a node may use what it is wired to").
+pub fn token_reset(workspace: &Path, node: &str) -> Result<(), String> {
+    let mut stream = connect(workspace)?;
+    let snap = get_snapshot(&mut stream)?;
+    let id = resolve(&snap, node)?.id;
+    send_command(
+        &mut stream,
+        Command::SetToken {
+            id,
+            token: Vec::new(),
+        },
+    )?;
+    println!("reset {} to the default token", short(id));
+    Ok(())
+}
+
 /// `wk logs [-f] <ref>`: print a node's output log (non-destructive; doesn't
 /// steal the live stream the way `attach` does). `follow` streams new output
 /// until the node exits or Ctrl-C.
@@ -686,6 +790,7 @@ mod tests {
             attached: false,
             compiling: false,
             error: None,
+            token: None,
         }
     }
 

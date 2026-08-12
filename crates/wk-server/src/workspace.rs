@@ -323,6 +323,10 @@ pub enum SnapKind {
         /// Launch args, editable in the GUI. Empty falls back to the
         /// dependency's default args at materialization.
         args: Vec<String>,
+        /// A *custom* capability token (hex-encoded Biscuit), set via
+        /// `wk token`. Absent = the workspace's default node token, which is
+        /// minted fresh each run and never persisted.
+        token: Option<String>,
     },
     /// An in-memory named volume. Its *bytes* are runtime state — undo carries
     /// them alongside the snap; the `.wk` file persists them (to a sidecar) only
@@ -361,6 +365,22 @@ pub enum SnapKind {
 /// Hex-encode an uplink secret for persistence.
 pub fn secret_hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Hex-encode arbitrary bytes (capability tokens) for persistence/transport.
+pub fn bytes_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Decode hex back to bytes, if well-formed.
+pub fn hex_bytes(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
 
 /// Decode a persisted uplink secret, if well-formed.
@@ -876,6 +896,7 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
                 name: n.get(0)?.as_string()?.to_string(),
                 options,
                 args,
+                token: text("token"),
             }
         }
         // `virtualfile`/`hostfile` are the legacy names, still accepted on read.
@@ -1010,7 +1031,13 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         }
         ch.nodes_mut().push(n);
     }
-    if let SnapKind::App { options, args, .. } = &s.kind {
+    if let SnapKind::App {
+        options,
+        args,
+        token,
+        ..
+    } = &s.kind
+    {
         if !options.is_empty() {
             let mut opts = KdlNode::new("options");
             for &v in options {
@@ -1024,6 +1051,11 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
                 a.push(str_entry(arg));
             }
             ch.nodes_mut().push(a);
+        }
+        if let Some(tok) = token {
+            let mut t = KdlNode::new("token");
+            t.push(str_entry(tok));
+            ch.nodes_mut().push(t);
         }
     }
     node.set_children(ch);
@@ -1472,6 +1504,7 @@ mod tests {
                                 name: "synth".into(),
                                 options: vec![8.0, 0.6, 0.0, 1.0],
                                 args: vec!["netserve".into(), "80".into()],
+                                token: Some("c0ffee".into()),
                             },
                         },
                         NodeSnap {
@@ -1736,11 +1769,15 @@ mod tests {
                 value_str(),
                 prop::collection::vec(coord(), 0..4),
                 prop::collection::vec(value_str(), 0..3),
+                prop::option::of(
+                    prop::collection::vec(any::<u8>(), 1..48).prop_map(|b| bytes_hex(&b))
+                ),
             )
-                .prop_map(|(name, options, args)| SnapKind::App {
+                .prop_map(|(name, options, args, token)| SnapKind::App {
                     name,
                     options,
-                    args
+                    args,
+                    token
                 }),
             (value_str(), any::<bool>())
                 .prop_map(|(name, persist)| SnapKind::Volume { name, persist }),

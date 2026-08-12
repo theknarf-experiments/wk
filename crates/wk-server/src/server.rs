@@ -373,6 +373,8 @@ enum Undo {
         new_dst: NodeId,
         old_dst: Option<NodeId>,
     },
+    /// Restore a node's previous capability token (`None` = the default).
+    Token(NodeId, Option<Vec<u8>>),
     /// Remove a node that a create added.
     Uncreate(NodeId),
     /// Recreate a node that was removed, with its wiring.
@@ -490,6 +492,11 @@ pub struct Graph {
     /// Screen-capture grants, as (app node id, Capture node id).
     pub capture_links: Vec<(NodeId, NodeId)>,
 
+    /// App nodes' *custom* capability tokens (serialized Biscuits), set via
+    /// `wk token`. Absent = the workspace's default node token ("use what
+    /// you're wired to"). Side table keyed by node id; persisted hex in the
+    /// `.wk` file.
+    pub node_tokens: HashMap<NodeId, Vec<u8>>,
     /// Iroh uplink nodes' ed25519 secrets, so a node's ticket (its dialable
     /// identity) survives restarts. The peer ticket it dials lives in
     /// `node_args`. Side table keyed by node id.
@@ -568,6 +575,17 @@ pub struct Server {
     /// unplaced node comes back still wired once it can materialize.
     unplaced_wires: Vec<(NodeId, WireRel, NodeId, NodeId)>,
 
+    /// Node-capability auth: the token service's public key plus the base node
+    /// token every app node holds by default (its authority block carries the
+    /// "use what you're wired to" rule). `None` = enforcement off (a server
+    /// embedded without a token service, and most tests) — wiring effects then
+    /// apply unconditionally, as before node tokens existed.
+    node_auth: Option<(biscuit_auth::PublicKey, Vec<u8>)>,
+    /// Memoized node-use decisions for the per-tick reconcilers: the cached
+    /// verdict is valid while its fingerprint (token bytes + the node's wire
+    /// set) is unchanged. Keyed by (node, kind, target).
+    auth_cache: HashMap<(NodeId, &'static str, NodeId), (u64, bool)>,
+
     /// Inverse-command history for [`Command::Undo`].
     undo: Vec<Undo>,
 
@@ -612,6 +630,8 @@ impl Server {
             attached: std::collections::HashSet::new(),
             unplaced: Vec::new(),
             unplaced_wires: Vec::new(),
+            node_auth: None,
+            auth_cache: HashMap::new(),
             undo: Vec::new(),
             next_port: 8080,
             file_seq: 0,
@@ -1029,12 +1049,19 @@ impl Server {
     fn sync_captures(&mut self) {
         let nodes: Vec<crate::plugin::SharedNode> = self.node_reg.lock().unwrap().clone();
         for node in nodes {
-            let feed = self
+            let pair = self
                 .graph
                 .capture_links
                 .iter()
                 .find(|&&(app, _)| app == node.id)
-                .and_then(|(_, cap)| self.capture_feeds.get(cap).cloned());
+                .copied();
+            let feed = pair.and_then(|(app, cap)| {
+                if self.node_may_use(app, "capture", cap) {
+                    self.capture_feeds.get(&cap).cloned()
+                } else {
+                    None
+                }
+            });
             *node.capture_src.lock().unwrap() = feed;
         }
     }
@@ -1232,7 +1259,10 @@ impl Server {
     /// Wire (or unwire) app node (or Iroh uplink) `app_id` onto Network node
     /// `net_id`.
     fn toggle_net(&mut self, app_id: NodeId, net_id: NodeId) {
-        let joined = wiring::toggle_unique(&mut self.graph.net_links, app_id, net_id);
+        let joined = wiring::toggle_unique(&mut self.graph.net_links, app_id, net_id)
+            // The immediate join is gated on the member's token too, not just
+            // the per-tick sync — no one-tick window on the network.
+            && self.node_may_use(app_id, "net", net_id);
         // An uplink member: its trunk follows the wire (own empty net = idle).
         if let Some(up) = self.uplinks.get(&app_id) {
             up.set_net(if joined { net_id } else { app_id });
@@ -1251,12 +1281,16 @@ impl Server {
 
     /// Ensure each wired node's fabric stack reflects its network membership.
     /// Nodes compile asynchronously, so one wired before its stack existed gets
-    /// its membership applied here once it's ready.
-    fn sync_net_membership(&self) {
+    /// its membership applied here once it's ready. A member whose token does
+    /// not allow the net (denied, or the authorization was revoked) is held in
+    /// isolation instead — the wire stays on the canvas but grants nothing.
+    fn sync_net_membership(&mut self) {
         let nodes = self.node_reg.lock().unwrap().clone();
-        for &(app, net) in &self.graph.net_links {
+        let links = self.graph.net_links.clone();
+        for (app, net) in links {
+            let allowed = self.node_may_use(app, "net", net);
             if let Some(up) = self.uplinks.get(&app) {
-                up.set_net(net);
+                up.set_net(if allowed { net } else { app });
                 continue;
             }
             let Some(stack) = nodes
@@ -1266,11 +1300,15 @@ impl Server {
             else {
                 continue;
             };
-            let host = self.is_gateway(net);
+            let (want_net, want_host) = if allowed {
+                (net, self.is_gateway(net))
+            } else {
+                (app, false) // own empty net = isolated
+            };
             let mut g = stack.lock().unwrap();
-            if g.net != net || g.host_access != host {
-                g.net = net;
-                g.host_access = host;
+            if g.net != want_net || g.host_access != want_host {
+                g.net = want_net;
+                g.host_access = want_host;
             }
         }
     }
@@ -1353,19 +1391,19 @@ impl Server {
         // a fabric (wasi:sockets) node only once its guest is actually running and
         // thus listening. Gating on `running` means a HostPort publishes exactly
         // when its node is live — never dialing a not-yet-listening guest, and it
-        // unbinds automatically when the node stops or exits.
-        let desired: HashMap<NodeId, NodeId> = self
-            .graph
-            .serve_links
-            .iter()
-            .filter(|&&(http, _)| {
-                self.app_node(http).is_some_and(|n| {
-                    n.http_path().is_some()
-                        || (n.net_stack().is_some() && n.running.load(Ordering::Relaxed))
-                })
-            })
-            .map(|&(h, hp)| (h, hp))
-            .collect();
+        // unbinds automatically when the node stops or exits. The node's token
+        // must also allow the publish; a denied/revoked one unbinds the same way.
+        let links = self.graph.serve_links.clone();
+        let mut desired: HashMap<NodeId, NodeId> = HashMap::new();
+        for (http, hp) in links {
+            let ready = self.app_node(http).is_some_and(|n| {
+                n.http_path().is_some()
+                    || (n.net_stack().is_some() && n.running.load(Ordering::Relaxed))
+            });
+            if ready && self.node_may_use(http, "port", hp) {
+                desired.insert(http, hp);
+            }
+        }
         // Stop forwards no longer desired: the wire was cut, the node stopped or
         // exited, or it's now published on a different HostPort.
         let stale: Vec<NodeId> = self
@@ -1514,13 +1552,151 @@ impl Server {
             })
     }
 
+    /// Turn on node-capability enforcement: `public_key` verifies node tokens
+    /// (a copy of the token service's key), `base_token` is the default token
+    /// every app node holds (see `wk_token_service::mint_node_base`). Until
+    /// this is called, wiring effects apply unconditionally.
+    pub fn set_node_auth(&mut self, public_key: biscuit_auth::PublicKey, base_token: Vec<u8>) {
+        // Tokens restored from the .wk before auth was configured couldn't be
+        // verified then; drop any that this service didn't sign (the key file
+        // was lost, or the file came from another machine) so those nodes fall
+        // back to the default token instead of being denied everything.
+        self.graph.node_tokens.retain(|id, t| {
+            let ok = biscuit_auth::Biscuit::from(t, public_key).is_ok();
+            if !ok {
+                eprintln!(
+                    "wk: node {id} has a token from a different token service; \
+                     using the default"
+                );
+            }
+            ok
+        });
+        self.node_auth = Some((public_key, base_token));
+        self.auth_cache.clear();
+    }
+
+    /// Every wire app node `id` currently has, as `(kind, counterpart)` — the
+    /// ambient `wired(...)` facts its token's Datalog runs against.
+    fn wires_of(&self, id: NodeId) -> Vec<(&'static str, NodeId)> {
+        let g = &self.graph;
+        let mut w: Vec<(&'static str, NodeId)> = Vec::new();
+        w.extend(
+            g.connections
+                .iter()
+                .filter(|&&(_, a)| a == id)
+                .map(|&(f, _)| ("file", f)),
+        );
+        // A MIDI wire is a fact for both endpoints (source and destination).
+        w.extend(
+            g.midi_links
+                .iter()
+                .filter(|&&(s, _)| s == id)
+                .map(|&(_, d)| ("midi", d)),
+        );
+        w.extend(
+            g.midi_links
+                .iter()
+                .filter(|&&(_, d)| d == id)
+                .map(|&(s, _)| ("midi", s)),
+        );
+        w.extend(
+            g.serve_links
+                .iter()
+                .filter(|&&(h, _)| h == id)
+                .map(|&(_, hp)| ("port", hp)),
+        );
+        w.extend(
+            g.net_links
+                .iter()
+                .filter(|&&(a, _)| a == id)
+                .map(|&(_, n)| ("net", n)),
+        );
+        w.extend(
+            g.capture_links
+                .iter()
+                .filter(|&&(a, _)| a == id)
+                .map(|&(_, c)| ("capture", c)),
+        );
+        w
+    }
+
+    /// Whether node `id`'s capability token authorizes using `(kind, target)`.
+    /// Always true with enforcement off, and for non-app nodes (uplinks,
+    /// hardware sources — those are resources/host-owned, not token-bearing
+    /// subjects). Decisions are memoized against a fingerprint of the token
+    /// bytes + the node's wire set, so the per-tick reconcilers stay cheap.
+    fn node_may_use(&mut self, id: NodeId, kind: &'static str, target: NodeId) -> bool {
+        if self.node_auth.is_none() {
+            return true;
+        }
+        if !matches!(self.graph.nodes.get(&id).map(|r| r.kind), Some(Kind::App)) {
+            return true;
+        }
+        let wires = self.wires_of(id);
+        let (key, base) = self.node_auth.as_ref().unwrap();
+        let key = *key;
+        let token = self.graph.node_tokens.get(&id).unwrap_or(base);
+        let fp = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            token.hash(&mut h);
+            wires.hash(&mut h);
+            h.finish()
+        };
+        if let Some(&(cached_fp, ok)) = self.auth_cache.get(&(id, kind, target)) {
+            if cached_fp == fp {
+                return ok;
+            }
+        }
+        let token = token.clone();
+        let facts: Vec<(&str, String)> = wires.iter().map(|&(k, t)| (k, t.to_string())).collect();
+        let ok = crate::auth::authorize_use(key, &token, &facts, kind, &target.to_string());
+        self.auth_cache.insert((id, kind, target), (fp, ok));
+        ok
+    }
+
+    /// Replace (or, with empty bytes, reset) an app node's capability token.
+    /// A replacement must verify against the token service's key — a token
+    /// signed by a different root gates nothing and is refused. Effects follow
+    /// on the next tick: the reconcilers re-filter every wire through the new
+    /// token, applying what it now allows and tearing down what it doesn't.
+    fn set_node_token(&mut self, id: NodeId, token: Vec<u8>) {
+        if !matches!(self.graph.nodes.get(&id).map(|r| r.kind), Some(Kind::App)) {
+            return;
+        }
+        if token.is_empty() {
+            self.graph.node_tokens.remove(&id);
+        } else {
+            if let Some((key, _)) = &self.node_auth {
+                if biscuit_auth::Biscuit::from(&token, *key).is_err() {
+                    eprintln!(
+                        "wk: refused token for node {id}: not signed by this \
+                         workspace's token service"
+                    );
+                    return;
+                }
+            }
+            self.graph.node_tokens.insert(id, token);
+        }
+        self.auth_cache.retain(|&(n, _, _), _| n != id);
+    }
+
     /// Reconcile the actual file mounts against the desired `connections`: mount
     /// each newly-wired volume into its app's fs at its mount path, unmount ones
     /// no longer wired. Idempotent; runs after any connection change and once per
     /// tick.
+    ///
+    /// Desired binds are filtered through each app's capability token first, so
+    /// a denied wire never mounts — and a mount whose authorization was revoked
+    /// (token swapped/attenuated) is unmounted on the next pass.
     fn sync_mounts(&mut self) {
+        let binds = self.graph.connections.clone();
+        let desired: Vec<(NodeId, NodeId)> = binds
+            .into_iter()
+            .filter(|&(f, a)| self.node_may_use(a, "file", f))
+            .collect();
         let active: HashSet<(NodeId, NodeId)> = self.mounted.keys().copied().collect();
-        let plan = wiring::reconcile_links(&self.graph.connections, &active);
+        let plan = wiring::reconcile_links(&desired, &active);
         for pair in plan.remove {
             if let Some((path, fs)) = self.mounted.remove(&pair) {
                 crate::vfs::unmount_file(&fs, &path);
@@ -1604,9 +1780,16 @@ impl Server {
     }
 
     /// Reconcile the MIDI router against the desired `midi_links`: add each new
-    /// route (once its destination exists), drop routes no longer wired.
+    /// route (once its destination exists), drop routes no longer wired. A route
+    /// needs both app endpoints' tokens to allow it (a hardware source has no
+    /// token and always consents).
     fn sync_midi(&mut self) {
-        let plan = wiring::reconcile_links(&self.graph.midi_links, &self.routed);
+        let links = self.graph.midi_links.clone();
+        let desired: Vec<(NodeId, NodeId)> = links
+            .into_iter()
+            .filter(|&(s, d)| self.node_may_use(s, "midi", d) && self.node_may_use(d, "midi", s))
+            .collect();
+        let plan = wiring::reconcile_links(&desired, &self.routed);
         let router = self.host.midi();
         let mut routes = router.lock().unwrap();
         for (src, dst) in plan.remove {
@@ -1639,9 +1822,11 @@ impl Server {
         self.graph.node_args.remove(&id);
         self.graph.file_nodes.remove(&id);
         self.graph.host_ports.remove(&id);
+        self.graph.node_tokens.remove(&id);
         self.graph.iroh_secrets.remove(&id);
         self.graph.veilid_ids.remove(&id);
         self.graph.note_text.remove(&id);
+        self.auth_cache.retain(|&(n, _, _), _| n != id);
     }
 
     /// Whether the given wire still connects two live nodes.
@@ -1715,6 +1900,7 @@ impl Server {
         self.sync_mounts();
         self.sync_midi();
         self.sync_net_membership();
+        self.sync_captures();
         self.sync_serves();
     }
 
@@ -1990,6 +2176,11 @@ impl Server {
                     }
                 }
             }
+            Command::SetToken { id, .. } => {
+                if matches!(self.graph.nodes.get(id).map(|r| r.kind), Some(Kind::App)) {
+                    self.record(Undo::Token(*id, self.graph.node_tokens.get(id).cloned()));
+                }
+            }
             // Not undoable: run, mount-path / serve-port edits, and undo itself.
             Command::SetMount { .. }
             | Command::SetServePort { .. }
@@ -2075,6 +2266,7 @@ impl Server {
                 hostport,
                 container,
             } => self.set_serve_port(served, hostport, container),
+            Command::SetToken { id, token } => self.set_node_token(id, token),
             Command::Run(id) => self.run_node(id),
             Command::Stop(id) => self.stop_node(id),
             Command::Duplicate(id) => self.duplicate(id),
@@ -2155,6 +2347,17 @@ impl Server {
                     self.connect_toggle(a, b);
                 }
             }
+            Undo::Token(id, old) => {
+                if self.node_exists(id) {
+                    // Restore directly (set_node_token would re-verify — the old
+                    // value was ours, and it may legitimately be "no custom token").
+                    match old {
+                        Some(t) => self.graph.node_tokens.insert(id, t),
+                        None => self.graph.node_tokens.remove(&id),
+                    };
+                    self.auth_cache.retain(|&(n, _, _), _| n != id);
+                }
+            }
             Undo::Uncreate(id) => {
                 if self.node_exists(id) {
                     self.remove_any(id);
@@ -2183,6 +2386,11 @@ impl Server {
                     name: node.name.clone(),
                     options,
                     args: self.graph.node_args.get(&id).cloned().unwrap_or_default(),
+                    token: self
+                        .graph
+                        .node_tokens
+                        .get(&id)
+                        .map(|t| crate::workspace::bytes_hex(t)),
                 }
             }
             Kind::File => match self.graph.file_nodes.get(&id)? {
@@ -2298,6 +2506,7 @@ impl Server {
                 name,
                 options,
                 args,
+                token,
             } => {
                 let Some(dep) = self
                     .graph
@@ -2332,6 +2541,27 @@ impl Server {
                 }
                 self.place(s.id, Kind::App, ws, s.pos, s.size);
                 self.graph.node_args.insert(s.id, args);
+                // Restore a custom capability token. One that doesn't verify
+                // (the key file was lost, or the .wk moved to another machine)
+                // is dropped — the node falls back to the default token.
+                if let Some(tok) = token
+                    .as_deref()
+                    .and_then(crate::workspace::hex_bytes)
+                    .filter(|t| !t.is_empty())
+                {
+                    match &self.node_auth {
+                        Some((key, _)) if biscuit_auth::Biscuit::from(&tok, *key).is_err() => {
+                            eprintln!(
+                                "wk: node {} has a token from a different token service; \
+                                 using the default",
+                                s.id
+                            );
+                        }
+                        _ => {
+                            self.graph.node_tokens.insert(s.id, tok);
+                        }
+                    }
+                }
             }
             SnapKind::Volume { name, persist } => {
                 if let Some(num) = name
@@ -2654,6 +2884,16 @@ impl Server {
                     terminal: app.as_ref().map(|n| n.is_command()).unwrap_or(false),
                     attached: self.attached.contains(&id),
                     error: v.port_errors.get(&id).cloned(),
+                    // The node's *effective* token: its custom one, else the
+                    // workspace default — what `wk token` inspects/attenuates.
+                    token: app.as_ref().and_then(|_| {
+                        self.graph
+                            .node_tokens
+                            .get(&id)
+                            .cloned()
+                            .or_else(|| self.node_auth.as_ref().map(|(_, base)| base.clone()))
+                            .map(|t| crate::workspace::bytes_hex(&t))
+                    }),
                 }
             })
             .collect();
@@ -2700,6 +2940,96 @@ mod model_tests {
     fn fresh_server() -> Server {
         Server::new(&Document::empty(), PathBuf::from("wk-proptest-scratch.wk"))
             .expect("a headless server constructs")
+    }
+
+    /// The full node-token lifecycle against a live server: the default token
+    /// allows exactly what is wired; an attenuated replacement narrows it (and
+    /// its denial is honored live); reset returns to the default; a token from
+    /// a foreign root is refused; undo restores the previous token.
+    #[test]
+    fn node_tokens_gate_wire_use_and_swap_live() {
+        let mut s = fresh_server();
+        let ws = s.graph.workspaces[0];
+        let root = biscuit_auth::KeyPair::new();
+        let base = biscuit_auth::Biscuit::builder()
+            .code(wk_token_service::NODE_BASE_RULE)
+            .unwrap()
+            .build(&root)
+            .unwrap()
+            .to_vec()
+            .unwrap();
+        s.set_node_auth(root.public(), base);
+
+        // An app node (a stand-in record is enough — authorization reads the
+        // graph, not the wasm) wired to a volume and a network.
+        let app = NodeId::new();
+        s.place(app, Kind::App, ws, [0.0, 0.0], [100.0, 100.0]);
+        s.apply(Command::Create(Resource::Node {
+            kind: NodeKind::Volume,
+            pos: [0.0, 0.0],
+            ws,
+        }));
+        let vol = *s.graph.file_nodes.keys().next().expect("volume placed");
+        let net = NodeId::new();
+        s.place(net, Kind::Network, ws, [0.0, 0.0], [80.0, 80.0]);
+        s.graph.connections.push((vol, app));
+        s.graph.net_links.push((app, net));
+
+        // Default token: wired ⇒ usable, unwired ⇒ not.
+        assert!(s.node_may_use(app, "file", vol));
+        assert!(s.node_may_use(app, "net", net));
+        assert!(!s.node_may_use(app, "file", NodeId::new()));
+        // Non-app nodes are exempt subjects (always allowed).
+        assert!(s.node_may_use(net, "file", vol));
+
+        // Attenuate: same authority, plus a check refusing file use. Swapped in
+        // via the command path, the file grant dies and the net grant survives.
+        let effective = s
+            .graph
+            .node_tokens
+            .get(&app)
+            .cloned()
+            .unwrap_or_else(|| s.node_auth.as_ref().unwrap().1.clone());
+        let attenuated = biscuit_auth::UnverifiedBiscuit::from(effective.as_slice())
+            .unwrap()
+            .append(
+                biscuit_auth::builder::BlockBuilder::new()
+                    .code(r#"check if operation($k, $t), $k != "file";"#)
+                    .unwrap(),
+            )
+            .unwrap()
+            .to_vec()
+            .unwrap();
+        s.apply(Command::SetToken {
+            id: app,
+            token: attenuated.clone(),
+        });
+        assert_eq!(s.graph.node_tokens.get(&app), Some(&attenuated));
+        assert!(!s.node_may_use(app, "file", vol), "file use revoked");
+        assert!(s.node_may_use(app, "net", net), "net use survives");
+
+        // Undo restores the default token (file use returns).
+        s.apply(Command::Undo);
+        assert!(!s.graph.node_tokens.contains_key(&app));
+        assert!(s.node_may_use(app, "file", vol));
+
+        // A token minted by a different root is refused outright.
+        let foreign = biscuit_auth::Biscuit::builder()
+            .code(wk_token_service::NODE_BASE_RULE)
+            .unwrap()
+            .build(&biscuit_auth::KeyPair::new())
+            .unwrap()
+            .to_vec()
+            .unwrap();
+        s.apply(Command::SetToken {
+            id: app,
+            token: foreign,
+        });
+        assert!(!s.graph.node_tokens.contains_key(&app), "foreign refused");
+
+        // Unwiring flips the decision (the memo respects the wire set).
+        s.graph.connections.clear();
+        assert!(!s.node_may_use(app, "file", vol), "no longer wired");
     }
 
     /// Undoing a *moved* one-per-source wire restores the displaced link, not
@@ -3073,6 +3403,7 @@ mod model_tests {
                             name: "ghost".into(),
                             options: vec![1.0, 2.0],
                             args: vec!["hello".into()],
+                            token: None,
                         },
                     },
                     NodeSnap {
@@ -3115,6 +3446,7 @@ mod model_tests {
                 name: "ghost".into(),
                 options: vec![1.0, 2.0],
                 args: vec!["hello".into()],
+                token: None,
             }
         );
         assert!(

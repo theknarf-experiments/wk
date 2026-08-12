@@ -226,6 +226,13 @@ pub enum Command {
         hostport: NodeId,
         container: u16,
     },
+    /// Replace an app node's capability token — the Biscuit whose Datalog
+    /// decides what the node's wires may grant it (see `wk token`). Empty
+    /// bytes reset the node to the workspace's default token.
+    SetToken {
+        id: NodeId,
+        token: Vec<u8>,
+    },
     /// (Re)run an idle/exited app node's guest.
     Run(NodeId),
     /// Stop a running app node's guest (it stays placed and can be re-run).
@@ -269,6 +276,8 @@ impl Command {
                 (ResourceKind::Wire, Action::Update)
             }
             Command::Delete(ResourceRef::Workspace(_)) => (ResourceKind::Workspace, Action::Delete),
+            // Swapping a node's capability token reconfigures the node.
+            Command::SetToken { .. } => (ResourceKind::Node, Action::Update),
             Command::Run(_) | Command::Stop(_) => (ResourceKind::Node, Action::Run),
             Command::Duplicate(_) => (ResourceKind::Node, Action::Create),
             // Undo can restore or remove anything it previously recorded, so it

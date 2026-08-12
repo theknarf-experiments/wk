@@ -97,13 +97,18 @@ pub struct ServerRuntime {
 impl ServerRuntime {
     /// Instantiate the document and start the server loop on its own thread.
     /// `public_key` is a copy of the token service's key, used to verify the
-    /// token presented with each command.
+    /// token presented with each command — and each node's capability token.
+    /// `node_base_token` is the default node token (minted by the token
+    /// service) every app node holds until `wk token` swaps it.
     pub fn spawn(
         doc: &Document,
         path: std::path::PathBuf,
         public_key: PublicKey,
+        node_base_token: Vec<u8>,
     ) -> Result<Self, String> {
-        let server = Server::new(doc, path)?;
+        let mut server = Server::new(doc, path)?;
+        server.set_node_auth(public_key, node_base_token);
+        let server = server;
         let server = Arc::new(Mutex::new(server));
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));

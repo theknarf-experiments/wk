@@ -122,4 +122,7 @@ plugins/echo6/echo6.wasm
 # recorder example output (written at runtime)
 example/out.mjpeg
 
+# token-service root signing keys (one per workspace, beside its .wk) — secrets
+*.wk.key
+
 # machine-specific) — only setup.sh is tracked

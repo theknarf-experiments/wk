@@ -10918,6 +10918,7 @@ dependencies = [
 name = "wk"
 version = "0.1.0"
 dependencies = [
+ "biscuit-auth",
  "clap",
  "client-local-ui",
  "env_logger",

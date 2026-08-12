@@ -163,6 +163,13 @@ enum Commands {
         cmd: MidiCmd,
     },
 
+    /// Inspect and swap node capability tokens (the Biscuit whose Datalog
+    /// decides what a node's wires grant it)
+    Token {
+        #[command(subcommand)]
+        cmd: TokenCmd,
+    },
+
     /// Open a workspace (default workspace.wk)
     Run {
         /// Workspace file to open. Overrides the global `--file`; defaults to
@@ -248,6 +255,29 @@ impl CreateKind {
 enum MidiCmd {
     /// List connected hardware MIDI input devices (their port names)
     Devices,
+}
+
+#[derive(Subcommand)]
+enum TokenCmd {
+    /// Print a node's token: its Datalog blocks (authority policy, then any
+    /// attenuations) and the hex form `set` accepts
+    Show {
+        /// Node reference: its name, or any part of its id
+        node: String,
+    },
+    /// Append an attenuation block (Datalog checks) to a node's token — an
+    /// offline, narrow-only permission change. Example:
+    /// wk token attenuate vim 'check if operation($k, $t), $k != "net"'
+    Attenuate {
+        node: String,
+        /// The block's Datalog (quote it)
+        block: String,
+    },
+    /// Replace a node's token wholesale (hex from `show`, or an external mint
+    /// signed by this workspace's token service)
+    Set { node: String, hex: String },
+    /// Reset a node to the workspace default: a node may use what it is wired to
+    Reset { node: String },
 }
 
 #[derive(Subcommand)]
@@ -406,6 +436,12 @@ fn main() -> Result<(), String> {
             }
             Ok(())
         }
+        Some(Commands::Token { cmd }) => match cmd {
+            TokenCmd::Show { node } => cli::token_show(file, node),
+            TokenCmd::Attenuate { node, block } => cli::token_attenuate(file, node, block),
+            TokenCmd::Set { node, hex } => cli::token_set(file, node, hex),
+            TokenCmd::Reset { node } => cli::token_reset(file, node),
+        },
         Some(Commands::Remove { plugin }) => workspace::remove(plugin.clone(), file),
         Some(Commands::Run {
             file: run_file,
@@ -416,6 +452,14 @@ fn main() -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+/// Where a workspace's token-service root key persists: beside the `.wk` file
+/// (e.g. `workspace.wk` → `workspace.wk.key`), like the volume sidecar dir.
+fn key_path(file: &Path) -> PathBuf {
+    let mut s = file.to_path_buf().into_os_string();
+    s.push(".key");
+    PathBuf::from(s)
 }
 
 /// Open the given `.wk` workspace. The server runs independently on its own
@@ -435,8 +479,12 @@ fn run(file: &Path, headless: bool) -> Result<(), String> {
     //  1. the token service owns the signing keys and mints tokens;
     //  2. the server gets a copy of the public key and only verifies;
     //  3. the client is handed a minted token and bears it with every action.
-    let tokens = TokenService::new();
-    let runtime = ServerRuntime::spawn(&doc, file.to_path_buf(), tokens.public_key())?;
+    // The root key persists beside the workspace (`<file>.key`) so node
+    // capability tokens — minted per node, swappable via `wk token` — survive
+    // restarts.
+    let tokens = TokenService::load_or_create(&key_path(file));
+    let node_base = tokens.mint_node_base()?;
+    let runtime = ServerRuntime::spawn(&doc, file.to_path_buf(), tokens.public_key(), node_base)?;
     // Start the CLI socket (wk's "docker daemon") so a separate `wk` process can
     // attach and drive this server live — for both windowed and headless runs.
     let _ipc = match tokens.mint_admin().and_then(|tok| {
