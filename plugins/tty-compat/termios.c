@@ -116,6 +116,21 @@ static int wk_check_winch(void) {
     return 0;
 }
 
+/* ---- terminal-aware poll/select/read (wasip1 only) ----
+ *
+ * These exist so a blocking read can be interrupted to deliver SIGWINCH, and
+ * they are written against preview1's poll_oneoff/fd_read because that ABI
+ * lets a shim re-enter the "real" read without recursing into its own
+ * override.
+ *
+ * Under wasip2 there is no such back door: `read` is libc's own, so
+ * overriding it here would recurse. wasip2 guests therefore use libc's poll
+ * and read directly and lose only mid-read SIGWINCH delivery — irrelevant for
+ * a shell, which redraws on the next prompt. (vim, which wants it, stays on
+ * wasip1.) Everything else in this file — the actual termios mapping onto
+ * wk:tty/control — is shared by both.
+ */
+#ifndef __wasip2__
 /* poll(2) built directly on wasi poll_oneoff. `timeout_ms` < 0 blocks. No
  * SIGWINCH handling here — callers add it around the wait. */
 static int wk_poll_raw(struct pollfd *fds, nfds_t nfds, int timeout_ms) {
@@ -277,6 +292,8 @@ ssize_t read(int fd, void *buf, size_t count) {
     }
     return (ssize_t)nread;
 }
+
+#endif /* !__wasip2__ */
 
 int ioctl(int fd, int request, ...) {
     (void)fd;

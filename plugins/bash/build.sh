@@ -27,9 +27,17 @@
 #     errors ("cannot duplicate fd"); for external commands the output simply
 #     goes to the shell's own stdout.
 #
-# Targets wasm32-wasip1 + the component adapter (bash needs no sockets), which
-# lets it reuse ../tty-compat — the same real termios shim vim uses, mapping
-# terminal control onto wk's `wk:tty/control` capability.
+# Targets wasm32-**wasip2**, which links a component directly (no adapter) and
+# matters for two reasons beyond tidiness:
+#   * the file-descriptor table lives in wasi-libc, in guest memory, rather
+#     than inside the prebuilt preview1 adapter — so dup/dup2/pipe become
+#     things this build can implement, which is the last thing standing
+#     between bash and redirection + pipelines.
+#   * wasip2 has real sockets, so bash's /dev/tcp support builds against
+#     headers that exist and its connections ride wk's fabric.
+# It still reuses ../tty-compat for real termios over `wk:tty/control`; the
+# shim's poll/read overrides are wasip1-only (see its #ifndef __wasip2__) and
+# a shell doesn't need them.
 #
 # No bash source is edited. The build knowledge, each item a failure first:
 #   * host build tools — bash compiles mksignames/mksyntax for the *build*
@@ -40,9 +48,11 @@
 #     provides the POSIX API (inert: nothing can signal a wasm guest).
 #   * ac_cv_have_sig_atomic_t=yes — otherwise config.h does
 #     `#define sig_atomic_t int`, which also breaks the *host* tools.
-#   * sockets — configure mis-detects netdb.h/sys/socket.h, so bash builds
-#     /dev/tcp support against headers wasip1 lacks. config.h is corrected
-#     after configure (a generated file, not source).
+#   * LDFLAGS needs --target too. bash's link step runs $(CC) $(LDFLAGS)
+#     *without* CFLAGS, so leaving the target off there silently links against
+#     the default (wasip1) sysroot — which has no sockets, and reports
+#     `undefined symbol: connect` for symbols that plainly exist in wasip2's
+#     libc.a.
 #   * signal_names — bash's generated signames.h holds an initialized array,
 #     and both trap.o and signames.o carry it. Upstream relies on -fcommon
 #     merging them; -fcommon makes this LLVM crash in wasm codegen, so link
@@ -76,15 +86,6 @@ EXEC="$PWD/../exec-compat"
 EXECGEN="$EXEC/gen"
 
 BUILD_PATH="$WASI_SDK/bin:/usr/bin:/bin"
-WASMTIME_VER=46.0.1
-ADAPTER="${WASI_ADAPTER:-$(find "$HOME/.cargo/registry/src" -name 'wasi_snapshot_preview1.command.wasm' 2>/dev/null | head -1)}"
-if [ -z "$ADAPTER" ] || [ ! -f "$ADAPTER" ]; then
-    ADAPTER="$COMPAT/wasi_snapshot_preview1.command.wasm"
-    [ -f "$ADAPTER" ] || curl -fsSL \
-        "https://github.com/bytecodealliance/wasmtime/releases/download/v$WASMTIME_VER/wasi_snapshot_preview1.command.wasm" \
-        -o "$ADAPTER"
-fi
-
 if [ ! -d "$SRC" ]; then
     echo "fetching GNU bash $BASH_VER..."
     curl -fsSL "https://ftp.gnu.org/gnu/bash/$SRC.tar.gz" -o "$SRC.tar.gz"
@@ -100,7 +101,7 @@ mkdir -p "$TTYGEN" "$EXECGEN"
 wit-bindgen c --world terminal "$TTY/wit/tty.wit" --out-dir "$TTYGEN"
 wit-bindgen c --world exec-host "$EXEC/wit/exec.wit" --out-dir "$EXECGEN"
 
-CFLAGS="--target=wasm32-wasip1 -O2 -DWK_EXEC=1 -I$COMPAT -I$EXEC -I$TTY -I$TTYGEN \
+CFLAGS="--target=wasm32-wasip2 -O2 -DWK_EXEC=1 -I$COMPAT -I$EXEC -I$TTY -I$TTYGEN \
     -DF_DUPFD=0 -DHAVE_TERMIOS_H=1 -DHAVE_TCGETATTR=1 \
     -Wno-implicit-function-declaration -Wno-deprecated-non-prototype \
     -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false \
@@ -109,13 +110,14 @@ CFLAGS="--target=wasm32-wasip1 -O2 -DWK_EXEC=1 -I$COMPAT -I$EXEC -I$TTY -I$TTYGE
 for src in "$COMPAT/compat.c" "$TTY/termios.c" "$TTYGEN/terminal.c" \
            "$COMPAT/wkbash.c" "$EXEC/wkexec.c" "$EXECGEN/exec_host.c"; do
     obj="$COMPAT/$(basename "${src%.c}").o"
-    "$WASI_SDK/bin/clang" --target=wasm32-wasip1 -O2 \
+    "$WASI_SDK/bin/clang" --target=wasm32-wasip2 -O2 \
         -I"$COMPAT" -I"$EXEC" -I"$EXECGEN" -I"$TTY" -I"$TTYGEN" \
         -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID \
         -c "$src" -o "$obj"
 done
 
-LDFLAGS="$COMPAT/compat.o $COMPAT/termios.o $COMPAT/terminal.o \
+# --target here as well: see the note above about the link step.
+LDFLAGS="--target=wasm32-wasip2 $COMPAT/compat.o $COMPAT/termios.o $COMPAT/terminal.o \
     $COMPAT/wkbash.o $COMPAT/wkexec.o $COMPAT/exec_host.o \
     $TTYGEN/terminal_component_type.o $EXECGEN/exec_host_component_type.o -lsetjmp \
     -lwasi-emulated-signal -lwasi-emulated-process-clocks -lwasi-emulated-getpid"
@@ -129,17 +131,9 @@ if [ ! -f Makefile ]; then
     CFLAGS="$CFLAGS" LDFLAGS="$LDFLAGS" \
     ./configure --host=wasm32-wasi \
         --disable-job-control --disable-readline --disable-history \
-        --disable-nls --disable-net-redirections --without-bash-malloc \
+        --disable-nls --without-bash-malloc \
         ac_cv_have_sig_atomic_t=yes bash_cv_signal_vintage=posix \
         ac_cv_func_getcwd=yes bash_cv_getcwd_malloc=yes
-
-    # configure mis-detects sockets; wasip1 has none (see the header).
-    sed -i '' \
-        -e 's|^#define HAVE_NETDB_H 1|/* wasip1 has no sockets */|' \
-        -e 's|^#define HAVE_SYS_SOCKET_H 1|/* wasip1 has no sockets */|' \
-        -e 's|^#define HAVE_NETINET_IN_H 1|/* wasip1 has no sockets */|' \
-        -e 's|^#define HAVE_GETPEERNAME 1|/* wasip1 has no sockets */|' \
-        config.h
 fi
 
 # SIGNAMES_O= : trap.o already carries signal_names (see the header).
@@ -155,7 +149,8 @@ env PATH="$BUILD_PATH" make \
 "$WASI_SDK/bin/llvm-ar" d lib/sh/libsh.a getcwd.o 2>/dev/null || true
 
 cd ..
-wasm-tools component new "$SRC/bash" --adapt "wasi_snapshot_preview1=$ADAPTER" -o bash.wasm
+# wasip2 links a component directly — no wasm-tools adapter step.
+cp "$SRC/bash" bash.wasm
 
 # The coreutils binary plus its command names as real symlinks, staged for the
 # wk-shell image — the same one-binary-many-links layout coreutils installs.
@@ -172,5 +167,5 @@ for a in "[" b2sum base32 base64 basename basenc cat chcon chgrp chmod chown \
          tty uname unexpand uniq unlink vdir wc whoami yes; do
     ln -sf coreutils.wasm "bin/$a"
 done
-echo "built plugins/bash/bash.wasm (GNU bash $BASH_VER, wasm32-wasip1 component)"
+echo "built plugins/bash/bash.wasm (GNU bash $BASH_VER, wasm32-wasip2 component)"
 echo "package it with: wk images build plugins/bash/Dockerfile --tag wk-shell"

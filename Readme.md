@@ -117,8 +117,11 @@ everywhere, since wk's filesystem supports real links (created, followed,
 `readlink`ed, and carried through OCI layers). bash's own PATH search finds
 them and `argv[0]` stays `ls`, which is what coreutils dispatches on.
 Pipelines and command substitution still need `pipe()` and a second process,
-so they fail cleanly; `wk images build plugins/bash/Dockerfile --tag wk-shell`
-packages the lot. Like every other capability it is token-gated (kind `exec`, allowed
+and redirection needs `dup` — bash is built for **wasip2**, where wasi-libc
+owns the descriptor table in guest memory, which is what makes implementing
+those possible at all (under wasip1 the table lives inside the prebuilt
+adapter). `wk images build plugins/bash/Dockerfile --tag wk-shell` packages
+the lot. Like every other capability it is token-gated (kind `exec`, allowed
 by default): `wk token attenuate <node> 'check if operation($k, $t, $a), $k !=
 "exec"'` revokes it within a tick.
 
