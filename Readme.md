@@ -22,7 +22,8 @@ its window, or it runs in a terminal (`wasi:cli` command components). Some nodes
 instead stand for shared resources a plugin can wire to:
 
 - **File** — a shared file, either in-memory (VirtualFile) or backed by a real
-  host file (HostMappedFile).
+  host file (HostMappedFile). The filesystem has real symlinks, so images that
+  ship one binary behind many names (busybox, coreutils) work as built.
 - **HostPort** — a `localhost` port an HTTP node can be served on.
 - **Network / Gateway** — an isolated userspace network (smoltcp). A Gateway
   additionally grants its members access to the real host network.
@@ -110,13 +111,14 @@ bash-5.2# nosuchcommand
 bash: nosuchcommand: command not found     # status 127
 ```
 
-Command *names* resolve through `/etc/wk-multicall`, an "applet binary" table
-(wk's filesystem has no symlinks, which is how a multicall binary normally
-provides its hundred names): `ls` runs `/bin/coreutils.wasm` with
-`argv[0]="ls"`, exactly as coreutils' symlink install does. Pipelines and
-command substitution still need `pipe()` and a second process, so they fail
-cleanly; `wk images build plugins/bash/Dockerfile --tag wk-shell` packages the
-lot. Like every other capability it is token-gated (kind `exec`, allowed
+Command names are ordinary **symlinks** onto the coreutils multicall binary —
+`/bin/ls -> coreutils.wasm` — the same install layout coreutils uses
+everywhere, since wk's filesystem supports real links (created, followed,
+`readlink`ed, and carried through OCI layers). bash's own PATH search finds
+them and `argv[0]` stays `ls`, which is what coreutils dispatches on.
+Pipelines and command substitution still need `pipe()` and a second process,
+so they fail cleanly; `wk images build plugins/bash/Dockerfile --tag wk-shell`
+packages the lot. Like every other capability it is token-gated (kind `exec`, allowed
 by default): `wk token attenuate <node> 'check if operation($k, $t, $a), $k !=
 "exec"'` revokes it within a tick.
 

@@ -27,6 +27,10 @@ use crate::netstack::{NetHub, SharedStack, SockKind};
 /// Per-direction buffer for each connection's smoltcp socket.
 const SOCK_BUF: usize = 64 * 1024;
 
+/// How many sockets sit in Listen at once — the accept backlog. More than one
+/// so the port is never momentarily unattended (see the accept loop).
+const BACKLOG: usize = 4;
+
 fn tcp_socket() -> tcp::Socket<'static> {
     tcp::Socket::new(
         tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]),
@@ -49,6 +53,12 @@ pub fn listen(
 ) {
     let net = follow.lock().unwrap().net;
     let bridge = hub.attach(net, hub.alloc_ip(3), name);
+    // Bind before returning, like TcpListener::bind: if the sockets were
+    // created inside the accept thread, a caller that resolves the name and
+    // connects immediately could land a SYN on an unattended port, and a
+    // dropped SYN can fail the connection outright rather than retrying.
+    let initial_backlog: Vec<smoltcp::iface::SocketHandle> =
+        (0..BACKLOG).map(|_| add_listener(&bridge, port)).collect();
 
     let accept_thread = std::thread::Builder::new()
         .name(format!("wk-fabric-listen-{name}"))
@@ -56,10 +66,14 @@ pub fn listen(
             let (bridge, hub) = (bridge.clone(), hub.clone());
             let _ = &hub; // the supervisor below owns the detach
             move || {
-                // One listening socket at a time; when it becomes a connection,
-                // hand it to a pump and add a fresh listener (smoltcp's accept
-                // pattern — a listening socket *becomes* the connection).
-                let mut listening = add_listener(&bridge, port);
+                // A real accept backlog. smoltcp has no separate accept(): a
+                // listening socket *becomes* the connection, so a single
+                // listener leaves a window with nothing listening on the port
+                // between taking a connection and adding its replacement — a
+                // SYN arriving in that window is refused. Keeping several
+                // sockets in Listen closes the window (and lets connections
+                // arrive back-to-back, which is what a backlog is for).
+                let mut backlog = initial_backlog;
                 while !kill.load(Ordering::Relaxed) {
                     // Follow the node's current network.
                     let net = follow.lock().unwrap().net;
@@ -70,53 +84,59 @@ pub fn listen(
                         let f = follow.lock().unwrap();
                         (IpAddress::from(f.ip), IpAddress::from(f.ip6))
                     };
-                    let taken = {
+                    // Collect whatever moved past the handshake this round.
+                    let mut accepted: Vec<smoltcp::iface::SocketHandle> = Vec::new();
+                    let mut idle = true;
+                    {
                         let mut g = bridge.lock().unwrap();
-                        let s = g.sockets.get_mut::<tcp::Socket>(listening);
-                        match s.state() {
-                            tcp::State::Listen | tcp::State::SynReceived => None,
-                            // Anything past the handshake (or dead): take it.
-                            _ => {
-                                let peer_ok = s
-                                    .remote_endpoint()
-                                    .is_some_and(|ep| ep.addr == allowed4 || ep.addr == allowed6);
-                                if !peer_ok {
-                                    // Not the followed node: refuse the deputy.
-                                    s.abort();
-                                    g.begin_close(listening, SockKind::Tcp);
-                                    Some(None)
-                                } else {
-                                    Some(Some(listening))
+                        backlog.retain(|&h| {
+                            let s = g.sockets.get_mut::<tcp::Socket>(h);
+                            match s.state() {
+                                tcp::State::Listen | tcp::State::SynReceived => true,
+                                _ => {
+                                    let peer_ok = s.remote_endpoint().is_some_and(|ep| {
+                                        ep.addr == allowed4 || ep.addr == allowed6
+                                    });
+                                    if peer_ok {
+                                        accepted.push(h);
+                                    } else {
+                                        // Not the followed node: refuse the deputy.
+                                        s.abort();
+                                        g.begin_close(h, SockKind::Tcp);
+                                    }
+                                    idle = false;
+                                    false
                                 }
                             }
-                        }
-                    };
-                    match taken {
-                        Some(conn) => {
-                            if let Some(handle) = conn {
-                                match UnixStream::pair() {
-                                    Ok((ours, theirs)) => {
-                                        let (bridge, kill) = (bridge.clone(), kill.clone());
-                                        std::thread::spawn(move || {
-                                            pump(ours, bridge, handle, kill)
-                                        });
-                                        on_conn(theirs);
-                                    }
-                                    Err(_) => {
-                                        let mut g = bridge.lock().unwrap();
-                                        g.sockets.get_mut::<tcp::Socket>(handle).abort();
-                                        g.begin_close(handle, SockKind::Tcp);
-                                    }
-                                }
+                        });
+                    }
+                    // Refill first, so the port is never unattended.
+                    while backlog.len() < BACKLOG {
+                        backlog.push(add_listener(&bridge, port));
+                    }
+                    for handle in accepted {
+                        match UnixStream::pair() {
+                            Ok((ours, theirs)) => {
+                                let (bridge, kill) = (bridge.clone(), kill.clone());
+                                std::thread::spawn(move || pump(ours, bridge, handle, kill));
+                                on_conn(theirs);
                             }
-                            listening = add_listener(&bridge, port);
+                            Err(_) => {
+                                let mut g = bridge.lock().unwrap();
+                                g.sockets.get_mut::<tcp::Socket>(handle).abort();
+                                g.begin_close(handle, SockKind::Tcp);
+                            }
                         }
-                        None => std::thread::sleep(Duration::from_millis(5)),
+                    }
+                    if idle {
+                        std::thread::sleep(Duration::from_millis(5));
                     }
                 }
                 let mut g = bridge.lock().unwrap();
-                g.sockets.get_mut::<tcp::Socket>(listening).abort();
-                g.begin_close(listening, SockKind::Tcp);
+                for h in backlog {
+                    g.sockets.get_mut::<tcp::Socket>(h).abort();
+                    g.begin_close(h, SockKind::Tcp);
+                }
             }
         })
         .expect("spawn fabric listen thread");

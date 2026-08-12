@@ -284,6 +284,18 @@ fn tar_file(b: &mut tar::Builder<Vec<u8>>, path: &str, data: &[u8]) -> Result<()
         .map_err(|e| format!("tar {path}: {e}"))
 }
 
+/// Append a symlink into the layer tar. The vfs has real links now, so COPYing
+/// a tree preserves them — which is what a multicall install (one binary, a
+/// farm of names) and plenty of real images depend on.
+fn tar_symlink(b: &mut tar::Builder<Vec<u8>>, path: &str, target: &Path) -> Result<(), String> {
+    let mut h = tar::Header::new_gnu();
+    h.set_entry_type(tar::EntryType::Symlink);
+    h.set_size(0);
+    h.set_mode(0o777);
+    b.append_link(&mut h, path, target)
+        .map_err(|e| format!("tar symlink {path}: {e}"))
+}
+
 fn tar_dir_entry(b: &mut tar::Builder<Vec<u8>>, path: &str) -> Result<(), String> {
     let mut h = tar::Header::new_gnu();
     h.set_entry_type(tar::EntryType::Directory);
@@ -315,12 +327,16 @@ fn tar_dir_contents(b: &mut tar::Builder<Vec<u8>>, src: &Path, dest: &str) -> Re
         if meta.is_dir() {
             tar_dir_entry(b, &sub)?;
             tar_dir_contents(b, &e.path(), &sub)?;
+        } else if meta.is_symlink() {
+            let target = std::fs::read_link(e.path())
+                .map_err(|e2| format!("readlink {}: {e2}", e.path().display()))?;
+            tar_symlink(b, &sub, &target)?;
         } else if meta.is_file() {
             let data = std::fs::read(e.path())
                 .map_err(|e2| format!("read {}: {e2}", e.path().display()))?;
             tar_file(b, &sub, &data)?;
         }
-        // Symlinks/specials are skipped: not representable in the node vfs.
+        // Devices/fifos/sockets are skipped: no meaning in a wasm sandbox.
     }
     Ok(())
 }

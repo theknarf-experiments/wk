@@ -23,6 +23,12 @@ pub enum LayerEntry {
     Dir(String),
     /// Place a file at this path (replacing any earlier entry).
     File(String, Arc<Vec<u8>>),
+    /// A symbolic link at this path, pointing at the stored target. Real
+    /// images lean on these heavily — busybox and coreutils ship one binary
+    /// plus a farm of links, and `/lib64 -> /lib` style aliases are
+    /// everywhere — so a layer that dropped them produced an image missing
+    /// most of its commands.
+    Symlink(String, String),
     /// OCI whiteout: remove the entry at this path from lower layers.
     Whiteout(String),
     /// OCI opaque marker: clear the directory at this path (lower layers'
@@ -102,8 +108,18 @@ pub fn from_tar_bytes(bytes: &[u8]) -> Result<Layer, String> {
                     .map_err(|e| format!("read {path}: {e}"))?;
                 entries.push(classify(&path, Some(Arc::new(data))));
             }
-            // Links and specials aren't representable in the vfs; skip them.
-            // (Whiteouts arrive as empty regular files, handled above.)
+            // Symlinks (and hard links, which we materialise as symlinks —
+            // the vfs has no second name for one inode, and the target path
+            // is what matters for resolution).
+            tar::EntryType::Symlink | tar::EntryType::Link => {
+                if let Ok(Some(target)) = entry.link_name() {
+                    entries.push(LayerEntry::Symlink(
+                        path,
+                        target.to_string_lossy().into_owned(),
+                    ));
+                }
+            }
+            // Devices, fifos and sockets have no meaning in a wasm sandbox.
             _ => {}
         }
     }
@@ -177,6 +193,12 @@ pub fn apply(fs: &SharedFs, layer: &Layer, prefix: &str) {
     for e in &layer.entries {
         if let LayerEntry::File(p, bytes) = e {
             g.put_ro_file_at(&join(p), bytes.clone());
+        }
+    }
+    // Links last: their targets may be files this same layer just placed.
+    for e in &layer.entries {
+        if let LayerEntry::Symlink(p, target) = e {
+            g.put_symlink_at(&join(p), target.clone());
         }
     }
 }

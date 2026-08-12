@@ -11,11 +11,12 @@
 # directory visible to the next command), `$?` propagation, and
 # "command not found" with status 127 for a genuinely missing command.
 #
-# Command *names* resolve through /etc/wk-multicall, a plain "applet binary"
-# table this build generates. wk's filesystem has no symlinks, which is how a
-# multicall binary normally provides its hundred names, so the table takes
-# their place: `ls` runs /bin/coreutils.wasm with argv[0]="ls", which is
-# exactly what coreutils' symlink install does.
+# Command *names* are ordinary symlinks onto the coreutils multicall binary —
+# `/bin/ls -> coreutils.wasm` — which is exactly how coreutils installs itself
+# everywhere else. wk's filesystem supports real symlinks, so bash's own PATH
+# search finds them and argv[0] stays "ls", which is what coreutils dispatches
+# on. (An earlier version of this build used a lookup table instead, because
+# the vfs had no links; that hack is gone.)
 #
 # What still cannot work, and why — both are WASI gaps, not port bugs:
 #   * pipelines and command substitution need pipe() and a second process;
@@ -156,25 +157,20 @@ env PATH="$BUILD_PATH" make \
 cd ..
 wasm-tools component new "$SRC/bash" --adapt "wasi_snapshot_preview1=$ADAPTER" -o bash.wasm
 
-# The multicall table + the binary it points at, for the wk-shell image. The
-# applet list is coreutils' own (what its symlink install would create).
+# The coreutils binary plus its command names as real symlinks, staged for the
+# wk-shell image — the same one-binary-many-links layout coreutils installs.
 cp ../coreutils/coreutils.wasm coreutils.wasm 2>/dev/null || \
     echo "note: build plugins/coreutils first for a shell that can run commands"
-{
-    echo "# applet -> multicall binary. wk's filesystem has no symlinks, which is how"
-    echo "# a multicall binary normally provides its names, so this table takes their"
-    echo "# place: bash runs the binary with argv[0] set to the applet."
-    echo
-    for a in "[" b2sum base32 base64 basename basenc cat chcon chgrp chmod chown \
-             cksum comm cp csplit cut date dir dircolors dirname du echo expand \
-             expr factor false fmt fold groups head hostid id join link ln logname \
-             ls md5sum mkdir mkfifo mknod mktemp mv nl nproc numfmt od paste \
-             pathchk pr printenv printf ptx pwd readlink realpath rm rmdir seq \
-             sha1sum sha224sum sha256sum sha384sum sha512sum shred shuf sleep sort \
-             split stat sum sync tac tail tee test touch tr true truncate tsort \
-             tty uname unexpand uniq unlink vdir wc whoami yes; do
-        echo "$a /bin/coreutils.wasm"
-    done
-} > wk-multicall
+rm -rf bin && mkdir -p bin
+for a in "[" b2sum base32 base64 basename basenc cat chcon chgrp chmod chown \
+         cksum comm cp csplit cut date dir dircolors dirname du echo expand \
+         expr factor false fmt fold groups head hostid id join link ln logname \
+         ls md5sum mkdir mkfifo mknod mktemp mv nl nproc numfmt od paste \
+         pathchk pr printenv printf ptx pwd readlink realpath rm rmdir seq \
+         sha1sum sha224sum sha256sum sha384sum sha512sum shred shuf sleep sort \
+         split stat sum sync tac tail tee test touch tr true truncate tsort \
+         tty uname unexpand uniq unlink vdir wc whoami yes; do
+    ln -sf coreutils.wasm "bin/$a"
+done
 echo "built plugins/bash/bash.wasm (GNU bash $BASH_VER, wasm32-wasip1 component)"
 echo "package it with: wk images build plugins/bash/Dockerfile --tag wk-shell"

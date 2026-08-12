@@ -6,20 +6,14 @@
  * status the shell would have waited for. That is exec semantics minus the
  * fork, which is exactly what the shell needs for a plain command.
  *
- * Command resolution. bash has already searched PATH and passes what it found
- * (`command`, possibly NULL) plus the name as typed (`typed`). Two cases:
- *
- *   1. PATH found a file — run it, with bash's argv unchanged.
- *   2. PATH found nothing — before giving up, consult /etc/wk-multicall, a
- *      plain "applet binary" table. wk's filesystem has no symlinks, which is
- *      how a multicall binary normally provides its hundred names, so the
- *      table takes their place: `ls /bin/coreutils.wasm` means "run that
- *      binary with argv[0] = ls". GNU coreutils (and busybox) dispatch on
- *      argv[0], so this is the same mechanism their symlink installs use.
+ * Command resolution is bash's own: it searches PATH and hands us what it
+ * found. Nothing special is needed for multicall binaries — wk's filesystem
+ * has real symlinks, so `/bin/ls -> coreutils.wasm` resolves like it does
+ * anywhere else, and argv[0] stays "ls", which is what coreutils dispatches
+ * on.
  *
  * The child's output is captured, so it is written to bash's stdout/stderr
- * here. That means a command's output appears at the shell's own descriptors —
- * `>` redirection still cannot work, because saving and restoring a descriptor
+ * here. `>` redirection still cannot work: saving and restoring a descriptor
  * needs dup(), which WASI does not have.
  */
 #include <stdio.h>
@@ -28,41 +22,6 @@
 #include <unistd.h>
 
 #include "wkexec.h"
-
-#define MULTICALL_TABLE "/etc/wk-multicall"
-
-/* Look `name` up in the multicall table. Returns a malloc'd binary path, or
- * NULL. Lines are "applet path"; blank lines and #comments are skipped. */
-static char *multicall_lookup(const char *name) {
-    FILE *f = fopen(MULTICALL_TABLE, "r");
-    if (!f)
-        return NULL;
-    char line[512];
-    char *found = NULL;
-    while (!found && fgets(line, sizeof line, f)) {
-        char *p = line;
-        while (*p == ' ' || *p == '\t')
-            p++;
-        if (*p == '#' || *p == '\n' || *p == '\0')
-            continue;
-        char *applet = p;
-        while (*p && *p != ' ' && *p != '\t')
-            p++;
-        if (!*p)
-            continue;
-        *p++ = '\0';
-        while (*p == ' ' || *p == '\t')
-            p++;
-        char *bin = p;
-        while (*p && *p != ' ' && *p != '\t' && *p != '\n')
-            p++;
-        *p = '\0';
-        if (strcmp(applet, name) == 0 && *bin)
-            found = strdup(bin);
-    }
-    fclose(f);
-    return found;
-}
 
 static void write_all(int fd, const char *buf, size_t len) {
     size_t off = 0;
@@ -77,34 +36,21 @@ static void write_all(int fd, const char *buf, size_t len) {
 /* Run an external command. Returns its exit status, or -1 if it could not be
  * run at all (so the caller can fall through to bash's own error paths). */
 int wk_bash_run(const char *command, char **argv, const char *typed) {
-    char *resolved = NULL;
-    const char *path = command;
-
-    if (!path || !*path) {
-        /* Not on PATH: try the multicall table, keyed by the name as typed. */
-        resolved = multicall_lookup(typed ? typed : (argv ? argv[0] : ""));
-        if (!resolved)
-            return -1;
-        path = resolved;
-    }
+    if (!command || !*command)
+        return -1; /* not on PATH: let bash report it */
 
     wk_result r;
-    int rc = wk_run(path, (const char *const *)argv, NULL, 0, &r);
+    int rc = wk_run(command, (const char *const *)argv, NULL, 0, &r);
     if (rc != 0 || r.error) {
-        /* Couldn't run it this way; if PATH had found something we still
-         * report the failure, otherwise let bash say "command not found". */
-        int had_path = (command && *command);
-        if (had_path && r.error)
-            fprintf(stderr, "%s: %s\n", typed ? typed : path, r.error);
+        if (r.error)
+            fprintf(stderr, "%s: %s\n", typed ? typed : command, r.error);
         wk_result_free(&r);
-        free(resolved);
-        return had_path ? 126 : -1;
+        return 126; /* found but not executable, as a shell reports it */
     }
 
     write_all(STDOUT_FILENO, r.stdout_data, r.stdout_len);
     write_all(STDERR_FILENO, r.stderr_data, r.stderr_len);
     int status = r.exit_code;
     wk_result_free(&r);
-    free(resolved);
     return status;
 }

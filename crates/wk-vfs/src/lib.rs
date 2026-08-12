@@ -112,6 +112,12 @@ enum Node {
     /// private [`Node::File`] copy (file-granularity copy-up, like overlayfs —
     /// see [`Fs::copy_up`]).
     RoFile(Arc<Vec<u8>>),
+    /// A symbolic link: the stored string is the target path, resolved when a
+    /// path walk crosses it (or returned verbatim by `readlink`). Real links
+    /// matter beyond POSIX fidelity — a multicall binary like busybox or GNU
+    /// coreutils provides its hundred command names *as symlinks* to one
+    /// executable, and plenty of OCI images are built the same way.
+    Symlink(String),
 }
 
 const ROOT: u64 = 0;
@@ -299,6 +305,9 @@ impl Fs {
                     Some(Node::RoFile(_)) => PathKind::LayerFile,
                     Some(Node::File(_)) => PathKind::PrivateFile,
                     Some(Node::Shared(_) | Node::Host(_)) => PathKind::Mounted,
+                    // A link is content a build layer must carry, like a
+                    // privately written file.
+                    Some(Node::Symlink(_)) => PathKind::PrivateFile,
                     None => continue,
                 };
                 out.insert(path.clone(), kind);
@@ -393,6 +402,26 @@ impl Fs {
         Some(out)
     }
 
+    /// Place a symlink at `path` pointing at `target`, creating parents and
+    /// replacing any existing entry (how a layer materialises its links).
+    pub fn put_symlink_at(&mut self, path: &str, target: String) {
+        let comps = components(path);
+        let Some((name, dirs)) = comps.split_last() else {
+            return;
+        };
+        let Some(parent) = self.ensure_dir_path(&dirs.join("/")) else {
+            return;
+        };
+        if self.at_capacity() {
+            return;
+        }
+        self.remove_path_in(parent, name);
+        let id = self.alloc(Node::Symlink(target));
+        if let Some(Node::Dir(children)) = self.nodes.get_mut(&parent) {
+            children.insert((*name).to_string(), id);
+        }
+    }
+
     /// Read up to `cap` bytes of the file at `path` for preview, or `None` if it
     /// isn't a file. Read-only; a host-mapped file is read from disk.
     pub fn read_file(&self, path: &str, cap: usize) -> Option<Vec<u8>> {
@@ -401,6 +430,8 @@ impl Fs {
             Node::File(d) => Some(d.iter().take(cap).copied().collect()),
             Node::RoFile(d) => Some(d.iter().take(cap).copied().collect()),
             Node::Shared(sh) => Some(sh.lock().unwrap().iter().take(cap).copied().collect()),
+            // resolve() follows links, so reaching one here means it dangles.
+            Node::Symlink(_) => None,
             Node::Host(p) => {
                 use std::io::Read;
                 let mut f = std::fs::File::open(p).ok()?;
@@ -507,15 +538,55 @@ fn components(path: &str) -> Vec<&str> {
 }
 
 /// Resolve an existing node from `start` following `path`.
-fn resolve(fs: &Fs, start: u64, path: &str) -> Option<u64> {
-    let mut cur = start;
-    for comp in components(path) {
-        match fs.nodes.get(&cur)? {
-            Node::Dir(children) => cur = *children.get(comp)?,
+/// How many symlinks one path walk may cross before giving up — POSIX's
+/// ELOOP guard, so a link cycle (`a -> b`, `b -> a`) terminates.
+const MAX_SYMLINK_HOPS: usize = 32;
+
+/// Resolve `path` from `start`, following symlinks (POSIX path resolution).
+/// Intermediate components are always followed; the final component is
+/// followed only if `follow_final` — that is the difference between `stat`
+/// and `lstat`, and between opening a link's target and the link itself.
+fn resolve_at(fs: &Fs, start: u64, path: &str, follow_final: bool) -> Option<u64> {
+    let mut hops = 0usize;
+    // A worklist of components still to walk, so an expanded link can push its
+    // own components back on.
+    let mut todo: Vec<String> = components(path)
+        .into_iter()
+        .rev()
+        .map(str::to_string)
+        .collect();
+    let mut cur = if path.starts_with('/') { ROOT } else { start };
+    while let Some(comp) = todo.pop() {
+        let next = match fs.nodes.get(&cur)? {
+            Node::Dir(children) => *children.get(&comp)?,
+            // A non-directory in the middle of a path is an error.
             _ => return None,
+        };
+        let is_final = todo.is_empty();
+        match fs.nodes.get(&next) {
+            Some(Node::Symlink(target)) if !is_final || follow_final => {
+                hops += 1;
+                if hops > MAX_SYMLINK_HOPS {
+                    return None; // ELOOP
+                }
+                if target.starts_with('/') {
+                    cur = ROOT;
+                }
+                // The link's own components run before whatever is left.
+                for c in components(target).into_iter().rev() {
+                    todo.push(c.to_string());
+                }
+            }
+            Some(_) => cur = next,
+            None => return None,
         }
     }
     Some(cur)
+}
+
+/// Resolve an existing node, following symlinks all the way (the common case).
+fn resolve(fs: &Fs, start: u64, path: &str) -> Option<u64> {
+    resolve_at(fs, start, path, true)
 }
 
 /// Resolve the parent directory of the last component of `path`.
@@ -529,6 +600,7 @@ fn resolve_parent(fs: &Fs, start: u64, path: &str) -> Option<(u64, String)> {
 fn node_type(fs: &Fs, id: u64) -> DescriptorType {
     match fs.nodes.get(&id) {
         Some(Node::Dir(_)) => DescriptorType::Directory,
+        Some(Node::Symlink(_)) => DescriptorType::SymbolicLink,
         _ => DescriptorType::RegularFile,
     }
 }
@@ -766,7 +838,9 @@ fn node_kind(fs: &SharedFs, node: u64) -> Kind {
             Some(Node::Shared(sh)) => Kind::Shared(sh.clone()),
             Some(Node::Host(p)) => Kind::Host(p.clone()),
             Some(Node::Dir(_)) => Kind::Dir,
-            None => Kind::Missing,
+            // Nothing reads or writes through an open link handle; readlink
+            // and lstat work on the path, not the descriptor.
+            Some(Node::Symlink(_)) | None => Kind::Missing,
         }
     }
 }
@@ -1001,12 +1075,14 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
     fn stat_at(
         &mut self,
         fd: Resource<Descriptor>,
-        _path_flags: PathFlags,
+        path_flags: PathFlags,
         path: String,
     ) -> Result<std::result::Result<DescriptorStat, ErrorCode>> {
         let (fs, node) = fd_fs(self, &fd)?;
         let g = fs.lock().unwrap();
-        match resolve(&g, node, &path).and_then(|id| stat_node(&g, id)) {
+        // Without SYMLINK_FOLLOW this is `lstat`: report the link itself.
+        let follow = path_flags.contains(PathFlags::SYMLINK_FOLLOW);
+        match resolve_at(&g, node, &path, follow).and_then(|id| stat_node(&g, id)) {
             Some(s) => Ok(Ok(s)),
             None => err(ErrorCode::NoEntry),
         }
@@ -1077,15 +1153,18 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
     fn open_at(
         &mut self,
         fd: Resource<Descriptor>,
-        _path_flags: PathFlags,
+        path_flags: PathFlags,
         path: String,
         oflags: OpenFlags,
         _flags: DescriptorFlags,
     ) -> Result<std::result::Result<Resource<Descriptor>, ErrorCode>> {
         let (fs, start) = fd_fs(self, &fd)?;
+        // Opening follows the final link unless the caller says otherwise;
+        // wasi-libc asks for SYMLINK_FOLLOW on an ordinary open().
+        let follow = path_flags.contains(PathFlags::SYMLINK_FOLLOW);
         let node = {
             let mut g = fs.lock().unwrap();
-            match resolve(&g, start, &path) {
+            match resolve_at(&g, start, &path, follow) {
                 Some(id) => {
                     if oflags.contains(OpenFlags::EXCLUSIVE) {
                         return err(ErrorCode::Exist);
@@ -1273,20 +1352,54 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
     ) -> Result<std::result::Result<(), ErrorCode>> {
         err(ErrorCode::Unsupported)
     }
+    /// Create a symlink at `dest_path` pointing at `src_path`. The target is
+    /// stored verbatim (it may dangle, exactly as POSIX allows) and resolved
+    /// on each traversal.
     fn symlink_at(
         &mut self,
-        _fd: Resource<Descriptor>,
-        _src_path: String,
-        _dest_path: String,
+        fd: Resource<Descriptor>,
+        src_path: String,
+        dest_path: String,
     ) -> Result<std::result::Result<(), ErrorCode>> {
-        err(ErrorCode::Unsupported)
+        let (fs, start) = fd_fs(self, &fd)?;
+        let mut g = fs.lock().unwrap();
+        let Some((parent, name)) = resolve_parent(&g, start, &dest_path) else {
+            return err(ErrorCode::NoEntry);
+        };
+        if let Some(Node::Dir(children)) = g.nodes.get(&parent) {
+            if children.contains_key(&name) {
+                return err(ErrorCode::Exist);
+            }
+        } else {
+            return err(ErrorCode::NotDirectory);
+        }
+        if g.at_capacity() {
+            return err(ErrorCode::InsufficientSpace);
+        }
+        let id = g.alloc(Node::Symlink(src_path));
+        if let Some(Node::Dir(children)) = g.nodes.get_mut(&parent) {
+            children.insert(name, id);
+        }
+        Ok(Ok(()))
     }
+
+    /// Read a symlink's target. The final component is *not* followed — that
+    /// is the whole point — so this reports the link's own contents.
     fn readlink_at(
         &mut self,
-        _fd: Resource<Descriptor>,
-        _path: String,
+        fd: Resource<Descriptor>,
+        path: String,
     ) -> Result<std::result::Result<String, ErrorCode>> {
-        err(ErrorCode::Invalid)
+        let (fs, start) = fd_fs(self, &fd)?;
+        let g = fs.lock().unwrap();
+        let Some(id) = resolve_at(&g, start, &path, false) else {
+            return err(ErrorCode::NoEntry);
+        };
+        match g.nodes.get(&id) {
+            Some(Node::Symlink(target)) => Ok(Ok(target.clone())),
+            Some(_) => err(ErrorCode::Invalid),
+            None => err(ErrorCode::NoEntry),
+        }
     }
 
     fn drop(&mut self, fd: Resource<Descriptor>) -> Result<()> {
@@ -1340,6 +1453,7 @@ fn stat_node(fs: &Fs, id: u64) -> Option<DescriptorStat> {
         Node::Dir(_) => (DescriptorType::Directory, 0),
         Node::Shared(sh) => (DescriptorType::RegularFile, sh.lock().unwrap().len() as u64),
         Node::Host(p) => (DescriptorType::RegularFile, host_size(p)),
+        Node::Symlink(target) => (DescriptorType::SymbolicLink, target.len() as u64),
     };
     Some(DescriptorStat {
         type_: ty,
@@ -1514,6 +1628,107 @@ mod tests {
             .unwrap()
             .expect("writes through the rw mount");
         assert_eq!(data.lock().unwrap()[0], b'W');
+    }
+
+    /// Symlinks resolve on traversal, report themselves to lstat/readlink,
+    /// survive being pointed at directories, and can't loop forever. This is
+    /// how a multicall binary provides its command names: one executable,
+    /// many links.
+    #[test]
+    fn symlinks_resolve_and_bound_loops() {
+        use wasi::filesystem::types::HostDescriptor;
+        let fs = new_fs();
+        {
+            let mut g = fs.lock().unwrap();
+            g.ensure_dir_path("bin");
+            g.put_file_at("bin/coreutils.wasm", b"\0asm-the-real-binary".to_vec());
+            // One binary, many names — exactly a busybox/coreutils install.
+            g.put_symlink_at("bin/ls", "coreutils.wasm".into());
+            g.put_symlink_at("bin/cat", "/bin/coreutils.wasm".into());
+            // A directory alias, and a cycle.
+            g.put_symlink_at("usr", "/bin".into());
+            g.put_symlink_at("loop-a", "loop-b".into());
+            g.put_symlink_at("loop-b", "loop-a".into());
+        }
+
+        // Relative and absolute links both reach the binary...
+        assert_eq!(
+            fs.lock().unwrap().read_file("/bin/ls", 64).as_deref(),
+            Some(&b"\0asm-the-real-binary"[..])
+        );
+        assert_eq!(
+            fs.lock().unwrap().read_file("/bin/cat", 64).as_deref(),
+            Some(&b"\0asm-the-real-binary"[..])
+        );
+        // ...including through a symlinked directory component.
+        assert_eq!(
+            fs.lock().unwrap().read_file("/usr/ls", 64).as_deref(),
+            Some(&b"\0asm-the-real-binary"[..])
+        );
+        // A cycle terminates instead of hanging.
+        assert!(fs.lock().unwrap().read_file("/loop-a", 64).is_none());
+
+        let mut store = VfsImpl(TestStore {
+            table: ResourceTable::new(),
+            fs: fs.clone(),
+        });
+        let root = store
+            .0
+            .table
+            .push(Descriptor {
+                fs: fs.clone(),
+                node: ROOT,
+            })
+            .unwrap();
+
+        // readlink reports the link itself, never its target's contents.
+        assert_eq!(
+            HostDescriptor::readlink_at(&mut store, Resource::new_own(root.rep()), "bin/ls".into())
+                .unwrap()
+                .unwrap(),
+            "coreutils.wasm"
+        );
+        // lstat sees a link; stat (follow) sees the file behind it.
+        let lst = HostDescriptor::stat_at(
+            &mut store,
+            Resource::new_own(root.rep()),
+            PathFlags::empty(),
+            "bin/ls".into(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(lst.type_, DescriptorType::SymbolicLink);
+        let st = HostDescriptor::stat_at(
+            &mut store,
+            Resource::new_own(root.rep()),
+            PathFlags::SYMLINK_FOLLOW,
+            "bin/ls".into(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(st.type_, DescriptorType::RegularFile);
+
+        // A guest can create links too, and reading through one works.
+        HostDescriptor::symlink_at(
+            &mut store,
+            Resource::new_own(root.rep()),
+            "/bin/coreutils.wasm".into(),
+            "bin/wc".into(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            fs.lock().unwrap().read_file("/bin/wc", 64).as_deref(),
+            Some(&b"\0asm-the-real-binary"[..])
+        );
+        // readlink on something that isn't a link is an error, not a guess.
+        assert!(HostDescriptor::readlink_at(
+            &mut store,
+            Resource::new_own(root.rep()),
+            "bin/coreutils.wasm".into()
+        )
+        .unwrap()
+        .is_err());
     }
 
     #[test]
