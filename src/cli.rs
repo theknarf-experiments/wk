@@ -7,9 +7,9 @@ use std::io::BufReader;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
+use wk_api::ipc::socket_path;
 use wk_protocol::ipc::{read_msg, write_msg, ClientMsg, ServerMsg, Snapshot};
 use wk_protocol::{Command, NodeKind, NodePatch, Resource, ResourceRef};
-use wk_server::ipc_server::socket_path;
 
 /// Connect to the running server for `workspace`, or a helpful error if none.
 pub(crate) fn connect(workspace: &Path) -> Result<UnixStream, String> {

@@ -15,6 +15,7 @@ edition = "2021"
 # backend, and the local UI client each live in their own crate.
 [dependencies]
 biscuit-auth = "6.0"
+wk-api = { path = "crates/wk-api" }
 wk-protocol = { path = "crates/wk-protocol" }
 wk-server = { path = "crates/wk-server" }
 wk-token-service = { path = "crates/wk-token-service" }

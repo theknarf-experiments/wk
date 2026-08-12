@@ -10925,6 +10925,17 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "wk-api",
+ "wk-protocol",
+ "wk-server",
+ "wk-token-service",
+]
+
+[[package]]
+name = "wk-api"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.10.9",
  "wk-protocol",
  "wk-server",
  "wk-token-service",

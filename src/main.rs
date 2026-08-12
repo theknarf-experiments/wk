@@ -488,7 +488,7 @@ fn run(file: &Path, headless: bool) -> Result<(), String> {
     // Start the CLI socket (wk's "docker daemon") so a separate `wk` process can
     // attach and drive this server live — for both windowed and headless runs.
     let _ipc = match tokens.mint_admin().and_then(|tok| {
-        wk_server::ipc_server::IpcServer::start(runtime.handle().with_token(tok), file)
+        wk_api::ipc::IpcServer::start(runtime.handle().with_token(tok), file)
             .map_err(|e| e.to_string())
     }) {
         Ok(s) => {

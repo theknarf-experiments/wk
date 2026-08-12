@@ -13,7 +13,6 @@ pub mod auth;
 pub mod capture;
 pub mod http;
 pub mod images;
-pub mod ipc_server;
 pub mod midi;
 pub mod midihw;
 pub mod oci;

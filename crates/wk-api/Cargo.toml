@@ -1,0 +1,12 @@
+[package]
+name = "wk-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sha2 = "0.10"
+wk-protocol = { path = "../wk-protocol" }
+wk-server = { path = "../wk-server" }
+
+[dev-dependencies]
+wk-token-service = { path = "../wk-token-service" }

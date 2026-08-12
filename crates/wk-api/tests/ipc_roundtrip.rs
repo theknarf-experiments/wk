@@ -5,9 +5,9 @@ use std::io::BufReader;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
+use wk_api::ipc::{socket_path, IpcServer};
 use wk_protocol::ipc::{read_msg, write_msg, ClientMsg, ServerMsg};
 use wk_protocol::{Command, NodeKind, Resource};
-use wk_server::ipc_server::{socket_path, IpcServer};
 use wk_server::runtime::ServerRuntime;
 use wk_server::workspace::Document;
 use wk_token_service::TokenService;
