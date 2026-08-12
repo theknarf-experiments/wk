@@ -14,7 +14,7 @@
 
 pub mod layers;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use wasmtime::component::{HasData, Linker, Resource, ResourceTable};
@@ -120,13 +120,22 @@ const ROOT: u64 = 0;
 pub struct Fs {
     nodes: BTreeMap<u64, Node>,
     next: u64,
+    /// Node ids mounted read-only: every write path (streams, direct writes,
+    /// truncate, resize, unlink, rename) refuses them with `NotPermitted` —
+    /// how a token that grants `read` but not `write` on a file is enforced.
+    /// Ids are never reused, so stale entries after an unmount are inert.
+    readonly: HashSet<u64>,
 }
 
 impl Default for Fs {
     fn default() -> Self {
         let mut nodes = BTreeMap::new();
         nodes.insert(ROOT, Node::Dir(BTreeMap::new()));
-        Fs { nodes, next: 1 }
+        Fs {
+            nodes,
+            next: 1,
+            readonly: HashSet::new(),
+        }
     }
 }
 
@@ -408,14 +417,17 @@ impl Fs {
 /// Bind-mount a Volume's shared bytes into `fs` at `at` (an absolute-ish path
 /// like `/data/notes.txt`; a bare name mounts at the root). Missing parent
 /// directories are created; any existing entry at that path is replaced.
-pub fn mount_file(fs: &SharedFs, at: &str, data: SharedFile) {
-    mount_node_at(fs, at, Node::Shared(data));
+/// `writable = false` mounts read-only: reads see the live shared bytes but
+/// every mutation (write, truncate, resize, unlink, rename) is refused.
+pub fn mount_file(fs: &SharedFs, at: &str, data: SharedFile, writable: bool) {
+    mount_node_at(fs, at, Node::Shared(data), !writable);
 }
 
 /// Bind-mount a real host file into `fs` at `at`, backed by the disk file at
-/// `path`. Reads and writes go straight to disk. Path semantics as [`mount_file`].
-pub fn mount_host_file(fs: &SharedFs, at: &str, path: std::path::PathBuf) {
-    mount_node_at(fs, at, Node::Host(path));
+/// `path`. Reads (and, if `writable`, writes) go straight to disk. Path
+/// semantics as [`mount_file`].
+pub fn mount_host_file(fs: &SharedFs, at: &str, path: std::path::PathBuf, writable: bool) {
+    mount_node_at(fs, at, Node::Host(path), !writable);
 }
 
 /// Bind a real host path into `fs` at `at`: a file mounts as one host-backed
@@ -425,16 +437,16 @@ pub fn mount_host_file(fs: &SharedFs, at: &str, path: std::path::PathBuf) {
 /// afterwards don't appear until the next mount, and files the guest creates
 /// inside a bound directory are private (in-memory), not written back to disk.
 /// Symlinks are not followed (so a directory cycle can't loop the walk).
-pub fn mount_host(fs: &SharedFs, at: &str, path: std::path::PathBuf) {
+pub fn mount_host(fs: &SharedFs, at: &str, path: std::path::PathBuf, writable: bool) {
     if path.is_dir() {
-        mount_host_dir(fs, at, &path);
+        mount_host_dir(fs, at, &path, writable);
     } else {
-        mount_host_file(fs, at, path);
+        mount_host_file(fs, at, path, writable);
     }
 }
 
 /// Mirror the host directory `dir` into `fs` under `at` (see [`mount_host`]).
-fn mount_host_dir(fs: &SharedFs, at: &str, dir: &std::path::Path) {
+fn mount_host_dir(fs: &SharedFs, at: &str, dir: &std::path::Path, writable: bool) {
     fs.lock().unwrap().ensure_dir_path(at);
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -443,17 +455,17 @@ fn mount_host_dir(fs: &SharedFs, at: &str, dir: &std::path::Path) {
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         let child_at = format!("{at}/{}", entry.file_name().to_string_lossy());
         if is_dir {
-            mount_host_dir(fs, &child_at, &entry.path());
+            mount_host_dir(fs, &child_at, &entry.path(), writable);
         } else {
             // Regular files (and, deliberately, symlinks treated as their target
             // file) mount live; a broken link just reads empty.
-            mount_host_file(fs, &child_at, entry.path());
+            mount_host_file(fs, &child_at, entry.path(), writable);
         }
     }
 }
 
 /// Place `node` at `at`, creating parent dirs and replacing any existing entry.
-fn mount_node_at(fs: &SharedFs, at: &str, node: Node) {
+fn mount_node_at(fs: &SharedFs, at: &str, node: Node, readonly: bool) {
     let mut g = fs.lock().unwrap();
     let comps = components(at);
     let Some((name, dirs)) = comps.split_last() else {
@@ -467,9 +479,17 @@ fn mount_node_at(fs: &SharedFs, at: &str, node: Node) {
     }
     g.remove_path_in(parent, name);
     let id = g.alloc(node);
+    if readonly {
+        g.readonly.insert(id);
+    }
     if let Some(Node::Dir(children)) = g.nodes.get_mut(&parent) {
         children.insert((*name).to_string(), id);
     }
+}
+
+/// Whether the node behind `id` was mounted read-only.
+fn is_readonly(fs: &SharedFs, id: u64) -> bool {
+    fs.lock().unwrap().readonly.contains(&id)
 }
 
 /// Disconnect a bind mounted at `at` from `fs` (leaves the volume's bytes intact
@@ -811,6 +831,9 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         offset: Filesize,
     ) -> Result<std::result::Result<Resource<DynOutputStream>, ErrorCode>> {
         let (fs, node) = fd_fs(self, &fd)?;
+        if is_readonly(&fs, node) {
+            return err(ErrorCode::NotPermitted);
+        }
         let stream: DynOutputStream = match node_kind(&fs, node) {
             // A layer file copy-ups on the stream's first write.
             Kind::File | Kind::Ro(_) => Box::new(VfsOutputStream { fs, node, offset }),
@@ -826,6 +849,9 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         fd: Resource<Descriptor>,
     ) -> Result<std::result::Result<Resource<DynOutputStream>, ErrorCode>> {
         let (fs, node) = fd_fs(self, &fd)?;
+        if is_readonly(&fs, node) {
+            return err(ErrorCode::NotPermitted);
+        }
         let stream: DynOutputStream = match node_kind(&fs, node) {
             Kind::File | Kind::Ro(_) => {
                 // Append needs the private copy's length; copy up now.
@@ -883,6 +909,9 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         offset: Filesize,
     ) -> Result<std::result::Result<Filesize, ErrorCode>> {
         let (fs, node) = fd_fs(self, &fd)?;
+        if is_readonly(&fs, node) {
+            return err(ErrorCode::NotPermitted);
+        }
         match node_kind(&fs, node) {
             Kind::File | Kind::Ro(_) => {
                 let mut g = fs.lock().unwrap();
@@ -994,8 +1023,12 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
 
     fn get_flags(
         &mut self,
-        _fd: Resource<Descriptor>,
+        fd: Resource<Descriptor>,
     ) -> Result<std::result::Result<DescriptorFlags, ErrorCode>> {
+        let (fs, node) = fd_fs(self, &fd)?;
+        if is_readonly(&fs, node) {
+            return Ok(Ok(DescriptorFlags::READ));
+        }
         Ok(Ok(DescriptorFlags::READ | DescriptorFlags::WRITE))
     }
 
@@ -1005,6 +1038,9 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         size: Filesize,
     ) -> Result<std::result::Result<(), ErrorCode>> {
         let (fs, node) = fd_fs(self, &fd)?;
+        if is_readonly(&fs, node) {
+            return err(ErrorCode::NotPermitted);
+        }
         let size = match usize::try_from(size) {
             Ok(s) if s <= MAX_FILE_SIZE => s,
             _ => return err(ErrorCode::FileTooLarge),
@@ -1053,6 +1089,9 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
                 Some(id) => {
                     if oflags.contains(OpenFlags::EXCLUSIVE) {
                         return err(ErrorCode::Exist);
+                    }
+                    if oflags.contains(OpenFlags::TRUNCATE) && g.readonly.contains(&id) {
+                        return err(ErrorCode::NotPermitted);
                     }
                     if oflags.contains(OpenFlags::TRUNCATE) {
                         match g.nodes.get_mut(&id) {
@@ -1136,6 +1175,10 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
             },
             _ => return err(ErrorCode::NotDirectory),
         };
+        // Moving a read-only mount is as off-limits as removing it.
+        if g.readonly.contains(&id) {
+            return err(ErrorCode::NotPermitted);
+        }
         let Some((new_parent, new_name)) = resolve_parent(&g, new_start, &new_path) else {
             return err(ErrorCode::NoEntry);
         };
@@ -1271,6 +1314,11 @@ fn unlink<T: VfsView>(
         },
         _ => return err(ErrorCode::NotDirectory),
     };
+    // A read-only mount can't be removed from inside the guest (its binding is
+    // the host's decision, like EROFS).
+    if g.readonly.contains(&id) {
+        return err(ErrorCode::NotPermitted);
+    }
     match (dir, g.nodes.get(&id)) {
         (true, Some(Node::Dir(c))) if !c.is_empty() => return err(ErrorCode::NotEmpty),
         (true, Some(Node::Dir(_))) => {}
@@ -1324,6 +1372,149 @@ impl<T: VfsView> wasi::filesystem::types::HostDirectoryEntryStream for VfsImpl<T
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A minimal store so tests can drive the generated `wasi:filesystem`
+    /// methods (the same surface a guest hits) without a live wasm instance.
+    struct TestStore {
+        table: ResourceTable,
+        fs: SharedFs,
+    }
+    impl wasmtime_wasi_io::IoView for TestStore {
+        fn table(&mut self) -> &mut ResourceTable {
+            &mut self.table
+        }
+    }
+    impl VfsView for TestStore {
+        fn fs(&mut self) -> SharedFs {
+            self.fs.clone()
+        }
+    }
+
+    #[test]
+    fn read_only_mount_reads_but_refuses_every_mutation() {
+        use wasi::filesystem::types::HostDescriptor;
+        let fs = new_fs();
+        let data: SharedFile = Arc::new(Mutex::new(b"shared".to_vec()));
+        mount_file(&fs, "ro.txt", data.clone(), false);
+
+        let mut store = VfsImpl(TestStore {
+            table: ResourceTable::new(),
+            fs: fs.clone(),
+        });
+        let root = store
+            .0
+            .table
+            .push(Descriptor {
+                fs: fs.clone(),
+                node: ROOT,
+            })
+            .unwrap();
+        let open = |st: &mut VfsImpl<TestStore>, root: &Resource<Descriptor>, of: OpenFlags| {
+            HostDescriptor::open_at(
+                st,
+                Resource::new_own(root.rep()),
+                PathFlags::empty(),
+                "ro.txt".to_string(),
+                of,
+                DescriptorFlags::empty(),
+            )
+            .unwrap()
+        };
+
+        // Plain open + read works and the flags report read-only.
+        let fd = open(&mut store, &root, OpenFlags::empty()).expect("opens");
+        let (bytes, _) = HostDescriptor::read(&mut store, Resource::new_own(fd.rep()), 64, 0)
+            .unwrap()
+            .expect("reads");
+        assert_eq!(bytes, b"shared");
+        assert_eq!(
+            HostDescriptor::get_flags(&mut store, Resource::new_own(fd.rep()))
+                .unwrap()
+                .expect("flags"),
+            DescriptorFlags::READ
+        );
+
+        // Every mutation path refuses: direct write, write/append streams,
+        // resize, truncate-open, unlink, rename.
+        assert_eq!(
+            HostDescriptor::write(&mut store, Resource::new_own(fd.rep()), b"x".to_vec(), 0)
+                .unwrap()
+                .unwrap_err(),
+            ErrorCode::NotPermitted
+        );
+        assert!(matches!(
+            HostDescriptor::write_via_stream(&mut store, Resource::new_own(fd.rep()), 0).unwrap(),
+            Err(ErrorCode::NotPermitted)
+        ));
+        assert!(matches!(
+            HostDescriptor::append_via_stream(&mut store, Resource::new_own(fd.rep())).unwrap(),
+            Err(ErrorCode::NotPermitted)
+        ));
+        assert_eq!(
+            HostDescriptor::set_size(&mut store, Resource::new_own(fd.rep()), 0)
+                .unwrap()
+                .unwrap_err(),
+            ErrorCode::NotPermitted
+        );
+        assert!(matches!(
+            open(&mut store, &root, OpenFlags::TRUNCATE),
+            Err(ErrorCode::NotPermitted)
+        ));
+        assert_eq!(
+            HostDescriptor::unlink_file_at(
+                &mut store,
+                Resource::new_own(root.rep()),
+                "ro.txt".to_string()
+            )
+            .unwrap()
+            .unwrap_err(),
+            ErrorCode::NotPermitted
+        );
+        assert_eq!(
+            HostDescriptor::rename_at(
+                &mut store,
+                Resource::new_own(root.rep()),
+                "ro.txt".to_string(),
+                Resource::new_own(root.rep()),
+                "moved.txt".to_string()
+            )
+            .unwrap()
+            .unwrap_err(),
+            ErrorCode::NotPermitted
+        );
+
+        // The shared bytes never changed, and a writable mount of the same
+        // volume elsewhere still works (read-only is per-mount, not per-volume).
+        assert_eq!(&*data.lock().unwrap(), b"shared");
+        let rw = new_fs();
+        mount_file(&rw, "rw.txt", data.clone(), true);
+        let mut store2 = VfsImpl(TestStore {
+            table: ResourceTable::new(),
+            fs: rw.clone(),
+        });
+        let root2 = store2
+            .0
+            .table
+            .push(Descriptor {
+                fs: rw.clone(),
+                node: ROOT,
+            })
+            .unwrap();
+        let fd2 = HostDescriptor::open_at(
+            &mut store2,
+            root2,
+            PathFlags::empty(),
+            "rw.txt".to_string(),
+            OpenFlags::empty(),
+            DescriptorFlags::empty(),
+        )
+        .unwrap()
+        .expect("opens rw");
+        HostDescriptor::write(&mut store2, fd2, b"W".to_vec(), 0)
+            .unwrap()
+            .expect("writes through the rw mount");
+        assert_eq!(data.lock().unwrap()[0], b'W');
+    }
 
     #[test]
     fn apps_are_isolated() {
@@ -1416,8 +1607,8 @@ mod tests {
         let data: SharedFile = Arc::new(Mutex::new(Vec::new()));
 
         // Wiring the same file node into both apps gives both a shared file.
-        mount_file(&a, "chan", data.clone());
-        mount_file(&b, "chan", data.clone());
+        mount_file(&a, "chan", data.clone(), true);
+        mount_file(&b, "chan", data.clone(), true);
         let na = resolve(&a.lock().unwrap(), ROOT, "/chan").expect("a sees it");
         let nb = resolve(&b.lock().unwrap(), ROOT, "/chan").expect("b sees it");
 
@@ -1437,7 +1628,7 @@ mod tests {
         let fs = new_fs();
         let data: SharedFile = Arc::new(Mutex::new(b"hi".to_vec()));
         // A volume can bind at a chosen path deep in the tree; parents appear.
-        mount_file(&fs, "/data/inputs/notes.txt", data.clone());
+        mount_file(&fs, "/data/inputs/notes.txt", data.clone(), true);
         let id = resolve(&fs.lock().unwrap(), ROOT, "/data/inputs/notes.txt")
             .expect("mounted at the nested path");
         assert_eq!(stat_node(&fs.lock().unwrap(), id).unwrap().size, 2);
@@ -1555,7 +1746,7 @@ mod tests {
         std::fs::write(&path, b"on disk").unwrap();
 
         let fs = new_fs();
-        mount_host_file(&fs, "h", path.clone());
+        mount_host_file(&fs, "h", path.clone(), true);
         let node = resolve(&fs.lock().unwrap(), ROOT, "/h").expect("mounted");
 
         // The mounted node reports the real file's size, and a write through it
@@ -1582,7 +1773,7 @@ mod tests {
         std::fs::write(root.join("sub/deep.txt"), b"deep!").unwrap();
 
         let fs = new_fs();
-        mount_host(&fs, "/vol", root.clone());
+        mount_host(&fs, "/vol", root.clone(), true);
 
         // The tree is mirrored: files appear at their sub-paths, backed by disk.
         let top = resolve(&fs.lock().unwrap(), ROOT, "/vol/top.txt").expect("top mounted");

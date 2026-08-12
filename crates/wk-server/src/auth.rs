@@ -45,13 +45,13 @@ pub fn authorize(
     };
     let res = resource.as_str();
     let act = action.as_str();
-    // The attempted (resource, action) are facts; a single static policy allows
-    // them iff the token grants the matching right.
+    // The attempted operation is an ambient fact — the same `operation(...)`
+    // vocabulary the node-capability plane uses — and a single static policy
+    // allows it iff the token grants the matching right.
     let authorizer = authorizer!(
         r#"
-        resource({res});
-        action({act});
-        allow if resource($r), action($a), right($r, $a);
+        operation({res}, {act});
+        allow if operation($r, $a), right($r, $a);
         "#
     );
     match authorizer.build(&token) {
@@ -60,24 +60,27 @@ pub fn authorize(
     }
 }
 
-/// Decide whether a *node* holding `token_bytes` may use `(kind, target)` — the
-/// node-capability half of authorization, gating what a node's wires actually
-/// grant (a file mount, a HostPort publish, a network join, a MIDI route).
+/// Decide whether a *node* holding `token_bytes` may perform `action` on
+/// `(kind, target)` — the node-capability half of authorization, gating what a
+/// node's wires actually grant (a file mount and its writability, a HostPort
+/// publish, a network join, host access via a gateway, a MIDI direction).
 ///
 /// The policy lives in the **token**, not here: the server only supplies the
 /// world as ambient facts — `wired(kind, target)` for every wire the node
-/// currently has, plus the attempted `operation(kind, target)` — and one
-/// static policy allowing the operation iff the token's Datalog derives
+/// currently has, plus the attempted `operation(kind, target, action)` — and
+/// one static policy allowing the operation iff the token's Datalog derives
 /// `can_use` for it. The default token's authority block carries
-/// `can_use($k, $t) <- wired($k, $t)` ("use what you're connected to");
-/// attenuation blocks append checks that narrow it, and a replacement token
-/// can carry different logic entirely.
+/// `can_use($k, $t, $a) <- wired($k, $t)` ("use what you're connected to, in
+/// every mode"); attenuation blocks append checks that narrow it (a kind, a
+/// target, or an action — e.g. read-only), and a replacement token can carry
+/// different logic entirely.
 pub fn authorize_use(
     public_key: PublicKey,
     token_bytes: &[u8],
     wired: &[(&str, String)],
     kind: &str,
     target: &str,
+    action: &str,
 ) -> bool {
     let token = match Biscuit::from(token_bytes, public_key) {
         Ok(t) => t,
@@ -85,8 +88,8 @@ pub fn authorize_use(
     };
     let mut builder = authorizer!(
         r#"
-        operation({kind}, {target});
-        allow if operation($k, $t), can_use($k, $t);
+        operation({kind}, {target}, {action});
+        allow if operation($k, $t, $a), can_use($k, $t, $a);
         "#
     );
     for (k, t) in wired {
@@ -228,7 +231,10 @@ mod tests {
     /// service's `mint_node_base` does.
     fn mint_node_base(root: &KeyPair) -> Vec<u8> {
         Biscuit::builder()
-            .code("can_use($kind, $target) <- wired($kind, $target);")
+            .code(
+                "can_use($kind, $target, $action) <- wired($kind, $target), \
+                 operation($kind, $target, $action);",
+            )
             .unwrap()
             .build(root)
             .unwrap()
@@ -241,19 +247,32 @@ mod tests {
         let root = KeyPair::new();
         let token = mint_node_base(&root);
         let wired = [("file", "vol1".to_string()), ("net", "lan".to_string())];
-        assert!(authorize_use(root.public(), &token, &wired, "file", "vol1"));
-        assert!(authorize_use(root.public(), &token, &wired, "net", "lan"));
+        let ok = |w: &[(&str, String)], k: &str, t: &str, a: &str| {
+            authorize_use(root.public(), &token, w, k, t, a)
+        };
+        // Wired grants every action on the wire's target.
+        assert!(ok(&wired, "file", "vol1", "read"));
+        assert!(ok(&wired, "file", "vol1", "write"));
+        assert!(ok(&wired, "net", "lan", "use"));
         // Not wired: no fact, so the rule derives nothing.
-        assert!(!authorize_use(root.public(), &token, &wired, "port", "hp1"));
-        assert!(!authorize_use(
-            root.public(),
-            &token,
-            &wired,
-            "file",
-            "other"
-        ));
+        assert!(!ok(&wired, "port", "hp1", "use"));
+        assert!(!ok(&wired, "file", "other", "read"));
         // No wires at all: nothing is usable.
-        assert!(!authorize_use(root.public(), &token, &[], "file", "vol1"));
+        assert!(!ok(&[], "file", "vol1", "read"));
+    }
+
+    /// Append one attenuation block to a token, holder-side (no key).
+    fn attenuate(token: &[u8], block: &str) -> Vec<u8> {
+        biscuit_auth::UnverifiedBiscuit::from(token)
+            .unwrap()
+            .append(
+                biscuit_auth::builder::BlockBuilder::new()
+                    .code(block)
+                    .unwrap(),
+            )
+            .unwrap()
+            .to_vec()
+            .unwrap()
     }
 
     #[test]
@@ -261,16 +280,7 @@ mod tests {
         let root = KeyPair::new();
         let token = mint_node_base(&root);
         // A holder (no signing key) appends a check: never the network.
-        let attenuated = biscuit_auth::UnverifiedBiscuit::from(&token)
-            .unwrap()
-            .append(
-                biscuit_auth::builder::BlockBuilder::new()
-                    .code(r#"check if operation($k, $t), $k != "net";"#)
-                    .unwrap(),
-            )
-            .unwrap()
-            .to_vec()
-            .unwrap();
+        let attenuated = attenuate(&token, r#"check if operation($k, $t, $a), $k != "net";"#);
         let wired = [("file", "vol1".to_string()), ("net", "lan".to_string())];
         // Still usable: the wired file.
         assert!(authorize_use(
@@ -278,7 +288,8 @@ mod tests {
             &attenuated,
             &wired,
             "file",
-            "vol1"
+            "vol1",
+            "write"
         ));
         // Cut off: the network, even though it is wired.
         assert!(!authorize_use(
@@ -286,7 +297,73 @@ mod tests {
             &attenuated,
             &wired,
             "net",
-            "lan"
+            "lan",
+            "use"
+        ));
+    }
+
+    #[test]
+    fn read_only_attenuation_keeps_reads_and_drops_writes() {
+        let root = KeyPair::new();
+        let token = mint_node_base(&root);
+        // Read-only: every operation must be a non-file one, or a file read.
+        let ro = attenuate(
+            &token,
+            r#"check if operation($k, $t, $a), $k != "file" || $a == "read";"#,
+        );
+        let wired = [("file", "vol1".to_string()), ("net", "lan".to_string())];
+        assert!(authorize_use(
+            root.public(),
+            &ro,
+            &wired,
+            "file",
+            "vol1",
+            "read"
+        ));
+        assert!(!authorize_use(
+            root.public(),
+            &ro,
+            &wired,
+            "file",
+            "vol1",
+            "write"
+        ));
+        // Other kinds are untouched.
+        assert!(authorize_use(
+            root.public(),
+            &ro,
+            &wired,
+            "net",
+            "lan",
+            "use"
+        ));
+    }
+
+    #[test]
+    fn gateway_is_a_distinct_kind_from_net() {
+        let root = KeyPair::new();
+        let token = mint_node_base(&root);
+        // Wired to a plain net and to a gateway; cut off host access only.
+        let no_gateway = attenuate(
+            &token,
+            r#"check if operation($k, $t, $a), $k != "gateway";"#,
+        );
+        let wired = [("net", "lan".to_string()), ("gateway", "gw".to_string())];
+        assert!(authorize_use(
+            root.public(),
+            &no_gateway,
+            &wired,
+            "net",
+            "lan",
+            "use"
+        ));
+        assert!(!authorize_use(
+            root.public(),
+            &no_gateway,
+            &wired,
+            "gateway",
+            "gw",
+            "use"
         ));
     }
 
@@ -294,10 +371,10 @@ mod tests {
     fn a_swapped_authority_replaces_the_logic() {
         let root = KeyPair::new();
         // A token with no wiring rule at all — a deny-everything policy —
-        // and one granting a single fixed target regardless of wiring.
+        // and one granting a single fixed (target, action) regardless of wiring.
         let deny_all = Biscuit::builder().build(&root).unwrap().to_vec().unwrap();
         let fixed = Biscuit::builder()
-            .code(r#"can_use("file", "vol1");"#)
+            .code(r#"can_use("file", "vol1", "read");"#)
             .unwrap()
             .build(&root)
             .unwrap()
@@ -309,12 +386,42 @@ mod tests {
             &deny_all,
             &wired,
             "file",
-            "vol1"
+            "vol1",
+            "read"
         ));
-        assert!(authorize_use(root.public(), &fixed, &wired, "file", "vol1"));
-        assert!(!authorize_use(root.public(), &fixed, &wired, "net", "lan"));
+        assert!(authorize_use(
+            root.public(),
+            &fixed,
+            &wired,
+            "file",
+            "vol1",
+            "read"
+        ));
+        assert!(!authorize_use(
+            root.public(),
+            &fixed,
+            &wired,
+            "file",
+            "vol1",
+            "write"
+        ));
+        assert!(!authorize_use(
+            root.public(),
+            &fixed,
+            &wired,
+            "net",
+            "lan",
+            "use"
+        ));
         // The fixed grant holds even with no wire present — the logic swapped.
-        assert!(authorize_use(root.public(), &fixed, &[], "file", "vol1"));
+        assert!(authorize_use(
+            root.public(),
+            &fixed,
+            &[],
+            "file",
+            "vol1",
+            "read"
+        ));
     }
 
     #[test]
@@ -328,14 +435,16 @@ mod tests {
             &forged,
             &wired,
             "file",
-            "vol1"
+            "vol1",
+            "read"
         ));
         assert!(!authorize_use(
             root.public(),
             b"garbage",
             &wired,
             "file",
-            "vol1"
+            "vol1",
+            "read"
         ));
     }
 }

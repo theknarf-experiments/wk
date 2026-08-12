@@ -71,10 +71,10 @@ impl FileNode {
 
     /// Bind this volume into app filesystem `fs` at the path `at` (by kind). A
     /// BindMount pointing at a host directory mirrors the whole tree.
-    pub fn mount(&self, fs: &crate::vfs::SharedFs, at: &str) {
+    pub fn mount(&self, fs: &crate::vfs::SharedFs, at: &str, writable: bool) {
         match self {
-            FileNode::Volume(f) => crate::vfs::mount_file(fs, at, f.data.clone()),
-            FileNode::Bind(f) => crate::vfs::mount_host(fs, at, f.path.clone()),
+            FileNode::Volume(f) => crate::vfs::mount_file(fs, at, f.data.clone(), writable),
+            FileNode::Bind(f) => crate::vfs::mount_host(fs, at, f.path.clone(), writable),
         }
     }
 }
@@ -163,7 +163,7 @@ impl UplinkHandle {
 /// surface and node handles, which are `Arc`s a client uses to paint pixels and
 /// forward input (the in-process fast path; a networked client would receive
 /// pixel streams instead).
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct View {
     /// Every canvas node id (app/file/port/network), for draw-order reconcile.
     pub node_ids: Vec<NodeId>,
@@ -525,10 +525,11 @@ pub struct Server {
     pub graph: Graph,
 
     // ---- runtime state derived from `graph` (not persisted, not synced) ----
-    /// Active file mounts: (file, app) -> (mount name, the app's fs). Stores the
-    /// name+fs so a mount can be torn down even after either node is gone.
-    /// Mirrors `graph.connections`; reconciled by `sync_mounts`.
-    mounted: HashMap<(NodeId, NodeId), (String, crate::vfs::SharedFs)>,
+    /// Active file mounts: (file, app) -> (mount name, the app's fs, writable).
+    /// Stores the name+fs so a mount can be torn down even after either node is
+    /// gone, and the mode so a write-permission change remounts. Mirrors
+    /// `graph.connections`; reconciled by `sync_mounts`.
+    mounted: HashMap<(NodeId, NodeId), (String, crate::vfs::SharedFs, bool)>,
     /// Active MIDI routes: (src, dst) currently in the router. Mirrors
     /// `graph.midi_links`; reconciled by `sync_midi`.
     routed: HashSet<(NodeId, NodeId)>,
@@ -583,8 +584,8 @@ pub struct Server {
     node_auth: Option<(biscuit_auth::PublicKey, Vec<u8>)>,
     /// Memoized node-use decisions for the per-tick reconcilers: the cached
     /// verdict is valid while its fingerprint (token bytes + the node's wire
-    /// set) is unchanged. Keyed by (node, kind, target).
-    auth_cache: HashMap<(NodeId, &'static str, NodeId), (u64, bool)>,
+    /// set) is unchanged. Keyed by (node, kind, target, action).
+    auth_cache: HashMap<(NodeId, &'static str, NodeId, &'static str), (u64, bool)>,
 
     /// Inverse-command history for [`Command::Undo`].
     undo: Vec<Undo>,
@@ -1056,7 +1057,7 @@ impl Server {
                 .find(|&&(app, _)| app == node.id)
                 .copied();
             let feed = pair.and_then(|(app, cap)| {
-                if self.node_may_use(app, "capture", cap) {
+                if self.node_may_use(app, "capture", cap, "read") {
                     self.capture_feeds.get(&cap).cloned()
                 } else {
                     None
@@ -1151,12 +1152,18 @@ impl Server {
         for file in files {
             let pair = (file, app);
             let path = self.mount_path_for(file, app);
-            if let Some((old, fs)) = self.mounted.remove(&pair) {
+            if let Some((old, fs, _)) = self.mounted.remove(&pair) {
                 crate::vfs::unmount_file(&fs, &old);
             }
+            // Same token gates as sync_mounts — re-applying must not resurrect
+            // a denied mount (or upgrade a read-only one).
+            if !self.node_may_use(app, "file", file, "read") {
+                continue;
+            }
+            let writable = self.node_may_use(app, "file", file, "write");
             if let Some(f) = self.graph.file_nodes.get(&file) {
-                f.mount(&node.fs, &path);
-                self.mounted.insert(pair, (path, node.fs.clone()));
+                f.mount(&node.fs, &path, writable);
+                self.mounted.insert(pair, (path, node.fs.clone(), writable));
             }
         }
     }
@@ -1259,10 +1266,15 @@ impl Server {
     /// Wire (or unwire) app node (or Iroh uplink) `app_id` onto Network node
     /// `net_id`.
     fn toggle_net(&mut self, app_id: NodeId, net_id: NodeId) {
+        let net_kind = if self.is_gateway(net_id) {
+            "gateway"
+        } else {
+            "net"
+        };
         let joined = wiring::toggle_unique(&mut self.graph.net_links, app_id, net_id)
             // The immediate join is gated on the member's token too, not just
             // the per-tick sync — no one-tick window on the network.
-            && self.node_may_use(app_id, "net", net_id);
+            && self.node_may_use(app_id, net_kind, net_id, "use");
         // An uplink member: its trunk follows the wire (own empty net = idle).
         if let Some(up) = self.uplinks.get(&app_id) {
             up.set_net(if joined { net_id } else { app_id });
@@ -1288,7 +1300,12 @@ impl Server {
         let nodes = self.node_reg.lock().unwrap().clone();
         let links = self.graph.net_links.clone();
         for (app, net) in links {
-            let allowed = self.node_may_use(app, "net", net);
+            let kind = if self.is_gateway(net) {
+                "gateway"
+            } else {
+                "net"
+            };
+            let allowed = self.node_may_use(app, kind, net, "use");
             if let Some(up) = self.uplinks.get(&app) {
                 up.set_net(if allowed { net } else { app });
                 continue;
@@ -1400,7 +1417,7 @@ impl Server {
                 n.http_path().is_some()
                     || (n.net_stack().is_some() && n.running.load(Ordering::Relaxed))
             });
-            if ready && self.node_may_use(http, "port", hp) {
+            if ready && self.node_may_use(http, "port", hp, "use") {
                 desired.insert(http, hp);
             }
         }
@@ -1575,6 +1592,12 @@ impl Server {
         self.auth_cache.clear();
     }
 
+    /// The token service's public key, if auth is configured — what a client
+    /// connection verifies its bearer token against for the read path.
+    pub fn auth_public_key(&self) -> Option<biscuit_auth::PublicKey> {
+        self.node_auth.as_ref().map(|(k, _)| *k)
+    }
+
     /// Every wire app node `id` currently has, as `(kind, counterpart)` — the
     /// ambient `wired(...)` facts its token's Datalog runs against.
     fn wires_of(&self, id: NodeId) -> Vec<(&'static str, NodeId)> {
@@ -1605,11 +1628,20 @@ impl Server {
                 .filter(|&&(h, _)| h == id)
                 .map(|&(_, hp)| ("port", hp)),
         );
+        // A gateway grants host access — a different capability than a plain
+        // net, so it gets its own kind (Datalog has no negation; cutting off
+        // host access must be expressible by kind matching).
         w.extend(
             g.net_links
                 .iter()
                 .filter(|&&(a, _)| a == id)
-                .map(|&(_, n)| ("net", n)),
+                .map(|&(_, n)| {
+                    if g.nodes.get(&n).map(|r| r.kind) == Some(Kind::Gateway) {
+                        ("gateway", n)
+                    } else {
+                        ("net", n)
+                    }
+                }),
         );
         w.extend(
             g.capture_links
@@ -1620,12 +1652,19 @@ impl Server {
         w
     }
 
-    /// Whether node `id`'s capability token authorizes using `(kind, target)`.
-    /// Always true with enforcement off, and for non-app nodes (uplinks,
-    /// hardware sources — those are resources/host-owned, not token-bearing
-    /// subjects). Decisions are memoized against a fingerprint of the token
-    /// bytes + the node's wire set, so the per-tick reconcilers stay cheap.
-    fn node_may_use(&mut self, id: NodeId, kind: &'static str, target: NodeId) -> bool {
+    /// Whether node `id`'s capability token authorizes `action` on
+    /// `(kind, target)`. Always true with enforcement off, and for non-app
+    /// nodes (uplinks, hardware sources — those are resources/host-owned, not
+    /// token-bearing subjects). Decisions are memoized against a fingerprint of
+    /// the token bytes + the node's wire set, so the per-tick reconcilers stay
+    /// cheap.
+    fn node_may_use(
+        &mut self,
+        id: NodeId,
+        kind: &'static str,
+        target: NodeId,
+        action: &'static str,
+    ) -> bool {
         if self.node_auth.is_none() {
             return true;
         }
@@ -1643,15 +1682,15 @@ impl Server {
             wires.hash(&mut h);
             h.finish()
         };
-        if let Some(&(cached_fp, ok)) = self.auth_cache.get(&(id, kind, target)) {
+        if let Some(&(cached_fp, ok)) = self.auth_cache.get(&(id, kind, target, action)) {
             if cached_fp == fp {
                 return ok;
             }
         }
         let token = token.clone();
         let facts: Vec<(&str, String)> = wires.iter().map(|&(k, t)| (k, t.to_string())).collect();
-        let ok = crate::auth::authorize_use(key, &token, &facts, kind, &target.to_string());
-        self.auth_cache.insert((id, kind, target), (fp, ok));
+        let ok = crate::auth::authorize_use(key, &token, &facts, kind, &target.to_string(), action);
+        self.auth_cache.insert((id, kind, target, action), (fp, ok));
         ok
     }
 
@@ -1678,7 +1717,7 @@ impl Server {
             }
             self.graph.node_tokens.insert(id, token);
         }
-        self.auth_cache.retain(|&(n, _, _), _| n != id);
+        self.auth_cache.retain(|&(n, _, _, _), _| n != id);
     }
 
     /// Reconcile the actual file mounts against the desired `connections`: mount
@@ -1686,47 +1725,64 @@ impl Server {
     /// no longer wired. Idempotent; runs after any connection change and once per
     /// tick.
     ///
-    /// Desired binds are filtered through each app's capability token first, so
-    /// a denied wire never mounts — and a mount whose authorization was revoked
-    /// (token swapped/attenuated) is unmounted on the next pass.
+    /// Desired binds are filtered through each app's capability token first
+    /// (`read` gates the mount existing at all; `write` picks read-only vs
+    /// read-write), so a denied wire never mounts — and a mount whose
+    /// authorization was revoked or changed mode (token swapped/attenuated) is
+    /// unmounted or remounted on the next pass.
     fn sync_mounts(&mut self) {
         let binds = self.graph.connections.clone();
         let desired: Vec<(NodeId, NodeId)> = binds
             .into_iter()
-            .filter(|&(f, a)| self.node_may_use(a, "file", f))
+            .filter(|&(f, a)| self.node_may_use(a, "file", f, "read"))
             .collect();
         let active: HashSet<(NodeId, NodeId)> = self.mounted.keys().copied().collect();
         let plan = wiring::reconcile_links(&desired, &active);
         for pair in plan.remove {
-            if let Some((path, fs)) = self.mounted.remove(&pair) {
+            if let Some((path, fs, _)) = self.mounted.remove(&pair) {
                 crate::vfs::unmount_file(&fs, &path);
             }
         }
         for (file, app) in plan.add {
+            let writable = self.node_may_use(app, "file", file, "write");
             let path = self.mount_path_for(file, app);
             let (Some(f), Some(node)) = (self.graph.file_nodes.get(&file), self.app_node(app))
             else {
                 continue; // a node isn't resolvable yet — retried next reconcile
             };
-            f.mount(&node.fs, &path);
-            self.mounted.insert((file, app), (path, node.fs.clone()));
+            f.mount(&node.fs, &path, writable);
+            self.mounted
+                .insert((file, app), (path, node.fs.clone(), writable));
+        }
+        // A live mount whose write permission flipped remounts in the new mode.
+        let live: Vec<((NodeId, NodeId), bool)> = self
+            .mounted
+            .iter()
+            .map(|(&pair, &(_, _, writable))| (pair, writable))
+            .collect();
+        for ((file, app), was_writable) in live {
+            if self.node_may_use(app, "file", file, "write") != was_writable {
+                self.remount((file, app));
+            }
         }
         // Drop mount-path overrides for binds that no longer exist.
         prune_side_map(&mut self.graph.mount_paths, &self.graph.connections);
     }
 
-    /// Re-apply the live mount for `(volume, app)` at its current effective path
-    /// — used after the mount path or the volume's own source changes. A no-op
-    /// if the bind isn't currently mounted.
+    /// Re-apply the live mount for `(volume, app)` at its current effective
+    /// path and write mode — used after the mount path, the volume's own
+    /// source, or the app's write permission changes. A no-op if the bind
+    /// isn't currently mounted.
     fn remount(&mut self, pair: (NodeId, NodeId)) {
-        let Some((old, fs)) = self.mounted.remove(&pair) else {
+        let Some((old, fs, _)) = self.mounted.remove(&pair) else {
             return;
         };
         crate::vfs::unmount_file(&fs, &old);
+        let writable = self.node_may_use(pair.1, "file", pair.0, "write");
         let at = self.mount_path_for(pair.0, pair.1);
         if let Some(f) = self.graph.file_nodes.get(&pair.0) {
-            f.mount(&fs, &at);
-            self.mounted.insert(pair, (at, fs));
+            f.mount(&fs, &at, writable);
+            self.mounted.insert(pair, (at, fs, writable));
         }
     }
 
@@ -1787,7 +1843,10 @@ impl Server {
         let links = self.graph.midi_links.clone();
         let desired: Vec<(NodeId, NodeId)> = links
             .into_iter()
-            .filter(|&(s, d)| self.node_may_use(s, "midi", d) && self.node_may_use(d, "midi", s))
+            .filter(|&(s, d)| {
+                self.node_may_use(s, "midi", d, "send")
+                    && self.node_may_use(d, "midi", s, "receive")
+            })
             .collect();
         let plan = wiring::reconcile_links(&desired, &self.routed);
         let router = self.host.midi();
@@ -1826,7 +1885,7 @@ impl Server {
         self.graph.iroh_secrets.remove(&id);
         self.graph.veilid_ids.remove(&id);
         self.graph.note_text.remove(&id);
-        self.auth_cache.retain(|&(n, _, _), _| n != id);
+        self.auth_cache.retain(|&(n, _, _, _), _| n != id);
     }
 
     /// Whether the given wire still connects two live nodes.
@@ -2355,7 +2414,7 @@ impl Server {
                         Some(t) => self.graph.node_tokens.insert(id, t),
                         None => self.graph.node_tokens.remove(&id),
                     };
-                    self.auth_cache.retain(|&(n, _, _), _| n != id);
+                    self.auth_cache.retain(|&(n, _, _, _), _| n != id);
                 }
             }
             Undo::Uncreate(id) => {
@@ -2975,12 +3034,13 @@ mod model_tests {
         s.graph.connections.push((vol, app));
         s.graph.net_links.push((app, net));
 
-        // Default token: wired ⇒ usable, unwired ⇒ not.
-        assert!(s.node_may_use(app, "file", vol));
-        assert!(s.node_may_use(app, "net", net));
-        assert!(!s.node_may_use(app, "file", NodeId::new()));
+        // Default token: wired ⇒ usable (every action), unwired ⇒ not.
+        assert!(s.node_may_use(app, "file", vol, "read"));
+        assert!(s.node_may_use(app, "file", vol, "write"));
+        assert!(s.node_may_use(app, "net", net, "use"));
+        assert!(!s.node_may_use(app, "file", NodeId::new(), "read"));
         // Non-app nodes are exempt subjects (always allowed).
-        assert!(s.node_may_use(net, "file", vol));
+        assert!(s.node_may_use(net, "file", vol, "read"));
 
         // Attenuate: same authority, plus a check refusing file use. Swapped in
         // via the command path, the file grant dies and the net grant survives.
@@ -2994,7 +3054,7 @@ mod model_tests {
             .unwrap()
             .append(
                 biscuit_auth::builder::BlockBuilder::new()
-                    .code(r#"check if operation($k, $t), $k != "file";"#)
+                    .code(r#"check if operation($k, $t, $a), $k != "file" || $a == "read";"#)
                     .unwrap(),
             )
             .unwrap()
@@ -3005,13 +3065,14 @@ mod model_tests {
             token: attenuated.clone(),
         });
         assert_eq!(s.graph.node_tokens.get(&app), Some(&attenuated));
-        assert!(!s.node_may_use(app, "file", vol), "file use revoked");
-        assert!(s.node_may_use(app, "net", net), "net use survives");
+        assert!(s.node_may_use(app, "file", vol, "read"), "reads survive");
+        assert!(!s.node_may_use(app, "file", vol, "write"), "writes revoked");
+        assert!(s.node_may_use(app, "net", net, "use"), "net use survives");
 
-        // Undo restores the default token (file use returns).
+        // Undo restores the default token (write use returns).
         s.apply(Command::Undo);
         assert!(!s.graph.node_tokens.contains_key(&app));
-        assert!(s.node_may_use(app, "file", vol));
+        assert!(s.node_may_use(app, "file", vol, "write"));
 
         // A token minted by a different root is refused outright.
         let foreign = biscuit_auth::Biscuit::builder()
@@ -3029,7 +3090,34 @@ mod model_tests {
 
         // Unwiring flips the decision (the memo respects the wire set).
         s.graph.connections.clear();
-        assert!(!s.node_may_use(app, "file", vol), "no longer wired");
+        assert!(!s.node_may_use(app, "file", vol, "read"), "no longer wired");
+
+        // A gateway membership is its own kind: cutting off "gateway" keeps a
+        // plain net working but severs host access.
+        let gw = NodeId::new();
+        s.place(gw, Kind::Gateway, ws, [0.0, 0.0], [80.0, 80.0]);
+        s.graph.net_links.push((app, gw));
+        assert!(s.node_may_use(app, "gateway", gw, "use"));
+        let no_gw =
+            biscuit_auth::UnverifiedBiscuit::from(s.node_auth.as_ref().unwrap().1.as_slice())
+                .unwrap()
+                .append(
+                    biscuit_auth::builder::BlockBuilder::new()
+                        .code(r#"check if operation($k, $t, $a), $k != "gateway";"#)
+                        .unwrap(),
+                )
+                .unwrap()
+                .to_vec()
+                .unwrap();
+        s.apply(Command::SetToken {
+            id: app,
+            token: no_gw,
+        });
+        assert!(
+            !s.node_may_use(app, "gateway", gw, "use"),
+            "host access cut"
+        );
+        assert!(s.node_may_use(app, "net", net, "use"), "plain net survives");
     }
 
     /// Undoing a *moved* one-per-source wire restores the displaced link, not

@@ -16,11 +16,17 @@ pub use biscuit_auth::PublicKey;
 pub use wk_protocol::{Action, ResourceKind};
 
 /// The Datalog policy every node token starts from: a node may use exactly what
-/// it is wired to on the canvas. The server supplies `wired(kind, target)`
-/// facts from the graph at each grant; the rule lives in the *token* so
-/// attenuation can narrow it and a swapped token can replace the logic
-/// wholesale.
-pub const NODE_BASE_RULE: &str = "can_use($kind, $target) <- wired($kind, $target);";
+/// it is wired to on the canvas, in every mode. The server supplies
+/// `wired(kind, target)` facts from the graph and checks one
+/// `operation(kind, target, action)` per grant — kinds are `file`, `midi`,
+/// `port`, `net`, `gateway` (host access — its own kind, so it can be cut off
+/// by matching, since Datalog has no negation), `capture`; actions are
+/// `read`/`write` (file), `send`/`receive` (midi), `read` (capture), and `use`
+/// (the rest). The rule lives in the *token* so attenuation can narrow it —
+/// e.g. read-only: `check if operation($k, $t, $a), $k != "file" || $a ==
+/// "read"` — and a swapped token can replace the logic wholesale.
+pub const NODE_BASE_RULE: &str =
+    "can_use($kind, $target, $action) <- wired($kind, $target), operation($kind, $target, $action);";
 
 /// The token-issuing authority. Holds the root keypair; mints tokens.
 pub struct TokenService {

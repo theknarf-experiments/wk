@@ -171,7 +171,10 @@ fn serve_client(
     let mut attach: Option<Attach> = None;
     while let Some(msg) = read_msg::<_, ClientMsg>(&mut reader)? {
         match msg {
-            ClientMsg::GetSnapshot => send(&writer, &ServerMsg::Snapshot(handle.snapshot()))?,
+            ClientMsg::GetSnapshot => match handle.snapshot() {
+                Ok(snap) => send(&writer, &ServerMsg::Snapshot(snap))?,
+                Err(e) => send(&writer, &ServerMsg::Error(e))?,
+            },
             ClientMsg::Command(cmd) => {
                 handle.send(cmd);
                 send(&writer, &ServerMsg::Ok)?;

@@ -16,7 +16,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use biscuit_auth::PublicKey;
-use wk_protocol::Command;
+use wk_protocol::{Action, Command, ResourceKind};
 
 use crate::auth;
 use crate::server::{Server, View};
@@ -59,18 +59,41 @@ impl ServerHandle {
         let _ = self.cmds.send((self.token.as_ref().clone(), cmd));
     }
 
-    /// A fresh render snapshot of the current server state.
+    /// Whether this connection's token grants `(resource, action)` — the same
+    /// check the command plane applies, here gating *reads*. A server with no
+    /// auth configured (no token service; most tests) allows everything.
+    fn allowed(&self, resource: ResourceKind, action: Action) -> bool {
+        let Some(key) = self.server.lock().unwrap().auth_public_key() else {
+            return true;
+        };
+        auth::authorize(key, &self.token, resource, action)
+    }
+
+    /// A fresh render snapshot of the current server state. Requires the token
+    /// to grant document read; denied, the view is empty (nothing to render).
     pub fn view(&self) -> View {
+        if !self.allowed(ResourceKind::Document, Action::Read) {
+            return View::default();
+        }
         self.server.lock().unwrap().view()
     }
 
     /// A serializable projection of the state, for a remote (CLI) client.
-    pub fn snapshot(&self) -> wk_protocol::ipc::Snapshot {
-        self.server.lock().unwrap().ipc_snapshot()
+    /// Requires the token to grant document read.
+    pub fn snapshot(&self) -> Result<wk_protocol::ipc::Snapshot, String> {
+        if !self.allowed(ResourceKind::Document, Action::Read) {
+            return Err("this connection's token does not grant document read".into());
+        }
+        Ok(self.server.lock().unwrap().ipc_snapshot())
     }
 
-    /// Look up a node's terminal I/O by id (for `attach`), if it's an app node.
+    /// Look up a node's terminal I/O by id (for `attach`/`logs`), if it's an
+    /// app node. Requires the token to grant node read (the stream carries the
+    /// node's output).
     pub fn term_io(&self, id: wk_protocol::NodeId) -> Option<crate::terminal::SharedTermIo> {
+        if !self.allowed(ResourceKind::Node, Action::Read) {
+            return None;
+        }
         self.server
             .lock()
             .unwrap()
@@ -80,7 +103,12 @@ impl ServerHandle {
 
     /// Mark (or clear) a node as externally attached by a CLI client, so the UI
     /// yields its terminal. Returns whether it is a streamable terminal node.
+    /// Attaching requires node update (an attached client injects input);
+    /// releasing is always allowed, so cleanup can't be blocked by a token.
     pub fn set_attached(&self, id: wk_protocol::NodeId, on: bool) -> bool {
+        if on && !self.allowed(ResourceKind::Node, Action::Update) {
+            return false;
+        }
         self.server.lock().unwrap().set_attached(id, on)
     }
 }
@@ -195,4 +223,57 @@ fn serve(
         thread::sleep(STEP);
     }
     server.lock().unwrap().save();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wk_token_service::TokenService;
+
+    /// The read path is token-gated like the command path: a connection with no
+    /// (or an insufficient) token sees nothing — empty view, refused snapshot,
+    /// no terminal I/O, failed attach — while document-read unlocks the reads
+    /// but still not attaching (which injects input, so it needs node update).
+    #[test]
+    fn reads_require_a_token_that_grants_them() {
+        let tokens = TokenService::new();
+        let dir = std::env::temp_dir().join("wk-read-auth-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let runtime = ServerRuntime::spawn(
+            &Document::empty(),
+            dir.join("t.wk"),
+            tokens.public_key(),
+            tokens.mint_node_base().unwrap(),
+        )
+        .expect("spawns");
+
+        // No token: nothing.
+        let bare = runtime.handle();
+        assert!(bare.view().workspaces.is_empty(), "empty view");
+        assert!(bare.snapshot().is_err(), "snapshot refused");
+        assert!(bare.term_io(wk_protocol::NodeId::new()).is_none());
+        assert!(!bare.set_attached(wk_protocol::NodeId::new(), true));
+
+        // Document read: views and snapshots, but attach still needs update.
+        let reader = runtime.handle().with_token(
+            tokens
+                .mint(&[(ResourceKind::Document, Action::Read)])
+                .unwrap(),
+        );
+        assert!(
+            !reader.view().workspaces.is_empty(),
+            "a real view (the document always has one workspace)"
+        );
+        assert!(reader.snapshot().is_ok());
+        assert!(!reader.set_attached(wk_protocol::NodeId::new(), true));
+
+        // Admin: everything (attach on a nonexistent node still returns false,
+        // but for the not-a-terminal reason, not authorization — verified by
+        // the reader/admin split above).
+        let admin = runtime.handle().with_token(tokens.mint_admin().unwrap());
+        assert!(admin.snapshot().is_ok());
+        runtime.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
