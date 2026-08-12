@@ -151,6 +151,60 @@ impl StdoutStream for PipeWriter {
     }
 }
 
+impl PipeReader {
+    /// This end as a stream that *owns* it: dropping the stream drops the
+    /// end, which is how a guest closing its file descriptor reaches the
+    /// pipe's end-of-file bookkeeping.
+    pub fn stream(self) -> OwnedReadEnd {
+        OwnedReadEnd(self)
+    }
+}
+
+impl PipeWriter {
+    /// As [`PipeReader::stream`]: the last one dropped closes the pipe.
+    pub fn stream(self) -> OwnedWriteEnd {
+        OwnedWriteEnd(self)
+    }
+}
+
+/// A reading end held directly as a stream (see [`PipeReader::stream`]).
+pub struct OwnedReadEnd(PipeReader);
+
+#[async_trait]
+impl Pollable for OwnedReadEnd {
+    async fn ready(&mut self) {
+        Readable(self.0 .0.clone()).await
+    }
+}
+
+impl InputStream for OwnedReadEnd {
+    fn read(&mut self, size: usize) -> StreamResult<Bytes> {
+        ReadEnd(self.0 .0.clone()).read(size)
+    }
+}
+
+/// A writing end held directly as a stream (see [`PipeWriter::stream`]).
+pub struct OwnedWriteEnd(PipeWriter);
+
+#[async_trait]
+impl Pollable for OwnedWriteEnd {
+    async fn ready(&mut self) {
+        Writable(self.0 .0.clone()).await
+    }
+}
+
+impl OutputStream for OwnedWriteEnd {
+    fn check_write(&mut self) -> StreamResult<usize> {
+        WriteEnd(self.0 .0.clone()).check_write()
+    }
+    fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
+        WriteEnd(self.0 .0.clone()).write(bytes)
+    }
+    fn flush(&mut self) -> StreamResult<()> {
+        Ok(())
+    }
+}
+
 struct ReadEnd(Pipe);
 
 #[async_trait]

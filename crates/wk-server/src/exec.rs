@@ -43,6 +43,9 @@ wasmtime::component::bindgen!({
     // The two resources are the host types themselves, held in the store's
     // table: a pipe is the shared buffer, a child is the running thread.
     with: {
+        "wasi:io/error": wasmtime_wasi_io::bindings::wasi::io::error,
+        "wasi:io/poll": wasmtime_wasi_io::bindings::wasi::io::poll,
+        "wasi:io/streams": wasmtime_wasi_io::bindings::wasi::io::streams,
         "wk:exec/process.pipe": crate::execpipe::Pipe,
         "wk:exec/process.child": ChildHandle,
     },
@@ -210,6 +213,27 @@ fn program_bytes(state: &HostState, path: &str) -> std::result::Result<(ExecCtx,
 impl wk::exec::process::HostPipe for HostState {
     fn new(&mut self) -> Result<Resource<Pipe>> {
         Ok(self.table().push(Pipe::new())?)
+    }
+
+    fn read_end(
+        &mut self,
+        rep: Resource<Pipe>,
+    ) -> Result<Resource<wasmtime_wasi_io::streams::DynInputStream>> {
+        // The stream owns a counted end, so dropping the stream is what tells
+        // the pipe this reader has gone — the same bookkeeping a child's end
+        // gets, and what a guest closing its fd ends up doing.
+        let end = self.table().get(&rep)?.reader();
+        let stream: wasmtime_wasi_io::streams::DynInputStream = Box::new(end.stream());
+        Ok(self.table().push(stream)?)
+    }
+
+    fn write_end(
+        &mut self,
+        rep: Resource<Pipe>,
+    ) -> Result<Resource<wasmtime_wasi_io::streams::DynOutputStream>> {
+        let end = self.table().get(&rep)?.writer();
+        let stream: wasmtime_wasi_io::streams::DynOutputStream = Box::new(end.stream());
+        Ok(self.table().push(stream)?)
     }
     fn drop(&mut self, rep: Resource<Pipe>) -> Result<()> {
         self.table().delete(rep)?;

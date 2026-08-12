@@ -105,7 +105,30 @@ takes its line and leaves, and `seq` then *fails* writing into a pipe nobody
 reads — a pipeline that stops early, exactly as a shell reports it.
 Unlike POSIX there is no parent copy of the pipe to remember to close: each
 child gets its own counted end, so end-of-file is simply when the last one
-exits. An image build's `RUN` step gets it
+exits.
+
+**Every guest gets a real `pipe()`.** wasi-libc's wasip2 `pipe` is `ENOSYS` —
+the component model had nothing to build one from until wasip3's async streams
+— but wasip2 keeps the descriptor table in *guest* memory, and an entry there
+is a fat pointer: data plus a vtable. `plugins/pipe-compat` puts wk's pipe
+behind one, so `read`, `write`, `close`, `dup`, `poll` and `fstat` on the
+resulting descriptor are libc's own and nothing linking it needs to know a
+pipe is involved. It is the same extension point wasi-libc uses for its own
+stdio. The self-test is an ordinary C program:
+
+```
+pipe() -> fds 3,4
+write = 19
+read = 19: through libc write
+S_ISFIFO = 1 (a pipe, not a file)
+dup(read end) = 5
+at EOF, read = 0 (0 means EOF)
+```
+
+The catch is that the table's layout is private to wasi-libc, so
+`wasilibc_descriptor_table.h` transcribes it from one pinned revision and
+`build.sh` refuses to build against a different wasi-sdk — a moved field would
+corrupt silently rather than fail to link. An image build's `RUN` step gets it
 too — that is what makes `RUN ["/bin/bash.wasm", "-c", "..."]` a shell that can
 run real commands, and it grants nothing extra: the child comes out of, and
 runs against, the same filesystem the step can already write to. `plugins/exec-compat` has a C shim

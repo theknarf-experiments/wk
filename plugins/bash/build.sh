@@ -102,7 +102,7 @@ fi
 # and the wk:exec bindings + shim that let bash run commands.
 mkdir -p "$TTYGEN" "$EXECGEN"
 wit-bindgen c --world terminal "$TTY/wit/tty.wit" --out-dir "$TTYGEN"
-wit-bindgen c --world exec-host "$EXEC/wit/exec.wit" --out-dir "$EXECGEN"
+wit-bindgen c --world exec-host "$EXEC/wit" --out-dir "$EXECGEN"
 
 CFLAGS="--target=wasm32-wasip2 -O2 -DWK_EXEC=1 -I$COMPAT -I$EXEC -I$TTY -I$TTYGEN \
     -DHAVE_TERMIOS_H=1 -DHAVE_TCGETATTR=1 \

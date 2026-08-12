@@ -66,7 +66,10 @@ int wk_run(const char *path, const char *const *argv,
     out->stdout_len = res.stdout.len;
     out->stderr_data = dup_bytes(res.stderr.ptr, res.stderr.len);
     out->stderr_len = res.stderr.len;
-    wk_exec_process_output_free(&res);
+    /* wit-bindgen emits no free for the record itself, only for its lists;
+     * the bytes were copied out above, so release the originals. */
+    exec_host_list_u8_free(&res.stdout);
+    exec_host_list_u8_free(&res.stderr);
     return 0;
 }
 
@@ -181,6 +184,9 @@ int wk_wait(wk_child child, wk_result *out) {
     out->stdout_len = res.stdout.len;
     out->stderr_data = dup_bytes(res.stderr.ptr, res.stderr.len);
     out->stderr_len = res.stderr.len;
-    wk_exec_process_output_free(&res);
+    /* wit-bindgen emits no free for the record itself, only for its lists;
+     * the bytes were copied out above, so release the originals. */
+    exec_host_list_u8_free(&res.stdout);
+    exec_host_list_u8_free(&res.stderr);
     return 0;
 }

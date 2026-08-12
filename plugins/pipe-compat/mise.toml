@@ -1,0 +1,5 @@
+# pipe-compat gives guests a real pipe(); wasi-sdk comes from the root
+# mise.toml [tools] (same as the other C plugins).
+[tasks.build]
+description = "Build the pipe() shim and its self-test"
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build.sh"

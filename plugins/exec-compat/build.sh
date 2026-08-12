@@ -23,7 +23,7 @@ if [ -z "$ADAPTER" ] || [ ! -f "$ADAPTER" ]; then
 fi
 
 # Bindings for wk:exec (must match crates/wk-server/wit-exec/world.wit).
-wit-bindgen c --world exec-host wit/exec.wit --out-dir gen
+wit-bindgen c --world exec-host wit --out-dir gen
 
 "$WASI_SDK/bin/clang" --target=wasm32-wasip1 -O2 -I. -Igen \
     demo.c wkexec.c gen/exec_host.c gen/exec_host_component_type.o \
