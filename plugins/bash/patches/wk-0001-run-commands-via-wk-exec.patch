@@ -1,6 +1,6 @@
 --- a/execute_cmd.c
 +++ b/execute_cmd.c
-@@ -5641,7 +5641,49 @@
+@@ -5641,7 +5641,79 @@
  
        maybe_make_export_env ();
        put_command_name_into_env (command);
@@ -19,29 +19,59 @@
 +    {
 +      char **wkargs;
 +      int wkstat;
++      REDIRECT *wk_undo;
 +      extern int wk_bash_run PARAMS((const char *, char **, const char *));
++
++      /* The shell normally applies redirections in the child, after the fork
++	 — which is precisely what we do not have. Apply them here instead,
++	 undoably, and restore afterwards: the same shape the shell already
++	 uses for builtins and functions in its own no-fork path (see
++	 execute_builtin_or_function). This is what needs dup(); without it
++	 do_redirections cannot save a descriptor to put back. */
++      if (do_redirections (redirects, RX_ACTIVE|RX_UNDOABLE) != 0)
++	{
++	  undo_partial_redirects ();
++	  dispose_exec_redirects ();
++	  result = last_command_exit_value = EX_REDIRFAIL;
++	  goto parent_return;
++	}
++      wk_undo = redirection_undo_list;
++      dispose_exec_redirects ();
++      redirection_undo_list = (REDIRECT *)NULL;
 +
 +      maybe_make_export_env ();
 +      /* argv[0] stays as the user typed it — execve semantics, and what a
 +         multicall binary dispatches on. */
 +      wkargs = strvec_from_word_list (words, 0, 0, (int *)NULL);
++      /* The command's output is written to fd 1/2 with write(), so anything
++	 the shell still holds in stdio has to go out first or it would appear
++	 after it — and would go to the wrong place once we undo below. */
++      fflush (stdout);
++      fflush (stderr);
 +      wkstat = wk_bash_run (command, wkargs, pathname);
 +      /* alloc = 0 above: the vector aliases the word list's own strings, so
 +	 free the vector only — strvec_dispose would free the words too, and
 +	 `pathname` points into them. */
 +      free (wkargs);
++
++      if (wkstat < 0 && command == 0)
++	{
++	  /* Not on PATH. Say so here: falling through would reach fork() and
++	     report its ENOSYS instead, which tells the user nothing about the
++	     actual problem. Reported before the undo so that a redirected
++	     stderr catches it, as it would in the child. */
++	  internal_error (_("%s: command not found"), pathname);
++	  wkstat = EX_NOTFOUND;
++	}
++
++      fflush (stdout);
++      fflush (stderr);
++      if (wk_undo)
++	cleanup_redirects (wk_undo);
++
 +      if (wkstat >= 0)
 +	{
 +	  result = last_command_exit_value = wkstat;
-+	  goto parent_return;
-+	}
-+      if (command == 0)
-+	{
-+	  /* Not on PATH and not in the multicall table. Say so here: falling
-+	     through would reach fork() and report its ENOSYS instead, which
-+	     tells the user nothing about the actual problem. */
-+	  internal_error (_("%s: command not found"), pathname);
-+	  result = last_command_exit_value = EX_NOTFOUND;
 +	  goto parent_return;
 +	}
 +      /* Found on PATH but unrunnable: fall through to bash's own paths. */

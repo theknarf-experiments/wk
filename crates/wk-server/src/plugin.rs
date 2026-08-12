@@ -998,8 +998,19 @@ impl crate::images::BuildRunner for PluginHost {
             term_io: crate::terminal::TermIo::new(),
             capture_src: crate::capture::new_src(),
             capture_seq: 0,
-            // A build step may not spawn programs: RUN stays hermetic.
-            exec: None,
+            // A RUN step may spawn programs from the image it is building.
+            // That is the point of RUN — `RUN ["/bin/bash.wasm", "-c", "mkdir
+            // -p /etc && cp a b"]` is a shell running real commands — and it
+            // grants no authority the step doesn't already have: the child is
+            // read out of the same filesystem and runs against that same
+            // filesystem, which the step can already write to directly. It is
+            // the same reasoning the node-level rule encodes, that running a
+            // program out of your own fs is not escalation.
+            exec: Some(crate::exec::ExecCtx {
+                host: Arc::new(self.clone()),
+                depth: 0,
+                permit: crate::exec::new_permit(true),
+            }),
             midi_in: crate::midi::new_inbox(),
             midi_router: self.midi.clone(),
             // A build step registers no visible entities; a throwaway registry.

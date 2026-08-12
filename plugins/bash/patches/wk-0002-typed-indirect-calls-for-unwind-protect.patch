@@ -1,0 +1,299 @@
+Give bash's unwind-protect cleanups the type they are actually called with.
+
+`Function' is bash's K&R `int ()', so `(*cleanup) (arg)' in unwind_prot.c
+compiles to an indirect call returning int with one argument, whatever was
+registered. On a normal ABI that mismatch is invisible: a surplus argument sits
+unread in a register, and a void function just leaves the return register
+undefined. wasm types its indirect calls and checks them at the call site, so
+this traps with "indirect call type mismatch" — and since every cleanup bash
+registers returns void, nothing ever unwound. In practice `bash -c` died at the
+end of parse_and_execute, on pop_stream.
+
+Calling through the shape the cleanups genuinely have, `void (char *)', fixes
+all but two kinds, which cannot be spelled that way and get a wrapper at each
+registration site: those taking no argument at all, and the two that return int
+(close and restore_signal_mask). `void (int)' needs no wrapper — an int and a
+pointer are both i32 on wasm32, so it already is that type.
+
+--- a/unwind_prot.c
++++ b/unwind_prot.c
+@@ -87,6 +87,23 @@
+ static inline void restore_variable PARAMS((SAVED_VAR *));
+ static void unwind_protect_mem_internal PARAMS((char *, char *));
+ 
++/* The shape every cleanup is actually called with.
++ *
++ * `Function' is bash's K&R `int ()', so `(*cleanup) (arg)' compiles to a call
++ * returning int with one argument no matter what was registered. On a normal
++ * ABI the mismatch is invisible: a surplus argument sits unread in a register
++ * and a void function just leaves the return register undefined. wasm types
++ * its indirect calls and checks them at the call, so calling a `void (char *)'
++ * through an `int ()' pointer traps with "indirect call type mismatch" — and
++ * every cleanup bash registers returns void, so nothing would ever unwind.
++ *
++ * Casting here to the shape the cleanups genuinely have fixes all but two
++ * kinds, which cannot be expressed this way and are wrapped at their
++ * registration sites instead (grep for uw_): those taking no argument, and
++ * the two that return int. Note `void (int)' needs no wrapper — an int and a
++ * pointer are both i32 on wasm32, so it is already this exact type. */
++typedef void sh_uwcleanup_t PARAMS((char *));
++
+ static UNWIND_ELT *unwind_protect_list = (UNWIND_ELT *)NULL;
+ 
+ /* Allocating from a cache of unwind-protect elements */
+@@ -323,7 +340,7 @@
+ 	  if (elt->head.cleanup == (Function *) restore_variable)
+ 	    restore_variable (&elt->sv.v);
+ 	  else
+-	    (*(elt->head.cleanup)) (elt->arg.v);
++	    (*(sh_uwcleanup_t *)(elt->head.cleanup)) (elt->arg.v);
+ 	}
+ 
+       uwpfree (elt);
+--- a/execute_cmd.c
++++ b/execute_cmd.c
+@@ -507,6 +507,37 @@
+       dispose_redirects (redirection_undo_list);
+       redirection_undo_list = (REDIRECT *)NULL;
+     }
++}
++
++/* Cleanups taking no argument at all: same story, a different wasm type. */
++static void
++uw_pop_context (ignore)
++     char *ignore;
++{
++  pop_context ();
++}
++
++static void
++uw_pop_args (ignore)
++     char *ignore;
++{
++  pop_args ();
++}
++
++static void
++uw_merge_temporary_env (ignore)
++     char *ignore;
++{
++  merge_temporary_env ();
++}
++
++/* Ditto for close(), which is registered with the descriptor squeezed into
++   the char * argument slot. */
++static void
++uw_close (fd)
++     char *fd;
++{
++  close ((int)(intptr_t)fd);
+ }
+ 
+ #if defined (JOB_CONTROL)
+@@ -518,6 +549,15 @@
+ {
+   return (sigprocmask (SIG_SETMASK, set, (sigset_t *)NULL));
+ }
++
++/* Cleanups are called as `void (char *)' (see unwind_prot.c). A function that
++   returns a value is a different type to wasm and traps if called directly. */
++static void
++uw_restore_signal_mask (set)
++     char *set;
++{
++  restore_signal_mask ((sigset_t *)set);
++}
+ #endif /* JOB_CONTROL */
+ 
+ #ifdef DEBUG
+@@ -2572,12 +2612,12 @@
+       add_unwind_protect (dispose_fd_bitmap, fd_bitmap);
+       add_unwind_protect (close_fd_bitmap, fd_bitmap);
+       if (prev >= 0)
+-	add_unwind_protect (close, prev);
++	add_unwind_protect (uw_close, prev);
+       dummyfd = fildes[1];
+-      add_unwind_protect (close, dummyfd);
++      add_unwind_protect (uw_close, dummyfd);
+ 
+ #if defined (JOB_CONTROL)
+-      add_unwind_protect (restore_signal_mask, &oset);
++      add_unwind_protect (uw_restore_signal_mask, (char *)&oset);
+ #endif /* JOB_CONTROL */
+ 
+       if (ignore_return && cmd->value.Connection->first)
+@@ -2634,7 +2674,7 @@
+ 	cmd->flags |= CMD_LASTPIPE;
+     }	  
+   if (prev >= 0)
+-    add_unwind_protect (close, prev);
++    add_unwind_protect (uw_close, prev);
+ 
+   exec_result = execute_command_internal (cmd, asynchronous, prev, pipe_out, fds_to_close);
+ 
+@@ -4966,7 +5006,7 @@
+   if (posixly_correct && subshell == 0 && builtin == return_builtin && (flags & CMD_COMMAND_BUILTIN) == 0 && temporary_env)
+     {
+       begin_unwind_frame ("return_temp_env");
+-      add_unwind_protect (merge_temporary_env, (char *)NULL);
++      add_unwind_protect (uw_merge_temporary_env, (char *)NULL);
+     }
+ 
+   executing_builtin++;
+@@ -5091,7 +5131,7 @@
+ 	 local variables may cause the restore of a local declaration of
+ 	 OPTIND to force a getopts state reset. */
+       add_unwind_protect (maybe_restore_getopt_state, gs);
+-      add_unwind_protect (pop_context, (char *)NULL);
++      add_unwind_protect (uw_pop_context, (char *)NULL);
+       unwind_protect_int (line_number);
+       unwind_protect_int (line_number_for_err_trap);
+       unwind_protect_int (function_line_number);
+@@ -5198,7 +5238,7 @@
+     {
+       push_args (words->next);
+       if (subshell == 0)
+-	add_unwind_protect (pop_args, 0);
++	add_unwind_protect (uw_pop_args, 0);
+     }
+ 
+   /* Number of the line on which the function body starts. */
+--- a/builtins/evalstring.c
++++ b/builtins/evalstring.c
+@@ -74,9 +74,32 @@
+ {
+   remember_on_history = enable_history_list;
+ }
++
++/* Cleanups are called as `void (char *)' (see unwind_prot.c); a no-argument
++   function is a different type to wasm and traps if called directly. */
++static void
++uw_set_history_remembering (ignore)
++     char *ignore;
++{
++  set_history_remembering ();
++}
+ #endif
+ 
+ static void
++uw_pop_stream (ignore)
++     char *ignore;
++{
++  pop_stream ();
++}
++
++static void
++uw_parser_restore_alias (ignore)
++     char *ignore;
++{
++  parser_restore_alias ();
++}
++
++static void
+ restore_lastcom (x)
+      char *x;
+ {
+@@ -239,7 +262,7 @@
+ 
+ #if defined (HISTORY)
+   if (parse_and_execute_level == 0)
+-    add_unwind_protect (set_history_remembering, (char *)NULL);
++    add_unwind_protect (uw_set_history_remembering, (char *)NULL);
+   else
+     unwind_protect_int (remember_on_history);	/* can be used in scripts */
+ #  if defined (BANG_HISTORY)
+@@ -259,9 +282,9 @@
+       add_unwind_protect (restore_lastcom, lastcom);
+     }
+ 
+-  add_unwind_protect (pop_stream, (char *)NULL);
++  add_unwind_protect (uw_pop_stream, (char *)NULL);
+   if (parser_expanding_alias ())
+-    add_unwind_protect (parser_restore_alias, (char *)NULL);
++    add_unwind_protect (uw_parser_restore_alias, (char *)NULL);
+ 
+   if (orig_string && ((flags & SEVAL_NOFREE) == 0))
+     add_unwind_protect (xfree, orig_string);
+--- a/builtins/evalfile.c
++++ b/builtins/evalfile.c
+@@ -72,6 +72,15 @@
+ /* How many `levels' of sourced files we have. */
+ int sourcelevel = 0;
+ 
++/* Cleanups are called as `void (char *)' (see unwind_prot.c); a no-argument
++   function is a different type to wasm and traps if called directly. */
++static void
++uw_pop_args (ignore)
++     char *ignore;
++{
++  pop_args ();
++}
++
+ static int
+ _evalfile (filename, flags)
+      const char *filename;
+@@ -260,7 +269,7 @@
+       tt[0] = '1'; tt[1] = '\0';
+       array_push (bash_argc_a, tt);
+       if (flags & FEVAL_UNWINDPROT)
+-	add_unwind_protect (pop_args, 0);
++	add_unwind_protect (uw_pop_args, 0);
+     }
+ #  endif
+ #endif
+--- a/print_cmd.c
++++ b/print_cmd.c
+@@ -1328,7 +1328,16 @@
+   printing_comsub = 0;
+ }
+ 
++/* Cleanups are called as `void (char *)' (see unwind_prot.c); a no-argument
++   function is a different type to wasm and traps if called directly. */
+ static void
++uw_reset_locals (ignore)
++     char *ignore;
++{
++  reset_locals ();
++}
++
++static void
+ print_function_def (func)
+      FUNCTION_DEF *func;
+ {
+@@ -1341,7 +1350,7 @@
+     cprintf ("function %s () \n", func->name->word);
+   else
+     cprintf ("%s () \n", func->name->word);
+-  add_unwind_protect (reset_locals, 0);
++  add_unwind_protect (uw_reset_locals, 0);
+ 
+   indent (indentation);
+   cprintf ("{ \n");
+--- a/subst.c
++++ b/subst.c
+@@ -6778,6 +6778,16 @@
+   close (fd);
+ 
+   return ret;
++}
++
++/* Cleanups are called as `void (char *)' (see unwind_prot.c). close() returns
++   a value, which is a different type to wasm, and the descriptor arrives in
++   the char * argument slot. */
++static void
++uw_close (fd)
++     char *fd;
++{
++  close ((int)(intptr_t)fd);
+ }
+ 
+ static char *
+@@ -7184,7 +7194,7 @@
+ 
+       begin_unwind_frame ("read-comsub");
+       dummyfd = fildes[0];
+-      add_unwind_protect (close, dummyfd);
++      add_unwind_protect (uw_close, dummyfd);
+ 
+       /* Block SIGINT while we're reading from the pipe. If the child
+ 	 process gets a SIGINT, it will either handle it or die, and the

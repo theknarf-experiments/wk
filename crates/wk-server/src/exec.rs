@@ -74,7 +74,7 @@ pub struct ExecCtx {
 
 /// Register `wk:exec` on a linker. A store without an [`ExecCtx`] still links
 /// (the import resolves) but every `run` reports that exec is unavailable —
-/// that is what a build step or a test harness gets.
+/// that is what a request-scoped `wasi:http` handler or a test harness gets.
 pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
     wk::exec::process::add_to_linker::<_, ExecData>(linker, |s| s)
 }

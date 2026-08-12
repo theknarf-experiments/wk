@@ -96,7 +96,10 @@ sharing that filesystem, and returns its exit code and output. The child gets
 the caller's files and nothing else — no surfaces, MIDI, capture, or network —
 so it can reach nothing the caller couldn't, and nesting is depth-bounded.
 It's `exec` without the `fork`, so a caller builds a pipeline by feeding one
-program's stdout into the next one's stdin. `plugins/exec-compat` has a C shim
+program's stdout into the next one's stdin. An image build's `RUN` step gets it
+too — that is what makes `RUN ["/bin/bash.wasm", "-c", "..."]` a shell that can
+run real commands, and it grants nothing extra: the child comes out of, and
+runs against, the same filesystem the step can already write to. `plugins/exec-compat` has a C shim
 (`wk_run()`) and a demo that drives the real GNU coreutils this way, pipeline
 included — and `plugins/bash` uses it for real: a one-hunk patch replaces the
 fork+exec in bash's `execute_disk_command()` with a synchronous run, so
@@ -107,6 +110,8 @@ bash-5.2# ls -1 /
 bin  etc  run
 bash-5.2# mkdir -p /work && echo ok
 ok
+bash-5.2# ls /bin > /tmp/ls.txt && wc -l < /tmp/ls.txt
+92
 bash-5.2# nosuchcommand
 bash: nosuchcommand: command not found     # status 127
 ```
@@ -116,12 +121,18 @@ Command names are ordinary **symlinks** onto the coreutils multicall binary —
 everywhere, since wk's filesystem supports real links (created, followed,
 `readlink`ed, and carried through OCI layers). bash's own PATH search finds
 them and `argv[0]` stays `ls`, which is what coreutils dispatches on.
-Pipelines and command substitution still need `pipe()` and a second process,
-and redirection needs `dup` — bash is built for **wasip2**, where wasi-libc
-owns the descriptor table in guest memory, which is what makes implementing
-those possible at all (under wasip1 the table lives inside the prebuilt
-adapter). `wk images build plugins/bash/Dockerfile --tag wk-shell` packages
-the lot. Like every other capability it is token-gated (kind `exec`, allowed
+**Redirection works** — `>`, `>>`, `2>`, `<`, `exec 9>`, for builtins and for
+exec'd commands alike. It needs `dup`, to save a descriptor and put it back,
+and that is why bash is built for **wasip2**: there the descriptor table lives
+in wasi-libc in guest memory, so wasi-sdk 34 could implement `dup`/`dup2`/
+`F_DUPFD` (under wasip1 the table is inside the prebuilt adapter, out of
+reach). Since the shell has no child to apply redirections in, the patch
+applies them around the `wk:exec` call and undoes them after — the shape bash
+already uses for builtins — and a `< file` stdin is read and handed to the
+child, which takes its input as bytes. Pipelines and command substitution
+still need `pipe()`, which is wasip3-only (it wants the component model's
+async streams), and here-documents need a temp file.
+`wk images build plugins/bash/Dockerfile --tag wk-shell` packages the lot. Like every other capability it is token-gated (kind `exec`, allowed
 by default): `wk token attenuate <node> 'check if operation($k, $t, $a), $k !=
 "exec"'` revokes it within a tick.
 

@@ -9,7 +9,10 @@ cargo.binstall = true
 "cargo:cargo-component" = "0.21.1"       # Rust plugins → wasm components
 "cargo:wit-bindgen-cli" = "0.46.0"       # C bindings for wk's custom host interfaces
 "wasm-tools" = "1.252.0"                  # componentization for C plugins
-"github:WebAssembly/wasi-sdk" = "wasi-sdk-33"  # clang + wasi-sysroot for C plugins
+# An -rc because dup/dup2/dup3/F_DUPFD for wasip2 landed in wasi-libc on
+# 2026-07-17, after wasi-sdk-33 was cut. Without them a guest cannot save and
+# restore a descriptor, so no shell redirection and no bash /dev/tcp.
+"github:WebAssembly/wasi-sdk" = "wasi-sdk-34-rc.2"  # clang + wasi-sysroot for C plugins
 
 [env]
 LIBRARY_PATH = "{{env.LIBRARY_PATH | default(value='')}}:{{exec(command='brew --prefix')}}/lib"

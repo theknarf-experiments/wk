@@ -91,8 +91,11 @@ if [ ! -d "$SRC" ]; then
     curl -fsSL "https://ftp.gnu.org/gnu/bash/$SRC.tar.gz" -o "$SRC.tar.gz"
     tar xzf "$SRC.tar.gz"
     rm -f "$SRC.tar.gz"
-    # Run external commands through wk:exec instead of fork+exec.
-    ( cd "$SRC" && patch -p1 --forward < ../patches/wk-0001-run-commands-via-wk-exec.patch )
+    # Run external commands through wk:exec instead of fork+exec, and give
+    # the unwind-protect cleanups the type wasm insists they be called with.
+    for p in ../patches/wk-*.patch; do
+        ( cd "$SRC" && patch -p1 --forward < "$p" )
+    done
 fi
 
 # The shared termios shim + its wk:tty/control bindings (same as vim's build),
@@ -102,7 +105,7 @@ wit-bindgen c --world terminal "$TTY/wit/tty.wit" --out-dir "$TTYGEN"
 wit-bindgen c --world exec-host "$EXEC/wit/exec.wit" --out-dir "$EXECGEN"
 
 CFLAGS="--target=wasm32-wasip2 -O2 -DWK_EXEC=1 -I$COMPAT -I$EXEC -I$TTY -I$TTYGEN \
-    -DF_DUPFD=0 -DHAVE_TERMIOS_H=1 -DHAVE_TCGETATTR=1 \
+    -DHAVE_TERMIOS_H=1 -DHAVE_TCGETATTR=1 \
     -Wno-implicit-function-declaration -Wno-deprecated-non-prototype \
     -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false \
     -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID"
@@ -123,6 +126,18 @@ LDFLAGS="--target=wasm32-wasip2 $COMPAT/compat.o $COMPAT/termios.o $COMPAT/termi
     -lwasi-emulated-signal -lwasi-emulated-process-clocks -lwasi-emulated-getpid"
 
 cd "$SRC"
+# configure answers questions *about the toolchain*, so its cached answers are
+# only good for the toolchain that produced them. The wasi-sdk 33 -> 34 bump
+# added dup2, and a config.h left over from before it said `#undef HAVE_DUP2`
+# — bash quietly built its own dup2 replacement and every redirection failed
+# with "cannot duplicate fd". Stamp what we configured against and start over
+# when that changes.
+TOOLCHAIN="$("$WASI_SDK/bin/clang" --version | head -1)"
+if [ -f Makefile ] && [ "$(cat .wk-toolchain 2>/dev/null)" != "$TOOLCHAIN" ]; then
+    echo "toolchain changed since configure; reconfiguring bash"
+    env PATH="$BUILD_PATH" make distclean >/dev/null 2>&1 || true
+    rm -f .wk-toolchain
+fi
 if [ ! -f Makefile ]; then
     CC="$WASI_SDK/bin/clang" \
     AR="$WASI_SDK/bin/llvm-ar" \
@@ -134,7 +149,13 @@ if [ ! -f Makefile ]; then
         --disable-nls --without-bash-malloc \
         ac_cv_have_sig_atomic_t=yes bash_cv_signal_vintage=posix \
         ac_cv_func_getcwd=yes bash_cv_getcwd_malloc=yes
+    printf '%s' "$TOOLCHAIN" > .wk-toolchain
 fi
+
+# The shim objects reach the link through LDFLAGS, so make has no idea they are
+# inputs and will happily leave `bash` alone after one of them changes. Drop it
+# and let the link run every time; it is a second.
+rm -f bash
 
 # SIGNAMES_O= : trap.o already carries signal_names (see the header).
 # LIBS without -ldl : no dynamic linker on WASI.

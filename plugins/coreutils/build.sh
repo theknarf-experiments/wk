@@ -31,9 +31,6 @@
 #   * opendirat — a genuine name collision: wasi-libc has a 2-argument
 #     `opendirat` extension, gnulib a 4-argument one. compat/dirent.h renames
 #     wasi-libc's as its header is pulled in.
-#   * F_DUPFD — undefined in WASI, so gnulib defines it as 1, colliding with
-#     WASI's F_GETFD. POSIX's real value is 0; -DF_DUPFD=0 is both correct and
-#     the fix.
 #   * rlimits — wasi-libc ships <sys/resource.h> with its body disabled.
 #     compat supplies it, guarded on RLIMIT_DATA (the sentinel sort.c probes),
 #     and getrlimit returns modest *finite* values: several tools size their
@@ -82,7 +79,7 @@ fi
 
 CFLAGS="--target=wasm32-wasip2 -O2 -I$COMPAT \
     -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false \
-    -DF_DUPFD=0 -DHAVE_GETRLIMIT=1 \
+    -DHAVE_GETRLIMIT=1 \
     -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID"
 
 # The shim is linked in as an object (it defines what wasi-libc leaves out).
@@ -94,6 +91,15 @@ LDFLAGS="$COMPAT/compat.o -lsetjmp \
     -lwasi-emulated-signal -lwasi-emulated-process-clocks -lwasi-emulated-getpid"
 
 cd "$SRC"
+# configure's answers describe the toolchain, so they go stale when it moves:
+# a sysroot that gains a function leaves config.h still saying it is missing,
+# and the tree silently keeps using a replacement. Reconfigure on a change.
+TOOLCHAIN="$("$WASI_SDK/bin/clang" --version | head -1)"
+if [ -f Makefile ] && [ "$(cat .wk-toolchain 2>/dev/null)" != "$TOOLCHAIN" ]; then
+    echo "toolchain changed since configure; reconfiguring coreutils"
+    env PATH="$BUILD_PATH" make distclean >/dev/null 2>&1 || true
+    rm -f .wk-toolchain
+fi
 if [ ! -f Makefile ]; then
     # Cache variables stand in for the runtime probes a cross build can't run,
     # and for the functions compat.c supplies (see the header above).
@@ -117,6 +123,7 @@ if [ ! -f Makefile ]; then
         gl_cv_func_getcwd_null=yes gl_cv_func_getcwd_posix_signature=yes \
         gl_cv_func_getcwd_path_max=yes ac_cv_func_getcwd=yes \
         gl_cv_header_working_stdint_h=yes
+    printf '%s' "$TOOLCHAIN" > .wk-toolchain
 fi
 
 # Two passes. The first (-k, failures expected) generates the headers and
