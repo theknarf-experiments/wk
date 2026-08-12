@@ -170,6 +170,33 @@ one (defaults to `workspace.wk`). Other commands: `list`, `remove <name>`, and
 `publish` (below). `run --headless` loads and runs the workspace with no window,
 keeping the guests alive until Ctrl-C.
 
+## The shell (`wk-base`)
+
+`plugins/wsh` is wk's shell, and the base image other images build on. WASI has
+no fork/exec, so it is **busybox-style**: one wasm binary where the shell *and*
+every "external" command are in-process builtins — coreutils-flavored
+(`ls cat cp mv rm mkdir head tail wc grep sort uniq cut tr seq find xxd ...`),
+plus `curl` (plain HTTP over the fabric via `std::net`) and `wk` (the workspace
+API through a wired Api node). It has pipelines, `> >> <` redirection,
+`&& || ;`, quoting, `$VAR`/`$?`, `test`/`[`, and `-c "script"`.
+
+```
+cd plugins/wsh && mise run build          # -> wsh.wasm (wasm32-wasip2)
+wk images build plugins/wsh/Dockerfile --tag wk-base
+```
+
+Then build on it — the shell doubles as the `RUN` interpreter:
+
+```dockerfile
+FROM wk-base
+RUN ["/bin/wsh.wasm", "-c", "mkdir -p /etc && echo hi > /etc/motd"]
+ENTRYPOINT ["/bin/wsh.wasm"]
+```
+
+Wire the node to an **Api** node and the shell can drive wk from inside the
+sandbox — `wk ps`, `wk snapshot`, `wk send '<json>'` — with exactly the
+authority its capability token grants (`wk token` prints the node's own token).
+
 ## Plugins
 
 Example plugins live under `plugins/`, spanning graphics (GPU via `wasi:webgpu`
