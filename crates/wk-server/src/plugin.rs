@@ -865,6 +865,43 @@ impl PluginHost {
         stdin: Vec<u8>,
         depth: u32,
     ) -> std::result::Result<crate::exec::Output, String> {
+        self.spawn_program(
+            wasm,
+            argv,
+            env,
+            fs,
+            Stdin::Bytes(stdin),
+            Sink::Capture,
+            Sink::Capture,
+            depth,
+        )?
+        .wait()
+    }
+
+    /// Start a program and *don't* wait for it.
+    ///
+    /// This is what a pipeline needs and [`run_program`](Self::run_program)
+    /// cannot give: with `run`, the producer must finish before the consumer
+    /// starts, because the consumer's stdin is the producer's collected
+    /// output. Here both children are live at once and the bytes move through
+    /// a [`Pipe`](crate::execpipe::Pipe) as they are written, so
+    /// `seq 1 100000 | head -1` finishes early and `yes | head` doesn't buffer
+    /// the universe.
+    ///
+    /// The child is impoverished exactly as in `run_program`: the caller's
+    /// filesystem and nothing else.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_program(
+        &self,
+        wasm: &[u8],
+        argv: &[String],
+        env: &[(String, String)],
+        fs: &crate::vfs::SharedFs,
+        stdin: Stdin,
+        stdout: Sink,
+        stderr: Sink,
+        depth: u32,
+    ) -> std::result::Result<Child, String> {
         use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 
         let component = Component::new(&self.engine, wasm)
@@ -873,13 +910,37 @@ impl PluginHost {
             .build_linker()
             .map_err(|e| format!("link program: {e:#}"))?;
 
-        let out = MemoryOutputPipe::new(crate::exec::MAX_OUTPUT);
-        let err = MemoryOutputPipe::new(crate::exec::MAX_OUTPUT);
+        // Only a captured sink has bytes to hand back at `wait`; a piped one
+        // has already delivered them to whoever is reading the other end.
         let mut b = WasiCtxBuilder::new();
-        b.stdin(MemoryInputPipe::new(stdin))
-            .stdout(out.clone())
-            .stderr(err.clone())
-            .args(argv);
+        b.args(argv);
+        match stdin {
+            Stdin::Empty => b.stdin(MemoryInputPipe::new(Vec::new())),
+            Stdin::Bytes(bytes) => b.stdin(MemoryInputPipe::new(bytes)),
+            Stdin::Pipe(r) => b.stdin(r),
+        };
+        let out = match stdout {
+            Sink::Capture => {
+                let p = MemoryOutputPipe::new(crate::exec::MAX_OUTPUT);
+                b.stdout(p.clone());
+                Some(p)
+            }
+            Sink::Pipe(w) => {
+                b.stdout(w);
+                None
+            }
+        };
+        let err = match stderr {
+            Sink::Capture => {
+                let p = MemoryOutputPipe::new(crate::exec::MAX_OUTPUT);
+                b.stderr(p.clone());
+                Some(p)
+            }
+            Sink::Pipe(w) => {
+                b.stderr(w);
+                None
+            }
+        };
         for (k, v) in env {
             b.env(k, v);
         }
@@ -909,11 +970,14 @@ impl PluginHost {
             gpu: Arc::clone(&self.gpu),
         };
         let engine = self.engine.clone();
+        let name = argv[0].clone();
         // The caller is *already* inside a tokio runtime (the guest's own
         // async host call), so the child gets its own thread: nesting
-        // `block_on` in a running runtime panics, and blocking this thread is
-        // exactly the semantics we want — `run` returns when the child exits.
-        let status: std::result::Result<i32, String> = std::thread::Builder::new()
+        // `block_on` in a running runtime panics. Handing back the join handle
+        // rather than joining here is the whole difference between `run` and
+        // `spawn` — and it is why the two ends of a pipe get polled from two
+        // different runtimes, which `execpipe` is built for.
+        let join = std::thread::Builder::new()
             .name("wk-exec-child".into())
             .spawn(move || {
                 let mut store = Store::new(&engine, state);
@@ -942,19 +1006,62 @@ impl PluginHost {
                     }
                 })
             })
-            .map_err(|e| format!("spawn child thread: {e}"))?
+            .map_err(|e| format!("spawn child thread: {e}"))?;
+        Ok(Child {
+            join,
+            out,
+            err,
+            name,
+        })
+    }
+}
+
+/// Where a spawned child's stdin comes from.
+pub enum Stdin {
+    /// Immediate end-of-file.
+    Empty,
+    /// These bytes, then end-of-file.
+    Bytes(Vec<u8>),
+    /// The reading end of a pipe — whatever the other end writes, as it is
+    /// written.
+    Pipe(crate::execpipe::PipeReader),
+}
+
+/// Where a spawned child's stdout or stderr goes.
+pub enum Sink {
+    /// Collected in memory and returned by [`Child::wait`].
+    Capture,
+    /// The writing end of a pipe. Dropped when the child exits, which is what
+    /// gives the reader its end-of-file.
+    Pipe(crate::execpipe::PipeWriter),
+}
+
+/// A running program. Dropping it detaches; [`wait`](Self::wait) collects.
+pub struct Child {
+    join: std::thread::JoinHandle<std::result::Result<i32, String>>,
+    out: Option<wasmtime_wasi::p2::pipe::MemoryOutputPipe>,
+    err: Option<wasmtime_wasi::p2::pipe::MemoryOutputPipe>,
+    name: String,
+}
+
+impl Child {
+    /// Block until it exits, then report its status and any captured output.
+    pub fn wait(self) -> std::result::Result<crate::exec::Output, String> {
+        let status = self
+            .join
             .join()
-            .map_err(|_| "child panicked".to_string())?;
-        // Drop the writers so the pipes can be drained even on a trap.
-        let stdout = out.contents().to_vec();
-        let stderr = err.contents().to_vec();
+            .map_err(|_| format!("{}: child panicked", self.name))?;
+        // Read the captures after the join: the child's writers are gone by
+        // then, so this sees everything it wrote even if it trapped.
+        let stdout = self.out.map(|p| p.contents().to_vec()).unwrap_or_default();
+        let stderr = self.err.map(|p| p.contents().to_vec()).unwrap_or_default();
         match status {
             Ok(exit_code) => Ok(crate::exec::Output {
                 exit_code,
                 stdout,
                 stderr,
             }),
-            Err(e) => Err(format!("{}: {e}", argv[0])),
+            Err(e) => Err(format!("{}: {e}", self.name)),
         }
     }
 }

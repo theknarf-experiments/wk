@@ -95,8 +95,17 @@ reads that program out of the **node's own filesystem**, runs it to completion
 sharing that filesystem, and returns its exit code and output. The child gets
 the caller's files and nothing else — no surfaces, MIDI, capture, or network —
 so it can reach nothing the caller couldn't, and nesting is depth-bounded.
-It's `exec` without the `fork`, so a caller builds a pipeline by feeding one
-program's stdout into the next one's stdin. An image build's `RUN` step gets it
+It's `exec` without the `fork`. `spawn` is the same thing without the waiting:
+it returns a `child` handle, and two children handed the same `pipe` are a
+**real pipeline** — bytes move as they are written, through a bounded buffer,
+and the reader sees end-of-file once the last writer exits. That is what `run`
+cannot express, since with `run` the producer must finish before the consumer
+starts. `plugins/exec-compat/pipedemo.c` is `seq 1 200000 | head -1`: `head`
+takes its line and leaves, and `seq` then *fails* writing into a pipe nobody
+reads — a pipeline that stops early, exactly as a shell reports it.
+Unlike POSIX there is no parent copy of the pipe to remember to close: each
+child gets its own counted end, so end-of-file is simply when the last one
+exits. An image build's `RUN` step gets it
 too — that is what makes `RUN ["/bin/bash.wasm", "-c", "..."]` a shell that can
 run real commands, and it grants nothing extra: the child comes out of, and
 runs against, the same filesystem the step can already write to. `plugins/exec-compat` has a C shim
@@ -129,9 +138,11 @@ in wasi-libc in guest memory, so wasi-sdk 34 could implement `dup`/`dup2`/
 reach). Since the shell has no child to apply redirections in, the patch
 applies them around the `wk:exec` call and undoes them after — the shape bash
 already uses for builtins — and a `< file` stdin is read and handed to the
-child, which takes its input as bytes. Pipelines and command substitution
-still need `pipe()`, which is wasip3-only (it wants the component model's
-async streams), and here-documents need a temp file.
+child, which takes its input as bytes. Pipelines and command substitution are not wired
+into bash yet: `pipe()` is wasip3-only, but that was never the real blocker —
+bash forks per pipeline stage (`dofork = pipe_in != NO_PIPE || ...`), so what
+was missing is two live processes, which `wk:exec`'s `spawn` now provides.
+Here-documents need a temp file.
 `wk images build plugins/bash/Dockerfile --tag wk-shell` packages the lot. Like every other capability it is token-gated (kind `exec`, allowed
 by default): `wk token attenuate <node> 'check if operation($k, $t, $a), $k !=
 "exec"'` revokes it within a tick.

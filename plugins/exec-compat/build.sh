@@ -31,6 +31,14 @@ wit-bindgen c --world exec-host wit/exec.wit --out-dir gen
 wasm-tools component new demo.core.wasm --adapt "wasi_snapshot_preview1=$ADAPTER" -o execdemo.wasm
 rm -f demo.core.wasm
 
+# The pipeline demo: two children live at once on one pipe, which `run` cannot
+# express (see pipedemo.c).
+"$WASI_SDK/bin/clang" --target=wasm32-wasip1 -O2 -I. -Igen \
+    pipedemo.c wkexec.c gen/exec_host.c gen/exec_host_component_type.o \
+    -o pipedemo.core.wasm
+wasm-tools component new pipedemo.core.wasm --adapt "wasi_snapshot_preview1=$ADAPTER" -o pipedemo.wasm
+rm -f pipedemo.core.wasm
+
 # The demo execs coreutils, so the image ships it next door.
 cp ../coreutils/coreutils.wasm coreutils.wasm
 echo "built plugins/exec-compat/execdemo.wasm (build the image with: wk images build plugins/exec-compat/Dockerfile --tag exec-demo)"

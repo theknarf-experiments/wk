@@ -43,6 +43,61 @@ interface process {
         env: list<tuple<string, string>>,
         stdin: list<u8>,
     ) -> result<output, string>;
+
+    /// A byte channel between two programs: a bounded buffer, written at one
+    /// end and read at the other, which reports end-of-file once every writer
+    /// has gone.
+    ///
+    /// This is what `run` cannot express. With `run` the producer must finish
+    /// before the consumer starts, because the consumer's stdin *is* the
+    /// producer's collected output — so `seq 1 100000 | head -1` would run to
+    /// 100000, and `yes | head` would never finish at all. Handing the same
+    /// pipe to two `spawn`s puts both children on it at once and lets the
+    /// bytes move as they are written.
+    resource pipe {
+        constructor();
+    }
+
+    /// A program that is running now. Dropping the handle detaches it.
+    resource child {
+        /// Block until it exits, then report its status and whatever output
+        /// was captured rather than piped elsewhere.
+        wait: func() -> result<output, string>;
+    }
+
+    /// Where a spawned child's standard input comes from.
+    variant stdin-from {
+        /// Nothing at all: it reads end-of-file immediately.
+        empty,
+        /// These bytes, then end-of-file.
+        bytes(list<u8>),
+        /// The pipe's reading end.
+        pipe-end(borrow<pipe>),
+    }
+
+    /// Where a spawned child's standard output or error goes.
+    variant stdout-to {
+        /// Collected, and handed back by `wait`.
+        capture,
+        /// The pipe's writing end. It closes when the child exits, which is
+        /// what gives whoever reads the pipe its end-of-file.
+        pipe-end(borrow<pipe>),
+    }
+
+    /// Start a program and return without waiting for it — `spawn` to `run`'s
+    /// `system`. Resolution of `path` and `argv` is exactly as for `run`.
+    ///
+    /// Two children spawned onto the same pipe are a shell pipeline: the
+    /// shell's own missing piece, since a pipeline stage cannot be run to
+    /// completion before the next one starts.
+    spawn: func(
+        path: string,
+        argv: list<string>,
+        env: list<tuple<string, string>>,
+        stdin: stdin-from,
+        stdout: stdout-to,
+        stderr: stdout-to,
+    ) -> result<child, string>;
 }
 
 /// The host side: wk implements (imports) the process interface for plugins.
