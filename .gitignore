@@ -129,3 +129,7 @@ example/out.mjpeg
 
 # wsh build artifact (the component the Dockerfile COPYs; built by mise run build)
 plugins/wsh/wsh.wasm
+
+# curl (upstream source fetched + built by build.sh; component is derived)
+plugins/curl/curl-*/
+plugins/curl/curl.wasm

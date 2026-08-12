@@ -58,6 +58,9 @@ dependencies {
     wordpress "image://wordpress" {
         description "WordPress (PHP + SQLite), assembled by plugins/wordpress/Dockerfile — build it first with `mise run build`"
     }
+    curl "plugins/curl/curl.wasm" {
+        description "GNU curl 8.11.1, cross-compiled to wasm32-wasip2 (real curl over the fabric)"
+    }
     fetch "plugins/fetch/fetch.wasm" {
         description "TCP client: fetches host port over the fabric"
         args "example.com" "80"
