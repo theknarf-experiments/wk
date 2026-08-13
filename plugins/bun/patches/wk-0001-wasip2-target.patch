@@ -186,6 +186,39 @@ index eb14e27b..6c1292db 100644
                  { return $crate::env_var::__key_opt!($posix); }
                  #[cfg(windows)]
                  { return $crate::env_var::__key_opt!($windows); }
+diff --git a/src/bun_core/lib.rs b/src/bun_core/lib.rs
+index 9d4fe108..9df7c8fb 100644
+--- a/src/bun_core/lib.rs
++++ b/src/bun_core/lib.rs
+@@ -2722,15 +2722,19 @@ pub mod ffi {
+             #[cfg_attr(target_os = "android", link_name = "__errno")]
+             #[cfg_attr(windows, link_name = "_errno")]
+             #[cfg_attr(
+-                all(
+-                    unix,
+-                    not(any(
+-                        target_os = "macos",
+-                        target_os = "ios",
+-                        target_os = "freebsd",
+-                        target_os = "dragonfly",
+-                        target_os = "android"
+-                    ))
++                any(
++                    all(
++                        unix,
++                        not(any(
++                            target_os = "macos",
++                            target_os = "ios",
++                            target_os = "freebsd",
++                            target_os = "dragonfly",
++                            target_os = "android"
++                        ))
++                    ),
++                    // wasi-libc also spells it __errno_location.
++                    target_os = "wasi"
+                 ),
+                 link_name = "__errno_location"
+             )]
 diff --git a/src/bun_core/output.rs b/src/bun_core/output.rs
 index 3274e5c0..36357470 100644
 --- a/src/bun_core/output.rs
@@ -699,6 +732,224 @@ index 43495dae..04df15ce 100644
      );
  
      impl String {
+diff --git a/src/sys/PosixStat.rs b/src/sys/PosixStat.rs
+index ed2c4812..31dc8c41 100644
+--- a/src/sys/PosixStat.rs
++++ b/src/sys/PosixStat.rs
+@@ -82,6 +82,13 @@ pub fn stat_atime(s: &Stat) -> Timespec {
+             nsec: s.st_atime_nsec,
+         }
+     }
++    #[cfg(target_os = "wasi")]
++    {
++        Timespec {
++            sec: s.st_atim.tv_sec,
++            nsec: s.st_atim.tv_nsec as i64,
++        }
++    }
+     #[cfg(windows)]
+     {
+         Timespec {
+@@ -99,6 +106,13 @@ pub fn stat_mtime(s: &Stat) -> Timespec {
+             nsec: s.st_mtime_nsec,
+         }
+     }
++    #[cfg(target_os = "wasi")]
++    {
++        Timespec {
++            sec: s.st_mtim.tv_sec,
++            nsec: s.st_mtim.tv_nsec as i64,
++        }
++    }
+     #[cfg(windows)]
+     {
+         Timespec {
+@@ -116,6 +130,13 @@ pub fn stat_ctime(s: &Stat) -> Timespec {
+             nsec: s.st_ctime_nsec,
+         }
+     }
++    #[cfg(target_os = "wasi")]
++    {
++        Timespec {
++            sec: s.st_ctim.tv_sec,
++            nsec: s.st_ctim.tv_nsec as i64,
++        }
++    }
+     #[cfg(windows)]
+     {
+         Timespec {
+diff --git a/src/sys/copy_file.rs b/src/sys/copy_file.rs
+index bf320925..f4f25210 100644
+--- a/src/sys/copy_file.rs
++++ b/src/sys/copy_file.rs
+@@ -8,7 +8,7 @@ use core::sync::atomic::{AtomicI32, Ordering};
+ use crate::E;
+ #[cfg(not(windows))]
+ use crate::Fd;
+-#[cfg(not(any(target_os = "linux", target_os = "android")))]
++#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "wasi")))]
+ use crate::Tag;
+ 
+ // `declare_scope!` uses the ident as both static name AND tag string, but
+diff --git a/src/sys/fd.rs b/src/sys/fd.rs
+index 4e423c09..3b94faff 100644
+--- a/src/sys/fd.rs
++++ b/src/sys/fd.rs
+@@ -117,6 +117,19 @@ impl FdExt for Fd {
+                     _ => None,
+                 }
+             }
++            #[cfg(target_os = "wasi")]
++            {
++                debug_assert!(self.native() >= 0);
++                match sys::get_errno(sys::safe_libc::close(self.native())) {
++                    sys::E::EBADF => Some(sys::Error {
++                        errno: sys::E::EBADF as _,
++                        syscall: sys::Tag::close,
++                        fd: self,
++                        ..Default::default()
++                    }),
++                    _ => None,
++                }
++            }
+             #[cfg(target_os = "freebsd")]
+             {
+                 debug_assert!(self.native() >= 0);
+diff --git a/src/sys/lib.rs b/src/sys/lib.rs
+index c2e8b817..00bb3d34 100644
+--- a/src/sys/lib.rs
++++ b/src/sys/lib.rs
+@@ -254,8 +254,9 @@ pub mod dir_iterator {
+         }
+     }
+ 
+-    /// `posix.DT.* → Entry.Kind` (Linux/Darwin/FreeBSD share the BSD `DT_*` values).
+-    #[cfg(unix)]
++    /// `posix.DT.* → Entry.Kind` (Linux/Darwin/FreeBSD share the BSD `DT_*`
++    /// values; wasi-libc has its own, and `libc::DT_*` resolves per-target).
++    #[cfg(any(unix, target_os = "wasi"))]
+     #[inline]
+     fn kind_from_dt(dt: u8) -> EntryKind {
+         match dt {
+@@ -277,6 +278,81 @@ pub mod dir_iterator {
+         }
+     }
+ 
++    // ── WASI ─────────────────────────────────────────────────────────────
++    // No getdents; wasi-libc's readdir(3) walks fd_readdir under the hood.
++    // `fdopendir` takes ownership of its fd, so the iterator dup()s the
++    // caller's fd and closes the stream (and with it the dup) on Drop —
++    // `WrappedIterator::dir` stays the caller's to close.
++    #[cfg(target_os = "wasi")]
++    struct State {
++        stream: *mut libc::DIR,
++    }
++    #[cfg(target_os = "wasi")]
++    impl State {
++        #[inline]
++        fn new() -> State {
++            State {
++                stream: core::ptr::null_mut(),
++            }
++        }
++        fn next(&mut self, dir: Fd) -> Result<Option<IteratorResult>> {
++            if self.stream.is_null() {
++                // SAFETY: dup only reads the fd; fdopendir consumes the dup.
++                let duped = unsafe { libc::dup(dir.native()) };
++                if duped < 0 {
++                    return Err(Error::from_code_int(super::last_errno(), Tag::dup));
++                }
++                // SAFETY: `duped` is a fresh owned fd; on failure we close it.
++                let stream = unsafe { libc::fdopendir(duped) };
++                if stream.is_null() {
++                    let e = super::last_errno();
++                    // SAFETY: `duped` is still ours when fdopendir fails.
++                    unsafe { libc::close(duped) };
++                    return Err(Error::from_code_int(e, Tag::open));
++                }
++                self.stream = stream;
++            }
++            loop {
++                // readdir returns null at end-of-stream AND on error; errno
++                // distinguishes. Reset it first (wasi-libc never clears it).
++                // SAFETY: errno_ptr is a valid thread-local for this thread.
++                unsafe { *bun_core::ffi::errno_ptr() = 0 };
++                // SAFETY: `self.stream` is a live DIR from fdopendir.
++                let ent = unsafe { libc::readdir(self.stream) };
++                if ent.is_null() {
++                    let e = super::last_errno();
++                    if e != 0 {
++                        return Err(Error::from_code_int(e, Tag::getdents64));
++                    }
++                    return Ok(None);
++                }
++                // SAFETY: readdir yields a valid entry with NUL-terminated
++                // d_name, alive until the next readdir on this stream — the
++                // documented lifetime of `IteratorResult::name`.
++                let (d_type, name) = unsafe {
++                    let name = core::ffi::CStr::from_ptr((*ent).d_name.as_ptr()).to_bytes();
++                    ((*ent).d_type, name)
++                };
++                if name == b"." || name == b".." {
++                    continue;
++                }
++                return Ok(Some(IteratorResult {
++                    name: Name::borrow(name),
++                    kind: kind_from_dt(d_type),
++                }));
++            }
++        }
++    }
++    #[cfg(target_os = "wasi")]
++    impl Drop for State {
++        fn drop(&mut self) {
++            if !self.stream.is_null() {
++                // SAFETY: closes the DIR and the dup()d fd it owns.
++                unsafe { libc::closedir(self.stream) };
++            }
++        }
++    }
++
+     // ── Linux / Android ──────────────────────────────────────────────────
+     // Same `getdents64(2)` walk for both — Android is the same kernel, and
+     // `linux_syscall::getdents64` is a raw syscall (no libc wrapper involved).
+@@ -1251,7 +1327,8 @@ pub use file::{File, ReadToEndResult};
+ pub mod dir;
+ pub use dir::*;
+ 
+-#[cfg(unix)]
++// wasi-libc provides a POSIX `struct stat` (birthtime-less, like Linux).
++#[cfg(any(unix, target_os = "wasi"))]
+ pub type Stat = libc::stat;
+ /// On Windows `bun.Stat` is libuv's `uv_stat_t`.
+ #[cfg(windows)]
+@@ -1563,7 +1640,7 @@ pub(crate) const MAX_COUNT: usize = u32::MAX as usize;
+ // return value / `errno` — passing a bad fd is `EBADF`, never UB. Declaring
+ // them locally as `safe fn` (instead of routing through the `libc` crate's
+ // `unsafe extern fn` items) drops the per-call-site `unsafe { }` block.
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ mod safe_libc {
+     use core::ffi::c_int;
+     // `close` is a libc symbol std relies on; this is an FFI import (not a
+@@ -1715,7 +1792,7 @@ mod nocancel {
+     }
+ }
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ mod posix_impl {
+     use super::*;
+     // Per-platform raw syscall dispatch — macOS uses `$NOCANCEL`; Linux goes
+@@ -3547,7 +3624,7 @@ mod posix_impl {
+         Err(Error::from_code_int(libc::ENOSYS, Tag::sendfile).with_fd(src))
+     }
+ }
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ pub use posix_impl::*;
+ 
+ // D034: canonical lives in the leaf crate (cached via OnceLock); the per-platform
 diff --git a/src/windows_sys/externs.rs b/src/windows_sys/externs.rs
 index f3996922..dc0a70b7 100644
 --- a/src/windows_sys/externs.rs
