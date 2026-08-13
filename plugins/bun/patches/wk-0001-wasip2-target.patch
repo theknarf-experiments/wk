@@ -1,3 +1,43 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index d6de440e..2de2bcfd 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2177,6 +2177,23 @@ dependencies = [
+ name = "bun_windows_sys"
+ version = "0.0.0"
+ 
++[[package]]
++name = "bun_wk_cli"
++version = "0.0.0"
++dependencies = [
++ "bun_alloc",
++ "bun_ast",
++ "bun_bundler",
++ "bun_core",
++ "bun_dotenv",
++ "bun_errno",
++ "bun_install_types",
++ "bun_js_parser",
++ "bun_options_types",
++ "bun_transpiler",
++ "libc",
++]
++
+ [[package]]
+ name = "bun_wyhash"
+ version = "0.0.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index 3c3f997a..6bac483b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -101,6 +101,7 @@ members = [
+   "src/spawn_sys",
+   "src/bunfig",
+   "src/bun_bin",
++  "src/wk_cli",
+ ]
+ # `vendor/lolhtml` (the `lol_html` crate) is a non-member path dependency,
+ # fetched into `vendor/` by `scripts/build/deps/lolhtml.ts` before cargo runs.
 diff --git a/src/analytics/lib.rs b/src/analytics/lib.rs
 index 07fa5303..c3c5ab72 100644
 --- a/src/analytics/lib.rs
@@ -323,7 +363,7 @@ index eb14e27b..6c1292db 100644
                  #[cfg(windows)]
                  { return $crate::env_var::__key_opt!($windows); }
 diff --git a/src/bun_core/lib.rs b/src/bun_core/lib.rs
-index 9d4fe108..f3bb9c07 100644
+index 9d4fe108..081c2189 100644
 --- a/src/bun_core/lib.rs
 +++ b/src/bun_core/lib.rs
 @@ -2545,13 +2545,13 @@ pub mod ffi {
@@ -342,6 +382,19 @@ index 9d4fe108..f3bb9c07 100644
      unsafe impl Zeroable for libc::timespec {}
      // SAFETY: C POD (integer/array/raw-pointer fields only); all-zero is valid.
      #[cfg(unix)]
+@@ -2575,10 +2575,10 @@ pub mod ffi {
+     #[cfg(unix)]
+     unsafe impl Zeroable for libc::sockaddr_in6 {}
+     // SAFETY: C POD (integer/array/raw-pointer fields only); all-zero is valid.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     unsafe impl Zeroable for libc::sockaddr_storage {}
+     // SAFETY: C POD (integer/array/raw-pointer fields only); all-zero is valid.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     unsafe impl Zeroable for libc::addrinfo {}
+     // SAFETY: C POD (integer/array/raw-pointer fields only); all-zero is valid.
+     #[cfg(any(target_os = "linux", target_os = "android"))]
 @@ -2722,15 +2722,19 @@ pub mod ffi {
              #[cfg_attr(target_os = "android", link_name = "__errno")]
              #[cfg_attr(windows, link_name = "_errno")]
@@ -937,6 +990,67 @@ index a5cb8c89..cf8d1321 100644
          {
              let sig = reason.terminal_signal();
  
+diff --git a/src/dns/lib.rs b/src/dns/lib.rs
+index ff2f42fb..4908c1af 100644
+--- a/src/dns/lib.rs
++++ b/src/dns/lib.rs
+@@ -15,9 +15,25 @@ use bun_wyhash::Wyhash11 as Wyhash;
+ mod sock {
+     // `addrinfo`/`freeaddrinfo` are re-exported from the crate root below;
+     // the rest are crate-internal.
++    #[cfg(not(target_os = "wasi"))]
+     pub(crate) use libc::{
+         AF_INET, AF_INET6, AF_UNIX, IPPROTO_TCP, IPPROTO_UDP, SOCK_DGRAM, SOCK_STREAM, sockaddr_un,
+     };
++    // WASI has no unix sockets; mirror the Windows shim's on-the-wire layout
++    // so `address_to_string` stays cfg-free, with AF_UNIX given an
++    // impossible-family value.
++    #[cfg(target_os = "wasi")]
++    pub(crate) use libc::{
++        AF_INET, AF_INET6, IPPROTO_TCP, IPPROTO_UDP, SOCK_DGRAM, SOCK_STREAM,
++    };
++    #[cfg(target_os = "wasi")]
++    pub(crate) const AF_UNIX: core::ffi::c_int = i32::MAX;
++    #[cfg(target_os = "wasi")]
++    #[repr(C)]
++    pub(crate) struct sockaddr_un {
++        pub sun_family: u16,
++        pub sun_path: [u8; 108],
++    }
+     pub use libc::{addrinfo, freeaddrinfo};
+ }
+ #[cfg(windows)]
+@@ -43,18 +59,27 @@ pub use sock::{addrinfo, freeaddrinfo};
+ 
+ #[cfg(windows)]
+ pub const AI_V4MAPPED: c_int = 2048;
+-#[cfg(not(windows))]
++#[cfg(not(any(windows, target_os = "wasi")))]
+ pub const AI_V4MAPPED: c_int = libc::AI_V4MAPPED;
++/// wasi-libc <netdb.h> value; the libc crate doesn't export it for WASI.
++#[cfg(target_os = "wasi")]
++pub const AI_V4MAPPED: c_int = 0x08;
+ 
+ #[cfg(windows)]
+ pub const AI_ADDRCONFIG: c_int = 1024;
+-#[cfg(not(windows))]
++#[cfg(not(any(windows, target_os = "wasi")))]
+ pub const AI_ADDRCONFIG: c_int = libc::AI_ADDRCONFIG;
++/// wasi-libc <netdb.h> value; the libc crate doesn't export it for WASI.
++#[cfg(target_os = "wasi")]
++pub const AI_ADDRCONFIG: c_int = 0x20;
+ 
+ #[cfg(windows)]
+ pub const AI_ALL: c_int = 256;
+-#[cfg(not(windows))]
++#[cfg(not(any(windows, target_os = "wasi")))]
+ pub const AI_ALL: c_int = libc::AI_ALL;
++/// wasi-libc <netdb.h> value; the libc crate doesn't export it for WASI.
++#[cfg(target_os = "wasi")]
++pub const AI_ALL: c_int = 0x10;
+ 
+ #[derive(Default)]
+ pub struct GetAddrInfo {
 diff --git a/src/errno/lib.rs b/src/errno/lib.rs
 index 09e327f8..436acd53 100644
 --- a/src/errno/lib.rs
@@ -1121,6 +1235,137 @@ index d91f9c8b..d855057b 100644
          let new_handle: VmEventLoopHandle = Some(self.uws_loop);
          #[cfg(windows)]
          let new_handle: VmEventLoopHandle = Some(
+diff --git a/src/http/HTTPThread.rs b/src/http/HTTPThread.rs
+index 09e3273c..c71b38f0 100644
+--- a/src/http/HTTPThread.rs
++++ b/src/http/HTTPThread.rs
+@@ -1372,7 +1372,7 @@ mod _event_loop_draft {
+     impl HttpThread {
+         fn process_events(&mut self) -> ! {
+             let uws_loop = self.uws_loop_mut();
+-            #[cfg(unix)]
++            #[cfg(any(unix, target_os = "wasi"))]
+             {
+                 uws_loop.num_polls = uws_loop.num_polls.max(2);
+             }
+diff --git a/src/http/SendFile.rs b/src/http/SendFile.rs
+index 2c7ed2d2..7e5825ca 100644
+--- a/src/http/SendFile.rs
++++ b/src/http/SendFile.rs
+@@ -125,7 +125,9 @@ impl SendFile {
+             }
+         }
+ 
+-        #[cfg(windows)]
++        // No sendfile(2) on Windows or WASI; the caller's read/write loop
++        // path is taken instead (see the cfg! guard at the top).
++        #[cfg(any(windows, target_os = "wasi"))]
+         {
+             let _ = (socket_fd, adjusted_count);
+         }
+@@ -135,9 +137,9 @@ impl SendFile {
+ }
+ 
+ pub(crate) enum Status {
+-    #[cfg(not(windows))]
++    #[cfg(not(any(windows, target_os = "wasi")))]
+     Done,
+-    #[cfg(not(windows))]
++    #[cfg(not(any(windows, target_os = "wasi")))]
+     Err(crate::Error),
+     Again,
+ }
+diff --git a/src/http/lib.rs b/src/http/lib.rs
+index 57bfb2fc..e3b30257 100644
+--- a/src/http/lib.rs
++++ b/src/http/lib.rs
+@@ -3409,12 +3409,12 @@ impl<'a> HTTPClient<'a> {
+ 
+                         // sendfile.write() takes the raw fd, not the socket handle.
+                         match sendfile.write(socket.fd()) {
+-                            #[cfg(not(windows))]
++                            #[cfg(not(any(windows, target_os = "wasi")))]
+                             crate::send_file::Status::Done => {
+                                 self.state.request_stage = RequestStage::Done;
+                                 return;
+                             }
+-                            #[cfg(not(windows))]
++                            #[cfg(not(any(windows, target_os = "wasi")))]
+                             crate::send_file::Status::Err(err) => {
+                                 self.close_and_fail::<IS_SSL>(err, socket);
+                                 return;
+diff --git a/src/install/PackageInstall.rs b/src/install/PackageInstall.rs
+index 43521627..d1c26be5 100644
+--- a/src/install/PackageInstall.rs
++++ b/src/install/PackageInstall.rs
+@@ -1603,7 +1603,7 @@ impl<'a> PackageInstall<'a> {
+                         break;
+                     }
+                 };
+-                #[cfg(unix)]
++                #[cfg(any(unix, target_os = "wasi"))]
+                 {
+                     match entry.kind {
+                         EntryKind::Directory => {
+@@ -1649,7 +1649,7 @@ impl<'a> PackageInstall<'a> {
+                         _ => {}
+                     }
+                 }
+-                #[cfg(not(unix))]
++                #[cfg(windows)]
+                 {
+                     match entry.kind {
+                         EntryKind::File => {}
+@@ -1796,7 +1796,7 @@ impl<'a> PackageInstall<'a> {
+             #[cfg(not(windows))]
+             let _ = (to_copy_into1_offset, head1);
+             while let Some(entry) = walker.next()? {
+-                #[cfg(unix)]
++                #[cfg(any(unix, target_os = "wasi"))]
+                 {
+                     match entry.kind {
+                         EntryKind::Directory => {
+@@ -1827,7 +1827,7 @@ impl<'a> PackageInstall<'a> {
+                         _ => {}
+                     }
+                 }
+-                #[cfg(not(unix))]
++                #[cfg(windows)]
+                 {
+                     use bun_sys::windows;
+                     match entry.kind {
+diff --git a/src/install/lifecycle_script_runner.rs b/src/install/lifecycle_script_runner.rs
+index fea6db69..2744e99c 100644
+--- a/src/install/lifecycle_script_runner.rs
++++ b/src/install/lifecycle_script_runner.rs
+@@ -611,11 +611,11 @@ impl<'a> LifecycleScriptSubprocess<'a> {
+                 } else if (*manager).options.log_level.is_verbose() || (*this).foreground {
+                     bun_spawn::Stdio::Inherit
+                 } else {
+-                    #[cfg(unix)]
++                    #[cfg(any(unix, target_os = "wasi"))]
+                     {
+                         bun_spawn::Stdio::Buffer
+                     }
+-                    #[cfg(not(unix))]
++                    #[cfg(windows)]
+                     {
+                         // Ownership of this raw heap allocation transfers to
+                         // `spawn_process_windows`, which `heap::take`s it into
+@@ -631,11 +631,11 @@ impl<'a> LifecycleScriptSubprocess<'a> {
+                 } else if (*manager).options.log_level.is_verbose() || (*this).foreground {
+                     bun_spawn::Stdio::Inherit
+                 } else {
+-                    #[cfg(unix)]
++                    #[cfg(any(unix, target_os = "wasi"))]
+                     {
+                         bun_spawn::Stdio::Buffer
+                     }
+-                    #[cfg(not(unix))]
++                    #[cfg(windows)]
+                     {
+                         // Ownership transfers to `spawned.stderr`.
+                         bun_spawn::Stdio::Buffer(bun_core::heap::into_raw(Box::new(
 diff --git a/src/io/ParentDeathWatchdog.rs b/src/io/ParentDeathWatchdog.rs
 index fe05cc8c..68f1fd52 100644
 --- a/src/io/ParentDeathWatchdog.rs
@@ -1474,6 +1719,21 @@ index 4a2dccc2..9c665866 100644
 +pub const UV_EHOSTDOWN: core::ffi::c_int = -4031;
 +#[cfg(target_os = "wasi")]
 +pub const UV_ESOCKTNOSUPPORT: core::ffi::c_int = -4025;
+diff --git a/src/patch/lib.rs b/src/patch/lib.rs
+index 5b076717..43d55b2c 100644
+--- a/src/patch/lib.rs
++++ b/src/patch/lib.rs
+@@ -213,6 +213,10 @@ impl<'a> PatchFile<'a> {
+                     }
+                     let newmode = file_mode_change.new_mode;
+                     let filepath = ZBox::from_vec_with_nul(file_mode_change.path.to_vec());
++                    // WASI has no file modes; patches that only chmod are a
++                    // no-op there.
++                    #[cfg(target_os = "wasi")]
++                    let _ = (newmode, &filepath);
+                     #[cfg(unix)]
+                     {
+                         if let sys::Result::Err(e) =
 diff --git a/src/perf/system_timer.rs b/src/perf/system_timer.rs
 index aa0e9e2a..9f68c504 100644
 --- a/src/perf/system_timer.rs
@@ -1568,6 +1828,23 @@ index b6553c4c..7433ff63 100644
                      let open_req: crate::CrateResult<FD> = {
                          bun_sys::open_dir_absolute_z(
                              sentinel,
+diff --git a/src/s3_signing/credentials.rs b/src/s3_signing/credentials.rs
+index 3996162f..4f3bf815 100644
+--- a/src/s3_signing/credentials.rs
++++ b/src/s3_signing/credentials.rs
+@@ -65,7 +65,12 @@ pub struct MultiPartUploadOptions {
+ impl MultiPartUploadOptions {
+     pub(crate) const ONE_MIB: usize = 1_048_576;
+     /// we limit to 5 GiB
++    #[cfg(target_pointer_width = "64")]
+     pub const MAX_SINGLE_UPLOAD_SIZE: usize = 5120 * Self::ONE_MIB;
++    /// 32-bit targets can't hold a 5 GiB buffer; the address space is the
++    /// effective limit.
++    #[cfg(target_pointer_width = "32")]
++    pub const MAX_SINGLE_UPLOAD_SIZE: usize = usize::MAX;
+     pub const MIN_SINGLE_UPLOAD_SIZE: usize = 5 * Self::ONE_MIB;
+     pub const DEFAULT_PART_SIZE: usize = Self::MIN_SINGLE_UPLOAD_SIZE;
+     /// dont make sense more than this because we use fetch; anything greater will be 64
 diff --git a/src/semver/lib.rs b/src/semver/lib.rs
 index 43495dae..04df15ce 100644
 --- a/src/semver/lib.rs
@@ -1587,11 +1864,231 @@ index 43495dae..04df15ce 100644
      );
  
      impl String {
+diff --git a/src/spawn/lib.rs b/src/spawn/lib.rs
+index 4725121e..498e1b24 100644
+--- a/src/spawn/lib.rs
++++ b/src/spawn/lib.rs
+@@ -115,9 +115,11 @@ link_impl_ProcessExit! {
+ /// `bun_spawn`). Downstream `runtime/api/bun/*` still spells the old path.
+ pub use bun_sys as spawn_sys;
+ 
++#[cfg(any(unix, target_os = "wasi"))]
++pub use process::{PosixSpawnOptions, PosixSpawnResult, PosixStdio as Stdio};
+ #[cfg(unix)]
+-pub use process::{PosixSpawnOptions, PosixSpawnResult, PosixStdio as Stdio, WaitPidResult};
+-#[cfg(unix)]
++pub use process::WaitPidResult;
++#[cfg(any(unix, target_os = "wasi"))]
+ pub type SpawnResult = process::PosixSpawnResult;
+ 
+ #[cfg(windows)]
+diff --git a/src/spawn/process.rs b/src/spawn/process.rs
+index dadd2fbb..0069e873 100644
+--- a/src/spawn/process.rs
++++ b/src/spawn/process.rs
+@@ -1,19 +1,23 @@
+ #[cfg(any(windows, target_os = "macos"))]
+ use core::ffi::c_void;
+-use core::ffi::{c_char, c_int};
++use core::ffi::c_char;
++#[cfg(not(target_os = "wasi"))]
++use core::ffi::c_int;
+ #[cfg(unix)]
+ use core::sync::atomic::AtomicU32;
++#[cfg(not(target_os = "wasi"))]
+ use core::sync::atomic::Ordering;
+ // (std::sync::Arc removed — Process is intrusively ref-counted via
+ // bun_ptr::ThreadSafeRefCount; see SyncWindowsProcess below.)
+ 
+ #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+ use bun_core::Global;
++#[cfg(not(target_os = "wasi"))]
+ use bun_core::Output;
+ use bun_event_loop::EventLoopHandle;
+ #[cfg(unix)]
+ use bun_io::ParentDeathWatchdog;
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ use bun_io::{FilePoll, KeepAlive};
+ #[cfg(windows)]
+ use bun_sys::ReturnCodeExt as _;
+@@ -261,7 +265,8 @@ impl Process {
+     pub fn wait(&mut self, sync_: bool) {
+         #[cfg(unix)]
+         self.wait_posix(sync_);
+-        #[cfg(windows)]
++        // Windows waits via libuv callbacks; WASI never has a child to wait on.
++        #[cfg(not(unix))]
+         let _ = sync_;
+     }
+ 
+@@ -372,6 +377,12 @@ impl Process {
+             return Ok(());
+         }
+ 
++        // Processes never spawn on WASI (spawn_process_posix is ENOSYS), so
++        // there is nothing to watch.
++        #[cfg(target_os = "wasi")]
++        {
++            return Ok(());
++        }
+         #[cfg(unix)]
+         {
+             let ctx = self.event_loop_ctx();
+@@ -627,6 +638,9 @@ impl Process {
+     }
+ 
+     pub fn kill(&mut self, signal: u8) -> Maybe<()> {
++        // No signals and no processes on WASI.
++        #[cfg(target_os = "wasi")]
++        let _ = signal;
+         #[cfg(unix)]
+         {
+             // Detached is a deliberate no-op: spawnSync's `read_all()` runs
+@@ -809,7 +823,7 @@ impl core::fmt::Display for Status {
+     }
+ }
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ pub enum PollerPosix {
+     /// Hive-allocated `bun_io::FilePoll` slot. Pointer (not `Box`) because the
+     /// poll lives in `Store`; freed via `FilePoll::deinit`,
+@@ -819,7 +833,7 @@ pub enum PollerPosix {
+     Detached,
+ }
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ impl PollerPosix {
+     /// NOT `impl Drop`: this enum is reassigned freely (`self.poller =
+     /// Poller::Detached`, `Poller::WaiterThread(..)`, etc.) and `close()`
+@@ -836,6 +850,7 @@ impl PollerPosix {
+         }
+     }
+ 
++    #[cfg(not(target_os = "wasi"))]
+     fn into_fd(self) -> Option<core::ptr::NonNull<FilePoll>> {
+         match self {
+             PollerPosix::Fd(f) => Some(f),
+@@ -879,7 +894,7 @@ impl PollerPosix {
+     }
+ }
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ pub type Poller = PollerPosix;
+ #[cfg(windows)]
+ pub type Poller = PollerWindows;
+@@ -1690,17 +1705,25 @@ impl SpawnResultExt for PosixSpawnResult {
+     }
+ }
+ 
+-#[cfg(unix)]
++#[cfg(target_os = "wasi")]
++impl SpawnResultExt for PosixSpawnResult {
++    fn to_process(self, _event_loop: EventLoopHandle) -> *mut Process {
++        // spawn_process_posix is ENOSYS on WASI; no result exists to convert.
++        unreachable!("no processes on WASI")
++    }
++}
++
++#[cfg(any(unix, target_os = "wasi"))]
+ pub type SpawnOptions = PosixSpawnOptions;
+ #[cfg(windows)]
+ pub type SpawnOptions = WindowsSpawnOptions;
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ pub type Stdio = PosixStdio;
+ #[cfg(windows)]
+ pub type Stdio = WindowsStdio;
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ pub type SpawnProcessResult = PosixSpawnResult;
+ #[cfg(windows)]
+ pub type SpawnProcessResult = WindowsSpawnResult;
+@@ -1709,10 +1732,11 @@ pub type SpawnProcessResult = WindowsSpawnResult;
+ 
+ mod spawn_process_body {
+     use super::*;
++    #[cfg(not(target_os = "wasi"))]
+     use bun_sys::FdExt as _;
+ 
+-    #[cfg(unix)]
+-    pub use bun_spawn_sys::spawn_process_posix;
++    #[cfg(any(unix, target_os = "wasi"))]
++    pub(crate) use bun_spawn_sys::spawn_process_posix;
+ 
+     /// RAII fd owner — closes the wrapped [`Fd`] on drop iff it is valid.
+     /// Used by `sync::spawn_posix` (no-orphans kqueue, ppid pidfd).
+@@ -1754,12 +1778,12 @@ mod spawn_process_body {
+         argv: Argv, // [*:null]?[*:0]const u8
+         envp: Envp,
+     ) -> Result<bun_sys::Result<SpawnProcessResult>, crate::Error> {
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "wasi"))]
+         {
+             // SAFETY: forwarded from this function's safety contract.
+             unsafe { spawn_process_posix(options, argv, envp) }.map_err(Into::into)
+         }
+-        #[cfg(not(unix))]
++        #[cfg(windows)]
+         {
+             spawn_process_windows(options, argv, envp)
+         }
+@@ -2264,6 +2288,7 @@ mod spawn_process_body {
+         }
+ 
+         impl SyncStdio {
++            #[cfg(not(target_os = "wasi"))]
+             pub(crate) fn to_stdio(self) -> SpawnOptionsStdio {
+                 match self {
+                     SyncStdio::Inherit => SpawnOptionsStdio::inherit(),
+@@ -2326,6 +2351,7 @@ mod spawn_process_body {
+         }
+ 
+         impl Options {
++            #[cfg(not(target_os = "wasi"))]
+             pub(crate) fn to_spawn_options(&self, new_process_group: bool) -> SpawnOptions {
+                 SpawnOptions {
+                     stdin: self.stdin.to_stdio(),
+@@ -2793,6 +2819,16 @@ mod spawn_process_body {
+                 return spawn_windows_with_pipes(options, argv, envp);
+             }
+ 
++            // Sync spawn shares spawn_process_posix's fate on WASI: ENOSYS
++            // until wk:exec is wired through.
++            #[cfg(target_os = "wasi")]
++            {
++                let _ = (options, argv, envp);
++                Ok(Err(bun_sys::Error::from_code_int(
++                    bun_sys::E::ENOSYS as i32,
++                    bun_sys::Tag::TODO,
++                )))
++            }
+             #[cfg(unix)]
+             spawn_posix(options, argv, envp)
+         }
+diff --git a/src/spawn_sys/lib.rs b/src/spawn_sys/lib.rs
+index 397ec3a5..26b23436 100644
+--- a/src/spawn_sys/lib.rs
++++ b/src/spawn_sys/lib.rs
+@@ -180,7 +180,7 @@ pub mod pdeathsig {
+ // Public surface — flat re-exports so `bun_spawn` can `pub use bun_spawn_sys::*`.
+ // ──────────────────────────────────────────────────────────────────────────
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ pub use spawn_process::spawn_process_posix;
+ #[cfg(windows)]
+ pub use spawn_process::uv_getrusage;
 diff --git a/src/spawn_sys/spawn_process.rs b/src/spawn_sys/spawn_process.rs
-index 3cd940e2..137d9cb0 100644
+index 3cd940e2..e68ccf19 100644
 --- a/src/spawn_sys/spawn_process.rs
 +++ b/src/spawn_sys/spawn_process.rs
-@@ -14,7 +14,7 @@ use core::sync::atomic::Ordering;
+@@ -14,19 +14,19 @@ use core::sync::atomic::Ordering;
  use bun_core::Output;
  use bun_sys::{self, Fd, FdExt as _};
  
@@ -1600,7 +2097,12 @@ index 3cd940e2..137d9cb0 100644
  use crate::posix_spawn::posix_spawn;
  #[cfg(unix)]
  use posix_spawn::{Actions as PosixSpawnActions, Attr as PosixSpawnAttr};
-@@ -26,7 +26,7 @@ use crate::{Argv, Envp};
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ use crate::{Argv, Envp};
+ 
+ // ──────────────────────────────────────────────────────────────────────────
  // PID / fd width aliases
  // ──────────────────────────────────────────────────────────────────────────
  
@@ -1666,6 +2168,42 @@ index 3cd940e2..137d9cb0 100644
      pub(crate) ipc: Option<Fd>,
      pub extra_pipes: Vec<ExtraPipe>,
      pub memfds: [bool; 3],
+@@ -644,6 +674,21 @@ impl Drop for PosixSpawnFdGuard {
+ /// with at least one non-null element (`argv[0]`); `envp` must point to a
+ /// null-terminated array of NUL-terminated C strings. Both must remain valid
+ /// for the duration of the call.
++/// WASI has no fork/exec/posix_spawn. This fails with ENOSYS until the wk
++/// port routes it through `wk:exec` (the same capability real bash uses to
++/// run commands in a wk node).
++#[cfg(target_os = "wasi")]
++pub unsafe fn spawn_process_posix(
++    _options: &PosixSpawnOptions,
++    _argv: Argv,
++    _envp: Envp,
++) -> crate::Result<bun_sys::Result<PosixSpawnResult>> {
++    Ok(Err(bun_sys::Error::from_code_int(
++        bun_sys::E::ENOSYS as i32,
++        bun_sys::Tag::TODO,
++    )))
++}
++
+ #[cfg(unix)]
+ pub unsafe fn spawn_process_posix(
+     options: &PosixSpawnOptions,
+diff --git a/src/standalone_graph/StandaloneModuleGraph.rs b/src/standalone_graph/StandaloneModuleGraph.rs
+index 20e2851f..36652698 100644
+--- a/src/standalone_graph/StandaloneModuleGraph.rs
++++ b/src/standalone_graph/StandaloneModuleGraph.rs
+@@ -2269,6 +2269,9 @@ impl StandaloneModuleGraph {
+ 
+ /// Allocates a StandaloneModuleGraph in the process-static `INSTANCE`,
+ /// populates it from bytes, sets it globally, and returns the pointer.
++// WASI has no from_executable arm (a wasm module can't read its own binary),
++// so the whole embedded-graph path is dead there.
++#[cfg(any(target_os = "macos", windows, target_os = "linux", target_os = "android", target_os = "freebsd"))]
+ fn from_bytes_alloc(
+     raw_ptr: *mut u8,
+     raw_len: usize,
 diff --git a/src/sys/PosixStat.rs b/src/sys/PosixStat.rs
 index ed2c4812..5ee1bb46 100644
 --- a/src/sys/PosixStat.rs
@@ -1777,7 +2315,7 @@ index 4e423c09..3b94faff 100644
              {
                  debug_assert!(self.native() >= 0);
 diff --git a/src/sys/lib.rs b/src/sys/lib.rs
-index c2e8b817..9ea5093e 100644
+index c2e8b817..5420d96e 100644
 --- a/src/sys/lib.rs
 +++ b/src/sys/lib.rs
 @@ -106,8 +106,11 @@ pub use bun_core::FileKind as EntryKind;
@@ -2337,7 +2875,28 @@ index c2e8b817..9ea5093e 100644
      {
          let _ = path;
          Err(Error::from_code(E::NOSYS, Tag::statfs))
-@@ -6231,9 +6406,21 @@ pub mod RTLD {
+@@ -5105,11 +5280,19 @@ pub mod c {
+     use core::ffi::{c_char, c_void};
+     #[cfg(unix)]
+     pub use libc::fchmod;
++    // wasi-libc declares fchmod (file modes are advisory there); the libc
++    // crate doesn't bind it. Wraps safe_libc's decl (an extern symbol can't
++    // be redeclared with a different `safe`ness) as `unsafe fn` so call
++    // sites share the unix arm's `unsafe {}` shape.
++    #[cfg(target_os = "wasi")]
++    pub unsafe fn fchmod(fd: core::ffi::c_int, mode: libc::mode_t) -> core::ffi::c_int {
++        crate::safe_libc::fchmod(fd, mode)
++    }
+     // `getuid`/`getgid` take no args and read kernel
+     // process state — no preconditions, never fail. Declared locally as
+     // `safe fn` (instead of re-exporting the `libc` crate's raw decls) so
+     // callers need no per-site proof.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     unsafe extern "C" {
+         pub safe fn getuid() -> libc::uid_t;
+         pub safe fn getgid() -> libc::gid_t;
+@@ -6231,9 +6414,21 @@ pub mod RTLD {
      pub const LAZY: i32 = 0x1;
      pub const LOCAL: i32 = 0;
  }
@@ -2359,7 +2918,7 @@ index c2e8b817..9ea5093e 100644
      #[cfg(unix)]
      {
          // SAFETY: filename is NUL-terminated.
-@@ -6271,6 +6458,12 @@ pub fn dlopen(filename: &ZStr, flags: i32) -> Option<*mut c_void> {
+@@ -6271,6 +6466,12 @@ pub fn dlopen(filename: &ZStr, flags: i32) -> Option<*mut c_void> {
  }
  /// `dlsym(handle, name)`.
  pub fn dlsym_impl(handle: Option<*mut c_void>, name: &ZStr) -> Option<*mut c_void> {
@@ -2372,7 +2931,7 @@ index c2e8b817..9ea5093e 100644
      #[cfg(unix)]
      {
          let h = handle.unwrap_or(core::ptr::null_mut());
-@@ -7392,7 +7585,7 @@ fn exists_at_type_nt(dir: Fd, mut path: &[u16]) -> Maybe<ExistsAtType> {
+@@ -7392,7 +7593,7 @@ fn exists_at_type_nt(dir: Fd, mut path: &[u16]) -> Maybe<ExistsAtType> {
  }
  /// `fstatat` then `S_ISDIR`.
  pub fn exists_at_type(dir: Fd, sub: &ZStr) -> Maybe<ExistsAtType> {
@@ -2381,7 +2940,7 @@ index c2e8b817..9ea5093e 100644
      {
          let st = fstatat(dir, sub)?;
          Ok(if S::ISDIR(st.st_mode as _) {
-@@ -7443,7 +7636,7 @@ pub fn directory_exists_at_w(dir: Fd, sub: &[u16]) -> Maybe<bool> {
+@@ -7443,7 +7644,7 @@ pub fn directory_exists_at_w(dir: Fd, sub: &[u16]) -> Maybe<bool> {
  // ── fcntl / nonblocking / dup ──
  
  /// `fcntl(fd, F_GETFL, 0)`.
@@ -2390,7 +2949,7 @@ index c2e8b817..9ea5093e 100644
  pub fn get_fcntl_flags(fd: Fd) -> Maybe<FcntlInt> {
      fcntl(fd, libc::F_GETFL, 0)
  }
-@@ -7457,7 +7650,7 @@ pub fn set_nonblocking(fd: Fd) -> Maybe<()> {
+@@ -7457,7 +7658,7 @@ pub fn set_nonblocking(fd: Fd) -> Maybe<()> {
  }
  /// GETFL → toggle O_NONBLOCK → SETFL (only if changed).
  pub fn update_nonblocking(fd: Fd, nonblocking: bool) -> Maybe<()> {
@@ -2399,7 +2958,7 @@ index c2e8b817..9ea5093e 100644
      {
          let cur = get_fcntl_flags(fd)? as i32;
          let new = if nonblocking {
-@@ -7833,7 +8026,7 @@ pub fn get_fd_path_w(_fd: Fd, _out: &mut [u16]) -> Maybe<&mut [u16]> {
+@@ -7833,7 +8034,7 @@ pub fn get_fd_path_w(_fd: Fd, _out: &mut [u16]) -> Maybe<&mut [u16]> {
  /// SAFETY note: the returned slice borrows the libc `environ` global; do not
  /// mutate the environment concurrently.
  pub fn environ() -> &'static [*const c_char] {
@@ -2408,7 +2967,7 @@ index c2e8b817..9ea5093e 100644
      {
          // SAFETY: `environ` is a process-global NULL-terminated array.
          unsafe {
-@@ -7868,7 +8061,7 @@ pub fn environ() -> &'static [*const c_char] {
+@@ -7868,7 +8069,7 @@ pub fn environ() -> &'static [*const c_char] {
  /// global pointer (already NULL-terminated) rather than a length-bounded
  /// borrowed slice, so it is suitable to pass directly as `envp`.
  pub fn environ_ptr() -> *const *const c_char {
@@ -2417,7 +2976,7 @@ index c2e8b817..9ea5093e 100644
      {
          bun_core::c_environ()
      }
-@@ -7990,6 +8183,8 @@ pub(crate) fn make_path_w(dir: Fd, sub_path: &[u16]) -> Maybe<()> {
+@@ -7990,6 +8191,8 @@ pub(crate) fn make_path_w(dir: Fd, sub_path: &[u16]) -> Maybe<()> {
  // ──────────────────────────────────────────────────────────────────────────
  pub mod posix {
      pub use bun_errno::posix::*;
@@ -2426,7 +2985,7 @@ index c2e8b817..9ea5093e 100644
      use core::ffi::c_int;
      #[cfg(any(
          target_os = "macos",
-@@ -8155,9 +8350,9 @@ pub mod posix {
+@@ -8155,9 +8358,9 @@ pub mod posix {
          pub const INET: c_int = bun_windows_sys::ws2_32::AF_INET;
          #[cfg(windows)]
          pub const INET6: c_int = bun_windows_sys::ws2_32::AF_INET6;
@@ -2438,7 +2997,7 @@ index c2e8b817..9ea5093e 100644
          pub const INET6: c_int = libc::AF_INET6;
      }
  
-@@ -8169,7 +8364,7 @@ pub mod posix {
+@@ -8169,7 +8372,7 @@ pub mod posix {
      pub const INET6_ADDRSTRLEN: usize = 46;
  
      // ── sockaddr family ──
@@ -2447,7 +3006,65 @@ index c2e8b817..9ea5093e 100644
      pub use libc::{sockaddr, sockaddr_in, sockaddr_in6, sockaddr_storage};
      // Route through `bun_libuv_sys` (not `bun_windows_sys::ws2_32`) so types
      // returned by libuv APIs (`uv_interface_address_t`, `uv_udp_*`) are the
-@@ -8337,7 +8532,7 @@ pub mod posix {
+@@ -8189,23 +8392,23 @@ pub mod posix {
+     // ── stat mode-kind tests ──
+     // `libc::S_IF*` is `mode_t` (u32 on Linux, u16 on Darwin/FreeBSD); widen to
+     // `u32` so the `m: u32` (== `bun_core::Mode`) comparison is uniform.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     #[inline]
+     pub const fn s_islnk(m: u32) -> bool {
+         (m & libc::S_IFMT as u32) == libc::S_IFLNK as u32
+     }
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     #[inline]
+     pub const fn s_isdir(m: u32) -> bool {
+         (m & libc::S_IFMT as u32) == libc::S_IFDIR as u32
+     }
+ 
+-    // ── signals ──
++    // ── signals ── (not on WASI: the emulated <signal.h> has no sigaction)
+     #[cfg(unix)]
+     pub use libc::sigaction as Sigaction;
+     #[cfg(unix)]
+     pub use libc::siginfo_t;
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub use libc::sigset_t;
+     /// `sigaction(sig, &act, *oact)`.
+     #[cfg(unix)]
+@@ -8217,9 +8420,9 @@ pub mod posix {
+     }
+ 
+     // ── time ──
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub use libc::timespec;
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub use libc::timeval;
+ 
+     #[cfg(windows)]
+@@ -8231,7 +8434,7 @@ pub mod posix {
+     }
+ 
+     // ── raw I/O (no `Maybe` wrapping) ──
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     #[inline]
+     pub unsafe fn read(fd: c_int, buf: *mut u8, count: usize) -> isize {
+         #[cfg(any(target_os = "linux", target_os = "android"))]
+@@ -8245,7 +8448,7 @@ pub mod posix {
+             unsafe { libc::read(fd, buf.cast(), count) }
+         }
+     }
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     #[inline]
+     pub unsafe fn write(fd: c_int, buf: *const u8, count: usize) -> isize {
+         #[cfg(any(target_os = "linux", target_os = "android"))]
+@@ -8337,7 +8540,7 @@ pub mod posix {
      }
  
      // ── rlimit ──
@@ -2456,7 +3073,7 @@ index c2e8b817..9ea5093e 100644
      #[repr(C)]
      #[derive(Clone, Copy)]
      pub struct Rlimit {
-@@ -8345,9 +8540,9 @@ pub mod posix {
+@@ -8345,9 +8548,9 @@ pub mod posix {
          pub max: u64,
      }
      // SAFETY: two `u64`; all-zero is a valid `Rlimit`.
@@ -2468,7 +3085,7 @@ index c2e8b817..9ea5093e 100644
      #[derive(Clone, Copy)]
      #[repr(i32)]
      pub enum RlimitResource {
-@@ -8355,7 +8550,7 @@ pub mod posix {
+@@ -8355,7 +8558,7 @@ pub mod posix {
          STACK = libc::RLIMIT_STACK as _,
          CORE = libc::RLIMIT_CORE as _,
      }
@@ -2477,7 +3094,7 @@ index c2e8b817..9ea5093e 100644
      pub fn getrlimit(res: RlimitResource) -> core::result::Result<Rlimit, super::Error> {
          let mut r = libc::rlimit {
              rlim_cur: 0,
-@@ -8370,7 +8565,7 @@ pub mod posix {
+@@ -8370,7 +8573,7 @@ pub mod posix {
              max: r.rlim_max as u64,
          })
      }
@@ -2486,7 +3103,7 @@ index c2e8b817..9ea5093e 100644
      pub fn setrlimit(res: RlimitResource, lim: Rlimit) -> core::result::Result<(), super::Error> {
          let r = libc::rlimit {
              rlim_cur: lim.cur as _,
-@@ -8394,7 +8589,7 @@ pub mod net {
+@@ -8394,7 +8597,7 @@ pub mod net {
  
      // POSIX libc has `sockaddr_*` at the crate root; MSVC libc does not. Route
      // both through a private `sock` shim so the body below is target-agnostic.
@@ -2495,7 +3112,7 @@ index c2e8b817..9ea5093e 100644
      mod sock {
          pub(super) use libc::{
              AF_INET, AF_INET6, sockaddr, sockaddr_in, sockaddr_in6, sockaddr_storage,
-@@ -8426,9 +8621,9 @@ pub mod net {
+@@ -8426,9 +8629,9 @@ pub mod net {
      // so struct-update initializers (`..sockaddr_in::ZEROED`)
      // work uniformly on all targets and in `const` context.
      // ──────────────────────────────────────────────────────────────────────
@@ -2507,7 +3124,7 @@ index c2e8b817..9ea5093e 100644
      pub type in_port_t = libc::in_port_t;
      #[cfg(windows)]
      pub type sa_family_t = u16; // ws2def.h: `typedef USHORT ADDRESS_FAMILY;`
-@@ -8439,6 +8634,9 @@ pub mod net {
+@@ -8439,6 +8642,9 @@ pub mod net {
      // the `ZEROED` initializer — Rust accepts outer attributes on struct-
      // expression fields, so a single body suffices on all targets.
      #[repr(C)]
@@ -2517,7 +3134,7 @@ index c2e8b817..9ea5093e 100644
      #[derive(Copy, Clone)]
      pub struct sockaddr_in {
          #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-@@ -8460,6 +8658,7 @@ pub mod net {
+@@ -8460,6 +8666,7 @@ pub mod net {
      }
  
      #[repr(C)]
@@ -2525,7 +3142,7 @@ index c2e8b817..9ea5093e 100644
      #[derive(Copy, Clone)]
      pub struct sockaddr_in6 {
          #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-@@ -8691,7 +8890,7 @@ pub mod elf {
+@@ -8691,7 +8898,7 @@ pub mod elf {
  
      /// Result of [`find_loaded_module`]: the loaded ELF object whose `PT_LOAD`
      /// segment spans a given address.
@@ -2534,7 +3151,7 @@ index c2e8b817..9ea5093e 100644
      pub struct LoadedModule {
          /// `dlpi_addr` — link-map base address (subtract from the lookup address
          /// to get an image-relative offset).
-@@ -8705,7 +8904,7 @@ pub mod elf {
+@@ -8705,7 +8912,7 @@ pub mod elf {
      /// via `dl_iterate_phdr`, returning the one whose `PT_LOAD` segment contains
      /// `address`. Shared by `bun_crash_handler::StackLine::from_address` and
      /// `bun_jsc::btjs::SelfInfo::lookup_module_dl` / `lookup_module_name_dl`.

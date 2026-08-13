@@ -56,4 +56,16 @@ pub const ENABLE_TINYCC: bool = !cfg!(any(
 ));
 `,
 );
-console.log("wrote codegen/{json,xml}_byte_class.{h,rs} + build_options.rs");
+// The *_jsc tier's build.rs artifacts. cppbind scans every .cpp for
+// [[ZIG_EXPORT]]; bundle-modules bundles the JS builtins (TARGET_PLATFORM is
+// a JS-visible `process.platform` string — wasi isn't one, linux is closest);
+// generate-node-errors emits ErrorCode.generated.rs.
+import { $ } from "bun";
+const dir = import.meta.dir;
+await $`bash -c ${"cd " + dir + "/bun && find src packages -name '*.cpp' | grep -vE 'test|Test' > " + dir + "/codegen/cxx-sources.txt"}`;
+await $`bun ${dir}/bun/src/codegen/cppbind.ts src ${dir}/codegen/cpp.rs ${dir}/codegen/cxx-sources.txt`.cwd(dir + "/bun");
+await $`bash -c ${"mkdir -p /tmp/bun-codegen-root"}`;
+await $`env TARGET_PLATFORM=linux TARGET_ARCH=x64 bun ${dir}/bun/src/codegen/bundle-modules.ts --debug=OFF /tmp/bun-codegen-root`.cwd(dir + "/bun");
+await $`bash -c ${"cp -r /tmp/bun-codegen-root/codegen/* " + dir + "/codegen/"}`;
+await $`bun ${dir}/bun/src/codegen/generate-node-errors.ts ${dir}/codegen`.cwd(dir + "/bun");
+console.log("wrote codegen/{json,xml}_byte_class.{h,rs} + build_options.rs + jsc-tier codegen");
