@@ -288,6 +288,20 @@ impl Fs {
     /// Every path in the filesystem (no leading `/`; the root itself omitted)
     /// classified for build-time diffs: layer files vs privately written files
     /// vs directories vs canvas mounts. See `crate::images`'s RUN capture.
+    /// The target of `path` if it is a symbolic link, without following it.
+    ///
+    /// [`snapshot`](Self::snapshot) reports a link as a file, because to a
+    /// build layer it is content either way; a caller that has to *carry* the
+    /// link — copying between build stages, say — needs to tell them apart, or
+    /// `/bin/ls -> coreutils.wasm` becomes another whole copy of coreutils.
+    pub fn read_symlink(&self, path: &str) -> Option<String> {
+        let id = resolve_at(self, ROOT, path.trim_start_matches('/'), false)?;
+        match self.nodes.get(&id) {
+            Some(Node::Symlink(target)) => Some(target.clone()),
+            _ => None,
+        }
+    }
+
     pub fn snapshot(&self) -> BTreeMap<String, PathKind> {
         let mut out = BTreeMap::new();
         fn walk(fs: &Fs, dir: u64, prefix: &str, out: &mut BTreeMap<String, PathKind>) {

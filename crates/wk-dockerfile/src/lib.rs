@@ -17,10 +17,22 @@ use chumsky::prelude::*;
 /// One parsed instruction.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Instr {
-    /// `FROM <image>` — the base image (`scratch` = empty rootfs).
-    From { image: String },
-    /// `COPY <src>... <dest>` — sources are build-context paths only.
-    Copy { srcs: Vec<String>, dest: String },
+    /// `FROM <image> [AS <name>]` — starts a build stage (`scratch` = empty
+    /// rootfs). A Dockerfile may have several; the last one is the image that
+    /// gets built, and the earlier ones exist to be copied out of.
+    From {
+        image: String,
+        /// The `AS <name>` label, if any. Earlier stages can also be referred
+        /// to by their index.
+        alias: Option<String>,
+    },
+    /// `COPY [--from=<stage>] <src>... <dest>` — sources are build-context
+    /// paths, or paths in an earlier stage when `from` is set.
+    Copy {
+        srcs: Vec<String>,
+        dest: String,
+        from: Option<String>,
+    },
     /// `ADD <src>... <dest>` — like COPY, but a source may be an http(s):// URL
     /// (fetched at build time) and archive sources are auto-extracted.
     Add { srcs: Vec<String>, dest: String },
@@ -48,13 +60,49 @@ pub struct Dockerfile {
     pub instructions: Vec<Instr>,
 }
 
+/// One build stage: a `FROM` and everything up to the next one.
+pub struct Stage<'a> {
+    pub image: &'a str,
+    pub alias: Option<&'a str>,
+    pub instructions: &'a [Instr],
+}
+
 impl Dockerfile {
-    /// The base image of the (single) `FROM`.
+    /// The base image of the first `FROM`.
     pub fn from_image(&self) -> Option<&str> {
         self.instructions.iter().find_map(|i| match i {
-            Instr::From { image } => Some(image.as_str()),
+            Instr::From { image, .. } => Some(image.as_str()),
             _ => None,
         })
+    }
+
+    /// The stages, in order. The last one is the image that gets built.
+    pub fn stages(&self) -> Vec<Stage<'_>> {
+        let starts: Vec<usize> = self
+            .instructions
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| matches!(i, Instr::From { .. }))
+            .map(|(n, _)| n)
+            .collect();
+        starts
+            .iter()
+            .enumerate()
+            .map(|(k, &start)| {
+                let end = starts
+                    .get(k + 1)
+                    .copied()
+                    .unwrap_or(self.instructions.len());
+                let Instr::From { image, alias } = &self.instructions[start] else {
+                    unreachable!("stage starts at a FROM")
+                };
+                Stage {
+                    image: image.as_str(),
+                    alias: alias.as_deref(),
+                    instructions: &self.instructions[start + 1..end],
+                }
+            })
+            .collect()
     }
 }
 
@@ -186,7 +234,7 @@ fn kv_pairs<'a>() -> impl Parser<'a, &'a str, Vec<(String, String)>, Extra<'a>> 
 }
 
 /// COPY/ADD arguments: `--flag[=v]`* then source... dest. Returns (flags, words).
-type CopyArgs = (Vec<String>, Vec<String>);
+type CopyArgs = (Vec<(String, Option<String>)>, Vec<String>);
 fn copy_args<'a>() -> impl Parser<'a, &'a str, CopyArgs, Extra<'a>> {
     let ws = text::inline_whitespace();
     let flag = just("--")
@@ -197,7 +245,7 @@ fn copy_args<'a>() -> impl Parser<'a, &'a str, CopyArgs, Extra<'a>> {
                 .at_least(1)
                 .collect::<String>(),
         )
-        .then_ignore(just('=').ignore_then(word()).or_not());
+        .then(just('=').ignore_then(word()).or_not());
     flag.padded_by(ws)
         .repeated()
         .collect::<Vec<_>>()
@@ -232,18 +280,29 @@ pub fn parse(source: &str) -> Result<Dockerfile, String> {
         let kw = kw_raw.to_ascii_uppercase();
         let instr = match kw.as_str() {
             "FROM" => {
-                if seen_from {
-                    return Err(format!(
-                        "Dockerfile line {line_no}: multi-stage builds are not supported"
-                    ));
-                }
                 seen_from = true;
-                let image = rest.split_whitespace().next().unwrap_or_default();
+                let mut words = rest.split_whitespace();
+                let image = words.next().unwrap_or_default();
                 if image.is_empty() {
                     return Err(format!("Dockerfile line {line_no}: FROM needs an image"));
                 }
+                // `FROM <image> AS <name>`; anything else after the image is a
+                // mistake worth reporting rather than ignoring.
+                let alias = match (words.next(), words.next(), words.next()) {
+                    (None, _, _) => None,
+                    (Some(kw), Some(name), None) if kw.eq_ignore_ascii_case("AS") => {
+                        Some(name.to_string())
+                    }
+                    _ => {
+                        return Err(format!(
+                            "Dockerfile line {line_no}: FROM takes an image and an optional \
+                             `AS <name>`"
+                        ))
+                    }
+                };
                 Instr::From {
                     image: image.to_string(),
+                    alias,
                 }
             }
             "COPY" | "ADD" => {
@@ -251,10 +310,20 @@ pub fn parse(source: &str) -> Result<Dockerfile, String> {
                     .parse(rest)
                     .into_result()
                     .map_err(|e| arg_err(line_no, &kw, e))?;
-                for f in &flags {
-                    match f.as_str() {
+                let mut from = None;
+                for (name, value) in &flags {
+                    match name.as_str() {
                         // No uid/gid or permission bits in the vfs; harmless.
                         "chown" | "chmod" | "link" => {}
+                        "from" => {
+                            let Some(v) = value.clone().filter(|v| !v.is_empty()) else {
+                                return Err(format!(
+                                    "Dockerfile line {line_no}: {kw} --from needs a stage \
+                                     name or index"
+                                ));
+                            };
+                            from = Some(v);
+                        }
                         other => {
                             return Err(format!(
                                 "Dockerfile line {line_no}: {kw} --{other} is not supported"
@@ -264,9 +333,18 @@ pub fn parse(source: &str) -> Result<Dockerfile, String> {
                 }
                 let dest = w.pop().expect("at_least(2) guarantees a destination");
                 if kw == "ADD" {
+                    if from.is_some() {
+                        return Err(format!(
+                            "Dockerfile line {line_no}: ADD --from is not supported (use COPY)"
+                        ));
+                    }
                     Instr::Add { srcs: w, dest }
                 } else {
-                    Instr::Copy { srcs: w, dest }
+                    Instr::Copy {
+                        srcs: w,
+                        dest,
+                        from,
+                    }
                 }
             }
             "ENTRYPOINT" | "CMD" => {
@@ -315,6 +393,13 @@ pub fn parse(source: &str) -> Result<Dockerfile, String> {
                 ))
             }
         };
+        // Everything belongs to a stage, and a stage starts at its FROM: an
+        // instruction before the first one would simply be dropped, so say so.
+        if !seen_from && !matches!(instr, Instr::From { .. }) {
+            return Err(format!(
+                "Dockerfile line {line_no}: {kw_raw} before the first FROM"
+            ));
+        }
         instructions.push(instr);
     }
     Ok(Dockerfile { instructions })
@@ -341,15 +426,18 @@ CMD ["-u", "NONE"]
             df.instructions,
             vec![
                 Instr::From {
-                    image: "scratch".into()
+                    image: "scratch".into(),
+                    alias: None
                 },
                 Instr::Copy {
                     srcs: vec!["vim.wasm".into()],
-                    dest: "/vim.wasm".into()
+                    dest: "/vim.wasm".into(),
+                    from: None
                 },
                 Instr::Copy {
                     srcs: vec!["vim-src/runtime".into()],
-                    dest: "/usr/share/vim/runtime".into()
+                    dest: "/usr/share/vim/runtime".into(),
+                    from: None
                 },
                 Instr::Env(vec![("VIMRUNTIME".into(), "/usr/share/vim/runtime".into())]),
                 Instr::Entrypoint(vec!["/vim.wasm".into()]),
@@ -366,7 +454,8 @@ CMD ["-u", "NONE"]
             df.instructions[1],
             Instr::Copy {
                 srcs: vec!["a.txt".into(), "b.txt".into()],
-                dest: "/dir/".into()
+                dest: "/dir/".into(),
+                from: None
             }
         );
     }
@@ -415,11 +504,21 @@ CMD ["-u", "NONE"]
             df.instructions[1],
             Instr::Copy {
                 srcs: vec!["a".into(), "b".into()],
-                dest: "/d".into()
+                dest: "/d".into(),
+                from: None
             }
         );
-        let err = parse("FROM scratch\nCOPY --from=builder /x /y\n").unwrap_err();
-        assert!(err.contains("--from"), "unsupported flag named: {err}");
+        let df = parse("FROM scratch AS b\nFROM scratch\nCOPY --from=b /x /y\n").unwrap();
+        assert_eq!(
+            df.instructions.last().unwrap(),
+            &Instr::Copy {
+                srcs: vec!["/x".into()],
+                dest: "/y".into(),
+                from: Some("b".into())
+            }
+        );
+        let err = parse("FROM scratch\nADD --from=b /x /y\n").unwrap_err();
+        assert!(err.contains("ADD --from"), "err was: {err}");
     }
 
     #[test]
@@ -439,9 +538,35 @@ CMD ["-u", "NONE"]
     }
 
     #[test]
-    fn multi_stage_is_rejected() {
-        let err = parse("FROM scratch\nFROM other AS b\n").unwrap_err();
-        assert!(err.contains("multi-stage"), "err was: {err}");
+    fn multi_stage_splits_into_stages() {
+        let df = parse(
+            "FROM scratch AS build\n\
+             COPY a.wasm /a.wasm\n\
+             FROM scratch\n\
+             COPY --from=build /a.wasm /bin/a.wasm\n\
+             ENTRYPOINT [\"/bin/a.wasm\"]\n",
+        )
+        .unwrap();
+        let stages = df.stages();
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].alias, Some("build"));
+        assert_eq!(stages[0].instructions.len(), 1, "COPY belongs to stage 0");
+        // The last stage is the one that gets built.
+        assert_eq!(stages[1].alias, None);
+        assert_eq!(stages[1].instructions.len(), 2);
+    }
+
+    /// `FROM x AS` and stray words are mistakes, not silently ignored.
+    #[test]
+    fn instructions_before_from_are_rejected() {
+        let err = parse("COPY a b\nFROM scratch\n").unwrap_err();
+        assert!(err.contains("before the first FROM"), "err was: {err}");
+    }
+
+    #[test]
+    fn from_rejects_a_malformed_alias() {
+        assert!(parse("FROM scratch AS\n").unwrap_err().contains("AS"));
+        assert!(parse("FROM scratch junk\n").unwrap_err().contains("AS"));
     }
 
     #[test]

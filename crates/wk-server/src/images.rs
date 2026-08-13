@@ -751,6 +751,94 @@ fn diff_layer(
 /// [`build`], with a runner for `RUN` instructions. The rootfs is materialized
 /// live as layers apply, so each RUN sees the filesystem built so far and its
 /// writes are captured (via [`diff_layer`]) as the next layer.
+/// Find the stage a `COPY --from=<name>` refers to: an `AS` name, or an index.
+fn resolve_stage<'a>(
+    finished: &'a [(Option<String>, crate::vfs::SharedFs)],
+    name: &str,
+) -> Option<&'a crate::vfs::SharedFs> {
+    finished
+        .iter()
+        .find(|(n, _)| n.as_deref() == Some(name))
+        .map(|(_, fs)| fs)
+}
+
+/// Build a layer from the files an earlier stage produced.
+///
+/// The same shape as copying from the build context, but the source is another
+/// stage's filesystem: a directory source brings its contents along, and a
+/// symlink is carried across as a symlink rather than as a copy of whatever it
+/// pointed at.
+fn copy_from_stage(
+    src_fs: &crate::vfs::SharedFs,
+    workdir: &str,
+    srcs: &[String],
+    dest: &str,
+) -> Result<Vec<u8>, String> {
+    use wk_vfs::PathKind;
+
+    let mut b = tar::Builder::new(Vec::new());
+    let dest_base = dest_path(workdir, dest);
+    let dir_dest = srcs.len() > 1 || dest.ends_with('/');
+    let fs = src_fs.lock().unwrap();
+    let snapshot = fs.snapshot();
+
+    for src in srcs {
+        let from = src.trim_start_matches('/').to_string();
+        // Exactly the source, or everything beneath it if it is a directory.
+        let under = format!("{from}/");
+        let mut matched = false;
+        for (path, kind) in &snapshot {
+            let rest = if *path == from {
+                ""
+            } else if let Some(r) = path.strip_prefix(&under) {
+                r
+            } else {
+                continue;
+            };
+            matched = true;
+            // Copying a directory copies its *contents* into the destination,
+            // as `docker build` does — so entries under the source keep only
+            // their path relative to it. A file source lands at the
+            // destination itself, or under it when the destination is a
+            // directory.
+            let leaf = if !rest.is_empty() {
+                rest.to_string()
+            } else if *kind != PathKind::Dir && dir_dest {
+                from.rsplit('/').next().unwrap_or(&from).to_string()
+            } else {
+                String::new()
+            };
+            let target = if leaf.is_empty() {
+                dest_base.clone()
+            } else if dest_base.is_empty() {
+                leaf
+            } else {
+                format!("{}/{leaf}", dest_base.trim_end_matches('/'))
+            };
+            if target.is_empty() {
+                // Copying a directory to `/`: the destination root is already
+                // there, and an empty path is not a tar entry.
+                continue;
+            }
+            if *kind == PathKind::Dir {
+                tar_dir_entry(&mut b, &target)?;
+            } else if let Some(to) = fs.read_symlink(path) {
+                // Carried across as a link, not as a copy of what it points at.
+                tar_symlink(&mut b, &target, Path::new(&to))?;
+            } else {
+                let data = fs
+                    .read_file(path, usize::MAX)
+                    .ok_or_else(|| format!("COPY --from: cannot read {path:?}"))?;
+                tar_file(&mut b, &target, &data)?;
+            }
+        }
+        if !matched {
+            return Err(format!("COPY --from: {src:?} is not in that stage"));
+        }
+    }
+    b.into_inner().map_err(|e| format!("build layer: {e}"))
+}
+
 pub fn build_with_runner(
     dockerfile_path: &Path,
     runner: Option<&dyn BuildRunner>,
@@ -765,6 +853,14 @@ pub fn build_with_runner(
         .to_path_buf();
     let df = dockerfile::parse(&source)?;
 
+    // Each `FROM` starts a stage. The last one is the image that gets built;
+    // the earlier ones exist to be copied out of, so their filesystems are kept
+    // until the whole build is done rather than thrown away at the next FROM.
+    let df_stages = df.stages();
+    if df_stages.is_empty() {
+        return Err("Dockerfile has no FROM".into());
+    }
+    let mut finished: Vec<(Option<String>, crate::vfs::SharedFs)> = Vec::new();
     let mut manifest = ImageManifest {
         layers: Vec::new(),
         entrypoint: Vec::new(),
@@ -773,99 +869,143 @@ pub fn build_with_runner(
         workdir: None,
         labels: BTreeMap::new(),
     };
-    let mut workdir = "/".to_string();
-    // The rootfs built so far, kept live for RUN steps and the final
-    // entrypoint extraction.
-    let rootfs = crate::vfs::new_fs();
-    let apply_tar = |manifest: &mut ImageManifest, tar: &[u8]| -> Result<(), String> {
-        let digest = put_layer(tar)?;
-        crate::layers::apply(&rootfs, &crate::layers::from_tar_bytes(tar)?, "");
-        manifest.layers.push(digest);
-        Ok(())
-    };
-    for instr in &df.instructions {
-        match instr {
-            Instr::From { image } => {
-                if image != "scratch" {
-                    // A non-scratch base must already be in the local store
-                    // (built earlier, or pulled). Resolve it the same way the CLI
-                    // does — by tag, full id, or id-prefix — so `FROM wk-base`
-                    // finds a locally-built+tagged image, not just a pulled ref.
-                    // Its layers stack under ours; its config is inherited.
-                    let base = resolve_ref(image)
-                        .and_then(|id| load_image(&id))
-                        .ok_or_else(|| {
-                            format!(
-                                "base image {image:?} is not in the local store \
+    let mut rootfs = crate::vfs::new_fs();
+
+    for (stage_no, stage) in df_stages.iter().enumerate() {
+        manifest = ImageManifest {
+            layers: Vec::new(),
+            entrypoint: Vec::new(),
+            cmd: Vec::new(),
+            env: Vec::new(),
+            workdir: None,
+            labels: BTreeMap::new(),
+        };
+        let mut workdir = "/".to_string();
+        // The rootfs built so far, kept live for RUN steps and the final
+        // entrypoint extraction.
+        rootfs = crate::vfs::new_fs();
+        let apply_tar = |manifest: &mut ImageManifest, tar: &[u8]| -> Result<(), String> {
+            let digest = put_layer(tar)?;
+            crate::layers::apply(&rootfs, &crate::layers::from_tar_bytes(tar)?, "");
+            manifest.layers.push(digest);
+            Ok(())
+        };
+        // The stage's own FROM, then its instructions.
+        let stage_instrs: Vec<Instr> = std::iter::once(Instr::From {
+            image: stage.image.to_string(),
+            alias: None,
+        })
+        .chain(stage.instructions.iter().cloned())
+        .collect();
+        for instr in &stage_instrs {
+            match instr {
+                Instr::From { image, .. } => {
+                    if image != "scratch" {
+                        // A non-scratch base must already be in the local store
+                        // (built earlier, or pulled). Resolve it the same way the CLI
+                        // does — by tag, full id, or id-prefix — so `FROM wk-base`
+                        // finds a locally-built+tagged image, not just a pulled ref.
+                        // Its layers stack under ours; its config is inherited.
+                        let base = resolve_ref(image)
+                            .and_then(|id| load_image(&id))
+                            .ok_or_else(|| {
+                                format!(
+                                    "base image {image:?} is not in the local store \
                                  (FROM scratch, or pull/build+tag it first)"
+                                )
+                            })?;
+                        for digest in &base.layers {
+                            let bytes = std::fs::read(layer_path(digest))
+                                .map_err(|e| format!("read layer {digest}: {e}"))?;
+                            crate::layers::apply(
+                                &rootfs,
+                                &crate::layers::from_tar_bytes(&bytes)?,
+                                "",
+                            );
+                        }
+                        manifest.layers.extend(base.layers);
+                        manifest.env.extend(base.env);
+                        manifest.entrypoint = base.entrypoint;
+                        manifest.cmd = base.cmd;
+                        manifest.labels.extend(base.labels);
+                        // Inherit the base's working directory so later COPY/ADD dests
+                        // resolve under it (until a WORKDIR overrides).
+                        if let Some(wd) = base.workdir {
+                            workdir = wd.clone();
+                            manifest.workdir = Some(wd);
+                        }
+                    }
+                }
+                Instr::Copy { srcs, dest, from } => {
+                    let tar = match from {
+                        // Out of an earlier stage's filesystem rather than the
+                        // build context — the point of a multi-stage build.
+                        Some(name) => {
+                            let src_fs = resolve_stage(&finished, name).ok_or_else(|| {
+                            format!(
+                                "COPY --from={name}: no such earlier stage                                  (name it with `FROM ... AS {name}`, or use its index)"
                             )
                         })?;
-                    for digest in &base.layers {
-                        let bytes = std::fs::read(layer_path(digest))
-                            .map_err(|e| format!("read layer {digest}: {e}"))?;
-                        crate::layers::apply(&rootfs, &crate::layers::from_tar_bytes(&bytes)?, "");
-                    }
-                    manifest.layers.extend(base.layers);
-                    manifest.env.extend(base.env);
-                    manifest.entrypoint = base.entrypoint;
-                    manifest.cmd = base.cmd;
-                    manifest.labels.extend(base.labels);
-                    // Inherit the base's working directory so later COPY/ADD dests
-                    // resolve under it (until a WORKDIR overrides).
-                    if let Some(wd) = base.workdir {
-                        workdir = wd.clone();
-                        manifest.workdir = Some(wd);
-                    }
-                }
-            }
-            Instr::Copy { srcs, dest } => {
-                let tar = copy_layer(&context, &workdir, srcs, dest)?;
-                apply_tar(&mut manifest, &tar)?;
-            }
-            Instr::Add { srcs, dest } => {
-                let tar = add_layer(&context, &workdir, srcs, dest, network)?;
-                apply_tar(&mut manifest, &tar)?;
-            }
-            Instr::Run(argv) => {
-                let Some(runner) = runner else {
-                    return Err(
-                        "RUN needs a build runner (wasm execution); build through wk".into(),
-                    );
-                };
-                let exe = argv
-                    .first()
-                    .ok_or("RUN needs a command (a wasm path in the rootfs)")?;
-                let wasm = rootfs
-                    .lock()
-                    .unwrap()
-                    .read_file(exe, usize::MAX)
-                    .ok_or_else(|| format!("RUN {exe}: not found in the rootfs built so far"))?;
-                if !wasm.starts_with(b"\0asm") {
-                    return Err(format!("RUN {exe}: not a wasm file"));
-                }
-                let before = rootfs.lock().unwrap().snapshot();
-                runner.run(&wasm, argv, &manifest.env, &rootfs)?;
-                if let Some(tar) = diff_layer(&before, &rootfs)? {
-                    // Store AND re-apply: the outputs become layer files, so the
-                    // next RUN's diff starts clean.
+                            copy_from_stage(src_fs, &workdir, srcs, dest)?
+                        }
+                        None => copy_layer(&context, &workdir, srcs, dest)?,
+                    };
                     apply_tar(&mut manifest, &tar)?;
                 }
-            }
-            Instr::Env(pairs) => manifest.env.extend(pairs.iter().cloned()),
-            Instr::Entrypoint(argv) => manifest.entrypoint = argv.clone(),
-            Instr::Cmd(argv) => manifest.cmd = argv.clone(),
-            Instr::Workdir(dir) => {
-                workdir = dir.clone();
-                manifest.workdir = Some(dir.clone());
-            }
-            Instr::Label(pairs) => manifest.labels.extend(pairs.iter().cloned()),
-            Instr::Ignored { keyword } => {
-                eprintln!(
-                    "wk build: ignoring {} (not applicable to a wasm container)",
-                    keyword
-                );
+                Instr::Add { srcs, dest } => {
+                    let tar = add_layer(&context, &workdir, srcs, dest, network)?;
+                    apply_tar(&mut manifest, &tar)?;
+                }
+                Instr::Run(argv) => {
+                    let Some(runner) = runner else {
+                        return Err(
+                            "RUN needs a build runner (wasm execution); build through wk".into(),
+                        );
+                    };
+                    let exe = argv
+                        .first()
+                        .ok_or("RUN needs a command (a wasm path in the rootfs)")?;
+                    let wasm = rootfs
+                        .lock()
+                        .unwrap()
+                        .read_file(exe, usize::MAX)
+                        .ok_or_else(|| {
+                            format!("RUN {exe}: not found in the rootfs built so far")
+                        })?;
+                    if !wasm.starts_with(b"\0asm") {
+                        return Err(format!("RUN {exe}: not a wasm file"));
+                    }
+                    let before = rootfs.lock().unwrap().snapshot();
+                    runner.run(&wasm, argv, &manifest.env, &rootfs)?;
+                    if let Some(tar) = diff_layer(&before, &rootfs)? {
+                        // Store AND re-apply: the outputs become layer files, so the
+                        // next RUN's diff starts clean.
+                        apply_tar(&mut manifest, &tar)?;
+                    }
+                }
+                Instr::Env(pairs) => manifest.env.extend(pairs.iter().cloned()),
+                Instr::Entrypoint(argv) => manifest.entrypoint = argv.clone(),
+                Instr::Cmd(argv) => manifest.cmd = argv.clone(),
+                Instr::Workdir(dir) => {
+                    workdir = dir.clone();
+                    manifest.workdir = Some(dir.clone());
+                }
+                Instr::Label(pairs) => manifest.labels.extend(pairs.iter().cloned()),
+                Instr::Ignored { keyword } => {
+                    eprintln!(
+                        "wk build: ignoring {} (not applicable to a wasm container)",
+                        keyword
+                    );
+                }
             }
         }
+        finished.push((
+            stage.alias.map(str::to_string).or_else(|| {
+                // Unnamed stages are still addressable by index, as Docker allows.
+                Some(stage_no.to_string())
+            }),
+            rootfs.clone(),
+        ));
     }
 
     // The executable: entrypoint[0], or cmd[0] when no entrypoint was given.
@@ -952,6 +1092,96 @@ mod tests {
         )
         .unwrap();
         dir
+    }
+
+    /// A multi-stage build: an earlier stage produces files, and the final
+    /// image copies only what it needs out of it. The earlier stage is not the
+    /// image that gets built.
+    #[test]
+    fn multi_stage_copies_between_stages() {
+        isolated_store("multistage");
+        let ctx = vim_like_context("multistage");
+        std::fs::write(ctx.join("app.wasm"), b"\0asm-pretend-component").unwrap();
+        std::fs::write(ctx.join("notes.txt"), b"build-only").unwrap();
+        std::fs::write(
+            ctx.join("Dockerfile"),
+            "FROM scratch AS build\n\
+             COPY app.wasm /out/app.wasm\n\
+             COPY notes.txt /out/notes.txt\n\
+             FROM scratch\n\
+             COPY --from=build /out/app.wasm /bin/app.wasm\n\
+             ENTRYPOINT [\"/bin/app.wasm\"]\n",
+        )
+        .unwrap();
+        let id = build(&ctx.join("Dockerfile")).expect("multi-stage build");
+        let m = load_image(&id).expect("stored");
+        assert_eq!(m.entrypoint, vec!["/bin/app.wasm"]);
+
+        // Only the copied file is in the final image; the build stage's other
+        // output was left behind, which is the point of doing this.
+        let fs = crate::vfs::new_fs();
+        for d in &m.layers {
+            let tar = std::fs::read(layer_path(d)).unwrap();
+            crate::layers::apply(&fs, &crate::layers::from_tar_bytes(&tar).unwrap(), "");
+        }
+        let g = fs.lock().unwrap();
+        assert!(g.read_file("/bin/app.wasm", 64).is_some());
+        assert!(
+            g.read_file("/out/notes.txt", 64).is_none(),
+            "the build stage's leftovers must not reach the final image"
+        );
+    }
+
+    /// A link is carried across as a link. Copying `/bin` out of a stage that
+    /// uses the multicall layout must not turn every name into its own copy of
+    /// the binary.
+    #[test]
+    fn copy_from_preserves_symlinks() {
+        isolated_store("multistage-link");
+        let ctx = vim_like_context("multistage-link");
+        // A directory source keeps links as links on the way in, which is how
+        // the multicall layout reaches an image in the first place.
+        std::fs::create_dir_all(ctx.join("bindir")).unwrap();
+        std::fs::write(ctx.join("bindir/app.wasm"), b"\0asm-pretend-component").unwrap();
+        std::os::unix::fs::symlink("app.wasm", ctx.join("bindir/link")).unwrap();
+        std::fs::write(
+            ctx.join("Dockerfile"),
+            "FROM scratch AS build\n\
+             COPY bindir/ /bin/\n\
+             FROM scratch\n\
+             COPY --from=build /bin /bin\n\
+             ENTRYPOINT [\"/bin/app.wasm\"]\n",
+        )
+        .unwrap();
+        let id = build(&ctx.join("Dockerfile")).expect("build");
+        let m = load_image(&id).unwrap();
+        let fs = crate::vfs::new_fs();
+        for d in &m.layers {
+            let tar = std::fs::read(layer_path(d)).unwrap();
+            crate::layers::apply(&fs, &crate::layers::from_tar_bytes(&tar).unwrap(), "");
+        }
+        assert_eq!(
+            fs.lock().unwrap().read_symlink("/bin/link"),
+            Some("app.wasm".to_string()),
+            "a link must cross as a link, not as another copy of its target"
+        );
+    }
+
+    /// A `--from` that names no stage is an error, not an empty layer.
+    #[test]
+    fn copy_from_an_unknown_stage_is_an_error() {
+        isolated_store("multistage-bad");
+        let ctx = vim_like_context("multistage-bad");
+        std::fs::write(ctx.join("app.wasm"), b"\0asm-pretend-component").unwrap();
+        std::fs::write(
+            ctx.join("Dockerfile"),
+            "FROM scratch\n\
+             COPY --from=nope /x /y\n\
+             ENTRYPOINT [\"/x\"]\n",
+        )
+        .unwrap();
+        let err = build(&ctx.join("Dockerfile")).unwrap_err();
+        assert!(err.contains("no such earlier stage"), "err was: {err}");
     }
 
     #[test]
