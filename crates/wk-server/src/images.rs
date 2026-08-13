@@ -737,6 +737,15 @@ fn diff_layer(
                 tar_file(&mut b, path, &data)?;
                 changed = true;
             }
+            // A link is carried as a link, and only when this step actually
+            // made or moved it. Reading through one instead would write the
+            // target's bytes over the link — which, for an image whose /bin is
+            // a multicall binary and ninety-odd names pointing at it, replaces
+            // every one of those names with its own copy.
+            PathKind::Symlink(target) if before.get(path) != Some(kind) => {
+                tar_symlink(&mut b, path, Path::new(target))?;
+                changed = true;
+            }
             _ => {}
         }
     }
@@ -822,9 +831,9 @@ fn copy_from_stage(
             }
             if *kind == PathKind::Dir {
                 tar_dir_entry(&mut b, &target)?;
-            } else if let Some(to) = fs.read_symlink(path) {
+            } else if let PathKind::Symlink(to) = kind {
                 // Carried across as a link, not as a copy of what it points at.
-                tar_symlink(&mut b, &target, Path::new(&to))?;
+                tar_symlink(&mut b, &target, Path::new(to))?;
             } else {
                 let data = fs
                     .read_file(path, usize::MAX)
@@ -1164,6 +1173,57 @@ mod tests {
             fs.lock().unwrap().read_symlink("/bin/link"),
             Some("app.wasm".to_string()),
             "a link must cross as a link, not as another copy of its target"
+        );
+    }
+
+    /// A RUN step must leave the image's links alone. Before, every link was
+    /// reported as a private write, so each RUN re-emitted all of them by
+    /// reading *through* them — turning a multicall /bin into one full copy of
+    /// the binary per name, and losing the links for anything copied later.
+    #[test]
+    fn a_run_step_does_not_flatten_symlinks() {
+        isolated_store("run-links");
+        let ctx = vim_like_context("run-links");
+        std::fs::create_dir_all(ctx.join("bindir")).unwrap();
+        std::fs::write(ctx.join("bindir/app.wasm"), b"\0asm-pretend-component").unwrap();
+        std::os::unix::fs::symlink("app.wasm", ctx.join("bindir/link")).unwrap();
+        std::fs::write(
+            ctx.join("Dockerfile"),
+            "FROM scratch AS base\n\
+             COPY bindir/ /bin/\n\
+             RUN /bin/app.wasm --touch\n\
+             FROM scratch\n\
+             COPY --from=base /bin /bin\n\
+             ENTRYPOINT [\"/bin/app.wasm\"]\n",
+        )
+        .unwrap();
+
+        struct Touch;
+        impl BuildRunner for Touch {
+            fn run(
+                &self,
+                _wasm: &[u8],
+                _argv: &[String],
+                _env: &[(String, String)],
+                fs: &crate::vfs::SharedFs,
+            ) -> Result<(), String> {
+                // Writes something unrelated; the links must be untouched.
+                fs.lock().unwrap().put_file_at("marker", b"1".to_vec());
+                Ok(())
+            }
+        }
+        let id = build_with_runner(&ctx.join("Dockerfile"), Some(&Touch), false)
+            .expect("build with a RUN");
+        let m = load_image(&id).unwrap();
+        let fs = crate::vfs::new_fs();
+        for d in &m.layers {
+            let tar = std::fs::read(layer_path(d)).unwrap();
+            crate::layers::apply(&fs, &crate::layers::from_tar_bytes(&tar).unwrap(), "");
+        }
+        assert_eq!(
+            fs.lock().unwrap().read_symlink("/bin/link"),
+            Some("app.wasm".to_string()),
+            "a RUN in the stage must not turn the link into a copy"
         );
     }
 

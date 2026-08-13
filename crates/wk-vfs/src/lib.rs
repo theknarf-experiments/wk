@@ -85,7 +85,7 @@ pub type SharedFile = Arc<Mutex<Vec<u8>>>;
 /// How a path exists in an `Fs`: provenance for build-time diffs (see
 /// [`Fs::snapshot`]) and for the UI's file inspector (layer vs written vs
 /// mounted badges).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PathKind {
     Dir,
     /// An immutable layer file (`RoFile`) — untouched since its layer applied.
@@ -94,6 +94,13 @@ pub enum PathKind {
     PrivateFile,
     /// A canvas file mount (shared/host) — not part of any image.
     Mounted,
+    /// A symbolic link, and what it points at.
+    ///
+    /// The target is part of the kind because it is the only thing that says
+    /// whether a link changed: unlike a file, which a layer turns into a
+    /// `RoFile` so that a private one is known to be a fresh write, a link is
+    /// a `Symlink` whether it came from a layer or was just created.
+    Symlink(String),
 }
 
 enum Node {
@@ -319,13 +326,12 @@ impl Fs {
                     Some(Node::RoFile(_)) => PathKind::LayerFile,
                     Some(Node::File(_)) => PathKind::PrivateFile,
                     Some(Node::Shared(_) | Node::Host(_)) => PathKind::Mounted,
-                    // A link is content a build layer must carry, like a
-                    // privately written file.
-                    Some(Node::Symlink(_)) => PathKind::PrivateFile,
+                    Some(Node::Symlink(target)) => PathKind::Symlink(target.clone()),
                     None => continue,
                 };
+                let is_dir = kind == PathKind::Dir;
                 out.insert(path.clone(), kind);
-                if kind == PathKind::Dir {
+                if is_dir {
                     walk(fs, id, &path, out);
                 }
             }
