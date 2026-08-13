@@ -10,23 +10,24 @@
 //                                        5-minute install
 import "../workspace.wk"
 workspace "01KZK2AB00000000000000WS01" {
-    note "01KZK2AC00000000000000NT02" {
-        text "WordPress on wk.\n\nThe `wordpress` container is real\nPHP 8.2 + SQLite (wasm32-wasip2),\nwith WordPress + the SQLite plugin\nfetched by its Dockerfile (ADD <url>)\n— no setup script. It serves on\n0.0.0.0:8092, joined to a Network\nand published by the HostPort.\n\nBuild once: plugins/wordpress `mise run build`.\nThen click play and open\nhttp://localhost:8092 to install."
-        pos 40.0 40.0
-        size 360.0 340.0
-    }
     node "wordpress" "01KZK2AD00000000000000AP03" {
         pos 40.0 420.0
         size 420.0 220.0
+        args "-S" "0.0.0.0:8092" "-t" "/var/www/wordpress"
     }
     hostport "01KZK2AF00000000000000HP05" {
         port 8092
-        pos 520.0 460.0
+        pos 523.86328125 446.61328125
         size 130.0 44.0
     }
     network "01KZK2AG00000000000000NW06" {
         pos 520.0 560.0
         size 130.0 44.0
+    }
+    note "01KZK2AC00000000000000NT02" {
+        text "WordPress on wk.\n\nThe `wordpress` container is real\nPHP 8.2 + SQLite (wasm32-wasip2),\nwith WordPress + the SQLite plugin\nfetched by its Dockerfile (ADD <url>)\n— no setup script. It serves on\n0.0.0.0:8092, joined to a Network\nand published by the HostPort.\n\nBuild once: plugins/wordpress `mise run build`.\nThen click play and open\nhttp://localhost:8092 to install."
+        pos 40.0 40.0
+        size 360.0 340.0
     }
     serve "01KZK2AD00000000000000AP03" "01KZK2AF00000000000000HP05"
     netlink "01KZK2AD00000000000000AP03" "01KZK2AG00000000000000NW06"

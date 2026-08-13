@@ -2426,6 +2426,32 @@ index 15e2b228..6730c1eb 100644
          #[cfg(windows)]
          let uid = bun_sys::windows::user_unique_id();
  
+diff --git a/src/runtime/cli/filter_run.rs b/src/runtime/cli/filter_run.rs
+index e506cbd3..5608d038 100644
+--- a/src/runtime/cli/filter_run.rs
++++ b/src/runtime/cli/filter_run.rs
+@@ -175,7 +175,7 @@ impl<'a> ProcessHandle<'a> {
+                 handle.stderr.start(stderr, true)?;
+             }
+         }
+-        #[cfg(not(unix))]
++        #[cfg(windows)]
+         {
+             handle.remaining_fds += 1;
+             handle.stdout.start_with_current_pipe()?;
+diff --git a/src/runtime/cli/multi_run.rs b/src/runtime/cli/multi_run.rs
+index 72c9fd15..4c3d644a 100644
+--- a/src/runtime/cli/multi_run.rs
++++ b/src/runtime/cli/multi_run.rs
+@@ -242,7 +242,7 @@ impl<'a> ProcessHandle<'a> {
+                     .map_err(Error::from)?;
+             }
+         }
+-        #[cfg(not(unix))]
++        #[cfg(windows)]
+         {
+             self.stdout_reader
+                 .reader
 diff --git a/src/runtime/node/node_fs.rs b/src/runtime/node/node_fs.rs
 index 6046c4ad..e0c40c2b 100644
 --- a/src/runtime/node/node_fs.rs
@@ -2440,6 +2466,47 @@ index 6046c4ad..e0c40c2b 100644
  
  /// In-place RAII wrapper for a libuv `fs_t` request.
  ///
+diff --git a/src/runtime/node/node_os.rs b/src/runtime/node/node_os.rs
+index ccff60e6..fe011fc1 100644
+--- a/src/runtime/node/node_os.rs
++++ b/src/runtime/node/node_os.rs
+@@ -259,6 +259,8 @@ mod _impl {
+         let result = cpus_impl_freebsd(global);
+         #[cfg(windows)]
+         let result = cpus_impl_windows(global);
++        #[cfg(target_os = "wasi")]
++        let result: Result<JSValue, OsError> = Ok(JSValue::create_empty_array(global, 0));
+ 
+         match result {
+             Ok(v) => Ok(v),
+@@ -714,7 +716,17 @@ mod _impl {
+             }
+             return Ok(BunString::clone_utf8(&out[0..size]));
+         }
+-        #[cfg(not(windows))]
++        #[cfg(target_os = "wasi")]
++        {
++            // WASI has no passwd database; HOME is the only source.
++            if let Some(home) = env_var::HOME.get() {
++                if !home.is_empty() {
++                    return Ok(BunString::init(home));
++                }
++            }
++            return Ok(BunString::empty());
++        }
++        #[cfg(unix)]
+         {
+             // The posix implementation of uv_os_homedir first checks the HOME
+             // environment variable, then falls back to reading the passwd entry.
+@@ -1586,7 +1598,7 @@ mod _impl {
+             result.put(global_this, b"gid", JSValue::js_number(-1.0));
+             result.put(global_this, b"shell", JSValue::NULL);
+         }
+-        #[cfg(not(windows))]
++        #[cfg(any(unix, target_os = "wasi"))]
+         {
+             let username = env_var::USER.get().unwrap_or(b"unknown");
+ 
 diff --git a/src/runtime/webcore/FileSink.rs b/src/runtime/webcore/FileSink.rs
 index 86a63c7b..ac77270e 100644
 --- a/src/runtime/webcore/FileSink.rs
@@ -2964,7 +3031,7 @@ index 4e423c09..3b94faff 100644
              {
                  debug_assert!(self.native() >= 0);
 diff --git a/src/sys/lib.rs b/src/sys/lib.rs
-index c2e8b817..5420d96e 100644
+index c2e8b817..2cdd8806 100644
 --- a/src/sys/lib.rs
 +++ b/src/sys/lib.rs
 @@ -106,8 +106,11 @@ pub use bun_core::FileKind as EntryKind;
@@ -3634,7 +3701,28 @@ index c2e8b817..5420d96e 100644
      use core::ffi::c_int;
      #[cfg(any(
          target_os = "macos",
-@@ -8155,9 +8358,9 @@ pub mod posix {
+@@ -8105,10 +8308,19 @@ pub mod posix {
+     /// `gethostname(2)` into `buf`. On success the hostname is NUL-terminated
+     /// somewhere in `buf` (POSIX guarantees truncation+NUL when `buf` is at
+     /// least `HOST_NAME_MAX+1`).
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     #[inline]
+     pub fn gethostname(buf: &mut [u8]) -> super::Maybe<()> {
++        // wasi-libc declares gethostname; the libc crate doesn't bind it.
++        #[cfg(target_os = "wasi")]
++        unsafe extern "C" {
++            #[link_name = "gethostname"]
++            fn wasi_gethostname(name: *mut core::ffi::c_char, len: usize) -> core::ffi::c_int;
++        }
+         // SAFETY: `buf` is `&mut [u8]` → exclusive, valid for `buf.len()` writes.
++        #[cfg(target_os = "wasi")]
++        let rc = unsafe { wasi_gethostname(buf.as_mut_ptr().cast(), buf.len()) };
++        #[cfg(not(target_os = "wasi"))]
+         let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len() as _) };
+         if rc != 0 {
+             return Err(super::err_with(super::Tag::TODO));
+@@ -8155,9 +8367,9 @@ pub mod posix {
          pub const INET: c_int = bun_windows_sys::ws2_32::AF_INET;
          #[cfg(windows)]
          pub const INET6: c_int = bun_windows_sys::ws2_32::AF_INET6;
@@ -3646,7 +3734,7 @@ index c2e8b817..5420d96e 100644
          pub const INET6: c_int = libc::AF_INET6;
      }
  
-@@ -8169,7 +8372,7 @@ pub mod posix {
+@@ -8169,7 +8381,7 @@ pub mod posix {
      pub const INET6_ADDRSTRLEN: usize = 46;
  
      // ── sockaddr family ──
@@ -3655,7 +3743,7 @@ index c2e8b817..5420d96e 100644
      pub use libc::{sockaddr, sockaddr_in, sockaddr_in6, sockaddr_storage};
      // Route through `bun_libuv_sys` (not `bun_windows_sys::ws2_32`) so types
      // returned by libuv APIs (`uv_interface_address_t`, `uv_udp_*`) are the
-@@ -8189,23 +8392,23 @@ pub mod posix {
+@@ -8189,23 +8401,23 @@ pub mod posix {
      // ── stat mode-kind tests ──
      // `libc::S_IF*` is `mode_t` (u32 on Linux, u16 on Darwin/FreeBSD); widen to
      // `u32` so the `m: u32` (== `bun_core::Mode`) comparison is uniform.
@@ -3683,7 +3771,7 @@ index c2e8b817..5420d96e 100644
      pub use libc::sigset_t;
      /// `sigaction(sig, &act, *oact)`.
      #[cfg(unix)]
-@@ -8217,9 +8420,9 @@ pub mod posix {
+@@ -8217,9 +8429,9 @@ pub mod posix {
      }
  
      // ── time ──
@@ -3695,7 +3783,7 @@ index c2e8b817..5420d96e 100644
      pub use libc::timeval;
  
      #[cfg(windows)]
-@@ -8231,7 +8434,7 @@ pub mod posix {
+@@ -8231,7 +8443,7 @@ pub mod posix {
      }
  
      // ── raw I/O (no `Maybe` wrapping) ──
@@ -3704,7 +3792,7 @@ index c2e8b817..5420d96e 100644
      #[inline]
      pub unsafe fn read(fd: c_int, buf: *mut u8, count: usize) -> isize {
          #[cfg(any(target_os = "linux", target_os = "android"))]
-@@ -8245,7 +8448,7 @@ pub mod posix {
+@@ -8245,7 +8457,7 @@ pub mod posix {
              unsafe { libc::read(fd, buf.cast(), count) }
          }
      }
@@ -3713,7 +3801,7 @@ index c2e8b817..5420d96e 100644
      #[inline]
      pub unsafe fn write(fd: c_int, buf: *const u8, count: usize) -> isize {
          #[cfg(any(target_os = "linux", target_os = "android"))]
-@@ -8337,7 +8540,7 @@ pub mod posix {
+@@ -8337,7 +8549,7 @@ pub mod posix {
      }
  
      // ── rlimit ──
@@ -3722,7 +3810,7 @@ index c2e8b817..5420d96e 100644
      #[repr(C)]
      #[derive(Clone, Copy)]
      pub struct Rlimit {
-@@ -8345,9 +8548,9 @@ pub mod posix {
+@@ -8345,9 +8557,9 @@ pub mod posix {
          pub max: u64,
      }
      // SAFETY: two `u64`; all-zero is a valid `Rlimit`.
@@ -3734,7 +3822,7 @@ index c2e8b817..5420d96e 100644
      #[derive(Clone, Copy)]
      #[repr(i32)]
      pub enum RlimitResource {
-@@ -8355,7 +8558,7 @@ pub mod posix {
+@@ -8355,7 +8567,7 @@ pub mod posix {
          STACK = libc::RLIMIT_STACK as _,
          CORE = libc::RLIMIT_CORE as _,
      }
@@ -3743,7 +3831,7 @@ index c2e8b817..5420d96e 100644
      pub fn getrlimit(res: RlimitResource) -> core::result::Result<Rlimit, super::Error> {
          let mut r = libc::rlimit {
              rlim_cur: 0,
-@@ -8370,7 +8573,7 @@ pub mod posix {
+@@ -8370,7 +8582,7 @@ pub mod posix {
              max: r.rlim_max as u64,
          })
      }
@@ -3752,7 +3840,7 @@ index c2e8b817..5420d96e 100644
      pub fn setrlimit(res: RlimitResource, lim: Rlimit) -> core::result::Result<(), super::Error> {
          let r = libc::rlimit {
              rlim_cur: lim.cur as _,
-@@ -8394,7 +8597,7 @@ pub mod net {
+@@ -8394,7 +8606,7 @@ pub mod net {
  
      // POSIX libc has `sockaddr_*` at the crate root; MSVC libc does not. Route
      // both through a private `sock` shim so the body below is target-agnostic.
@@ -3761,7 +3849,7 @@ index c2e8b817..5420d96e 100644
      mod sock {
          pub(super) use libc::{
              AF_INET, AF_INET6, sockaddr, sockaddr_in, sockaddr_in6, sockaddr_storage,
-@@ -8426,9 +8629,9 @@ pub mod net {
+@@ -8426,9 +8638,9 @@ pub mod net {
      // so struct-update initializers (`..sockaddr_in::ZEROED`)
      // work uniformly on all targets and in `const` context.
      // ──────────────────────────────────────────────────────────────────────
@@ -3773,7 +3861,7 @@ index c2e8b817..5420d96e 100644
      pub type in_port_t = libc::in_port_t;
      #[cfg(windows)]
      pub type sa_family_t = u16; // ws2def.h: `typedef USHORT ADDRESS_FAMILY;`
-@@ -8439,6 +8642,9 @@ pub mod net {
+@@ -8439,6 +8651,9 @@ pub mod net {
      // the `ZEROED` initializer — Rust accepts outer attributes on struct-
      // expression fields, so a single body suffices on all targets.
      #[repr(C)]
@@ -3783,7 +3871,7 @@ index c2e8b817..5420d96e 100644
      #[derive(Copy, Clone)]
      pub struct sockaddr_in {
          #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-@@ -8460,6 +8666,7 @@ pub mod net {
+@@ -8460,6 +8675,7 @@ pub mod net {
      }
  
      #[repr(C)]
@@ -3791,7 +3879,7 @@ index c2e8b817..5420d96e 100644
      #[derive(Copy, Clone)]
      pub struct sockaddr_in6 {
          #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-@@ -8691,7 +8898,7 @@ pub mod elf {
+@@ -8691,7 +8907,7 @@ pub mod elf {
  
      /// Result of [`find_loaded_module`]: the loaded ELF object whose `PT_LOAD`
      /// segment spans a given address.
@@ -3800,7 +3888,7 @@ index c2e8b817..5420d96e 100644
      pub struct LoadedModule {
          /// `dlpi_addr` — link-map base address (subtract from the lookup address
          /// to get an image-relative offset).
-@@ -8705,7 +8912,7 @@ pub mod elf {
+@@ -8705,7 +8921,7 @@ pub mod elf {
      /// via `dl_iterate_phdr`, returning the one whose `PT_LOAD` segment contains
      /// `address`. Shared by `bun_crash_handler::StackLine::from_address` and
      /// `bun_jsc::btjs::SelfInfo::lookup_module_dl` / `lookup_module_name_dl`.
