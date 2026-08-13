@@ -9,52 +9,18 @@
 #   2. (moonshot) JavaScriptCore itself — cloop/LLInt interpreter, no JIT —
 #      via wasi-sdk, then bun's *_jsc bridge crates over it.
 #
-# Status: the whole ~60-crate JSC-free slice type-checks AND a bin crate
-# exists (src/wk_cli → `bun-transpile`, driving Transpiler::transform like
-# `bun build --no-bundle`). Linking is underway:
-#   * src/wk_cli/wasi_shims.rs provides the JSC-tier symbols — REAL
-#     approximations for the runtime-reachable WTF number machinery
-#     (WTF__dtoa = ES ToString(Number), WTF__parseDouble, operationMathPow,
-#     jsToNumber) and aborts for unreachable macro/dispatch/BoringSSL paths.
-#   * real mimalloc (oven-sh/mimalloc @ the repo pin, src/prim/wasi backend)
-#     compiles with wasi-sdk into native/libmimalloc.a — link with
-#     `-L native -l static=mimalloc`.
-#   * REMAINING: ~10 highway_* + ~10 simdutf__* kernels (semantics live in
-#     src/jsc/bindings/highway_strings.cpp / src/simdutf_sys/bun-simdutf.cpp;
-#     either scalar-shim them in wasi_shims.rs like the four already there,
-#     or build the real C++ — highway_strings.cpp includes Bun's root.h so
-#     the real build needs a shim header), a getpid shim for mimalloc's
-#     heap-snapshot path (do NOT add the wasi-sdk lib dir to the search
-#     path — its libc.a preempts rustc's bundled one and breaks
-#     __wasi_init_tp in rust's crt1; `dup` instead needs a Rust shim), then
-#     wasm-component output + Dockerfile + a run in a wk node.
-#
-# The port knowledge, each item a compile failure first:
-#   * bun assumes 64-bit everywhere it tags pointer high bits. Three separate
-#     schemes hit this: bun_alloc's ZigString (bits 61-63 → moved to bits
-#     29-31 on 32-bit, strings must sit below 512 MiB of linear memory),
-#     bun_core's SmolStr (tag lives in the upper 64-bit word of a u128 — raw
-#     accessors widened usize→u64 so the tag survives 32-bit), and
-#     bun_semver's packed handle (pure u64 off/len math — only its assert was
-#     over-strict).
-#   * bun_windows_sys compiles on EVERY target (type aliases stay valid
-#     cross-platform, deliberately); its WSADATA size assert and asm-bodied
-#     teb()/peb() needed wasm arms.
-#   * WASI's errno VALUES are CloudABI's alphabetical ordering — nothing like
-#     Linux/Darwin. src/errno/wasi_errno.rs is generated from wasi-libc's
-#     __errno_values.h; EWOULDBLOCK/EOPNOTSUPP (header aliases) and the
-#     errnos WASI lacks get synthetic discriminants past the real range.
-#   * `-D warnings` + deny(dead_code/unused) means every cfg hole is a hard
-#     error: each new target arm must consume its bindings (`let _ = name;`).
-#   * configure-time codegen (build_options.rs, {json,xml}_byte_class.rs) is
-#     produced by `bun bd --configure-only`, which we never run; gen-codegen.ts
-#     regenerates the byte-class tables from bun's own generators and
-#     build_options.rs is templated in gen-codegen.ts. Cargo finds them via
-#     BUN_CODEGEN_DIR.
-#
-# Requires: rustup (the pinned nightly in bun/rust-toolchain.toml +
-# wasm32-wasip2 target auto-install), wasi-sdk (WASI_SDK), bun (drives
-# gen-codegen.ts). Source is cloned (and cached) under bun/ on first run.
+# Status: WORKS. `bun-transpile demo.ts` emits real Bun transpiler output
+# (TS stripped, const enums inlined, JSX automatic runtime) under wasmtime.
+# The port knowledge lives in patches/ + src/wk_cli/wasi_shims.rs; two
+# runtime-debugging lessons worth keeping:
+#   * rustc links its OWN bundled wasi-libc (not wasi-sdk's) — it predates
+#     F_DUPFD, so dup() fails EINVAL and the dir iterator reopens "."
+#     through the dirfd instead. Never add the sdk lib dir to the search
+#     path to "fix" this: its libc.a preempts rustc's and breaks
+#     __wasi_init_tp in rust's crt1.
+#   * wasi-libc has TWO fcntl headers; __header_fcntl.h is the canonical
+#     one (F_DUPFD=5, F_DUPFD_CLOEXEC=6 — fcntl.h's 1030 is a musl
+#     leftover).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -87,7 +53,27 @@ export BUN_CODEGEN_DIR="$PWD/codegen"
 export CC_wasm32_wasip2="$WASI_SDK/bin/clang"
 export AR_wasm32_wasip2="$WASI_SDK/bin/llvm-ar"
 
+# mimalloc is bun's global allocator and officially supports wasi
+# (src/prim/wasi); build it from bun's own pin (scripts/build/deps/mimalloc.ts).
+MIMALLOC_COMMIT=1803341d6241d8fa4b3f65fa68cb13a32ad92f04
+if [ ! -f native/libmimalloc.a ]; then
+    mkdir -p native
+    if [ ! -d native/mimalloc ]; then
+        curl -fsSL "https://github.com/oven-sh/mimalloc/archive/$MIMALLOC_COMMIT.tar.gz" | tar xz -C native
+        mv "native/mimalloc-$MIMALLOC_COMMIT" native/mimalloc
+    fi
+    "$WASI_SDK/bin/clang" --target=wasm32-wasip2 -O2 -DNDEBUG \
+        -DMI_MALLOC_OVERRIDE=0 -D_WASI_EMULATED_GETPID \
+        -Inative/mimalloc/include -c native/mimalloc/src/static.c -o native/mimalloc.o
+    "$WASI_SDK/bin/llvm-ar" rcs native/libmimalloc.a native/mimalloc.o
+fi
+
 cd bun
-# WIP: still `check` — flips to `build` + wasm-component output once the
-# slice closes (bun_sys / bun_uws_sys are the frontier; see plugin notes).
-cargo check -p bun_transpiler --target wasm32-wasip2
+# wasm-component-ld emits a component directly; wasi_shims.rs (in wk_cli)
+# supplies the JSC-tier symbols and the SIMD-kernel scalar fallbacks.
+RUSTFLAGS="-L ../native -l static=mimalloc" \
+    cargo +nightly-2026-07-20 build -p bun_wk_cli --target wasm32-wasip2 --profile release-dev
+cd ..
+cp bun/target/wasm32-wasip2/release-dev/bun-transpile.wasm bun-transpile.wasm
+echo "built plugins/bun/bun-transpile.wasm (real Bun transpiler, wasm32-wasip2 component)"
+echo "package it with: wk images build plugins/bun/Dockerfile --tag bun-transpile"
