@@ -1,43 +1,3 @@
-diff --git a/Cargo.lock b/Cargo.lock
-index d6de440e..2de2bcfd 100644
---- a/Cargo.lock
-+++ b/Cargo.lock
-@@ -2177,6 +2177,23 @@ dependencies = [
- name = "bun_windows_sys"
- version = "0.0.0"
- 
-+[[package]]
-+name = "bun_wk_cli"
-+version = "0.0.0"
-+dependencies = [
-+ "bun_alloc",
-+ "bun_ast",
-+ "bun_bundler",
-+ "bun_core",
-+ "bun_dotenv",
-+ "bun_errno",
-+ "bun_install_types",
-+ "bun_js_parser",
-+ "bun_options_types",
-+ "bun_transpiler",
-+ "libc",
-+]
-+
- [[package]]
- name = "bun_wyhash"
- version = "0.0.0"
-diff --git a/Cargo.toml b/Cargo.toml
-index 3c3f997a..6bac483b 100644
---- a/Cargo.toml
-+++ b/Cargo.toml
-@@ -101,6 +101,7 @@ members = [
-   "src/spawn_sys",
-   "src/bunfig",
-   "src/bun_bin",
-+  "src/wk_cli",
- ]
- # `vendor/lolhtml` (the `lol_html` crate) is a non-member path dependency,
- # fetched into `vendor/` by `scripts/build/deps/lolhtml.ts` before cargo runs.
 diff --git a/src/analytics/lib.rs b/src/analytics/lib.rs
 index 07fa5303..c3c5ab72 100644
 --- a/src/analytics/lib.rs
@@ -1295,10 +1255,46 @@ index 57bfb2fc..e3b30257 100644
                                  self.close_and_fail::<IS_SSL>(err, socket);
                                  return;
 diff --git a/src/install/PackageInstall.rs b/src/install/PackageInstall.rs
-index 43521627..d1c26be5 100644
+index 43521627..d7634157 100644
 --- a/src/install/PackageInstall.rs
 +++ b/src/install/PackageInstall.rs
-@@ -1603,7 +1603,7 @@ impl<'a> PackageInstall<'a> {
+@@ -150,6 +150,18 @@ impl Method {
+         })
+     }
+ 
++    /// wk's vfs supports hard links and symlinks, so WASI matches Linux.
++    #[cfg(target_os = "wasi")]
++    fn wasi() -> BackendSupport {
++        enum_map::EnumMap::from_fn(|k| match k {
++            Method::Clonefile => false,
++            Method::ClonefileEachDir => false,
++            Method::Hardlink => true,
++            Method::Copyfile => true,
++            Method::Symlink => true,
++        })
++    }
++
+     #[inline]
+     pub(crate) fn is_supported(self) -> bool {
+         #[cfg(target_os = "macos")]
+@@ -157,6 +169,8 @@ impl Method {
+         // Android is listed explicitly: `target_os = "linux"` does not cover the Android ABI.
+         #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+         return Self::linux()[self];
++        #[cfg(target_os = "wasi")]
++        return Self::wasi()[self];
+         #[cfg(windows)]
+         return Self::windows()[self];
+         #[cfg(not(any(
+@@ -164,6 +178,7 @@ impl Method {
+             target_os = "linux",
+             target_os = "android",
+             target_os = "freebsd",
++            target_os = "wasi",
+             windows
+         )))]
+         return false;
+@@ -1603,7 +1618,7 @@ impl<'a> PackageInstall<'a> {
                          break;
                      }
                  };
@@ -1307,7 +1303,7 @@ index 43521627..d1c26be5 100644
                  {
                      match entry.kind {
                          EntryKind::Directory => {
-@@ -1649,7 +1649,7 @@ impl<'a> PackageInstall<'a> {
+@@ -1649,7 +1664,7 @@ impl<'a> PackageInstall<'a> {
                          _ => {}
                      }
                  }
@@ -1316,7 +1312,16 @@ index 43521627..d1c26be5 100644
                  {
                      match entry.kind {
                          EntryKind::File => {}
-@@ -1796,7 +1796,7 @@ impl<'a> PackageInstall<'a> {
+@@ -1756,7 +1771,7 @@ impl<'a> PackageInstall<'a> {
+         let mut buf2 = PathBuffer::uninit();
+         #[cfg(not(windows))]
+         let to_copy_buf2_offset: usize;
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "wasi"))]
+         {
+             let cache_dir_path = sys::get_fd_path(state.cached_package_dir.fd(), &mut buf2)?;
+             let cache_len = cache_dir_path.len();
+@@ -1796,7 +1811,7 @@ impl<'a> PackageInstall<'a> {
              #[cfg(not(windows))]
              let _ = (to_copy_into1_offset, head1);
              while let Some(entry) = walker.next()? {
@@ -1325,7 +1330,7 @@ index 43521627..d1c26be5 100644
                  {
                      match entry.kind {
                          EntryKind::Directory => {
-@@ -1827,7 +1827,7 @@ impl<'a> PackageInstall<'a> {
+@@ -1827,7 +1842,7 @@ impl<'a> PackageInstall<'a> {
                          _ => {}
                      }
                  }
@@ -1334,10 +1339,81 @@ index 43521627..d1c26be5 100644
                  {
                      use bun_sys::windows;
                      match entry.kind {
+diff --git a/src/install/PackageInstaller.rs b/src/install/PackageInstaller.rs
+index 43570af6..cb68f828 100644
+--- a/src/install/PackageInstaller.rs
++++ b/src/install/PackageInstaller.rs
+@@ -214,7 +214,7 @@ impl NodeModulesFolder {
+     }
+ 
+     pub(crate) fn open_dir(&self, root: &Dir) -> crate::Result<Dir> {
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "wasi"))]
+         {
+             // Copy into a NUL-terminated PathBuffer.
+             let mut path_buf = PathBuffer::uninit();
+@@ -224,7 +224,7 @@ impl NodeModulesFolder {
+                 .map_err(|e| e.to_zig_err().into());
+         }
+ 
+-        #[cfg(not(unix))]
++        #[cfg(windows)]
+         {
+             return Ok(Dir::from_fd(
+                 bun_sys::open_dir_at_windows_a(
+@@ -242,7 +242,7 @@ impl NodeModulesFolder {
+ 
+     fn make_and_open_dir(&mut self, root: &Dir) -> crate::Result<Dir> {
+         let out = 'brk: {
+-            #[cfg(unix)]
++            #[cfg(any(unix, target_os = "wasi"))]
+             {
+                 break 'brk root.make_open_path(
+                     self.path.as_slice(),
+@@ -253,7 +253,7 @@ impl NodeModulesFolder {
+                 )?;
+             }
+ 
+-            #[cfg(not(unix))]
++            #[cfg(windows)]
+             {
+                 break 'brk Dir::from_fd(
+                     bun_sys::open_dir_at_windows_a(
+diff --git a/src/install/PackageManager/security_scanner.rs b/src/install/PackageManager/security_scanner.rs
+index a8bad273..62cd1c5c 100644
+--- a/src/install/PackageManager/security_scanner.rs
++++ b/src/install/PackageManager/security_scanner.rs
+@@ -21,7 +21,7 @@ use bun_install::{
+     DependencyID, PackageID, PackageManager, invalid_dependency_id, invalid_package_id,
+ };
+ use bun_io::Loop as AsyncLoop;
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ use bun_io::pipe_reader::PosixFlags;
+ use bun_io::{BufferedReader, ReadState};
+ use bun_ptr::{RefCount, RefPtr, ThreadSafeRefCount};
+@@ -1060,7 +1060,7 @@ impl<'a> SecurityScanSubprocess<'a> {
+     /// spawn machinery. The child's end is dup'd to fd 4 and closed in the
+     /// parent by spawn's to_close_at_end list. The parent's
+     /// end comes back via spawned.extra_pipes.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     fn spawn_posix(
+         &mut self,
+         argv: &mut [*const core::ffi::c_char; 5],
 diff --git a/src/install/lifecycle_script_runner.rs b/src/install/lifecycle_script_runner.rs
-index fea6db69..2744e99c 100644
+index fea6db69..abc796c5 100644
 --- a/src/install/lifecycle_script_runner.rs
 +++ b/src/install/lifecycle_script_runner.rs
+@@ -14,7 +14,7 @@ use bun_io::heap as io_heap;
+ use bun_io::{FilePollFlag, PosixFlags};
+ 
+ use bun_core::ZStr;
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ use bun_spawn::SpawnResultExt as _;
+ use bun_spawn::{Process, ProcessExit, ProcessExitKind, Rusage, SpawnOptions, Status};
+ #[cfg(unix)]
 @@ -611,11 +611,11 @@ impl<'a> LifecycleScriptSubprocess<'a> {
                  } else if (*manager).options.log_level.is_verbose() || (*this).foreground {
                      bun_spawn::Stdio::Inherit
@@ -1366,6 +1442,32 @@ index fea6db69..2744e99c 100644
                      {
                          // Ownership transfers to `spawned.stderr`.
                          bun_spawn::Stdio::Buffer(bun_core::heap::into_raw(Box::new(
+diff --git a/src/install_types/resolver_hooks.rs b/src/install_types/resolver_hooks.rs
+index 90292158..97dbd3fd 100644
+--- a/src/install_types/resolver_hooks.rs
++++ b/src/install_types/resolver_hooks.rs
+@@ -840,6 +840,9 @@ impl OperatingSystem {
+     pub const CURRENT: Self = Self(Self::WIN32);
+     #[cfg(target_os = "freebsd")]
+     pub const CURRENT: Self = Self(Self::FREEBSD);
++    // See Architecture::CURRENT's wasm note.
++    #[cfg(target_os = "wasi")]
++    pub const CURRENT: Self = Self(Self::LINUX);
+ 
+     // NB: NODE not NPM — package.json `os` field uses process.platform values
+     // ("win32").
+@@ -936,6 +939,11 @@ impl Architecture {
+     pub const CURRENT: Self = Self(Self::ARM64);
+     #[cfg(target_arch = "x86_64")]
+     pub const CURRENT: Self = Self(Self::X64);
++    // npm has no wasm32 cpu value. Claim x64, consistent with the JS builtins
++    // reporting process.platform/arch as linux/x64 (gen-codegen.ts) — native
++    // prebuilds can't run in a wasm guest regardless.
++    #[cfg(target_arch = "wasm32")]
++    pub const CURRENT: Self = Self(Self::X64);
+ 
+     #[inline]
+     pub const fn none() -> Self {
 diff --git a/src/io/ParentDeathWatchdog.rs b/src/io/ParentDeathWatchdog.rs
 index fe05cc8c..68f1fd52 100644
 --- a/src/io/ParentDeathWatchdog.rs
@@ -1675,6 +1777,19 @@ index 22ae907b..148f4291 100644
 +// (An old browser-wasm alias to `*mut c_void` lived here; the call sites
 +// have since outgrown it.)
  pub type MacroContext = crate::Macro::MacroContext;
+diff --git a/src/js_parser_jsc/Macro.rs b/src/js_parser_jsc/Macro.rs
+index 4d6e8a20..7daeb17d 100644
+--- a/src/js_parser_jsc/Macro.rs
++++ b/src/js_parser_jsc/Macro.rs
+@@ -316,7 +316,7 @@ fn __bun_macro_context_call(
+     // SAFETY: `data` is the `Box<MacroContext>` allocated in `init` above; the
+     // lower-tier handle is uniquely borrowed for this call so no alias exists.
+     let inner = unsafe { &mut *ctx.data.cast::<MacroContext>() };
+-    inner.javascript_object = JSValue::from_encoded(ctx.javascript_object.0 as usize);
++    inner.javascript_object = JSValue::from_encoded(ctx.javascript_object.0 as u64 as bun_jsc::EncodedBits);
+     let caller_loc = caller.loc;
+     inner
+         .call(
 diff --git a/src/js_printer/renamer.rs b/src/js_printer/renamer.rs
 index aebe444e..830d0a03 100644
 --- a/src/js_printer/renamer.rs
@@ -1691,6 +1806,401 @@ index aebe444e..830d0a03 100644
      let mut names = StringHashMap::<u32>::default();
  
      const EXTRAS: [&[u8]; 2] = [b"Promise", b"Require"];
+diff --git a/src/jsc/BunCPUProfiler.rs b/src/jsc/BunCPUProfiler.rs
+index f854f1ae..c28bc15d 100644
+--- a/src/jsc/BunCPUProfiler.rs
++++ b/src/jsc/BunCPUProfiler.rs
+@@ -213,7 +213,11 @@ pub(crate) fn write_diagnostic_filename(
+ ) -> std::io::Result<()> {
+     #[cfg(windows)]
+     let pid = bun_sys::windows::GetCurrentProcessId();
+-    #[cfg(not(windows))]
++    // The libc crate doesn't bind getpid for WASI; profile filenames just
++    // need a stable disambiguator (matches -lwasi-emulated-getpid's stub).
++    #[cfg(target_os = "wasi")]
++    let pid = 42;
++    #[cfg(unix)]
+     // SAFETY: getpid() is always safe to call.
+     let pid = unsafe { libc::getpid() };
+ 
+@@ -228,7 +232,35 @@ pub(crate) fn write_diagnostic_filename(
+     )
+ }
+ 
+-#[cfg(not(windows))]
++// WASI: no tz database, and libc's `tm` isn't Zeroable-bound there; UTC via
++// pure math is good enough for profile filenames.
++#[cfg(target_os = "wasi")]
++pub(crate) fn local_time_now() -> (i32, u32, u32, u32, u32, u32) {
++    let secs = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map_or(0, |d| d.as_secs());
++    let days = secs / 86400;
++    let (mut y, mut rem) = (1970i32, days);
++    loop {
++        let len = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
++        if rem < len {
++            break;
++        }
++        rem -= len;
++        y += 1;
++    }
++    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
++    let month_days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
++    let mut m = 0usize;
++    while rem >= month_days[m] {
++        rem -= month_days[m];
++        m += 1;
++    }
++    let tod = secs % 86400;
++    (y, m as u32 + 1, rem as u32 + 1, (tod / 3600) as u32, (tod / 60 % 60) as u32, (tod % 60) as u32)
++}
++
++#[cfg(all(not(windows), not(target_os = "wasi")))]
+ pub(crate) fn local_time_now() -> (i32, u32, u32, u32, u32, u32) {
+     let secs = std::time::SystemTime::now()
+         .duration_since(std::time::UNIX_EPOCH)
+diff --git a/src/jsc/DecodedJSValue.rs b/src/jsc/DecodedJSValue.rs
+index 477a2f42..45ec7d1e 100644
+--- a/src/jsc/DecodedJSValue.rs
++++ b/src/jsc/DecodedJSValue.rs
+@@ -41,9 +41,12 @@ impl DecodedJSValue {
+     }
+ }
+ 
++// On 32-bit, `ptr` is the low (payload) half of the 8-byte union — the same
++// layout JSC's own EncodedValueDescriptor has under JSVALUE32_64. Only read
++// `as_int64` from values that were written fully encoded.
+ const _: () = assert!(
+-    core::mem::size_of::<usize>() == 8,
+-    "EncodedValueDescriptor assumes a 64-bit system",
++    core::mem::size_of::<EncodedValueDescriptor>() == 8,
++    "EncodedValueDescriptor must be 8 bytes (EncodedJSValue ABI)",
+ );
+ const _: () = assert!(
+     cfg!(target_endian = "little"),
+diff --git a/src/jsc/FFI.rs b/src/jsc/FFI.rs
+index cba54c82..cca49262 100644
+--- a/src/jsc/FFI.rs
++++ b/src/jsc/FFI.rs
+@@ -8,7 +8,9 @@
+ 
+ #![allow(non_snake_case, non_upper_case_globals, clippy::missing_safety_doc)]
+ 
+-use core::ffi::{c_int, c_longlong, c_void};
++use core::ffi::c_void;
++#[cfg(target_pointer_width = "64")]
++use core::ffi::{c_int, c_longlong};
+ 
+ use bun_jsc::JSValue;
+ 
+@@ -48,5 +50,7 @@ const TRUE_I64: i64 = ((2 | 4) | 1) as i64;
+ static ValueTrue: bun_core::RacyCell<EncodedJSValue> =
+     bun_core::RacyCell::new(EncodedJSValue { as_int64: TRUE_I64 });
+ 
++#[cfg(target_pointer_width = "64")]
+ const DOUBLE_ENCODE_OFFSET_BIT: c_int = 49;
++#[cfg(target_pointer_width = "64")]
+ pub(crate) const DOUBLE_ENCODE_OFFSET: c_longlong = (1 as c_longlong) << DOUBLE_ENCODE_OFFSET_BIT;
+diff --git a/src/jsc/JSGlobalObject.rs b/src/jsc/JSGlobalObject.rs
+index 032eacd0..d34275de 100644
+--- a/src/jsc/JSGlobalObject.rs
++++ b/src/jsc/JSGlobalObject.rs
+@@ -307,9 +307,9 @@ impl JSGlobalObject {
+ 
+     #[inline]
+     pub fn to_js_value(&self) -> JSValue {
+-        // JSValue is #[repr(transparent)] over the encoded pointer-width word; a
+-        // cell pointer is encoded as its address.
+-        JSValue::from_encoded(std::ptr::from_ref::<Self>(self) as usize)
++        // The global object is a cell; from_cell picks the encoding
++        // (raw address on JSVALUE64, CellTag-qualified on 32_64).
++        JSValue::from_cell(std::ptr::from_ref::<Self>(self))
+     }
+ 
+     pub fn throw_invalid_arguments(&self, args: Arguments<'_>) -> JsError {
+diff --git a/src/jsc/JSValue.rs b/src/jsc/JSValue.rs
+index ed019c91..1e64e281 100644
+--- a/src/jsc/JSValue.rs
++++ b/src/jsc/JSValue.rs
+@@ -13,8 +13,11 @@ use crate::array_buffer::MarkedArrayBuffer_deallocator;
+ use crate::{
+     AnyPromise, ArrayBuffer, BuiltinName, JSArrayIterator, JSGlobalObject, JSInternalPromise,
+     JSObject, JSPromise, JSString, JSType, JsClass, JsError, JsResult, ZigException,
+-    bun_string_jsc, ffi, host_fn,
++    bun_string_jsc, host_fn,
+ };
++// Only the JSVALUE64 double decode reads DOUBLE_ENCODE_OFFSET.
++#[cfg(target_pointer_width = "64")]
++use crate::ffi;
+ 
+ /// ABI-compatible with `EncodedJSValue` (`#[repr(transparent)]` over the
+ /// encoded 64-bit word, `Copy`, `!Send`).
+@@ -28,7 +31,15 @@ use crate::{
+ // `from_raw` is the signed view where sign-correct math matters.
+ #[repr(transparent)]
+ #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+-pub struct JSValue(pub usize, PhantomData<*const ()>);
++pub struct JSValue(pub EncodedBits, PhantomData<*const ()>);
++
++/// `EncodedJSValue` is `int64_t` on EVERY target. 64-bit targets spell it
++/// `usize` (historical; leaf modules do pointer math on `.0`); wasm32 uses
++/// `u64` and the JSVALUE32_64 tag<<32|payload encoding below.
++#[cfg(target_pointer_width = "64")]
++pub type EncodedBits = usize;
++#[cfg(target_pointer_width = "32")]
++pub type EncodedBits = u64;
+ 
+ const _: () = assert!(
+     core::mem::size_of::<JSValue>() == core::mem::size_of::<i64>(),
+@@ -41,39 +52,65 @@ const _: () = assert!(
+ impl JSValue {
+     /// Typically means an exception was thrown.
+     pub const ZERO: JSValue = JSValue(0, PhantomData);
++    #[cfg(target_pointer_width = "64")]
+     pub const UNDEFINED: JSValue = JSValue(0xa, PhantomData);
++    #[cfg(target_pointer_width = "64")]
+     pub const NULL: JSValue = JSValue(0x2, PhantomData);
++    #[cfg(target_pointer_width = "64")]
+     pub const TRUE: JSValue = JSValue(0x7, PhantomData);
++    #[cfg(target_pointer_width = "64")]
+     pub const FALSE: JSValue = JSValue(0x6, PhantomData);
++    // JSVALUE32_64 (JSCJSValue.h): tag in the high word, payload low.
++    // UndefinedTag=0xfffffffc NullTag=0xfffffffd BooleanTag=0xfffffffe.
++    #[cfg(target_pointer_width = "32")]
++    pub const UNDEFINED: JSValue = JSValue(0xfffffffc_00000000, PhantomData);
++    #[cfg(target_pointer_width = "32")]
++    pub const NULL: JSValue = JSValue(0xfffffffd_00000000, PhantomData);
++    #[cfg(target_pointer_width = "32")]
++    pub const TRUE: JSValue = JSValue(0xfffffffe_00000001, PhantomData);
++    #[cfg(target_pointer_width = "32")]
++    pub const FALSE: JSValue = JSValue(0xfffffffe_00000000, PhantomData);
+ 
+     /// `JSC::JSValue::ValueDeleted` (0x4) — sentinel returned by
+     /// `getIfPropertyExistsImpl` / `fastGet` when the property does not exist.
+     /// Deleted is a special encoding used in JSC hash-map internals for the
+     /// null state; it is re-used here for "not present".
++    #[cfg(target_pointer_width = "64")]
+     pub(crate) const PROPERTY_DOES_NOT_EXIST: JSValue = JSValue(0x4, PhantomData);
++    // DeletedValueTag = 0xfffffff9.
++    #[cfg(target_pointer_width = "32")]
++    pub(crate) const PROPERTY_DOES_NOT_EXIST: JSValue = JSValue(0xfffffff9_00000000, PhantomData);
+ 
+     /// Construct a JSValue from an opaque encoded bit-pattern.
+     #[inline]
+-    pub const fn from_encoded(bits: usize) -> JSValue {
++    pub const fn from_encoded(bits: EncodedBits) -> JSValue {
+         JSValue(bits, PhantomData)
+     }
+     /// Read the raw encoded bit-pattern.
+     #[inline]
+-    pub const fn encoded(self) -> usize {
++    pub const fn encoded(self) -> EncodedBits {
+         self.0
+     }
+     #[inline]
+     pub(crate) const fn from_raw(raw: i64) -> JSValue {
+-        JSValue(raw as usize, PhantomData)
++        JSValue(raw as u64 as EncodedBits, PhantomData)
+     }
+ 
+-    /// Wrap a JSCell pointer as a JSValue (cell-tagged JSValues *are* the
+-    /// pointer — `NotCellMask` bits are zero). Mirrors `JSValue.fromCell`.
++    /// Wrap a JSCell pointer as a JSValue. On JSVALUE64 cell-tagged values
++    /// *are* the pointer (`NotCellMask` bits zero); JSVALUE32_64 adds the
++    /// CellTag high word. Mirrors `JSValue.fromCell`.
++    #[cfg(target_pointer_width = "64")]
+     #[inline]
+     pub fn from_cell<T>(cell: *const T) -> JSValue {
+         debug_assert!(!cell.is_null());
+         JSValue(cell as usize, PhantomData)
+     }
++    #[cfg(target_pointer_width = "32")]
++    #[inline]
++    pub fn from_cell<T>(cell: *const T) -> JSValue {
++        debug_assert!(!cell.is_null());
++        JSValue((0xfffffffbu64 << 32) | (cell as usize as u64), PhantomData)
++    }
+ 
+     /// `JSValue.fromPtrAddress` — encode an arbitrary native pointer as a JS
+     /// number (round-trips via `as_promise_ptr`). Used to smuggle a `*mut T`
+@@ -185,7 +222,7 @@ impl JSValue {
+     /// Reinterpret a raw pointer's address as a JSValue bit-pattern.
+     #[inline]
+     pub fn cast<T>(ptr: *const T) -> JSValue {
+-        JSValue(ptr as usize, PhantomData)
++        JSValue(ptr as usize as EncodedBits, PhantomData)
+     }
+ }
+ 
+@@ -209,10 +246,17 @@ impl JSValue {
+     pub fn is_null(self) -> bool {
+         self.0 == Self::NULL.0
+     }
++    #[cfg(target_pointer_width = "64")]
+     #[inline]
+     pub fn is_undefined_or_null(self) -> bool {
+         (self.0 | 0x8) == 0xa
+     }
++    #[cfg(target_pointer_width = "32")]
++    #[inline]
++    pub fn is_undefined_or_null(self) -> bool {
++        // UndefinedTag | 1 == NullTag.
++        (self.tag() | 1) == 0xfffffffd
++    }
+     #[inline]
+     pub fn is_empty_or_undefined_or_null(self) -> bool {
+         self.is_empty() || self.is_undefined_or_null()
+@@ -221,22 +265,47 @@ impl JSValue {
+     pub fn is_boolean(self) -> bool {
+         self.0 == Self::TRUE.0 || self.0 == Self::FALSE.0
+     }
++    #[cfg(target_pointer_width = "64")]
+     #[inline]
+     pub fn is_cell(self) -> bool {
+         // NotCellMask = NumberTag | OtherTag (0xfffe_0000_0000_0000 | 0x2).
+         const NOT_CELL_MASK: usize = 0xfffe_0000_0000_0002;
+         !self.is_empty() && (self.0 & NOT_CELL_MASK) == 0
+     }
++    #[cfg(target_pointer_width = "32")]
++    #[inline]
++    pub fn is_cell(self) -> bool {
++        self.tag() == 0xfffffffb // CellTag
++    }
++    #[cfg(target_pointer_width = "64")]
+     #[inline]
+     pub fn is_int32(self) -> bool {
+         const NUMBER_TAG: usize = 0xfffe_0000_0000_0000;
+         (self.0 & NUMBER_TAG) == NUMBER_TAG
+     }
++    #[cfg(target_pointer_width = "32")]
++    #[inline]
++    pub fn is_int32(self) -> bool {
++        self.tag() == 0xffffffff // Int32Tag
++    }
++    #[cfg(target_pointer_width = "64")]
+     #[inline]
+     pub fn is_number(self) -> bool {
+         const NUMBER_TAG: usize = 0xfffe_0000_0000_0000;
+         (self.0 & NUMBER_TAG) != 0
+     }
++    #[cfg(target_pointer_width = "32")]
++    #[inline]
++    pub fn is_number(self) -> bool {
++        // Doubles are any tag below LowestTag (DeletedValueTag = 0xfffffff9).
++        self.is_int32() || self.tag() < 0xfffffff9
++    }
++    /// JSVALUE32_64's high word.
++    #[cfg(target_pointer_width = "32")]
++    #[inline]
++    pub(crate) fn tag(self) -> u32 {
++        (self.0 >> 32) as u32
++    }
+     #[inline]
+     pub fn is_double(self) -> bool {
+         self.is_number() && !self.is_int32()
+@@ -467,12 +536,18 @@ impl JSValue {
+     pub fn js_boolean(b: bool) -> JSValue {
+         if b { Self::TRUE } else { Self::FALSE }
+     }
++    #[cfg(target_pointer_width = "64")]
+     #[inline]
+     pub fn js_number_from_int32(i: i32) -> JSValue {
+         // NumberTag | i (low 32 bits).
+         const NUMBER_TAG: usize = 0xfffe_0000_0000_0000;
+         JSValue(NUMBER_TAG | (i as u32 as usize), PhantomData)
+     }
++    #[cfg(target_pointer_width = "32")]
++    #[inline]
++    pub fn js_number_from_int32(i: i32) -> JSValue {
++        JSValue((0xffffffffu64 << 32) | u64::from(i as u32), PhantomData)
++    }
+     pub fn js_number_from_uint64(i: u64) -> JSValue {
+         if i <= i32::MAX as u64 {
+             Self::js_number_from_int32(i as i32)
+@@ -510,11 +585,19 @@ impl JSValue {
+     /// *always* as a double-encoded immediate (no int32 fast path). Required
+     /// when the consumer round-trips through `f64::to_bits` / `as_number` and
+     /// must see the original bit pattern (e.g. [`from_ptr_address`]).
++    #[cfg(target_pointer_width = "64")]
+     #[inline]
+     pub(crate) fn js_double_number(n: f64) -> JSValue {
+         const DOUBLE_ENCODE_OFFSET: i64 = 1i64 << 49;
+         JSValue::from_raw((n.to_bits() as i64).wrapping_add(DOUBLE_ENCODE_OFFSET))
+     }
++    #[cfg(target_pointer_width = "32")]
++    #[inline]
++    pub(crate) fn js_double_number(n: f64) -> JSValue {
++        // JSVALUE32_64 stores doubles unboxed; purifyNaN keeps the tag space
++        // (high word >= LowestTag) unreachable.
++        JSValue(Self::purify_nan(n).to_bits(), PhantomData)
++    }
+     pub fn js_empty_string(global: &JSGlobalObject) -> JSValue {
+         JSC__JSValue__jsEmptyString(global)
+     }
+@@ -722,12 +805,19 @@ impl JSValue {
+         debug_assert!(self.is_int32());
+         (self.0 & 0xffff_ffff) as u32 as i32
+     }
++    #[cfg(target_pointer_width = "64")]
+     #[inline]
+     pub fn as_double(self) -> f64 {
+         debug_assert!(self.is_double());
+         // Subtract DoubleEncodeOffset, bitcast to f64.
+         f64::from_bits((self.0 as i64).wrapping_sub(ffi::DOUBLE_ENCODE_OFFSET) as u64)
+     }
++    #[cfg(target_pointer_width = "32")]
++    #[inline]
++    pub fn as_double(self) -> f64 {
++        debug_assert!(self.is_double());
++        f64::from_bits(self.0)
++    }
+     /// Asserts this is a number, undefined, null, or a boolean.
+     pub fn as_number(self) -> f64 {
+         if self.is_int32() {
+diff --git a/src/jsc/Strong.rs b/src/jsc/Strong.rs
+index 44ca97cd..994d0309 100644
+--- a/src/jsc/Strong.rs
++++ b/src/jsc/Strong.rs
+@@ -169,7 +169,12 @@ bun_opaque::opaque_ffi! {
+ impl Impl {
+     // Low 48 bits of the handle point at the `WriteBarrier<Unknown>` slot (a
+     // `JSC::JSValue`); see `encodeStrongRef` in StrongRef.cpp.
++    #[cfg(target_pointer_width = "64")]
+     const SLOT_MASK: usize = (1usize << 48) - 1;
++    // 32-bit pointers already fit; the mask is a no-op (mirrors the C++,
++    // where the uintptr_t mask truncates to a no-op too).
++    #[cfg(target_pointer_width = "32")]
++    const SLOT_MASK: usize = usize::MAX;
+ 
+     #[inline(always)]
+     fn slot_ptr(this: NonNull<Impl>) -> *mut crate::DecodedJSValue {
+diff --git a/src/jsc/event_loop.rs b/src/jsc/event_loop.rs
+index aa9643fe..591679ef 100644
+--- a/src/jsc/event_loop.rs
++++ b/src/jsc/event_loop.rs
+@@ -1144,7 +1144,7 @@ impl EventLoop {
+     pub fn tick_possibly_forever(&mut self) {
+         let loop_ptr = self.usockets_loop();
+ 
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "wasi"))]
+         {
+             let pending_unref = self.vm_ref().take_pending_unref();
+             if pending_unref > 0 {
+diff --git a/src/jsc/lib.rs b/src/jsc/lib.rs
+index 377b657f..035bf2a1 100644
+--- a/src/jsc/lib.rs
++++ b/src/jsc/lib.rs
+@@ -178,7 +178,7 @@ pub mod weak;
+ pub mod zig_string;
+ 
+ pub use self::js_value::{
+-    CoerceTo, ComparisonResult, ForEachCallback, FromAny, FromJsEnum, JSValue,
++    CoerceTo, ComparisonResult, EncodedBits, ForEachCallback, FromAny, FromJsEnum, JSValue,
+     Protected as ProtectedJSValue, ProxyField, SerializedFlags, SerializedScriptValue,
+ };
+ 
 diff --git a/src/libarchive/lib.rs b/src/libarchive/lib.rs
 index 3965e9b4..6c30a3d8 100644
 --- a/src/libarchive/lib.rs

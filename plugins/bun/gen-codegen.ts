@@ -68,4 +68,10 @@ await $`bash -c ${"mkdir -p /tmp/bun-codegen-root"}`;
 await $`env TARGET_PLATFORM=linux TARGET_ARCH=x64 bun ${dir}/bun/src/codegen/bundle-modules.ts --debug=OFF /tmp/bun-codegen-root`.cwd(dir + "/bun");
 await $`bash -c ${"cp -r /tmp/bun-codegen-root/codegen/* " + dir + "/codegen/"}`;
 await $`bun ${dir}/bun/src/codegen/generate-node-errors.ts ${dir}/codegen`.cwd(dir + "/bun");
+// bun_runtime's build.rs artifacts: the .classes.ts bindings, stream sinks,
+// and host exports.
+const classFiles = (await $`bash -c ${"find src -name '*.classes.ts'"}`.cwd(dir + "/bun").text()).trim().split("\n");
+await $`bun ${dir}/bun/src/codegen/generate-classes.ts ${classFiles} ${dir}/codegen`.cwd(dir + "/bun");
+await $`bun ${dir}/bun/src/codegen/generate-jssink.ts ${dir}/codegen`.cwd(dir + "/bun");
+await $`bun ${dir}/bun/src/codegen/generate-host-exports.ts ${dir}/codegen`.cwd(dir + "/bun");
 console.log("wrote codegen/{json,xml}_byte_class.{h,rs} + build_options.rs + jsc-tier codegen");
