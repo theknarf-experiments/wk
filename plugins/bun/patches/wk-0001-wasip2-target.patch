@@ -1,0 +1,735 @@
+diff --git a/src/analytics/lib.rs b/src/analytics/lib.rs
+index 07fa5303..c3c5ab72 100644
+--- a/src/analytics/lib.rs
++++ b/src/analytics/lib.rs
+@@ -341,6 +341,7 @@ pub enum OperatingSystem {
+     Wsl,
+     Android,
+     Freebsd,
++    Wasi,
+ }
+ 
+ #[derive(Copy, Clone)]
+@@ -431,6 +432,13 @@ pub mod generate_header {
+                         version: &[],
+                     };
+                 }
++                #[cfg(target_os = "wasi")]
++                {
++                    return Platform {
++                        os: OperatingSystem::Wasi,
++                        version: &[],
++                    };
++                }
+             })
+         }
+ 
+diff --git a/src/bun_alloc/baby_vec.rs b/src/bun_alloc/baby_vec.rs
+index 97e14932..daea5a01 100644
+--- a/src/bun_alloc/baby_vec.rs
++++ b/src/bun_alloc/baby_vec.rs
+@@ -24,7 +24,7 @@ pub struct BabyVec<'a, T> {
+     alloc: &'a MimallocArena,
+ }
+ 
+-const _: () = assert!(size_of::<BabyVec<'static, u8>>() == 24);
++const _: () = assert!(size_of::<BabyVec<'static, u8>>() == 2 * size_of::<usize>() + 8);
+ 
+ // SAFETY: same as `Vec<T, &MimallocArena>` — `Send`/`Sync` follow `T` and the
+ // allocator handle (`&MimallocArena: Sync` is already declared upstream; the
+diff --git a/src/bun_alloc/basic.rs b/src/bun_alloc/basic.rs
+index f586006b..876200f5 100644
+--- a/src/bun_alloc/basic.rs
++++ b/src/bun_alloc/basic.rs
+@@ -114,7 +114,9 @@ static C_ALLOCATOR_VTABLE: &AllocatorVTable = &AllocatorVTable {
+ mod memory_allocator_tags {
+     use core::ffi::c_void;
+ 
+-    const DEFAULT_ALLOCATOR_TAG: usize = 0xBEEFA110C; // "BEEFA110C"  beef a110c i guess
++    // Truncates to 0xEEFA110C on 32-bit targets — still non-null, which is
++    // the only property the tag pointer needs.
++    const DEFAULT_ALLOCATOR_TAG: usize = 0xBEEFA110Cu64 as usize; // "BEEFA110C"  beef a110c i guess
+     pub(crate) const DEFAULT_ALLOCATOR_TAG_PTR: *mut c_void = DEFAULT_ALLOCATOR_TAG as *mut c_void;
+ }
+ 
+diff --git a/src/bun_alloc/lib.rs b/src/bun_alloc/lib.rs
+index d9968341..8878b52b 100644
+--- a/src/bun_alloc/lib.rs
++++ b/src/bun_alloc/lib.rs
+@@ -756,6 +756,11 @@ pub fn page_size() -> usize {
+             }
+             sysconf(libc::_SC_PAGESIZE) as usize
+         }
++        #[cfg(target_family = "wasm")]
++        {
++            // The wasm page size, fixed by the spec; WASI has no sysconf.
++            65536
++        }
+         #[cfg(windows)]
+         {
+             // Local `#[repr(C)]` mirror so this crate stays leaf (no
+@@ -809,10 +814,25 @@ pub enum Tag {
+ 
+ // `ZigString` pointer-tag scheme — single source of truth.
+ // Flag bits live in the POINTER's high byte; untagging truncates to 53 bits.
++#[cfg(target_pointer_width = "64")]
+ pub(crate) const ZS_UTF8_BIT: usize = 1usize << 61;
++#[cfg(target_pointer_width = "64")]
+ pub(crate) const ZS_GLOBAL_BIT: usize = 1usize << 62;
++#[cfg(target_pointer_width = "64")]
+ pub(crate) const ZS_16BIT_BIT: usize = 1usize << 63;
++#[cfg(target_pointer_width = "64")]
+ pub(crate) const ZS_UNTAG_MASK: usize = (1usize << 53) - 1;
++// 32-bit (wasm32): same scheme in the top 3 bits of the 32-bit word. The
++// untag mask caps tagged string pointers at 512 MiB of linear memory — a
++// guest whose strings sit above that would corrupt them.
++#[cfg(target_pointer_width = "32")]
++pub(crate) const ZS_UTF8_BIT: usize = 1usize << 29;
++#[cfg(target_pointer_width = "32")]
++pub(crate) const ZS_GLOBAL_BIT: usize = 1usize << 30;
++#[cfg(target_pointer_width = "32")]
++pub(crate) const ZS_16BIT_BIT: usize = 1usize << 31;
++#[cfg(target_pointer_width = "32")]
++pub(crate) const ZS_UNTAG_MASK: usize = (1usize << 29) - 1;
+ 
+ /// FFI string slice — `{ ptr: *const u8, len: usize }`.
+ ///
+diff --git a/src/bun_core/Global.rs b/src/bun_core/Global.rs
+index 56a912ae..3fdf9434 100644
+--- a/src/bun_core/Global.rs
++++ b/src/bun_core/Global.rs
+@@ -616,6 +616,11 @@ pub fn set_thread_name(name: &ZStr) {
+         // TODO: use SetThreadDescription or NtSetInformationThread with 0x26 (ThreadNameInformation)
+         // without causing exit code 0xC0000409 (stack buffer overrun) in child process
+     }
++    // WASI has no threads, so nothing to name.
++    #[cfg(target_os = "wasi")]
++    {
++        let _ = name;
++    }
+ }
+ 
+ // ──────────────────────────────────────────────────────────────────────────
+@@ -687,7 +692,7 @@ unsafe extern "C" {
+     safe fn libc_abort() -> !;
+     #[link_name = "raise"]
+     safe fn libc_raise(sig: c_int) -> c_int;
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     #[link_name = "exit"]
+     safe fn libc_exit(code: c_int) -> !;
+     #[cfg(all(unix, not(target_os = "macos")))]
+@@ -722,7 +727,12 @@ pub fn exit(code: u32) -> ! {
+         // `ExitProcess` is `safe fn` (no preconditions; never returns).
+         crate::windows_sys::kernel32::ExitProcess(code)
+     }
+-    #[cfg(not(any(target_os = "macos", windows)))]
++    // wasi-libc has no quick_exit; plain exit is the only way out.
++    #[cfg(target_os = "wasi")]
++    {
++        libc_exit(code as i32)
++    }
++    #[cfg(not(any(target_os = "macos", windows, target_os = "wasi")))]
+     {
+         if env::ENABLE_ASAN {
+             libc_exit(code as i32);
+@@ -785,8 +795,8 @@ pub fn raise_ignoring_panic_handler_raw(sig: c_int) -> ! {
+         }
+     }
+ 
+-    // clear signal handler
+-    #[cfg(not(windows))]
++    // clear signal handler — WASI has no signals to clear.
++    #[cfg(not(any(windows, target_os = "wasi")))]
+     {
+         // SAFETY: zeroed sigset + SIG_DFL handler is a valid Sigaction.
+         unsafe {
+diff --git a/src/bun_core/debug.rs b/src/bun_core/debug.rs
+index 9ff90f16..f76322c3 100644
+--- a/src/bun_core/debug.rs
++++ b/src/bun_core/debug.rs
+@@ -206,7 +206,13 @@ fn is_valid_memory(address: usize) -> bool {
+             && mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0
+             && mbi.Protect & READABLE != 0
+     }
+-    #[cfg(not(windows))]
++    #[cfg(target_family = "wasm")]
++    {
++        // Linear memory is uniformly readable below its current size; there
++        // are no page protections (and no msync) to query.
++        aligned_address < core::arch::wasm32::memory_size(0) * 65536
++    }
++    #[cfg(not(any(windows, target_family = "wasm")))]
+     {
+         // SAFETY: msync only inspects the mapping; aligned_address is page-aligned.
+         let rc = unsafe {
+@@ -278,6 +284,8 @@ impl StackIterator {
+     }
+ }
+ 
++// Only `return_address()`'s x86_64/aarch64 arms read the re-export.
++#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+ pub(crate) const PC_OFFSET: usize = StackIterator::PC_OFFSET;
+ 
+ /// Capture the current thread's call stack.
+diff --git a/src/bun_core/env_var.rs b/src/bun_core/env_var.rs
+index eb14e27b..6c1292db 100644
+--- a/src/bun_core/env_var.rs
++++ b/src/bun_core/env_var.rs
+@@ -739,7 +739,8 @@ macro_rules! platform_specific_new {
+ 
+             /// Retrieve the key of the environment variable for the current platform, if any.
+             pub(crate) fn platform_key() -> Option<&'static ZStr> {
+-                #[cfg(unix)]
++                // WASI environments use POSIX variable names.
++                #[cfg(any(unix, target_os = "wasi"))]
+                 { return $crate::env_var::__key_opt!($posix); }
+                 #[cfg(windows)]
+                 { return $crate::env_var::__key_opt!($windows); }
+diff --git a/src/bun_core/output.rs b/src/bun_core/output.rs
+index 3274e5c0..36357470 100644
+--- a/src/bun_core/output.rs
++++ b/src/bun_core/output.rs
+@@ -270,10 +270,7 @@ pub static TERMINAL_SIZE: crate::AtomicCell<crate::Winsize> =
+ // ──────────────────────────────────────────────────────────────────────────
+ 
+ /// `Source.StreamType` — `File` on native, a fixed-buffer stream on WASM.
+-#[cfg(not(target_arch = "wasm32"))]
+ pub type StreamType = File;
+-#[cfg(target_arch = "wasm32")]
+-pub type StreamType = io::FixedBufferStream; // wasm32 is not built yet; FixedBufferStream is unported.
+ 
+ pub struct Source {
+     pub(crate) stdout_buffer: [u8; 4096],
+@@ -300,19 +297,9 @@ impl Source {
+     // Field-wise placeholder value for the pre-`init()` thread_local slot.
+     // Every field is overwritten by `init()` before use.
+     //
+-    // The pre-init stream placeholder is cfg-split because the two
+-    // `StreamType` aliases have different const surfaces: native
+     // `File::ZEROED` is `Fd::INVALID`, so a pre-init read fails loudly
+-    // instead of aliasing fd 0; `FixedBufferStream` has no `ZEROED` const,
+-    // so the wasm32 arm spells out the empty stream field-wise.
+-    #[cfg(not(target_arch = "wasm32"))]
++    // instead of aliasing fd 0.
+     const ZEROED_STREAM: StreamType = StreamType::ZEROED;
+-    #[cfg(target_arch = "wasm32")]
+-    const ZEROED_STREAM: StreamType = StreamType {
+-        buf: core::ptr::null_mut(),
+-        len: 0,
+-        pos: 0,
+-    };
+ 
+     pub(crate) const ZEROED: Self = Self {
+         stdout_buffer: [0u8; 4096],
+@@ -479,7 +466,6 @@ impl Source {
+         SOURCE_SET.set(true);
+         if !STDOUT_STREAM_SET.load(Ordering::Relaxed) {
+             STDOUT_STREAM_SET.store(true, Ordering::Relaxed);
+-            #[cfg(not(target_arch = "wasm32"))]
+             {
+                 let is_stdout_tty = stdio_tty_flag(1);
+                 if is_stdout_tty {
+@@ -1287,6 +1273,7 @@ fn with_dest_writer<R>(dest: Destination, f: impl FnOnce(*mut io::Writer) -> R)
+ ///
+ /// SAFETY: `w` must point to a live `io::Writer` for the duration of the call
+ /// (guaranteed by `with_dest_writer`'s thread-local-stability invariant).
++#[cfg(not(target_arch = "wasm32"))]
+ unsafe fn write_fmt_raw(w: *mut io::Writer, args: fmt::Arguments<'_>) {
+     struct Raw(*mut io::Writer);
+     impl fmt::Write for Raw {
+@@ -1323,23 +1310,30 @@ fn write_bytes(dest: Destination, bytes: &[u8]) {
+ pub fn print_to(dest: Destination, args: fmt::Arguments<'_>) {
+     #[cfg(target_arch = "wasm32")]
+     {
+-        // wasm32 is not built yet; output is dropped.
+-        let _ = (dest, args);
+-        return;
++        // WASI has real stdio; route through std until the fd-writer stack
++        // below is ported.
++        use std::io::Write;
++        let _ = match dest {
++            Destination::Stderr => std::io::stderr().write_fmt(args),
++            Destination::Stdout => std::io::stdout().write_fmt(args),
++        };
+     }
+-    // PERF: `fmt::Arguments::as_str()` returns Some only when there are no
+-    // interpolations, giving a single `write_bytes(dest, str)` fast path per
+-    // such call site.
+-    if let Some(s) = args.as_str() {
+-        return write_bytes(dest, s.as_bytes());
++    #[cfg(not(target_arch = "wasm32"))]
++    {
++        // PERF: `fmt::Arguments::as_str()` returns Some only when there are no
++        // interpolations, giving a single `write_bytes(dest, str)` fast path per
++        // such call site.
++        if let Some(s) = args.as_str() {
++            return write_bytes(dest, s.as_bytes());
++        }
++        // There's not much we can do if this errors. Especially if it's something like BrokenPipe.
++        with_dest_writer(dest, |w| {
++            // SAFETY: `w` is valid per `with_dest_writer`; `write_fmt_raw` routes
++            // through the vtable without forming a `&mut Writer`, so `Display`
++            // impls that re-enter `print_to`/`flush` cannot alias.
++            unsafe { write_fmt_raw(w, args) };
++        });
+     }
+-    // There's not much we can do if this errors. Especially if it's something like BrokenPipe.
+-    with_dest_writer(dest, |w| {
+-        // SAFETY: `w` is valid per `with_dest_writer`; `write_fmt_raw` routes
+-        // through the vtable without forming a `&mut Writer`, so `Display`
+-        // impls that re-enter `print_to`/`flush` cannot alias.
+-        unsafe { write_fmt_raw(w, args) };
+-    });
+ }
+ 
+ /// Print to stdout
+diff --git a/src/bun_core/string/SmolStr.rs b/src/bun_core/string/SmolStr.rs
+index 05b93a01..1406e214 100644
+--- a/src/bun_core/string/SmolStr.rs
++++ b/src/bun_core/string/SmolStr.rs
+@@ -4,8 +4,11 @@ use bun_alloc::AllocError;
+ 
+ // NOTE: the tag-bit scheme below only works on little-endian systems.
+ const _: () = assert!(cfg!(target_endian = "little"));
+-// NOTE: the packed layout assumes 64-bit pointers (`__ptr` occupies the upper 64 bits of the u128).
+-const _: () = assert!(mem::size_of::<usize>() == 8);
++// NOTE: `__ptr` occupies the upper 64 bits of the u128; the tag and inline
++// length live in that word's top byte, so the raw accessors traffic in `u64`
++// (not `usize`) and only pointer extraction truncates — on 32-bit targets a
++// pointer fits with the tag byte untouched.
++const _: () = assert!(mem::size_of::<usize>() <= 8);
+ 
+ /// This is a string type that stores up to 15 bytes inline on the stack, and heap allocates if it is longer.
+ ///
+@@ -29,8 +32,8 @@ impl Clone for SmolStr {
+     }
+ }
+ 
+-const TAG: usize = 0x8000_0000_0000_0000; // bit 63 of the ptr word == bit 127 of the u128
+-const NEGATED_TAG: usize = !TAG;
++const TAG: u64 = 0x8000_0000_0000_0000; // bit 63 of the ptr word == bit 127 of the u128
++const NEGATED_TAG: u64 = !TAG;
+ 
+ impl SmolStr {
+     // ---- raw field accessors (packed-struct shims) ------------------------
+@@ -52,11 +55,11 @@ impl SmolStr {
+         self.0 = (self.0 & !(0xFFFF_FFFFu128 << 32)) | ((v as u128) << 32);
+     }
+     #[inline]
+-    fn raw_ptr_bits(&self) -> usize {
+-        (self.0 >> 64) as usize
++    fn raw_ptr_bits(&self) -> u64 {
++        (self.0 >> 64) as u64
+     }
+     #[inline]
+-    fn set_raw_ptr_bits(&mut self, v: usize) {
++    fn set_raw_ptr_bits(&mut self, v: u64) {
+         self.0 = (self.0 & 0xFFFF_FFFF_FFFF_FFFFu128) | ((v as u128) << 64);
+     }
+ 
+@@ -74,11 +77,11 @@ impl SmolStr {
+     }
+ 
+     pub fn ptr(&mut self) -> *mut u8 {
+-        (self.raw_ptr_bits() & NEGATED_TAG) as *mut u8
++        (self.raw_ptr_bits() & NEGATED_TAG) as usize as *mut u8
+     }
+ 
+     pub(crate) fn ptr_const(&self) -> *const u8 {
+-        (self.raw_ptr_bits() & NEGATED_TAG) as *const u8
++        (self.raw_ptr_bits() & NEGATED_TAG) as usize as *const u8
+     }
+ 
+     pub(crate) fn mark_inlined(&mut self) {
+@@ -111,7 +114,7 @@ impl SmolStr {
+         let mut smol_str = SmolStr(0);
+         smol_str.set_raw_len(len);
+         smol_str.set_raw_cap(cap);
+-        smol_str.set_raw_ptr_bits(p as usize);
++        smol_str.set_raw_ptr_bits(p as usize as u64);
+         smol_str.mark_heap();
+         smol_str
+     }
+diff --git a/src/bun_core/string/mod.rs b/src/bun_core/string/mod.rs
+index 2e7a65b2..9e311f47 100644
+--- a/src/bun_core/string/mod.rs
++++ b/src/bun_core/string/mod.rs
+@@ -65,7 +65,12 @@ pub struct String(pub bun_alloc::String);
+ // C++ mirror: `struct BunString { BunStringTag tag; BunStringImpl impl; }`
+ // (`headers-handwritten.h`); returned **by value** from every `BunString__*`
+ // FFI below, so size/align drift is silent ABI corruption.
++#[cfg(target_pointer_width = "64")]
+ crate::assert_ffi_layout!(String, 24, 8);
++// 32-bit (wasm32): tag u8 + 4-byte-aligned 8-byte impl union. There is no
++// C++ peer yet on this target; the assert pins the Rust side only.
++#[cfg(target_pointer_width = "32")]
++crate::assert_ffi_layout!(String, 12, 4);
+ // FFI surface from `src/jsc/bindings/BunString.cpp`. All return a fresh
+ // WTF-backed `String` with refcount = 1; caller must `deref()` (or transfer).
+ unsafe extern "C" {
+diff --git a/src/bun_core/util.rs b/src/bun_core/util.rs
+index 1e90288e..ef3ee566 100644
+--- a/src/bun_core/util.rs
++++ b/src/bun_core/util.rs
+@@ -2224,7 +2224,7 @@ unsafe extern "C" {
+     /// only pointer-validity precondition, so `safe fn` discharges the
+     /// link-time proof and `nano_timestamp`/`Timespec::now_real` call it
+     /// directly.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     safe fn clock_gettime(clk_id: libc::clockid_t, tp: &mut libc::timespec) -> core::ffi::c_int;
+     /// Bun C++ shim over `QueryPerformanceCounter` (c-bindings.cpp). Infallible
+     /// on Windows XP+; out-params are `&mut i64` so pointer validity is typed.
+@@ -2729,7 +2729,12 @@ fn os_entropy(bytes: &mut [u8]) {
+             filled += rc as usize;
+         }
+     }
+-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
++    #[cfg(any(
++        target_os = "macos",
++        target_os = "ios",
++        target_os = "freebsd",
++        target_os = "wasi"
++    ))]
+     {
+         // getentropy caps at 256 bytes per call.
+         for chunk in bytes.chunks_mut(256) {
+@@ -2782,6 +2787,17 @@ pub fn self_exe_path() -> crate::CrateResult<&'static ZStr> {
+             use std::os::unix::ffi::OsStringExt;
+             Ok(ZBox::from_vec_with_nul(path.into_os_string().into_vec()))
+         }
++        #[cfg(target_os = "wasi")]
++        {
++            // `std::os::wasi::ffi::OsStringExt` is unstable on wasip2; WASI
++            // paths are UTF-8, so go through `String`.
++            let bytes = path
++                .into_os_string()
++                .into_string()
++                .map_err(|_| crate::CrateError::Unexpected)?
++                .into_bytes();
++            Ok(ZBox::from_vec_with_nul(bytes))
++        }
+         #[cfg(windows)]
+         {
+             // Store the WTF-8 form. `into_string()` rejects unpaired
+@@ -4487,7 +4503,13 @@ pub fn reload_process(clear_terminal: bool, may_return: bool) {
+         panic!("Unexpected error while reloading: errno {}", errno);
+     }
+ 
+-    #[cfg(not(any(unix, windows)))]
++    // WASI has no execve; `bun --watch` reload is meaningless in a wasm guest.
++    #[cfg(target_os = "wasi")]
++    {
++        let _ = (clear_terminal, may_return);
++        panic!("reload_process is not supported on WASI");
++    }
++    #[cfg(not(any(unix, windows, target_os = "wasi")))]
+     {
+         // Bun only targets POSIX + Windows; any other target
+         // is a build-time error, not a runtime panic.
+@@ -5065,7 +5087,7 @@ impl Timespec {
+     }
+ 
+     fn now_real() -> Timespec {
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "wasi"))]
+         {
+             let mut ts = libc::timespec {
+                 tv_sec: 0,
+@@ -5074,7 +5096,8 @@ impl Timespec {
+             clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+             Timespec {
+                 sec: ts.tv_sec,
+-                nsec: ts.tv_nsec,
++                // `c_long` nsec is i32 on wasm32.
++                nsec: ts.tv_nsec.into(),
+             }
+         }
+         #[cfg(windows)]
+diff --git a/src/cares_sys/c_ares.rs b/src/cares_sys/c_ares.rs
+index 7c07c672..b1b320c8 100644
+--- a/src/cares_sys/c_ares.rs
++++ b/src/cares_sys/c_ares.rs
+@@ -68,22 +68,50 @@ impl EAI {
+     #[cfg(not(target_os = "linux"))]
+     pub(crate) const ADDRFAMILY: Self = Self(1);
+ 
++    // The libc crate doesn't export EAI_* for WASI; wasi-libc's <netdb.h>
++    // uses the glibc values, hardcoded like ADDRFAMILY above.
++    #[cfg(not(target_os = "wasi"))]
+     pub(crate) const AGAIN: Self = Self(libc::EAI_AGAIN);
++    #[cfg(target_os = "wasi")]
++    pub(crate) const AGAIN: Self = Self(-3);
++    #[cfg(not(target_os = "wasi"))]
+     pub(crate) const BADFLAGS: Self = Self(libc::EAI_BADFLAGS);
++    #[cfg(target_os = "wasi")]
++    pub(crate) const BADFLAGS: Self = Self(-1);
++    #[cfg(not(target_os = "wasi"))]
+     pub(crate) const FAIL: Self = Self(libc::EAI_FAIL);
++    #[cfg(target_os = "wasi")]
++    pub(crate) const FAIL: Self = Self(-4);
++    #[cfg(not(target_os = "wasi"))]
+     pub(crate) const FAMILY: Self = Self(libc::EAI_FAMILY);
++    #[cfg(target_os = "wasi")]
++    pub(crate) const FAMILY: Self = Self(-6);
++    #[cfg(not(target_os = "wasi"))]
+     pub(crate) const MEMORY: Self = Self(libc::EAI_MEMORY);
++    #[cfg(target_os = "wasi")]
++    pub(crate) const MEMORY: Self = Self(-10);
+     // RFC 3493 dropped EAI_NODATA; FreeBSD's <netdb.h> only exposes it under
+     // __BSD_VISIBLE (historical value 7) and the libc crate omits it entirely.
+-    #[cfg(not(any(target_os = "freebsd", target_os = "dragonfly")))]
++    #[cfg(not(any(target_os = "freebsd", target_os = "dragonfly", target_os = "wasi")))]
+     pub(crate) const NODATA: Self = Self(libc::EAI_NODATA);
++    #[cfg(target_os = "wasi")]
++    pub(crate) const NODATA: Self = Self(-5);
+     #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+     pub(crate) const NODATA: Self = Self(7);
++    #[cfg(not(target_os = "wasi"))]
+     pub(crate) const NONAME: Self = Self(libc::EAI_NONAME);
++    #[cfg(target_os = "wasi")]
++    pub(crate) const NONAME: Self = Self(-2);
++    #[cfg(not(target_os = "wasi"))]
+     pub(crate) const SERVICE: Self = Self(libc::EAI_SERVICE);
++    #[cfg(target_os = "wasi")]
++    pub(crate) const SERVICE: Self = Self(-8);
+     #[cfg(any(target_os = "linux", target_os = "android"))]
+     pub(crate) const SOCKTYPE: Self = Self(libc::EAI_SOCKTYPE);
++    #[cfg(not(target_os = "wasi"))]
+     pub(crate) const SYSTEM: Self = Self(libc::EAI_SYSTEM);
++    #[cfg(target_os = "wasi")]
++    pub(crate) const SYSTEM: Self = Self(-11);
+ 
+     // glibc-only `getaddrinfo_a` / IDN extensions (absent on musl, bionic).
+     #[cfg(all(target_os = "linux", target_env = "gnu"))]
+diff --git a/src/errno/lib.rs b/src/errno/lib.rs
+index 09e327f8..436acd53 100644
+--- a/src/errno/lib.rs
++++ b/src/errno/lib.rs
+@@ -191,6 +191,10 @@ pub use freebsd_errno::*;
+ pub mod linux_errno;
+ #[cfg(any(target_os = "linux", target_os = "android"))]
+ pub use linux_errno::*;
++#[cfg(target_os = "wasi")]
++pub mod wasi_errno;
++#[cfg(target_os = "wasi")]
++pub use wasi_errno::*;
+ #[cfg(windows)]
+ pub mod windows_errno;
+ #[cfg(windows)]
+@@ -213,6 +217,9 @@ pub mod posix {
+     /// Darwin/FreeBSD `mode_t` == `__uint16_t` in `<sys/types.h>`.
+     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+     pub type mode_t = u16;
++    /// wasi-libc `mode_t` == `unsigned int`.
++    #[cfg(target_os = "wasi")]
++    pub type mode_t = u32;
+ 
+     /// Kernel errno enum. `E` and `SystemErrno` share the exact same
+     /// discriminant space on each POSIX target; alias rather than duplicate.
+diff --git a/src/errno/wasi_errno.rs b/src/errno/wasi_errno.rs
+new file mode 100644
+index 00000000..fec084c4
+--- /dev/null
++++ b/src/errno/wasi_errno.rs
+@@ -0,0 +1,131 @@
++// WASI errno table. Values come from wasi-libc's `__errno_values.h`
++// (wasm32-wasip2 sysroot) — WASI inherited CloudABI's alphabetically-ordered
++// errno space, so NO value below matches Linux/Darwin/FreeBSD.
++//
++// `EWOULDBLOCK`/`EOPNOTSUPP` are #define-aliases of `EAGAIN`/`ENOTSUP` in the
++// header; Rust enums need unique discriminants, so they (and the errnos WASI
++// lacks entirely but shared code names, e.g. `ESHUTDOWN`) get synthetic
++// values past the real range — decoding never produces them, mirroring how
++// linux_errno.rs uniquifies `EWOULDBLOCK`.
++pub use crate::posix::E;
++pub use crate::posix::S;
++pub use crate::posix::mode_t as Mode;
++
++#[repr(u16)]
++#[derive(
++    Copy, Clone, Eq, PartialEq, Hash, Debug, strum::IntoStaticStr, strum::EnumString, enum_map::Enum,
++)]
++pub enum SystemErrno {
++    SUCCESS = 0,
++    E2BIG = 1,
++    EACCES = 2,
++    EADDRINUSE = 3,
++    EADDRNOTAVAIL = 4,
++    EAFNOSUPPORT = 5,
++    EAGAIN = 6,
++    EALREADY = 7,
++    EBADF = 8,
++    EBADMSG = 9,
++    EBUSY = 10,
++    ECANCELED = 11,
++    ECHILD = 12,
++    ECONNABORTED = 13,
++    ECONNREFUSED = 14,
++    ECONNRESET = 15,
++    EDEADLK = 16,
++    EDESTADDRREQ = 17,
++    EDOM = 18,
++    EDQUOT = 19,
++    EEXIST = 20,
++    EFAULT = 21,
++    EFBIG = 22,
++    EHOSTUNREACH = 23,
++    EIDRM = 24,
++    EILSEQ = 25,
++    EINPROGRESS = 26,
++    EINTR = 27,
++    EINVAL = 28,
++    EIO = 29,
++    EISCONN = 30,
++    EISDIR = 31,
++    ELOOP = 32,
++    EMFILE = 33,
++    EMLINK = 34,
++    EMSGSIZE = 35,
++    EMULTIHOP = 36,
++    ENAMETOOLONG = 37,
++    ENETDOWN = 38,
++    ENETRESET = 39,
++    ENETUNREACH = 40,
++    ENFILE = 41,
++    ENOBUFS = 42,
++    ENODEV = 43,
++    ENOENT = 44,
++    ENOEXEC = 45,
++    ENOLCK = 46,
++    ENOLINK = 47,
++    ENOMEM = 48,
++    ENOMSG = 49,
++    ENOPROTOOPT = 50,
++    ENOSPC = 51,
++    ENOSYS = 52,
++    ENOTCONN = 53,
++    ENOTDIR = 54,
++    ENOTEMPTY = 55,
++    ENOTRECOVERABLE = 56,
++    ENOTSOCK = 57,
++    ENOTSUP = 58,
++    ENOTTY = 59,
++    ENXIO = 60,
++    EOVERFLOW = 61,
++    EOWNERDEAD = 62,
++    EPERM = 63,
++    EPIPE = 64,
++    EPROTO = 65,
++    EPROTONOSUPPORT = 66,
++    EPROTOTYPE = 67,
++    ERANGE = 68,
++    EROFS = 69,
++    ESPIPE = 70,
++    ESRCH = 71,
++    ESTALE = 72,
++    ETIMEDOUT = 73,
++    ETXTBSY = 74,
++    EXDEV = 75,
++    ENOTCAPABLE = 76,
++    // Synthetic (not real WASI errnos; see header comment).
++    EWOULDBLOCK = 77,
++    EOPNOTSUPP = 78,
++    ESHUTDOWN = 79,
++    EHOSTDOWN = 80,
++    ESOCKTNOSUPPORT = 81,
++    ENODATA = 82,
++    EFTYPE = 83,
++}
++
++impl SystemErrno {
++    pub const MAX: u16 = 84;
++}
++
++#[allow(non_upper_case_globals)]
++pub mod uv_e {
++    // Native `SystemErrno::$e as i32`; libuv-synthetic fallback for the codes
++    // WASI lacks (the four every-POSIX synthetics plus the BSD/SysV strays).
++    macro_rules! __v {
++        (CHARSET,        $e:tt, $uv:tt) => { -::bun_libuv_sys::$uv };
++        (NONET,          $e:tt, $uv:tt) => { -::bun_libuv_sys::$uv };
++        (REMOTEIO,       $e:tt, $uv:tt) => { -::bun_libuv_sys::$uv };
++        (UNATCH,         $e:tt, $uv:tt) => { -::bun_libuv_sys::$uv };
++        (SHUTDOWN,       $e:tt, $uv:tt) => { -::bun_libuv_sys::$uv };
++        (HOSTDOWN,       $e:tt, $uv:tt) => { -::bun_libuv_sys::$uv };
++        (SOCKTNOSUPPORT, $e:tt, $uv:tt) => { -::bun_libuv_sys::$uv };
++        (NODATA,         $e:tt, $uv:tt) => { -::bun_libuv_sys::$uv };
++        (FTYPE,          $e:tt, $uv:tt) => { -::bun_libuv_sys::$uv };
++        ($i:tt,          $e:tt, $uv:tt) => { super::SystemErrno::$e as i32 };
++    }
++    crate::__uv_e_rows!(__v);
++}
++
++// wasi-libc follows the Darwin/FreeBSD convention: every failure returns the
++// all-ones sentinel with the real code in the thread-local errno slot.
++impl_get_errno_libc!(i32, u32, isize, usize, i64);
+diff --git a/src/libuv_sys/lib.rs b/src/libuv_sys/lib.rs
+index 4a2dccc2..9c665866 100644
+--- a/src/libuv_sys/lib.rs
++++ b/src/libuv_sys/lib.rs
+@@ -45,3 +45,10 @@ pub const UV_EFTYPE: core::ffi::c_int = -4028;
+ pub const UV_ENODATA: core::ffi::c_int = -4024;
+ #[cfg(not(windows))]
+ pub const UV_EUNATCH: core::ffi::c_int = -4023;
++// WASI also lacks native errnos for these (values match `libuv::*` above).
++#[cfg(target_os = "wasi")]
++pub const UV_ESHUTDOWN: core::ffi::c_int = -4042;
++#[cfg(target_os = "wasi")]
++pub const UV_EHOSTDOWN: core::ffi::c_int = -4031;
++#[cfg(target_os = "wasi")]
++pub const UV_ESOCKTNOSUPPORT: core::ffi::c_int = -4025;
+diff --git a/src/semver/lib.rs b/src/semver/lib.rs
+index 43495dae..04df15ce 100644
+--- a/src/semver/lib.rs
++++ b/src/semver/lib.rs
+@@ -256,9 +256,12 @@ pub mod semver_string {
+     // Pointers are truncated to 63 bits via this mask.
+     const MAX_ADDRESSABLE_SPACE_MASK: u64 = (1u64 << 63) - 1;
+ 
++    // The packed handle is pure u64 math over (off: u32, len: u32) — no raw
++    // addresses — so 32-bit targets (wasm32) work as-is; wider-than-64-bit
++    // usize would need a new scheme.
+     const _: () = assert!(
+-        core::mem::size_of::<usize>() == 8,
+-        "This code needs to be updated for non-64-bit architectures",
++        core::mem::size_of::<usize>() <= 8,
++        "This code needs to be updated for wider-than-64-bit architectures",
+     );
+ 
+     impl String {
+diff --git a/src/windows_sys/externs.rs b/src/windows_sys/externs.rs
+index f3996922..dc0a70b7 100644
+--- a/src/windows_sys/externs.rs
++++ b/src/windows_sys/externs.rs
+@@ -1143,6 +1143,9 @@ pub mod ws2_32 {
+         pub szDescription: [u8; 257],
+         pub szSystemStatus: [u8; 129],
+     }
++    // The 408-byte layout holds only with 8-byte pointers (`lpVendorInfo`);
++    // on 32-bit targets (wasm32) the type is never used, only compiled.
++    #[cfg(target_pointer_width = "64")]
+     const _: () = assert!(core::mem::size_of::<WSADATA>() == 408);
+ 
+     /// `SOCKADDR_STORAGE` (`ws2def.h`). 128 bytes, 8-aligned.
+@@ -1762,6 +1765,9 @@ pub fn teb() -> *mut TEB {
+         core::arch::asm!("mov {}, x18", out(reg) p, options(nostack, pure, readonly));
+         p
+     }
++    // Compiled (never called) on targets with no OS thread block, e.g. wasm32.
++    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++    unreachable!()
+ }
+ 
+ /// Reads the PEB pointer — `gs:[0x60]` (x64) / `TEB+0x60` (ARM64).
+@@ -1790,6 +1796,9 @@ pub fn peb() -> *const PEB {
+             .cast::<core::ffi::c_void>()
+             .cast::<*const PEB>()
+     }
++    // Compiled (never called) on targets with no OS thread block, e.g. wasm32.
++    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++    unreachable!()
+ }
+ 
+ // ── Console ctrl-handler dwCtrlType values (`wincon.h`) ───────────────────

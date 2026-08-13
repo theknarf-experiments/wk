@@ -1,0 +1,5 @@
+# Build this plugin: `mise run build`
+[tasks.build]
+description = "Build bun's transpiler slice into a wasm component"
+dir = "{{config_root}}"
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build.sh"
