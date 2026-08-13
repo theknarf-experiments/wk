@@ -62,16 +62,45 @@ if [ ! -f native/libmimalloc.a ]; then
         curl -fsSL "https://github.com/oven-sh/mimalloc/archive/$MIMALLOC_COMMIT.tar.gz" | tar xz -C native
         mv "native/mimalloc-$MIMALLOC_COMMIT" native/mimalloc
     fi
+    # No MI_MALLOC_OVERRIDE: mimalloc's gates are defined()-based, so even
+    # =0 overrides malloc/free and collides with wasi-libc's allocator.
     "$WASI_SDK/bin/clang" --target=wasm32-wasip2 -O2 -DNDEBUG \
-        -DMI_MALLOC_OVERRIDE=0 -D_WASI_EMULATED_GETPID \
+        -D_WASI_EMULATED_GETPID \
         -Inative/mimalloc/include -c native/mimalloc/src/static.c -o native/mimalloc.o
     "$WASI_SDK/bin/llvm-ar" rcs native/libmimalloc.a native/mimalloc.o
 fi
 
+# JSC + support archives (build-jsc.sh must have run). Everything goes on the
+# FINAL link line via -C link-arg — `-l static=` in RUSTFLAGS would make every
+# rlib try to bundle the archives. -L points at jsc-build/lib directly because
+# cmake emits THIN archives whose member paths are relative to that directory.
+# libc++/libc++abi + the wasi-emulated libs are copied out of the wasi-sdk
+# sysroot by build-jsc.sh's stage step (never -L the sysroot itself: its
+# libc.a preempts rustc's and breaks the crt).
+if [ ! -f native/jsc-build/lib/libJavaScriptCore.a ]; then
+    echo "run ./build-jsc.sh first (JSC + ICU for wasi)" >&2
+    exit 1
+fi
+for lib in libc++.a libc++abi.a libsetjmp.a libwasi-emulated-getpid.a \
+           libwasi-emulated-signal.a libwasi-emulated-mman.a \
+           libwasi-emulated-process-clocks.a; do
+    [ -f "native/$lib" ] || cp "$WASI_SDK/share/wasi-sysroot/lib/wasm32-wasip2/$lib" native/
+done
+
+N="$PWD/native"
 cd bun
 # wasm-component-ld emits a component directly; wasi_shims.rs (in wk_cli)
-# supplies the JSC-tier symbols and the SIMD-kernel scalar fallbacks.
-RUSTFLAGS="-L ../native -l static=mimalloc" \
+# supplies the JSC-tier symbols and the SIMD-kernel scalar fallbacks;
+# jsc_api.rs drives evaluation (--run) over JSC's C API. 8 MB stack: JSC's
+# reserved zone alone is bigger than wasm-ld's 64 KB default.
+RUSTFLAGS="-C link-arg=-L$N -C link-arg=-L$N/jsc-build/lib \
+    -C link-arg=-lmimalloc -C link-arg=-lJavaScriptCore -C link-arg=-lWTF \
+    -C link-arg=-lbmalloc -C link-arg=-licui18n -C link-arg=-licuuc \
+    -C link-arg=-licudata -C link-arg=-lc++ -C link-arg=-lc++abi \
+    -C link-arg=-lsetjmp -C link-arg=-lwasi-emulated-getpid \
+    -C link-arg=-lwasi-emulated-signal -C link-arg=-lwasi-emulated-mman \
+    -C link-arg=-lwasi-emulated-process-clocks \
+    -C link-arg=-z -C link-arg=stack-size=8388608" \
     cargo +nightly-2026-07-20 build -p bun_wk_cli --target wasm32-wasip2 --profile release-dev
 cd ..
 cp bun/target/wasm32-wasip2/release-dev/bun-transpile.wasm bun-transpile.wasm

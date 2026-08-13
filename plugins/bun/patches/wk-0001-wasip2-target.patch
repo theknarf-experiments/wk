@@ -1,43 +1,3 @@
-diff --git a/Cargo.lock b/Cargo.lock
-index d6de440e..2de2bcfd 100644
---- a/Cargo.lock
-+++ b/Cargo.lock
-@@ -2177,6 +2177,23 @@ dependencies = [
- name = "bun_windows_sys"
- version = "0.0.0"
- 
-+[[package]]
-+name = "bun_wk_cli"
-+version = "0.0.0"
-+dependencies = [
-+ "bun_alloc",
-+ "bun_ast",
-+ "bun_bundler",
-+ "bun_core",
-+ "bun_dotenv",
-+ "bun_errno",
-+ "bun_install_types",
-+ "bun_js_parser",
-+ "bun_options_types",
-+ "bun_transpiler",
-+ "libc",
-+]
-+
- [[package]]
- name = "bun_wyhash"
- version = "0.0.0"
-diff --git a/Cargo.toml b/Cargo.toml
-index 3c3f997a..6bac483b 100644
---- a/Cargo.toml
-+++ b/Cargo.toml
-@@ -101,6 +101,7 @@ members = [
-   "src/spawn_sys",
-   "src/bunfig",
-   "src/bun_bin",
-+  "src/wk_cli",
- ]
- # `vendor/lolhtml` (the `lol_html` crate) is a non-member path dependency,
- # fetched into `vendor/` by `scripts/build/deps/lolhtml.ts` before cargo runs.
 diff --git a/src/analytics/lib.rs b/src/analytics/lib.rs
 index 07fa5303..c3c5ab72 100644
 --- a/src/analytics/lib.rs
@@ -2856,12 +2816,157 @@ index 00000000..ca9afe9b
 +
 +[lints]
 +workspace = true
+diff --git a/src/wk_cli/jsc_api.rs b/src/wk_cli/jsc_api.rs
+new file mode 100644
+index 00000000..5ed1bbba
+--- /dev/null
++++ b/src/wk_cli/jsc_api.rs
+@@ -0,0 +1,139 @@
++//! Minimal bindings to JavaScriptCore's C API (the wasi cloop build from
++//! plugins/bun/build-jsc.sh) — enough to evaluate the transpiler's output
++//! and print. This is the interim execution path; bun's real `*_jsc` bridge
++//! (which speaks the C++ additions layer, not the C API) replaces it as the
++//! port advances.
++
++#![allow(non_snake_case)]
++
++use core::ffi::{c_char, c_uint, c_void};
++
++pub(crate) type JSContextRef = *const c_void;
++pub(crate) type JSGlobalContextRef = *mut c_void;
++pub(crate) type JSValueRef = *const c_void;
++pub(crate) type JSObjectRef = *mut c_void;
++pub(crate) type JSStringRef = *mut c_void;
++type JSObjectCallAsFunctionCallback = unsafe extern "C" fn(
++    ctx: JSContextRef,
++    function: JSObjectRef,
++    this_object: JSObjectRef,
++    argument_count: usize,
++    arguments: *const JSValueRef,
++    exception: *mut JSValueRef,
++) -> JSValueRef;
++
++unsafe extern "C" {
++    fn JSGlobalContextCreate(global_object_class: *mut c_void) -> JSGlobalContextRef;
++    fn JSContextGetGlobalObject(ctx: JSContextRef) -> JSObjectRef;
++    fn JSEvaluateScript(
++        ctx: JSContextRef,
++        script: JSStringRef,
++        this_object: JSObjectRef,
++        source_url: JSStringRef,
++        starting_line_number: i32,
++        exception: *mut JSValueRef,
++    ) -> JSValueRef;
++    fn JSStringCreateWithUTF8CString(string: *const c_char) -> JSStringRef;
++    fn JSStringRelease(string: JSStringRef);
++    fn JSStringGetMaximumUTF8CStringSize(string: JSStringRef) -> usize;
++    fn JSStringGetUTF8CString(string: JSStringRef, buffer: *mut c_char, buffer_size: usize) -> usize;
++    fn JSValueToStringCopy(ctx: JSContextRef, value: JSValueRef, exception: *mut JSValueRef) -> JSStringRef;
++    fn JSValueMakeUndefined(ctx: JSContextRef) -> JSValueRef;
++    fn JSObjectMakeFunctionWithCallback(
++        ctx: JSContextRef,
++        name: JSStringRef,
++        callback: JSObjectCallAsFunctionCallback,
++    ) -> JSObjectRef;
++    fn JSObjectSetProperty(
++        ctx: JSContextRef,
++        object: JSObjectRef,
++        property_name: JSStringRef,
++        value: JSValueRef,
++        attributes: c_uint,
++        exception: *mut JSValueRef,
++    );
++    fn JSObjectMake(ctx: JSContextRef, class: *mut c_void, data: *mut c_void) -> JSObjectRef;
++}
++
++fn js_string(s: &str) -> JSStringRef {
++    let c = std::ffi::CString::new(s).expect("no interior NULs in source");
++    // SAFETY: valid NUL-terminated pointer for the duration of the call.
++    unsafe { JSStringCreateWithUTF8CString(c.as_ptr()) }
++}
++
++fn to_rust_string(ctx: JSContextRef, value: JSValueRef) -> String {
++    // SAFETY: ctx/value are live; a failed copy yields null, mapped to "".
++    unsafe {
++        let js = JSValueToStringCopy(ctx, value, core::ptr::null_mut());
++        if js.is_null() {
++            return String::new();
++        }
++        let cap = JSStringGetMaximumUTF8CStringSize(js);
++        let mut buf = vec![0u8; cap.max(1)];
++        let written = JSStringGetUTF8CString(js, buf.as_mut_ptr().cast(), buf.len());
++        JSStringRelease(js);
++        buf.truncate(written.saturating_sub(1)); // drop the NUL
++        String::from_utf8_lossy(&buf).into_owned()
++    }
++}
++
++unsafe extern "C" fn print_callback(
++    ctx: JSContextRef,
++    _function: JSObjectRef,
++    _this: JSObjectRef,
++    argument_count: usize,
++    arguments: *const JSValueRef,
++    _exception: *mut JSValueRef,
++) -> JSValueRef {
++    use std::io::Write;
++    let mut out = std::io::stdout();
++    for i in 0..argument_count {
++        // SAFETY: JSC passes `argument_count` valid values.
++        let arg = unsafe { *arguments.add(i) };
++        if i > 0 {
++            let _ = out.write_all(b" ");
++        }
++        let _ = out.write_all(to_rust_string(ctx, arg).as_bytes());
++    }
++    let _ = out.write_all(b"\n");
++    let _ = out.flush();
++    // SAFETY: ctx is live.
++    unsafe { JSValueMakeUndefined(ctx) }
++}
++
++/// Evaluate `source` in a fresh global context with `print`/`console.log`
++/// wired to stdout. Returns the uncaught-exception text, if any.
++pub(crate) fn evaluate(source: &str, source_url: &str) -> Result<(), String> {
++    // SAFETY: straight-line C API use; every ref we create is either
++    // released or owned by the context, which lives for the process.
++    unsafe {
++        let ctx = JSGlobalContextCreate(core::ptr::null_mut());
++        let global = JSContextGetGlobalObject(ctx);
++
++        let print_name = js_string("print");
++        let print_fn = JSObjectMakeFunctionWithCallback(ctx, print_name, print_callback);
++        JSObjectSetProperty(ctx, global, print_name, print_fn.cast_const(), 0, core::ptr::null_mut());
++
++        let console = JSObjectMake(ctx, core::ptr::null_mut(), core::ptr::null_mut());
++        for method in ["log", "error", "warn", "info", "debug"] {
++            let name = js_string(method);
++            JSObjectSetProperty(ctx, console, name, print_fn.cast_const(), 0, core::ptr::null_mut());
++            JSStringRelease(name);
++        }
++        let console_name = js_string("console");
++        JSObjectSetProperty(ctx, global, console_name, console.cast_const(), 0, core::ptr::null_mut());
++        JSStringRelease(console_name);
++
++        let script = js_string(source);
++        let url = js_string(source_url);
++        let mut exception: JSValueRef = core::ptr::null();
++        let result = JSEvaluateScript(ctx, script, core::ptr::null_mut(), url, 1, &mut exception);
++        JSStringRelease(script);
++        JSStringRelease(url);
++
++        if result.is_null() && !exception.is_null() {
++            return Err(to_rust_string(ctx, exception));
++        }
++        Ok(())
++    }
++}
 diff --git a/src/wk_cli/main.rs b/src/wk_cli/main.rs
 new file mode 100644
-index 00000000..bd425453
+index 00000000..e9caf1c0
 --- /dev/null
 +++ b/src/wk_cli/main.rs
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,82 @@
 +#![allow(non_snake_case)]
 +//! `bun-transpile` — real Bun transpiling TS/TSX/JSX to stdout inside a wk
 +//! wasm node. Drives the same `Transpiler::transform` pipeline as
@@ -2869,14 +2974,19 @@ index 00000000..bd425453
 +//! wasm yet. Mirrors `Cli::start`'s minimal init: one process-lifetime
 +//! `Log` + `Arena`, then transform each entry point to stdout.
 +
++mod jsc_api;
 +mod wasi_shims;
 +
 +use bun_options_types::schema::api;
 +
 +fn main() {
-+    let args: Vec<String> = std::env::args().collect();
++    let mut args: Vec<String> = std::env::args().collect();
++    // --run: transpile, then execute the result on JSC (the wasi cloop build)
++    // instead of printing it.
++    let run_mode = args.iter().any(|a| a == "--run");
++    args.retain(|a| a != "--run");
 +    if args.len() < 2 {
-+        bun_core::pretty_errorln!("usage: bun-transpile FILE.ts [FILE...]");
++        bun_core::pretty_errorln!("usage: bun-transpile [--run] FILE.ts [FILE...]");
 +        std::process::exit(2);
 +    }
 +
@@ -2902,16 +3012,29 @@ index 00000000..bd425453
 +    });
 +
 +    if let Ok(result) = &result {
-+        // Same as BuildCommand's no-outdir path: buffer-valued outputs go
-+        // straight to stdout.
-+        use std::io::Write;
-+        let mut out = std::io::stdout();
-+        for f in &result.output_files {
-+            if let bun_bundler::options::OutputFileValue::Buffer { bytes } = &f.value {
-+                let _ = out.write_all(bytes);
++        if run_mode {
++            for f in &result.output_files {
++                if let bun_bundler::options::OutputFileValue::Buffer { bytes } = &f.value {
++                    let source = String::from_utf8_lossy(bytes);
++                    if let Err(exception) = jsc_api::evaluate(&source, &args[1]) {
++                        bun_core::pretty_errorln!("uncaught: {}", exception);
++                        bun_core::Output::flush();
++                        std::process::exit(1);
++                    }
++                }
 +            }
++        } else {
++            // Same as BuildCommand's no-outdir path: buffer-valued outputs go
++            // straight to stdout.
++            use std::io::Write;
++            let mut out = std::io::stdout();
++            for f in &result.output_files {
++                if let bun_bundler::options::OutputFileValue::Buffer { bytes } = &f.value {
++                    let _ = out.write_all(bytes);
++                }
++            }
++            let _ = out.flush();
 +        }
-+        let _ = out.flush();
 +    }
 +
 +    if log.errors > 0 || result.is_err() {
