@@ -25,6 +25,7 @@
 
 #include "wkexec.h"
 #include "wkpipe.h"
+#include "exec_host.h"
 
 static void write_all(int fd, const char *buf, size_t len) {
     size_t off = 0;
@@ -205,5 +206,128 @@ int wk_bash_run(const char *command, char **argv, const char *typed) {
     write_all(STDERR_FILENO, r.stderr_data, r.stderr_len);
     int status = r.exit_code;
     wk_result_free(&r);
+    return status;
+}
+
+
+/* --- command substitution: a real subshell, in another instance ------------
+ *
+ * `$(...)' is a subshell whose output the shell reads back, and there is no
+ * fork to make one with. Running it inside this shell is not an option: the
+ * expansion that asked for it is still walking its word list, and re-entering
+ * the executor recycles the cached WORD_DESCs it is holding — bash's object
+ * cache scrambles freed objects with 0xdf, which is exactly the address such a
+ * shell traps on.
+ *
+ * So run it in a *second bash*, started through wk:exec with its stdout on a
+ * pipe. That is a genuine subshell — its own instance, its own memory, its own
+ * caches — so the aliasing cannot arise, and side effects correctly do not
+ * leak back, which is what a subshell means.
+ *
+ * What it does not get is this shell's unexported state: functions and
+ * variables that were never exported are not visible to another instance.
+ * The exported environment is passed along.
+ */
+#define WK_MAX_COMSUB 8
+static wk_child comsub_child[WK_MAX_COMSUB];
+static int comsub_depth;
+
+/* Start `shell -c script' with its stdout on a pipe. Returns a descriptor to
+ * read the output from, or -1; `*tok' identifies the child for the wait. */
+int wk_bash_comsub_start(const char *shell, const char *script, char **envp,
+                         int *tok) {
+    int fds[2];
+
+    if (comsub_depth >= WK_MAX_COMSUB)
+        return -1;
+    if (!shell || !*shell || pipe(fds) != 0)
+        return -1;
+
+    wk_exec_process_borrow_pipe_t wp;
+    if (!wk_pipe_of_fd(fds[1], &wp)) {
+        close(fds[0]);
+        close(fds[1]);
+        return -1;
+    }
+
+    /* The child's environment is this shell's exported one. */
+    size_t nenv = 0;
+    while (envp && envp[nenv])
+        nenv++;
+    exec_host_list_tuple2_string_string_t wenv = {NULL, 0};
+    if (nenv) {
+        wenv.ptr = malloc(nenv * sizeof *wenv.ptr);
+        if (!wenv.ptr) {
+            close(fds[0]);
+            close(fds[1]);
+            return -1;
+        }
+        for (size_t i = 0; i < nenv; i++) {
+            const char *eq = strchr(envp[i], '=');
+            size_t nlen = eq ? (size_t)(eq - envp[i]) : strlen(envp[i]);
+            exec_host_string_t k, v;
+            k.ptr = (uint8_t *)envp[i];
+            k.len = nlen;
+            v.ptr = (uint8_t *)(eq ? eq + 1 : "");
+            v.len = eq ? strlen(eq + 1) : 0;
+            wenv.ptr[i].f0 = k;
+            wenv.ptr[i].f1 = v;
+        }
+        wenv.len = nenv;
+    }
+
+    exec_host_string_t wpath;
+    exec_host_string_set(&wpath, shell);
+    exec_host_string_t wargs_buf[3];
+    /* argv[0] is the shell's own path, not "bash": a substitution inside the
+     * child has to start a third instance, and it finds itself by this. */
+    exec_host_string_set(&wargs_buf[0], (char *)shell);
+    exec_host_string_set(&wargs_buf[1], "-c");
+    exec_host_string_set(&wargs_buf[2], (char *)script);
+    exec_host_list_string_t wargs = {wargs_buf, 3};
+
+    wk_exec_process_stdin_from_t win;
+    win.tag = WK_EXEC_PROCESS_STDIN_FROM_EMPTY;
+    wk_exec_process_stdout_to_t wout, werr;
+    wout.tag = WK_EXEC_PROCESS_STDOUT_TO_PIPE_END;
+    wout.val.pipe_end = wp;
+    werr.tag = WK_EXEC_PROCESS_STDOUT_TO_CAPTURE;
+
+    wk_exec_process_own_child_t child;
+    exec_host_string_t err;
+    bool ok = wk_exec_process_spawn(&wpath, &wargs, &wenv, &win, &wout, &werr,
+                                    &child, &err);
+    free(wenv.ptr);
+    if (!ok) {
+        exec_host_string_free(&err);
+        close(fds[0]);
+        close(fds[1]);
+        return -1;
+    }
+
+    /* Let go of this shell's copy of the write end, or the reader below would
+     * wait for an end-of-file that only the child's exit can no longer give. */
+    close(fds[1]);
+
+    comsub_child[comsub_depth].h = child.__handle;
+    *tok = comsub_depth++;
+    return fds[0];
+}
+
+/* Collect the child started above; returns its exit status. */
+int wk_bash_comsub_wait(int tok) {
+    wk_result r;
+    int status = 127;
+
+    if (tok < 0 || tok >= comsub_depth)
+        return status;
+    if (wk_wait(comsub_child[tok], &r) == 0) {
+        /* stderr was captured rather than piped, so pass it through. */
+        write_all(STDERR_FILENO, r.stderr_data, r.stderr_len);
+        status = r.exit_code;
+    }
+    wk_result_free(&r);
+    if (tok == comsub_depth - 1)
+        comsub_depth--;
     return status;
 }

@@ -175,8 +175,15 @@ afterwards. That save-and-restore is exactly what `dup` is for, which is why it
 could not be done before. **Here-documents work**: bash 5.2 writes a short one into a `pipe()`, which
 this build now has, and a child takes such a pipe as its standard input
 directly — so it streams, and a document larger than the pipe's buffer cannot
-deadlock. Command substitution is still missing: `$(...)` is a subshell whose
-output the shell reads back, and there is no fork to make that subshell with.
+deadlock. **Command substitution works** — `$(...)` and backticks, nested, and with a
+pipeline inside. It is a subshell whose output the shell reads back, and with
+no fork the subshell is a *second bash*, started through `wk:exec` with its
+stdout on a pipe. That is closer to the real thing than running it in place
+would be: side effects correctly do not leak back. Running it in this shell is
+in fact not possible — the word expansion that asked for it is still walking
+its word list, and re-entering the executor recycles the cached `WORD_DESC`s it
+holds. What the child does not inherit is unexported state: functions and
+variables never exported are not visible to another instance.
 `wk images build plugins/bash/Dockerfile --tag wk-shell` packages the lot. Like every other capability it is token-gated (kind `exec`, allowed
 by default): `wk token attenuate <node> 'check if operation($k, $t, $a), $k !=
 "exec"'` revokes it within a tick.

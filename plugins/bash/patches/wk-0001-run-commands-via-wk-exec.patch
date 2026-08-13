@@ -11,7 +11,7 @@
  static int execute_builtin_or_function PARAMS((WORD_LIST *, sh_builtin_func_t *,
  					    SHELL_VAR *,
  					    REDIRECT *, struct fd_bitmap *, int));
-@@ -4463,6 +4467,17 @@
+@@ -4423,6 +4427,17 @@
       statements from affecting the parent shell's environment when they
       should not. */
    dofork = pipe_in != NO_PIPE || pipe_out != NO_PIPE || async;
@@ -29,7 +29,7 @@
  
    /* Something like `%2 &' should restart job 2 in the background, not cause
       the shell to fork here. */
-@@ -4777,9 +4792,34 @@
+@@ -4737,9 +4752,34 @@
  	}
        else
  	{
@@ -66,7 +66,7 @@
  	  if (builtin)
  	    {
  	      if (result > EX_SHERRBASE)
-@@ -5598,9 +5638,58 @@
+@@ -5558,9 +5598,58 @@
  
        get_original_signal (SIGQUIT);
        set_signal_handler (SIGQUIT, SIG_IGN);
@@ -125,7 +125,7 @@
  /* Execute a simple command that is hopefully defined in a disk file
     somewhere.
  
-@@ -5681,7 +5770,89 @@
+@@ -5641,7 +5730,89 @@
  
        maybe_make_export_env ();
        put_command_name_into_env (command);
@@ -215,3 +215,63 @@
  
    /* We have to make the child before we check for the non-existence
       of COMMAND, since we want the error messages to be redirected. */
+--- a/subst.c
++++ b/subst.c
+@@ -6986,7 +6986,57 @@
+   pflags = (interactive && sourcelevel == 0) ? SEVAL_RESETLINE : 0;
+ 
+   old_pid = last_made_pid;
++
++#if defined (WK_EXEC)
++  /* wk: `$(...)' is a subshell whose output the shell reads back, and there is
++     no fork to make one with.
++
++     It cannot be run inside this shell either: the word expansion that asked
++     for it is still walking its word list, and re-entering the executor
++     recycles the cached WORD_DESCs it holds. bash scrambles freed cache
++     objects with 0xdf (ocache.h), which is precisely the address such a shell
++     traps on, and `n=$(...)' — an assignment, where do_assignment_statements
++     is mid-iteration — is where it shows.
++
++     So run it in a second bash, started through wk:exec with its stdout on a
++     pipe. That is a genuine subshell: its own instance, its own caches, and
++     side effects that correctly do not leak back. Reading it, and the word
++     that comes out, stay bash's own read_comsub below.
++
++     What the child does not inherit is unexported state — functions and
++     variables never exported are not visible to another instance. */
++  {
++    extern int wk_bash_comsub_start PARAMS((const char *, const char *, char **, int *));
++    extern int wk_bash_comsub_wait PARAMS((int));
++    char *wk_shell;
++    int wk_fd, wk_tok;
++
++    wk_shell = get_string_value ("BASH");
++    if (wk_shell == 0 || *wk_shell != '/')
++      wk_shell = shell_name;
++
++    maybe_make_export_env ();
++    wk_fd = wk_bash_comsub_start (wk_shell, string, export_env, &wk_tok);
++    if (wk_fd < 0)
++      {
++	sys_error ("%s", _("cannot start subshell for command substitution"));
++	goto error_exit;
++      }
++
++    tflag = 0;
++    istring = read_comsub (wk_fd, quoted, flags, &tflag);
++    close (wk_fd);
+ 
++    last_command_exit_value = wk_bash_comsub_wait (wk_tok);
++    last_command_subst_pid = NO_PID;
++
++    ret = alloc_word_desc ();
++    ret->word = istring;
++    ret->flags = tflag;
++    return ret;
++  }
++#endif /* WK_EXEC */
++
+   /* Pipe the output of executing STRING into the current shell. */
+   if (pipe (fildes) < 0)
+     {
