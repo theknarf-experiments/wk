@@ -2440,6 +2440,43 @@ index 6046c4ad..e0c40c2b 100644
  
  /// In-place RAII wrapper for a libuv `fs_t` request.
  ///
+diff --git a/src/runtime/webcore/FileSink.rs b/src/runtime/webcore/FileSink.rs
+index 86a63c7b..ac77270e 100644
+--- a/src/runtime/webcore/FileSink.rs
++++ b/src/runtime/webcore/FileSink.rs
+@@ -137,7 +137,7 @@ fn is_pollable(mode: sys::Mode) -> bool {
+         let _ = mode;
+         false
+     }
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     {
+         let fmt = mode & (libc::S_IFMT as sys::Mode);
+         fmt == (libc::S_IFIFO as sys::Mode) || fmt == (libc::S_IFSOCK as sys::Mode)
+@@ -148,7 +148,7 @@ fn is_pollable(mode: sys::Mode) -> bool {
+ /// parent type implements the handler trait
+ /// (onClose / onWritable / onError / onWrite) directly.
+ pub type IOWriter = bun_io::StreamingWriter<FileSink>;
+-#[cfg(not(windows))]
++#[cfg(any(unix, target_os = "wasi"))]
+ pub(crate) type Poll = IOWriter;
+ 
+ // `StreamingWriter<P>` requires `P: PosixStreamingWriterParent` (POSIX) /
+diff --git a/src/runtime/webcore/Sink.rs b/src/runtime/webcore/Sink.rs
+index 7d75f6bf..81d9dbb6 100644
+--- a/src/runtime/webcore/Sink.rs
++++ b/src/runtime/webcore/Sink.rs
+@@ -245,7 +245,9 @@ impl<T: JsSinkAbi> JSSink<T> {
+         if let Some(src) = ptr.source() {
+             *src = streams::SourceHandle::JSController(JSValue::ZERO);
+         }
+-        let mut bits: usize = 0;
++        // Raw EncodedJSValue slot written by the C++ side (usize on LP64,
++        // u64 under JSVALUE32_64).
++        let mut bits: bun_jsc::EncodedBits = 0;
+         let result = T::assign_to_stream_extern(
+             global,
+             stream,
 diff --git a/src/s3_signing/credentials.rs b/src/s3_signing/credentials.rs
 index 3996162f..4f3bf815 100644
 --- a/src/s3_signing/credentials.rs
