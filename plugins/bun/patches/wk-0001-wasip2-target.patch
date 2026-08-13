@@ -1,3 +1,42 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index d6de440e..aa4ef42c 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2177,6 +2177,22 @@ dependencies = [
+ name = "bun_windows_sys"
+ version = "0.0.0"
+ 
++[[package]]
++name = "bun_wk_cli"
++version = "0.0.0"
++dependencies = [
++ "bun_alloc",
++ "bun_ast",
++ "bun_core",
++ "bun_dotenv",
++ "bun_errno",
++ "bun_install_types",
++ "bun_js_parser",
++ "bun_options_types",
++ "bun_transpiler",
++ "libc",
++]
++
+ [[package]]
+ name = "bun_wyhash"
+ version = "0.0.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index 3c3f997a..6bac483b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -101,6 +101,7 @@ members = [
+   "src/spawn_sys",
+   "src/bunfig",
+   "src/bun_bin",
++  "src/wk_cli",
+ ]
+ # `vendor/lolhtml` (the `lol_html` crate) is a non-member path dependency,
+ # fetched into `vendor/` by `scripts/build/deps/lolhtml.ts` before cargo runs.
 diff --git a/src/analytics/lib.rs b/src/analytics/lib.rs
 index 07fa5303..c3c5ab72 100644
 --- a/src/analytics/lib.rs
@@ -2740,3 +2779,330 @@ index f3996922..dc0a70b7 100644
  }
  
  // ── Console ctrl-handler dwCtrlType values (`wincon.h`) ───────────────────
+diff --git a/src/wk_cli/Cargo.toml b/src/wk_cli/Cargo.toml
+new file mode 100644
+index 00000000..12619933
+--- /dev/null
++++ b/src/wk_cli/Cargo.toml
+@@ -0,0 +1,26 @@
++# wk's wasm32-wasip2 CLI over the JSC-free transpiler slice — the
++# `bun build --no-bundle`-shaped transform pipeline as a wasi command.
++# Not part of any upstream build; exists for the wk plugin port.
++[package]
++name = "bun_wk_cli"
++version.workspace = true
++edition.workspace = true
++
++[[bin]]
++name = "bun-transpile"
++path = "main.rs"
++
++[dependencies]
++libc.workspace = true
++bun_alloc.workspace = true
++bun_dotenv.workspace = true
++bun_errno.workspace = true
++bun_install_types.workspace = true
++bun_js_parser.workspace = true
++bun_ast.workspace = true
++bun_core.workspace = true
++bun_options_types.workspace = true
++bun_transpiler.workspace = true
++
++[lints]
++workspace = true
+diff --git a/src/wk_cli/main.rs b/src/wk_cli/main.rs
+new file mode 100644
+index 00000000..ec7b0846
+--- /dev/null
++++ b/src/wk_cli/main.rs
+@@ -0,0 +1,44 @@
++#![allow(non_snake_case)]
++//! `bun-transpile` — real Bun transpiling TS/TSX/JSX to stdout inside a wk
++//! wasm node. Drives the same `Transpiler::transform` pipeline as
++//! `bun build --no-bundle`, minus the CLI/JSC tiers that can't exist on
++//! wasm yet. Mirrors `Cli::start`'s minimal init: one process-lifetime
++//! `Log` + `Arena`, then transform each entry point to stdout.
++
++mod wasi_shims;
++
++use bun_options_types::schema::api;
++
++fn main() {
++    let args: Vec<String> = std::env::args().collect();
++    if args.len() < 2 {
++        bun_core::pretty_errorln!("usage: bun-transpile FILE.ts [FILE...]");
++        std::process::exit(2);
++    }
++
++    // Process-lifetime, same as the real CLI (`exec` diverges there; we exit).
++    let arena: &'static bun_alloc::Arena = Box::leak(Box::new(bun_alloc::Arena::new()));
++    let log: &'static mut bun_ast::Log = Box::leak(Box::new(bun_ast::Log::init()));
++    let log_ptr: *mut bun_ast::Log = log;
++
++    let mut opts = api::TransformOptions::default();
++    opts.entry_points = args[1..]
++        .iter()
++        .map(|a| a.as_bytes().to_vec().into_boxed_slice())
++        .collect();
++
++    let result = bun_transpiler::Transpiler::init(arena, log_ptr, opts.clone(), None)
++        .and_then(|t| arena.alloc(t).transform(log_ptr, opts));
++
++    if log.errors > 0 || result.is_err() {
++        let _ = log.print(std::ptr::from_mut::<bun_core::io::Writer>(
++            bun_core::Output::error_writer(),
++        ));
++        if let Err(err) = result {
++            bun_core::pretty_errorln!("<red>error<r>: {:?}", err);
++        }
++        bun_core::Output::flush();
++        std::process::exit(1);
++    }
++    bun_core::Output::flush();
++}
+diff --git a/src/wk_cli/wasi_shims.rs b/src/wk_cli/wasi_shims.rs
+new file mode 100644
+index 00000000..5dd9a524
+--- /dev/null
++++ b/src/wk_cli/wasi_shims.rs
+@@ -0,0 +1,239 @@
++//! Native symbols the transpiler slice references but which live in tiers
++//! that don't exist on wasm yet, in three classes:
++//!
++//! * **WebKit/WTF number machinery** — runtime-reachable from the printer and
++//!   constant folder, so these are real (approximate) implementations, not
++//!   aborts. They come with the JSC port later.
++//! * **JSC/dispatch/package-manager hooks** — referenced but unreachable in a
++//!   transform-only run (`ALLOW_MACROS` is false on wasm, no VM exists);
++//!   no-ops or aborts.
++//! * **BoringSSL X.509 helpers** — cert pretty-printing paths that a
++//!   transpile can't reach; aborts.
++//!
++//! mimalloc / highway / simdutf are NOT stubbed — build.sh compiles the real
++//! libraries with wasi-sdk.
++
++use core::ffi::{c_int, c_void};
++
++// ── WTF number machinery (approximations; JSC port replaces these) ────────
++
++/// `WTF::numberToString` — ES `ToString(Number)`: shortest round-trip
++/// digits, exponent form outside [1e-6, 1e21). Rust's shortest-round-trip
++/// formatter provides the digits; the exponent styling is applied here.
++#[unsafe(no_mangle)]
++extern "C" fn WTF__dtoa(buf: &mut [u8; 124], number: f64) -> usize {
++    let s = if number.is_nan() {
++        "NaN".to_string()
++    } else if number.is_infinite() {
++        if number < 0.0 { "-Infinity" } else { "Infinity" }.to_string()
++    } else if number == 0.0 {
++        "0".to_string()
++    } else if number.abs() >= 1e21 || number.abs() < 1e-6 {
++        // "1.5e30" → "1.5e+30" (ES always signs the exponent).
++        let e = format!("{:e}", number);
++        match e.find('e') {
++            Some(i) if e.as_bytes().get(i + 1) != Some(&b'-') => {
++                format!("{}e+{}", &e[..i], &e[i + 1..])
++            }
++            _ => e,
++        }
++    } else {
++        format!("{}", number)
++    };
++    let n = s.len().min(buf.len());
++    buf[..n].copy_from_slice(&s.as_bytes()[..n]);
++    n
++}
++
++/// `WTF::parseDouble` — JS-semantics prefix parse of a Latin-1 decimal.
++/// Callers feed lexer-validated numeric text, so a longest-valid-prefix
++/// retry loop is enough.
++#[unsafe(no_mangle)]
++unsafe extern "C" fn WTF__parseDouble(bytes: *const u8, length: usize, counted: *mut usize) -> f64 {
++    let s = unsafe { core::slice::from_raw_parts(bytes, length) };
++    let mut end = s.len();
++    while end > 0 {
++        if let Ok(text) = core::str::from_utf8(&s[..end])
++            && let Ok(v) = text.parse::<f64>()
++        {
++            unsafe { *counted = end };
++            return v;
++        }
++        end -= 1;
++    }
++    unsafe { *counted = 0 };
++    f64::NAN
++}
++
++/// JSC's `operationMathPow` — ES `**`: like `powf` except `±1 ** ±Infinity`
++/// is NaN (IEEE says 1).
++#[unsafe(no_mangle)]
++extern "C" fn Bun__JSC__operationMathPow(x: f64, y: f64) -> f64 {
++    if y.is_infinite() && x.abs() == 1.0 {
++        return f64::NAN;
++    }
++    x.powf(y)
++}
++
++/// JSC's `jsToNumber(String)` — ES `ToNumber(string)` for constant folding:
++/// trimmed empty → 0, hex/octal/binary prefixes, `Infinity`, else decimal.
++#[unsafe(no_mangle)]
++unsafe extern "C" fn JSC__jsToNumber(ptr: *const u8, len: usize) -> f64 {
++    let s = unsafe { core::slice::from_raw_parts(ptr, len) };
++    let Ok(s) = core::str::from_utf8(s) else {
++        return f64::NAN;
++    };
++    let t = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
++    if t.is_empty() {
++        return 0.0;
++    }
++    let radix = |p: &str, r: u32| i64::from_str_radix(p, r).map(|v| v as f64).ok();
++    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
++        return radix(hex, 16).unwrap_or(f64::NAN);
++    }
++    if let Some(oct) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
++        return radix(oct, 8).unwrap_or(f64::NAN);
++    }
++    if let Some(bin) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
++        return radix(bin, 2).unwrap_or(f64::NAN);
++    }
++    match t {
++        "Infinity" | "+Infinity" => f64::INFINITY,
++        "-Infinity" => f64::NEG_INFINITY,
++        _ => t.parse::<f64>().unwrap_or(f64::NAN),
++    }
++}
++
++/// Same probe trick as `bun_parsers::native_test_shims` — the caller treats
++/// the result as the recursion floor.
++#[unsafe(no_mangle)]
++extern "C" fn Bun__StackCheck__getMaxStack() -> *mut c_void {
++    let probe: u8 = 0;
++    let approx_sp = (&raw const probe) as usize;
++    (approx_sp.saturating_sub(512 * 1024)) as *mut c_void
++}
++
++// ── Scalar fallbacks for the SIMD kernels the linker kept ─────────────────
++// Same shapes as `bun_parsers::native_test_shims` (which is `cfg(test)`-only).
++// A real highway/simdutf wasi build can replace these later.
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn highway_count_char(haystack: *const u8, len: usize, needle: u8) -> usize {
++    let h = unsafe { core::slice::from_raw_parts(haystack, len) };
++    h.iter().filter(|&&c| c == needle).count()
++}
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn highway_last_index_of_char(haystack: *const u8, len: usize, needle: u8) -> usize {
++    let h = unsafe { core::slice::from_raw_parts(haystack, len) };
++    h.iter().rposition(|&c| c == needle).unwrap_or(len)
++}
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn highway_index_of_any_char(
++    text: *const u8,
++    text_len: usize,
++    chars: *const u8,
++    chars_len: usize,
++) -> usize {
++    let (t, cs) = unsafe {
++        (
++            core::slice::from_raw_parts(text, text_len),
++            core::slice::from_raw_parts(chars, chars_len),
++        )
++    };
++    t.iter().position(|c| cs.contains(c)).unwrap_or(text_len)
++}
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn simdutf__validate_ascii(buf: *const u8, len: usize) -> bool {
++    unsafe { core::slice::from_raw_parts(buf, len) }.is_ascii()
++}
++
++// ── JSC / dispatch / package-manager hooks ────────────────────────────────
++
++#[unsafe(no_mangle)]
++fn __bun_macro_context_init(
++    _transpiler: *mut c_void,
++) -> bun_js_parser::Macro::MacroContext {
++    // `ALLOW_MACROS` is false on wasm; a null-data context makes `get_remap`
++    // return None and `deinit` a no-op if either is ever reached.
++    bun_js_parser::Macro::MacroContext::default()
++}
++
++#[unsafe(no_mangle)]
++fn __bun_dispatch__TranspilerCacheImpl__Jsc__put(
++    _output_code: &[u8],
++    _sourcemap: &[u8],
++    _esm_record: &[u8],
++) {
++    unreachable!("TranspilerCacheImplKind::Jsc is never installed on wasm");
++}
++
++#[unsafe(no_mangle)]
++fn __bun_resolver_init_package_manager(
++    _log: core::ptr::NonNull<bun_ast::Log>,
++    _install: Option<core::ptr::NonNull<bun_options_types::schema::api::BunInstall>>,
++    _env: core::ptr::NonNull<bun_dotenv::Loader>,
++) -> Result<core::ptr::NonNull<dyn bun_install_types::AutoInstaller>, bun_errno::SystemErrno> {
++    // `bun install`-on-resolve needs the package manager tier; not on wasm.
++    Err(bun_errno::SystemErrno::ENOSYS)
++}
++
++#[unsafe(no_mangle)]
++extern "C" fn Bun__WTFStringImpl__destroy(_this: *const c_void) {
++    unreachable!("no WTF strings exist without the JSC tier");
++}
++
++#[unsafe(no_mangle)]
++extern "C" fn URL__getFileURLString(_input: *mut c_void) -> *mut c_void {
++    unreachable!("WebKit URL is part of the JSC tier");
++}
++
++#[unsafe(no_mangle)]
++extern "C" fn bun_restore_stdio() {}
++
++// ── libc gaps in rustc's bundled wasi-libc ────────────────────────────────
++// (`dup` comes from the wasi-sdk sysroot's libc.a, which build.sh puts on
++// the library path — rustc's bundled wasi-libc predates it.)
++
++/// zlib `compress2` — referenced by the sourcemap gzip path, which the
++/// transform pipeline doesn't take. Real zlib arrives with the runtime port.
++#[unsafe(no_mangle)]
++extern "C" fn compress2(
++    _dest: *mut u8,
++    _dest_len: *mut usize,
++    _src: *const u8,
++    _src_len: usize,
++    _level: c_int,
++) -> c_int {
++    unreachable!("zlib not linked on wasm yet (sourcemap gzip)");
++}
++
++// ── BoringSSL X.509 pretty-printing (unreachable from a transpile) ────────
++
++macro_rules! ssl_abort_stubs {
++    ($($name:ident($($arg:ty),*) -> $ret:ty;)+) => {$(
++        #[unsafe(no_mangle)]
++        extern "C" fn $name($(_: $arg),*) -> $ret {
++            unreachable!("BoringSSL is not linked on wasm; no TLS/cert paths exist")
++        }
++    )+};
++}
++ssl_abort_stubs! {
++    ASN1_STRING_to_UTF8(*mut *mut u8, *const c_void) -> c_int;
++    GENERAL_NAME_free(*mut c_void) -> ();
++    OPENSSL_free(*mut c_void) -> ();
++    sk_num(*const c_void) -> usize;
++    sk_pop_free_ex(*mut c_void, *const c_void, *const c_void) -> ();
++    sk_value(*const c_void, usize) -> *mut c_void;
++    X509_get_ext(*const c_void, c_int) -> *mut c_void;
++    X509_get_ext_by_NID(*const c_void, c_int, c_int) -> c_int;
++    X509_get_subject_name(*const c_void) -> *mut c_void;
++    X509_NAME_ENTRY_get_data(*const c_void) -> *mut c_void;
++    X509_NAME_get_entry(*const c_void, c_int) -> *mut c_void;
++    X509_NAME_get_index_by_NID(*const c_void, c_int, c_int) -> c_int;
++    X509V3_EXT_d2i(*const c_void) -> *mut c_void;
++    X509V3_EXT_get(*const c_void) -> *mut c_void;
++    X509V3_EXT_get_nid(c_int) -> *mut c_void;
++}

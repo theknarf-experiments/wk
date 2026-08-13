@@ -9,14 +9,25 @@
 #   2. (moonshot) JavaScriptCore itself — cloop/LLInt interpreter, no JIT —
 #      via wasi-sdk, then bun's *_jsc bridge crates over it.
 #
-# Status: `cargo check -p bun_transpiler --target wasm32-wasip2` PASSES — the
-# whole ~60-crate JSC-free slice type-checks, including bun_sys (readdir dir
-# iterator, wasi_libc shim for the libc crate's wasip2 gaps), bun_uws_sys,
-# bun_io (WasiWaker; reactor internals gated), bun_watcher (inert WasiWatcher
-# backend), bun_crash_handler (no signals/dladdr arms), and the parser/
-# printer/resolver/bundler themselves. Next: `cargo build` + a thin bin crate
-# + componentize (expect link-time work: __bun_macro_context_* and other
-# *_jsc-provided symbols need stubs; -lwasi-emulated-* for getrusage).
+# Status: the whole ~60-crate JSC-free slice type-checks AND a bin crate
+# exists (src/wk_cli → `bun-transpile`, driving Transpiler::transform like
+# `bun build --no-bundle`). Linking is underway:
+#   * src/wk_cli/wasi_shims.rs provides the JSC-tier symbols — REAL
+#     approximations for the runtime-reachable WTF number machinery
+#     (WTF__dtoa = ES ToString(Number), WTF__parseDouble, operationMathPow,
+#     jsToNumber) and aborts for unreachable macro/dispatch/BoringSSL paths.
+#   * real mimalloc (oven-sh/mimalloc @ the repo pin, src/prim/wasi backend)
+#     compiles with wasi-sdk into native/libmimalloc.a — link with
+#     `-L native -l static=mimalloc`.
+#   * REMAINING: ~10 highway_* + ~10 simdutf__* kernels (semantics live in
+#     src/jsc/bindings/highway_strings.cpp / src/simdutf_sys/bun-simdutf.cpp;
+#     either scalar-shim them in wasi_shims.rs like the four already there,
+#     or build the real C++ — highway_strings.cpp includes Bun's root.h so
+#     the real build needs a shim header), a getpid shim for mimalloc's
+#     heap-snapshot path (do NOT add the wasi-sdk lib dir to the search
+#     path — its libc.a preempts rustc's bundled one and breaks
+#     __wasi_init_tp in rust's crt1; `dup` instead needs a Rust shim), then
+#     wasm-component output + Dockerfile + a run in a wk node.
 #
 # The port knowledge, each item a compile failure first:
 #   * bun assumes 64-bit everywhere it tags pointer high bits. Three separate
