@@ -1546,7 +1546,7 @@ index 4ad0c562..b3193340 100644
 +#[cfg(not(any(unix, windows, target_os = "wasi")))]
  compile_error!("Unsupported platform");
 diff --git a/src/io/PipeWriter.rs b/src/io/PipeWriter.rs
-index 074c6793..ffa13886 100644
+index 074c6793..3fcb91e0 100644
 --- a/src/io/PipeWriter.rs
 +++ b/src/io/PipeWriter.rs
 @@ -2533,14 +2533,14 @@ impl<Parent: WindowsStreamingWriterParent> Drop for WindowsStreamingWriter<Paren
@@ -1568,6 +1568,15 @@ index 074c6793..ffa13886 100644
  pub type StreamingWriter<P> = WindowsStreamingWriter<P>;
  
  // ──────────────────────────────────────────────────────────────────────────
+@@ -2612,7 +2612,7 @@ macro_rules! impl_streaming_writer_parent {
+         ref_       = |$ref_this:ident| $ref_:expr,
+         deref      = |$deref_this:ident| $deref:expr,
+     ) => {
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "wasi"))]
+         impl $($gen)* $crate::pipe_writer::PosixStreamingWriterParent for $Ty {
+             const POLL_OWNER_TAG: $crate::PollTag = $poll_tag;
+             const HAS_ON_READY: bool = true;
 diff --git a/src/io/lib.rs b/src/io/lib.rs
 index b5eb529e..4ec58f68 100644
 --- a/src/io/lib.rs
@@ -2338,6 +2347,99 @@ index b6553c4c..7433ff63 100644
                      let open_req: crate::CrateResult<FD> = {
                          bun_sys::open_dir_absolute_z(
                              sentinel,
+diff --git a/src/runtime/api/bun/Terminal.rs b/src/runtime/api/bun/Terminal.rs
+index 700eb630..edecdc65 100644
+--- a/src/runtime/api/bun/Terminal.rs
++++ b/src/runtime/api/bun/Terminal.rs
+@@ -2067,7 +2067,7 @@ impl BufferedReaderParent for Terminal {
+ // `bun.io.StreamingWriter(@This(), struct { onClose, onWritable, onError, onWrite })`
+ // → trait impl on `Terminal`. All methods take `*mut Self` because the writer
+ // is an intrusive *field of* the parent — see PipeWriter.rs PosixStreamingWriterParent.
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ impl bun_io::pipe_writer::PosixStreamingWriterParent for Terminal {
+     const POLL_OWNER_TAG: bun_io::PollTag = bun_io::posix_event_loop::poll_tag::TERMINAL_POLL;
+     const HAS_ON_READY: bool = true;
+diff --git a/src/runtime/cli/bunx_command.rs b/src/runtime/cli/bunx_command.rs
+index 15e2b228..6730c1eb 100644
+--- a/src/runtime/cli/bunx_command.rs
++++ b/src/runtime/cli/bunx_command.rs
+@@ -540,7 +540,7 @@ impl BunxCommand {
+     ///
+     /// On non-Unix targets there is no comparable shared world-writable temp
+     /// dir / uid model, so the check is a no-op there.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     fn is_trusted_cached_binary(destination: &ZStr, uid: libc::uid_t) -> bool {
+         let lstat_ok = |st: &bun_sys::Stat| {
+             let kind = st.st_mode & libc::S_IFMT;
+@@ -560,13 +560,13 @@ impl BunxCommand {
+         }
+     }
+ 
+-    #[cfg(not(unix))]
++    #[cfg(windows)]
+     #[inline(always)]
+     fn is_trusted_cached_binary(_destination: &ZStr, _uid: u32) -> bool {
+         true
+     }
+ 
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     fn is_trusted_cache_root(cache_root: &[u8], temp_dir_len: usize, uid: libc::uid_t) -> bool {
+         let mut buf = PathBuffer::uninit();
+         if cache_root.len() >= buf.len() || temp_dir_len >= cache_root.len() {
+@@ -605,13 +605,13 @@ impl BunxCommand {
+         }
+     }
+ 
+-    #[cfg(not(unix))]
++    #[cfg(windows)]
+     #[inline(always)]
+     fn is_trusted_cache_root(_cache_root: &[u8], _temp_dir_len: usize, _uid: u32) -> bool {
+         true
+     }
+ 
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     fn is_trusted_opened_cache_dir(
+         dir: Fd,
+         cache_dir: &[u8],
+@@ -652,7 +652,7 @@ impl BunxCommand {
+         }
+     }
+ 
+-    #[cfg(not(unix))]
++    #[cfg(windows)]
+     #[inline(always)]
+     fn is_trusted_opened_cache_dir(
+         _dir: Fd,
+@@ -937,9 +937,8 @@ impl BunxCommand {
+         //     where a user can replace the directory with malicious code.
+         //
+         // If this format changes, please update cache clearing code in package_manager_command.rs
+-        #[cfg(unix)]
+-        // SAFETY: getuid() is always safe to call (no preconditions, never fails)
+-        let uid = unsafe { libc::getuid() };
++        #[cfg(any(unix, target_os = "wasi"))]
++        let uid = bun_sys::c::getuid();
+         #[cfg(windows)]
+         let uid = bun_sys::windows::user_unique_id();
+ 
+diff --git a/src/runtime/node/node_fs.rs b/src/runtime/node/node_fs.rs
+index 6046c4ad..e0c40c2b 100644
+--- a/src/runtime/node/node_fs.rs
++++ b/src/runtime/node/node_fs.rs
+@@ -242,6 +242,9 @@ const IOV_MAX: usize = libc::UIO_MAXIOV as usize;
+ const IOV_MAX: usize = libc::IOV_MAX as usize;
+ #[cfg(windows)]
+ const IOV_MAX: usize = core::ffi::c_uint::MAX as usize;
++// wasi-libc defines UIO_MAXIOV = 1024 (<limits.h>); the libc crate omits it.
++#[cfg(target_os = "wasi")]
++const IOV_MAX: usize = 1024;
+ 
+ /// In-place RAII wrapper for a libuv `fs_t` request.
+ ///
 diff --git a/src/s3_signing/credentials.rs b/src/s3_signing/credentials.rs
 index 3996162f..4f3bf815 100644
 --- a/src/s3_signing/credentials.rs
