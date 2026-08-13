@@ -1,0 +1,632 @@
+diff --git a/Source/JavaScriptCore/dfg/DFGAbstractHeap.h b/Source/JavaScriptCore/dfg/DFGAbstractHeap.h
+index 7626bb9370..f73399a6e8 100644
+--- a/Source/JavaScriptCore/dfg/DFGAbstractHeap.h
++++ b/Source/JavaScriptCore/dfg/DFGAbstractHeap.h
+@@ -25,25 +25,12 @@
+ 
+ #pragma once
+ 
+-#if ENABLE(DFG_JIT)
+-
+-#include "DOMJITHeapRange.h"
+-#include "OperandsInlines.h"
+-#include "VirtualRegister.h"
+-#include <wtf/HashMap.h>
+-#include <wtf/PrintStream.h>
++// The AbstractHeapKind enum is plain data consumed by DOMJIT::Effect's
++// forReadKinds/forWriteKinds APIs, which exist in every build mode — keep it
++// outside the ENABLE(DFG_JIT) gate (cloop/wasi builds compile the rest out).
+ 
+ namespace JSC { namespace DFG {
+ 
+-// Implements a four-level type hierarchy:
+-// - World is the supertype of all of the things.
+-// - Stack with a TOP payload is a direct subtype of World
+-// - Stack with a non-TOP payload is a direct subtype of Stack with a TOP payload.
+-// - Heap is a direct subtype of World.
+-// - SideState is a direct subtype of World.
+-// - Any other kind with TOP payload is the direct subtype of Heap.
+-// - Any other kind with non-TOP payload is the direct subtype of the same kind with a TOP payload.
+-
+ #define FOR_EACH_ABSTRACT_HEAP_KIND(macro) \
+     macro(InvalidAbstractHeap) \
+     macro(World) \
+@@ -100,6 +87,28 @@ enum AbstractHeapKind : uint8_t {
+ #undef ABSTRACT_HEAP_DECLARATION
+ };
+ 
++} } // namespace JSC::DFG
++
++#if ENABLE(DFG_JIT)
++
++#include "DOMJITHeapRange.h"
++#include "OperandsInlines.h"
++#include "VirtualRegister.h"
++#include <wtf/HashMap.h>
++#include <wtf/PrintStream.h>
++
++namespace JSC { namespace DFG {
++
++// Implements a four-level type hierarchy:
++// - World is the supertype of all of the things.
++// - Stack with a TOP payload is a direct subtype of World
++// - Stack with a non-TOP payload is a direct subtype of Stack with a TOP payload.
++// - Heap is a direct subtype of World.
++// - SideState is a direct subtype of World.
++// - Any other kind with TOP payload is the direct subtype of Heap.
++// - Any other kind with non-TOP payload is the direct subtype of the same kind with a TOP payload.
++
++
+ class AbstractHeap {
+ public:
+     class Payload {
+diff --git a/Source/JavaScriptCore/heap/BlockDirectory.cpp b/Source/JavaScriptCore/heap/BlockDirectory.cpp
+index 93ac202399..1f67e3aa39 100644
+--- a/Source/JavaScriptCore/heap/BlockDirectory.cpp
++++ b/Source/JavaScriptCore/heap/BlockDirectory.cpp
+@@ -69,7 +69,8 @@ void BlockDirectory::updatePercentageOfPagedOutPages(SimpleStats& stats)
+     // FIXME: We should figure out a solution for Windows and PlayStation.
+     // QNX doesn't have mincore(), though the information can be had. But since all mapped
+     // pages are resident, does it matter?
+-#if OS(UNIX) && !PLATFORM(PLAYSTATION) && !OS(QNX) && !OS(HAIKU)
++// WASI: like QNX — no mincore, and all mapped pages are resident anyway.
++#if OS(UNIX) && !PLATFORM(PLAYSTATION) && !OS(QNX) && !OS(HAIKU) && !defined(__wasi__)
+     size_t pageSize = WTF::pageSize();
+     ASSERT(!(MarkedBlock::blockSize % pageSize));
+     auto numberOfPagesInMarkedBlock = MarkedBlock::blockSize / pageSize;
+diff --git a/Source/JavaScriptCore/jsc.cpp b/Source/JavaScriptCore/jsc.cpp
+index 7fa734ca38..2cba409ba0 100644
+--- a/Source/JavaScriptCore/jsc.cpp
++++ b/Source/JavaScriptCore/jsc.cpp
+@@ -3731,7 +3731,7 @@ int main(int argc, char** argv)
+     }
+ #endif
+ 
+-#if OS(UNIX)
++#if OS(UNIX) && !defined(__wasi__)
+     if (getenv("JS_SHELL_WAIT_FOR_SIGUSR2_TO_EXIT")) {
+         addSignalHandler(Signal::Usr, SignalHandler([&] (Signal, SigInfo&, PlatformRegisters&) {
+             dataLogLn("Signal handler hit, we can exit now.");
+@@ -3756,7 +3756,7 @@ int main(int argc, char** argv)
+         getc(stdin);
+     }
+ 
+-#if OS(UNIX)
++#if OS(UNIX) && !defined(__wasi__)
+     if (getenv("JS_SHELL_WAIT_FOR_SIGUSR2_TO_EXIT")) {
+         WTF::fastDisableScavenger();
+         fprintf(stdout, "\njs shell waiting for `kill -USR2 [pid]` to exit\n");
+@@ -4255,7 +4255,7 @@ void CommandLine::parseArguments(int argc, char** argv, int start)
+             continue;
+         }
+         if (!strcmp(arg, "--signal-expected")) {
+-#if OS(UNIX)
++#if OS(UNIX) && !defined(__wasi__)
+             SignalAction (*exit)(Signal, SigInfo&, PlatformRegisters&) = [] (Signal signal, SigInfo&, PlatformRegisters&) {
+                 dataLogLn("Signal handler for ", ScopedEnumDump(signal), " hit. Exiting with status 137");
+                 // Deliberate exit with a SIGKILL code greater than 130.
+diff --git a/Source/JavaScriptCore/runtime/JSCBytecodeCacheVersion.cpp b/Source/JavaScriptCore/runtime/JSCBytecodeCacheVersion.cpp
+index 73c7f54df3..2b80e1eeb4 100644
+--- a/Source/JavaScriptCore/runtime/JSCBytecodeCacheVersion.cpp
++++ b/Source/JavaScriptCore/runtime/JSCBytecodeCacheVersion.cpp
+@@ -31,7 +31,9 @@
+ #include <wtf/NeverDestroyed.h>
+ #include <wtf/text/SuperFastHash.h>
+ 
+-#if OS(UNIX)
++// WASI has no dynamic loader; the BUN_JSC_ADDITIONS build-stamp path below
++// never touches these.
++#if OS(UNIX) && !defined(__wasi__)
+ #include <dlfcn.h>
+ #if OS(DARWIN)
+ #include <mach-o/dyld.h>
+diff --git a/Source/JavaScriptCore/runtime/JSModuleLoader.cpp b/Source/JavaScriptCore/runtime/JSModuleLoader.cpp
+index 0abfe4ebdb..a038fc5c5e 100644
+--- a/Source/JavaScriptCore/runtime/JSModuleLoader.cpp
++++ b/Source/JavaScriptCore/runtime/JSModuleLoader.cpp
+@@ -33,6 +33,7 @@
+ #include "GlobalObjectMethodTable.h"
+ #include "JSCInlines.h"
+ #include "JSMicrotask.h"
++#include <wtf/Scope.h>
+ #include "JSModuleNamespaceObject.h"
+ #include "JSModuleRecord.h"
+ #include "JSPromise.h"
+diff --git a/Source/JavaScriptCore/runtime/Options.cpp b/Source/JavaScriptCore/runtime/Options.cpp
+index 7b58015d90..ea7183ad41 100644
+--- a/Source/JavaScriptCore/runtime/Options.cpp
++++ b/Source/JavaScriptCore/runtime/Options.cpp
+@@ -233,7 +233,9 @@ std::optional<OptionsStorage::Unsigned> parse(const char* string)
+     return std::nullopt;
+ }
+ 
+-#if CPU(ADDRESS64) || OS(DARWIN) || OS(HAIKU)
++#if CPU(ADDRESS64) || OS(DARWIN) || OS(HAIKU) || defined(__wasi__)
++// wasm32: size_t is `unsigned long`, distinct from `unsigned`, so the Size
++// specialization is needed (and unambiguous) here too.
+ template<>
+ std::optional<OptionsStorage::Size> parse(const char* string)
+ {
+diff --git a/Source/WTF/wtf/FastMalloc.cpp b/Source/WTF/wtf/FastMalloc.cpp
+index ae00355743..82976bf528 100644
+--- a/Source/WTF/wtf/FastMalloc.cpp
++++ b/Source/WTF/wtf/FastMalloc.cpp
+@@ -626,6 +626,9 @@ FastMallocStatistics fastMallocStatistics()
+     area_info info;
+     while (get_next_area_info(B_CURRENT_TEAM, &cookie, &info) == B_OK)
+         statistics.committedVMBytes += info.ram_size;
++#elif defined(__wasi__)
++    // wasi-libc's emulated getrusage carries no maxrss.
++    statistics.committedVMBytes = 0;
+ #elif HAVE(RESOURCE_H)
+     struct rusage resourceUsage;
+     getrusage(RUSAGE_SELF, &resourceUsage);
+diff --git a/Source/WTF/wtf/FileSystem.cpp b/Source/WTF/wtf/FileSystem.cpp
+index 7771695d64..69fffe5322 100644
+--- a/Source/WTF/wtf/FileSystem.cpp
++++ b/Source/WTF/wtf/FileSystem.cpp
+@@ -844,8 +844,25 @@ String createTemporaryDirectory()
+     std::string newTempDirTemplate = tempDir + "XXXXXXXX";
+ 
+     Vector<char> newTempDir(std::span<const char> { newTempDirTemplate });
++#if defined(__wasi__)
++    // No mkdtemp in wasi-libc: substitute the Xs from the monotonic clock and
++    // mkdir directly (single-threaded guest, no races to defend against).
++    {
++        auto* span = newTempDir.mutableSpan().data();
++        size_t len = strlen(span);
++        uint64_t stamp = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
++        for (size_t i = len; i > 0 && span[i - 1] == 'X'; --i) {
++            span[i - 1] = 'a' + (stamp % 26);
++            stamp /= 26;
++        }
++        std::error_code mkdirError;
++        if (!std::filesystem::create_directory(span, mkdirError) || mkdirError)
++            return String();
++    }
++#else
+     if (!mkdtemp(newTempDir.mutableSpan().data()))
+         return String();
++#endif
+ 
+     return stringFromFileSystemRepresentation(newTempDir.span().data());
+ }
+diff --git a/Source/WTF/wtf/PlatformOS.h b/Source/WTF/wtf/PlatformOS.h
+index e3184e90a1..bbb8568753 100644
+--- a/Source/WTF/wtf/PlatformOS.h
++++ b/Source/WTF/wtf/PlatformOS.h
+@@ -144,7 +144,8 @@
+     || OS(OPENBSD)          \
+     || defined(unix)        \
+     || defined(__unix)      \
+-    || defined(__unix__)
++    || defined(__unix__)    \
++    || defined(__wasi__)
+ #define WTF_OS_UNIX 1
+ #endif
+ 
+diff --git a/Source/WTF/wtf/PlatformRegisters.h b/Source/WTF/wtf/PlatformRegisters.h
+index 37efb86df1..77579bc357 100644
+--- a/Source/WTF/wtf/PlatformRegisters.h
++++ b/Source/WTF/wtf/PlatformRegisters.h
+@@ -39,6 +39,8 @@
+ typedef ucontext_t mcontext_t;
+ #elif OS(QNX)
+ #include <ucontext.h>
++#elif defined(__wasi__)
++/* No ucontext on WASI; the generic { stackPointer } arm below applies. */
+ #else
+ #include <sys/ucontext.h>
+ #endif
+diff --git a/Source/WTF/wtf/RandomDevice.cpp b/Source/WTF/wtf/RandomDevice.cpp
+index 95921fd376..4292b97619 100644
+--- a/Source/WTF/wtf/RandomDevice.cpp
++++ b/Source/WTF/wtf/RandomDevice.cpp
+@@ -29,7 +29,7 @@
+ 
+ #include <stdlib.h>
+ 
+-#if !OS(DARWIN) && !OS(FUCHSIA) && OS(UNIX)
++#if !OS(DARWIN) && !OS(FUCHSIA) && OS(UNIX) && !defined(__wasi__)
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <unistd.h>
+@@ -49,9 +49,13 @@
+ #include <zircon/syscalls.h>
+ #endif
+ 
++#if defined(__wasi__)
++#include <unistd.h>
++#endif
++
+ namespace WTF {
+ 
+-#if !OS(DARWIN) && !OS(FUCHSIA) && OS(UNIX)
++#if !OS(DARWIN) && !OS(FUCHSIA) && OS(UNIX) && !defined(__wasi__)
+ NEVER_INLINE NO_RETURN_DUE_TO_CRASH static void crashUnableToOpenURandom()
+ {
+     CRASH();
+@@ -63,7 +67,7 @@ NEVER_INLINE NO_RETURN_DUE_TO_CRASH static void crashUnableToReadFromURandom()
+ }
+ #endif
+ 
+-#if !OS(DARWIN) && !OS(FUCHSIA) && !OS(WINDOWS)
++#if !OS(DARWIN) && !OS(FUCHSIA) && !OS(WINDOWS) && !defined(__wasi__)
+ RandomDevice::RandomDevice()
+ {
+     int ret = 0;
+@@ -76,7 +80,7 @@ RandomDevice::RandomDevice()
+ }
+ #endif
+ 
+-#if !OS(DARWIN) && !OS(FUCHSIA) && !OS(WINDOWS)
++#if !OS(DARWIN) && !OS(FUCHSIA) && !OS(WINDOWS) && !defined(__wasi__)
+ RandomDevice::~RandomDevice()
+ {
+     close(m_fd);
+@@ -91,6 +95,12 @@ void RandomDevice::cryptographicallyRandomValues(std::span<uint8_t> buffer)
+     RELEASE_ASSERT(!CCRandomGenerateBytes(buffer.data(), buffer.size()));
+ #elif OS(FUCHSIA)
+     zx_cprng_draw(buffer.data(), buffer.size());
++#elif defined(__wasi__)
++    // getentropy (the WASI entropy source) caps at 256 bytes per call.
++    for (size_t offset = 0; offset < buffer.size(); offset += 256) {
++        size_t n = std::min<size_t>(256, buffer.size() - offset);
++        RELEASE_ASSERT(!getentropy(buffer.data() + offset, n));
++    }
+ #elif OS(UNIX)
+     ssize_t amountRead = 0;
+     while (static_cast<size_t>(amountRead) < buffer.size()) {
+diff --git a/Source/WTF/wtf/RandomDevice.h b/Source/WTF/wtf/RandomDevice.h
+index ce4af34736..83bca36932 100644
+--- a/Source/WTF/wtf/RandomDevice.h
++++ b/Source/WTF/wtf/RandomDevice.h
+@@ -36,7 +36,7 @@ class RandomDevice {
+     WTF_MAKE_NONCOPYABLE(RandomDevice);
+     WTF_DEPRECATED_MAKE_FAST_ALLOCATED(RandomDevice);
+ public:
+-#if OS(DARWIN) || OS(FUCHSIA) || OS(WINDOWS)
++#if OS(DARWIN) || OS(FUCHSIA) || OS(WINDOWS) || defined(__wasi__)
+     RandomDevice() = default;
+ #else
+     RandomDevice();
+diff --git a/Source/WTF/wtf/RawHex.h b/Source/WTF/wtf/RawHex.h
+index ad348c937c..c05c229865 100644
+--- a/Source/WTF/wtf/RawHex.h
++++ b/Source/WTF/wtf/RawHex.h
+@@ -51,7 +51,9 @@ public:
+         : RawHex(static_cast<uintptr_t>(value))
+     { }
+ 
+-#if CPU(ADDRESS64) || OS(DARWIN) || OS(HAIKU)
++// wasi: wasm32's uintptr_t is `unsigned long`, distinct from uint32_t's
++// `unsigned int`, so the explicit 32-bit ctors are needed (and unambiguous).
++#if CPU(ADDRESS64) || OS(DARWIN) || OS(HAIKU) || defined(__wasi__)
+     // These causes build errors for CPU(ADDRESS32) on some ports because int32_t
+     // is already handled by intptr_t, and uint32_t is handled by uintptr_t.
+     explicit RawHex(int32_t value)
+diff --git a/Source/WTF/wtf/StackBounds.cpp b/Source/WTF/wtf/StackBounds.cpp
+index d928bed898..469b788f9e 100644
+--- a/Source/WTF/wtf/StackBounds.cpp
++++ b/Source/WTF/wtf/StackBounds.cpp
+@@ -93,6 +93,24 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_END
+     return StackBounds { origin, bound };
+ }
+ 
++#elif defined(__wasi__)
++
++// wasm-ld lays the shadow (data) stack out between these two linker-provided
++// symbols; the wasm stack grows DOWN from __stack_high toward __stack_low.
++extern "C" unsigned char __stack_low[];
++extern "C" unsigned char __stack_high[];
++
++StackBounds StackBounds::currentThreadStackBoundsInternal()
++{
++    return StackBounds { __stack_high, __stack_low };
++}
++
++StackBounds StackBounds::newThreadStackBounds(PlatformThreadHandle)
++{
++    // Thread creation never succeeds on WASI; only the main thread exists.
++    return currentThreadStackBoundsInternal();
++}
++
+ #elif OS(UNIX) || OS(HAIKU)
+ 
+ #if OS(OPENBSD)
+diff --git a/Source/WTF/wtf/Threading.h b/Source/WTF/wtf/Threading.h
+index 319a94f31c..851b7b1686 100644
+--- a/Source/WTF/wtf/Threading.h
++++ b/Source/WTF/wtf/Threading.h
+@@ -327,7 +327,7 @@ protected:
+     void establishPlatformSpecificHandle(PlatformThreadHandle, ThreadIdentifier);
+ #endif
+ 
+-#if USE(PTHREADS) && !OS(DARWIN)
++#if USE(PTHREADS) && !OS(DARWIN) && !defined(__wasi__)
+     static void signalHandlerSuspendResume(int, siginfo_t*, void* ucontext);
+ #endif
+ 
+diff --git a/Source/WTF/wtf/dtoa/utils.h b/Source/WTF/wtf/dtoa/utils.h
+index 3d374cf7a3..a3da710e7d 100644
+--- a/Source/WTF/wtf/dtoa/utils.h
++++ b/Source/WTF/wtf/dtoa/utils.h
+@@ -93,7 +93,7 @@ int main(int argc, char** argv) {
+     defined(__AARCH64EL__) || defined(__aarch64__) || defined(__AARCH64EB__) || \
+     defined(__riscv) || \
+     defined(__or1k__) || defined(__arc__) || \
+-    defined(__EMSCRIPTEN__)
++    defined(__EMSCRIPTEN__) || defined(__wasm__)
+ #define DOUBLE_CONVERSION_CORRECT_DOUBLE_OPERATIONS 1
+ #elif defined(__mc68000__) || \
+     defined(__pnacl__) || defined(__native_client__)
+diff --git a/Source/WTF/wtf/generic/MemoryFootprintGeneric.cpp b/Source/WTF/wtf/generic/MemoryFootprintGeneric.cpp
+index 393310d007..8e999ce939 100644
+--- a/Source/WTF/wtf/generic/MemoryFootprintGeneric.cpp
++++ b/Source/WTF/wtf/generic/MemoryFootprintGeneric.cpp
+@@ -33,8 +33,13 @@ namespace WTF {
+ 
+ size_t memoryFootprint()
+ {
++#if defined(__wasi__)
++    // No memory-status source on WASI; footprint reporting is best-effort.
++    return 0;
++#else
+     auto memoryUse = memoryStatus();
+     return memoryUse.memoryFootprint;
++#endif
+ }
+ 
+ } // namespace WTF
+diff --git a/Source/WTF/wtf/posix/CPUTimePOSIX.cpp b/Source/WTF/wtf/posix/CPUTimePOSIX.cpp
+index 66384038ed..8f2765e1d7 100644
+--- a/Source/WTF/wtf/posix/CPUTimePOSIX.cpp
++++ b/Source/WTF/wtf/posix/CPUTimePOSIX.cpp
+@@ -47,7 +47,13 @@ std::optional<CPUTime> CPUTime::get()
+ Seconds CPUTime::forCurrentThread()
+ {
+     struct timespec ts { };
++#if defined(__wasi__)
++    // Single thread, no per-thread clock; the emulated process clock (wall
++    // time) is the closest available answer.
++    int ret = clock_gettime(CLOCK_MONOTONIC, &ts);
++#else
+     int ret = clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
++#endif
+     RELEASE_ASSERT(!ret);
+     return Seconds(ts.tv_sec) + Seconds::fromNanoseconds(ts.tv_nsec);
+ }
+diff --git a/Source/WTF/wtf/posix/FileSystemPOSIX.cpp b/Source/WTF/wtf/posix/FileSystemPOSIX.cpp
+index eef66beff0..9536c9c56c 100644
+--- a/Source/WTF/wtf/posix/FileSystemPOSIX.cpp
++++ b/Source/WTF/wtf/posix/FileSystemPOSIX.cpp
+@@ -188,7 +188,24 @@ std::pair<String, FileHandle> openTemporaryFile(StringView prefix, StringView su
+     snprintf(buffer.mutableSpan().data(), length, "%s/%s-XXXXXX", directory, prefixUTF8.data());
+     IGNORE_CLANG_WARNINGS_END
+ 
++#if defined(__wasi__)
++    // No mk(o)stemp in wasi-libc: substitute the Xs from the monotonic clock
++    // and open O_EXCL (single-threaded guest, no races to defend against).
++    auto handle = FileHandle::adopt([&] {
++        auto* path = buffer.mutableSpan().data();
++        size_t pathLen = strlen(path);
++        struct timespec ts { };
++        clock_gettime(CLOCK_MONOTONIC, &ts);
++        uint64_t stamp = static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + ts.tv_nsec;
++        for (size_t i = pathLen; i > 0 && path[i - 1] == 'X'; --i) {
++            path[i - 1] = 'a' + (stamp % 26);
++            stamp /= 26;
++        }
++        return open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
++    }());
++#else
+     auto handle = FileHandle::adopt(mkostemp(buffer.mutableSpan().data(), O_CLOEXEC));
++#endif
+     if (!handle)
+         return { String(), FileHandle() };
+ 
+diff --git a/Source/WTF/wtf/posix/ThreadingPOSIX.cpp b/Source/WTF/wtf/posix/ThreadingPOSIX.cpp
+index 9a4cd5be13..12f2f84634 100644
+--- a/Source/WTF/wtf/posix/ThreadingPOSIX.cpp
++++ b/Source/WTF/wtf/posix/ThreadingPOSIX.cpp
+@@ -82,7 +82,7 @@ namespace WTF {
+ 
+ Thread::~Thread() = default;
+ 
+-#if !OS(DARWIN)
++#if !OS(DARWIN) && !defined(__wasi__)
+ class Semaphore final {
+     WTF_MAKE_NONCOPYABLE(Semaphore);
+     WTF_DEPRECATED_MAKE_FAST_ALLOCATED(Semaphore);
+@@ -199,7 +199,7 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_END
+     }
+     g_wtfConfig.isThreadSuspendResumeSignalConfigured = true;
+ 
+-#if !OS(DARWIN)
++#if !OS(DARWIN) && !defined(__wasi__)
+     globalSemaphoreForSuspendResume.construct(0);
+ 
+     // Signal handlers are process global configuration.
+@@ -240,7 +240,7 @@ ThreadIdentifier Thread::currentID()
+ 
+ void Thread::initializeCurrentThreadEvenIfNonWTFCreated()
+ {
+-#if !OS(DARWIN)
++#if !OS(DARWIN) && !defined(__wasi__)
+     RELEASE_ASSERT(g_wtfConfig.isThreadSuspendResumeSignalConfigured);
+     sigset_t mask;
+     sigemptyset(&mask);
+@@ -387,7 +387,7 @@ void Thread::initializeCurrentThreadInternal(const char* threadName)
+ 
+ void Thread::changePriority(int delta)
+ {
+-#if HAVE(PTHREAD_SETSCHEDPARAM)
++#if HAVE(PTHREAD_SETSCHEDPARAM) && !defined(__wasi__)
+     Locker locker { m_mutex };
+ 
+     int policy;
+@@ -486,8 +486,14 @@ bool Thread::signal(int signalNumber)
+     Locker locker { m_mutex };
+     if (hasExited())
+         return false;
++#if defined(__wasi__)
++    // No signal delivery between threads (there is only one).
++    UNUSED_PARAM(signalNumber);
++    return false;
++#else
+     int errNo = pthread_kill(m_handle, signalNumber);
+     return !errNo; // A 0 errNo means success.
++#endif
+ }
+ 
+ auto Thread::suspend(const ThreadSuspendLocker&) -> Expected<void, PlatformSuspendError>
+@@ -500,6 +506,9 @@ auto Thread::suspend(const ThreadSuspendLocker&) -> Expected<void, PlatformSuspe
+     if (result != KERN_SUCCESS)
+         return makeUnexpected(result);
+     return { };
++#elif defined(__wasi__)
++    // Single-threaded guest: there is never another thread to suspend.
++    return makeUnexpected(ENOTSUP);
+ #else
+     if (!m_suspendCount) {
+         targetThread.store(this);
+@@ -526,6 +535,8 @@ void Thread::resume(const ThreadSuspendLocker&)
+ {
+ #if OS(DARWIN)
+     thread_resume(m_platformThread);
++#elif defined(__wasi__)
++    // See suspend(): unreachable, no thread was ever suspended.
+ #else
+     if (m_suspendCount == 1) {
+         // When allowing sigThreadSuspendResume interrupt in the signal handler by sigsuspend and SigThreadSuspendResume is actually issued,
+@@ -589,6 +600,10 @@ size_t Thread::getRegisters(const ThreadSuspendLocker&, PlatformRegisters& regis
+         CRASH_WITH_INFO(result, KERN_SUCCESS);
+     }
+     return metadata.userCount * sizeof(uintptr_t);
++#elif defined(__wasi__)
++    // See suspend(): never reached.
++    UNUSED_PARAM(registers);
++    return 0;
+ #else
+     ASSERT_WITH_MESSAGE(m_suspendCount, "We can get registers only if the thread is suspended.");
+     ASSERT(m_platformRegisters);
+diff --git a/Source/WTF/wtf/threads/Signals.cpp b/Source/WTF/wtf/threads/Signals.cpp
+index 1c2a5b655b..dc9860e764 100644
+--- a/Source/WTF/wtf/threads/Signals.cpp
++++ b/Source/WTF/wtf/threads/Signals.cpp
+@@ -26,7 +26,7 @@
+ #include "config.h"
+ #include <wtf/threads/Signals.h>
+ 
+-#if OS(UNIX)
++#if OS(UNIX) && !defined(__wasi__)
+ 
+ #if HAVE(MACH_EXCEPTIONS)
+ extern "C" {
+@@ -602,3 +602,30 @@ void SignalHandlers::finalize()
+ } // namespace WTF
+ 
+ #endif // OS(UNIX)
++
++#if defined(__wasi__)
++
++#include <wtf/WTFConfig.h>
++
++namespace WTF {
++
++// No signals to install on WASI; keep the init-state machine so WTFConfig's
++// assertions hold.
++void SignalHandlers::initialize()
++{
++    SignalHandlers& handlers = g_wtfConfig.signalHandlers;
++    RELEASE_ASSERT(handlers.initState == SignalHandlers::InitState::Uninitialized);
++    handlers.initState = SignalHandlers::InitState::Initializing;
++}
++
++void SignalHandlers::finalize()
++{
++    Config::AssertNotFrozenScope assertScope;
++    SignalHandlers& handlers = g_wtfConfig.signalHandlers;
++    RELEASE_ASSERT(handlers.initState == SignalHandlers::InitState::Initializing);
++    handlers.initState = SignalHandlers::InitState::Finalized;
++}
++
++} // namespace WTF
++
++#endif // defined(__wasi__)
+diff --git a/Source/WTF/wtf/threads/Signals.h b/Source/WTF/wtf/threads/Signals.h
+index 8917f36969..c06a8dacc9 100644
+--- a/Source/WTF/wtf/threads/Signals.h
++++ b/Source/WTF/wtf/threads/Signals.h
+@@ -31,7 +31,7 @@
+ #include <wtf/Lock.h>
+ #include <wtf/PlatformRegisters.h>
+ 
+-#if OS(UNIX)
++#if OS(UNIX) && !defined(__wasi__)
+ 
+ #include <signal.h>
+ #include <tuple>
+@@ -45,7 +45,7 @@ namespace WTF {
+ 
+ // Note that SIGUSR1 is used in Pthread-based ports except for Darwin to suspend and resume threads.
+ enum class Signal {
+-#if OS(UNIX)
++#if OS(UNIX) && !defined(__wasi__)
+     // Usr will always chain to any non-default handler install before us. Since there is no way to know
+     // if a signal was intended exclusively for us.
+     Usr,
+@@ -61,7 +61,7 @@ enum class Signal {
+     AccessFault, // For posix this is both SIGSEGV and SIGBUS
+     NumberOfSignals = AccessFault + 2, // AccessFault is really two signals.
+     Unknown = NumberOfSignals
+-#else // not OS(UNIX)
++#else // not OS(UNIX) (or WASI)
+     FloatingPoint,
+     IllegalInstruction,
+     AccessFault,
+@@ -123,7 +123,7 @@ struct SignalHandlers {
+     std::array<uint8_t, numberOfSignals> numberOfHandlers;
+     std::array<std::array<SignalHandlerMemory, maxNumberOfHandlers>, numberOfSignals> handlers;
+ 
+-#if OS(UNIX)
++#if OS(UNIX) && !defined(__wasi__)
+     std::array<struct sigaction, numberOfSignals> oldActions;
+ #endif
+ };
+diff --git a/Source/bmalloc/bmalloc/VMAllocate.cpp b/Source/bmalloc/bmalloc/VMAllocate.cpp
+index 53c30661ea..f41708f849 100644
+--- a/Source/bmalloc/bmalloc/VMAllocate.cpp
++++ b/Source/bmalloc/bmalloc/VMAllocate.cpp
+@@ -29,6 +29,16 @@
+ #include "pas_mte_config.h"
+ #endif
+ 
++#if defined(__wasi__)
++// wasi-libc's emulated <sys/mman.h> declares madvise but the emulation
++// library doesn't provide it. wasm linear memory cannot be decommitted or
++// advised, so every hint is an accepted no-op.
++extern "C" int madvise(void*, size_t, int)
++{
++    return 0;
++}
++#endif
++
+ namespace bmalloc {
+ 
+ #if BMALLOC_USE_MADV_ZERO
+diff --git a/Source/cmake/WebKitCommon.cmake b/Source/cmake/WebKitCommon.cmake
+index 9614c2120b..85a1b68842 100644
+--- a/Source/cmake/WebKitCommon.cmake
++++ b/Source/cmake/WebKitCommon.cmake
+@@ -203,6 +203,10 @@ if (NOT HAS_RUN_WEBKIT_COMMON)
+         set(WTF_OS_WINDOWS 1)
+     elseif (CMAKE_SYSTEM_NAME MATCHES "Fuchsia")
+         set(WTF_OS_FUCHSIA 1)
++    elseif (CMAKE_SYSTEM_NAME MATCHES "WASI")
++        # wasm32-wasip2 via wasi-sdk: POSIX-shaped enough that the generic
++        # Unix path fits (wasi-libc is musl-derived).
++        set(WTF_OS_UNIX 1)
+     else ()
+         message(FATAL_ERROR "Unknown OS '${CMAKE_SYSTEM_NAME}'")
+     endif ()
