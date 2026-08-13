@@ -24,6 +24,142 @@ index 07fa5303..c3c5ab72 100644
              })
          }
  
+diff --git a/src/ast/b.rs b/src/ast/b.rs
+index a8654bf2..e0e73489 100644
+--- a/src/ast/b.rs
++++ b/src/ast/b.rs
+@@ -51,8 +51,10 @@ impl Default for B {
+ // Three `StoreRef<T>` variants (8 B align 4) + one ZST → 1-byte discriminant
+ // + 8-byte payload = 9, align(4) rounds to 12. `Binding` = `B` (12, align 4)
+ // + `Loc` (i32) → 16. `Option<B>` niche-packs via spare discriminant values.
++#[cfg(target_pointer_width = "64")]
+ const _: () = assert!(core::mem::size_of::<B>() == 12);
+ const _: () = assert!(core::mem::align_of::<B>() == 4);
++#[cfg(target_pointer_width = "64")]
+ const _: () = assert!(core::mem::size_of::<super::binding::Binding>() == 16);
+ const _: () = assert!(
+     core::mem::size_of::<Option<B>>() == core::mem::size_of::<B>(),
+diff --git a/src/ast/e.rs b/src/ast/e.rs
+index d5b97756..d9b59e10 100644
+--- a/src/ast/e.rs
++++ b/src/ast/e.rs
+@@ -344,6 +344,7 @@ pub struct Arrow {
+     pub has_react_hooks_suppression: bool,
+ }
+ // The fourth bool fits in existing trailing padding.
++#[cfg(target_pointer_width = "64")]
+ const _: () = assert!(core::mem::size_of::<Arrow>() == 32);
+ impl Arrow {
+     pub const NOOP_RETURN_UNDEFINED: Arrow = Arrow {
+@@ -853,6 +854,7 @@ pub enum JsonValue {
+     Array(StoreRef<ArrayJSON>) = 5,
+ }
+ 
++#[cfg(target_pointer_width = "64")]
+ const _: () = assert!(core::mem::size_of::<JsonValue>() == 16);
+ const _: () = assert!(core::mem::align_of::<JsonValue>() == 4);
+ 
+@@ -923,10 +925,13 @@ pub struct PropertyJSON {
+     pub value: JsonValue,
+ }
+ 
++#[cfg(target_pointer_width = "64")]
+ const _: () = assert!(core::mem::size_of::<PropertyJSON>() == 32);
+ // Read from C++ (JSONRowsToJS.cpp), which asserts the same offsets.
+ const _: () = assert!(core::mem::offset_of!(PropertyJSON, key) == 0);
++#[cfg(target_pointer_width = "64")]
+ const _: () = assert!(core::mem::offset_of!(PropertyJSON, key_loc) == 12);
++#[cfg(target_pointer_width = "64")]
+ const _: () = assert!(core::mem::offset_of!(PropertyJSON, value) == 16);
+ 
+ /// Where a [`JsonTape`]'s buffers (and, in arena mode, the tape itself) live.
+@@ -1133,9 +1138,13 @@ pub struct ObjectJSON {
+     pub is_single_line: bool,
+ }
+ 
++#[cfg(target_pointer_width = "64")]
+ const _: () = assert!(core::mem::offset_of!(ObjectJSON, first) == 8);
++#[cfg(target_pointer_width = "64")]
+ const _: () = assert!(core::mem::offset_of!(ObjectJSON, count) == 12);
++#[cfg(target_pointer_width = "64")]
+ const _: () = assert!(core::mem::offset_of!(ArrayJSON, first) == 8);
++#[cfg(target_pointer_width = "64")]
+ const _: () = assert!(core::mem::offset_of!(ArrayJSON, count) == 12);
+ 
+ // SAFETY: the tape outlives the AST (`StoreRef`'s contract) and is read-only once parsing returns.
+diff --git a/src/ast/expr.rs b/src/ast/expr.rs
+index 7fff5ed5..9943f499 100644
+--- a/src/ast/expr.rs
++++ b/src/ast/expr.rs
+@@ -1536,8 +1536,10 @@ const _: () = assert!(core::mem::size_of::<E::RequireString>() <= 8);
+ const _: () = assert!(core::mem::size_of::<E::NewTarget>() <= 8);
+ const _: () = assert!(core::mem::size_of::<StoreRef<E::Binary>>() == core::mem::size_of::<usize>());
+ // Heap-payload shrinks unlocked by the 12-byte StoreSlice<T>:
++#[cfg(target_pointer_width = "64")]
+ const _: () = assert!(core::mem::size_of::<crate::G::FnBody>() == 16);
+ const _: () = assert!(core::mem::size_of::<E::Arrow>() <= 32);
++#[cfg(target_pointer_width = "64")]
+ const _: () = assert!(core::mem::size_of::<crate::S::Block>() == 16);
+ 
+ // Field-style accessors (`data.e_string()`, `data.e_object()`). The match arms
+diff --git a/src/ast/nodes.rs b/src/ast/nodes.rs
+index 3231a727..bc1c730a 100644
+--- a/src/ast/nodes.rs
++++ b/src/ast/nodes.rs
+@@ -29,8 +29,10 @@ pub use crate::flags as Flags;
+ #[repr(C, packed(4))]
+ pub struct StoreRef<T>(NonNull<T>);
+ 
++#[cfg(target_pointer_width = "64")]
+ const _: () = assert!(core::mem::size_of::<StoreRef<u8>>() == 8);
+ const _: () = assert!(core::mem::align_of::<StoreRef<u8>>() == 4);
++#[cfg(target_pointer_width = "64")]
+ const _: () = assert!(core::mem::size_of::<Option<StoreRef<u8>>>() == 8);
+ 
+ // SAFETY: `StoreRef` is a thin pointer into a single-threaded bump arena.
+@@ -162,6 +164,7 @@ pub struct StoreStr {
+     len: u32,
+ }
+ 
++#[cfg(target_pointer_width = "64")]
+ const _: () = assert!(core::mem::size_of::<StoreStr>() == 12);
+ const _: () = assert!(core::mem::align_of::<StoreStr>() == 4);
+ 
+@@ -328,6 +331,7 @@ pub struct StoreSlice<T> {
+     len: u32,
+ }
+ 
++#[cfg(target_pointer_width = "64")]
+ const _: () = assert!(core::mem::size_of::<StoreSlice<u8>>() == 12);
+ const _: () = assert!(core::mem::align_of::<StoreSlice<u8>>() == 4);
+ 
+diff --git a/src/ast/stmt.rs b/src/ast/stmt.rs
+index 53ec19ba..fdb9971e 100644
+--- a/src/ast/stmt.rs
++++ b/src/ast/stmt.rs
+@@ -328,8 +328,10 @@ pub enum Data {
+ // `Data` (12, align 4) + `Loc` (i32) → 16. `Option<Data>`/`Option<Stmt>`
+ // niche-pack via spare discriminant values (33 variants < 256); a
+ // `#[repr(C)]`/`#[repr(u32)]` on `Data` would break it.
++#[cfg(target_pointer_width = "64")]
+ const _: () = assert!(core::mem::size_of::<Data>() == 12);
+ const _: () = assert!(core::mem::align_of::<Data>() == 4);
++#[cfg(target_pointer_width = "64")]
+ const _: () = assert!(
+     core::mem::size_of::<Stmt>() == 16,
+     "Expected Stmt to be 16 bytes"
+diff --git a/src/ast/symbol.rs b/src/ast/symbol.rs
+index 699462ba..c95145b7 100644
+--- a/src/ast/symbol.rs
++++ b/src/ast/symbol.rs
+@@ -147,6 +147,7 @@ symbol_flag_accessors! {
+     has_been_assigned_to, set_has_been_assigned_to => HAS_BEEN_ASSIGNED_TO;
+ }
+ 
++#[cfg(target_pointer_width = "64")]
+ const _: () = assert!(core::mem::size_of::<Option<bun_alloc::AstBox<G::NamespaceAlias>>>() == 8);
+ const _: () = assert!(core::mem::size_of::<Symbol>() <= 48);
+ 
 diff --git a/src/bun_alloc/baby_vec.rs b/src/bun_alloc/baby_vec.rs
 index 97e14932..daea5a01 100644
 --- a/src/bun_alloc/baby_vec.rs
@@ -187,9 +323,25 @@ index eb14e27b..6c1292db 100644
                  #[cfg(windows)]
                  { return $crate::env_var::__key_opt!($windows); }
 diff --git a/src/bun_core/lib.rs b/src/bun_core/lib.rs
-index 9d4fe108..9df7c8fb 100644
+index 9d4fe108..f3bb9c07 100644
 --- a/src/bun_core/lib.rs
 +++ b/src/bun_core/lib.rs
+@@ -2545,13 +2545,13 @@ pub mod ffi {
+     #[cfg(unix)]
+     unsafe impl Zeroable for libc::passwd {}
+     // SAFETY: C POD (integer/array/raw-pointer fields only); all-zero is valid.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     unsafe impl Zeroable for libc::stat {}
+     // SAFETY: C POD (integer/array/raw-pointer fields only); all-zero is valid.
+     #[cfg(unix)]
+     unsafe impl Zeroable for libc::rusage {}
+     // SAFETY: C POD (integer/array/raw-pointer fields only); all-zero is valid.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     unsafe impl Zeroable for libc::timespec {}
+     // SAFETY: C POD (integer/array/raw-pointer fields only); all-zero is valid.
+     #[cfg(unix)]
 @@ -2722,15 +2722,19 @@ pub mod ffi {
              #[cfg_attr(target_os = "android", link_name = "__errno")]
              #[cfg_attr(windows, link_name = "_errno")]
@@ -402,9 +554,18 @@ index 2e7a65b2..9e311f47 100644
  // WTF-backed `String` with refcount = 1; caller must `deref()` (or transfer).
  unsafe extern "C" {
 diff --git a/src/bun_core/util.rs b/src/bun_core/util.rs
-index 1e90288e..ef3ee566 100644
+index 1e90288e..e03355f3 100644
 --- a/src/bun_core/util.rs
 +++ b/src/bun_core/util.rs
+@@ -352,7 +352,7 @@ pub fn getenv_z(key: &ZStr) -> Option<&'static [u8]> {
+ /// NUL-terminated `KEY=VALUE` entries). Single decl for all POSIX call sites.
+ /// `#[inline]` and allocation-free so it stays async-signal-safe for the
+ /// post-fork crash-handler child path.
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ #[inline]
+ pub fn c_environ() -> *const *const core::ffi::c_char {
+     // `AtomicPtr<T>` is `#[repr(C)]` over `*mut T`, so this has the same
 @@ -2224,7 +2224,7 @@ unsafe extern "C" {
      /// only pointer-validity precondition, so `safe fn` discharges the
      /// link-time proof and `nano_timestamp`/`Timespec::now_real` call it
@@ -480,6 +641,34 @@ index 1e90288e..ef3ee566 100644
              }
          }
          #[cfg(windows)]
+diff --git a/src/bundler/ParseTask.rs b/src/bundler/ParseTask.rs
+index e051a225..fc6b0d2b 100644
+--- a/src/bundler/ParseTask.rs
++++ b/src/bundler/ParseTask.rs
+@@ -1696,18 +1696,22 @@ pub mod parse_worker {
+     // These structs are passed by-pointer to **third-party** native plugins via
+     // `packages/bun-native-bundler-plugin-api/bundler_plugin.h`, so layout drift
+     // is a silent ABI break for every plugin in the wild. Literals are the 64-bit
+-    // C layout from `bundler_plugin.h`.
++    // C layout from `bundler_plugin.h`. Native plugins are dlopen'd — n/a on
++    // wasm — so 32-bit targets skip the pin.
++    #[cfg(target_pointer_width = "64")]
+     bun_core::assert_ffi_layout!(
+         OnBeforeParseArguments, 64, 8;
+         struct_size @ 0, context @ 8, path_ptr @ 16, path_len @ 24,
+         namespace_ptr @ 32, namespace_len @ 40, default_loader @ 48, external @ 56,
+     );
++    #[cfg(target_pointer_width = "64")]
+     bun_core::assert_ffi_layout!(
+         BunLogOptions, 80, 8;
+         struct_size @ 0, message_ptr @ 8, message_len @ 16, path_ptr @ 24,
+         path_len @ 32, source_line_text_ptr @ 40, source_line_text_len @ 48,
+         level @ 56, line @ 60, line_end @ 64, column @ 68, column_end @ 72,
+     );
++    #[cfg(target_pointer_width = "64")]
+     bun_core::assert_ffi_layout!(
+         OnBeforeParseResult, 64, 8;
+         struct_size @ 0, source_ptr @ 8, source_len @ 16, loader @ 24,
 diff --git a/src/cares_sys/c_ares.rs b/src/cares_sys/c_ares.rs
 index 7c07c672..b1b320c8 100644
 --- a/src/cares_sys/c_ares.rs
@@ -536,6 +725,218 @@ index 7c07c672..b1b320c8 100644
  
      // glibc-only `getaddrinfo_a` / IDN extensions (absent on musl, bionic).
      #[cfg(all(target_os = "linux", target_env = "gnu"))]
+diff --git a/src/crash_handler/CPUFeatures.rs b/src/crash_handler/CPUFeatures.rs
+index 5736ea90..dce165c6 100644
+--- a/src/crash_handler/CPUFeatures.rs
++++ b/src/crash_handler/CPUFeatures.rs
+@@ -1,6 +1,7 @@
+ // (no c types needed; kept for FFI clarity)
+ use core::fmt;
+ 
++#[cfg(not(target_arch = "wasm32"))]
+ unsafe extern "C" {
+     safe fn bun_cpu_features() -> u8;
+ }
+@@ -28,6 +29,17 @@ bitflags::bitflags! {
+     }
+ }
+ 
++#[cfg(target_arch = "wasm32")]
++bitflags::bitflags! {
++    #[repr(transparent)]
++    #[derive(Copy, Clone)]
++    pub struct Flags: u8 {
++        const NONE = 1 << 0;
++        // wasm has no runtime-detected CPU features; SIMD is a build-time
++        // target feature.
++    }
++}
++
+ #[cfg(target_arch = "aarch64")]
+ bitflags::bitflags! {
+     #[repr(transparent)]
+@@ -44,7 +56,7 @@ bitflags::bitflags! {
+     }
+ }
+ 
+-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "wasm32")))]
+ compile_error!("CPUFeatures: unsupported target architecture");
+ 
+ // Per-arch const table of flag names, skipping "none" and padding bits.
+@@ -67,6 +79,9 @@ const NAMED_FLAGS: &[(&str, Flags)] = &[
+     ("sve", Flags::SVE),
+ ];
+ 
++#[cfg(target_arch = "wasm32")]
++const NAMED_FLAGS: &[(&str, Flags)] = &[];
++
+ impl fmt::Display for CPUFeatures {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         let mut is_first = true;
+@@ -96,6 +111,9 @@ impl CPUFeatures {
+     }
+ 
+     pub(crate) fn get() -> CPUFeatures {
++        #[cfg(target_arch = "wasm32")]
++        let raw = 0u8;
++        #[cfg(not(target_arch = "wasm32"))]
+         let raw = bun_cpu_features();
+         let flags = Flags::from_bits_retain(raw);
+         // sanity check: `none` bit clear and no padding bits set
+diff --git a/src/crash_handler/lib.rs b/src/crash_handler/lib.rs
+index a5cb8c89..cf8d1321 100644
+--- a/src/crash_handler/lib.rs
++++ b/src/crash_handler/lib.rs
+@@ -97,15 +97,16 @@ pub mod debug {
+     // crash handler (lower-tier crate) gets real symbol names in debug builds
+     // and `btjs` re-exports from this module.
+     use crate::Error;
+-    #[cfg(not(windows))]
++    #[cfg(not(any(windows, target_os = "wasi")))]
+     use bun_collections::HashMap;
+-    #[cfg(not(windows))]
++    #[cfg(not(any(windows, target_os = "wasi")))]
+     use core::ffi::c_void;
+ 
+     pub use bun_core::debug::{SourceLocation, SymbolInfo};
+ 
+     pub struct SelfInfo {
+-        #[cfg(not(windows))]
++        // Populated by the dl/dyld module-lookup paths, which WASI lacks.
++        #[cfg(not(any(windows, target_os = "wasi")))]
+         address_map: HashMap<usize, Box<Module>>,
+     }
+ 
+@@ -141,7 +142,7 @@ pub mod debug {
+             {
+                 // SelfInfo.init — non-Windows path is just an empty address_map.
+                 return Ok(SelfInfo {
+-                    #[cfg(not(windows))]
++                    #[cfg(not(any(windows, target_os = "wasi")))]
+                     address_map: HashMap::new(),
+                 });
+             }
+@@ -171,7 +172,13 @@ pub mod debug {
+                 let _ = address;
+                 return Err(crate::Error::MissingDebugInfo);
+             }
+-            #[cfg(not(any(target_vendor = "apple", windows)))]
++            // No dynamic loader on WASI: nothing to enumerate.
++            #[cfg(target_os = "wasi")]
++            {
++                let _ = address;
++                return Err(crate::Error::MissingDebugInfo);
++            }
++            #[cfg(not(any(target_vendor = "apple", windows, target_os = "wasi")))]
+             {
+                 return self.lookup_module_dl(address);
+             }
+@@ -189,13 +196,18 @@ pub mod debug {
+                 let _ = address;
+                 return None;
+             }
+-            #[cfg(not(any(target_vendor = "apple", windows)))]
++            #[cfg(target_os = "wasi")]
++            {
++                let _ = address;
++                return None;
++            }
++            #[cfg(not(any(target_vendor = "apple", windows, target_os = "wasi")))]
+             {
+                 return lookup_module_name_dl(address);
+             }
+         }
+ 
+-        #[cfg(not(any(target_vendor = "apple", windows)))]
++        #[cfg(not(any(target_vendor = "apple", windows, target_os = "wasi")))]
+         fn lookup_module_dl(&mut self, address: usize) -> Result<&mut Module, Error> {
+             let m =
+                 bun_sys::elf::find_loaded_module(address).ok_or(crate::Error::MissingDebugInfo)?;
+@@ -255,7 +267,17 @@ pub mod debug {
+             })
+         }
+         /// Port of `Module.getSymbolAtAddress`.
+-        #[cfg(not(windows))]
++        #[cfg(target_os = "wasi")]
++        pub fn get_symbol_at_address(&mut self, address: usize) -> Result<SymbolInfo, Error> {
++            // No dladdr on WASI; keep the caller printing the address line.
++            let _ = (self.base_address, address);
++            Ok(SymbolInfo {
++                name: b"???".to_vec().into_boxed_slice(),
++                compile_unit_name: bun_paths::basename(&self.name).to_vec().into_boxed_slice(),
++                source_location: None,
++            })
++        }
++        #[cfg(not(any(windows, target_os = "wasi")))]
+         pub fn get_symbol_at_address(&mut self, address: usize) -> Result<SymbolInfo, Error> {
+             let _ = self.base_address;
+             let mut info: libc::Dl_info = bun_core::ffi::zeroed();
+@@ -293,7 +315,7 @@ pub mod debug {
+         }
+     }
+ 
+-    #[cfg(not(any(target_vendor = "apple", windows)))]
++    #[cfg(not(any(target_vendor = "apple", windows, target_os = "wasi")))]
+     fn lookup_module_name_dl(address: usize) -> Option<Box<[u8]>> {
+         bun_sys::elf::find_loaded_module(address)
+             .map(|m| bun_paths::basename(&m.name).to_vec().into_boxed_slice())
+@@ -457,11 +479,11 @@ mod draft {
+ 
+     use core::cell::Cell;
+     use core::ffi::c_char;
+-    #[cfg(not(windows))]
++    #[cfg(unix)]
+     use core::ffi::c_int;
+     #[cfg(windows)]
+     use core::ffi::c_long;
+-    #[cfg(not(windows))]
++    #[cfg(unix)]
+     use core::ffi::c_void;
+     use core::fmt;
+     // D101: `core::fmt::Write` intentionally NOT in scope here — `bun_io::Write`
+@@ -2390,6 +2412,12 @@ mod draft {
+             {
+                 b'F'
+             }
++            // Provisional: bun.report has no wasm decoder; trace strings from
++            // wk guests are for local eyes only.
++            #[cfg(target_arch = "wasm32")]
++            {
++                b'q'
++            }
+         };
+     }
+ 
+@@ -2542,7 +2570,12 @@ mod draft {
+                 let _ = name_bytes;
+                 return None;
+             }
+-            #[cfg(not(any(windows, target_os = "macos")))]
++            #[cfg(target_os = "wasi")]
++            {
++                let _ = (addr, name_bytes);
++                return None;
++            }
++            #[cfg(not(any(windows, target_os = "macos", target_os = "wasi")))]
+             {
+                 let _ = name_bytes;
+                 let address = addr.saturating_sub(1);
+@@ -2962,7 +2995,13 @@ mod draft {
+     /// for panics) so the parent sees the real fault and core dumps are
+     /// attributed correctly.
+     fn crash(reason: CrashReason) -> ! {
+-        #[cfg(not(windows))]
++        #[cfg(target_os = "wasi")]
++        {
++            let _ = reason;
++            // No signals on WASI; trap immediately.
++            core::intrinsics::abort();
++        }
++        #[cfg(unix)]
+         {
+             let sig = reason.terminal_signal();
+ 
 diff --git a/src/errno/lib.rs b/src/errno/lib.rs
 index 09e327f8..436acd53 100644
 --- a/src/errno/lib.rs
@@ -698,6 +1099,366 @@ index 00000000..fec084c4
 +// wasi-libc follows the Darwin/FreeBSD convention: every failure returns the
 +// all-ones sentinel with the real code in the thread-local errno slot.
 +impl_get_errno_libc!(i32, u32, isize, usize, i64);
+diff --git a/src/event_loop/SpawnSyncEventLoop.rs b/src/event_loop/SpawnSyncEventLoop.rs
+index d91f9c8b..d855057b 100644
+--- a/src/event_loop/SpawnSyncEventLoop.rs
++++ b/src/event_loop/SpawnSyncEventLoop.rs
+@@ -31,7 +31,7 @@ use bun_uws as uws;
+ use crate::EventLoopHandle;
+ 
+ // On POSIX this is `?*uws.Loop`, on Windows `?*libuv.Loop`.
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ pub type VmEventLoopHandle = Option<NonNull<uws::Loop>>;
+ #[cfg(windows)]
+ pub type VmEventLoopHandle = Option<NonNull<libuv::Loop>>;
+@@ -293,7 +293,7 @@ impl SpawnSyncEventLoop {
+         self.vm = vm;
+ 
+         self.original_event_loop_handle = __bun_spawn_sync_vm_get_event_loop_handle(vm);
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "wasi"))]
+         let new_handle: VmEventLoopHandle = Some(self.uws_loop);
+         #[cfg(windows)]
+         let new_handle: VmEventLoopHandle = Some(
+diff --git a/src/io/ParentDeathWatchdog.rs b/src/io/ParentDeathWatchdog.rs
+index fe05cc8c..68f1fd52 100644
+--- a/src/io/ParentDeathWatchdog.rs
++++ b/src/io/ParentDeathWatchdog.rs
+@@ -32,11 +32,13 @@
+ //! watchdog closes both gaps from Bun's side without requiring the shim to
+ //! cooperate.
+ 
++#[cfg(not(target_os = "wasi"))]
+ use core::ffi::c_int;
+ use core::sync::atomic::{AtomicBool, Ordering};
+ 
+ #[cfg(any(target_os = "linux", target_os = "android"))]
+ use bun_core::ZStr;
++#[cfg(unix)]
+ use bun_core::env_var;
+ #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+ use bun_sys::Fd;
+@@ -58,6 +60,7 @@ pub const EXIT_CODE: u8 = 128 + 1;
+ // Atomics/OnceLock with single-writer-at-startup discipline (see
+ // docs/PORTING.md §Global mutable state).
+ static ENABLED: AtomicBool = AtomicBool::new(false);
++#[cfg(unix)]
+ static ORIGINAL_PPID: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+ 
+ /// Whether no-orphans mode was enabled at startup. Read by the spawn path to
+@@ -97,8 +100,10 @@ pub fn ppid_to_watch() -> Option<libc::pid_t> {
+ /// every Unix target, and per-slot atomics let push/read use safe
+ /// `.store()/.load()` instead of an `unsafe` raw-pointer deref. Ordering stays
+ /// Relaxed — `SYNC_PGIDS_LEN` is the publish point.
++#[cfg(unix)]
+ static SYNC_PGIDS_BUF: [core::sync::atomic::AtomicI32; 4] =
+     [const { core::sync::atomic::AtomicI32::new(0) }; 4];
++#[cfg(unix)]
+ static SYNC_PGIDS_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+ 
+ /// Returns true if the push was recorded; caller must pop iff true. Depth >4
+@@ -156,6 +161,7 @@ pub fn kill_sync_script_tree() {
+ 
+ /// Full-process teardown: pgroups + tracked + getpid()-rooted tree.
+ /// Only safe to call when the whole Bun process is exiting.
++#[cfg(unix)]
+ fn kill_sync_pgroups_and_descendants() {
+     #[cfg(unix)]
+     {
+@@ -361,6 +367,7 @@ pub fn on_parent_exit(_this: &mut ParentDeathWatchdog) {
+ /// Registered with `Global.addExitCallback` so it runs from `Bun__onExit`
+ /// (atexit on macOS, at_quick_exit on Linux, and the explicit `Global.exit`
+ /// path). C calling convention because that's the exit-callback ABI.
++#[cfg(unix)]
+ extern "C" fn on_process_exit() {
+     kill_sync_pgroups_and_descendants();
+ }
+@@ -383,6 +390,7 @@ extern "C" fn on_process_exit() {
+ /// (so its child set is stable while we recurse), which is what makes the
+ /// verify step sufficient. The only forking process is `self`, and we're in
+ /// the exit handler — not forking.
++#[cfg(unix)]
+ fn kill_descendants() {
+     #[cfg(unix)]
+     {
+diff --git a/src/io/PipeReader.rs b/src/io/PipeReader.rs
+index 4ad0c562..b3193340 100644
+--- a/src/io/PipeReader.rs
++++ b/src/io/PipeReader.rs
+@@ -2325,9 +2325,9 @@ impl Drop for WindowsBufferedReader {
+ // Platform alias
+ // ──────────────────────────────────────────────────────────────────────────
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ pub type BufferedReader = PosixBufferedReader;
+ #[cfg(windows)]
+ pub type BufferedReader = WindowsBufferedReader;
+-#[cfg(not(any(unix, windows)))]
++#[cfg(not(any(unix, windows, target_os = "wasi")))]
+ compile_error!("Unsupported platform");
+diff --git a/src/io/PipeWriter.rs b/src/io/PipeWriter.rs
+index 074c6793..ffa13886 100644
+--- a/src/io/PipeWriter.rs
++++ b/src/io/PipeWriter.rs
+@@ -2533,14 +2533,14 @@ impl<Parent: WindowsStreamingWriterParent> Drop for WindowsStreamingWriter<Paren
+ // Platform aliases
+ // ──────────────────────────────────────────────────────────────────────────
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ pub type BufferedWriter<P> = PosixBufferedWriter<P>;
+-#[cfg(not(unix))]
++#[cfg(windows)]
+ pub type BufferedWriter<P> = WindowsBufferedWriter<P>;
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ pub type StreamingWriter<P> = PosixStreamingWriter<P>;
+-#[cfg(not(unix))]
++#[cfg(windows)]
+ pub type StreamingWriter<P> = WindowsStreamingWriter<P>;
+ 
+ // ──────────────────────────────────────────────────────────────────────────
+diff --git a/src/io/lib.rs b/src/io/lib.rs
+index b5eb529e..4ec58f68 100644
+--- a/src/io/lib.rs
++++ b/src/io/lib.rs
+@@ -677,7 +677,7 @@ pub use open_for_writing_mod::{open_for_writing, open_for_writing_impl};
+ 
+ // ════════════════════════════════════════════════════════════════════════════
+ 
+-#[cfg(not(windows))]
++#[cfg(unix)]
+ use core::ffi::c_int;
+ use core::sync::atomic::Ordering;
+ 
+@@ -1092,7 +1092,8 @@ impl IoRequestLoop {
+     // `Waker.getFd` / the loop's poll fd have no Windows equivalent. Gate
+     // these so any Windows call site fails at compile time rather than
+     // compiling cleanly and only panicking at runtime.
+-    #[cfg(not(windows))]
++    // ...nor on WASI, whose backend has no reactor yet.
++    #[cfg(not(any(windows, target_os = "wasi")))]
+     pub(crate) fn pollfd(&self) -> Fd {
+         #[cfg(any(target_os = "linux", target_os = "android"))]
+         {
+@@ -1397,18 +1398,21 @@ pub enum PollableTag {
+ /// into `(tag: u8, ptr: *mut ())`. Here the value must round-trip through a
+ /// single `u64` (`epoll_event.data.u64` / `kevent.udata`), so we keep the
+ /// packed addr:49 + tag:15 layout locally.
+-#[cfg(not(windows))]
++#[cfg(not(any(windows, target_os = "wasi")))]
+ #[derive(Clone, Copy)]
+ struct Pollable {
+     value: u64,
+ }
+ 
+-#[cfg(not(windows))]
++#[cfg(not(any(windows, target_os = "wasi")))]
++#[cfg(not(any(windows, target_os = "wasi")))]
+ const POLLABLE_ADDR_BITS: u64 = 49;
+-#[cfg(not(windows))]
++#[cfg(not(any(windows, target_os = "wasi")))]
++#[cfg(not(any(windows, target_os = "wasi")))]
+ const POLLABLE_ADDR_MASK: u64 = (1u64 << POLLABLE_ADDR_BITS) - 1;
+ 
+-#[cfg(not(windows))]
++#[cfg(not(any(windows, target_os = "wasi")))]
++#[cfg(not(any(windows, target_os = "wasi")))]
+ impl Pollable {
+     fn init(t: PollableTag, p: *mut Poll) -> Pollable {
+         let addr = p as usize as u64;
+@@ -1962,7 +1966,7 @@ pub enum PathOrFileDescriptor<'a> {
+ // Waker so `Loop::load` has no upward dep on bun_io (T3). bun_io re-exports.
+ 
+ pub mod waker {
+-    #[cfg(not(windows))]
++    #[cfg(not(any(windows, target_os = "wasi")))]
+     use bun_sys::Fd;
+ 
+     #[cfg(target_os = "macos")]
+@@ -1972,6 +1976,29 @@ pub mod waker {
+     pub type Waker = LinuxWaker;
+     #[cfg(windows)]
+     pub type Waker = WindowsWaker;
++    #[cfg(target_os = "wasi")]
++    pub type Waker = WasiWaker;
++
++    // ── WASI ──────────────────────────────────────────────────────────────
++    // Single thread, no eventfd/pipe in wasi-libc: there is never another
++    // thread to wake, so waits return immediately and wakes are no-ops.
++    #[cfg(target_os = "wasi")]
++    pub struct WasiWaker;
++
++    #[cfg(target_os = "wasi")]
++    impl WasiWaker {
++        pub const fn placeholder() -> Self {
++            Self
++        }
++
++        pub fn init() -> crate::error::Result<Self> {
++            Ok(Self)
++        }
++
++        pub fn wait(&self) {}
++
++        pub fn wake(&self) {}
++    }
+ 
+     // ── Linux / FreeBSD ───────────────────────────────────────────────────────
+ 
+diff --git a/src/io/openForWriting.rs b/src/io/openForWriting.rs
+index ac898e68..3c0fe4bc 100644
+--- a/src/io/openForWriting.rs
++++ b/src/io/openForWriting.rs
+@@ -1,5 +1,5 @@
+ use bun_core::ZStr;
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ use bun_sys::FdExt;
+ use bun_sys::{self, Fd, Mode};
+ 
+@@ -109,14 +109,14 @@ where
+         );
+     }
+     // TODO: this should be concurrent.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     let mut isatty = false;
+     let mut is_nonblocking = false;
+     let result =
+         input_path.open_for_writing_result(dir, input_flags, mode, &mut is_nonblocking, &openat);
+     let fd = result?;
+ 
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     {
+         match bun_sys::fstat(fd) {
+             Err(err) => {
+diff --git a/src/io/posix_event_loop.rs b/src/io/posix_event_loop.rs
+index 86f85383..8c3bb9ed 100644
+--- a/src/io/posix_event_loop.rs
++++ b/src/io/posix_event_loop.rs
+@@ -2,7 +2,7 @@
+ use core::ffi::c_int;
+ use core::ffi::c_void;
+ use core::fmt;
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ use core::ptr;
+ 
+ #[cfg(not(windows))]
+@@ -16,7 +16,7 @@ pub type Loop = UwsLoop;
+ // `bun_uws_sys` grows `add_active`/`sub_active`. On Windows the uws loop has no
+ // such counter (libuv tracks active handles itself); `posix_event_loop` is only
+ // reachable from non-Windows `Loop` consumers, so the Windows arm is a no-op.
+-#[cfg(not(windows))]
++#[cfg(not(any(windows, target_os = "wasi")))]
+ #[inline]
+ fn loop_add_active(loop_: &mut Loop, value: u32) {
+     loop_.active = loop_.active.saturating_add(value);
+@@ -76,7 +76,7 @@ fn kevent_change_error(data: i64) -> sys::Result<()> {
+ /// be cleared, which an error return would skip, leaving the poll claiming to
+ /// be registered and re-issuing doomed deletes on later teardown calls. libuv
+ /// ignores the same errnos for its kqueue/epoll delete operations.
+-#[cfg(not(windows))]
++#[cfg(not(any(windows, target_os = "wasi")))]
+ #[inline]
+ fn deregistration_already_gone(errno: sys::E) -> bool {
+     matches!(errno, sys::E::ENOENT | sys::E::EBADF)
+@@ -141,7 +141,10 @@ pub fn js_vm_ctx() -> EventLoopCtx {
+ // `KQueueGenerationNumber` is `usize` on macOS-debug, else a zero-size sentinel.
+ #[cfg(all(target_os = "macos", debug_assertions))]
+ type KQueueGenerationNumber = usize;
+-#[cfg(all(unix, not(all(target_os = "macos", debug_assertions))))]
++#[cfg(any(
++    all(unix, not(all(target_os = "macos", debug_assertions))),
++    target_os = "wasi"
++))]
+ type KQueueGenerationNumber = u8; // Note: conceptually zero-width; smallest Rust int is u8. Gated by cfg below.
+ 
+ // Debug-only diagnostic; `Relaxed` (no synchronization implied).
+@@ -317,6 +320,9 @@ impl Default for FilePoll {
+ 
+ #[cfg(not(windows))]
+ impl FilePoll {
++    // The reactor-event path (update/dispatch/activate) has no WASI caller;
++    // the registry surface below (init/register/unregister) does.
++    #[cfg(not(target_os = "wasi"))]
+     fn update_flags(&mut self, updated: FlagsSet) {
+         let mut flags = self.flags;
+         flags.remove(Flags::Readable);
+@@ -431,6 +437,7 @@ impl FilePoll {
+             || self.flags.contains(Flags::PollMemoryPressure)
+     }
+ 
++    #[cfg(not(target_os = "wasi"))]
+     pub(crate) fn on_update(&mut self, size_or_offset: i64) {
+         if self.flags.contains(Flags::OneShot) && !self.flags.contains(Flags::NeedsRearm) {
+             self.flags.insert(Flags::NeedsRearm);
+@@ -497,6 +504,7 @@ impl FilePoll {
+     }
+ 
+     /// Only intended to be used from EventLoop.Pollable
++    #[cfg(not(target_os = "wasi"))]
+     fn activate(&mut self, loop_: &mut Loop) {
+         self.flags.remove(Flags::Closed);
+ 
+diff --git a/src/js_parser/parse/parse_entry.rs b/src/js_parser/parse/parse_entry.rs
+index 22ae907b..148f4291 100644
+--- a/src/js_parser/parse/parse_entry.rs
++++ b/src/js_parser/parse/parse_entry.rs
+@@ -5,6 +5,7 @@ use core::mem::MaybeUninit;
+ use crate::Error;
+ use bun_alloc::Arena; // bumpalo::Bump re-export
+ use bun_core;
++#[cfg(not(target_arch = "wasm32"))]
+ use bun_core::strings;
+ use bun_wyhash::Wyhash;
+ 
+@@ -2216,7 +2217,8 @@ struct PragmaState {
+     seen_bytecode: bool,
+ }
+ 
+-#[cfg(target_arch = "wasm32")]
+-pub type MacroContext = Option<*mut c_void>;
+-#[cfg(not(target_arch = "wasm32"))]
++// The real context on every target — its FFI surface is decls-only, and
++// `ALLOW_MACROS` (false on wasm) keeps the call paths runtime-unreachable.
++// (An old browser-wasm alias to `*mut c_void` lived here; the call sites
++// have since outgrown it.)
+ pub type MacroContext = crate::Macro::MacroContext;
+diff --git a/src/js_printer/renamer.rs b/src/js_printer/renamer.rs
+index aebe444e..830d0a03 100644
+--- a/src/js_printer/renamer.rs
++++ b/src/js_printer/renamer.rs
+@@ -1049,11 +1049,6 @@ impl ExportRenamer {
+ pub fn compute_initial_reserved_names(
+     output_format: Format,
+ ) -> Result<StringHashMap<u32>, bun_alloc::AllocError> {
+-    #[cfg(target_arch = "wasm32")]
+-    {
+-        unreachable!();
+-    }
+-
+     let mut names = StringHashMap::<u32>::default();
+ 
+     const EXTRAS: [&[u8]; 2] = [b"Promise", b"Require"];
+diff --git a/src/libarchive/lib.rs b/src/libarchive/lib.rs
+index 3965e9b4..6c30a3d8 100644
+--- a/src/libarchive/lib.rs
++++ b/src/libarchive/lib.rs
+@@ -282,7 +282,7 @@ pub mod lib {
+                 // Track the furthest point we need to write to (for final truncation)
+                 final_offset = final_offset.max(block.offset + data.len() as i64);
+ 
+-                #[cfg(unix)]
++                #[cfg(any(unix, target_os = "wasi"))]
+                 {
+                     // Try pwrite first — it handles sparse files without needing lseek
+                     if *can_use_pwrite {
 diff --git a/src/libuv_sys/lib.rs b/src/libuv_sys/lib.rs
 index 4a2dccc2..9c665866 100644
 --- a/src/libuv_sys/lib.rs
@@ -713,6 +1474,66 @@ index 4a2dccc2..9c665866 100644
 +pub const UV_EHOSTDOWN: core::ffi::c_int = -4031;
 +#[cfg(target_os = "wasi")]
 +pub const UV_ESOCKTNOSUPPORT: core::ffi::c_int = -4025;
+diff --git a/src/react_compiler/inference/infer_mutation_aliasing_effects.rs b/src/react_compiler/inference/infer_mutation_aliasing_effects.rs
+index 62e22e79..2b4f25c3 100644
+--- a/src/react_compiler/inference/infer_mutation_aliasing_effects.rs
++++ b/src/react_compiler/inference/infer_mutation_aliasing_effects.rs
+@@ -291,7 +291,9 @@ struct ValueIdSet {
+ }
+ 
+ const _: () = assert!(std::mem::size_of::<ValueIdSet>() == 16);
+-const _: () = assert!(std::mem::size_of::<usize>() == 8);
++// Pointers round-trip through u64 words; 32-bit targets fit with a zero
++// upper word.
++const _: () = assert!(std::mem::size_of::<usize>() <= 8);
+ 
+ impl ValueIdSet {
+     const INLINE_CAP: u32 = 3;
+diff --git a/src/resolver/fs/stat_hash.rs b/src/resolver/fs/stat_hash.rs
+index fedfe150..0d570fe3 100644
+--- a/src/resolver/fs/stat_hash.rs
++++ b/src/resolver/fs/stat_hash.rs
+@@ -18,6 +18,13 @@ pub struct StatHash {
+ fn stat_mtime(s: &Stat) -> Timespec {
+     // The `libc` crate flattens BSD/Darwin `st_mtimespec` into
+     // `st_mtime`/`st_mtime_nsec` so the access is uniform on all `unix`.
++    #[cfg(target_os = "wasi")]
++    {
++        Timespec {
++            sec: s.st_mtim.tv_sec,
++            nsec: s.st_mtim.tv_nsec.into(),
++        }
++    }
+     #[cfg(unix)]
+     {
+         Timespec {
+diff --git a/src/resolver/lib.rs b/src/resolver/lib.rs
+index 23bed025..be20f546 100644
+--- a/src/resolver/lib.rs
++++ b/src/resolver/lib.rs
+@@ -1758,6 +1758,9 @@ pub mod fs {
+             // uniform on all `unix`.
+             #[cfg(unix)]
+             let mtime: i128 = (stat.st_mtime as i128) * NS_PER_S + stat.st_mtime_nsec as i128;
++            #[cfg(target_os = "wasi")]
++            let mtime: i128 =
++                (stat.st_mtim.tv_sec as i128) * NS_PER_S + stat.st_mtim.tv_nsec as i128;
+             #[cfg(windows)]
+             let mtime: i128 = (stat.mtim.sec as i128) * NS_PER_S + stat.mtim.nsec as i128;
+             let seconds = mtime / NS_PER_S;
+diff --git a/src/resolver/resolver.rs b/src/resolver/resolver.rs
+index b6553c4c..7433ff63 100644
+--- a/src/resolver/resolver.rs
++++ b/src/resolver/resolver.rs
+@@ -4522,7 +4522,7 @@ impl<'a> Resolver<'a> {
+                     path[nul_at] = 0;
+                     let sentinel = bun_core::ZStr::from_buf(path, nul_at);
+ 
+-                    #[cfg(unix)]
++                    #[cfg(any(unix, target_os = "wasi"))]
+                     let open_req: crate::CrateResult<FD> = {
+                         bun_sys::open_dir_absolute_z(
+                             sentinel,
 diff --git a/src/semver/lib.rs b/src/semver/lib.rs
 index 43495dae..04df15ce 100644
 --- a/src/semver/lib.rs
@@ -732,8 +1553,87 @@ index 43495dae..04df15ce 100644
      );
  
      impl String {
+diff --git a/src/spawn_sys/spawn_process.rs b/src/spawn_sys/spawn_process.rs
+index 3cd940e2..137d9cb0 100644
+--- a/src/spawn_sys/spawn_process.rs
++++ b/src/spawn_sys/spawn_process.rs
+@@ -14,7 +14,7 @@ use core::sync::atomic::Ordering;
+ use bun_core::Output;
+ use bun_sys::{self, Fd, FdExt as _};
+ 
+-#[cfg(not(windows))]
++#[cfg(unix)]
+ use crate::posix_spawn::posix_spawn;
+ #[cfg(unix)]
+ use posix_spawn::{Actions as PosixSpawnActions, Attr as PosixSpawnAttr};
+@@ -26,7 +26,7 @@ use crate::{Argv, Envp};
+ // PID / fd width aliases
+ // ──────────────────────────────────────────────────────────────────────────
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ pub type PidT = libc::pid_t;
+ #[cfg(windows)]
+ pub type PidT = bun_libuv_sys::uv_pid_t;
+@@ -144,6 +144,36 @@ pub fn uv_getrusage(process: &mut bun_libuv_sys::uv_process_t) -> WinRusage {
+ pub type Rusage = WinRusage;
+ #[cfg(unix)]
+ pub type Rusage = libc::rusage;
++/// wasi-libc's <sys/resource.h> `struct rusage` — full layout. The libc
++/// crate's wasi binding stops at ru_utime/ru_stime, but `RusageFields`
++/// reads the Linux-extension counters wasi-libc declares (and zero-fills).
++#[cfg(target_os = "wasi")]
++#[repr(C)]
++#[derive(Clone, Copy)]
++pub struct WasiRusage {
++    pub ru_utime: libc::timeval,
++    pub ru_stime: libc::timeval,
++    pub ru_maxrss: core::ffi::c_long,
++    pub ru_ixrss: core::ffi::c_long,
++    pub ru_idrss: core::ffi::c_long,
++    pub ru_isrss: core::ffi::c_long,
++    pub ru_minflt: core::ffi::c_long,
++    pub ru_majflt: core::ffi::c_long,
++    pub ru_nswap: core::ffi::c_long,
++    pub ru_inblock: core::ffi::c_long,
++    pub ru_oublock: core::ffi::c_long,
++    pub ru_msgsnd: core::ffi::c_long,
++    pub ru_msgrcv: core::ffi::c_long,
++    pub ru_nsignals: core::ffi::c_long,
++    pub ru_nvcsw: core::ffi::c_long,
++    pub ru_nivcsw: core::ffi::c_long,
++    __reserved: [core::ffi::c_long; 16],
++}
++#[cfg(target_os = "wasi")]
++// SAFETY: timevals + longs; all-zero is the "no usage recorded" value.
++unsafe impl bun_core::ffi::Zeroable for WasiRusage {}
++#[cfg(target_os = "wasi")]
++pub type Rusage = WasiRusage;
+ 
+ // SAFETY: `i64`/`u64` only (via `WinTimeval`); all-zero matches `Default`.
+ unsafe impl bun_core::ffi::Zeroable for WinRusage {}
+@@ -174,8 +204,8 @@ pub trait RusageFields {
+     fn nivcsw(&self) -> f64;
+ }
+ 
+-#[cfg(unix)]
+-impl RusageFields for libc::rusage {
++#[cfg(any(unix, target_os = "wasi"))]
++impl RusageFields for Rusage {
+     // `tv_sec`/`tv_usec` are `i64` on linux but `i32` on darwin (`suseconds_t`);
+     // the `as i64` is required for the latter and a no-op on the former.
+     #[inline]
+@@ -462,7 +492,7 @@ pub struct PosixSpawnResult {
+     pub stdin: Option<Fd>,
+     pub stdout: Option<Fd>,
+     pub stderr: Option<Fd>,
+-    #[cfg(not(windows))]
++    #[cfg(unix)]
+     pub(crate) ipc: Option<Fd>,
+     pub extra_pipes: Vec<ExtraPipe>,
+     pub memfds: [bool; 3],
 diff --git a/src/sys/PosixStat.rs b/src/sys/PosixStat.rs
-index ed2c4812..31dc8c41 100644
+index ed2c4812..5ee1bb46 100644
 --- a/src/sys/PosixStat.rs
 +++ b/src/sys/PosixStat.rs
 @@ -82,6 +82,13 @@ pub fn stat_atime(s: &Stat) -> Timespec {
@@ -778,11 +1678,25 @@ index ed2c4812..31dc8c41 100644
      #[cfg(windows)]
      {
          Timespec {
+@@ -173,7 +194,7 @@ impl PosixStat {
+         let ctime_val = stat_ctime(stat_);
+         let birthtime_val = stat_birthtime(stat_);
+ 
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "wasi"))]
+         {
+             PosixStat {
+                 dev: to_u64(stat_.st_dev),
 diff --git a/src/sys/copy_file.rs b/src/sys/copy_file.rs
-index bf320925..f4f25210 100644
+index bf320925..393304b2 100644
 --- a/src/sys/copy_file.rs
 +++ b/src/sys/copy_file.rs
-@@ -8,7 +8,7 @@ use core::sync::atomic::{AtomicI32, Ordering};
+@@ -4,11 +4,11 @@
+ 
+ use core::sync::atomic::{AtomicI32, Ordering};
+ 
+-#[cfg(not(windows))]
++#[cfg(not(any(windows, target_os = "wasi")))]
  use crate::E;
  #[cfg(not(windows))]
  use crate::Fd;
@@ -791,6 +1705,19 @@ index bf320925..f4f25210 100644
  use crate::Tag;
  
  // `declare_scope!` uses the ident as both static name AND tag string, but
+diff --git a/src/sys/dir.rs b/src/sys/dir.rs
+index 6dcea30a..db2e81fa 100644
+--- a/src/sys/dir.rs
++++ b/src/sys/dir.rs
+@@ -281,7 +281,7 @@ impl Dir {
+     }
+ }
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ pub const AT_REMOVEDIR: i32 = libc::AT_REMOVEDIR;
+ #[cfg(windows)]
+ pub const AT_REMOVEDIR: i32 = 0x200;
 diff --git a/src/sys/fd.rs b/src/sys/fd.rs
 index 4e423c09..3b94faff 100644
 --- a/src/sys/fd.rs
@@ -816,10 +1743,33 @@ index 4e423c09..3b94faff 100644
              {
                  debug_assert!(self.native() >= 0);
 diff --git a/src/sys/lib.rs b/src/sys/lib.rs
-index c2e8b817..00bb3d34 100644
+index c2e8b817..9336d2e1 100644
 --- a/src/sys/lib.rs
 +++ b/src/sys/lib.rs
-@@ -254,8 +254,9 @@ pub mod dir_iterator {
+@@ -106,8 +106,11 @@ pub use bun_core::FileKind as EntryKind;
+ // iterate without pulling `bun_runtime` up-tier.
+ pub mod dir_iterator {
+     use super::{EntryKind, Error, Fd, Result, Tag};
++    #[cfg(target_os = "wasi")]
++    use crate::wasi_libc as libc;
+     use bun_paths::OSPathChar;
+ 
++    #[cfg(not(target_os = "wasi"))]
+     const BUF_SIZE: usize = 8192;
+ 
+     /// Native-encoding directory entry returned by `WrappedIterator::next()`.
+@@ -230,8 +233,10 @@ pub mod dir_iterator {
+     // ~1.4K dirs/install → ~11 MB zalloc churn dropped) and store it inline in
+     // `State` so the per-dir heap allocation is gone too. The kernel fills
+     // `[0..rc]` before we read; we never index past `end_index`.
++    #[cfg(not(target_os = "wasi"))]
+     #[repr(C, align(8))]
+     struct AlignedBuf(core::mem::MaybeUninit<[u8; BUF_SIZE]>);
++    #[cfg(not(target_os = "wasi"))]
+     impl AlignedBuf {
+         #[inline(always)]
+         const fn uninit() -> Self {
+@@ -254,8 +259,9 @@ pub mod dir_iterator {
          }
      }
  
@@ -831,7 +1781,7 @@ index c2e8b817..00bb3d34 100644
      #[inline]
      fn kind_from_dt(dt: u8) -> EntryKind {
          match dt {
-@@ -277,6 +278,81 @@ pub mod dir_iterator {
+@@ -277,6 +283,81 @@ pub mod dir_iterator {
          }
      }
  
@@ -913,7 +1863,113 @@ index c2e8b817..00bb3d34 100644
      // ── Linux / Android ──────────────────────────────────────────────────
      // Same `getdents64(2)` walk for both — Android is the same kernel, and
      // `linux_syscall::getdents64` is a raw syscall (no libc wrapper involved).
-@@ -1251,7 +1327,8 @@ pub use file::{File, ReadToEndResult};
+@@ -832,7 +913,10 @@ pub fn lstatat(fd: impl AsFd, path: &ZStr) -> Result<Stat> {
+         linux_syscall::fstatat(dirfd, path, libc::AT_SYMLINK_NOFOLLOW)
+             .map_err(|e| Error::from_code_int(e, Tag::fstatat).with_path(path.as_bytes()))
+     }
+-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
++    #[cfg(any(
++        all(unix, not(any(target_os = "linux", target_os = "android"))),
++        target_os = "wasi"
++    ))]
+     {
+         let mut st = core::mem::MaybeUninit::<libc::stat>::uninit();
+         let dirfd = if fd.is_valid() {
+@@ -901,7 +985,7 @@ pub use tmp::Tmpfile;
+ // `#[cfg(windows)]` arms in dependents.
+ pub mod windows;
+ 
+-#[cfg(not(windows))]
++#[cfg(unix)]
+ use core::ffi::c_int;
+ use core::ffi::{c_char, c_void};
+ 
+@@ -967,7 +1051,7 @@ pub(crate) extern "C" fn Bun__errnoName(err: core::ffi::c_int) -> *const core::f
+     // `SystemErrno::init` has a per-target signature: `i64` on every POSIX
+     // target (Linux/Darwin/FreeBSD), generic `SystemErrnoInit` on Windows.
+     // Feed it the widest signed int and let each impl narrow.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     let code = err as i64;
+     #[cfg(windows)]
+     let code = err;
+@@ -1153,13 +1237,13 @@ pub mod O {
+     // NOT MSVCRT `_O_*`. `uv::O::from_bun_o` bit-tests
+     // against these exact values, so re-using `libc::O_CREAT` (0x100) etc.
+     // silently dropped CREAT/EXCL/APPEND on Windows.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub const CREAT: i32 = libc::O_CREAT;
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub const TRUNC: i32 = libc::O_TRUNC;
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub const APPEND: i32 = libc::O_APPEND;
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub const EXCL: i32 = libc::O_EXCL;
+     #[cfg(windows)]
+     pub const CREAT: i32 = 0o100;
+@@ -1169,9 +1253,9 @@ pub mod O {
+     pub const TRUNC: i32 = 0o1000;
+     #[cfg(windows)]
+     pub const APPEND: i32 = 0o2000;
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub const NONBLOCK: i32 = libc::O_NONBLOCK;
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub const CLOEXEC: i32 = libc::O_CLOEXEC;
+     // Windows libc has no `O_NONBLOCK`/`O_CLOEXEC`; libuv ignores them. Values
+     // chosen to round-trip through `uv::O::from_bun_o` without colliding with
+@@ -1180,7 +1264,7 @@ pub mod O {
+     pub const NONBLOCK: i32 = 0o4000;
+     #[cfg(windows)]
+     pub const CLOEXEC: i32 = 0o2000000;
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub const DIRECTORY: i32 = libc::O_DIRECTORY;
+     // Non-zero on Windows so `(flags & O::DIRECTORY) != 0`
+     // routes `openat_windows_impl` to the directory NtCreateFile path.
+@@ -1200,29 +1284,29 @@ pub mod O {
+     pub const NOATIME: i32 = 0o1000000;
+     #[cfg(windows)]
+     pub(crate) const TMPFILE: i32 = 0o20200000;
+-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
++    #[cfg(any(all(unix, not(any(target_os = "linux", target_os = "android"))), target_os = "wasi"))]
+     pub const PATH: i32 = 0;
+-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
++    #[cfg(any(all(unix, not(any(target_os = "linux", target_os = "android"))), target_os = "wasi"))]
+     pub const NOATIME: i32 = 0;
+-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
++    #[cfg(any(all(unix, not(any(target_os = "linux", target_os = "android"))), target_os = "wasi"))]
+     pub(crate) const TMPFILE: i32 = 0;
+     // Defined for every platform; Darwin-only flags map to 0
+     // elsewhere so `flags & O.EVTONLY` etc. compile and are no-ops.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub const NOFOLLOW: i32 = libc::O_NOFOLLOW;
+     #[cfg(windows)]
+     pub const NOFOLLOW: i32 = 0o400000;
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub const SYNC: i32 = libc::O_SYNC;
+     // Windows has no O_SYNC/O_DSYNC; node's stringToFlags() ORs in `undefined`
+     // (→ 0) there, so the 's' flag-string modifier is a no-op. Match that.
+     #[cfg(windows)]
+     pub const SYNC: i32 = 0;
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub const DSYNC: i32 = libc::O_DSYNC;
+     #[cfg(windows)]
+     pub const DSYNC: i32 = 0;
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub const NOCTTY: i32 = libc::O_NOCTTY;
+     #[cfg(windows)]
+     pub const NOCTTY: i32 = 0;
+@@ -1251,7 +1335,8 @@ pub use file::{File, ReadToEndResult};
  pub mod dir;
  pub use dir::*;
  
@@ -923,7 +1979,74 @@ index c2e8b817..00bb3d34 100644
  pub type Stat = libc::stat;
  /// On Windows `bun.Stat` is libuv's `uv_stat_t`.
  #[cfg(windows)]
-@@ -1563,7 +1640,7 @@ pub(crate) const MAX_COUNT: usize = u32::MAX as usize;
+@@ -1404,7 +1489,8 @@ impl Tag {
+     #[cfg(not(windows))]
+     pub(crate) const fchdir: Tag = Tag(102);
+     pub const fchownat: Tag = Tag(103);
+-    #[cfg(not(windows))]
++    // On WASI the tc*/winsize surface that tags with `ioctl` is compiled out.
++    #[cfg(not(any(windows, target_os = "wasi")))]
+     pub(crate) const ioctl: Tag = Tag(104);
+     #[cfg(not(windows))]
+     pub(crate) const getrlimit: Tag = Tag(105);
+@@ -1552,20 +1638,67 @@ impl From<Tag> for &'static str {
+ /// Darwin/BSD use signed 32-bit byte counts.
+ #[cfg(any(target_os = "linux", target_os = "android"))]
+ pub(crate) const MAX_COUNT: usize = 0x7ffff000;
+-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
++#[cfg(any(
++    all(unix, not(any(target_os = "linux", target_os = "android"))),
++    target_os = "wasi"
++))]
+ pub(crate) const MAX_COUNT: usize = i32::MAX as usize;
+ #[cfg(windows)]
+ pub(crate) const MAX_COUNT: usize = u32::MAX as usize;
+ 
++// The `libc` crate's wasm32-wasip2 surface lags wasi-libc: these symbols and
++// constants all exist in the sysroot headers (values transcribed from them)
++// but have no Rust binding yet. Modules that need them shadow the crate with
++// `use crate::wasi_libc as libc;` — the glob re-export keeps every other
++// `libc::` path working unchanged.
++#[cfg(target_os = "wasi")]
++pub(crate) mod wasi_libc {
++    // c_char/c_int/c_void/mode_t/off_t all come through the glob.
++    pub use ::libc::*;
++    pub(crate) const F_DUPFD_CLOEXEC: c_int = 1030; // <fcntl.h>
++    pub(crate) const MSG_DONTWAIT: c_int = 0x0040; // <sys/socket.h>
++    pub(crate) const PROT_READ: c_int = 1; // <sys/mman.h>
++    pub(crate) const PROT_WRITE: c_int = 2;
++    pub(crate) const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
++    pub(crate) const RLIMIT_STACK: c_int = 3; // <sys/resource.h>
++    pub(crate) const RLIMIT_CORE: c_int = 4;
++    pub(crate) const RLIMIT_NOFILE: c_int = 7;
++    #[repr(C)]
++    #[derive(Clone, Copy)]
++    pub(crate) struct rlimit {
++        pub(crate) rlim_cur: u64, // rlim_t = unsigned long long
++        pub(crate) rlim_max: u64,
++    }
++    unsafe extern "C" {
++        pub(crate) fn dup(fd: c_int) -> c_int;
++        pub(crate) fn chown(path: *const c_char, uid: u32, gid: u32) -> c_int;
++        pub(crate) fn lchown(path: *const c_char, uid: u32, gid: u32) -> c_int;
++        pub(crate) fn fchmodat(dirfd: c_int, path: *const c_char, mode: mode_t, flags: c_int) -> c_int;
++        // wasi-libc emulates mmap with malloc + pread (private, non-shared
++        // maps only) — good enough for the read-only file-mapping fast path.
++        pub(crate) fn mmap(
++            addr: *mut c_void,
++            len: usize,
++            prot: c_int,
++            flags: c_int,
++            fd: c_int,
++            offset: off_t,
++        ) -> *mut c_void;
++        pub(crate) fn munmap(addr: *mut c_void, len: usize) -> c_int;
++    }
++}
++
+ // ── libc shims with no preconditions ────────────────────────────────────────
+ // Every fn here takes only by-value scalars (`c_int` fd, `mode_t`, `uid_t`,
+ // `gid_t`, `off_t`). The kernel validates the fd and reports failure via the
  // return value / `errno` — passing a bad fd is `EBADF`, never UB. Declaring
  // them locally as `safe fn` (instead of routing through the `libc` crate's
  // `unsafe extern fn` items) drops the per-call-site `unsafe { }` block.
@@ -931,8 +2054,29 @@ index c2e8b817..00bb3d34 100644
 +#[cfg(any(unix, target_os = "wasi"))]
  mod safe_libc {
      use core::ffi::c_int;
++    #[cfg(target_os = "wasi")]
++    use crate::wasi_libc as libc;
      // `close` is a libc symbol std relies on; this is an FFI import (not a
-@@ -1715,7 +1792,7 @@ mod nocancel {
+     // competing definition) with the canonical signature.
+     #[allow(suspicious_runtime_symbol_definitions)]
+@@ -1618,12 +1751,16 @@ mod safe_libc {
+         // bad fd/resource → errno (`ENOTTY`/`EINVAL`/…), never UB. `resource`
+         // is ABI-`int` on every Unix (glibc's `__rlimit_resource_t` is a
+         // `c_uint`-typed enum, same 32-bit register slot).
++        // wasi-libc has no termios (wk guests get theirs via the tty-compat
++        // shim in C land); gate so `libc::termios` never resolves here.
++        #[cfg(not(target_os = "wasi"))]
+         pub(crate) safe fn tcsetattr(fd: c_int, action: c_int, t: &libc::termios) -> c_int;
+         // Out-param is `&mut MaybeUninit<termios>` (`MaybeUninit<T>` is
+         // `#[repr(transparent)]`, so ABI-identical to `*mut termios`,
+         // non-null, valid for `sizeof(termios)` writes); libc only writes the
+         // slot on success and reports failure via the return value — bad fd →
+         // `ENOTTY`/`EBADF`, never UB.
++        #[cfg(not(target_os = "wasi"))]
+         pub(crate) safe fn tcgetattr(
+             fd: c_int,
+             t: &mut core::mem::MaybeUninit<libc::termios>,
+@@ -1715,9 +1852,11 @@ mod nocancel {
      }
  }
  
@@ -940,8 +2084,51 @@ index c2e8b817..00bb3d34 100644
 +#[cfg(any(unix, target_os = "wasi"))]
  mod posix_impl {
      use super::*;
++    #[cfg(target_os = "wasi")]
++    use crate::wasi_libc as libc;
      // Per-platform raw syscall dispatch — macOS uses `$NOCANCEL`; Linux goes
-@@ -3547,7 +3624,7 @@ mod posix_impl {
+     // through rustix's linux_raw backend (no libc trampoline);
+     // other POSIX falls back to libc. The Linux hot paths
+@@ -2770,7 +2909,10 @@ mod posix_impl {
+             return Ok(());
+         }
+     }
+-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
++    #[cfg(any(
++        all(unix, not(any(target_os = "linux", target_os = "android"))),
++        target_os = "wasi"
++    ))]
+     pub(crate) fn linkat_tmpfile(_tmpfd: Fd, _dirfd: Fd, name: &ZStr) -> Maybe<()> {
+         // Tags as `.link` (matches Linux arm).
+         Err(Error::from_code_int(libc::EOPNOTSUPP, Tag::link).with_path(name.as_bytes()))
+@@ -2850,7 +2992,11 @@ mod posix_impl {
+             );
+             Ok(())
+         }
+-        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
++        #[cfg(target_os = "wasi")]
++        {
++            return fchmodat(Fd::cwd(), path, mode, libc::AT_SYMLINK_NOFOLLOW);
++        }
++        #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "wasi")))]
+         {
+             const SYS_FCHMODAT2: libc::c_long = 452;
+             loop {
+@@ -3137,11 +3283,11 @@ mod posix_impl {
+     pub fn send_non_block(fd: Fd, buf: &[u8]) -> Maybe<usize> {
+         send(fd, buf, SEND_FLAGS_NONBLOCK)
+     }
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub(crate) const MSG_DONTWAIT: i32 = libc::MSG_DONTWAIT;
+     // `MSG_DONTWAIT | MSG_NOSIGNAL` on all Unix including macOS
+     // (Darwin defines MSG_NOSIGNAL=0x80000).
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub(crate) const SEND_FLAGS_NONBLOCK: i32 = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+     /// `fcntl(F_GETFD)` then OR in `FD_CLOEXEC`.
+     pub fn set_close_on_exec(fd: Fd) -> Maybe<()> {
+@@ -3547,7 +3693,7 @@ mod posix_impl {
          Err(Error::from_code_int(libc::ENOSYS, Tag::sendfile).with_fd(src))
      }
  }
@@ -950,6 +2137,575 @@ index c2e8b817..00bb3d34 100644
  pub use posix_impl::*;
  
  // D034: canonical lives in the leaf crate (cached via OnceLock); the per-platform
+@@ -4614,7 +4760,7 @@ fn read_fill_vec(
+ // Layout matches `libc::iovec` (`{ *void, usize }`) so a `&[PlatformIoVecConst]`
+ // can be passed straight to `pwritev(2)`.
+ // ──────────────────────────────────────────────────────────────────────────
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ #[repr(C)]
+ #[derive(Clone, Copy)]
+ pub struct PlatformIoVecConst {
+@@ -4622,15 +4768,15 @@ pub struct PlatformIoVecConst {
+     pub len: usize,
+ }
+ // SAFETY: `{ *const u8, usize }` — `(null, 0)` is a valid empty iovec (S021).
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ unsafe impl bun_core::ffi::Zeroable for PlatformIoVecConst {}
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ const _: () = assert!(
+     core::mem::size_of::<PlatformIoVecConst>() == core::mem::size_of::<libc::iovec>()
+         && core::mem::align_of::<PlatformIoVecConst>() == core::mem::align_of::<libc::iovec>()
+ );
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ #[inline]
+ pub fn platform_iovec_const_create(buf: &[u8]) -> PlatformIoVecConst {
+     PlatformIoVecConst {
+@@ -4642,7 +4788,7 @@ pub fn platform_iovec_const_create(buf: &[u8]) -> PlatformIoVecConst {
+ /// `bun.sys.pwritev` — gather-write at `offset`. Returns bytes written
+ /// (may be less than the sum of `vecs` lengths on a short write).
+ pub fn pwritev(fd: Fd, vecs: &[PlatformIoVecConst], offset: i64) -> Maybe<usize> {
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     {
+         // SAFETY: `PlatformIoVecConst` is layout-compatible with `libc::iovec`
+         // (asserted above); `pwritev(2)` only reads through `iov_base`.
+@@ -4707,7 +4853,7 @@ pub fn pwritev(fd: Fd, vecs: &[PlatformIoVecConst], offset: i64) -> Maybe<usize>
+ // `uv_buf_t` on Windows). Layout-compatible with `libc::iovec` so a
+ // `&[PlatformIoVec]` can be passed straight to `readv(2)`/`writev(2)`.
+ // ──────────────────────────────────────────────────────────────────────────
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ pub type PlatformIoVec = libc::iovec;
+ #[cfg(windows)]
+ pub type PlatformIoVec = bun_libuv_sys::uv_buf_t;
+@@ -4718,7 +4864,7 @@ pub use PlatformIoVecConst as PlatformIOVecConst;
+ 
+ #[inline]
+ pub fn platform_iovec_create(buf: &mut [u8]) -> PlatformIoVec {
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     {
+         PlatformIoVec {
+             iov_base: buf.as_mut_ptr().cast(),
+@@ -4738,7 +4884,7 @@ pub fn platform_iovec_create(buf: &mut [u8]) -> PlatformIoVec {
+ 
+ #[inline]
+ pub const fn platform_iovec_len(iov: &PlatformIoVec) -> usize {
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     {
+         iov.iov_len
+     }
+@@ -4779,7 +4925,7 @@ pub fn platform_iovec_const_create(buf: &[u8]) -> PlatformIoVecConst {
+ /// `bun.sys.writev` — gather-write. macOS uses `writev$NOCANCEL` with no
+ /// EINTR retry; other POSIX retries on EINTR.
+ pub fn writev(fd: Fd, vecs: &[PlatformIoVec]) -> Maybe<usize> {
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     {
+         #[cfg(target_os = "macos")]
+         {
+@@ -4814,7 +4960,7 @@ pub fn writev(fd: Fd, vecs: &[PlatformIoVec]) -> Maybe<usize> {
+             return Ok(rc as usize);
+         }
+     }
+-    #[cfg(not(unix))]
++    #[cfg(not(any(unix, target_os = "wasi")))]
+     {
+         // TODO(windows): route through `uv_fs_write` with `uv_buf_t[]`.
+         let _ = (fd, vecs);
+@@ -4829,7 +4975,7 @@ pub fn readv(fd: Fd, vecs: &[PlatformIoVec]) -> Maybe<usize> {
+     if vecs.is_empty() {
+         bun_core::debug_warn!("readv() called with 0 length buffer");
+     }
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     {
+         #[cfg(target_os = "macos")]
+         {
+@@ -4864,7 +5010,7 @@ pub fn readv(fd: Fd, vecs: &[PlatformIoVec]) -> Maybe<usize> {
+             return Ok(rc as usize);
+         }
+     }
+-    #[cfg(not(unix))]
++    #[cfg(not(any(unix, target_os = "wasi")))]
+     {
+         let _ = (fd, vecs);
+         Err(Error::from_code_int(libc::ENOSYS, Tag::readv))
+@@ -4878,7 +5024,7 @@ pub fn preadv(fd: Fd, vecs: &[PlatformIoVec], position: i64) -> Maybe<usize> {
+     if vecs.is_empty() {
+         bun_core::debug_warn!("preadv() called with 0 length buffer");
+     }
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     {
+         #[cfg(target_os = "macos")]
+         {
+@@ -4923,7 +5069,7 @@ pub fn preadv(fd: Fd, vecs: &[PlatformIoVec], position: i64) -> Maybe<usize> {
+             return Ok(rc as usize);
+         }
+     }
+-    #[cfg(not(unix))]
++    #[cfg(not(any(unix, target_os = "wasi")))]
+     {
+         let _ = (fd, vecs, position);
+         Err(Error::from_code_int(libc::ENOSYS, Tag::preadv))
+@@ -4938,8 +5084,22 @@ pub fn preadv(fd: Fd, vecs: &[PlatformIoVec], position: i64) -> Maybe<usize> {
+ // ──────────────────────────────────────────────────────────────────────────
+ #[cfg(unix)]
+ pub type StatFS = libc::statfs;
+-#[cfg(not(unix))]
++#[cfg(windows)]
+ pub type StatFS = self::windows::libuv::uv_statfs_t;
++/// WASI has no statfs(2) — `statfs()` returns `ENOSYS`; the struct exists so
++/// signatures resolve, shaped like the Linux field set.
++#[cfg(target_os = "wasi")]
++#[repr(C)]
++#[derive(Clone, Copy, Default)]
++pub struct StatFS {
++    pub f_type: u64,
++    pub f_bsize: u64,
++    pub f_blocks: u64,
++    pub f_bfree: u64,
++    pub f_bavail: u64,
++    pub f_files: u64,
++    pub f_ffree: u64,
++}
+ 
+ /// `bun.sys.statfs` — query filesystem stats for `path`. Retries on EINTR.
+ ///
+@@ -4976,7 +5136,13 @@ pub fn statfs(path: &ZStr) -> Maybe<StatFS> {
+         }
+         return Ok(st);
+     }
+-    #[cfg(not(unix))]
++    // Prefixed variant name on WASI (posix-style E), unprefixed on Windows.
++    #[cfg(target_os = "wasi")]
++    {
++        let _ = path;
++        return Err(Error::from_code(E::ENOSYS, Tag::statfs));
++    }
++    #[cfg(not(any(unix, target_os = "wasi")))]
+     {
+         let _ = path;
+         Err(Error::from_code(E::NOSYS, Tag::statfs))
+@@ -6231,9 +6397,21 @@ pub mod RTLD {
+     pub const LAZY: i32 = 0x1;
+     pub const LOCAL: i32 = 0;
+ }
++#[cfg(target_os = "wasi")]
++pub mod RTLD {
++    // `dlopen` always fails on WASI; inert values so call sites compile.
++    pub const LAZY: i32 = 0x1;
++    pub const LOCAL: i32 = 0;
++}
+ 
+ /// `dlopen(filename, flags)`. Windows → `LoadLibraryExW` (UTF-8 → UTF-16).
+ pub fn dlopen(filename: &ZStr, flags: i32) -> Option<*mut c_void> {
++    // No dynamic linker on wasm; every lookup fails cleanly.
++    #[cfg(target_os = "wasi")]
++    {
++        let _ = (filename, flags);
++        return None;
++    }
+     #[cfg(unix)]
+     {
+         // SAFETY: filename is NUL-terminated.
+@@ -6271,6 +6449,12 @@ pub fn dlopen(filename: &ZStr, flags: i32) -> Option<*mut c_void> {
+ }
+ /// `dlsym(handle, name)`.
+ pub fn dlsym_impl(handle: Option<*mut c_void>, name: &ZStr) -> Option<*mut c_void> {
++    // No dynamic linker on wasm; every lookup fails cleanly.
++    #[cfg(target_os = "wasi")]
++    {
++        let _ = (handle, name);
++        return None;
++    }
+     #[cfg(unix)]
+     {
+         let h = handle.unwrap_or(core::ptr::null_mut());
+@@ -7392,7 +7576,7 @@ fn exists_at_type_nt(dir: Fd, mut path: &[u16]) -> Maybe<ExistsAtType> {
+ }
+ /// `fstatat` then `S_ISDIR`.
+ pub fn exists_at_type(dir: Fd, sub: &ZStr) -> Maybe<ExistsAtType> {
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     {
+         let st = fstatat(dir, sub)?;
+         Ok(if S::ISDIR(st.st_mode as _) {
+@@ -7443,7 +7627,7 @@ pub fn directory_exists_at_w(dir: Fd, sub: &[u16]) -> Maybe<bool> {
+ // ── fcntl / nonblocking / dup ──
+ 
+ /// `fcntl(fd, F_GETFL, 0)`.
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ pub fn get_fcntl_flags(fd: Fd) -> Maybe<FcntlInt> {
+     fcntl(fd, libc::F_GETFL, 0)
+ }
+@@ -7457,7 +7641,7 @@ pub fn set_nonblocking(fd: Fd) -> Maybe<()> {
+ }
+ /// GETFL → toggle O_NONBLOCK → SETFL (only if changed).
+ pub fn update_nonblocking(fd: Fd, nonblocking: bool) -> Maybe<()> {
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     {
+         let cur = get_fcntl_flags(fd)? as i32;
+         let new = if nonblocking {
+@@ -7833,7 +8017,7 @@ pub fn get_fd_path_w(_fd: Fd, _out: &mut [u16]) -> Maybe<&mut [u16]> {
+ /// SAFETY note: the returned slice borrows the libc `environ` global; do not
+ /// mutate the environment concurrently.
+ pub fn environ() -> &'static [*const c_char] {
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     {
+         // SAFETY: `environ` is a process-global NULL-terminated array.
+         unsafe {
+@@ -7868,7 +8052,7 @@ pub fn environ() -> &'static [*const c_char] {
+ /// global pointer (already NULL-terminated) rather than a length-bounded
+ /// borrowed slice, so it is suitable to pass directly as `envp`.
+ pub fn environ_ptr() -> *const *const c_char {
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     {
+         bun_core::c_environ()
+     }
+@@ -7990,6 +8174,8 @@ pub(crate) fn make_path_w(dir: Fd, sub_path: &[u16]) -> Maybe<()> {
+ // ──────────────────────────────────────────────────────────────────────────
+ pub mod posix {
+     pub use bun_errno::posix::*;
++    #[cfg(target_os = "wasi")]
++    use crate::wasi_libc as libc;
+     use core::ffi::c_int;
+     #[cfg(any(
+         target_os = "macos",
+@@ -8155,9 +8341,9 @@ pub mod posix {
+         pub const INET: c_int = bun_windows_sys::ws2_32::AF_INET;
+         #[cfg(windows)]
+         pub const INET6: c_int = bun_windows_sys::ws2_32::AF_INET6;
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "wasi"))]
+         pub const INET: c_int = libc::AF_INET;
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "wasi"))]
+         pub const INET6: c_int = libc::AF_INET6;
+     }
+ 
+@@ -8169,7 +8355,7 @@ pub mod posix {
+     pub const INET6_ADDRSTRLEN: usize = 46;
+ 
+     // ── sockaddr family ──
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub use libc::{sockaddr, sockaddr_in, sockaddr_in6, sockaddr_storage};
+     // Route through `bun_libuv_sys` (not `bun_windows_sys::ws2_32`) so types
+     // returned by libuv APIs (`uv_interface_address_t`, `uv_udp_*`) are the
+@@ -8337,7 +8523,7 @@ pub mod posix {
+     }
+ 
+     // ── rlimit ──
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     #[repr(C)]
+     #[derive(Clone, Copy)]
+     pub struct Rlimit {
+@@ -8345,9 +8531,9 @@ pub mod posix {
+         pub max: u64,
+     }
+     // SAFETY: two `u64`; all-zero is a valid `Rlimit`.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     unsafe impl bun_core::ffi::Zeroable for Rlimit {}
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     #[derive(Clone, Copy)]
+     #[repr(i32)]
+     pub enum RlimitResource {
+@@ -8355,7 +8541,7 @@ pub mod posix {
+         STACK = libc::RLIMIT_STACK as _,
+         CORE = libc::RLIMIT_CORE as _,
+     }
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub fn getrlimit(res: RlimitResource) -> core::result::Result<Rlimit, super::Error> {
+         let mut r = libc::rlimit {
+             rlim_cur: 0,
+@@ -8370,7 +8556,7 @@ pub mod posix {
+             max: r.rlim_max as u64,
+         })
+     }
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub fn setrlimit(res: RlimitResource, lim: Rlimit) -> core::result::Result<(), super::Error> {
+         let r = libc::rlimit {
+             rlim_cur: lim.cur as _,
+@@ -8394,7 +8580,7 @@ pub mod net {
+ 
+     // POSIX libc has `sockaddr_*` at the crate root; MSVC libc does not. Route
+     // both through a private `sock` shim so the body below is target-agnostic.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     mod sock {
+         pub(super) use libc::{
+             AF_INET, AF_INET6, sockaddr, sockaddr_in, sockaddr_in6, sockaddr_storage,
+@@ -8426,9 +8612,9 @@ pub mod net {
+     // so struct-update initializers (`..sockaddr_in::ZEROED`)
+     // work uniformly on all targets and in `const` context.
+     // ──────────────────────────────────────────────────────────────────────
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub type sa_family_t = libc::sa_family_t;
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub type in_port_t = libc::in_port_t;
+     #[cfg(windows)]
+     pub type sa_family_t = u16; // ws2def.h: `typedef USHORT ADDRESS_FAMILY;`
+@@ -8439,6 +8625,9 @@ pub mod net {
+     // the `ZEROED` initializer — Rust accepts outer attributes on struct-
+     // expression fields, so a single body suffices on all targets.
+     #[repr(C)]
++    // libc's wasip2 sockaddr types are `#[repr(align(16))]`; mirror it so the
++    // layout asserts below hold.
++    #[cfg_attr(target_os = "wasi", repr(align(16)))]
+     #[derive(Copy, Clone)]
+     pub struct sockaddr_in {
+         #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+@@ -8460,6 +8649,7 @@ pub mod net {
+     }
+ 
+     #[repr(C)]
++    #[cfg_attr(target_os = "wasi", repr(align(16)))]
+     #[derive(Copy, Clone)]
+     pub struct sockaddr_in6 {
+         #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+@@ -8691,7 +8881,7 @@ pub mod elf {
+ 
+     /// Result of [`find_loaded_module`]: the loaded ELF object whose `PT_LOAD`
+     /// segment spans a given address.
+-    #[cfg(not(any(windows, target_os = "macos")))]
++    #[cfg(not(any(windows, target_os = "macos", target_os = "wasi")))]
+     pub struct LoadedModule {
+         /// `dlpi_addr` — link-map base address (subtract from the lookup address
+         /// to get an image-relative offset).
+@@ -8705,7 +8895,7 @@ pub mod elf {
+     /// via `dl_iterate_phdr`, returning the one whose `PT_LOAD` segment contains
+     /// `address`. Shared by `bun_crash_handler::StackLine::from_address` and
+     /// `bun_jsc::btjs::SelfInfo::lookup_module_dl` / `lookup_module_name_dl`.
+-    #[cfg(not(any(windows, target_os = "macos")))]
++    #[cfg(not(any(windows, target_os = "macos", target_os = "wasi")))]
+     pub fn find_loaded_module(address: usize) -> Option<LoadedModule> {
+         use core::ffi::{c_int, c_void};
+ 
+diff --git a/src/threading/Futex.rs b/src/threading/Futex.rs
+index 3d2b2376..0102d7f1 100644
+--- a/src/threading/Futex.rs
++++ b/src/threading/Futex.rs
+@@ -461,9 +461,24 @@ mod wasm_impl {
+         expect: u32,
+         timeout: Option<u64>,
+     ) -> Result<(), TimeoutError> {
++        // Without the atomics feature the memory is non-shared and there is
++        // exactly one thread: a mismatch returns immediately, a timed wait
++        // can only time out, and an untimed wait is a self-deadlock.
+         #[cfg(not(target_feature = "atomics"))]
+-        compile_error!("WASI target missing cpu feature 'atomics'");
+-
++        {
++            if ptr.load(core::sync::atomic::Ordering::SeqCst) != expect {
++                return Ok(());
++            }
++            match timeout {
++                Some(to) => {
++                    std::thread::sleep(core::time::Duration::from_nanos(to));
++                    return Err(TimeoutError::Timeout);
++                }
++                None => panic!("futex wait would deadlock: single-threaded wasm guest"),
++            }
++        }
++        #[cfg(target_feature = "atomics")]
++        {
+         let to: i64 = match timeout {
+             Some(to) => i64::try_from(to).expect("int cast"),
+             None => -1,
+@@ -478,18 +493,24 @@ mod wasm_impl {
+             2 => Err(TimeoutError::Timeout),
+             _ => panic!("Unexpected memory.atomic.wait32() return code"),
+         }
++        }
+     }
+ 
+-    pub fn wake(ptr: &AtomicU32, max_waiters: u32) {
++    pub(crate) fn wake(ptr: &AtomicU32, max_waiters: u32) {
++        // Single thread, nobody waiting (wait() never blocks; see above).
+         #[cfg(not(target_feature = "atomics"))]
+-        compile_error!("WASI target missing cpu feature 'atomics'");
+-
++        {
++            let _ = (ptr, max_waiters);
++        }
++        #[cfg(target_feature = "atomics")]
++        {
+         debug_assert!(max_waiters != 0);
+         // SAFETY: ptr.as_ptr() is a valid aligned *mut i32 (AtomicU32 has the same layout).
+         let woken_count = unsafe {
+             core::arch::wasm32::memory_atomic_notify(ptr.as_ptr().cast::<i32>(), max_waiters)
+         };
+         let _ = woken_count; // can be 0 when linker flag 'shared-memory' is not enabled
++        }
+     }
+ }
+ 
+diff --git a/src/uws_sys/Loop.rs b/src/uws_sys/Loop.rs
+index 5120f7d8..476bddf4 100644
+--- a/src/uws_sys/Loop.rs
++++ b/src/uws_sys/Loop.rs
+@@ -99,6 +99,10 @@ pub type EventType = libc::kevent;
+ // TODO:
+ #[cfg(windows)]
+ pub type EventType = *mut c_void;
++// WASI: no epoll/kqueue; the (future) uSockets wasi backend polls pollfds
++// over wasi:io. The alias keeps the Loop mirror compiling.
++#[cfg(target_os = "wasi")]
++pub type EventType = libc::pollfd;
+ 
+ /// Loop handler trait with optional `pre`/`post` hooks. Implementors override
+ /// `PRE`/`POST` if they have them.
+diff --git a/src/uws_sys/SocketContext.rs b/src/uws_sys/SocketContext.rs
+index a61ef554..c602d105 100644
+--- a/src/uws_sys/SocketContext.rs
++++ b/src/uws_sys/SocketContext.rs
+@@ -15,7 +15,7 @@ use crate::create_bun_socket_error_t;
+ /// crate already links, so the former link-time hook bought nothing. Returns
+ /// `None` on stat failure (digest feeds zeros — `create_ssl_context` will then
+ /// fail on the same path and the entry never reaches the cache).
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ fn stat_for_digest(path: &bun_core::ZStr) -> Option<[i64; 3]> {
+     // SAFETY: POD, zero-valid — `libc::stat` is all-integer; `stat(2)` writes it.
+     let mut st: libc::stat = bun_core::ffi::zeroed();
+@@ -25,7 +25,12 @@ fn stat_for_digest(path: &bun_core::ZStr) -> Option<[i64; 3]> {
+         return None;
+     }
+     // libc exposes mtime as `st_mtime` (sec) + `st_mtime_nsec` (nsec) on
+-    // Linux/BSD/macOS. Widen to i64 (already i64 on LP64; cast is a no-op).
++    // Linux/BSD/macOS; the wasi binding only has the `st_mtim` timespec.
++    #[cfg(target_os = "wasi")]
++    {
++        Some([st.st_mtim.tv_sec, st.st_mtim.tv_nsec as i64, st.st_size])
++    }
++    #[cfg(not(target_os = "wasi"))]
+     Some([
+         st.st_mtime as i64,
+         st.st_mtime_nsec as i64,
+diff --git a/src/uws_sys/SocketGroup.rs b/src/uws_sys/SocketGroup.rs
+index a820e388..b225eea8 100644
+--- a/src/uws_sys/SocketGroup.rs
++++ b/src/uws_sys/SocketGroup.rs
+@@ -59,9 +59,12 @@ pub struct VTable {
+ }
+ 
+ // Must match `struct us_socket_group_t` in libusockets.h.
+-// 9 ptrs + u32 + u16 + 3×u8, padded to 8-byte alignment.
++// 9 ptrs + u32 + u16 + 3×u8, padded to pointer alignment (16 on LP64, 12 on
++// wasm32 — the same computation clang makes for the C struct).
+ const _: () = assert!(
+-    core::mem::size_of::<SocketGroup>() == 9 * core::mem::size_of::<*mut c_void>() + 16,
++    core::mem::size_of::<SocketGroup>()
++        == 9 * core::mem::size_of::<*mut c_void>()
++            + if core::mem::size_of::<usize>() == 8 { 16 } else { 12 },
+     "SocketGroup layout drifted from us_socket_group_t"
+ );
+ const _: () = assert!(
+diff --git a/src/watcher/WasiWatcher.rs b/src/watcher/WasiWatcher.rs
+new file mode 100644
+index 00000000..26430da0
+--- /dev/null
++++ b/src/watcher/WasiWatcher.rs
+@@ -0,0 +1,30 @@
++//! WASI backend: watchlist bookkeeping only, events never fire. WASI has no
++//! file change notification (and a wk guest's vfs none yet either), so
++//! `--watch` degrades to "runs once" instead of failing to start. Per-file
++//! OS registration is a per-backend concern (the linux/macos arms in
++//! `Watcher.rs` are cfg'd to their platforms); this backend has none.
++
++use crate::Watcher;
++
++pub(crate) type Platform = WasiWatcher;
++
++pub struct WasiWatcher;
++
++impl WasiWatcher {
++    pub(crate) fn new(_root: &[u8]) -> crate::Result<Self> {
++        Ok(WasiWatcher)
++    }
++
++    pub(crate) fn stop(&mut self) {}
++}
++
++/// Repeatedly called by the main watcher until the watcher is terminated.
++pub(crate) fn watch_loop_cycle(this: &mut Watcher) -> bun_sys::Result<()> {
++    // No event source: dispatch the (always empty) batch — keeping the shared
++    // trace/callback path live — then terminate the loop.
++    this.dispatch_file_updates(0, 0);
++    Err(bun_sys::Error::from_code_int(
++        bun_errno::SystemErrno::ENOSYS as i32,
++        bun_sys::Tag::TODO,
++    ))
++}
+diff --git a/src/watcher/Watcher.rs b/src/watcher/Watcher.rs
+index 796f0b07..4c94296a 100644
+--- a/src/watcher/Watcher.rs
++++ b/src/watcher/Watcher.rs
+@@ -18,8 +18,8 @@ use crate::inotify_watcher as platform;
+ use crate::kevent_watcher as platform;
+ #[cfg(windows)]
+ use crate::windows_watcher as platform;
+-#[cfg(target_arch = "wasm32")]
+-compile_error!("Unsupported platform");
++#[cfg(target_os = "wasi")]
++use crate::wasi_watcher as platform;
+ 
+ bun_core::define_scoped_log!(log, watcher, visible);
+ 
+@@ -996,6 +996,9 @@ impl WatchEvent {
+         event.index.cmp(&rhs.index)
+     }
+ 
++    // Only real backends' watch_loop_cycle merges events; the WASI stub never
++    // produces any.
++    #[cfg(not(target_os = "wasi"))]
+     pub(crate) fn merge(&mut self, other: WatchEvent) {
+         self.name_len += other.name_len;
+         self.op = Op::merge(self.op, other.op);
+@@ -1016,6 +1019,9 @@ bitflags::bitflags! {
+ }
+ 
+ impl Op {
++    // Only real backends' watch_loop_cycle merges events; the WASI stub never
++    // produces any.
++    #[cfg(not(target_os = "wasi"))]
+     pub(crate) fn merge(before: Op, after: Op) -> Op {
+         before | after
+     }
+diff --git a/src/watcher/lib.rs b/src/watcher/lib.rs
+index 935ba850..207a04a0 100644
+--- a/src/watcher/lib.rs
++++ b/src/watcher/lib.rs
+@@ -21,6 +21,10 @@ pub mod kevent_watcher;
+ #[path = "WindowsWatcher.rs"]
+ pub mod windows_watcher;
+ 
++#[cfg(target_os = "wasi")]
++#[path = "WasiWatcher.rs"]
++pub mod wasi_watcher;
++
+ #[path = "WatcherTrace.rs"]
+ pub(crate) mod watcher_trace;
+ 
 diff --git a/src/windows_sys/externs.rs b/src/windows_sys/externs.rs
 index f3996922..dc0a70b7 100644
 --- a/src/windows_sys/externs.rs

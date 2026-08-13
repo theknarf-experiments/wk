@@ -9,15 +9,14 @@
 #   2. (moonshot) JavaScriptCore itself — cloop/LLInt interpreter, no JIT —
 #      via wasi-sdk, then bun's *_jsc bridge crates over it.
 #
-# Status: cargo check of the slice is being driven crate by crate; see
-# patches/. Compiles so far: bun_windows_sys bun_alloc bun_core bun_errno
-# (new wasi_errno.rs — WASI's alphabetical CloudABI errno space) bun_semver
-# bun_cares_sys bun_analytics bun_libuv_sys. In progress: bun_sys — the
-# posix_impl syscall surface + dir iterator (readdir-based) + Stat/PosixStat
-# are widened to wasi; ~15 cfg-fallthrough sites remain (run the check for
-# the list: iovec aliases, E::NOSYS name, mmap arms, exists_at, exec argv,
-# `sock` module). Then bun_uws_sys (uSockets FFI — needs a WASI stub or
-# wasi:sockets shim).
+# Status: `cargo check -p bun_transpiler --target wasm32-wasip2` PASSES — the
+# whole ~60-crate JSC-free slice type-checks, including bun_sys (readdir dir
+# iterator, wasi_libc shim for the libc crate's wasip2 gaps), bun_uws_sys,
+# bun_io (WasiWaker; reactor internals gated), bun_watcher (inert WasiWatcher
+# backend), bun_crash_handler (no signals/dladdr arms), and the parser/
+# printer/resolver/bundler themselves. Next: `cargo build` + a thin bin crate
+# + componentize (expect link-time work: __bun_macro_context_* and other
+# *_jsc-provided symbols need stubs; -lwasi-emulated-* for getrusage).
 #
 # The port knowledge, each item a compile failure first:
 #   * bun assumes 64-bit everywhere it tags pointer high bits. Three separate
