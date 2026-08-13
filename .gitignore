@@ -127,8 +127,6 @@ example/out.mjpeg
 
 # machine-specific) — only setup.sh is tracked
 
-# wsh build artifact (the component the Dockerfile COPYs; built by mise run build)
-plugins/wsh/wsh.wasm
 
 # curl (upstream source fetched + built by build.sh; component is derived)
 plugins/curl/curl-*/

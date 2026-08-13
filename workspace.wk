@@ -33,8 +33,8 @@ dependencies {
     totem "plugins/totem/target/wasm32-wasip1/debug/totem.wasm" {
         description "a spinning 3D crystal (wk:scene) — click it in the 3D view"
     }
-    wsh "docker://plugins/wsh/Dockerfile" {
-        description "wk-base: busybox-style shell — coreutils + curl + the wk API client, all builtins"
+    bash "docker://plugins/bash/Dockerfile" {
+        description "wk-shell: real GNU bash + GNU coreutils (pipes, redirection, $(...))"
     }
     kilo "plugins/kilo/kilo.wasm" {
         description "the kilo text editor"

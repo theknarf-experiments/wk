@@ -272,28 +272,31 @@ one (defaults to `workspace.wk`). Other commands: `list`, `remove <name>`, and
 `publish` (below). `run --headless` loads and runs the workspace with no window,
 keeping the guests alive until Ctrl-C.
 
-## The shell (`wk-base`)
+## The shell (`wk-shell`)
 
-`plugins/wsh` is wk's shell, and the base image other images build on. WASI has
-no fork/exec, so it is **busybox-style**: one wasm binary where the shell *and*
-every "external" command are in-process builtins — coreutils-flavored
-(`ls cat cp mv rm mkdir head tail wc grep sort uniq cut tr seq find xxd ...`),
-plus `curl` (plain HTTP over the fabric via `std::net`) and `wk` (the workspace
-API through a wired Api node). It has pipelines, `> >> <` redirection,
-`&& || ;`, quoting, `$VAR`/`$?`, `test`/`[`, and `-c "script"`.
+wk's shell is **GNU bash** — the real one, cross-compiled — running real GNU
+coreutils as separate programs. It is the base image other images build on:
 
 ```
-cd plugins/wsh && mise run build          # -> wsh.wasm (wasm32-wasip2)
-wk images build plugins/wsh/Dockerfile --tag wk-base
+cd plugins/coreutils && mise run build    # -> coreutils.wasm (multicall)
+cd plugins/bash && mise run build         # -> bash.wasm (wasm32-wasip2)
+wk images build plugins/bash/Dockerfile --tag wk-shell
 ```
 
-Then build on it — the shell doubles as the `RUN` interpreter:
+Then build on it — bash doubles as the `RUN` interpreter:
 
 ```dockerfile
-FROM wk-base
-RUN ["/bin/wsh.wasm", "-c", "mkdir -p /etc && echo hi > /etc/motd"]
-ENTRYPOINT ["/bin/wsh.wasm"]
+FROM wk-shell
+RUN ["/bin/bash.wasm", "-c", "mkdir -p /etc && echo hi > /etc/motd"]
+ENTRYPOINT ["/bin/bash.wasm"]
 ```
+
+It runs external commands, redirects (`>` `>>` `2>` `<` `exec 9>`), pipes
+(`ls /bin | wc -l`, including builtin stages and three-stage chains), expands
+`$(...)`, and reads here-documents — none of which a sandbox with no `fork` is
+supposed to be able to do. How each was made to work is described under
+Concepts above: `wk:exec` for running programs, a host pipe behind a real
+`pipe()`, and `dup` out of wasi-libc's descriptor table.
 
 Wire the node to an **Api** node and the shell can drive wk from inside the
 sandbox — `wk ps`, `wk snapshot`, `wk send '<json>'` — with exactly the
