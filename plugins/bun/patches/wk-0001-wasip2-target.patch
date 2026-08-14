@@ -323,10 +323,42 @@ index eb14e27b..6c1292db 100644
                  #[cfg(windows)]
                  { return $crate::env_var::__key_opt!($windows); }
 diff --git a/src/bun_core/lib.rs b/src/bun_core/lib.rs
-index 9d4fe108..081c2189 100644
+index 9d4fe108..dc122ca9 100644
 --- a/src/bun_core/lib.rs
 +++ b/src/bun_core/lib.rs
-@@ -2545,13 +2545,13 @@ pub mod ffi {
+@@ -2406,6 +2406,31 @@ pub mod ffi {
+     /// Safe `uname(2)` wrapper: zero-init a `utsname`, call `libc::uname`, return
+     /// it by value. On the (theoretical) error path the struct stays all-zero,
+     /// so every `c_char[]` field reads as an empty NUL-terminated string.
++    /// wasi-libc has <sys/utsname.h> but the libc crate doesn't bind it;
++    /// mirror the header layout so `release`/`version` work like on unix.
++    #[cfg(target_os = "wasi")]
++    #[repr(C)]
++    #[derive(Clone, Copy)]
++    pub struct Utsname {
++        pub sysname: [core::ffi::c_char; 65],
++        pub nodename: [core::ffi::c_char; 65],
++        pub release: [core::ffi::c_char; 65],
++        pub version: [core::ffi::c_char; 65],
++        pub machine: [core::ffi::c_char; 65],
++        pub __domainname: [core::ffi::c_char; 65],
++    }
++    #[cfg(target_os = "wasi")]
++    #[inline]
++    pub fn uname() -> Utsname {
++        unsafe extern "C" {
++            fn uname(buf: *mut Utsname) -> core::ffi::c_int;
++        }
++        // SAFETY: all-zero utsname is valid (every field reads as an empty
++        // NUL-terminated string); `&mut u` is a valid out-pointer.
++        let mut u: Utsname = unsafe { core::mem::MaybeUninit::zeroed().assume_init() };
++        let _ = unsafe { uname(&raw mut u) };
++        u
++    }
+     #[cfg(unix)]
+     #[inline]
+     pub fn uname() -> libc::utsname {
+@@ -2545,13 +2570,13 @@ pub mod ffi {
      #[cfg(unix)]
      unsafe impl Zeroable for libc::passwd {}
      // SAFETY: C POD (integer/array/raw-pointer fields only); all-zero is valid.
@@ -342,7 +374,7 @@ index 9d4fe108..081c2189 100644
      unsafe impl Zeroable for libc::timespec {}
      // SAFETY: C POD (integer/array/raw-pointer fields only); all-zero is valid.
      #[cfg(unix)]
-@@ -2575,10 +2575,10 @@ pub mod ffi {
+@@ -2575,10 +2600,10 @@ pub mod ffi {
      #[cfg(unix)]
      unsafe impl Zeroable for libc::sockaddr_in6 {}
      // SAFETY: C POD (integer/array/raw-pointer fields only); all-zero is valid.
@@ -355,7 +387,7 @@ index 9d4fe108..081c2189 100644
      unsafe impl Zeroable for libc::addrinfo {}
      // SAFETY: C POD (integer/array/raw-pointer fields only); all-zero is valid.
      #[cfg(any(target_os = "linux", target_os = "android"))]
-@@ -2722,15 +2722,19 @@ pub mod ffi {
+@@ -2722,15 +2747,19 @@ pub mod ffi {
              #[cfg_attr(target_os = "android", link_name = "__errno")]
              #[cfg_attr(windows, link_name = "_errno")]
              #[cfg_attr(
@@ -2546,19 +2578,55 @@ index 6046c4ad..e0c40c2b 100644
  /// In-place RAII wrapper for a libuv `fs_t` request.
  ///
 diff --git a/src/runtime/node/node_os.rs b/src/runtime/node/node_os.rs
-index ccff60e6..fe011fc1 100644
+index ccff60e6..7b8f848a 100644
 --- a/src/runtime/node/node_os.rs
 +++ b/src/runtime/node/node_os.rs
-@@ -259,6 +259,8 @@ mod _impl {
+@@ -1,5 +1,5 @@
+ use core::ffi::c_int;
+-#[cfg(not(windows))]
++#[cfg(all(not(windows), not(target_os = "wasi")))]
+ use core::ffi::{c_char, c_uint, c_void};
+ 
+ use bun_core;
+@@ -39,9 +39,15 @@ mod _impl {
+     use bun_core::ZStr;
+     use bun_core::ZigString;
+     #[cfg(not(windows))]
++    #[cfg(not(target_os = "wasi"))]
+     use bun_core::strings;
+-    use bun_core::{env_var, fmt as bun_fmt};
++    use bun_core::env_var;
++    #[cfg(not(target_os = "wasi"))]
++    use bun_core::fmt as bun_fmt;
++    #[cfg(not(target_os = "wasi"))]
+     use bun_jsc::{CallFrame, JSArray, StringJsc as _, SysErrorJsc as _, SystemError};
++    #[cfg(target_os = "wasi")]
++    use bun_jsc::{CallFrame, JSArray, StringJsc as _, SystemError};
+     #[cfg(windows)]
+     use bun_paths::PathBuffer;
+     #[cfg(windows)]
+@@ -50,6 +56,7 @@ mod _impl {
+     use bun_sys::c;
+     #[cfg(windows)]
+     use bun_sys::windows::{self, libuv};
++    #[cfg(not(target_os = "wasi"))]
+     use std::io::Write as _;
+ 
+     // ─── local shims for upstream API gaps (Phase D) ──────────────────────────
+@@ -259,7 +266,11 @@ mod _impl {
          let result = cpus_impl_freebsd(global);
          #[cfg(windows)]
          let result = cpus_impl_windows(global);
+-
++        // WASI has no cpuinfo; return an empty array directly (cpus returns
++        // JsResult, which is exactly JSArray::create's type).
 +        #[cfg(target_os = "wasi")]
-+        let result: Result<JSValue, OsError> = Ok(JSValue::create_empty_array(global, 0));
- 
++        return JSArray::create(global, &[]);
++        #[cfg(not(target_os = "wasi"))]
          match result {
              Ok(v) => Ok(v),
-@@ -714,7 +716,17 @@ mod _impl {
+             Err(_) => {
+@@ -714,7 +725,17 @@ mod _impl {
              }
              return Ok(BunString::clone_utf8(&out[0..size]));
          }
@@ -2577,7 +2645,54 @@ index ccff60e6..fe011fc1 100644
          {
              // The posix implementation of uv_os_homedir first checks the HOME
              // environment variable, then falls back to reading the passwd entry.
-@@ -1586,7 +1598,7 @@ mod _impl {
+@@ -891,6 +912,9 @@ mod _impl {
+         };
+         #[cfg(windows)]
+         let result: [f64; 3] = [0.0, 0.0, 0.0];
++        // No loadavg source on WASI.
++        #[cfg(target_os = "wasi")]
++        let result: [f64; 3] = [0.0, 0.0, 0.0];
+ 
+         JSArray::create(
+             global,
+@@ -1399,6 +1423,13 @@ mod _impl {
+             }
+             bun_core::slice_to_nul(&name_buffer)
+         };
++        #[cfg(target_os = "wasi")]
++        let value: &[u8] = {
++            let uts = bun_core::ffi::uname();
++            let result = bun_core::ffi::c_field_bytes(&uts.release);
++            name_buffer[0..result.len()].copy_from_slice(result);
++            &name_buffer[0..result.len()]
++        };
+         #[cfg(windows)]
+         let value: &[u8] = 'slice: {
+             // SAFETY: zeroed POD
+@@ -1521,6 +1552,9 @@ mod _impl {
+             // SAFETY: pure FFI getter
+             return unsafe { libuv::uv_get_total_memory() };
+         }
++        // No memory-size query on WASI.
++        #[cfg(target_os = "wasi")]
++        0
+     }
+ 
+     pub(crate) fn uptime(global: &JSGlobalObject) -> JsResult<f64> {
+@@ -1558,6 +1592,12 @@ mod _impl {
+             }
+             return Ok(0.0);
+         }
++        // No boot-time source on WASI.
++        #[cfg(target_os = "wasi")]
++        {
++            let _ = global;
++            Ok(0.0)
++        }
+     }
+ 
+     pub(crate) fn user_info(
+@@ -1586,7 +1626,7 @@ mod _impl {
              result.put(global_this, b"gid", JSValue::js_number(-1.0));
              result.put(global_this, b"shell", JSValue::NULL);
          }
@@ -2586,6 +2701,20 @@ index ccff60e6..fe011fc1 100644
          {
              let username = env_var::USER.get().unwrap_or(b"unknown");
  
+@@ -1622,6 +1662,13 @@ mod _impl {
+             }
+             bun_core::slice_to_nul(&name_buffer)
+         };
++        #[cfg(target_os = "wasi")]
++        let slice: &[u8] = {
++            let uts = bun_core::ffi::uname();
++            let result = bun_core::ffi::c_field_bytes(&uts.version);
++            name_buffer[..result.len()].copy_from_slice(result);
++            &name_buffer[..result.len()]
++        };
+         #[cfg(any(target_os = "linux", target_os = "android"))]
+         let slice: &[u8] = {
+             let uts = bun_core::ffi::uname();
 diff --git a/src/runtime/webcore/FileSink.rs b/src/runtime/webcore/FileSink.rs
 index 86a63c7b..ac77270e 100644
 --- a/src/runtime/webcore/FileSink.rs
