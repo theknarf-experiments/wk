@@ -1,43 +1,40 @@
-=== LINK CONVERGING: bun-run component is ~1 vendored-lib-build away ===
+=== FRONTIER (accurate): 100% of bun C++/Rust/JSC links; ONLY vendored C libs remain ===
 
-STATE: all 520 non-v8 bindings + 4 generated .cpp + the modules-data blob
-compile/assemble. A trial link (plugins/bun/link/link.sh) of everything +
-libbun_rust.a + JSC/WTF/bmalloc/ICU + mimalloc resolves ALL of JSC/WTF/ICU/
-Rust/bindings. Remaining undefined are ONLY vendored networking C libs that
-bun's Rust build.rs did NOT compile for wasi (they need epoll/an event
-backend) + a couple generated bits:
+Every bun C++ binding + generated .cpp + the modules blob compiles, and the
+trial link (plugins/bun/link/link.sh) resolves ALL of JSC/WTF/ICU/Rust/
+bindings. Correction to earlier notes: LLD's default 20-error cap HID the
+true scale. With -Wl,--error-limit=0 the real count is 1287 UNIQUE undefined
+symbols, and they are ALL from vendored C libraries that bun's Rust build.rs
+did NOT cross-compile for wasi (they were cfg'd out / use non-wasm build
+systems). Full list: plugins/bun/link/undefined-symbols.txt.
 
-  ~16 us_*  — uSockets CORE (us_socket_write/ext/is_closed, us_loop_ext,
-              us_socket_group*, us_quic_stream_ext, ...). packages/bun-usockets.
-              Needs a wasi cross-build WITH an event-loop backend (wasi has no
-              epoll/kqueue — see the smoltcp/wk network fabric, or a poll shim).
-  EVP_*/ERR_* — BoringSSL libcrypto. Needs a wasi cross-build (CMake, the
-              C-only no-asm path). Headers already in native/boringssl.
-  lshpack_*  — HTTP/2 HPACK. native/lshpack; needs XXH_HEADER_NAME + queue
-              compat set up (lshpack.ts has the flags).
-  Zig::generateNativeModule_{NodeUtilTypes,NodeModule}, jsBufferTranscode —
-              a couple binding/codegen C++ symbols; likely a missing generated
-              .cpp (check bindgen/InternalModuleRegistry generators).
+VENDORED C LIBS TO CROSS-COMPILE FOR wasi (unique-symbol counts):
+  530  BoringSSL (crypto)  — the big one. CMake; use the C-only no-asm path
+       (OPENSSL_NO_ASM). Headers in native/boringssl. Referenced by node:crypto/
+       tls/X509. This is most of the work.
+  333  uSockets            — packages/bun-usockets. HARDEST: needs a wasi
+       event-loop backend (no epoll/kqueue). Tie to [[wk-userspace-network]]
+       smoltcp, or a poll(2)/stub backend. All the us_*/uws_* symbols.
+   37  libarchive          — native/libarchive. Standard C cross-build.
+   29  c-ares (DNS)        — native/cares. Standard C.
+   25  zstd                — native/zstd (VERIFIED cross-compiles w/
+       -DZSTD_DISABLE_ASM). Standard C.
+   16  brotli              — native/brotli/c. Standard C.
+   15  simdutf             — the SIMD unicode lib (bun's simdutf_sys didn't
+       compile its C++ for wasi). Has a scalar fallback path.
+   14  zlib(-ng)           — native/zlib. Standard C.
+    3  Bun::Secrets::*     — OS keychain; no wasi equiv. STUB (return error).
+    +  WebP (image), a few singles.
 
-LINK ARTIFACTS (all in plugins/bun/link/):
-  link.sh — the full link command (clang++ driver, $BUN/$BUN_NATIVE/$OBJDIR
-    placeholders); currently links to /tmp/bun-run.wasm.
-  wasi-stubs.c — first-link stubs for dl*/napi/partial-uSockets/lshpack/EVP
-    (REPLACE with real vendored-lib builds for a WORKING run).
-  InternalModuleRegistryConstants.wasm.S — wasm-compatible re-spelling of the
-    modules-data blob .S (wasm needs `.section X,"",@` + explicit `.size`);
-    assemble with -I codegen (it .incbin's the .bin).
+APPROACH: each standard-C lib (zstd/zlib/brotli/cares/libarchive/simdutf)
+cross-compiles cleanly with wasi-sdk clang -O2 (+ its -DNO_ASM flags) — build
+all its .c into a .a, add to link.sh. BoringSSL is the large mechanical one.
+uSockets needs the event-backend design. THEN the component links + should
+run console.log (crypto/net stubbed inert until their libs land).
 
-KEY LINK FACTS: bindings MUST be -fno-rtti (match WebKit; else JSC typeinfo
-undefined). The vendored libs uSockets/zlib/lolhtml/etc. that ARE in
-libbun_rust.a came free from the Rust build. wasm-component-ld rejects
-undefined imports (no --allow-undefined for a component) — every symbol must
-be defined. C++ recipe: plugins/bun/cxx-flags.rsp.
+Also 13 C++<->Rust ABI sig-mismatch WARNINGS remain (i64/i32 JSVALUE32_64;
+don't block link but crash at runtime — fix for a WORKING run; listed above
+in git history / earlier punchlist).
 
-REMAINING C++<->Rust ABI sig mismatches (wasm-ld warnings, don't block link
-but are real i64/i32 JSVALUE32_64 bugs to fix for a WORKING run): Bun__{
-reportUnhandledError,ensureProcessIPCInitialized,setExitCode,setVerboseFetchValue,
-closeChildIPC,emitHandledPromiseEvent,inspect_singleline}, JSC__JSValue__
-getClassInfoName, JSC__JSGlobalObject__createAggregateErrorWithArray,
-NodeHTTP{Server__writeHead_http,Response__createForJS}, TextEncoder__encodeInto8,
-ByteRangeMapping__getSourceID.
+DONE & REUSABLE: cxx-flags.rsp (-fno-rtti!), link.sh, wasi-stubs.c,
+InternalModuleRegistryConstants.wasm.S, gen-codegen.ts (all codegen).
