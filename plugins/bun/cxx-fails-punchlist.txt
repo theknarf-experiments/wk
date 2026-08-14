@@ -1,84 +1,42 @@
-=== C++ bindings compile status: 469/520 non-v8 (90%); +42 v8 shim excluded ===
-=== remaining 48 fails by root cause:
-   6 error: unknown type name 'JSCompressionStream'; did you mean '
-   4 error: no member named 'inspectorController' in 'JSC::JSGlobal
-   2 error: void lambda should not return a value
-   2 error: use of undeclared identifier 'JIT'
-   2 error: static assertion failed due to requirement 'std::is_sam
-   2 error: no type named 'SamplingProfiler' in namespace 'JSC'
-   2 error: no member named 'StreamingCompiler' in namespace 'JSC::
-   2 error: no matching function for call to 'bit_cast'
-   2 error: member access into incomplete type 'WebCore::EventTarge
-   2 error: member access into incomplete type 'const CryptoAlgorit
-   1 error: variable has incomplete type 'struct sigaction'
-   1 error: use of undeclared identifier 'sigfillset'
-   1 error: use of undeclared identifier 'processBindingNativesTabl
-   1 error: use of undeclared identifier 'processBindingHTTPParserT
-   1 error: use of undeclared identifier 'processBindingFsTable'; d
-   1 error: use of undeclared identifier 'processBindingConstantsTa
-   1 error: use of undeclared identifier 'processBindingBufferTable
-   1 error: use of undeclared identifier 'PRIO_PROCESS'
-   1 error: use of undeclared identifier 'NeedsDestruction'; did yo
-   1 error: use of undeclared identifier 'JSEventTableValues'; did 
-   1 error: use of undeclared identifier 'cfmakeraw'
-   1 error: static assertion failed due to requirement 'sizeof(WTF:
-   1 error: static assertion failed due to requirement 'sizeof(v8::
-   1 error: static assertion failed due to requirement 'sizeof(Bun:
-   1 error: non-constant-expression cannot be narrowed from type 'u
-   1 error: no type named 'ClassInfo' in namespace 'Bun::JSC'; did 
-   1 error: no member named 'TopExceptionScope' in namespace 'JSC';
-   1 error: no member named 'createJSWebAssemblyCompileError' in na
-   1 error: member access into incomplete type 'JSC::JSPromise'
-   1 error: constexpr variable 'kStrongRefSlotMask' must be initial
-   1 error: base class has incomplete type
-   1 error: "Unknown architecture"
+=== C++ bindings: ~496/520 non-v8 compile (95%); +42 v8 shim excluded ===
+=== Remaining ~21, in 3 buckets by root cause ===
 
-=== files:
-src/jsc/bindings/BunCPUProfiler.cpp | error: no type named 'SamplingProfiler' in namespace 'JSC'
-src/jsc/bindings/BunDebugger.cpp | error: base class has incomplete type
-src/jsc/bindings/BunObject.cpp | error: no type named 'ClassInfo' in namespace 'Bun::JSC'; did 
-src/jsc/bindings/BunProcess.cpp | error: static assertion failed due to requirement 'sizeof(v8::
-src/jsc/bindings/c-bindings.cpp | error: use of undeclared identifier 'PRIO_PROCESS'
-src/jsc/bindings/ConsoleObject.cpp | error: no member named 'inspectorController' in 'JSC::JSGlobal
-src/jsc/bindings/CPUFeatures.cpp | error: "Unknown architecture"
-src/jsc/bindings/InspectorBunFrontendDevServerAgent.cpp | error: no member named 'inspectorController' in 'JSC::JSGlobal
-src/jsc/bindings/InspectorHTTPServerAgent.cpp | error: no member named 'inspectorController' in 'JSC::JSGlobal
-src/jsc/bindings/InspectorLifecycleAgent.cpp | error: no member named 'inspectorController' in 'JSC::JSGlobal
-src/jsc/bindings/InternalModuleRegistry.cpp | error: no type named 'SamplingProfiler' in namespace 'JSC'
-src/jsc/bindings/JSBuffer.cpp | error: static assertion failed due to requirement 'std::is_sam
-src/jsc/bindings/JSBundlerPlugin.cpp | error: no matching function for call to 'bit_cast'
-src/jsc/bindings/JSCommonJSModule.cpp | error: void lambda should not return a value
-src/jsc/bindings/JSFFIFunction.cpp | error: no matching function for call to 'bit_cast'
-src/jsc/bindings/JSMockFunction.cpp | error: void lambda should not return a value
-src/jsc/bindings/JSONRowsToJS.cpp | error: static assertion failed due to requirement 'sizeof(Bun:
-src/jsc/bindings/napi.cpp | error: static assertion failed due to requirement 'std::is_sam
-src/jsc/bindings/NodeVM.cpp | error: no member named 'createJSWebAssemblyCompileError' in na
-src/jsc/bindings/NodeVMScript.cpp | error: use of undeclared identifier 'JIT'
-src/jsc/bindings/NodeVMSourceTextModule.cpp | error: use of undeclared identifier 'JIT'
-src/jsc/bindings/ProcessBindingBuffer.cpp | error: use of undeclared identifier 'processBindingBufferTable
-src/jsc/bindings/ProcessBindingConstants.cpp | error: use of undeclared identifier 'processBindingConstantsTa
-src/jsc/bindings/ProcessBindingFs.cpp | error: use of undeclared identifier 'processBindingFsTable'; d
-src/jsc/bindings/ProcessBindingHTTPParser.cpp | error: use of undeclared identifier 'processBindingHTTPParserT
-src/jsc/bindings/ProcessBindingNatives.cpp | error: use of undeclared identifier 'processBindingNativesTabl
-src/jsc/bindings/spawn.cpp | error: use of undeclared identifier 'sigfillset'
-src/jsc/bindings/sqlite/NodeSqlite.cpp | error: use of undeclared identifier 'NeedsDestruction'; did yo
-src/jsc/bindings/StringBuilderBinding.cpp | error: static assertion failed due to requirement 'sizeof(WTF:
-src/jsc/bindings/StrongRef.cpp | error: constexpr variable 'kStrongRefSlotMask' must be initial
-src/jsc/bindings/TopExceptionScopeBinding.cpp | error: no member named 'TopExceptionScope' in namespace 'JSC';
-src/jsc/bindings/vm/SigintWatcher.cpp | error: variable has incomplete type 'struct sigaction'
-src/jsc/bindings/webcore/EventContext.cpp | error: member access into incomplete type 'WebCore::EventTarge
-src/jsc/bindings/webcore/EventPath.cpp | error: member access into incomplete type 'WebCore::EventTarge
-src/jsc/bindings/webcore/JSEvent.cpp | error: use of undeclared identifier 'JSEventTableValues'; did 
-src/jsc/bindings/webcore/JSWasmStreamingCompiler.cpp | error: no member named 'StreamingCompiler' in namespace 'JSC::
-src/jsc/bindings/webcore/SerializedScriptValue.cpp | error: non-constant-expression cannot be narrowed from type 'u
-src/jsc/bindings/webcore/streams/CrossRealmTransform.cpp | error: unknown type name 'JSCompressionStream'; did you mean '
-src/jsc/bindings/webcore/streams/JSStreamsRuntime.cpp | error: unknown type name 'JSCompressionStream'; did you mean '
-src/jsc/bindings/webcore/streams/TransformStreamOperations.cpp | error: unknown type name 'JSCompressionStream'; did you mean '
-src/jsc/bindings/webcore/streams/WebStreamsExports.cpp | error: unknown type name 'JSCompressionStream'; did you mean '
-src/jsc/bindings/webcore/streams/WebStreamsMisc.cpp | error: unknown type name 'JSCompressionStream'; did you mean '
-src/jsc/bindings/webcore/streams/WritableStreamOperations.cpp | error: unknown type name 'JSCompressionStream'; did you mean '
-src/jsc/bindings/webcore/WorkerMessagingProxy.cpp | error: member access into incomplete type 'JSC::JSPromise'
-src/jsc/bindings/webcrypto/CryptoAlgorithmMLDSA.cpp | error: member access into incomplete type 'const CryptoAlgorit
-src/jsc/bindings/webcrypto/CryptoAlgorithmMLKEM.cpp | error: member access into incomplete type 'const CryptoAlgorit
-src/jsc/bindings/wtf-bindings.cpp | error: use of undeclared identifier 'cfmakeraw'
-src/jsc/bindings/ZigGlobalObject.cpp | error: no member named 'StreamingCompiler' in namespace 'JSC::
+--- BUCKET A: JSC features disabled in our JSCONLY cloop build ---
+Our native/jsc-build/cmakeconfig.h has: ENABLE_WEBASSEMBLY 0,
+ENABLE_SAMPLING_PROFILER 0, ENABLE_REMOTE_INSPECTOR 0, ENABLE_JIT 0.
+These genuinely can't work on wasm (JIT impossible, inspector needs
+sockets, profiler needs signals, wasm-in-wasm exotic). Gate the bun C++
+with #if ENABLE(...) + stub the Rust-facing extern "C" exports. NOTE:
+must be a COORDINATED cross-language disable — bun_runtime (Rust) also has
+wasm-streaming/inspector paths that call these symbols; gating only the
+C++ creates link-time undefined symbols. Do Rust + C++ together per feature.
+  WEBASSEMBLY:  ZigGlobalObject.cpp (core; wasm block at lines 150-151,
+                2359-2361, 3996-4058), JSWasmStreamingCompiler.cpp, NodeVM.cpp
+                (createJSWebAssemblyCompileError)
+  SAMPLING_PROFILER: BunCPUProfiler.cpp (whole file), InternalModuleRegistry.cpp
+  REMOTE_INSPECTOR:  BunDebugger.cpp, ConsoleObject.cpp (core),
+                InspectorBunFrontendDevServerAgent/HTTPServerAgent/LifecycleAgent.cpp
+  JIT:          NodeVMScript.cpp, NodeVMSourceTextModule.cpp
+
+--- BUCKET B: 32-bit-pointer ABI (need real wasm32 variants, like JSVALUE32_64) ---
+These static_assert 64-bit pointers or pack bits into a 64-bit pointer.
+Must stay ABI-consistent with the Rust side.
+  StrongRef.cpp — packs 48-bit slot ptr + 16-bit index into one pointer.
+    HARD: needs a 2-word StrongRefImpl on 32-bit (Rust Strong.rs SLOT_MASK
+    fix already done but the C++ encode/decode must agree). Core mechanism.
+  BunProcess.cpp, JSBuffer.cpp, napi.cpp, JSONRowsToJS.cpp,
+  StringBuilderBinding.cpp — sizeof static_asserts assuming 8-byte layout.
+
+--- BUCKET C: version-drift / misc ---
+  NodeSqlite.cpp — JSC::DestructionMode / NeedsDestruction absent from our
+    JSC (a USE_BUN_JSC_ADDITIONS type not exported). sqlite; optional for bun run.
+  TopExceptionScopeBinding.cpp — JSC::TopExceptionScope missing (version drift).
+  SerializedScriptValue.cpp — narrowing conversion (wasm32 size_t).
+
+=== ALREADY FIXED this session (were failing, now compile) ===
+lut.h namespace (create-hash-table.ts), JSCompressionStream using-decls,
+napi.h <vector>, usockets __wasi__ mutex, termios/spawn/epoll/pwd/signal
+shims (wasi-compat/), CPUFeatures wasm arm, c-bindings tty/socket gates,
+EventContext/EventPath/WorkerMessagingProxy/CryptoMLDSA/MLKEM includes,
+JSBundlerPlugin/JSFFIFunction pointer<->double bit_cast, JSMockFunction/
+JSCommonJSModule void-lambda RETURN_IF_EXCEPTION.
