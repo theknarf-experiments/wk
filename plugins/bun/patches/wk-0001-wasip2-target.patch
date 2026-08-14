@@ -2220,7 +2220,7 @@ index 4dc13cd2..547fdba8 100644
 +}
 +#endif // ENABLE(REMOTE_INSPECTOR)
 diff --git a/src/jsc/bindings/BunProcess.cpp b/src/jsc/bindings/BunProcess.cpp
-index 10210178..376f4b32 100644
+index 10210178..40fedb94 100644
 --- a/src/jsc/bindings/BunProcess.cpp
 +++ b/src/jsc/bindings/BunProcess.cpp
 @@ -1,3 +1,5 @@
@@ -2268,7 +2268,47 @@ index 10210178..376f4b32 100644
  #endif
          if (pointer_to_plugin_name) {
              // TODO: think about the finalizer here
-@@ -1635,6 +1647,9 @@ static void onDidChangeListeners(EventEmitter& eventEmitter, const Identifier& e
+@@ -1321,8 +1333,13 @@ void signalHandler(uv_signal_t* signal, int signalNumber)
+ 
+ extern "C" void Bun__logUnhandledException(JSC::EncodedJSValue exception);
+ 
+-extern "C" int Bun__handleUncaughtException(JSC::JSGlobalObject* lexicalGlobalObject, JSC::JSValue exception, int isRejection)
++// Takes the exception as EncodedJSValue (i64), not JSC::JSValue by value: on
++// wasm32 clang passes the JSValue class (a union member) by pointer (i32),
++// which mismatches the Rust caller's by-value i64 and traps. EncodedJSValue is
++// a plain int64_t on both sides.
++extern "C" int Bun__handleUncaughtException(JSC::JSGlobalObject* lexicalGlobalObject, JSC::EncodedJSValue encodedException, int isRejection)
+ {
++    JSC::JSValue exception = JSC::JSValue::decode(encodedException);
+     if (!lexicalGlobalObject->inherits(Zig::GlobalObject::info()))
+         return false;
+     auto* globalObject = uncheckedDowncast<Zig::GlobalObject>(lexicalGlobalObject);
+@@ -1474,8 +1491,11 @@ extern "C" void Bun__promises__emitUnhandledRejectionWarning(JSC::JSGlobalObject
+     CLEAR_IF_EXCEPTION(scope);
+ }
+ 
+-extern "C" int Bun__handleUnhandledRejection(JSC::JSGlobalObject* lexicalGlobalObject, JSC::JSValue reason, JSC::JSValue promise)
++// EncodedJSValue params, not JSC::JSValue by value — see Bun__handleUncaughtException.
++extern "C" int Bun__handleUnhandledRejection(JSC::JSGlobalObject* lexicalGlobalObject, JSC::EncodedJSValue encodedReason, JSC::EncodedJSValue encodedPromise)
+ {
++    JSC::JSValue reason = JSC::JSValue::decode(encodedReason);
++    JSC::JSValue promise = JSC::JSValue::decode(encodedPromise);
+     if (!lexicalGlobalObject->inherits(Zig::GlobalObject::info()))
+         return false;
+     auto* globalObject = uncheckedDowncast<Zig::GlobalObject>(lexicalGlobalObject);
+@@ -1499,8 +1519,10 @@ extern "C" int Bun__handleUnhandledRejection(JSC::JSGlobalObject* lexicalGlobalO
+ 
+ extern "C" bool Bun__VM__allowRejectionHandledWarning(void* vm);
+ 
+-extern "C" bool Bun__emitHandledPromiseEvent(JSC::JSGlobalObject* lexicalGlobalObject, JSC::JSValue promise)
++// EncodedJSValue param, not JSC::JSValue by value — see Bun__handleUncaughtException.
++extern "C" bool Bun__emitHandledPromiseEvent(JSC::JSGlobalObject* lexicalGlobalObject, JSC::EncodedJSValue encodedPromise)
+ {
++    JSC::JSValue promise = JSC::JSValue::decode(encodedPromise);
+     auto& vm = JSC::getVM(lexicalGlobalObject);
+     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
+     if (!lexicalGlobalObject->inherits(Zig::GlobalObject::info()))
+@@ -1635,6 +1657,9 @@ static void onDidChangeListeners(EventEmitter& eventEmitter, const Identifier& e
  #elif OS(WINDOWS)
              // windows has no SIGSTOP
              if (signalNumber != SIGKILL) {
@@ -2278,7 +2318,7 @@ index 10210178..376f4b32 100644
  #else
  #error unknown OS
  #endif
-@@ -2381,9 +2396,13 @@ static JSValue constructReportObjectComplete(VM& vm, Zig::GlobalObject* globalOb
+@@ -2381,9 +2406,13 @@ static JSValue constructReportObjectComplete(VM& vm, Zig::GlobalObject* globalOb
          JSC::JSObject* resourceUsage = JSC::constructEmptyObject(globalObject, globalObject->objectPrototype(), 11);
          RETURN_IF_EXCEPTION(scope, {});
  
@@ -2292,7 +2332,7 @@ index 10210178..376f4b32 100644
  
          resourceUsage->putDirect(vm, JSC::Identifier::fromString(vm, "free_memory"_s), JSC::jsNumber(usage.ru_maxrss), 0);
          resourceUsage->putDirect(vm, JSC::Identifier::fromString(vm, "total_memory"_s), JSC::jsNumber(usage.ru_maxrss), 0);
-@@ -2842,7 +2861,7 @@ static JSValue constructProcessConfigObject(VM& vm, JSObject* processObject)
+@@ -2842,7 +2871,7 @@ static JSValue constructProcessConfigObject(VM& vm, JSObject* processObject)
  #if CPU(ARM64)
      variables->putDirect(vm, JSC::Identifier::fromString(vm, "arm_fpu"_s), JSC::jsString(vm, String("neon"_s)), 0);
  #endif
@@ -2301,7 +2341,7 @@ index 10210178..376f4b32 100644
      variables->putDirect(vm, JSC::Identifier::fromString(vm, "control_flow_guard"_s), JSC::jsBoolean(false), 0);
      variables->putDirect(vm, JSC::Identifier::fromString(vm, "coverage"_s), JSC::jsBoolean(false), 0);
      variables->putDirect(vm, JSC::Identifier::fromString(vm, "dcheck_always_on"_s), JSC::jsNumber(0), 0);
-@@ -2868,6 +2887,9 @@ static JSValue constructProcessConfigObject(VM& vm, JSObject* processObject)
+@@ -2868,6 +2897,9 @@ static JSValue constructProcessConfigObject(VM& vm, JSObject* processObject)
  #elif CPU(ARM64)
      variables->putDirect(vm, JSC::Identifier::fromString(vm, "host_arch"_s), JSC::jsString(vm, String("arm64"_s)), 0);
      variables->putDirect(vm, JSC::Identifier::fromString(vm, "target_arch"_s), JSC::jsString(vm, String("arm64"_s)), 0);
@@ -2311,7 +2351,7 @@ index 10210178..376f4b32 100644
  #else
  #error "Unsupported architecture"
  #endif
-@@ -3780,7 +3802,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionResourceUsage, (JSC::JSGlobalObject * g
+@@ -3780,7 +3812,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionResourceUsage, (JSC::JSGlobalObject * g
      auto& vm = JSC::getVM(globalObject);
      auto throwScope = DECLARE_THROW_SCOPE(vm);
  
@@ -2322,7 +2362,7 @@ index 10210178..376f4b32 100644
      struct rusage rusage;
      if (getrusage(RUSAGE_SELF, &rusage) != 0) {
          throwSystemError(throwScope, globalObject, "Failed to get resource usage"_s, "getrusage"_s, errno);
-@@ -3828,7 +3852,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionCpuUsage, (JSC::JSGlobalObject * global
+@@ -3828,7 +3862,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionCpuUsage, (JSC::JSGlobalObject * global
  {
      auto& vm = JSC::getVM(globalObject);
      auto throwScope = DECLARE_THROW_SCOPE(vm);
@@ -2333,7 +2373,7 @@ index 10210178..376f4b32 100644
      struct rusage rusage;
      if (getrusage(RUSAGE_SELF, &rusage) != 0) {
          throwSystemError(throwScope, globalObject, "Failed to get CPU usage"_s, "getrusage"_s, errno);
-@@ -3955,10 +3981,15 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionThreadCpuUsage, (JSC::JSGlobalObject *
+@@ -3955,10 +3991,15 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionThreadCpuUsage, (JSC::JSGlobalObject *
      }
      user = 1e6 * info.user_time.seconds + info.user_time.microseconds;
      system = 1e6 * info.system_time.seconds + info.system_time.microseconds;
@@ -2350,7 +2390,7 @@ index 10210178..376f4b32 100644
      struct rusage threadUsage;
      if (getrusage(RUSAGE_THREAD, &threadUsage) != 0) {
          throwSystemError(throwScope, globalObject, "Failed to get thread CPU usage"_s, "getrusage"_s, errno);
-@@ -3966,6 +3997,7 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionThreadCpuUsage, (JSC::JSGlobalObject *
+@@ -3966,6 +4007,7 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionThreadCpuUsage, (JSC::JSGlobalObject *
      }
      user = 1e6 * threadUsage.ru_utime.tv_sec + threadUsage.ru_utime.tv_usec;
      system = 1e6 * threadUsage.ru_stime.tv_sec + threadUsage.ru_stime.tv_usec;
@@ -2358,7 +2398,7 @@ index 10210178..376f4b32 100644
  #else
      uv_rusage_t threadUsage;
      int err = uv_getrusage_thread(&threadUsage);
-@@ -4079,6 +4111,10 @@ err:
+@@ -4079,6 +4121,10 @@ err:
      return 0;
  #elif OS(WINDOWS)
      return uv_resident_set_memory(rss);
@@ -2369,6 +2409,15 @@ index 10210178..376f4b32 100644
  #else
  #error "Unknown platform"
  #endif
+@@ -4308,7 +4354,7 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionFatalException, (JSC::JSGlobalObject *
+     // machinery and returns whether a handler claimed the error. fromPromise selects
+     // origin 'unhandledRejection' vs 'uncaughtException'.
+     int isRejection = callFrame->argument(1).toBoolean(globalObject) ? 1 : 0;
+-    return JSValue::encode(jsBoolean(Bun__handleUncaughtException(globalObject, callFrame->argument(0), isRejection) > 0));
++    return JSValue::encode(jsBoolean(Bun__handleUncaughtException(globalObject, JSValue::encode(callFrame->argument(0)), isRejection) > 0));
+ }
+ 
+ JSC_DEFINE_HOST_FUNCTION(jsFunctionDrainMicrotaskQueue, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
 diff --git a/src/jsc/bindings/CPUFeatures.cpp b/src/jsc/bindings/CPUFeatures.cpp
 index d1b15605..e8ada386 100644
 --- a/src/jsc/bindings/CPUFeatures.cpp
