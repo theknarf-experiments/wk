@@ -1,42 +1,35 @@
-=== C++ bindings: ~496/520 non-v8 compile (95%); +42 v8 shim excluded ===
-=== Remaining ~21, in 3 buckets by root cause ===
+=== C++ bindings: 509/520 non-v8 compile (98%); +42 v8 shim excluded ===
+=== Remaining 8 ===
 
---- BUCKET A: JSC features disabled in our JSCONLY cloop build ---
-Our native/jsc-build/cmakeconfig.h has: ENABLE_WEBASSEMBLY 0,
-ENABLE_SAMPLING_PROFILER 0, ENABLE_REMOTE_INSPECTOR 0, ENABLE_JIT 0.
-These genuinely can't work on wasm (JIT impossible, inspector needs
-sockets, profiler needs signals, wasm-in-wasm exotic). Gate the bun C++
-with #if ENABLE(...) + stub the Rust-facing extern "C" exports. NOTE:
-must be a COORDINATED cross-language disable — bun_runtime (Rust) also has
-wasm-streaming/inspector paths that call these symbols; gating only the
-C++ creates link-time undefined symbols. Do Rust + C++ together per feature.
-  WEBASSEMBLY:  ZigGlobalObject.cpp (core; wasm block at lines 150-151,
-                2359-2361, 3996-4058), JSWasmStreamingCompiler.cpp, NodeVM.cpp
-                (createJSWebAssemblyCompileError)
-  SAMPLING_PROFILER: BunCPUProfiler.cpp (whole file), InternalModuleRegistry.cpp
-  REMOTE_INSPECTOR:  BunDebugger.cpp, ConsoleObject.cpp (core),
-                InspectorBunFrontendDevServerAgent/HTTPServerAgent/LifecycleAgent.cpp
-  JIT:          NodeVMScript.cpp, NodeVMSourceTextModule.cpp
+--- EXCLUDABLE optional subsystems (whole-file; not needed for `bun run`) ---
+Exclude from the wasi link like the v8 shim; stub their Rust-facing extern
+"C" exports at link time (the linker will name the undefined symbols).
+  Inspector (REMOTE_INSPECTOR=0): BunDebugger.cpp, InspectorBunFrontendDevServerAgent.cpp,
+    InspectorHTTPServerAgent.cpp, InspectorLifecycleAgent.cpp
+  Profiler (SAMPLING_PROFILER=0): BunCPUProfiler.cpp
+  Wasm streaming (WEBASSEMBLY=0): webcore/JSWasmStreamingCompiler.cpp
+  sqlite (optional): sqlite/NodeSqlite.cpp — uses JSC::DestructionMode/
+    NeedsDestruction, a USE_BUN_JSC_ADDITIONS type absent from our JSC build.
 
---- BUCKET B: 32-bit-pointer ABI (need real wasm32 variants, like JSVALUE32_64) ---
-These static_assert 64-bit pointers or pack bits into a 64-bit pointer.
-Must stay ABI-consistent with the Rust side.
-  StrongRef.cpp — packs 48-bit slot ptr + 16-bit index into one pointer.
-    HARD: needs a 2-word StrongRefImpl on 32-bit (Rust Strong.rs SLOT_MASK
-    fix already done but the C++ encode/decode must agree). Core mechanism.
-  BunProcess.cpp, JSBuffer.cpp, napi.cpp, JSONRowsToJS.cpp,
-  StringBuilderBinding.cpp — sizeof static_asserts assuming 8-byte layout.
+--- THE ONE CORE BLOCKER: StrongRef.cpp (32-bit GC-handle redesign) ---
+StrongRef packs (48-bit slot ptr | 16-bit index) into ONE pointer-sized
+handle; static_assert(sizeof(uintptr_t)==8). On wasm32 a pointer is 32 bits
+— can't pack both. Must stay ABI-consistent with src/jsc/Strong.rs (whose
+32-bit path currently treats handle == raw slot pointer, index 0 — WRONG
+for a multi-slot block).
+  StrongRootBlock: JSCell in an IsoSubspace/MarkedBlock, capacity=960
+  WriteBarrier slots; set/write/clear all need block+index for GC write
+  barriers + occupancy bits.
+  DESIGN for 32-bit (both sides): make StrongRefImpl a heap {block*, index}
+  pair; handle = ptr to it. Rust Strong.rs get() derefs handle->block->
+  slotAt(index) instead of reading handle as slot. Needs alloc/free of the
+  pair (mind leaks). ~half-day focused task + testing. Core (GC handles used
+  everywhere), so NOT excludable — this gates a working `bun run`.
 
---- BUCKET C: version-drift / misc ---
-  NodeSqlite.cpp — JSC::DestructionMode / NeedsDestruction absent from our
-    JSC (a USE_BUN_JSC_ADDITIONS type not exported). sqlite; optional for bun run.
-  TopExceptionScopeBinding.cpp — JSC::TopExceptionScope missing (version drift).
-  SerializedScriptValue.cpp — narrowing conversion (wasm32 size_t).
-
-=== ALREADY FIXED this session (were failing, now compile) ===
-lut.h namespace (create-hash-table.ts), JSCompressionStream using-decls,
-napi.h <vector>, usockets __wasi__ mutex, termios/spawn/epoll/pwd/signal
-shims (wasi-compat/), CPUFeatures wasm arm, c-bindings tty/socket gates,
-EventContext/EventPath/WorkerMessagingProxy/CryptoMLDSA/MLKEM includes,
-JSBundlerPlugin/JSFFIFunction pointer<->double bit_cast, JSMockFunction/
-JSCommonJSModule void-lambda RETURN_IF_EXCEPTION.
+=== SESSION-CLEARED (this iteration): ~13 files ===
+JSBuffer/napi BigInt asserts (digit-agnostic), JSONRowsToJS layout asserts
+(target-aware), StringBuilder/TopExceptionScope 32-bit ABI (+Strong.rs),
+BunProcess (~25 wasi arms: process-compat/grp/signal shims, dep-versions,
+v8-assert gating, arch/platform/rss/rusage), SerializedScriptValue narrowing,
+InternalModuleRegistry+ConsoleObject+NodeVM* (inspector/JIT/wasm gates),
+ZigGlobalObject (wasm-streaming gated, core), bit_cast fixes throughout.
