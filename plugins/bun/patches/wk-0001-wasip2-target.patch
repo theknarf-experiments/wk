@@ -2688,6 +2688,88 @@ index eb0f9e43..099245e8 100644
  #endif
  
  static_assert(sizeof(TopExceptionScope) == ExpectedTopExceptionScopeSize, "src/jsc/TopExceptionScope.rs assumes TopExceptionScope is 56 bytes");
+diff --git a/src/jsc/bindings/ZigGlobalObject.cpp b/src/jsc/bindings/ZigGlobalObject.cpp
+index 3022c09c..89f77493 100644
+--- a/src/jsc/bindings/ZigGlobalObject.cpp
++++ b/src/jsc/bindings/ZigGlobalObject.cpp
+@@ -145,10 +145,13 @@
+ #include "streams/JSTextDecoderStream.h"
+ #include "streams/JSTransformStream.h"
+ #include "streams/JSTransformStreamDefaultController.h"
++#include <wtf/SetForScope.h>
+ #include "JSURLPattern.h"
+ #include "JSURLSearchParams.h"
++#if ENABLE(WEBASSEMBLY)
+ #include "JSWasmStreamingCompiler.h"
+ #include <JavaScriptCore/WebAssemblyCompileOptions.h>
++#endif
+ #include "JSWebSocket.h"
+ #include "JSWorker.h"
+ #include "streams/JSWritableStream.h"
+@@ -999,8 +1002,13 @@ const JSC::GlobalObjectMethodTable& GlobalObject::globalObjectMethodTable()
+         &scriptExecutionStatus,
+         &unsafeEvalNoop, // reportViolationForUnsafeEval
+         nullptr, // defaultLanguage
++#if ENABLE(WEBASSEMBLY)
+         &compileStreaming,
+         &instantiateStreaming,
++#else
++        nullptr, // compileStreaming (WebAssembly disabled)
++        nullptr, // instantiateStreaming
++#endif
+         &Zig::deriveShadowRealmGlobalObject,
+         &codeForEval, // codeForEval
+         &canCompileStrings, // canCompileStrings
+@@ -1027,8 +1035,13 @@ const JSC::GlobalObjectMethodTable& EvalGlobalObject::globalObjectMethodTable()
+         &scriptExecutionStatus,
+         &unsafeEvalNoop, // reportViolationForUnsafeEval
+         nullptr, // defaultLanguage
++#if ENABLE(WEBASSEMBLY)
+         &compileStreaming,
+         &instantiateStreaming,
++#else
++        nullptr, // compileStreaming (WebAssembly disabled)
++        nullptr, // instantiateStreaming
++#endif
+         &Zig::deriveShadowRealmGlobalObject,
+         &codeForEval, // codeForEval
+         &canCompileStrings, // canCompileStrings
+@@ -1332,8 +1345,8 @@ JSC_DEFINE_HOST_FUNCTION(functionNativeMicrotaskTrampoline,
+     double cellPtr = callFrame->uncheckedArgument(0).asNumber();
+     double callbackPtr = callFrame->uncheckedArgument(1).asNumber();
+ 
+-    void* cell = reinterpret_cast<void*>(std::bit_cast<uintptr_t>(cellPtr));
+-    auto* callback = reinterpret_cast<MicrotaskCallback>(std::bit_cast<uintptr_t>(callbackPtr));
++    void* cell = reinterpret_cast<void*>(static_cast<uintptr_t>(std::bit_cast<uint64_t>(cellPtr)));
++    auto* callback = reinterpret_cast<MicrotaskCallback>(static_cast<uintptr_t>(std::bit_cast<uint64_t>(callbackPtr)));
+     callback(cell);
+     return JSValue::encode(jsUndefined());
+ }
+@@ -3598,7 +3611,7 @@ extern "C" void JSC__JSGlobalObject__queueMicrotaskCallback(Zig::GlobalObject* g
+ 
+     // Do not use JSCell* here because the GC will try to visit it.
+     // Use BunInvokeJobWithArguments to pass the two arguments (ptr and callback) to the trampoline function
+-    JSC::QueuedTask task { nullptr, JSC::InternalMicrotask::BunInvokeJobWithArguments, 0, globalObject, function, JSValue(std::bit_cast<double>(reinterpret_cast<uintptr_t>(ptr))), JSValue(std::bit_cast<double>(reinterpret_cast<uintptr_t>(callback))) };
++    JSC::QueuedTask task { nullptr, JSC::InternalMicrotask::BunInvokeJobWithArguments, 0, globalObject, function, JSValue(std::bit_cast<double>(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ptr)))), JSValue(std::bit_cast<double>(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(callback)))) };
+     globalObject->vm().queueMicrotask(WTF::move(task));
+ }
+ 
+@@ -3993,6 +4006,7 @@ JSC::JSValue EvalGlobalObject::moduleLoaderEvaluate(JSGlobalObject* lexicalGloba
+     return result;
+ }
+ 
++#if ENABLE(WEBASSEMBLY)
+ extern "C" JSC::EncodedJSValue Zig__GlobalObject__getBodyStreamOrBytesForWasmStreaming(JSGlobalObject*, EncodedJSValue response, JSC::Wasm::StreamingCompiler* compiler);
+ 
+ extern "C" void JSC__Wasm__StreamingCompiler__addBytes(JSC::Wasm::StreamingCompiler* compiler, const uint8_t* spanPtr, size_t spanSize)
+@@ -4055,6 +4069,7 @@ void GlobalObject::instantiateStreaming(JSGlobalObject* globalObject, JSC::JSPro
+ {
+     handleResponseOnStreamingAction(globalObject, promise, source, JSC::Wasm::CompilerMode::FullCompile, importObject, WTF::move(compileOptions));
+ }
++#endif // ENABLE(WEBASSEMBLY)
+ 
+ GlobalObject::PromiseFunctions GlobalObject::promiseHandlerID(Zig::FFIFunction handler)
+ {
 diff --git a/src/jsc/bindings/c-bindings.cpp b/src/jsc/bindings/c-bindings.cpp
 index 1ead5980..3584d2ac 100644
 --- a/src/jsc/bindings/c-bindings.cpp
