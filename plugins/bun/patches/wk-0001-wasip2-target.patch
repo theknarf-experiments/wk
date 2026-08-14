@@ -2825,6 +2825,88 @@ index 377b657f..035bf2a1 100644
      Protected as ProtectedJSValue, ProxyField, SerializedFlags, SerializedScriptValue,
  };
  
+diff --git a/src/jsc/modules/BunJSCModule.h b/src/jsc/modules/BunJSCModule.h
+index 4597cdd1..050af5e7 100644
+--- a/src/jsc/modules/BunJSCModule.h
++++ b/src/jsc/modules/BunJSCModule.h
+@@ -451,6 +451,14 @@ JSC_DEFINE_HOST_FUNCTION(functionStartSamplingProfiler,
+     (JSC::JSGlobalObject * globalObject,
+         JSC::CallFrame* callFrame))
+ {
++#if !ENABLE(SAMPLING_PROFILER)
++    // Sampling profiler is compiled out (needs signals; unavailable on wasm).
++    auto& vm = JSC::getVM(globalObject);
++    auto scope = DECLARE_THROW_SCOPE(vm);
++    (void)callFrame;
++    return JSC::JSValue::encode(throwException(globalObject, scope,
++        createError(globalObject, "Sampling profiler is not available in this build"_s)));
++#else
+     auto& vm = JSC::getVM(globalObject);
+     JSC::SamplingProfiler& samplingProfiler = vm.ensureSamplingProfiler(WTF::Stopwatch::create());
+ 
+@@ -483,6 +491,7 @@ JSC_DEFINE_HOST_FUNCTION(functionStartSamplingProfiler,
+     samplingProfiler.noticeCurrentThreadAsJSCExecutionThread();
+     samplingProfiler.start();
+     return JSC::JSValue::encode(jsUndefined());
++#endif
+ }
+ 
+ JSC_DECLARE_HOST_FUNCTION(functionSamplingProfilerStackTraces);
+@@ -493,7 +502,10 @@ JSC_DEFINE_HOST_FUNCTION(functionSamplingProfilerStackTraces,
+     auto& vm = JSC::getVM(globalObject);
+     JSC::DeferTermination deferScope(vm);
+     auto scope = DECLARE_THROW_SCOPE(vm);
+-
++#if !ENABLE(SAMPLING_PROFILER)
++    return JSC::JSValue::encode(throwException(globalObject, scope,
++        createError(globalObject, "Sampling profiler is not available in this build"_s)));
++#else
+     if (!vm.samplingProfiler())
+         return JSC::JSValue::encode(throwException(
+             globalObject, scope,
+@@ -503,6 +515,7 @@ JSC_DEFINE_HOST_FUNCTION(functionSamplingProfilerStackTraces,
+     JSC::EncodedJSValue result = JSC::JSValue::encode(JSONParse(globalObject, jsonString));
+     scope.releaseAssertNoException();
+     return result;
++#endif
+ }
+ 
+ JSC_DECLARE_HOST_FUNCTION(functionGetRandomSeed);
+@@ -596,7 +609,12 @@ JSC_DECLARE_HOST_FUNCTION(functionTotalCompileTime);
+ JSC_DEFINE_HOST_FUNCTION(functionTotalCompileTime,
+     (JSGlobalObject*, CallFrame*))
+ {
++#if ENABLE(JIT)
+     return JSValue::encode(jsNumber(JIT::totalCompileTime().milliseconds()));
++#else
++    // No JIT in this build.
++    return JSValue::encode(jsNumber(0));
++#endif
+ }
+ 
+ JSC_DECLARE_HOST_FUNCTION(functionGetProtectedObjects);
+@@ -677,6 +695,13 @@ JSC_DEFINE_HOST_FUNCTION(functionSetTimeZone, (JSGlobalObject * globalObject, Ca
+ 
+ JSC_DEFINE_HOST_FUNCTION(functionRunProfiler, (JSGlobalObject * globalObject, CallFrame* callFrame))
+ {
++#if !ENABLE(SAMPLING_PROFILER)
++    auto& vm = JSC::getVM(globalObject);
++    auto scope = DECLARE_THROW_SCOPE(vm);
++    (void)callFrame;
++    return JSValue::encode(throwException(globalObject, scope,
++        createError(globalObject, "Sampling profiler is not available in this build"_s)));
++#else
+     auto& vm = JSC::getVM(globalObject);
+     JSC::SamplingProfiler& samplingProfiler = vm.ensureSamplingProfiler(WTF::Stopwatch::create());
+ 
+@@ -789,6 +814,7 @@ JSC_DEFINE_HOST_FUNCTION(functionRunProfiler, (JSGlobalObject * globalObject, Ca
+ 
+     JSValue result = report(vm, globalObject);
+     RELEASE_AND_RETURN(throwScope, JSValue::encode(result));
++#endif
+ }
+ 
+ JSC_DECLARE_HOST_FUNCTION(functionGenerateHeapSnapshotForDebugging);
 diff --git a/src/libarchive/lib.rs b/src/libarchive/lib.rs
 index 3965e9b4..6c30a3d8 100644
 --- a/src/libarchive/lib.rs
