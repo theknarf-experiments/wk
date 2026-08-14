@@ -3,6 +3,17 @@
 #ifndef _WASI_SOCKET_COMPAT_H
 #define _WASI_SOCKET_COMPAT_H
 #if defined(__wasi__)
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+// Pre-empt wasi-libc's member-less struct sockaddr_un (WASI "has no unix
+// domain sockets") with the full BSD shape, so uSockets bsd.c's sun_path
+// code compiles. Claim the header's include guard so its version is skipped.
+#include <__typedef_sa_family_t.h>
+#ifndef __wasilibc___struct_sockaddr_un_h
+#define __wasilibc___struct_sockaddr_un_h
+struct sockaddr_un { sa_family_t sun_family; char sun_path[108]; };
+#endif
 #include <sys/socket.h>
 #include <stddef.h>
 #ifndef SO_LINGER
@@ -56,21 +67,24 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-static inline int socketpair(int d, int t, int p, int sv[2]) { (void)d;(void)t;(void)p;(void)sv; return -1; }
-static inline long recvmsg(int fd, struct msghdr* m, int flags) { (void)fd;(void)m;(void)flags; return -1; }
-static inline long sendmsg(int fd, const struct msghdr* m, int flags) { (void)fd;(void)m;(void)flags; return -1; }
 #ifdef __cplusplus
 }
 #endif
 #ifndef struct_cmsghdr_defined
 struct cmsghdr { size_t cmsg_len; int cmsg_level; int cmsg_type; };
 #endif
-struct mmsghdr { struct msghdr msg_hdr; unsigned int msg_len; };
 #ifdef __cplusplus
 extern "C" {
 #endif
-static inline int recvmmsg(int fd, struct mmsghdr* m, unsigned n, int flags, void* t) { (void)fd;(void)m;(void)n;(void)flags;(void)t; return -1; }
-static inline int sendmmsg(int fd, struct mmsghdr* m, unsigned n, int flags) { (void)fd;(void)m;(void)n;(void)flags; return -1; }
+#ifdef __cplusplus
+}
+#endif
+#ifdef __cplusplus
+extern "C" {
+#endif
+static inline int socketpair(int d, int t, int p, int sv[2]) { (void)d;(void)t;(void)p;(void)sv; return -1; }
+static inline long recvmsg(int fd, struct msghdr* m, int flags) { (void)fd;(void)m;(void)flags; return -1; }
+static inline long sendmsg(int fd, const struct msghdr* m, int flags) { (void)fd;(void)m;(void)flags; return -1; }
 #ifdef __cplusplus
 }
 #endif

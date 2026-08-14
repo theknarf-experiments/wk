@@ -23,6 +23,7 @@ extern "C" {
 static inline int epoll_create1(int f){(void)f;errno=ENOSYS;return -1;}
 static inline int epoll_ctl(int e,int o,int fd,struct epoll_event*ev){(void)e;(void)o;(void)fd;(void)ev;errno=ENOSYS;return -1;}
 static inline int epoll_wait(int e,struct epoll_event*ev,int m,int t){(void)e;(void)ev;(void)m;(void)t;errno=ENOSYS;return -1;}
+static inline int epoll_pwait(int e,struct epoll_event*ev,int m,int t,const void*sig){(void)e;(void)ev;(void)m;(void)t;(void)sig;errno=ENOSYS;return -1;}
 #ifdef __cplusplus
 }
 #endif

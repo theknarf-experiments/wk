@@ -10,17 +10,6 @@ int dlclose(void* h) { (void)h; return 0; }
 char* dlerror(void) { return NULL; }
 void node_module_register(void* m) { (void)m; }
 uint64_t Bun__Os__getFreeMemory(void) { return 0; }
-// uSockets core (not compiled for wasi — needs an event backend)
-void* us_socket_ext(void* s) { (void)s; return NULL; }
-int us_socket_is_closed(const void* s) { (void)s; return 1; }
-void* us_quic_stream_ext(void* s) { (void)s; return NULL; }
-void* us_loop_ext(void* loop) { (void)loop; return NULL; }
-int us_socket_write(void* s, const char* data, int length) { (void)s; (void)data; return length; }
-void* us_socket_group(void* s) { (void)s; return NULL; }
-void* us_socket_group_loop(void* group) { (void)group; return NULL; }
-// uSockets QUIC (HTTP/3)
-void* us_quic_stream_header_count(void* s) { (void)s; return NULL; }
-void* us_quic_stream_header(void* s, unsigned int i) { (void)s; (void)i; return NULL; }
 // lshpack (HTTP/2 HPACK) — needs its own build
 struct lshpack_enc; struct lshpack_dec;
 int lshpack_enc_init(struct lshpack_enc* e) { (void)e; return 0; }
