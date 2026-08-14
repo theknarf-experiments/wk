@@ -2684,6 +2684,43 @@ index 72c9fd15..6b2c96b6 100644
                  stderr: spawn::Stdio::Buffer(bun_core::heap::into_raw(Box::new(
                      bun_core::ffi::zeroed::<bun_sys::windows::libuv::Pipe>(),
                  ))),
+diff --git a/src/runtime/cli/test/parallel/Worker.rs b/src/runtime/cli/test/parallel/Worker.rs
+index b7393f89..6ed60dcd 100644
+--- a/src/runtime/cli/test/parallel/Worker.rs
++++ b/src/runtime/cli/test/parallel/Worker.rs
+@@ -5,11 +5,11 @@
+ 
+ use core::ffi::c_void;
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ use crate::api::bun::process::PosixStdio as Stdio;
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ use crate::api::bun::process::SpawnResultExt as _;
+-#[cfg(not(unix))]
++#[cfg(windows)]
+ use crate::api::bun::process::WindowsStdio as Stdio;
+ use crate::api::bun::process::{self as spawn, Process, Rusage, SpawnOptions, Status};
+ use bun_core::{self, Output};
+@@ -118,7 +118,7 @@ impl Worker {
+             this.err = WorkerPipe::new(self_ptr);
+         });
+ 
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "wasi"))]
+         {
+             // `.buffer` extra_fd creates an AF_UNIX socketpair; the parent end is
+             // adopted into a usockets `Channel`.
+@@ -180,7 +180,7 @@ impl Worker {
+                 this.ipc.done.set(true);
+             }
+         }
+-        #[cfg(not(unix))]
++        #[cfg(windows)]
+         {
+             // Windows: `.ipc` extra_fd creates a duplex `uv.Pipe` (named pipe
+             // under the hood, UV_READABLE | UV_WRITABLE | UV_OVERLAPPED) and
 diff --git a/src/runtime/node/StatFS.rs b/src/runtime/node/StatFS.rs
 index daf0254f..a248a493 100644
 --- a/src/runtime/node/StatFS.rs
