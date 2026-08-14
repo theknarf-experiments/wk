@@ -14,6 +14,13 @@ static inline int posix_spawnattr_init(posix_spawnattr_t *a){(void)a;return 0;}
 static inline int posix_spawnattr_destroy(posix_spawnattr_t *a){(void)a;return 0;}
 static inline int posix_spawn_file_actions_init(posix_spawn_file_actions_t *a){(void)a;return 0;}
 static inline int posix_spawn_file_actions_destroy(posix_spawn_file_actions_t *a){(void)a;return 0;}
+static inline int posix_spawnattr_setsigdefault(posix_spawnattr_t*a,const void*m){(void)a;(void)m;return 0;}
+static inline int posix_spawnattr_setsigmask(posix_spawnattr_t*a,const void*m){(void)a;(void)m;return 0;}
+static inline int posix_spawnattr_setflags(posix_spawnattr_t*a,short f){(void)a;(void)f;return 0;}
+static inline int posix_spawnattr_setpgroup(posix_spawnattr_t*a,int p){(void)a;(void)p;return 0;}
+static inline int posix_spawn_file_actions_adddup2(posix_spawn_file_actions_t*a,int f,int n){(void)a;(void)f;(void)n;return 0;}
+static inline int posix_spawn_file_actions_addclose(posix_spawn_file_actions_t*a,int f){(void)a;(void)f;return 0;}
+static inline int posix_spawn_file_actions_addopen(posix_spawn_file_actions_t*a,int f,const char*p,int o,unsigned m){(void)a;(void)f;(void)p;(void)o;(void)m;return 0;}
 #ifdef __cplusplus
 }
 #endif
