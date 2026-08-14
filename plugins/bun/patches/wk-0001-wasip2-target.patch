@@ -4242,7 +4242,7 @@ index 700eb630..a1086fc1 100644
      const POLL_OWNER_TAG: bun_io::PollTag = bun_io::posix_event_loop::poll_tag::TERMINAL_POLL;
      const HAS_ON_READY: bool = true;
 diff --git a/src/runtime/api/bun/js_bun_spawn_bindings.rs b/src/runtime/api/bun/js_bun_spawn_bindings.rs
-index 698ea540..b6bedfd5 100644
+index 698ea540..f9621580 100644
 --- a/src/runtime/api/bun/js_bun_spawn_bindings.rs
 +++ b/src/runtime/api/bun/js_bun_spawn_bindings.rs
 @@ -18,12 +18,14 @@ use bun_jsc::{JsCell, SysErrorJsc as _};
@@ -4281,7 +4281,39 @@ index 698ea540..b6bedfd5 100644
                      {
                          // On Windows, ConPTY supplies stdio via PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE.
                          // Set stdio to .ignore so spawnProcessWindows doesn't allocate pipes.
-@@ -1411,7 +1413,7 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
+@@ -1112,6 +1114,22 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
+         None => None,
+     };
+ 
++    // WASI: the blocking wk:exec run consumes stdin up front, so pull a fixed
++    // Buffer/Blob input out of stdio[0] now and neutralize the slot — bun would
++    // otherwise make a pipe and write it *after* spawn, by which point the
++    // wk:exec run has already finished. (A streamed stdin isn't threaded.)
++    #[cfg(target_os = "wasi")]
++    let wasi_stdin: Box<[u8]> = {
++        let bytes: Box<[u8]> = match &stdio[0] {
++            Stdio::ArrayBuffer(_) | Stdio::Blob(_) => stdio[0].byte_slice().into(),
++            _ => Box::default(),
++        };
++        if !bytes.is_empty() {
++            stdio[0] = Stdio::Ignore;
++        }
++        bytes
++    };
++
+     let mut spawn_options = SpawnOptions {
+         // Empty means "inherit the parent's working directory". Only chdir
+         // when the user asked for it: the stored cwd path string can be stale
+@@ -1174,6 +1192,8 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
+         },
+         #[cfg(any(target_os = "linux", target_os = "android"))]
+         cgroup_fd: cgroup_dir.as_ref().map(|c| c.dir.handle()),
++        #[cfg(target_os = "wasi")]
++        wasi_stdin,
+         ..Default::default()
+     };
+ 
+@@ -1411,7 +1431,7 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
                      }
                  }
              }
@@ -4290,7 +4322,7 @@ index 698ea540..b6bedfd5 100644
              {
                  use bun_libuv_sys::UvHandle as _;
                  for r in [spawned_stdout, spawned_stderr] {
-@@ -1582,7 +1584,7 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
+@@ -1582,7 +1602,7 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
                  v[usize::try_from(ipc_channel).expect("int cast")] = ExtraPipe::Unavailable;
              });
          }
@@ -4299,6 +4331,25 @@ index 698ea540..b6bedfd5 100644
          {
              use crate::node::MaybeExt as _;
              let idx = usize::try_from(ipc_channel).expect("int cast");
+diff --git a/src/runtime/api/bun/spawn/stdio.rs b/src/runtime/api/bun/spawn/stdio.rs
+index a6ba3faf..71d4d67e 100644
+--- a/src/runtime/api/bun/spawn/stdio.rs
++++ b/src/runtime/api/bun/spawn/stdio.rs
+@@ -102,12 +102,13 @@ impl ToSpawnOptsError {
+ }
+ 
+ impl Stdio {
+-    #[cfg(any(target_os = "linux", target_os = "android"))]
++    #[cfg(any(target_os = "linux", target_os = "android", target_os = "wasi"))]
+     pub(crate) fn byte_slice(&self) -> &[u8] {
+         match self {
+             // SAFETY: `buf` is a live backref owned by the caller (shell); the
+             // returned slice borrows `self` and the caller guarantees the
+             // Vec<u8> outlives this Stdio.
++            #[cfg(any(target_os = "linux", target_os = "android"))]
+             Self::Capture(c) => unsafe { (*c.buf).slice() },
+             Self::ArrayBuffer(ab) => ab.array_buffer.byte_slice(),
+             Self::Blob(blob) => blob.slice(),
 diff --git a/src/runtime/api/bun/subprocess.rs b/src/runtime/api/bun/subprocess.rs
 index 6908c027..a8b7ae2d 100644
 --- a/src/runtime/api/bun/subprocess.rs
@@ -6062,7 +6113,7 @@ index 397ec3a5..26b23436 100644
  #[cfg(windows)]
  pub use spawn_process::uv_getrusage;
 diff --git a/src/spawn_sys/spawn_process.rs b/src/spawn_sys/spawn_process.rs
-index 3cd940e2..c3e47a4b 100644
+index 3cd940e2..d6a7ad82 100644
 --- a/src/spawn_sys/spawn_process.rs
 +++ b/src/spawn_sys/spawn_process.rs
 @@ -14,19 +14,19 @@ use core::sync::atomic::Ordering;
@@ -6136,7 +6187,28 @@ index 3cd940e2..c3e47a4b 100644
      // `tv_sec`/`tv_usec` are `i64` on linux but `i32` on darwin (`suseconds_t`);
      // the `as i64` is required for the latter and a no-op on the former.
      #[inline]
-@@ -462,12 +492,18 @@ pub struct PosixSpawnResult {
+@@ -352,6 +382,11 @@ pub struct PosixSpawnOptions {
+     /// Linux only. Directory fd of a cgroup the child starts inside
+     /// (`CLONE_INTO_CGROUP`, else a pre-exec `cgroup.procs` write). Caller owns the fd.
+     pub cgroup_fd: Option<Fd>,
++    /// WASI only: fixed stdin bytes for the blocking `wk:exec` run, which needs
++    /// stdin up front (bun would otherwise write it to a pipe after spawn). The
++    /// binding pulls a Buffer/Blob stdin out of `stdio[0]` into here.
++    #[cfg(target_os = "wasi")]
++    pub wasi_stdin: Box<[u8]>,
+ }
+ 
+ impl Default for PosixSpawnOptions {
+@@ -378,6 +413,8 @@ impl Default for PosixSpawnOptions {
+             pseudoconsole: (),
+             linux_pdeathsig: None,
+             cgroup_fd: None,
++            #[cfg(target_os = "wasi")]
++            wasi_stdin: Box::default(),
+         }
+     }
+ }
+@@ -462,12 +499,18 @@ pub struct PosixSpawnResult {
      pub stdin: Option<Fd>,
      pub stdout: Option<Fd>,
      pub stderr: Option<Fd>,
@@ -6156,7 +6228,7 @@ index 3cd940e2..c3e47a4b 100644
  }
  
  /// Entry in `extra_pipes` for a stdio slot at index >= 3.
-@@ -639,11 +675,169 @@ impl Drop for PosixSpawnFdGuard {
+@@ -639,11 +682,177 @@ impl Drop for PosixSpawnFdGuard {
      }
  }
  
@@ -6276,12 +6348,20 @@ index 3cd940e2..c3e47a4b 100644
 +        stderr_len: 0,
 +        error: core::ptr::null_mut(),
 +    };
-+    // stdin is written by the parent *after* spawn on native (a pipe end); the
-+    // blocking wk:exec run needs it upfront, so this first cut runs the child
-+    // with an empty stdin. (TODO: thread a Buffer-mode fixed stdin through.)
-+    // SAFETY: path/argv are valid C strings for the call; result is a valid
++    // The blocking wk:exec run needs stdin up front; the binding pulled any
++    // fixed Buffer/Blob input out of stdio[0] into `wasi_stdin` (a streamed
++    // stdin isn't supported — it stays empty).
++    let (stdin_ptr, stdin_len) = if options.wasi_stdin.is_empty() {
++        (core::ptr::null(), 0)
++    } else {
++        (
++            options.wasi_stdin.as_ptr().cast::<c_char>(),
++            options.wasi_stdin.len(),
++        )
++    };
++    // SAFETY: path/argv/stdin are valid for the call; result is a valid
 +    // out-pointer.
-+    let rc = unsafe { wk_run(path, argv, core::ptr::null(), 0, &mut result) };
++    let rc = unsafe { wk_run(path, argv, stdin_ptr, stdin_len, &mut result) };
 +    if rc != 0 {
 +        // The program could not be run at all (no such file / not a component
 +        // / exec not permitted / nesting too deep). Map to ENOENT.
