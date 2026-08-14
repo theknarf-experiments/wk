@@ -2157,22 +2157,39 @@ index 8161b439..84732916 100644
  impl StringBuilder {
      #[inline]
 diff --git a/src/jsc/Strong.rs b/src/jsc/Strong.rs
-index 44ca97cd..994d0309 100644
+index 44ca97cd..744f0f4b 100644
 --- a/src/jsc/Strong.rs
 +++ b/src/jsc/Strong.rs
-@@ -169,7 +169,12 @@ bun_opaque::opaque_ffi! {
+@@ -167,15 +167,27 @@ bun_opaque::opaque_ffi! {
+ }
+ 
  impl Impl {
-     // Low 48 bits of the handle point at the `WriteBarrier<Unknown>` slot (a
-     // `JSC::JSValue`); see `encodeStrongRef` in StrongRef.cpp.
+-    // Low 48 bits of the handle point at the `WriteBarrier<Unknown>` slot (a
+-    // `JSC::JSValue`); see `encodeStrongRef` in StrongRef.cpp.
++    // JSVALUE64: the low 48 bits of the handle ARE the `WriteBarrier<Unknown>`
++    // slot pointer; see `encodeStrongRef` in StrongRef.cpp.
 +    #[cfg(target_pointer_width = "64")]
      const SLOT_MASK: usize = (1usize << 48) - 1;
-+    // 32-bit pointers already fit; the mask is a no-op (mirrors the C++,
-+    // where the uintptr_t mask truncates to a no-op too).
-+    #[cfg(target_pointer_width = "32")]
-+    const SLOT_MASK: usize = usize::MAX;
  
++    #[cfg(target_pointer_width = "64")]
      #[inline(always)]
      fn slot_ptr(this: NonNull<Impl>) -> *mut crate::DecodedJSValue {
+         (this.as_ptr() as usize & Self::SLOT_MASK) as *mut crate::DecodedJSValue
+     }
+ 
++    // wasm32: a pointer can't pack slot+index, so the handle points at C++'s
++    // `StrongRef32` record whose FIRST word is the slot pointer (StrongRef.cpp).
++    // One extra load keeps get/clear on the direct-slot fast path.
++    #[cfg(target_pointer_width = "32")]
++    #[inline(always)]
++    fn slot_ptr(this: NonNull<Impl>) -> *mut crate::DecodedJSValue {
++        // SAFETY: the handle is a live StrongRef32*; its first field is the slot ptr.
++        unsafe { *(this.as_ptr() as *const *mut crate::DecodedJSValue) }
++    }
++
+     pub(crate) fn init(global: &JSGlobalObject, value: JSValue) -> NonNull<Impl> {
+         crate::mark_binding!();
+         NonNull::new(Bun__StrongRef__new(global, value)).expect("Bun__StrongRef__new returned null")
 diff --git a/src/jsc/TopExceptionScope.rs b/src/jsc/TopExceptionScope.rs
 index 4d5b858f..c8066f70 100644
 --- a/src/jsc/TopExceptionScope.rs
@@ -2667,6 +2684,73 @@ index 4e397570..007b0136 100644
  
  extern "C" void StringBuilder__init(WTF::StringBuilder* ptr)
  {
+diff --git a/src/jsc/bindings/StrongRef.cpp b/src/jsc/bindings/StrongRef.cpp
+index 5744b259..c100c7e3 100644
+--- a/src/jsc/bindings/StrongRef.cpp
++++ b/src/jsc/bindings/StrongRef.cpp
+@@ -24,11 +24,15 @@ static ALWAYS_INLINE WebCore::JSVMClientData* clientDataFast(JSC::VM& vm)
+ // JSC cells live in the low 48 bits of the address space (the same invariant
+ // JSValue NaN-boxing and StructureID encoding rely on), and the slot index is
+ // bounded by StrongRootBlock::capacity.
++static_assert(sizeof(StrongRootBlock::Slot) == sizeof(JSC::JSValue), "Rust Impl::get reads the slot as a JSValue");
++
++#if UINTPTR_MAX > 0xffffffffu
++// JSVALUE64: pack the slot pointer in the low 48 bits and the slot index in
++// the top 16 bits; the handle carries no allocation. JSC cells live in the
++// low 48 bits (the invariant NaN-boxing/StructureID rely on).
+ static constexpr unsigned kStrongRefIndexShift = 48;
+ static constexpr uintptr_t kStrongRefSlotMask = (static_cast<uintptr_t>(1) << kStrongRefIndexShift) - 1;
+-static_assert(sizeof(uintptr_t) == 8, "StrongRef handle encoding requires 64-bit pointers");
+ static_assert(StrongRootBlock::capacity < (1u << (64 - kStrongRefIndexShift)), "slot index must fit in the top 16 bits");
+-static_assert(sizeof(StrongRootBlock::Slot) == sizeof(JSC::JSValue), "Rust Impl::get reads the slot as a JSValue");
+ 
+ static ALWAYS_INLINE StrongRefImpl* encodeStrongRef(StrongRootBlock* block, unsigned index)
+ {
+@@ -47,6 +51,34 @@ static ALWAYS_INLINE StrongRootBlock* decodeStrongRefBlock(StrongRefImpl* ref)
+     uintptr_t slot = reinterpret_cast<uintptr_t>(ref) & kStrongRefSlotMask;
+     return reinterpret_cast<StrongRootBlock*>(slot - static_cast<uintptr_t>(decodeStrongRefIndex(ref)) * sizeof(StrongRootBlock::Slot) - StrongRootBlock::slotsOffset());
+ }
++static ALWAYS_INLINE void freeStrongRef(StrongRefImpl*) {}
++#else
++// 32-bit (wasm32): a pointer can't hold slot+index, so the handle points at a
++// tiny heap record. Its FIRST word is the slot pointer, so bun_jsc::Strong's
++// hot get/clear stay a single extra load (see Strong.rs slot_ptr on wasm32).
++struct StrongRef32 {
++    StrongRootBlock::Slot* slot; // WriteBarrier<Unknown>*; ABI-identical to a JSValue slot
++    StrongRootBlock* block;
++    unsigned index;
++};
++
++static ALWAYS_INLINE StrongRefImpl* encodeStrongRef(StrongRootBlock* block, unsigned index)
++{
++    auto* h = new StrongRef32 { block->slotAt(index), block, index };
++    return reinterpret_cast<StrongRefImpl*>(h);
++}
++
++static ALWAYS_INLINE unsigned decodeStrongRefIndex(StrongRefImpl* ref)
++{
++    return reinterpret_cast<StrongRef32*>(ref)->index;
++}
++
++static ALWAYS_INLINE StrongRootBlock* decodeStrongRefBlock(StrongRefImpl* ref)
++{
++    return reinterpret_cast<StrongRef32*>(ref)->block;
++}
++static ALWAYS_INLINE void freeStrongRef(StrongRefImpl* ref) { delete reinterpret_cast<StrongRef32*>(ref); }
++#endif
+ 
+ extern "C" StrongRefImpl* Bun__StrongRef__new(JSC::JSGlobalObject* globalObject, JSC::EncodedJSValue encodedValue)
+ {
+@@ -76,6 +108,8 @@ extern "C" void Bun__StrongRef__delete(StrongRefImpl* _Nonnull ref)
+     // (covers the FIFO pattern where the oldest-armed block gets room while
+     // the cursor sits at a full head).
+     clientData->m_strongRootBlockCursor = block;
+-    if (block->clear(decodeStrongRefIndex(ref))) [[unlikely]]
++    bool blockEmptied = block->clear(decodeStrongRefIndex(ref));
++    freeStrongRef(ref);
++    if (blockEmptied) [[unlikely]]
+         StrongRootBlock::release(clientData, vm, block);
+ }
 diff --git a/src/jsc/bindings/TopExceptionScopeBinding.cpp b/src/jsc/bindings/TopExceptionScopeBinding.cpp
 index eb0f9e43..099245e8 100644
 --- a/src/jsc/bindings/TopExceptionScopeBinding.cpp
