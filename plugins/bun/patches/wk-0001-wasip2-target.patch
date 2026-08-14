@@ -6968,6 +6968,30 @@ index 3d2b2376..0102d7f1 100644
      }
  }
  
+diff --git a/src/threading/work_pool.rs b/src/threading/work_pool.rs
+index 60f4a0c9..91700446 100644
+--- a/src/threading/work_pool.rs
++++ b/src/threading/work_pool.rs
+@@ -147,6 +147,19 @@ impl WorkPool {
+     }
+ 
+     pub fn schedule(task: *mut Task) {
++        // Single-threaded wasi has no worker threads (pthread_create is a
++        // stub), so a task handed to the pool would never run and whatever
++        // awaits it (async fs, crypto jobs, …) would hang forever. Run it
++        // inline instead; its completion posts a concurrent task that the
++        // event loop drains on the next tick.
++        #[cfg(target_os = "wasi")]
++        // SAFETY: `task` points to a live `Task` with an installed callback;
++        // the pool contract is that the callback fires exactly once per
++        // scheduled task, which running it once here honors.
++        unsafe {
++            ((*task).callback)(task);
++        }
++        #[cfg(not(target_os = "wasi"))]
+         Self::get().schedule(Batch::from(task));
+     }
+ 
 diff --git a/src/uws_sys/Loop.rs b/src/uws_sys/Loop.rs
 index 5120f7d8..476bddf4 100644
 --- a/src/uws_sys/Loop.rs
