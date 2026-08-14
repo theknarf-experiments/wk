@@ -1220,12 +1220,16 @@ impl wasi::sockets::ip_name_lookup::Host for HostState {
             .filter(|(net, hub)| hub.resolve(*net, &name).is_some())
         {
             // A peer node on this node's virtual network, resolved by name —
-            // offer both its IPv6 and IPv4 fabric addresses.
-            if let Some(v6) = hub.resolve6(net, &name) {
-                push_v6(&mut addrs, v6);
-            }
+            // offer both its IPv4 and IPv6 fabric addresses. IPv4 comes first:
+            // the fabric is addressed as `10.0.0.x` everywhere (that is a
+            // node's canonical address), and resolvers try results in order, so
+            // a bare `dns.lookup(name)` / `fetch("http://name")` must land on
+            // the IPv4. (The `fd00::x` ULA is a secondary form.)
             if let Some(v4) = hub.resolve(net, &name) {
                 push_v4(&mut addrs, v4);
+            }
+            if let Some(v6) = hub.resolve6(net, &name) {
+                push_v6(&mut addrs, v6);
             }
         } else if self
             .net
