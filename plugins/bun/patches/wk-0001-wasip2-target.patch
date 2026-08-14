@@ -2182,7 +2182,7 @@ index 4a2dccc2..9c665866 100644
 +#[cfg(target_os = "wasi")]
 +pub const UV_ESOCKTNOSUPPORT: core::ffi::c_int = -4025;
 diff --git a/src/patch/lib.rs b/src/patch/lib.rs
-index 5b076717..43d55b2c 100644
+index 5b076717..1b58c5d6 100644
 --- a/src/patch/lib.rs
 +++ b/src/patch/lib.rs
 @@ -213,6 +213,10 @@ impl<'a> PatchFile<'a> {
@@ -2196,6 +2196,21 @@ index 5b076717..43d55b2c 100644
                      #[cfg(unix)]
                      {
                          if let sys::Result::Err(e) =
+@@ -286,7 +290,13 @@ fn apply_patch(patch: &FilePatch<'_>, patch_dir: Fd, state: &mut ApplyState) ->
+     #[cfg(unix)]
+     let _ = state; // suppress unused on posix
+ 
+-    let filebuf: Vec<u8> = match read_file_alloc(patch_dir, &file_path, 1024 * 1024 * 1024 * 4) {
++    // 4 GiB cap; compute as u64 so it doesn't overflow a 32-bit usize (wasm32),
++    // then clamp to usize::MAX there.
++    let filebuf: Vec<u8> = match read_file_alloc(
++        patch_dir,
++        &file_path,
++        (1024u64 * 1024 * 1024 * 4).min(usize::MAX as u64) as usize,
++    ) {
+         Ok(b) => b,
+         Err(_) => {
+             return sys::Result::Err(
 diff --git a/src/perf/system_timer.rs b/src/perf/system_timer.rs
 index aa0e9e2a..9f68c504 100644
 --- a/src/perf/system_timer.rs
