@@ -38,6 +38,20 @@ index 3c3f997a..6bac483b 100644
  ]
  # `vendor/lolhtml` (the `lol_html` crate) is a non-member path dependency,
  # fetched into `vendor/` by `scripts/build/deps/lolhtml.ts` before cargo runs.
+diff --git a/packages/bun-usockets/src/internal/loop_data.h b/packages/bun-usockets/src/internal/loop_data.h
+index 3937ea5d..6f49ec61 100644
+--- a/packages/bun-usockets/src/internal/loop_data.h
++++ b/packages/bun-usockets/src/internal/loop_data.h
+@@ -28,6 +28,9 @@ typedef uint32_t zig_mutex_t;
+ #elif defined(_WIN32)
+ // SRWLOCK
+ typedef void* zig_mutex_t;
++#elif defined(__wasi__)
++// Single-threaded wasm guest: no real mutex needed.
++typedef uint32_t zig_mutex_t;
+ #else
+ #error "Unsupported platform"
+ #endif
 diff --git a/src/analytics/lib.rs b/src/analytics/lib.rs
 index 07fa5303..c3c5ab72 100644
 --- a/src/analytics/lib.rs
@@ -4004,6 +4018,90 @@ index aa0e9e2a..9f68c504 100644
  impl Timer {
      pub fn start() -> Result<Self, bun_core::Error> {
          // Infallible here, but kept fallible to match the `Result` signature
+diff --git a/src/ptr/tagged_pointer.rs b/src/ptr/tagged_pointer.rs
+index 8d1018d5..1909d9a7 100644
+--- a/src/ptr/tagged_pointer.rs
++++ b/src/ptr/tagged_pointer.rs
+@@ -21,6 +21,27 @@ impl TaggedPtr {
+     const ADDR_MASK: u64 = (1u64 << Self::ADDR_BITS) - 1;
+     const TAG_MASK: u16 = (1u16 << 15) - 1;
+ 
++    // wasm32: a `*mut c_void` is 32-bit, so a TaggedPtr stored through one (the
++    // uSockets socket ext, the C on_open `ptr` arg) loses its tag (packed in
++    // bits 49-63). Every tagged pointer is usize-aligned (see DeadSocket), and
++    // our unions have ≤4 members, so we can fold the tag *index* (MAX_TAG - tag,
++    // 0..=3) into the pointer's low 2 bits and reconstruct on the way back —
++    // preserving both address and tag across a 32-bit round-trip.
++    #[cfg(target_pointer_width = "32")]
++    const FOLD_MASK: u64 = 0x3;
++    #[cfg(target_pointer_width = "32")]
++    const MAX_TAG_FOLD: u64 = 1024; // TypeList::MAX_TAG (universal)
++
++    #[cfg(target_pointer_width = "32")]
++    #[inline]
++    fn unfold_from_c_void(val: usize) -> TaggedPtr {
++        let word = val as u64;
++        let idx = word & Self::FOLD_MASK;
++        let addr = word & !Self::FOLD_MASK;
++        let tag = Self::MAX_TAG_FOLD - idx;
++        TaggedPtr((addr & Self::ADDR_MASK) | ((tag & Self::TAG_MASK as u64) << Self::ADDR_BITS))
++    }
++
+     #[inline]
+     pub fn init<T>(ptr: *const T, data: TagType) -> TaggedPtr {
+         // A null `*const T` yields address 0 below.
+@@ -49,9 +70,19 @@ impl TaggedPtr {
+ 
+     #[inline]
+     pub fn to(self) -> *mut c_void {
+-        // Note: includes the tag bits in the high word. This is intentional:
+-        // round-tripping through `*anyopaque` preserves the tag.
+-        self.0 as usize as *mut c_void
++        // On 64-bit, the u64 (tag in the high word) survives a `*mut c_void`
++        // round-trip. On wasm32 the high word would be truncated, so fold the
++        // tag index into the aligned low bits instead (see FOLD_MASK note).
++        #[cfg(target_pointer_width = "32")]
++        {
++            let addr = self.ptr_bits();
++            let idx = Self::MAX_TAG_FOLD.wrapping_sub(self.data() as u64) & Self::FOLD_MASK;
++            return ((addr & !Self::FOLD_MASK) | idx) as usize as *mut c_void;
++        }
++        #[cfg(not(target_pointer_width = "32"))]
++        {
++            self.0 as usize as *mut c_void
++        }
+     }
+ }
+ 
+@@ -64,13 +95,26 @@ impl From<u64> for TaggedPtr {
+ impl From<*mut c_void> for TaggedPtr {
+     #[inline]
+     fn from(val: *mut c_void) -> Self {
+-        TaggedPtr(val as usize as u64)
++        // Mirror `to()`: on wasm32 unfold the tag from the low bits.
++        #[cfg(target_pointer_width = "32")]
++        {
++            TaggedPtr::unfold_from_c_void(val as usize)
++        }
++        #[cfg(not(target_pointer_width = "32"))]
++        {
++            TaggedPtr(val as usize as u64)
++        }
+     }
+ }
+ impl From<Option<*mut c_void>> for TaggedPtr {
+     #[inline]
+     fn from(val: Option<*mut c_void>) -> Self {
+-        TaggedPtr(val.map_or(0, |p| p as usize as u64))
++        // A null slot is the zero word (no address, no tag); a real pointer
++        // round-trips through `From<*mut c_void>` (which unfolds on wasm32).
++        match val {
++            None => TaggedPtr(0),
++            Some(p) => TaggedPtr::from(p),
++        }
+     }
+ }
+ 
 diff --git a/src/react_compiler/inference/infer_mutation_aliasing_effects.rs b/src/react_compiler/inference/infer_mutation_aliasing_effects.rs
 index 62e22e79..2b4f25c3 100644
 --- a/src/react_compiler/inference/infer_mutation_aliasing_effects.rs
