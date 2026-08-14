@@ -2380,6 +2380,49 @@ index d1b15605..e8ada386 100644
  #else
  #error "Unknown architecture"
  #endif
+diff --git a/src/jsc/bindings/ConsoleObject.cpp b/src/jsc/bindings/ConsoleObject.cpp
+index 05999401..122459c4 100644
+--- a/src/jsc/bindings/ConsoleObject.cpp
++++ b/src/jsc/bindings/ConsoleObject.cpp
+@@ -34,11 +34,13 @@ void ConsoleObject::messageWithTypeAndLevel(MessageType type, MessageLevel level
+     JSC::JSGlobalObject* globalObject,
+     Ref<ScriptArguments>&& arguments)
+ {
++#if ENABLE(REMOTE_INSPECTOR)
+     if (globalObject->inspectable()) {
+         if (auto client = globalObject->inspectorController().consoleClient()) {
+             client->messageWithTypeAndLevel(type, level, globalObject, arguments.copyRef());
+         }
+     }
++#endif
+     auto& vm = JSC::getVM(globalObject);
+     auto args = arguments.ptr();
+     JSC::EncodedJSValue jsArgs[255];
+@@ -111,20 +113,24 @@ void ConsoleObject::screenshot(JSGlobalObject*, Ref<ScriptArguments>&&)
+ 
+ void ConsoleObject::profile(JSC::JSGlobalObject* globalObject, const String& title)
+ {
++#if ENABLE(REMOTE_INSPECTOR)
+     if (globalObject->inspectable()) {
+         if (auto client = globalObject->inspectorController().consoleClient()) {
+             client->profile(globalObject, title);
+         }
+     }
++#endif
+ }
+ 
+ void ConsoleObject::profileEnd(JSC::JSGlobalObject* globalObject, const String& title)
+ {
++#if ENABLE(REMOTE_INSPECTOR)
+     if (globalObject->inspectable()) {
+         if (auto client = globalObject->inspectorController().consoleClient()) {
+             client->profileEnd(globalObject, title);
+         }
+     }
++#endif
+ }
+ 
+ }
 diff --git a/src/jsc/bindings/JSBuffer.cpp b/src/jsc/bindings/JSBuffer.cpp
 index 217d2970..1ce41bbc 100644
 --- a/src/jsc/bindings/JSBuffer.cpp
@@ -2519,6 +2562,93 @@ index cf0c96f3..7b02be0c 100644
  
  // `E::StrEncoding`: how the bytes behind every string on one tape are encoded.
  enum class RowEncoding : uint8_t {
+diff --git a/src/jsc/bindings/NodeVM.cpp b/src/jsc/bindings/NodeVM.cpp
+index 54a3d25d..37631791 100644
+--- a/src/jsc/bindings/NodeVM.cpp
++++ b/src/jsc/bindings/NodeVM.cpp
+@@ -982,11 +982,21 @@ const JSC::GlobalObjectMethodTable& NodeVMGlobalObject::globalObjectMethodTable(
+     return table;
+ }
+ 
++#if ENABLE(WEBASSEMBLY)
++static JSC::JSObject* bunNodeVmWasmCompileError(JSC::JSGlobalObject* globalObject, JSC::VM& vm) {
++    return JSC::createJSWebAssemblyCompileError(globalObject, vm, "Wasm code generation disallowed by embedder"_s);
++}
++#else
++static JSC::JSObject* bunNodeVmWasmCompileError(JSC::JSGlobalObject* globalObject, JSC::VM&) {
++    return JSC::createError(globalObject, "Wasm code generation disallowed by embedder"_s);
++}
++#endif
++
+ JSC_DEFINE_HOST_FUNCTION(jsNodeVmWasmDisallowed, (JSC::JSGlobalObject * globalObject, JSC::CallFrame*))
+ {
+     VM& vm = globalObject->vm();
+     auto scope = DECLARE_THROW_SCOPE(vm);
+-    scope.throwException(globalObject, JSC::createJSWebAssemblyCompileError(globalObject, vm, "Wasm code generation disallowed by embedder"_s));
++    scope.throwException(globalObject, bunNodeVmWasmCompileError(globalObject, vm));
+     return {};
+ }
+ 
+@@ -996,7 +1006,7 @@ JSC_DEFINE_HOST_FUNCTION(jsNodeVmWasmCompileDisallowed, (JSC::JSGlobalObject * g
+ {
+     VM& vm = globalObject->vm();
+     auto scope = DECLARE_THROW_SCOPE(vm);
+-    JSObject* error = JSC::createJSWebAssemblyCompileError(globalObject, vm, "Wasm code generation disallowed by embedder"_s);
++    JSObject* error = bunNodeVmWasmCompileError(globalObject, vm);
+     RETURN_IF_EXCEPTION(scope, {});
+     RELEASE_AND_RETURN(scope, JSValue::encode(JSC::JSPromise::rejectedPromise(globalObject, error)));
+ }
+diff --git a/src/jsc/bindings/NodeVMScript.cpp b/src/jsc/bindings/NodeVMScript.cpp
+index 1a8653a1..37dccb29 100644
+--- a/src/jsc/bindings/NodeVMScript.cpp
++++ b/src/jsc/bindings/NodeVMScript.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include "JavaScriptCore/Completion.h"
+ #include "JavaScriptCore/JIT.h"
++#include "JavaScriptCore/Watchdog.h"
+ #include "JavaScriptCore/JSWeakMap.h"
+ #include "JavaScriptCore/JSWeakMapInlines.h"
+ #include "JavaScriptCore/Parser.h"
+@@ -190,6 +191,7 @@ constructScript(JSGlobalObject* globalObject, CallFrame* callFrame, JSValue newT
+                 codeBlock = JSC::ProgramCodeBlock::create(vm, executable, unlinkedBlock, jsScope);
+                 RETURN_IF_EXCEPTION(scope, {});
+             }
++#if ENABLE(JIT)
+             JSC::CompilationResult compilationResult = JIT::compileSync(vm, codeBlock, JITCompilationEffort::JITCompilationCanFail);
+             if (compilationResult != JSC::CompilationResult::CompilationFailed) {
+                 executable->installCode(codeBlock);
+@@ -197,6 +199,11 @@ constructScript(JSGlobalObject* globalObject, CallFrame* callFrame, JSValue newT
+             } else {
+                 script->cachedDataRejected(TriState::True);
+             }
++#else
++            // No JIT in this build; the cloop interpreter runs bytecode directly, so
++            // there is no machine-code cache to produce.
++            script->cachedDataRejected(TriState::True);
++#endif
+         }
+     } else if (produceCachedData) {
+         script->cacheBytecode();
+diff --git a/src/jsc/bindings/NodeVMSourceTextModule.cpp b/src/jsc/bindings/NodeVMSourceTextModule.cpp
+index 363ce0d9..e5609d52 100644
+--- a/src/jsc/bindings/NodeVMSourceTextModule.cpp
++++ b/src/jsc/bindings/NodeVMSourceTextModule.cpp
+@@ -141,12 +141,14 @@ NodeVMSourceTextModule* NodeVMSourceTextModule::create(VM& vm, JSGlobalObject* g
+             RETURN_IF_EXCEPTION(scope, nullptr);
+         }
+         if (codeBlock) {
++#if ENABLE(JIT)
+             CompilationResult compilationResult = JIT::compileSync(vm, codeBlock, JITCompilationEffort::JITCompilationCanFail);
+             RETURN_IF_EXCEPTION(scope, nullptr);
+             if (compilationResult != CompilationResult::CompilationFailed) {
+                 executable->installCode(codeBlock);
+                 return ptr;
+             }
++#endif
+         }
+     }
+ 
 diff --git a/src/jsc/bindings/StringBuilderBinding.cpp b/src/jsc/bindings/StringBuilderBinding.cpp
 index 4e397570..007b0136 100644
 --- a/src/jsc/bindings/StringBuilderBinding.cpp
