@@ -2153,6 +2153,20 @@ index 05b95066..c0153e3e 100644
  #include <JavaScriptCore/JSWeakValue.h>
  #include "JSFFIFunction.h"
  #include "ZigGlobalObject.h"
+diff --git a/src/jsc/bindings/webcore/streams/WebStreamsInternals.h b/src/jsc/bindings/webcore/streams/WebStreamsInternals.h
+index 99b56429..cee7a029 100644
+--- a/src/jsc/bindings/webcore/streams/WebStreamsInternals.h
++++ b/src/jsc/bindings/webcore/streams/WebStreamsInternals.h
+@@ -53,7 +53,9 @@ inline bool exceedsStringLimit(size_t length)
+ }
+ 
+ // Reduce noise: every class name below is a WebCore JS cell (StreamsForward.h).
++using WebCore::JSCompressionStream;
+ using WebCore::JSCrossRealmTransformState;
++using WebCore::JSDecompressionStream;
+ using WebCore::JSDirectSinkCloseState;
+ using WebCore::JSDirectStreamController;
+ using WebCore::JSNativeStreamSourceAdapter;
 diff --git a/src/jsc/event_loop.rs b/src/jsc/event_loop.rs
 index aa9643fe..591679ef 100644
 --- a/src/jsc/event_loop.rs

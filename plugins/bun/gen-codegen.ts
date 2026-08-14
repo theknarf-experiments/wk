@@ -74,4 +74,27 @@ const classFiles = (await $`bash -c ${"find src -name '*.classes.ts'"}`.cwd(dir 
 await $`bun ${dir}/bun/src/codegen/generate-classes.ts ${classFiles} ${dir}/codegen`.cwd(dir + "/bun");
 await $`bun ${dir}/bun/src/codegen/generate-jssink.ts ${dir}/codegen`.cwd(dir + "/bun");
 await $`bun ${dir}/bun/src/codegen/generate-host-exports.ts ${dir}/codegen`.cwd(dir + "/bun");
-console.log("wrote codegen/{json,xml}_byte_class.{h,rs} + build_options.rs + jsc-tier codegen");
+// The C++ bindings' generated headers (for the wasi C++ compile, not the
+// Rust build). bindgen emits GeneratedBunObject.h + GeneratedBindings.cpp;
+// create-hash-table.ts turns the `@begin XXXTable` blocks into .lut.h (it
+// strips the `namespace JSC` wrapper the raw perl adds — the .cpp reference
+// the tables unqualified). TARGET_PLATFORM=linux matches the runtime codegen.
+await $`bun ${dir}/bun/src/codegen/bindgen.ts --codegen-root=${dir}/codegen`.cwd(dir + "/bun");
+const lutPairs: [string, string][] = [
+  ["src/jsc/bindings/BunObject.cpp", "BunObject.lut.h"],
+  ["src/jsc/bindings/ZigGlobalObject.lut.txt", "ZigGlobalObject.lut.h"],
+  ["src/jsc/bindings/JSBuffer.cpp", "JSBuffer.lut.h"],
+  ["src/jsc/bindings/BunProcess.cpp", "BunProcess.lut.h"],
+  ["src/jsc/bindings/ProcessBindingBuffer.cpp", "ProcessBindingBuffer.lut.h"],
+  ["src/jsc/bindings/ProcessBindingConstants.cpp", "ProcessBindingConstants.lut.h"],
+  ["src/jsc/bindings/ProcessBindingFs.cpp", "ProcessBindingFs.lut.h"],
+  ["src/jsc/bindings/ProcessBindingNatives.cpp", "ProcessBindingNatives.lut.h"],
+  ["src/jsc/bindings/ProcessBindingHTTPParser.cpp", "ProcessBindingHTTPParser.lut.h"],
+  ["src/jsc/modules/NodeModuleModule.cpp", "NodeModuleModule.lut.h"],
+  ["src/jsc/bindings/webcore/JSEvent.cpp", "JSEvent.lut.h"],
+  [dir + "/codegen/ZigGeneratedClasses.lut.txt", "ZigGeneratedClasses.lut.h"],
+];
+for (const [src, out] of lutPairs) {
+  await $`env TARGET_PLATFORM=linux bun ${dir}/bun/src/codegen/create-hash-table.ts ${src} ${dir}/codegen/${out}`.cwd(dir + "/bun");
+}
+console.log("wrote codegen/{json,xml}_byte_class.{h,rs} + build_options.rs + jsc-tier codegen + C++ headers/luts");
