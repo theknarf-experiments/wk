@@ -1,25 +1,29 @@
-=== C++ bindings: ALL 520 non-v8 files compile for wasm32-wasip2 (0 fails) ===
+=== LINK PHASE: the component nearly links ===
 
-The entire hand-written + optional C++ bindings layer builds. StrongRef's
-32-bit GC-handle redesign (the last core blocker) is done; the 6 optional
-subsystems (inspector/profiler/wasm-streaming/sqlite) are gated to their
-ENABLE flags with linkable no-op stubs for Rust-called exports.
+All 520 non-v8 C++ bindings + 4 generated .cpp compile. A trial link of
+{all .o + libbun_rust.a + JSC/WTF/bmalloc/ICU + mimalloc + wasi-emulated}
+via wasm-ld resolves ~everything. THE VENDORED C LIBS ARE ALREADY IN
+libbun_rust.a (Rust build.rs compiled them with CC_wasm32_wasip2) — no
+separate uSockets/zlib/lolhtml/etc. cross-build needed. Link recipe:
+scratchpad/link.sh (clang++ driver + all libs + -z stack-size=8M).
 
-=== REMAINING to a linked `bun run` component ===
-1. GENERATED .cpp — compile GeneratedBindings.cpp, WebCoreJSBuiltins.cpp,
-   JSSink.cpp, ZigGeneratedClasses.cpp, ErrorCode.cpp, etc. (codegen/*.cpp
-   from bindgen.ts/bundle-functions.ts/generate-classes.ts) with the same
-   cxx-flags.rsp.
-2. v8 SHIM (42 files, src/jsc/bindings/v8/**) — real V8 headers reject
-   wasm32 ("Host architecture not supported"). Native addons can't load on
-   wasm, so EXCLUDE from the link and stub whatever napi/runtime symbols the
-   linker reports undefined.
-3. VENDORED C LIBS — cross-compile to .a for wasi: boringssl, zlib(-ng),
-   lshpack, lolhtml, cares, brotli, zstd, libarchive, picohttpparser,
-   bun-usockets, mimalloc, tinycc(?). Headers already fetched in native/.
-4. LINK: libbun_rust.a + all bindings .o + generated .o + vendored .a +
-   {JSC,WTF,bmalloc,ICU,c++,c++abi,setjmp,wasi-emulated-*} + -z stack-size=8M
-   via wasm-component-ld → the bun-run component.
-
-Recipe: plugins/bun/cxx-flags.rsp (clang response file, $BUN_NATIVE/$BUN_CODEGEN
-/$BUN_PLUGIN placeholders). All codegen headers reproduced via gen-codegen.ts.
+REMAINING before a clean link:
+1. -fno-rtti — bindings must match JSC's (WebKit builds -fno-rtti); without
+   it, 15 `typeinfo for JSC::WeakHandleOwner/SourceProvider` are undefined.
+   Added to cxx-flags.rsp; recompile all bindings.
+2. BoringSSL libcrypto — NOT in libbun_rust.a (only ~8 EVP wrappers). The
+   C++ crypto bindings (AsymmetricKeyValue.cpp, node/crypto) need EVP_PKEY_*.
+   Needs a real BoringSSL wasi cross-build (CMake, C-fallback for asm) — a
+   follow-up. For a FIRST linking component, STUB the missing EVP symbols
+   (crypto isn't on the console.log path).
+3. us_quic_stream_header(_count) — 2 QUIC (HTTP/3) symbols missing (68 other
+   us_quic_* ARE in libbun_rust.a); stub for now.
+4. 13 C++<->Rust ABI signature mismatches (wasm-ld WARNINGS, don't block the
+   link but are real i64/i32 bugs from JSVALUE32_64 — fix for a WORKING run):
+   Bun__{reportUnhandledError,ensureProcessIPCInitialized,setExitCode,
+   setVerboseFetchValue,closeChildIPC,emitHandledPromiseEvent,inspect_singleline},
+   JSC__JSValue__getClassInfoName, JSC__JSGlobalObject__createAggregateErrorWithArray,
+   NodeHTTP{Server__writeHead_http,Response__createForJS}, TextEncoder__encodeInto8,
+   ByteRangeMapping__getSourceID. Align each decl's JSValue args (i64) /
+   pointer args (i32) / return type between the .cpp and its Rust FFI.
+   (uws_res_get_remote_address_info already fixed: uint64_t->size_t.)

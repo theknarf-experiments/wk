@@ -56,3 +56,8 @@ $BUN_NATIVE/icu-wasi/install/include
 -I$BUN_NATIVE/libarchive/libarchive
 -idirafter
 $BUN_NATIVE/lshpack/compat/queue
+-DREPORTED_NODEJS_VERSION=\"26.3.0\"
+-DREPORTED_NODEJS_ABI_VERSION=137
+-DREPORTED_NODEJS_V8_VERSION=\"13.6.233.10\"
+-I$BUN_NATIVE/nodejs-headers/include
+-fno-rtti

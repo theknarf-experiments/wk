@@ -3039,6 +3039,19 @@ index 05b95066..c0153e3e 100644
  #include <JavaScriptCore/JSWeakValue.h>
  #include "JSFFIFunction.h"
  #include "ZigGlobalObject.h"
+diff --git a/src/jsc/bindings/node/JSNodeHTTPServerSocketPrototype.cpp b/src/jsc/bindings/node/JSNodeHTTPServerSocketPrototype.cpp
+index 59e3be68..4239d9cd 100644
+--- a/src/jsc/bindings/node/JSNodeHTTPServerSocketPrototype.cpp
++++ b/src/jsc/bindings/node/JSNodeHTTPServerSocketPrototype.cpp
+@@ -9,7 +9,7 @@
+ #include <cmath>
+ 
+ extern "C" EncodedJSValue us_socket_buffered_js_write(void* socket, bool is_ssl, bool ended, us_socket_stream_buffer_t* streamBuffer, JSC::JSGlobalObject* globalObject, JSC::EncodedJSValue data, JSC::EncodedJSValue encoding);
+-extern "C" uint64_t uws_res_get_remote_address_info(void* res, const char** dest, int* port, bool* is_ipv6);
++extern "C" size_t uws_res_get_remote_address_info(void* res, const char** dest, int* port, bool* is_ipv6);
+ extern "C" uint64_t uws_res_get_local_address_info(void* res, const char** dest, int* port, bool* is_ipv6);
+ extern "C" void us_socket_resume(us_socket_t*);
+ extern "C" void us_socket_pause(us_socket_t*);
 diff --git a/src/jsc/bindings/spawn.cpp b/src/jsc/bindings/spawn.cpp
 index daa0f782..dbcbf8ee 100644
 --- a/src/jsc/bindings/spawn.cpp
