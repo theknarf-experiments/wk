@@ -93,7 +93,12 @@ cd bun
 # supplies the JSC-tier symbols and the SIMD-kernel scalar fallbacks;
 # jsc_api.rs drives evaluation (--run) over JSC's C API. 8 MB stack: JSC's
 # reserved zone alone is bigger than wasm-ld's 64 KB default.
-RUSTFLAGS="-C link-arg=-L$N -C link-arg=-L$N/jsc-build/lib \
+# -A dead_code/unused-*: bun_runtime stubs many features on wasi (spawn,
+# sockets, netif, PTY, fs.watch), leaving helpers dead on this target only —
+# legitimate for a feature-stubbed cross-compile, and NOT source-level
+# allow()s (the repo hook rejects those).
+RUSTFLAGS="-A dead_code -A unused-variables -A unused-imports -A unused-mut -A unreachable-code \
+    -C link-arg=-L$N -C link-arg=-L$N/jsc-build/lib \
     -C link-arg=-lmimalloc -C link-arg=-lJavaScriptCore -C link-arg=-lWTF \
     -C link-arg=-lbmalloc -C link-arg=-licui18n -C link-arg=-licuuc \
     -C link-arg=-licudata -C link-arg=-lc++ -C link-arg=-lc++abi \
