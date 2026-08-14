@@ -1832,6 +1832,28 @@ index f854f1ae..c28bc15d 100644
  pub(crate) fn local_time_now() -> (i32, u32, u32, u32, u32, u32) {
      let secs = std::time::SystemTime::now()
          .duration_since(std::time::UNIX_EPOCH)
+diff --git a/src/jsc/CallFrame.rs b/src/jsc/CallFrame.rs
+index c654b79b..0effe0fd 100644
+--- a/src/jsc/CallFrame.rs
++++ b/src/jsc/CallFrame.rs
+@@ -163,8 +163,16 @@ impl CallFrame {
+     }
+ }
+ 
+-// These constants are from JSC::CallFrameSlot in JavaScriptCore/interpreter/CallFrame.h
++// These constants are from JSC::CallFrameSlot in JavaScriptCore/interpreter/CallFrame.h.
++// `codeBlock == CallerFrameAndPC::sizeInRegisters == 2*sizeof(void*)/sizeof(Register)`.
++// A Register is a JSValue (8 bytes) on every target, but on 32-bit (wasm32) the two
++// header pointers (callerFrame + returnPC) are 4 bytes each and pack into ONE Register,
++// so the header — and every slot after it — shifts down by one. Getting this wrong makes
++// `argument(0)` read `arg[1]`, so native functions see their arguments off by one.
++#[cfg(target_pointer_width = "64")]
+ const OFFSET_CODE_BLOCK: usize = 2;
++#[cfg(target_pointer_width = "32")]
++const OFFSET_CODE_BLOCK: usize = 1;
+ const OFFSET_CALLEE: usize = OFFSET_CODE_BLOCK + 1;
+ const OFFSET_ARGUMENT_COUNT_INCLUDING_THIS: usize = OFFSET_CALLEE + 1;
+ const OFFSET_THIS_ARGUMENT: usize = OFFSET_ARGUMENT_COUNT_INCLUDING_THIS + 1;
 diff --git a/src/jsc/DecodedJSValue.rs b/src/jsc/DecodedJSValue.rs
 index 477a2f42..45ec7d1e 100644
 --- a/src/jsc/DecodedJSValue.rs
