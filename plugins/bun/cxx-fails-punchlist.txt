@@ -1,29 +1,43 @@
-=== LINK PHASE: the component nearly links ===
+=== LINK CONVERGING: bun-run component is ~1 vendored-lib-build away ===
 
-All 520 non-v8 C++ bindings + 4 generated .cpp compile. A trial link of
-{all .o + libbun_rust.a + JSC/WTF/bmalloc/ICU + mimalloc + wasi-emulated}
-via wasm-ld resolves ~everything. THE VENDORED C LIBS ARE ALREADY IN
-libbun_rust.a (Rust build.rs compiled them with CC_wasm32_wasip2) — no
-separate uSockets/zlib/lolhtml/etc. cross-build needed. Link recipe:
-scratchpad/link.sh (clang++ driver + all libs + -z stack-size=8M).
+STATE: all 520 non-v8 bindings + 4 generated .cpp + the modules-data blob
+compile/assemble. A trial link (plugins/bun/link/link.sh) of everything +
+libbun_rust.a + JSC/WTF/bmalloc/ICU + mimalloc resolves ALL of JSC/WTF/ICU/
+Rust/bindings. Remaining undefined are ONLY vendored networking C libs that
+bun's Rust build.rs did NOT compile for wasi (they need epoll/an event
+backend) + a couple generated bits:
 
-REMAINING before a clean link:
-1. -fno-rtti — bindings must match JSC's (WebKit builds -fno-rtti); without
-   it, 15 `typeinfo for JSC::WeakHandleOwner/SourceProvider` are undefined.
-   Added to cxx-flags.rsp; recompile all bindings.
-2. BoringSSL libcrypto — NOT in libbun_rust.a (only ~8 EVP wrappers). The
-   C++ crypto bindings (AsymmetricKeyValue.cpp, node/crypto) need EVP_PKEY_*.
-   Needs a real BoringSSL wasi cross-build (CMake, C-fallback for asm) — a
-   follow-up. For a FIRST linking component, STUB the missing EVP symbols
-   (crypto isn't on the console.log path).
-3. us_quic_stream_header(_count) — 2 QUIC (HTTP/3) symbols missing (68 other
-   us_quic_* ARE in libbun_rust.a); stub for now.
-4. 13 C++<->Rust ABI signature mismatches (wasm-ld WARNINGS, don't block the
-   link but are real i64/i32 bugs from JSVALUE32_64 — fix for a WORKING run):
-   Bun__{reportUnhandledError,ensureProcessIPCInitialized,setExitCode,
-   setVerboseFetchValue,closeChildIPC,emitHandledPromiseEvent,inspect_singleline},
-   JSC__JSValue__getClassInfoName, JSC__JSGlobalObject__createAggregateErrorWithArray,
-   NodeHTTP{Server__writeHead_http,Response__createForJS}, TextEncoder__encodeInto8,
-   ByteRangeMapping__getSourceID. Align each decl's JSValue args (i64) /
-   pointer args (i32) / return type between the .cpp and its Rust FFI.
-   (uws_res_get_remote_address_info already fixed: uint64_t->size_t.)
+  ~16 us_*  — uSockets CORE (us_socket_write/ext/is_closed, us_loop_ext,
+              us_socket_group*, us_quic_stream_ext, ...). packages/bun-usockets.
+              Needs a wasi cross-build WITH an event-loop backend (wasi has no
+              epoll/kqueue — see the smoltcp/wk network fabric, or a poll shim).
+  EVP_*/ERR_* — BoringSSL libcrypto. Needs a wasi cross-build (CMake, the
+              C-only no-asm path). Headers already in native/boringssl.
+  lshpack_*  — HTTP/2 HPACK. native/lshpack; needs XXH_HEADER_NAME + queue
+              compat set up (lshpack.ts has the flags).
+  Zig::generateNativeModule_{NodeUtilTypes,NodeModule}, jsBufferTranscode —
+              a couple binding/codegen C++ symbols; likely a missing generated
+              .cpp (check bindgen/InternalModuleRegistry generators).
+
+LINK ARTIFACTS (all in plugins/bun/link/):
+  link.sh — the full link command (clang++ driver, $BUN/$BUN_NATIVE/$OBJDIR
+    placeholders); currently links to /tmp/bun-run.wasm.
+  wasi-stubs.c — first-link stubs for dl*/napi/partial-uSockets/lshpack/EVP
+    (REPLACE with real vendored-lib builds for a WORKING run).
+  InternalModuleRegistryConstants.wasm.S — wasm-compatible re-spelling of the
+    modules-data blob .S (wasm needs `.section X,"",@` + explicit `.size`);
+    assemble with -I codegen (it .incbin's the .bin).
+
+KEY LINK FACTS: bindings MUST be -fno-rtti (match WebKit; else JSC typeinfo
+undefined). The vendored libs uSockets/zlib/lolhtml/etc. that ARE in
+libbun_rust.a came free from the Rust build. wasm-component-ld rejects
+undefined imports (no --allow-undefined for a component) — every symbol must
+be defined. C++ recipe: plugins/bun/cxx-flags.rsp.
+
+REMAINING C++<->Rust ABI sig mismatches (wasm-ld warnings, don't block link
+but are real i64/i32 JSVALUE32_64 bugs to fix for a WORKING run): Bun__{
+reportUnhandledError,ensureProcessIPCInitialized,setExitCode,setVerboseFetchValue,
+closeChildIPC,emitHandledPromiseEvent,inspect_singleline}, JSC__JSValue__
+getClassInfoName, JSC__JSGlobalObject__createAggregateErrorWithArray,
+NodeHTTP{Server__writeHead_http,Response__createForJS}, TextEncoder__encodeInto8,
+ByteRangeMapping__getSourceID.
