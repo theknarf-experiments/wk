@@ -629,6 +629,24 @@ index 05b93a01..1406e214 100644
          smol_str.mark_heap();
          smol_str
      }
+diff --git a/src/bun_core/string/immutable/unicode.rs b/src/bun_core/string/immutable/unicode.rs
+index a15a452e..5930bf11 100644
+--- a/src/bun_core/string/immutable/unicode.rs
++++ b/src/bun_core/string/immutable/unicode.rs
+@@ -756,7 +756,12 @@ pub fn to_utf16_alloc_maybe_buffered<const FAIL_IF_INVALID: bool, const FLUSH: b
+         .try_reserve(remaining.len())
+         .map_err(|_| ToUTF16Error::OutOfMemory)?;
+ 
+-    let mut non_ascii: Option<u32> = Some(0);
++    // `remaining` begins at `start`, so the first non-ASCII byte within it is
++    // `first_non_ascii_idx - start` code units in. On the simdutf-partial path
++    // `start == first_non_ascii_idx` (giving 0); on the scalar path (simdutf
++    // disabled, e.g. wasm) `start == 0`, so the leading ASCII bytes must be
++    // copied verbatim rather than mis-decoded as a sequence start.
++    let mut non_ascii: Option<u32> = Some((first_non_ascii_idx - start) as u32);
+     while let Some(i) = non_ascii {
+         let i = i as usize;
+         {
 diff --git a/src/bun_core/string/mod.rs b/src/bun_core/string/mod.rs
 index 2e7a65b2..9e311f47 100644
 --- a/src/bun_core/string/mod.rs
