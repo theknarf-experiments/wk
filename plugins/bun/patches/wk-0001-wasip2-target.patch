@@ -2517,9 +2517,36 @@ index 15e2b228..6730c1eb 100644
          let uid = bun_sys::windows::user_unique_id();
  
 diff --git a/src/runtime/cli/filter_run.rs b/src/runtime/cli/filter_run.rs
-index e506cbd3..5608d038 100644
+index e506cbd3..cb48ee04 100644
 --- a/src/runtime/cli/filter_run.rs
 +++ b/src/runtime/cli/filter_run.rs
+@@ -3,7 +3,7 @@ use std::io::Write as _;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::time::Instant;
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ use crate::api::bun::process::SpawnResultExt as _;
+ use crate::api::bun::process::{self as spawn, Process, Rusage, SpawnOptions, Status};
+ use crate::cli::Command;
+@@ -134,7 +134,7 @@ impl<'a> ProcessHandle<'a> {
+             }??;
+             // `_guard` drops here (or on `?` above), restoring PATH.
+         };
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "wasi"))]
+         let (stdout_fd, stderr_fd) = (spawned.stdout, spawned.stderr);
+         // Windows: `spawn_process_windows` has already moved the heap pipe out of
+         // `options.stdout/stderr` (via `heap::take`) into `spawned.stdout/stderr`
+@@ -162,7 +162,7 @@ impl<'a> ProcessHandle<'a> {
+             }
+         }
+ 
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "wasi"))]
+         {
+             if let Some(stdout) = stdout_fd {
+                 let _ = sys::set_nonblocking(stdout);
 @@ -175,7 +175,7 @@ impl<'a> ProcessHandle<'a> {
                  handle.stderr.start(stderr, true)?;
              }
@@ -2529,10 +2556,96 @@ index e506cbd3..5608d038 100644
          {
              handle.remaining_fds += 1;
              handle.stdout.start_with_current_pipe()?;
+@@ -226,7 +226,7 @@ impl<'a> ProcessHandle<'a> {
+         unsafe {
+             for reader in [&raw mut (*this).stdout, &raw mut (*this).stderr] {
+                 // `is_done()` = EOF already counted out of `remaining_fds`.
+-                #[cfg(unix)]
++                #[cfg(any(unix, target_os = "wasi"))]
+                 if !(*reader).is_done() && (*reader).get_fd() != sys::Fd::INVALID {
+                     BufferedReader::read(reader);
+                 }
+@@ -726,7 +726,7 @@ impl AbortHandler {
+                 libc::sigaction(libc::SIGINT, &raw const act, core::ptr::null_mut());
+             }
+         }
+-        #[cfg(not(unix))]
++        #[cfg(windows)]
+         {
+             let res = bun_sys::c::SetConsoleCtrlHandler(
+                 Some(Self::windows_ctrl_handler),
+@@ -967,7 +967,7 @@ pub(crate) fn run_scripts_with_filter(
+         &mut *event_loop
+     }));
+     let shell_bin: &'static ZStr = {
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "wasi"))]
+         {
+             RunCommand::find_shell(
+                 // SAFETY: env_ptr is the live process-lifetime DotEnv loader.
+@@ -976,7 +976,7 @@ pub(crate) fn run_scripts_with_filter(
+             )
+             .ok_or(crate::Error::MissingShell)?
+         }
+-        #[cfg(not(unix))]
++        #[cfg(windows)]
+         {
+             bun_core::self_exe_path().map_err(|_| crate::Error::MissingShell)?
+         }
+@@ -1031,15 +1031,15 @@ pub(crate) fn run_scripts_with_filter(
+             process: None,
+             options: SpawnOptions {
+                 stdin: spawn::Stdio::Ignore,
+-                #[cfg(unix)]
++                #[cfg(any(unix, target_os = "wasi"))]
+                 stdout: spawn::Stdio::Buffer,
+-                #[cfg(not(unix))]
++                #[cfg(windows)]
+                 stdout: spawn::Stdio::Buffer(bun_core::heap::into_raw(Box::new(
+                     bun_core::ffi::zeroed::<bun_sys::windows::libuv::Pipe>(),
+                 ))),
+-                #[cfg(unix)]
++                #[cfg(any(unix, target_os = "wasi"))]
+                 stderr: spawn::Stdio::Buffer,
+-                #[cfg(not(unix))]
++                #[cfg(windows)]
+                 stderr: spawn::Stdio::Buffer(bun_core::heap::into_raw(Box::new(
+                     bun_core::ffi::zeroed::<bun_sys::windows::libuv::Pipe>(),
+                 ))),
 diff --git a/src/runtime/cli/multi_run.rs b/src/runtime/cli/multi_run.rs
-index 72c9fd15..4c3d644a 100644
+index 72c9fd15..6b2c96b6 100644
 --- a/src/runtime/cli/multi_run.rs
 +++ b/src/runtime/cli/multi_run.rs
+@@ -19,7 +19,7 @@ use crate::run_command::RunCommand;
+ 
+ // `bun.spawn` (Process/Status/SpawnOptions/Rusage/spawnProcess) —
+ // lives under crate::api::bun::process.
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ use crate::api::bun::process::SpawnResultExt as _;
+ use crate::api::bun::process::{
+     self as spawn, Process, Rusage, SpawnOptions, SpawnProcessResult, Status,
+@@ -188,9 +188,9 @@ impl<'a> ProcessHandle<'a> {
+         // POSIX-only: pipe FDs are read before `to_process` consumes `spawned`.
+         // On Windows the readers are wired via `Source::Pipe` taken from
+         // `spawned.stdout/stderr` below, and `WindowsStdioResult` is not `Copy`.
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "wasi"))]
+         let stdout_fd = spawned.stdout;
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "wasi"))]
+         let stderr_fd = spawned.stderr;
+         let process = spawned.to_process(EventLoopHandle::init_mini(state.event_loop));
+ 
+@@ -225,7 +225,7 @@ impl<'a> ProcessHandle<'a> {
+             }
+         }
+ 
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "wasi"))]
+         {
+             if let Some(stdout_fd) = stdout_fd {
+                 let _ = bun_sys::set_nonblocking(stdout_fd);
 @@ -242,7 +242,7 @@ impl<'a> ProcessHandle<'a> {
                      .map_err(Error::from)?;
              }
@@ -2542,6 +2655,35 @@ index 72c9fd15..4c3d644a 100644
          {
              self.stdout_reader
                  .reader
+@@ -649,7 +649,7 @@ impl AbortHandler {
+                 bun_sys::posix::sigaction(libc::SIGINT, &raw const action, core::ptr::null_mut());
+             }
+         }
+-        #[cfg(not(unix))]
++        #[cfg(windows)]
+         {
+             let res = bun_sys::windows::SetConsoleCtrlHandler(
+                 Some(Self::windows_ctrl_handler),
+@@ -1227,15 +1227,15 @@ pub(crate) fn run(ctx: &mut Command::ContextData) -> Result<core::convert::Infal
+             next_dependents: Vec::new(),
+             options: SpawnOptions {
+                 stdin: spawn::Stdio::Ignore,
+-                #[cfg(unix)]
++                #[cfg(any(unix, target_os = "wasi"))]
+                 stdout: spawn::Stdio::Buffer,
+-                #[cfg(not(unix))]
++                #[cfg(windows)]
+                 stdout: spawn::Stdio::Buffer(bun_core::heap::into_raw(Box::new(
+                     bun_core::ffi::zeroed::<bun_sys::windows::libuv::Pipe>(),
+                 ))),
+-                #[cfg(unix)]
++                #[cfg(any(unix, target_os = "wasi"))]
+                 stderr: spawn::Stdio::Buffer,
+-                #[cfg(not(unix))]
++                #[cfg(windows)]
+                 stderr: spawn::Stdio::Buffer(bun_core::heap::into_raw(Box::new(
+                     bun_core::ffi::zeroed::<bun_sys::windows::libuv::Pipe>(),
+                 ))),
 diff --git a/src/runtime/node/StatFS.rs b/src/runtime/node/StatFS.rs
 index daf0254f..a248a493 100644
 --- a/src/runtime/node/StatFS.rs
