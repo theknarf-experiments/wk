@@ -1,39 +1,27 @@
-// First-link stubs for symbols not yet cross-compiled for wasi:
-// BoringSSL EVP (needs a libcrypto wasi build) + 2 uSockets QUIC functions
-// (behind an HTTP/3 flag). These abort if actually invoked.
+// First-link stubs for vendored networking/FFI symbols not yet cross-compiled
+// for wasi (uSockets core needs an event backend; lshpack needs its build).
+// BoringSSL crypto is now REAL (libbssl_crypto.a) — no crypto stubs here.
 #include <stddef.h>
 #include <stdint.h>
-void abort(void);
-// BoringSSL EVP_PKEY
-typedef struct evp_pkey_st EVP_PKEY;
-typedef struct engine_st ENGINE;
-void EVP_PKEY_free(EVP_PKEY* k) { (void)k; }
-EVP_PKEY* EVP_PKEY_new_raw_private_key(int type, ENGINE* e, const uint8_t* key, size_t len) {
-    (void)type; (void)e; (void)key; (void)len; return NULL;
-}
-EVP_PKEY* EVP_PKEY_new_raw_public_key(int type, ENGINE* e, const uint8_t* key, size_t len) {
-    (void)type; (void)e; (void)key; (void)len; return NULL;
-}
-// uSockets QUIC (HTTP/3)
-typedef struct us_quic_stream_t us_quic_stream_t;
-typedef struct us_quic_header_t us_quic_header_t;
-unsigned int us_quic_stream_header_count(us_quic_stream_t* s) { (void)s; return 0; }
-const us_quic_header_t* us_quic_stream_header(us_quic_stream_t* s, unsigned int i) { (void)s; (void)i; return NULL; }
-
-// --- More first-link stubs: vendored networking/FFI not compiled for wasi ---
-// dynamic linking (no dlopen on wasm; FFI/napi disabled)
+// dynamic linking (no dlopen on wasm)
 void* dlopen(const char* f, int m) { (void)f; (void)m; return NULL; }
 void* dlsym(void* h, const char* s) { (void)h; (void)s; return NULL; }
 int dlclose(void* h) { (void)h; return 0; }
 char* dlerror(void) { return NULL; }
 void node_module_register(void* m) { (void)m; }
-// bun os helper (usually a C++/codegen fn; report 0 free memory)
 uint64_t Bun__Os__getFreeMemory(void) { return 0; }
 // uSockets core (not compiled for wasi — needs an event backend)
 void* us_socket_ext(void* s) { (void)s; return NULL; }
 int us_socket_is_closed(const void* s) { (void)s; return 1; }
 void* us_quic_stream_ext(void* s) { (void)s; return NULL; }
-// lshpack (HTTP/2 HPACK) — needs its own wasi build; stub the raw C API
+void* us_loop_ext(void* loop) { (void)loop; return NULL; }
+int us_socket_write(void* s, const char* data, int length) { (void)s; (void)data; return length; }
+void* us_socket_group(void* s) { (void)s; return NULL; }
+void* us_socket_group_loop(void* group) { (void)group; return NULL; }
+// uSockets QUIC (HTTP/3)
+void* us_quic_stream_header_count(void* s) { (void)s; return NULL; }
+void* us_quic_stream_header(void* s, unsigned int i) { (void)s; (void)i; return NULL; }
+// lshpack (HTTP/2 HPACK) — needs its own build
 struct lshpack_enc; struct lshpack_dec;
 int lshpack_enc_init(struct lshpack_enc* e) { (void)e; return 0; }
 void lshpack_enc_cleanup(struct lshpack_enc* e) { (void)e; }
