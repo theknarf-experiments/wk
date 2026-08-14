@@ -2,7 +2,7 @@
 S="$WORK"; N="$BUN_NATIVE"; WASI_SDK="$WASI_SDK"
 "$WASI_SDK/bin/clang++" --target=wasm32-wasip2 -fno-exceptions -O2 \
   -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false \
-  $S/bunobj/*.o $OBJ/gen_*.o $OBJ/mod_*.o $OBJ/wasi_stubs.o $OBJ/imrc.o $OBJ/hdr_*.o $VLIB/libzstd.a $VLIB/libbrotli.a $VLIB/libbssl_crypto.a $VLIB/libusockets.a $OBJ/libuwsockets.o \
+  $S/bunobj/*.o $OBJ/gen_*.o $OBJ/mod_*.o $OBJ/wasi_stubs.o $OBJ/imrc.o $OBJ/hdr_*.o $VLIB/libzstd.a $VLIB/libbrotli.a $VLIB/libbssl_crypto.a $VLIB/libusockets.a $OBJ/libuwsockets.o $OBJ/us_root_certs.o $VLIB/libcares.a $VLIB/libarchive.a $VLIB/libz.a \
   "/Users/knarf/projects/theknarf-experiments/wk/plugins/bun/bun/target/wasm32-wasip2/release-dev/libbun_rust.a" \
   -L "$N/jsc-build/lib" -lJavaScriptCore -lWTF -lbmalloc \
   -L "$N/icu-wasi/install/lib" -licui18n -licuuc -licudata \
