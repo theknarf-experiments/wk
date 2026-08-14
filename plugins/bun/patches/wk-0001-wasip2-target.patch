@@ -2235,7 +2235,7 @@ index 4d5b858f..c8066f70 100644
  /// RAII guard for a [`TopExceptionScope`] whose backing storage lives in the caller's
  /// stack frame. The guard itself is freely movable (it only holds a borrow); the storage
 diff --git a/src/jsc/bindings/BunCPUProfiler.cpp b/src/jsc/bindings/BunCPUProfiler.cpp
-index 978ab566..1f9eca3b 100644
+index 978ab566..b9a341f0 100644
 --- a/src/jsc/bindings/BunCPUProfiler.cpp
 +++ b/src/jsc/bindings/BunCPUProfiler.cpp
 @@ -1,4 +1,8 @@
@@ -2247,7 +2247,7 @@ index 978ab566..1f9eca3b 100644
  #include "BunCPUProfiler.h"
  #include "ZigGlobalObject.h"
  #include "helpers.h"
-@@ -945,3 +949,13 @@ extern "C" void Bun__stopCPUProfiler(JSC::VM* vm, BunString* outJSON, BunString*
+@@ -945,3 +949,20 @@ extern "C" void Bun__stopCPUProfiler(JSC::VM* vm, BunString* outJSON, BunString*
      if (outText)
          *outText = Bun::toStringRef(textResult);
  }
@@ -2260,9 +2260,16 @@ index 978ab566..1f9eca3b 100644
 +    if (outJSON) outJSON->tag = BunStringTag::Empty;
 +    if (outText) outText->tag = BunStringTag::Empty;
 +}
++#include <wtf/text/WTFString.h>
++namespace Bun {
++void setSamplingInterval(int) {}
++bool isCPUProfilerRunning() { return false; }
++void startCPUProfiler(JSC::VM&) {}
++void stopCPUProfiler(JSC::VM&, WTF::String*, WTF::String*) {}
++}
 +#endif // ENABLE(SAMPLING_PROFILER)
 diff --git a/src/jsc/bindings/BunDebugger.cpp b/src/jsc/bindings/BunDebugger.cpp
-index 4dc13cd2..f0529520 100644
+index 4dc13cd2..547fdba8 100644
 --- a/src/jsc/bindings/BunDebugger.cpp
 +++ b/src/jsc/bindings/BunDebugger.cpp
 @@ -1,4 +1,6 @@
@@ -2272,7 +2279,7 @@ index 4dc13cd2..f0529520 100644
  
  #include "BunDebugger.h"
  #include "ZigGlobalObject.h"
-@@ -1095,3 +1097,23 @@ extern "C" void Bun__InspectorConnection__disconnectAllOnExit(Zig::GlobalObject*
+@@ -1095,3 +1097,30 @@ extern "C" void Bun__InspectorConnection__disconnectAllOnExit(Zig::GlobalObject*
      globalObject->m_inspectorController = makeUnique<Inspector::JSGlobalObjectInspectorController>(*globalObject, Bun::BunInjectedScriptHost::create());
  }
  }
@@ -2295,6 +2302,13 @@ index 4dc13cd2..f0529520 100644
 +extern "C" void Debugger__didDispatchAsyncCall(JSC::JSGlobalObject*, AsyncCallTypeUint8, uint64_t) {}
 +extern "C" void Debugger__willDispatchAsyncCall(JSC::JSGlobalObject*, AsyncCallTypeUint8, uint64_t) {}
 +extern "C" void Bun__InspectorConnection__disconnectAllOnExit(Zig::GlobalObject*) {}
++#include "BunDebugger.h"
++namespace Bun {
++JSC_DEFINE_HOST_FUNCTION(jsFunction_openNodeInspector, (JSC::JSGlobalObject* g, JSC::CallFrame*)) { return JSC::JSValue::encode(JSC::jsUndefined()); (void)g; }
++JSC_DEFINE_HOST_FUNCTION(jsFunction_waitForNodeInspectorConnection, (JSC::JSGlobalObject* g, JSC::CallFrame*)) { return JSC::JSValue::encode(JSC::jsUndefined()); (void)g; }
++JSC_DEFINE_HOST_FUNCTION(jsFunction_postNodeInspectorControl, (JSC::JSGlobalObject* g, JSC::CallFrame*)) { return JSC::JSValue::encode(JSC::jsUndefined()); (void)g; }
++JSC_DEFINE_HOST_FUNCTION(jsFunction_closeNodeInspector, (JSC::JSGlobalObject* g, JSC::CallFrame*)) { return JSC::JSValue::encode(JSC::jsUndefined()); (void)g; }
++}
 +#endif // ENABLE(REMOTE_INSPECTOR)
 diff --git a/src/jsc/bindings/BunProcess.cpp b/src/jsc/bindings/BunProcess.cpp
 index 10210178..376f4b32 100644
@@ -3416,6 +3430,28 @@ index 4597cdd1..050af5e7 100644
  }
  
  JSC_DECLARE_HOST_FUNCTION(functionGenerateHeapSnapshotForDebugging);
+diff --git a/src/jsc/modules/ObjectModule.cpp b/src/jsc/modules/ObjectModule.cpp
+index b24970a2..40381271 100644
+--- a/src/jsc/modules/ObjectModule.cpp
++++ b/src/jsc/modules/ObjectModule.cpp
+@@ -52,7 +52,7 @@ generateObjectModuleSourceCodeForJSON(JSC::JSGlobalObject* globalObject,
+         PropertyNameArrayBuilder properties(vm, PropertyNameMode::Strings,
+             PrivateSymbolMode::Exclude);
+         object->getPropertyNames(globalObject, properties, DontEnumPropertiesMode::Exclude);
+-        RETURN_IF_EXCEPTION(scope, {});
++        RETURN_IF_EXCEPTION(scope, void());
+         gcUnprotectNullTolerant(object);
+ 
+         exportNames.append(vm.propertyNames->defaultKeyword);
+@@ -66,7 +66,7 @@ generateObjectModuleSourceCodeForJSON(JSC::JSGlobalObject* globalObject,
+             exportNames.append(entry);
+ 
+             JSValue value = object->get(globalObject, entry);
+-            RETURN_IF_EXCEPTION(scope, {});
++            RETURN_IF_EXCEPTION(scope, void());
+             exportValues.append(value);
+         }
+     };
 diff --git a/src/libarchive/lib.rs b/src/libarchive/lib.rs
 index 3965e9b4..6c30a3d8 100644
 --- a/src/libarchive/lib.rs

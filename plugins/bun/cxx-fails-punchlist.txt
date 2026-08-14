@@ -1,40 +1,26 @@
-=== FRONTIER (accurate): 100% of bun C++/Rust/JSC links; ONLY vendored C libs remain ===
+=== VENDORED-C LINK PHASE: 703 -> ~560 undefined; BoringSSL DONE ===
 
-Every bun C++ binding + generated .cpp + the modules blob compiles, and the
-trial link (plugins/bun/link/link.sh) resolves ALL of JSC/WTF/ICU/Rust/
-bindings. Correction to earlier notes: LLD's default 20-error cap HID the
-true scale. With -Wl,--error-limit=0 the real count is 1287 UNIQUE undefined
-symbols, and they are ALL from vendored C libraries that bun's Rust build.rs
-did NOT cross-compile for wasi (they were cfg'd out / use non-wasm build
-systems). Full list: plugins/bun/link/undefined-symbols.txt.
+Progress this phase (link undefined 1287 -> 703, dropping as libs land):
+  DONE: BoringSSL (530 syms, the hardest) — crypto+bcm+ssl/pki/decrepit
+        cross-built -DOPENSSL_NO_ASM; zstd, brotli.
+  uSockets (packages/bun-usockets, ~333 syms) IN PROGRESS: compiles per-file
+    with -DLIBUS_USE_EPOLL -I mimalloc/include -include wasi-compat/sys/
+    socket_compat.h (adds CMSG_*/SO_*/mmsghdr/recvmsg/socketpair wasi gates
+    out). loop.c(24)/socket.c(61)/context.c(33)/udp.c(24) = 142 us_* symbols
+    COMPILE. BLOCKER: bsd.c uses AF_UNIX sun_path — wasi's struct sockaddr_un
+    is a member-less stub. Needs source gating of the unix-domain-socket path
+    in bsd.c (#if !defined(__wasi__)), OR a wasi backend. Plus the epoll
+    eventing backend (epoll_kqueue.c) needs the wasi-compat/sys/epoll.h shim
+    (inert — real networking needs [[wk-userspace-network]] smoltcp).
 
-VENDORED C LIBS TO CROSS-COMPILE FOR wasi (unique-symbol counts):
-  530  BoringSSL (crypto)  — the big one. CMake; use the C-only no-asm path
-       (OPENSSL_NO_ASM). Headers in native/boringssl. Referenced by node:crypto/
-       tls/X509. This is most of the work.
-  333  uSockets            — packages/bun-usockets. HARDEST: needs a wasi
-       event-loop backend (no epoll/kqueue). Tie to [[wk-userspace-network]]
-       smoltcp, or a poll(2)/stub backend. All the us_*/uws_* symbols.
-   37  libarchive          — native/libarchive. Standard C cross-build.
-   29  c-ares (DNS)        — native/cares. Standard C.
-   25  zstd                — native/zstd (VERIFIED cross-compiles w/
-       -DZSTD_DISABLE_ASM). Standard C.
-   16  brotli              — native/brotli/c. Standard C.
-   15  simdutf             — the SIMD unicode lib (bun's simdutf_sys didn't
-       compile its C++ for wasi). Has a scalar fallback path.
-   14  zlib(-ng)           — native/zlib. Standard C.
-    3  Bun::Secrets::*     — OS keychain; no wasi equiv. STUB (return error).
-    +  WebP (image), a few singles.
+STILL TO BUILD (each a focused wasi cross-build):
+  libarchive 37, c-ares 29 — have source in native/; need their cmake-
+    generated config headers (ares_config.h / archive config.h).
+  zlib(-ng) 15, simdutf 15, WebP 15 — NOT fetched into native/ yet.
+  Bun::Secrets 3 — OS keychain; STUB (no wasi equiv).
+  v8::shim::GlobalInternals::s_info +misc singles — v8 shim (excluded); stub.
 
-APPROACH: each standard-C lib (zstd/zlib/brotli/cares/libarchive/simdutf)
-cross-compiles cleanly with wasi-sdk clang -O2 (+ its -DNO_ASM flags) — build
-all its .c into a .a, add to link.sh. BoringSSL is the large mechanical one.
-uSockets needs the event-backend design. THEN the component links + should
-run console.log (crypto/net stubbed inert until their libs land).
-
-Also 13 C++<->Rust ABI sig-mismatch WARNINGS remain (i64/i32 JSVALUE32_64;
-don't block link but crash at runtime — fix for a WORKING run; listed above
-in git history / earlier punchlist).
-
-DONE & REUSABLE: cxx-flags.rsp (-fno-rtti!), link.sh, wasi-stubs.c,
-InternalModuleRegistryConstants.wasm.S, gen-codegen.ts (all codegen).
+RECIPES (plugins/bun/link/): link.sh, build_boringssl.sh, build_bssl_ssl.sh,
+build-vendored.sh (zstd/brotli), wasi-stubs.c, undefined-symbols.txt.
+KEY: -fno-rtti on ALL C++; BoringSSL needs -I crypto/fipsmodule for bcm's
+.cc.inc; shell while-read skips a trailing-newline-less last line.
