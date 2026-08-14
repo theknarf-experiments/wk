@@ -1,0 +1,99 @@
+=== non-v8 fails punch-list (66):
+  11 error: no template named 'vector' in namespace 'std'; did
+   7 error: "Unsupported platform"
+   6 fatal error: 'termios.h'
+   6 error: unknown type name 'JSCompressionStream'; did you m
+   4 error: no member named 'inspectorController' in 'JSC::JSG
+   2 error: void lambda should not return a value
+   2 error: use of undeclared identifier 'JIT'
+   2 error: static assertion failed due to requirement 'sizeof
+   2 error: no type named 'SamplingProfiler' in namespace 'JSC
+   2 error: no member named 'StreamingCompiler' in namespace '
+   2 error: member access into incomplete type 'WebCore::Event
+   2 error: member access into incomplete type 'const CryptoAl
+   1 fatal error: 'zstd.h'
+   1 fatal error: 'spawn.h'
+   1 error: variable has incomplete type 'struct sigaction'
+   1 error: use of undeclared identifier 'processBindingNative
+   1 error: use of undeclared identifier 'processBindingHTTPPa
+   1 error: use of undeclared identifier 'processBindingFsTabl
+   1 error: use of undeclared identifier 'processBindingBuffer
+   1 error: use of undeclared identifier 'NeedsDestruction'; d
+   1 error: use of undeclared identifier 'JSEventTableValues';
+   1 error: static assertion failed due to requirement 'std::i
+   1 error: no type named 'ClassInfo' in namespace 'Bun::JSC';
+   1 error: no member named 'TopExceptionScope' in namespace '
+   1 error: no member named 'createJSWebAssemblyCompileError' 
+   1 error: no matching function for call to 'bit_cast'
+   1 error: member access into incomplete type 'JSC::JSPromise
+   1 error: constexpr variable 'kStrongRefSlotMask' must be in
+   1 error: base class has incomplete type
+   1 error: "Unknown architecture"
+
+=== files:
+src/jsc/bindings/bindings.cpp | error: "Unsupported platform"
+src/jsc/bindings/BunCPUProfiler.cpp | error: no type named 'SamplingProfiler' in namespace 'JSC
+src/jsc/bindings/BunDebugger.cpp | error: base class has incomplete type
+src/jsc/bindings/BunObject.cpp | error: no type named 'ClassInfo' in namespace 'Bun::JSC';
+src/jsc/bindings/BunProcess.cpp | error: no template named 'vector' in namespace 'std'; did
+src/jsc/bindings/c-bindings.cpp | fatal error: 'termios.h'
+src/jsc/bindings/ConsoleObject.cpp | error: no member named 'inspectorController' in 'JSC::JSG
+src/jsc/bindings/CookieMap.cpp | error: "Unsupported platform"
+src/jsc/bindings/CPUFeatures.cpp | error: "Unknown architecture"
+src/jsc/bindings/InspectorBunFrontendDevServerAgent.cpp | error: no member named 'inspectorController' in 'JSC::JSG
+src/jsc/bindings/InspectorHTTPServerAgent.cpp | error: no member named 'inspectorController' in 'JSC::JSG
+src/jsc/bindings/InspectorLifecycleAgent.cpp | error: no member named 'inspectorController' in 'JSC::JSG
+src/jsc/bindings/InternalModuleRegistry.cpp | error: no type named 'SamplingProfiler' in namespace 'JSC
+src/jsc/bindings/JSBuffer.cpp | error: static assertion failed due to requirement 'std::i
+src/jsc/bindings/JSBundlerPlugin.cpp | error: no template named 'vector' in namespace 'std'; did
+src/jsc/bindings/JSBunRequest.cpp | error: "Unsupported platform"
+src/jsc/bindings/JSCommonJSModule.cpp | error: void lambda should not return a value
+src/jsc/bindings/JSFFIFunction.cpp | error: no matching function for call to 'bit_cast'
+src/jsc/bindings/JSMockFunction.cpp | error: void lambda should not return a value
+src/jsc/bindings/JSONRowsToJS.cpp | error: static assertion failed due to requirement 'sizeof
+src/jsc/bindings/napi_external.cpp | error: no template named 'vector' in namespace 'std'; did
+src/jsc/bindings/napi_finalizer.cpp | error: no template named 'vector' in namespace 'std'; did
+src/jsc/bindings/napi_handle_scope.cpp | error: no template named 'vector' in namespace 'std'; did
+src/jsc/bindings/napi_type_tag.cpp | error: no template named 'vector' in namespace 'std'; did
+src/jsc/bindings/napi.cpp | error: no template named 'vector' in namespace 'std'; did
+src/jsc/bindings/NapiClass.cpp | error: no template named 'vector' in namespace 'std'; did
+src/jsc/bindings/NapiRef.cpp | error: no template named 'vector' in namespace 'std'; did
+src/jsc/bindings/NapiWeakValue.cpp | error: no template named 'vector' in namespace 'std'; did
+src/jsc/bindings/node/http/JSConnectionsListPrototype.cpp | fatal error: 'termios.h'
+src/jsc/bindings/node/http/NodeHTTPParser.cpp | fatal error: 'termios.h'
+src/jsc/bindings/node/JSNodeHTTPServerSocket.cpp | error: "Unsupported platform"
+src/jsc/bindings/NodeHTTP.cpp | error: "Unsupported platform"
+src/jsc/bindings/NodeVM.cpp | error: no member named 'createJSWebAssemblyCompileError' 
+src/jsc/bindings/NodeVMScript.cpp | error: use of undeclared identifier 'JIT'
+src/jsc/bindings/NodeVMSourceTextModule.cpp | error: use of undeclared identifier 'JIT'
+src/jsc/bindings/ProcessBindingBuffer.cpp | error: use of undeclared identifier 'processBindingBuffer
+src/jsc/bindings/ProcessBindingConstants.cpp | fatal error: 'zstd.h'
+src/jsc/bindings/ProcessBindingFs.cpp | error: use of undeclared identifier 'processBindingFsTabl
+src/jsc/bindings/ProcessBindingHTTPParser.cpp | error: use of undeclared identifier 'processBindingHTTPPa
+src/jsc/bindings/ProcessBindingNatives.cpp | error: use of undeclared identifier 'processBindingNative
+src/jsc/bindings/ProcessBindingTTYWrap.cpp | fatal error: 'termios.h'
+src/jsc/bindings/ProcessBindingUV.cpp | fatal error: 'termios.h'
+src/jsc/bindings/ServerRouteList.cpp | error: "Unsupported platform"
+src/jsc/bindings/spawn.cpp | fatal error: 'spawn.h'
+src/jsc/bindings/sqlite/NodeSqlite.cpp | error: use of undeclared identifier 'NeedsDestruction'; d
+src/jsc/bindings/StringBuilderBinding.cpp | error: static assertion failed due to requirement 'sizeof
+src/jsc/bindings/StrongRef.cpp | error: constexpr variable 'kStrongRefSlotMask' must be in
+src/jsc/bindings/TopExceptionScopeBinding.cpp | error: no member named 'TopExceptionScope' in namespace '
+src/jsc/bindings/uws_bindings.cpp | error: "Unsupported platform"
+src/jsc/bindings/vm/SigintWatcher.cpp | error: variable has incomplete type 'struct sigaction'
+src/jsc/bindings/webcore/EventContext.cpp | error: member access into incomplete type 'WebCore::Event
+src/jsc/bindings/webcore/EventPath.cpp | error: member access into incomplete type 'WebCore::Event
+src/jsc/bindings/webcore/JSEvent.cpp | error: use of undeclared identifier 'JSEventTableValues';
+src/jsc/bindings/webcore/JSWasmStreamingCompiler.cpp | error: no member named 'StreamingCompiler' in namespace '
+src/jsc/bindings/webcore/SerializedScriptValue.cpp | error: no template named 'vector' in namespace 'std'; did
+src/jsc/bindings/webcore/streams/CrossRealmTransform.cpp | error: unknown type name 'JSCompressionStream'; did you m
+src/jsc/bindings/webcore/streams/JSStreamsRuntime.cpp | error: unknown type name 'JSCompressionStream'; did you m
+src/jsc/bindings/webcore/streams/TransformStreamOperations.cpp | error: unknown type name 'JSCompressionStream'; did you m
+src/jsc/bindings/webcore/streams/WebStreamsExports.cpp | error: unknown type name 'JSCompressionStream'; did you m
+src/jsc/bindings/webcore/streams/WebStreamsMisc.cpp | error: unknown type name 'JSCompressionStream'; did you m
+src/jsc/bindings/webcore/streams/WritableStreamOperations.cpp | error: unknown type name 'JSCompressionStream'; did you m
+src/jsc/bindings/webcore/WorkerMessagingProxy.cpp | error: member access into incomplete type 'JSC::JSPromise
+src/jsc/bindings/webcrypto/CryptoAlgorithmMLDSA.cpp | error: member access into incomplete type 'const CryptoAl
+src/jsc/bindings/webcrypto/CryptoAlgorithmMLKEM.cpp | error: member access into incomplete type 'const CryptoAl
+src/jsc/bindings/wtf-bindings.cpp | fatal error: 'termios.h'
+src/jsc/bindings/ZigGlobalObject.cpp | error: no member named 'StreamingCompiler' in namespace '
