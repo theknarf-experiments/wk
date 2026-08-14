@@ -2173,6 +2173,50 @@ index 44ca97cd..994d0309 100644
  
      #[inline(always)]
      fn slot_ptr(this: NonNull<Impl>) -> *mut crate::DecodedJSValue {
+diff --git a/src/jsc/TopExceptionScope.rs b/src/jsc/TopExceptionScope.rs
+index 4d5b858f..c8066f70 100644
+--- a/src/jsc/TopExceptionScope.rs
++++ b/src/jsc/TopExceptionScope.rs
+@@ -7,9 +7,15 @@ use crate::{Exception, JSGlobalObject, JSValue, JsError, JsResult};
+ // the bun_jsc crate gates on the same predicate this file uses for `SIZE`.
+ #[cfg(any(debug_assertions, bun_asan))]
+ const SIZE: usize = 56;
+-#[cfg(not(any(debug_assertions, bun_asan)))]
++#[cfg(all(not(any(debug_assertions, bun_asan)), target_pointer_width = "64"))]
+ const SIZE: usize = 8;
++#[cfg(all(not(any(debug_assertions, bun_asan)), target_pointer_width = "32"))]
++const SIZE: usize = 4;
++// Non-verification TopExceptionScope is pointer-sized/aligned.
++#[cfg(any(debug_assertions, bun_asan, target_pointer_width = "64"))]
+ const ALIGNMENT: usize = 8;
++#[cfg(all(not(any(debug_assertions, bun_asan)), target_pointer_width = "32"))]
++const ALIGNMENT: usize = 4;
+ 
+ /// A NUL-terminated source location (function name, file, line, column).
+ /// Rust's `core::panic::Location` lacks `fn_name`
+@@ -134,6 +140,7 @@ macro_rules! src {
+ /// Ok(value)
+ /// // `scope` drops here → C++ dtor runs.
+ /// ```
++#[cfg(any(debug_assertions, bun_asan, target_pointer_width = "64"))]
+ #[repr(C, align(8))]
+ pub struct TopExceptionScope {
+     bytes: [u8; SIZE],
+@@ -141,6 +148,14 @@ pub struct TopExceptionScope {
+     #[cfg(any(debug_assertions, bun_asan))]
+     location: *const u8,
+ }
++#[cfg(all(not(any(debug_assertions, bun_asan)), target_pointer_width = "32"))]
++#[repr(C, align(4))]
++pub struct TopExceptionScope {
++    bytes: [u8; SIZE],
++    /// Pointer to `bytes`, set by `init()`, used to assert that the location did not change
++    #[cfg(any(debug_assertions, bun_asan))]
++    location: *const u8,
++}
+ 
+ /// RAII guard for a [`TopExceptionScope`] whose backing storage lives in the caller's
+ /// stack frame. The guard itself is freely movable (it only holds a borrow); the storage
 diff --git a/src/jsc/bindings/BunProcess.cpp b/src/jsc/bindings/BunProcess.cpp
 index 10210178..376f4b32 100644
 --- a/src/jsc/bindings/BunProcess.cpp
@@ -2493,6 +2537,27 @@ index 4e397570..007b0136 100644
  
  extern "C" void StringBuilder__init(WTF::StringBuilder* ptr)
  {
+diff --git a/src/jsc/bindings/TopExceptionScopeBinding.cpp b/src/jsc/bindings/TopExceptionScopeBinding.cpp
+index eb0f9e43..099245e8 100644
+--- a/src/jsc/bindings/TopExceptionScopeBinding.cpp
++++ b/src/jsc/bindings/TopExceptionScopeBinding.cpp
+@@ -1,4 +1,5 @@
+ #include <root.h>
++#include <JavaScriptCore/TopExceptionScope.h>
+ 
+ using JSC::TopExceptionScope;
+ 
+@@ -6,8 +7,8 @@ using JSC::TopExceptionScope;
+ #define ExpectedTopExceptionScopeSize 56
+ #define ExpectedTopExceptionScopeAlignment 8
+ #else
+-#define ExpectedTopExceptionScopeSize 8
+-#define ExpectedTopExceptionScopeAlignment 8
++#define ExpectedTopExceptionScopeSize sizeof(void*)
++#define ExpectedTopExceptionScopeAlignment alignof(void*)
+ #endif
+ 
+ static_assert(sizeof(TopExceptionScope) == ExpectedTopExceptionScopeSize, "src/jsc/TopExceptionScope.rs assumes TopExceptionScope is 56 bytes");
 diff --git a/src/jsc/bindings/c-bindings.cpp b/src/jsc/bindings/c-bindings.cpp
 index 1ead5980..3584d2ac 100644
 --- a/src/jsc/bindings/c-bindings.cpp
@@ -2683,6 +2748,19 @@ index 09464fa4..4b1c4719 100644
  #include <wtf/Vector.h>
  
  namespace WebCore {
+diff --git a/src/jsc/bindings/webcore/SerializedScriptValue.cpp b/src/jsc/bindings/webcore/SerializedScriptValue.cpp
+index a6ada2d0..04cf3539 100644
+--- a/src/jsc/bindings/webcore/SerializedScriptValue.cpp
++++ b/src/jsc/bindings/webcore/SerializedScriptValue.cpp
+@@ -2694,7 +2694,7 @@ private:
+             return false;
+         if (m_ptr + length > m_end)
+             return false;
+-        arrayBuffer = ArrayBuffer::tryCreate({ m_ptr, length });
++        arrayBuffer = ArrayBuffer::tryCreate({ m_ptr, static_cast<size_t>(length) });
+         if (!arrayBuffer)
+             return false;
+         m_ptr += length;
 diff --git a/src/jsc/bindings/webcore/WorkerMessagingProxy.cpp b/src/jsc/bindings/webcore/WorkerMessagingProxy.cpp
 index 926b113b..279f5195 100644
 --- a/src/jsc/bindings/webcore/WorkerMessagingProxy.cpp
