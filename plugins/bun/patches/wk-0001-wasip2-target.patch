@@ -2229,6 +2229,42 @@ index 0c2c99a1..4c2de2a9 100644
  #include "NodeVM.h"
  #include "SigintWatcher.h"
  
+diff --git a/src/jsc/bindings/webcore/EventContext.cpp b/src/jsc/bindings/webcore/EventContext.cpp
+index b618b830..448cd541 100644
+--- a/src/jsc/bindings/webcore/EventContext.cpp
++++ b/src/jsc/bindings/webcore/EventContext.cpp
+@@ -27,6 +27,7 @@
+ 
+ #include "config.h"
+ #include "EventContext.h"
++#include "EventTarget.h"
+ 
+ namespace WebCore {
+ 
+diff --git a/src/jsc/bindings/webcore/EventPath.cpp b/src/jsc/bindings/webcore/EventPath.cpp
+index 09464fa4..4b1c4719 100644
+--- a/src/jsc/bindings/webcore/EventPath.cpp
++++ b/src/jsc/bindings/webcore/EventPath.cpp
+@@ -23,6 +23,7 @@
+ 
+ #include "Event.h"
+ #include "EventContext.h"
++#include "EventTarget.h"
+ #include <wtf/Vector.h>
+ 
+ namespace WebCore {
+diff --git a/src/jsc/bindings/webcore/WorkerMessagingProxy.cpp b/src/jsc/bindings/webcore/WorkerMessagingProxy.cpp
+index 926b113b..279f5195 100644
+--- a/src/jsc/bindings/webcore/WorkerMessagingProxy.cpp
++++ b/src/jsc/bindings/webcore/WorkerMessagingProxy.cpp
+@@ -26,6 +26,7 @@
+ 
+ #include "config.h"
+ #include "WorkerMessagingProxy.h"
++#include <JavaScriptCore/JSPromise.h>
+ 
+ #include "BunClientData.h"
+ #include "GlobalEventScope.h"
 diff --git a/src/jsc/bindings/webcore/streams/WebStreamsInternals.h b/src/jsc/bindings/webcore/streams/WebStreamsInternals.h
 index 99b56429..cee7a029 100644
 --- a/src/jsc/bindings/webcore/streams/WebStreamsInternals.h
@@ -2243,6 +2279,18 @@ index 99b56429..cee7a029 100644
  using WebCore::JSDirectSinkCloseState;
  using WebCore::JSDirectStreamController;
  using WebCore::JSNativeStreamSourceAdapter;
+diff --git a/src/jsc/bindings/webcrypto/CryptoAlgorithmAKPShared.h b/src/jsc/bindings/webcrypto/CryptoAlgorithmAKPShared.h
+index b96e8af0..55126074 100644
+--- a/src/jsc/bindings/webcrypto/CryptoAlgorithmAKPShared.h
++++ b/src/jsc/bindings/webcrypto/CryptoAlgorithmAKPShared.h
+@@ -25,6 +25,7 @@
+ 
+ #pragma once
+ 
++#include "CryptoAlgorithmParameters.h"
+ #include "CryptoAlgorithm.h"
+ #include "CryptoAlgorithmRegistry.h"
+ #include "CryptoKeyAKP.h"
 diff --git a/src/jsc/event_loop.rs b/src/jsc/event_loop.rs
 index aa9643fe..591679ef 100644
 --- a/src/jsc/event_loop.rs
