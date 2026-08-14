@@ -4242,7 +4242,7 @@ index 700eb630..a1086fc1 100644
      const POLL_OWNER_TAG: bun_io::PollTag = bun_io::posix_event_loop::poll_tag::TERMINAL_POLL;
      const HAS_ON_READY: bool = true;
 diff --git a/src/runtime/api/bun/js_bun_spawn_bindings.rs b/src/runtime/api/bun/js_bun_spawn_bindings.rs
-index 698ea540..5f920fb4 100644
+index 698ea540..b6bedfd5 100644
 --- a/src/runtime/api/bun/js_bun_spawn_bindings.rs
 +++ b/src/runtime/api/bun/js_bun_spawn_bindings.rs
 @@ -18,12 +18,14 @@ use bun_jsc::{JsCell, SysErrorJsc as _};
@@ -4281,28 +4281,7 @@ index 698ea540..5f920fb4 100644
                      {
                          // On Windows, ConPTY supplies stdio via PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE.
                          // Set stdio to .ignore so spawnProcessWindows doesn't allocate pipes.
-@@ -1112,6 +1114,20 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
-         None => None,
-     };
- 
-+    // WASI: capturing a child's stdout/stderr into `result.stdout` needs a
-+    // reader that drains a seekable fd — bun's pipe reader is a nonblocking
-+    // socket and spins under the wasi busy-poll shim (and `Stdio::Pipe`
-+    // asserts a capture fd that the wk:exec spawn has no live stream for). So
-+    // treat a capture request as `inherit`: the child's output still reaches
-+    // the node's log and spawnSync returns a real exit code. (True capture is
-+    // a follow-up.)
-+    #[cfg(target_os = "wasi")]
-+    for slot in stdio[1..3].iter_mut() {
-+        if matches!(slot, Stdio::Pipe) {
-+            *slot = Stdio::Inherit;
-+        }
-+    }
-+
-     let mut spawn_options = SpawnOptions {
-         // Empty means "inherit the parent's working directory". Only chdir
-         // when the user asked for it: the stored cwd path string can be stale
-@@ -1411,7 +1427,7 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
+@@ -1411,7 +1413,7 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
                      }
                  }
              }
@@ -4311,7 +4290,7 @@ index 698ea540..5f920fb4 100644
              {
                  use bun_libuv_sys::UvHandle as _;
                  for r in [spawned_stdout, spawned_stderr] {
-@@ -1582,7 +1598,7 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
+@@ -1582,7 +1584,7 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
                  v[usize::try_from(ipc_channel).expect("int cast")] = ExtraPipe::Unavailable;
              });
          }
@@ -4334,7 +4313,7 @@ index 6908c027..a8b7ae2d 100644
          }
  
 diff --git a/src/runtime/api/bun/subprocess/SubprocessPipeReader.rs b/src/runtime/api/bun/subprocess/SubprocessPipeReader.rs
-index a5863b92..6c6b856c 100644
+index a5863b92..399e7f80 100644
 --- a/src/runtime/api/bun/subprocess/SubprocessPipeReader.rs
 +++ b/src/runtime/api/bun/subprocess/SubprocessPipeReader.rs
 @@ -6,7 +6,7 @@ use bun_io::BufferedReader;
@@ -4346,6 +4325,21 @@ index a5863b92..6c6b856c 100644
  use bun_io::pipe_reader::PosixFlags;
  use bun_jsc::event_loop::EventLoop;
  use bun_jsc::{self as jsc, JSGlobalObject, JSValue, JsResult, MarkedArrayBuffer};
+@@ -206,6 +206,14 @@ impl PipeReader {
+             // outlives the guard's drop on return.
+             let _keepalive = unsafe { ScopedRef::new(std::ptr::from_mut::<PipeReader>(self)) };
+ 
++            // WASI's wk:exec spawn hands back the captured output as a seekable
++            // regular file, not a live pipe/socket, and the poll-driven reader
++            // (Socket + nonblocking, set only under `cfg(unix)` below) spins on
++            // it under the busy-poll epoll shim. Start non-pollable so the fd is
++            // read blocking-to-EOF as a `FileType::File` — no poll, no spin.
++            #[cfg(target_os = "wasi")]
++            let _ = self.reader.start(self.stdio_result.unwrap(), false);
++            #[cfg(not(target_os = "wasi"))]
+             let _ = self.reader.start(self.stdio_result.unwrap(), true);
+ 
+             #[cfg(unix)]
 diff --git a/src/runtime/api/cron.rs b/src/runtime/api/cron.rs
 index b492f929..289c00e8 100644
 --- a/src/runtime/api/cron.rs
@@ -6068,7 +6062,7 @@ index 397ec3a5..26b23436 100644
  #[cfg(windows)]
  pub use spawn_process::uv_getrusage;
 diff --git a/src/spawn_sys/spawn_process.rs b/src/spawn_sys/spawn_process.rs
-index 3cd940e2..0641cd81 100644
+index 3cd940e2..c3e47a4b 100644
 --- a/src/spawn_sys/spawn_process.rs
 +++ b/src/spawn_sys/spawn_process.rs
 @@ -14,19 +14,19 @@ use core::sync::atomic::Ordering;
@@ -6162,7 +6156,7 @@ index 3cd940e2..0641cd81 100644
  }
  
  /// Entry in `extra_pipes` for a stdio slot at index >= 3.
-@@ -639,11 +675,185 @@ impl Drop for PosixSpawnFdGuard {
+@@ -639,11 +675,169 @@ impl Drop for PosixSpawnFdGuard {
      }
  }
  
@@ -6193,16 +6187,7 @@ index 3cd940e2..0641cd81 100644
 +        out: *mut WkResult,
 +    ) -> core::ffi::c_int;
 +    fn wk_result_free(r: *mut WkResult);
-+    /// `plugins/pipe-compat` — a real `pipe()` backed by `wk:exec`'s pipe
-+    /// resource + wasi-libc's descriptor table (libc's own is ENOSYS on
-+    /// wasip2). `fds[0]` reads, `fds[1]` writes; closing the write end EOFs the
-+    /// read end once buffered bytes drain.
-+    fn pipe(fds: *mut core::ffi::c_int) -> core::ffi::c_int;
 +}
-+
-+/// `execpipe::PIPE_CAPACITY` — writes up to this can't park a lone writer.
-+#[cfg(target_os = "wasi")]
-+const WASI_PIPE_CAPACITY: usize = 64 * 1024;
 +
 +/// A synthetic pid for each `wk:exec` run: there is no OS pid on WASI, but the
 +/// `Subprocess`/`Process` layer keys on one.
@@ -6214,37 +6199,30 @@ index 3cd940e2..0641cd81 100644
 +}
 +
 +/// Surface a captured stdio buffer for `mode`. wk:exec ran the child to
-+/// completion and already collected its output, so there is no live stream —
-+/// but bun's stdio reader is socket/poll-oriented and EOFs on a closed peer,
-+/// so for `Buffer` (capture) we hand it the read end of a real pipe pre-filled
-+/// with the bytes, whose write end we close so the reader drains then EOFs.
-+/// `Inherit` writes straight to the node's own fd.
++/// completion and already collected its output, so there is no live stream.
++/// For `Buffer` (capture) we materialize the bytes as a **seekable** regular
++/// file and hand back a read-only fd at offset 0; on wasi the subprocess reader
++/// starts non-pollable (see `SubprocessPipeReader::start`) and drains it
++/// blocking-to-EOF as a `FileType::File`, so `result.stdout` gets the bytes
++/// without the poll-reader spin. `Inherit` writes straight to the node's fd.
 +#[cfg(target_os = "wasi")]
-+fn wasi_captured_fd(mode: &PosixStdio, bytes: &[u8], idx: u32) -> Option<Fd> {
++fn wasi_captured_fd(mode: &PosixStdio, bytes: &[u8], pid: PidT, idx: u32) -> Option<Fd> {
 +    match mode {
 +        PosixStdio::Buffer => {
-+            // bun's stdio reader treats any pipe/regular fd as a nonblocking
-+            // *socket* (it forces the SOCKET flag) and, under the wasi busy-poll
-+            // epoll shim, spins reading it whenever it still holds bytes. So we
-+            // do NOT stream the captured bytes back through it yet — instead we
-+            // hand bun an already-empty pipe (write end closed → the reader sees
-+            // EOF at once, no spin, no panic) and surface the child's real
-+            // output on the node's own stdout/stderr, visible in the log.
-+            // (True capture into `result.stdout` awaits a reader that drains a
-+            // seekable fd; a follow-up.)
-+            let mut fds = [0 as core::ffi::c_int; 2];
-+            // SAFETY: `fds` is a valid two-int out array.
-+            if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
-+                let _ = WASI_PIPE_CAPACITY;
-+                return None;
++            // Write it, then hand back a fresh read-only fd positioned at 0.
++            let path = format!("/.bun-spawn-{pid}-{idx}");
++            {
++                let w = bun_sys::File::openat(
++                    Fd::cwd(),
++                    path.as_bytes(),
++                    bun_sys::O::WRONLY | bun_sys::O::CREAT | bun_sys::O::TRUNC,
++                    0o600,
++                )
++                .ok()?;
++                let _ = w.write_all(bytes);
 +            }
-+            let read_fd = Fd::from_native(fds[0] as _);
-+            drop(bun_sys::File::from_fd(Fd::from_native(fds[1] as _))); // close write → EOF
-+            if !bytes.is_empty() {
-+                let out = if idx == 2 { Fd::stderr() } else { Fd::stdout() };
-+                let _ = bun_sys::File::from_fd(out).write_all(bytes);
-+            }
-+            Some(read_fd)
++            let r = bun_sys::File::openat(Fd::cwd(), path.as_bytes(), bun_sys::O::RDONLY, 0).ok()?;
++            Some(r.into_raw())
 +        }
 +        PosixStdio::Inherit => {
 +            if !bytes.is_empty() {
@@ -6328,8 +6306,8 @@ index 3cd940e2..0641cd81 100644
 +    } else {
 +        unsafe { core::slice::from_raw_parts(result.stderr_data.cast::<u8>(), result.stderr_len) }
 +    };
-+    let stdout = wasi_captured_fd(&options.stdout, out_bytes, 1);
-+    let stderr = wasi_captured_fd(&options.stderr, err_bytes, 2);
++    let stdout = wasi_captured_fd(&options.stdout, out_bytes, pid, 1);
++    let stderr = wasi_captured_fd(&options.stderr, err_bytes, pid, 2);
 +
 +    let spawned = PosixSpawnResult {
 +        pid,
