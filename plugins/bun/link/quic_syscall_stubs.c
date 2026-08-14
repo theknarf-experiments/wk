@@ -1,5 +1,4 @@
 // Auto-generated blind stubs for inert QUIC/HTTP3 + unavailable-on-wasi syscalls.
-// QUIC (us_nq_*/uws_h3_*/lsquic_*) can't run on wasip2; never called at startup.
 #include <stddef.h>
 void __archive_read_program(void) {}
 void ares_tvnow(void) {}
@@ -7,7 +6,6 @@ void bindgenConvertJSToSocketConfig(void) {}
 void bindgenConvertJSToSocketConfigHandlers(void) {}
 void bindgenConvertJSToSSLConfig(void) {}
 void chown(void) {}
-void eventfd(void) {}
 void fchown(void) {}
 void getgid(void) {}
 void getuid(void) {}

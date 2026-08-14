@@ -2,6 +2,7 @@
 #ifndef _WASI_COMPAT_TERMIOS_H
 #define _WASI_COMPAT_TERMIOS_H
 #include <stdint.h>
+#include <errno.h>
 typedef unsigned int tcflag_t;
 typedef unsigned char cc_t;
 typedef unsigned int speed_t;
@@ -46,8 +47,10 @@ struct winsize { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel; };
 #ifdef __cplusplus
 extern "C" {
 #endif
-static inline int tcgetattr(int fd, struct termios *t) { (void)fd; (void)t; return -1; }
-static inline int tcsetattr(int fd, int a, const struct termios *t) { (void)fd; (void)a; (void)t; return -1; }
+// Return -1 with errno=ENOTTY (never EINTR): callers loop `while (err==-1 && errno==EINTR)`,
+// and a shim that left errno untouched at a stale EINTR would spin forever on wasm.
+static inline int tcgetattr(int fd, struct termios *t) { (void)fd; (void)t; errno = ENOTTY; return -1; }
+static inline int tcsetattr(int fd, int a, const struct termios *t) { (void)fd; (void)a; (void)t; errno = ENOTTY; return -1; }
 static inline speed_t cfgetispeed(const struct termios *t) { (void)t; return 0; }
 static inline speed_t cfgetospeed(const struct termios *t) { (void)t; return 0; }
 static inline int cfsetispeed(struct termios *t, speed_t s) { (void)t; (void)s; return -1; }

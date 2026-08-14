@@ -38,20 +38,6 @@ index 3c3f997a..6bac483b 100644
  ]
  # `vendor/lolhtml` (the `lol_html` crate) is a non-member path dependency,
  # fetched into `vendor/` by `scripts/build/deps/lolhtml.ts` before cargo runs.
-diff --git a/packages/bun-usockets/src/internal/loop_data.h b/packages/bun-usockets/src/internal/loop_data.h
-index 3937ea5d..6f49ec61 100644
---- a/packages/bun-usockets/src/internal/loop_data.h
-+++ b/packages/bun-usockets/src/internal/loop_data.h
-@@ -28,6 +28,9 @@ typedef uint32_t zig_mutex_t;
- #elif defined(_WIN32)
- // SRWLOCK
- typedef void* zig_mutex_t;
-+#elif defined(__wasi__)
-+// Single-threaded wasm guest: no real mutex needed.
-+typedef uint32_t zig_mutex_t;
- #else
- #error "Unsupported platform"
- #endif
 diff --git a/src/analytics/lib.rs b/src/analytics/lib.rs
 index 07fa5303..c3c5ab72 100644
 --- a/src/analytics/lib.rs
@@ -1358,6 +1344,26 @@ index a8bad273..62cd1c5c 100644
      fn spawn_posix(
          &mut self,
          argv: &mut [*const core::ffi::c_char; 5],
+diff --git a/src/install/lib.rs b/src/install/lib.rs
+index 11258ad5..275e7903 100644
+--- a/src/install/lib.rs
++++ b/src/install/lib.rs
+@@ -499,7 +499,15 @@ impl RunCommand {
+         path: &mut Vec<u8>,
+         optional_bun_path: &mut &[u8],
+     ) -> Result<(), crate::Error> {
++        // wasi can't spawn child processes and has no `self_exe_path()`, so
++        // there is no `node` shim to plant. Leave PATH untouched.
++        #[cfg(target_os = "wasi")]
++        {
++            let _ = (path, optional_bun_path);
++            return Ok(());
++        }
+         // If we are already running as "node", the path should exist
++        #[cfg(not(target_os = "wasi"))]
+         if PRETEND_TO_BE_NODE.load(core::sync::atomic::Ordering::Relaxed) {
+             return Ok(());
+         }
 diff --git a/src/install/lifecycle_script_runner.rs b/src/install/lifecycle_script_runner.rs
 index fea6db69..abc796c5 100644
 --- a/src/install/lifecycle_script_runner.rs
@@ -2929,7 +2935,7 @@ index eb0f9e43..099245e8 100644
  
  static_assert(sizeof(TopExceptionScope) == ExpectedTopExceptionScopeSize, "src/jsc/TopExceptionScope.rs assumes TopExceptionScope is 56 bytes");
 diff --git a/src/jsc/bindings/ZigGlobalObject.cpp b/src/jsc/bindings/ZigGlobalObject.cpp
-index 3022c09c..89f77493 100644
+index 3022c09c..d7027775 100644
 --- a/src/jsc/bindings/ZigGlobalObject.cpp
 +++ b/src/jsc/bindings/ZigGlobalObject.cpp
 @@ -145,10 +145,13 @@
@@ -2946,7 +2952,29 @@ index 3022c09c..89f77493 100644
  #include "JSWebSocket.h"
  #include "JSWorker.h"
  #include "streams/JSWritableStream.h"
-@@ -999,8 +1002,13 @@ const JSC::GlobalObjectMethodTable& GlobalObject::globalObjectMethodTable()
+@@ -302,10 +305,21 @@ extern "C" void JSCInitialize(const char* envp[], size_t envc, void (*onCrash)(c
+         // useWasmFaultSignalHandler/FastMemory when ASAN_OPTIONS lacks
+         // allow_user_segv_handler=1, so we don't force it off here.
+         JSC::initialize([&] {
++#if defined(__wasi__)
++            // The wasi JSC build is cloop/no-JIT and ships no WebAssembly engine
++            // tier (neither BBQ JIT nor IPInt), so leaving useWasm on trips
++            // assertOptionsAreCoherent ("at least one of useWasmIPInt or
++            // useBBQJIT must be true"). Everything runs in the interpreter.
++            JSC::Options::useWasm() = false;
++            JSC::Options::useJIT() = false;
++            JSC::Options::useBBQJIT() = false;
++            JSC::Options::useConcurrentJIT() = false;
++#else
+             JSC::Options::useWasm() = true;
+             JSC::Options::useJIT() = true;
+             JSC::Options::useBBQJIT() = true;
+             JSC::Options::useConcurrentJIT() = true;
++#endif
+             // JSC::Options::useSigillCrashAnalyzer() = true;
+             JSC::Options::useSourceProviderCache() = true;
+             // JSC::Options::useUnlinkedCodeBlockJettisoning() = false;
+@@ -999,8 +1013,13 @@ const JSC::GlobalObjectMethodTable& GlobalObject::globalObjectMethodTable()
          &scriptExecutionStatus,
          &unsafeEvalNoop, // reportViolationForUnsafeEval
          nullptr, // defaultLanguage
@@ -2960,7 +2988,7 @@ index 3022c09c..89f77493 100644
          &Zig::deriveShadowRealmGlobalObject,
          &codeForEval, // codeForEval
          &canCompileStrings, // canCompileStrings
-@@ -1027,8 +1035,13 @@ const JSC::GlobalObjectMethodTable& EvalGlobalObject::globalObjectMethodTable()
+@@ -1027,8 +1046,13 @@ const JSC::GlobalObjectMethodTable& EvalGlobalObject::globalObjectMethodTable()
          &scriptExecutionStatus,
          &unsafeEvalNoop, // reportViolationForUnsafeEval
          nullptr, // defaultLanguage
@@ -2974,7 +3002,7 @@ index 3022c09c..89f77493 100644
          &Zig::deriveShadowRealmGlobalObject,
          &codeForEval, // codeForEval
          &canCompileStrings, // canCompileStrings
-@@ -1332,8 +1345,8 @@ JSC_DEFINE_HOST_FUNCTION(functionNativeMicrotaskTrampoline,
+@@ -1332,8 +1356,8 @@ JSC_DEFINE_HOST_FUNCTION(functionNativeMicrotaskTrampoline,
      double cellPtr = callFrame->uncheckedArgument(0).asNumber();
      double callbackPtr = callFrame->uncheckedArgument(1).asNumber();
  
@@ -2985,7 +3013,7 @@ index 3022c09c..89f77493 100644
      callback(cell);
      return JSValue::encode(jsUndefined());
  }
-@@ -3598,7 +3611,7 @@ extern "C" void JSC__JSGlobalObject__queueMicrotaskCallback(Zig::GlobalObject* g
+@@ -3598,7 +3622,7 @@ extern "C" void JSC__JSGlobalObject__queueMicrotaskCallback(Zig::GlobalObject* g
  
      // Do not use JSCell* here because the GC will try to visit it.
      // Use BunInvokeJobWithArguments to pass the two arguments (ptr and callback) to the trampoline function
@@ -2994,7 +3022,7 @@ index 3022c09c..89f77493 100644
      globalObject->vm().queueMicrotask(WTF::move(task));
  }
  
-@@ -3993,6 +4006,7 @@ JSC::JSValue EvalGlobalObject::moduleLoaderEvaluate(JSGlobalObject* lexicalGloba
+@@ -3993,6 +4017,7 @@ JSC::JSValue EvalGlobalObject::moduleLoaderEvaluate(JSGlobalObject* lexicalGloba
      return result;
  }
  
@@ -3002,7 +3030,7 @@ index 3022c09c..89f77493 100644
  extern "C" JSC::EncodedJSValue Zig__GlobalObject__getBodyStreamOrBytesForWasmStreaming(JSGlobalObject*, EncodedJSValue response, JSC::Wasm::StreamingCompiler* compiler);
  
  extern "C" void JSC__Wasm__StreamingCompiler__addBytes(JSC::Wasm::StreamingCompiler* compiler, const uint8_t* spanPtr, size_t spanSize)
-@@ -4055,6 +4069,7 @@ void GlobalObject::instantiateStreaming(JSGlobalObject* globalObject, JSC::JSPro
+@@ -4055,6 +4080,7 @@ void GlobalObject::instantiateStreaming(JSGlobalObject* globalObject, JSC::JSPro
  {
      handleResponseOnStreamingAction(globalObject, promise, source, JSC::Wasm::CompilerMode::FullCompile, importObject, WTF::move(compileOptions));
  }
@@ -5530,10 +5558,22 @@ index 3cd940e2..e68ccf19 100644
  pub unsafe fn spawn_process_posix(
      options: &PosixSpawnOptions,
 diff --git a/src/standalone_graph/StandaloneModuleGraph.rs b/src/standalone_graph/StandaloneModuleGraph.rs
-index 20e2851f..36652698 100644
+index 20e2851f..d018e4d8 100644
 --- a/src/standalone_graph/StandaloneModuleGraph.rs
 +++ b/src/standalone_graph/StandaloneModuleGraph.rs
-@@ -2269,6 +2269,9 @@ impl StandaloneModuleGraph {
+@@ -2184,7 +2184,10 @@ impl StandaloneModuleGraph {
+             target_os = "freebsd"
+         )))]
+         {
+-            unreachable!()
++            // WASI (and any other platform without an executable-image reader):
++            // a wasm module can't read its own binary, so there is never an
++            // embedded standalone graph. Return None rather than aborting.
++            Ok(None)
+         }
+     }
+ 
+@@ -2269,6 +2272,9 @@ impl StandaloneModuleGraph {
  
  /// Allocates a StandaloneModuleGraph in the process-static `INSTANCE`,
  /// populates it from bytes, sets it globally, and returns the pointer.
