@@ -2154,6 +2154,34 @@ index d1b15605..e8ada386 100644
  #else
  #error "Unknown architecture"
  #endif
+diff --git a/src/jsc/bindings/JSBundlerPlugin.cpp b/src/jsc/bindings/JSBundlerPlugin.cpp
+index a6d60de0..070f8799 100644
+--- a/src/jsc/bindings/JSBundlerPlugin.cpp
++++ b/src/jsc/bindings/JSBundlerPlugin.cpp
+@@ -44,8 +44,8 @@ namespace Bun {
+ extern "C" void CrashHandler__setInsideNativePlugin(const char* plugin_name);
+ extern "C" int OnBeforeParsePlugin__isDone(void* context);
+ extern "C" void OnBeforeParseResult__reset(OnBeforeParseResult* result);
+-#define WRAP_BUNDLER_PLUGIN(argName) jsDoubleNumber(std::bit_cast<double>(reinterpret_cast<uintptr_t>(argName)))
+-#define UNWRAP_BUNDLER_PLUGIN(callFrame) reinterpret_cast<void*>(std::bit_cast<uintptr_t>(callFrame->argument(0).asDouble()))
++#define WRAP_BUNDLER_PLUGIN(argName) jsDoubleNumber(std::bit_cast<double>(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(argName))))
++#define UNWRAP_BUNDLER_PLUGIN(callFrame) reinterpret_cast<void*>(static_cast<uintptr_t>(std::bit_cast<uint64_t>(callFrame->argument(0).asDouble())))
+ 
+ /// These are native callbacks to be run after their associated JS version is run
+ extern "C" void JSBundlerPlugin__addError(void*, void*, JSC::EncodedJSValue, JSC::EncodedJSValue);
+diff --git a/src/jsc/bindings/JSFFIFunction.cpp b/src/jsc/bindings/JSFFIFunction.cpp
+index 2dc7bd22..4879134b 100644
+--- a/src/jsc/bindings/JSFFIFunction.cpp
++++ b/src/jsc/bindings/JSFFIFunction.cpp
+@@ -78,7 +78,7 @@ extern "C" JSC::EncodedJSValue Bun__CreateFFIFunctionValue(Zig::GlobalObject* gl
+         // We should only expose the "ptr" field when it's a JSCallback for bun:ffi.
+         // Not for internal usages of this function type.
+         // We should also consider a separate JSFunction type for our usage to not have this branch in the first place...
+-        function->putDirect(vm, JSC::Identifier::fromString(vm, String("ptr"_s)), JSC::jsNumber(std::bit_cast<double>(functionPointer)), JSC::PropertyAttribute::ReadOnly | 0);
++        function->putDirect(vm, JSC::Identifier::fromString(vm, String("ptr"_s)), JSC::jsNumber(std::bit_cast<double>(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(functionPointer)))), JSC::PropertyAttribute::ReadOnly | 0);
+         function->symbolFromDynamicLibrary = symbolFromDynamicLibrary;
+         return JSC::JSValue::encode(function);
+     }
 diff --git a/src/jsc/bindings/c-bindings.cpp b/src/jsc/bindings/c-bindings.cpp
 index 1ead5980..3584d2ac 100644
 --- a/src/jsc/bindings/c-bindings.cpp
