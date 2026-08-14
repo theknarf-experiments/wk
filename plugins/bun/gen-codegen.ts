@@ -68,6 +68,16 @@ await $`bash -c ${"mkdir -p /tmp/bun-codegen-root"}`;
 await $`env TARGET_PLATFORM=linux TARGET_ARCH=x64 bun ${dir}/bun/src/codegen/bundle-modules.ts --debug=OFF /tmp/bun-codegen-root`.cwd(dir + "/bun");
 await $`bash -c ${"cp -r /tmp/bun-codegen-root/codegen/* " + dir + "/codegen/"}`;
 await $`bun ${dir}/bun/src/codegen/generate-node-errors.ts ${dir}/codegen`.cwd(dir + "/bun");
+// The transpiler runtime helpers (__legacyDecorate, __decorateElement,
+// __using, __esDecorate, __runInitializers, …) that lowered TS/JS features
+// import from "bun:wrap". Bun's build esbuild-bundles src/runtime.bun.js →
+// codegen/runtime.out.js; src/ast/runtime.rs embeds it (on wasi via
+// include_str). Without it the first decorator / `using` / auto-accessor
+// panics with ENOENT loading runtime.out.js. `*` and the quoted define are
+// passed as vars so bun's `$` doesn't glob/mangle them.
+const rtDefine = `--define:process.env.NODE_ENV="production"`;
+const rtExternal = "--external:/bun:*";
+await $`bunx esbuild ${dir}/bun/src/runtime.bun.js --outfile=${dir}/codegen/runtime.out.js ${rtDefine} --target=esnext --bundle --format=esm --platform=node --minify ${rtExternal}`.cwd(dir + "/bun");
 // bun_runtime's build.rs artifacts: the .classes.ts bindings, stream sinks,
 // and host exports.
 const classFiles = (await $`bash -c ${"find src -name '*.classes.ts'"}`.cwd(dir + "/bun").text()).trim().split("\n");

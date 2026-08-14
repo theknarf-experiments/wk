@@ -173,6 +173,32 @@ index 3231a727..bc1c730a 100644
  const _: () = assert!(core::mem::size_of::<StoreSlice<u8>>() == 12);
  const _: () = assert!(core::mem::align_of::<StoreSlice<u8>>() == 4);
  
+diff --git a/src/ast/runtime.rs b/src/ast/runtime.rs
+index 03d99775..7dbe3e44 100644
+--- a/src/ast/runtime.rs
++++ b/src/ast/runtime.rs
+@@ -18,7 +18,20 @@ pub struct Runtime;
+ 
+ impl Runtime {
+     pub fn source_code() -> &'static [u8] {
+-        bun_core::runtime_embed_file!(Codegen, "runtime.out.js").as_bytes()
++        // The wasm build never ships the codegen dir alongside the binary, so
++        // the `runtime_embed_file!` disk-load fallback (used because the wk
++        // build doesn't set `bun_codegen_embed` globally) fails with ENOENT and
++        // panics the first time a lowered feature (decorators, `using`, …)
++        // needs the transpiler runtime. Embed just this one file directly;
++        // `BUN_CODEGEN_DIR` is set at build time.
++        #[cfg(target_os = "wasi")]
++        {
++            include_str!(concat!(env!("BUN_CODEGEN_DIR"), "/runtime.out.js")).as_bytes()
++        }
++        #[cfg(not(target_os = "wasi"))]
++        {
++            bun_core::runtime_embed_file!(Codegen, "runtime.out.js").as_bytes()
++        }
+     }
+ }
+ 
 diff --git a/src/ast/stmt.rs b/src/ast/stmt.rs
 index 53ec19ba..fdb9971e 100644
 --- a/src/ast/stmt.rs
