@@ -2742,6 +2742,26 @@ index daf0254f..a248a493 100644
  
                  // Platform field types vary (u32/i64/u64); `as i64` is lossless
                  // for the in-range values statfs reports.
+diff --git a/src/runtime/node/node_cluster_binding.rs b/src/runtime/node/node_cluster_binding.rs
+index c9c22e06..24760d40 100644
+--- a/src/runtime/node/node_cluster_binding.rs
++++ b/src/runtime/node/node_cluster_binding.rs
+@@ -409,7 +409,14 @@ pub(crate) fn cluster_raw_bind(global: &JSGlobalObject, frame: &CallFrame) -> Js
+         obj.put(global, b"port", JSValue::js_number_from_int32(out_port));
+         return Ok(obj);
+     }
+-    #[cfg(not(windows))]
++    #[cfg(target_os = "wasi")]
++    {
++        // node:cluster needs real sockets + child processes; neither exists
++        // in a wasm guest.
++        let _ = frame;
++        return Err(global.throw_type_error(format_args!("cluster is not supported on WASI")));
++    }
++    #[cfg(unix)]
+     {
+         use core::ffi::c_int;
+ 
 diff --git a/src/runtime/node/node_fs.rs b/src/runtime/node/node_fs.rs
 index 6046c4ad..e0c40c2b 100644
 --- a/src/runtime/node/node_fs.rs
