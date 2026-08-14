@@ -2220,7 +2220,7 @@ index 4dc13cd2..547fdba8 100644
 +}
 +#endif // ENABLE(REMOTE_INSPECTOR)
 diff --git a/src/jsc/bindings/BunProcess.cpp b/src/jsc/bindings/BunProcess.cpp
-index 10210178..40fedb94 100644
+index 10210178..057c9b59 100644
 --- a/src/jsc/bindings/BunProcess.cpp
 +++ b/src/jsc/bindings/BunProcess.cpp
 @@ -1,3 +1,5 @@
@@ -2229,7 +2229,27 @@ index 10210178..40fedb94 100644
  #include "ModuleLoader.h"
  #include "napi.h"
  
-@@ -195,6 +197,9 @@ static JSValue constructArch(VM& vm, JSObject* processObject)
+@@ -171,12 +173,16 @@ namespace JSCastingHelpers = JSC::JSCastingHelpers;
+ JSC_DECLARE_HOST_FUNCTION(Process_functionCwd);
+ 
+ extern "C" uint8_t Bun__getExitCode(void*);
+-extern "C" uint8_t Bun__setExitCode(void*, uint8_t);
+-extern "C" bool Bun__closeChildIPC(JSGlobalObject*);
++// These are defined in Rust returning nothing; the returns are ignored at every
++// call site. On wasm32 a wrong return type in the declaration (uint8_t/bool vs
++// void) is a hard function-signature mismatch that traps, not a silently-ignored
++// register like on native — so the declaration must match the Rust void return.
++extern "C" void Bun__setExitCode(void*, uint8_t);
++extern "C" void Bun__closeChildIPC(JSGlobalObject*);
+ 
+ extern "C" bool Bun__GlobalObject__connectedIPC(JSGlobalObject*);
+ extern "C" bool Bun__GlobalObject__hasIPC(JSGlobalObject*);
+-extern "C" bool Bun__ensureProcessIPCInitialized(JSGlobalObject*);
++extern "C" void Bun__ensureProcessIPCInitialized(JSGlobalObject*);
+ extern "C" const char* Bun__githubURL;
+ extern "C" const char* Bun__sqlite3_version();
+ BUN_DECLARE_HOST_FUNCTION(Bun__Process__send);
+@@ -195,6 +201,9 @@ static JSValue constructArch(VM& vm, JSObject* processObject)
      return JSC::jsString(vm, makeAtomString("x64"_s));
  #elif CPU(ARM64)
      return JSC::jsString(vm, makeAtomString("arm64"_s));
@@ -2239,7 +2259,7 @@ index 10210178..40fedb94 100644
  #else
  #error "Unknown architecture"
  #endif
-@@ -212,6 +217,8 @@ static JSValue constructPlatform(VM& vm, JSObject* processObject)
+@@ -212,6 +221,8 @@ static JSValue constructPlatform(VM& vm, JSObject* processObject)
      return JSC::jsString(vm, makeAtomString("freebsd"_s));
  #elif OS(WINDOWS)
      return JSC::jsString(vm, makeAtomString("win32"_s));
@@ -2248,7 +2268,7 @@ index 10210178..40fedb94 100644
  #else
  #error "Unknown platform"
  #endif
-@@ -777,7 +784,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionDlopen, (JSC::JSGlobalObject * globalOb
+@@ -777,7 +788,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionDlopen, (JSC::JSGlobalObject * globalOb
          .reserved = {},
      };
  
@@ -2258,7 +2278,7 @@ index 10210178..40fedb94 100644
  
      auto env = globalObject->makeNapiEnv(nmodule);
      env->filename = filename_cstr;
-@@ -796,6 +805,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionDlopen, (JSC::JSGlobalObject * globalOb
+@@ -796,6 +809,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionDlopen, (JSC::JSGlobalObject * globalOb
          const char** pointer_to_plugin_name = (const char**)dlsym(handle, "BUN_PLUGIN_NAME");
  #elif OS(WINDOWS)
          const char** pointer_to_plugin_name = (const char**)GetProcAddress(handle, "BUN_PLUGIN_NAME");
@@ -2268,7 +2288,7 @@ index 10210178..40fedb94 100644
  #endif
          if (pointer_to_plugin_name) {
              // TODO: think about the finalizer here
-@@ -1321,8 +1333,13 @@ void signalHandler(uv_signal_t* signal, int signalNumber)
+@@ -1321,8 +1337,13 @@ void signalHandler(uv_signal_t* signal, int signalNumber)
  
  extern "C" void Bun__logUnhandledException(JSC::EncodedJSValue exception);
  
@@ -2283,7 +2303,28 @@ index 10210178..40fedb94 100644
      if (!lexicalGlobalObject->inherits(Zig::GlobalObject::info()))
          return false;
      auto* globalObject = uncheckedDowncast<Zig::GlobalObject>(lexicalGlobalObject);
-@@ -1474,8 +1491,11 @@ extern "C" void Bun__promises__emitUnhandledRejectionWarning(JSC::JSGlobalObject
+@@ -1388,8 +1409,10 @@ extern "C" int Bun__handleUncaughtException(JSC::JSGlobalObject* lexicalGlobalOb
+ 
+     return true;
+ }
+-extern "C" bool Bun__promises__isErrorLike(JSC::JSGlobalObject* globalObject, JSC::JSValue obj)
++// EncodedJSValue param, not JSC::JSValue by value — see Bun__handleUncaughtException.
++extern "C" bool Bun__promises__isErrorLike(JSC::JSGlobalObject* globalObject, JSC::EncodedJSValue encodedObj)
+ {
++    JSC::JSValue obj = JSC::JSValue::decode(encodedObj);
+     //   return typeof obj === 'object' &&
+     //      obj !== null &&
+     //      ObjectPrototypeHasOwnProperty(obj, 'stack');
+@@ -1447,7 +1470,7 @@ extern "C" void Bun__promises__emitUnhandledRejectionWarning(JSC::JSGlobalObject
+     warning->putDirect(vm, vm.propertyNames->name, jsString(vm, "UnhandledPromiseRejectionWarning"_str), JSC::PropertyAttribute::DontEnum | 0);
+ 
+     JSValue reasonStack {};
+-    auto is_errorlike = Bun__promises__isErrorLike(globalObject, JSValue::decode(reason));
++    auto is_errorlike = Bun__promises__isErrorLike(globalObject, reason);
+     CLEAR_IF_EXCEPTION(scope);
+     if (vm.hasPendingTerminationException()) [[unlikely]]
+         return;
+@@ -1474,8 +1497,11 @@ extern "C" void Bun__promises__emitUnhandledRejectionWarning(JSC::JSGlobalObject
      CLEAR_IF_EXCEPTION(scope);
  }
  
@@ -2296,7 +2337,7 @@ index 10210178..40fedb94 100644
      if (!lexicalGlobalObject->inherits(Zig::GlobalObject::info()))
          return false;
      auto* globalObject = uncheckedDowncast<Zig::GlobalObject>(lexicalGlobalObject);
-@@ -1499,8 +1519,10 @@ extern "C" int Bun__handleUnhandledRejection(JSC::JSGlobalObject* lexicalGlobalO
+@@ -1499,8 +1525,10 @@ extern "C" int Bun__handleUnhandledRejection(JSC::JSGlobalObject* lexicalGlobalO
  
  extern "C" bool Bun__VM__allowRejectionHandledWarning(void* vm);
  
@@ -2308,7 +2349,7 @@ index 10210178..40fedb94 100644
      auto& vm = JSC::getVM(lexicalGlobalObject);
      auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
      if (!lexicalGlobalObject->inherits(Zig::GlobalObject::info()))
-@@ -1635,6 +1657,9 @@ static void onDidChangeListeners(EventEmitter& eventEmitter, const Identifier& e
+@@ -1635,6 +1663,9 @@ static void onDidChangeListeners(EventEmitter& eventEmitter, const Identifier& e
  #elif OS(WINDOWS)
              // windows has no SIGSTOP
              if (signalNumber != SIGKILL) {
@@ -2318,7 +2359,7 @@ index 10210178..40fedb94 100644
  #else
  #error unknown OS
  #endif
-@@ -2381,9 +2406,13 @@ static JSValue constructReportObjectComplete(VM& vm, Zig::GlobalObject* globalOb
+@@ -2381,9 +2412,13 @@ static JSValue constructReportObjectComplete(VM& vm, Zig::GlobalObject* globalOb
          JSC::JSObject* resourceUsage = JSC::constructEmptyObject(globalObject, globalObject->objectPrototype(), 11);
          RETURN_IF_EXCEPTION(scope, {});
  
@@ -2332,7 +2373,7 @@ index 10210178..40fedb94 100644
  
          resourceUsage->putDirect(vm, JSC::Identifier::fromString(vm, "free_memory"_s), JSC::jsNumber(usage.ru_maxrss), 0);
          resourceUsage->putDirect(vm, JSC::Identifier::fromString(vm, "total_memory"_s), JSC::jsNumber(usage.ru_maxrss), 0);
-@@ -2842,7 +2871,7 @@ static JSValue constructProcessConfigObject(VM& vm, JSObject* processObject)
+@@ -2842,7 +2877,7 @@ static JSValue constructProcessConfigObject(VM& vm, JSObject* processObject)
  #if CPU(ARM64)
      variables->putDirect(vm, JSC::Identifier::fromString(vm, "arm_fpu"_s), JSC::jsString(vm, String("neon"_s)), 0);
  #endif
@@ -2341,7 +2382,7 @@ index 10210178..40fedb94 100644
      variables->putDirect(vm, JSC::Identifier::fromString(vm, "control_flow_guard"_s), JSC::jsBoolean(false), 0);
      variables->putDirect(vm, JSC::Identifier::fromString(vm, "coverage"_s), JSC::jsBoolean(false), 0);
      variables->putDirect(vm, JSC::Identifier::fromString(vm, "dcheck_always_on"_s), JSC::jsNumber(0), 0);
-@@ -2868,6 +2897,9 @@ static JSValue constructProcessConfigObject(VM& vm, JSObject* processObject)
+@@ -2868,6 +2903,9 @@ static JSValue constructProcessConfigObject(VM& vm, JSObject* processObject)
  #elif CPU(ARM64)
      variables->putDirect(vm, JSC::Identifier::fromString(vm, "host_arch"_s), JSC::jsString(vm, String("arm64"_s)), 0);
      variables->putDirect(vm, JSC::Identifier::fromString(vm, "target_arch"_s), JSC::jsString(vm, String("arm64"_s)), 0);
@@ -2351,7 +2392,7 @@ index 10210178..40fedb94 100644
  #else
  #error "Unsupported architecture"
  #endif
-@@ -3780,7 +3812,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionResourceUsage, (JSC::JSGlobalObject * g
+@@ -3780,7 +3818,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionResourceUsage, (JSC::JSGlobalObject * g
      auto& vm = JSC::getVM(globalObject);
      auto throwScope = DECLARE_THROW_SCOPE(vm);
  
@@ -2362,7 +2403,7 @@ index 10210178..40fedb94 100644
      struct rusage rusage;
      if (getrusage(RUSAGE_SELF, &rusage) != 0) {
          throwSystemError(throwScope, globalObject, "Failed to get resource usage"_s, "getrusage"_s, errno);
-@@ -3828,7 +3862,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionCpuUsage, (JSC::JSGlobalObject * global
+@@ -3828,7 +3868,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionCpuUsage, (JSC::JSGlobalObject * global
  {
      auto& vm = JSC::getVM(globalObject);
      auto throwScope = DECLARE_THROW_SCOPE(vm);
@@ -2373,7 +2414,7 @@ index 10210178..40fedb94 100644
      struct rusage rusage;
      if (getrusage(RUSAGE_SELF, &rusage) != 0) {
          throwSystemError(throwScope, globalObject, "Failed to get CPU usage"_s, "getrusage"_s, errno);
-@@ -3955,10 +3991,15 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionThreadCpuUsage, (JSC::JSGlobalObject *
+@@ -3955,10 +3997,15 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionThreadCpuUsage, (JSC::JSGlobalObject *
      }
      user = 1e6 * info.user_time.seconds + info.user_time.microseconds;
      system = 1e6 * info.system_time.seconds + info.system_time.microseconds;
@@ -2390,7 +2431,7 @@ index 10210178..40fedb94 100644
      struct rusage threadUsage;
      if (getrusage(RUSAGE_THREAD, &threadUsage) != 0) {
          throwSystemError(throwScope, globalObject, "Failed to get thread CPU usage"_s, "getrusage"_s, errno);
-@@ -3966,6 +4007,7 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionThreadCpuUsage, (JSC::JSGlobalObject *
+@@ -3966,6 +4013,7 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionThreadCpuUsage, (JSC::JSGlobalObject *
      }
      user = 1e6 * threadUsage.ru_utime.tv_sec + threadUsage.ru_utime.tv_usec;
      system = 1e6 * threadUsage.ru_stime.tv_sec + threadUsage.ru_stime.tv_usec;
@@ -2398,7 +2439,7 @@ index 10210178..40fedb94 100644
  #else
      uv_rusage_t threadUsage;
      int err = uv_getrusage_thread(&threadUsage);
-@@ -4079,6 +4121,10 @@ err:
+@@ -4079,6 +4127,10 @@ err:
      return 0;
  #elif OS(WINDOWS)
      return uv_resident_set_memory(rss);
@@ -2409,7 +2450,7 @@ index 10210178..40fedb94 100644
  #else
  #error "Unknown platform"
  #endif
-@@ -4308,7 +4354,7 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionFatalException, (JSC::JSGlobalObject *
+@@ -4308,7 +4360,7 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionFatalException, (JSC::JSGlobalObject *
      // machinery and returns whether a handler claimed the error. fromPromise selects
      // origin 'unhandledRejection' vs 'uncaughtException'.
      int isRejection = callFrame->argument(1).toBoolean(globalObject) ? 1 : 0;
@@ -2474,6 +2515,30 @@ index 05999401..122459c4 100644
  }
  
  }
+diff --git a/src/jsc/bindings/ErrorCode.cpp b/src/jsc/bindings/ErrorCode.cpp
+index 6114d1d7..1d5ed7b2 100644
+--- a/src/jsc/bindings/ErrorCode.cpp
++++ b/src/jsc/bindings/ErrorCode.cpp
+@@ -262,7 +262,9 @@ JSObject* createError(Zig::JSGlobalObject* globalObject, ErrorCode code, JSC::JS
+ // `Bun.inspect` with `single_line` + `quote_strings` — the same renderer
+ // JSBuffer uses to inline a value into an error message; it renders objects
+ // on one line ("Received { abc: 123 }") the way Node does.
+-extern "C" BunString Bun__inspect_singleline(JSC::JSGlobalObject* globalObject, JSValue value);
++// EncodedJSValue param: JSC::JSValue by value passes as i32 (by pointer) on
++// wasm32 but the Rust definition sends i64 — see Bun__handleUncaughtException.
++extern "C" BunString Bun__inspect_singleline(JSC::JSGlobalObject* globalObject, JSC::EncodedJSValue value);
+ 
+ // util.inspect's quoted-string escaping (https://github.com/nodejs/node/blob/main/lib/internal/util/inspect.js
+ // strEscape). Bun.inspect double-quotes; Node's messages use single quotes.
+@@ -369,7 +371,7 @@ void JSValueToStringSafe(JSC::JSGlobalObject* globalObject, WTF::StringBuilder&
+     }
+ 
+     // Node renders objects inline in error messages ("Received { abc: 123 }").
+-    builder.append(Bun__inspect_singleline(globalObject, arg).transferToWTFString());
++    builder.append(Bun__inspect_singleline(globalObject, JSValue::encode(arg)).transferToWTFString());
+ }
+ 
+ void determineSpecificType(JSC::VM& vm, JSC::JSGlobalObject* globalObject, WTF::StringBuilder& builder, JSValue value)
 diff --git a/src/jsc/bindings/InspectorBunFrontendDevServerAgent.cpp b/src/jsc/bindings/InspectorBunFrontendDevServerAgent.cpp
 index a6116137..d3338a0b 100644
 --- a/src/jsc/bindings/InspectorBunFrontendDevServerAgent.cpp
@@ -2529,10 +2594,16 @@ index 8a4f4394..bc6af8ca 100644
 +
 +#endif // ENABLE(REMOTE_INSPECTOR)
 diff --git a/src/jsc/bindings/JSBuffer.cpp b/src/jsc/bindings/JSBuffer.cpp
-index 217d2970..1ce41bbc 100644
+index 217d2970..e152437a 100644
 --- a/src/jsc/bindings/JSBuffer.cpp
 +++ b/src/jsc/bindings/JSBuffer.cpp
-@@ -99,7 +99,12 @@ extern "C" BunString Bun__inspect_singleline(JSC::JSGlobalObject* globalObject,
+@@ -94,12 +94,17 @@ extern "C" size_t highway_last_index_of_char(const uint8_t* haystack, size_t hay
+ static constexpr size_t kHighwayNotFound = ~static_cast<size_t>(0);
+ 
+ // export fn Bun__inspect_singleline(globalThis: *JSGlobalObject, value: JSValue) bun.String
+-extern "C" BunString Bun__inspect_singleline(JSC::JSGlobalObject* globalObject, JSC::JSValue value);
++extern "C" BunString Bun__inspect_singleline(JSC::JSGlobalObject* globalObject, JSC::EncodedJSValue value);
+ 
  using namespace JSC;
  using namespace WebCore;
  
@@ -2545,6 +2616,15 @@ index 217d2970..1ce41bbc 100644
  
  JSC_DECLARE_HOST_FUNCTION(constructJSBuffer);
  JSC_DECLARE_HOST_FUNCTION(callJSBuffer);
+@@ -1930,7 +1935,7 @@ static JSC::EncodedJSValue jsBufferPrototypeFunction_inspectBody(JSC::JSGlobalOb
+                 result.append(": "_s);
+                 auto value = castedThis->get(globalObject, ident);
+                 RETURN_IF_EXCEPTION(scope, {});
+-                auto inspected = Bun__inspect_singleline(globalObject, value).transferToWTFString();
++                auto inspected = Bun__inspect_singleline(globalObject, JSC::JSValue::encode(value)).transferToWTFString();
+                 RETURN_IF_EXCEPTION(scope, {});
+                 result.append(inspected);
+                 i++;
 diff --git a/src/jsc/bindings/JSBundlerPlugin.cpp b/src/jsc/bindings/JSBundlerPlugin.cpp
 index a6d60de0..070f8799 100644
 --- a/src/jsc/bindings/JSBundlerPlugin.cpp
@@ -2591,6 +2671,24 @@ index 7b78b335..9d26937d 100644
                      }
                  } else {
                      // require map was cleared of the entry
+diff --git a/src/jsc/bindings/JSEnvironmentVariableMap.cpp b/src/jsc/bindings/JSEnvironmentVariableMap.cpp
+index a67acad6..48e9e86d 100644
+--- a/src/jsc/bindings/JSEnvironmentVariableMap.cpp
++++ b/src/jsc/bindings/JSEnvironmentVariableMap.cpp
+@@ -352,9 +352,11 @@ bool JSEnvironmentVariableMap::deleteProperty(JSCell* cell, JSGlobalObject* glob
+ }
+ 
+ extern "C" int Bun__getTLSRejectUnauthorizedValue();
+-extern "C" int Bun__setTLSRejectUnauthorizedValue(int value);
++// Rust returns nothing; the returns are ignored at the call sites. A wrong
++// return type is a hard signature mismatch (trap) on wasm32, so declare void.
++extern "C" void Bun__setTLSRejectUnauthorizedValue(int value);
+ extern "C" int Bun__getVerboseFetchValue();
+-extern "C" int Bun__setVerboseFetchValue(int value);
++extern "C" void Bun__setVerboseFetchValue(int value);
+ 
+ ALWAYS_INLINE static Identifier NODE_TLS_REJECT_UNAUTHORIZED_PRIVATE_PROPERTY(VM& vm)
+ {
 diff --git a/src/jsc/bindings/JSFFIFunction.cpp b/src/jsc/bindings/JSFFIFunction.cpp
 index 2dc7bd22..4879134b 100644
 --- a/src/jsc/bindings/JSFFIFunction.cpp
@@ -2667,6 +2765,24 @@ index cf0c96f3..7b02be0c 100644
  
  // `E::StrEncoding`: how the bytes behind every string on one tape are encoded.
  enum class RowEncoding : uint8_t {
+diff --git a/src/jsc/bindings/JSWrappingFunction.cpp b/src/jsc/bindings/JSWrappingFunction.cpp
+index 57f53d11..296d2543 100644
+--- a/src/jsc/bindings/JSWrappingFunction.cpp
++++ b/src/jsc/bindings/JSWrappingFunction.cpp
+@@ -58,8 +58,12 @@ extern "C" JSC::EncodedJSValue Bun__JSWrappingFunction__create(
+     Zig::GlobalObject* globalObject,
+     const BunString* symbolName,
+     Bun::NativeFunctionPtr functionPointer,
+-    JSC::EncodedJSValue wrappedFnEncoded)
++    JSC::EncodedJSValue wrappedFnEncoded,
++    // The Rust caller passes a trailing `strong: bool`; the arg was missing here,
++    // an arg-count mismatch that traps on wasm32. Currently unused by create().
++    bool strong)
+ {
++    (void)strong;
+     auto& vm = JSC::getVM(globalObject);
+     JSC::JSValue wrappedFn = JSC::JSValue::decode(wrappedFnEncoded);
+     auto function = JSWrappingFunction::create(vm, globalObject, symbolName, functionPointer, wrappedFn);
 diff --git a/src/jsc/bindings/NodeVM.cpp b/src/jsc/bindings/NodeVM.cpp
 index 54a3d25d..37631791 100644
 --- a/src/jsc/bindings/NodeVM.cpp
@@ -2990,6 +3106,57 @@ index 3022c09c..d7027775 100644
  
  GlobalObject::PromiseFunctions GlobalObject::promiseHandlerID(Zig::FFIFunction handler)
  {
+diff --git a/src/jsc/bindings/bindings.cpp b/src/jsc/bindings/bindings.cpp
+index 40e19b3e..3340610b 100644
+--- a/src/jsc/bindings/bindings.cpp
++++ b/src/jsc/bindings/bindings.cpp
+@@ -3633,8 +3633,14 @@ JSC::EncodedJSValue JSC__JSGlobalObject__createAggregateError(JSC::JSGlobalObjec
+ 
+     RELEASE_AND_RETURN(scope, JSC::JSValue::encode(JSC::createAggregateError(vm, errorStructure, array, message, cause, nullptr, JSC::TypeNothing, false)));
+ }
+-JSC::EncodedJSValue JSC__JSGlobalObject__createAggregateErrorWithArray(JSC::JSGlobalObject* global, JSC::JSArray* array, BunString message, JSValue cause)
+-{
++// The Rust side passes the error array and cause as JSValues (i64). Take them as
++// EncodedJSValue rather than JSArray*/JSValue-by-value, which pass as i32 on
++// wasm32 and mismatch — see Bun__handleUncaughtException.
++JSC::EncodedJSValue JSC__JSGlobalObject__createAggregateErrorWithArray(JSC::JSGlobalObject* global, JSC::EncodedJSValue encodedArray, BunString message, JSC::EncodedJSValue encodedCause)
++{
++    // The Rust caller guarantees this JSValue is an Array.
++    auto* array = static_cast<JSC::JSArray*>(JSC::JSValue::decode(encodedArray).getObject());
++    JSValue cause = JSC::JSValue::decode(encodedCause);
+     auto& vm = JSC::getVM(global);
+     JSC::Structure* errorStructure = global->errorStructure(JSC::ErrorType::AggregateError);
+     WTF::String messageString = message.toWTFString();
+@@ -4917,8 +4923,9 @@ void JSC__JSValue__getClassName(JSC::EncodedJSValue JSValue0, JSC::JSGlobalObjec
+     *arg2 = Zig::toZigString(view);
+ }
+ 
+-bool JSC__JSValue__getClassInfoName(JSValue value, const uint8_t** outPtr, size_t* outLen)
++bool JSC__JSValue__getClassInfoName(JSC::EncodedJSValue encodedValue, const uint8_t** outPtr, size_t* outLen)
+ {
++    JSValue value = JSC::JSValue::decode(encodedValue);
+     if (auto info = value.classInfoOrNull()) {
+         *outPtr = info->className.span8().data();
+         *outLen = info->className.span8().size();
+@@ -5944,15 +5951,15 @@ extern "C" void WebCore__AbortSignal__decrementPendingActivity(WebCore::AbortSig
+     abortSignal->decrementPendingActivityCount();
+ }
+ 
+-extern "C" WebCore::AbortSignal* WebCore__AbortSignal__signal(WebCore::AbortSignal* arg0, JSC::JSGlobalObject* globalObject, uint8_t reason)
++// Returns void, not AbortSignal*: the Rust caller ignores the return, and a
++// pointer-vs-void return type is a hard signature mismatch (trap) on wasm32.
++extern "C" void WebCore__AbortSignal__signal(WebCore::AbortSignal* arg0, JSC::JSGlobalObject* globalObject, uint8_t reason)
+ {
+ 
+     WebCore::AbortSignal* abortSignal = reinterpret_cast<WebCore::AbortSignal*>(arg0);
+     abortSignal->signalAbort(
+         globalObject,
+         static_cast<WebCore::CommonAbortReason>(reason));
+-    ;
+-    return arg0;
+ }
+ 
+ extern "C" JSC::EncodedJSValue WebCore__AbortSignal__reasonIfAborted(WebCore::AbortSignal* signal, JSC::JSGlobalObject* globalObject, CommonAbortReason* reason)
 diff --git a/src/jsc/bindings/c-bindings.cpp b/src/jsc/bindings/c-bindings.cpp
 index 1ead5980..3584d2ac 100644
 --- a/src/jsc/bindings/c-bindings.cpp
@@ -3033,6 +3200,19 @@ index 1ead5980..3584d2ac 100644
  #else
  
  #error "TODO"
+diff --git a/src/jsc/bindings/headers.h b/src/jsc/bindings/headers.h
+index 208be793..01878634 100644
+--- a/src/jsc/bindings/headers.h
++++ b/src/jsc/bindings/headers.h
+@@ -124,7 +124,7 @@ CPP_DECL void WebCore__AbortSignal__cleanNativeBindings(WebCore::AbortSignal* ar
+ CPP_DECL JSC::EncodedJSValue WebCore__AbortSignal__create(JSC::JSGlobalObject* arg0);
+ CPP_DECL WebCore::AbortSignal* WebCore__AbortSignal__fromJS(JSC::EncodedJSValue JSValue0);
+ CPP_DECL WebCore::AbortSignal* WebCore__AbortSignal__ref(WebCore::AbortSignal* arg0);
+-CPP_DECL WebCore::AbortSignal* WebCore__AbortSignal__signal(WebCore::AbortSignal* arg0, JSC::JSGlobalObject*,  uint8_t abortReason);
++CPP_DECL void WebCore__AbortSignal__signal(WebCore::AbortSignal* arg0, JSC::JSGlobalObject*,  uint8_t abortReason);
+ CPP_DECL JSC::EncodedJSValue WebCore__AbortSignal__toJS(WebCore::AbortSignal* arg0, JSC::JSGlobalObject* arg1);
+ CPP_DECL void WebCore__AbortSignal__unref(WebCore::AbortSignal* arg0);
+ 
 diff --git a/src/jsc/bindings/helpers.h b/src/jsc/bindings/helpers.h
 index ac788968..a387f7cb 100644
 --- a/src/jsc/bindings/helpers.h
@@ -3310,6 +3490,46 @@ index 09464fa4..4b1c4719 100644
  #include <wtf/Vector.h>
  
  namespace WebCore {
+diff --git a/src/jsc/bindings/webcore/JSMessageEvent.cpp b/src/jsc/bindings/webcore/JSMessageEvent.cpp
+index 19bb33fc..9aa864cf 100644
+--- a/src/jsc/bindings/webcore/JSMessageEvent.cpp
++++ b/src/jsc/bindings/webcore/JSMessageEvent.cpp
+@@ -45,7 +45,7 @@
+ #include "ScriptExecutionContext.h"
+ #include "WebCoreJSClientData.h"
+ 
+-extern "C" BunString Bun__inspect_singleline(JSC::JSGlobalObject* globalObject, JSC::JSValue value);
++extern "C" BunString Bun__inspect_singleline(JSC::JSGlobalObject* globalObject, JSC::EncodedJSValue value);
+ #include <JavaScriptCore/HeapAnalyzer.h>
+ #include <JavaScriptCore/JSArray.h>
+ #include <JavaScriptCore/JSCInlines.h>
+@@ -163,7 +163,7 @@ template<> MessageEvent::Init convertDictionary<MessageEvent::Init>(JSGlobalObje
+             iterable = iterFn.isCallable();
+         }
+         if (!iterable) {
+-            auto inspected = Bun__inspect_singleline(&lexicalGlobalObject, portsValue).transferToWTFString();
++            auto inspected = Bun__inspect_singleline(&lexicalGlobalObject, JSC::JSValue::encode(portsValue)).transferToWTFString();
+             RETURN_IF_EXCEPTION(throwScope, {});
+             throwTypeError(&lexicalGlobalObject, throwScope, makeString("MessageEvent constructor: eventInitDict.ports ("_s, inspected, ") is not iterable."_s));
+             return {};
+@@ -173,7 +173,7 @@ template<> MessageEvent::Init convertDictionary<MessageEvent::Init>(JSGlobalObje
+             auto scope = DECLARE_THROW_SCOPE(vm);
+             auto* wrapped = item.isCell() ? JSMessagePort::toWrapped(vm, item) : nullptr;
+             if (!wrapped) {
+-                auto inspected = Bun__inspect_singleline(&g, item).transferToWTFString();
++                auto inspected = Bun__inspect_singleline(&g, JSC::JSValue::encode(item)).transferToWTFString();
+                 RETURN_IF_EXCEPTION(scope, );
+                 throwTypeError(&g, scope, makeString("MessageEvent constructor: Expected eventInitDict.ports["_s, i, "] (\""_s, inspected, "\") to be an instance of MessagePort."_s));
+                 return;
+@@ -193,7 +193,7 @@ template<> MessageEvent::Init convertDictionary<MessageEvent::Init>(JSGlobalObje
+     }
+     if (!sourceValue.isUndefinedOrNull()) {
+         result.source = convert<IDLNullable<IDLInterface<MessagePort>>>(lexicalGlobalObject, sourceValue, [&sourceValue](JSGlobalObject& lexicalGlobalObject, ThrowScope& throwScope) {
+-            auto inspected = Bun__inspect_singleline(&lexicalGlobalObject, sourceValue).transferToWTFString();
++            auto inspected = Bun__inspect_singleline(&lexicalGlobalObject, JSC::JSValue::encode(sourceValue)).transferToWTFString();
+             if (throwScope.exception()) [[unlikely]]
+                 return;
+             throwTypeError(&lexicalGlobalObject, throwScope, makeString("MessageEvent constructor: Expected eventInitDict.source (\""_s, inspected, "\") to be an instance of MessagePort."_s));
 diff --git a/src/jsc/bindings/webcore/JSWasmStreamingCompiler.cpp b/src/jsc/bindings/webcore/JSWasmStreamingCompiler.cpp
 index befcdaab..034b1f28 100644
 --- a/src/jsc/bindings/webcore/JSWasmStreamingCompiler.cpp
@@ -3509,6 +3729,21 @@ index b24970a2..40381271 100644
              exportValues.append(value);
          }
      };
+diff --git a/src/jsc/virtual_machine_exports.rs b/src/jsc/virtual_machine_exports.rs
+index c81f5f14..a4e6194e 100644
+--- a/src/jsc/virtual_machine_exports.rs
++++ b/src/jsc/virtual_machine_exports.rs
+@@ -72,6 +72,10 @@ pub fn is_bun_main(global: &JSGlobalObject, str: &BunString) -> bool {
+ }
+ 
+ // HOST_EXPORT(Bun__reportUnhandledError, c)
++// NOTE: JSC's prebuilt code references this as `-> void` but the generated host
++// export wrapper returns JSValue, so it stays signature-mismatched on wasm32
++// (only reachable on VM-level unhandled rejections). Fixing it needs the
++// host-export codegen to emit a void return.
+ pub fn report_unhandled_error(global: &JSGlobalObject, value: JSValue) -> JSValue {
+     crate::mark_binding!();
+ 
 diff --git a/src/libarchive/lib.rs b/src/libarchive/lib.rs
 index 3965e9b4..6c30a3d8 100644
 --- a/src/libarchive/lib.rs
