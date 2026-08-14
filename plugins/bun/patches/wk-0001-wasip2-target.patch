@@ -3466,6 +3466,32 @@ index 0c2c99a1..4c2de2a9 100644
  #include "NodeVM.h"
  #include "SigintWatcher.h"
  
+diff --git a/src/jsc/bindings/webcore/AbortSignal.cpp b/src/jsc/bindings/webcore/AbortSignal.cpp
+index 88a58421..a9d5702f 100644
+--- a/src/jsc/bindings/webcore/AbortSignal.cpp
++++ b/src/jsc/bindings/webcore/AbortSignal.cpp
+@@ -368,4 +368,5 @@ void AbortSignal::visitAbortAlgorithms(Visitor& visitor)
+ template void AbortSignal::visitAbortAlgorithms(JSC::AbstractSlotVisitor&);
+ template void AbortSignal::visitAbortAlgorithms(JSC::SlotVisitor&);
+ 
++
+ } // namespace WebCore
+diff --git a/src/jsc/bindings/webcore/BunScriptWrappableWrapper.cpp b/src/jsc/bindings/webcore/BunScriptWrappableWrapper.cpp
+new file mode 100644
+index 00000000..1d1aa14e
+--- /dev/null
++++ b/src/jsc/bindings/webcore/BunScriptWrappableWrapper.cpp
+@@ -0,0 +1,10 @@
++// Out-of-line definition of the inline ScriptWrappable::wrapper(). WebCore inlines
++// it everywhere, so no TU emits the out-of-line body — but non-inlined references
++// (e.g. AbortSignal::markAborted) need the symbol. Defined here without including
++// ScriptWrappableInlines.h to avoid an inline redefinition.
++#include "root.h"
++#include "ScriptWrappable.h"
++#include <JavaScriptCore/WeakInlines.h>
++namespace WebCore {
++JSDOMObject* ScriptWrappable::wrapper() const { return m_wrapper.get(); }
++}
 diff --git a/src/jsc/bindings/webcore/EventContext.cpp b/src/jsc/bindings/webcore/EventContext.cpp
 index b618b830..448cd541 100644
 --- a/src/jsc/bindings/webcore/EventContext.cpp

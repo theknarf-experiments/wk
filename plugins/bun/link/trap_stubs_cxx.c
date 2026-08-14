@@ -11,5 +11,3 @@ void s1(void) __asm__("_ZN3Bun28setupJSWebViewClassStructureERN3JSC18LazyClassSt
 void s1(void){__builtin_trap();}
 void s2(void) __asm__("_ZN3Bun4toJSEPN3JSC14JSGlobalObjectEPN3Zig12GlobalObjectERNS_18WebViewEventTargetE");
 void s2(void){__builtin_trap();}
-void s3(void) __asm__("_ZNK7WebCore15ScriptWrappable7wrapperEv");
-void s3(void){__builtin_trap();}
