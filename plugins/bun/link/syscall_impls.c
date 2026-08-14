@@ -11,3 +11,8 @@ int eventfd(unsigned int initval, int flags) {
     if (fd < 0) { errno = EMFILE; return -1; }
     return fd;
 }
+// WebView teardown hooks fire on every VM exit; there is no native webview on
+// wasi, so they are genuine no-ops (not the trapping stubs the rest of the
+// inert webview surface gets).
+void Bun__WebView__closeAllForTermination(void) {}
+void Bun__WebViewHost__childDied(void) {}

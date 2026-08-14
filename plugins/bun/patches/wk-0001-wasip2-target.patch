@@ -3081,6 +3081,57 @@ index 1ead5980..3584d2ac 100644
  #else
  
  #error "TODO"
+diff --git a/src/jsc/bindings/helpers.h b/src/jsc/bindings/helpers.h
+index ac788968..a387f7cb 100644
+--- a/src/jsc/bindings/helpers.h
++++ b/src/jsc/bindings/helpers.h
+@@ -31,10 +31,22 @@ namespace Zig {
+ // we tag the final two bits
+ // so 56 bits are copied over
+ // rest we zero out for consistentcy
++// ZigString pointer tags live in the TOP bits of the pointer. On 64-bit those
++// are bits 63/62/61 (UTF16/external/UTF8); on wasm32 (32-bit pointers, heap
++// kept < 256 MB) they shift down to 31/30/29 — width-relative to the top bit,
++// matching the Rust side (`bun_core::String`, whose 64-bit bits 61-63 map to
++// 29-31 on 32-bit). Using a hardcoded `1 << 63` on wasm32 would never touch a
++// 32-bit pointer, so `untag` would leave the tag bits set and every ZigString
++// deref would read out of bounds.
++static constexpr unsigned kZigPtrTopBit = sizeof(uintptr_t) * 8 - 1; // 63 or 31
+ static const unsigned char* untag(const unsigned char* ptr)
+ {
+-    return reinterpret_cast<const unsigned char*>(
+-        (((reinterpret_cast<uintptr_t>(ptr) & ~(static_cast<uint64_t>(1) << 63) & ~(static_cast<uint64_t>(1) << 62)) & ~(static_cast<uint64_t>(1) << 61)) & ~(static_cast<uint64_t>(1) << 60)));
++    uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
++    p &= ~(static_cast<uintptr_t>(1) << kZigPtrTopBit);
++    p &= ~(static_cast<uintptr_t>(1) << (kZigPtrTopBit - 1));
++    p &= ~(static_cast<uintptr_t>(1) << (kZigPtrTopBit - 2));
++    p &= ~(static_cast<uintptr_t>(1) << (kZigPtrTopBit - 3));
++    return reinterpret_cast<const unsigned char*>(p);
+ }
+ 
+ static void* untagVoid(const unsigned char* ptr)
+@@ -49,18 +61,18 @@ static void* untagVoid(const char16_t* ptr)
+ 
+ static bool isTaggedUTF16Ptr(const unsigned char* ptr)
+ {
+-    return (reinterpret_cast<uintptr_t>(ptr) & (static_cast<uint64_t>(1) << 63)) != 0;
++    return (reinterpret_cast<uintptr_t>(ptr) & (static_cast<uintptr_t>(1) << kZigPtrTopBit)) != 0;
+ }
+ 
+ // Do we need to convert the string from UTF-8 to UTF-16?
+ static bool isTaggedUTF8Ptr(const unsigned char* ptr)
+ {
+-    return (reinterpret_cast<uintptr_t>(ptr) & (static_cast<uint64_t>(1) << 61)) != 0;
++    return (reinterpret_cast<uintptr_t>(ptr) & (static_cast<uintptr_t>(1) << (kZigPtrTopBit - 2))) != 0;
+ }
+ 
+ static bool isTaggedExternalPtr(const unsigned char* ptr)
+ {
+-    return (reinterpret_cast<uintptr_t>(ptr) & (static_cast<uint64_t>(1) << 62)) != 0;
++    return (reinterpret_cast<uintptr_t>(ptr) & (static_cast<uintptr_t>(1) << (kZigPtrTopBit - 1))) != 0;
+ }
+ 
+ static void free_global_string(void* str, void* ptr, unsigned len)
 diff --git a/src/jsc/bindings/napi.cpp b/src/jsc/bindings/napi.cpp
 index e7f5eebd..86ec29bc 100644
 --- a/src/jsc/bindings/napi.cpp
