@@ -38,6 +38,20 @@ index 3c3f997a..6bac483b 100644
  ]
  # `vendor/lolhtml` (the `lol_html` crate) is a non-member path dependency,
  # fetched into `vendor/` by `scripts/build/deps/lolhtml.ts` before cargo runs.
+diff --git a/packages/bun-usockets/src/internal/loop_data.h b/packages/bun-usockets/src/internal/loop_data.h
+index 3937ea5d..6f49ec61 100644
+--- a/packages/bun-usockets/src/internal/loop_data.h
++++ b/packages/bun-usockets/src/internal/loop_data.h
+@@ -28,6 +28,9 @@ typedef uint32_t zig_mutex_t;
+ #elif defined(_WIN32)
+ // SRWLOCK
+ typedef void* zig_mutex_t;
++#elif defined(__wasi__)
++// Single-threaded wasm guest: no real mutex needed.
++typedef uint32_t zig_mutex_t;
+ #else
+ #error "Unsupported platform"
+ #endif
 diff --git a/src/analytics/lib.rs b/src/analytics/lib.rs
 index 07fa5303..c3c5ab72 100644
 --- a/src/analytics/lib.rs
@@ -2127,6 +2141,18 @@ index 44ca97cd..994d0309 100644
  
      #[inline(always)]
      fn slot_ptr(this: NonNull<Impl>) -> *mut crate::DecodedJSValue {
+diff --git a/src/jsc/bindings/napi.h b/src/jsc/bindings/napi.h
+index 05b95066..c0153e3e 100644
+--- a/src/jsc/bindings/napi.h
++++ b/src/jsc/bindings/napi.h
+@@ -9,6 +9,7 @@
+ #include "BunClientData.h"
+ #include <JavaScriptCore/CallFrame.h>
+ #include "node_api.h"
++#include <vector>
+ #include <JavaScriptCore/JSWeakValue.h>
+ #include "JSFFIFunction.h"
+ #include "ZigGlobalObject.h"
 diff --git a/src/jsc/event_loop.rs b/src/jsc/event_loop.rs
 index aa9643fe..591679ef 100644
 --- a/src/jsc/event_loop.rs
