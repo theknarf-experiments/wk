@@ -1852,27 +1852,27 @@ index 477a2f42..45ec7d1e 100644
  const _: () = assert!(
      cfg!(target_endian = "little"),
 diff --git a/src/jsc/FFI.rs b/src/jsc/FFI.rs
-index cba54c82..cca49262 100644
+index cba54c82..2c8239cc 100644
 --- a/src/jsc/FFI.rs
 +++ b/src/jsc/FFI.rs
-@@ -8,7 +8,9 @@
+@@ -8,7 +8,8 @@
  
  #![allow(non_snake_case, non_upper_case_globals, clippy::missing_safety_doc)]
  
 -use core::ffi::{c_int, c_longlong, c_void};
 +use core::ffi::c_void;
-+#[cfg(target_pointer_width = "64")]
 +use core::ffi::{c_int, c_longlong};
  
  use bun_jsc::JSValue;
  
-@@ -48,5 +50,7 @@ const TRUE_I64: i64 = ((2 | 4) | 1) as i64;
+@@ -48,5 +49,8 @@ const TRUE_I64: i64 = ((2 | 4) | 1) as i64;
  static ValueTrue: bun_core::RacyCell<EncodedJSValue> =
      bun_core::RacyCell::new(EncodedJSValue { as_int64: TRUE_I64 });
  
-+#[cfg(target_pointer_width = "64")]
++// The WebKit fork uses JSVALUE64 on every target (its EncodedValueDescriptor is
++// an unconditional `union { int64_t; JSCell*; }`), so wasm32 boxes doubles with
++// the same offset — see `JSValue.rs`.
  const DOUBLE_ENCODE_OFFSET_BIT: c_int = 49;
-+#[cfg(target_pointer_width = "64")]
  pub(crate) const DOUBLE_ENCODE_OFFSET: c_longlong = (1 as c_longlong) << DOUBLE_ENCODE_OFFSET_BIT;
 diff --git a/src/jsc/JSGlobalObject.rs b/src/jsc/JSGlobalObject.rs
 index 032eacd0..d34275de 100644
@@ -1892,7 +1892,7 @@ index 032eacd0..d34275de 100644
  
      pub fn throw_invalid_arguments(&self, args: Arguments<'_>) -> JsError {
 diff --git a/src/jsc/JSValue.rs b/src/jsc/JSValue.rs
-index ed019c91..1e64e281 100644
+index ed019c91..7617c42e 100644
 --- a/src/jsc/JSValue.rs
 +++ b/src/jsc/JSValue.rs
 @@ -13,8 +13,11 @@ use crate::array_buffer::MarkedArrayBuffer_deallocator;
@@ -1902,8 +1902,8 @@ index ed019c91..1e64e281 100644
 -    bun_string_jsc, ffi, host_fn,
 +    bun_string_jsc, host_fn,
  };
-+// Only the JSVALUE64 double decode reads DOUBLE_ENCODE_OFFSET.
-+#[cfg(target_pointer_width = "64")]
++// The double decode reads DOUBLE_ENCODE_OFFSET. The WebKit fork is JSVALUE64 on
++// every target, so this is used on wasm32 too.
 +use crate::ffi;
  
  /// ABI-compatible with `EncodedJSValue` (`#[repr(transparent)]` over the
@@ -1925,38 +1925,18 @@ index ed019c91..1e64e281 100644
  
  const _: () = assert!(
      core::mem::size_of::<JSValue>() == core::mem::size_of::<i64>(),
-@@ -41,39 +52,65 @@ const _: () = assert!(
+@@ -41,6 +52,10 @@ const _: () = assert!(
  impl JSValue {
      /// Typically means an exception was thrown.
      pub const ZERO: JSValue = JSValue(0, PhantomData);
-+    #[cfg(target_pointer_width = "64")]
++    // JSVALUE64 immediates (ValueUndefined=0xa NULL=0x2 TRUE=0x7 FALSE=0x6).
++    // The WebKit fork is JSVALUE64 on every target (its EncodedValueDescriptor is
++    // an unconditional `union { int64_t; JSCell*; }`), so wasm32 uses these too —
++    // it just stores the 64-bit word in a `u64` rather than a `usize`.
      pub const UNDEFINED: JSValue = JSValue(0xa, PhantomData);
-+    #[cfg(target_pointer_width = "64")]
      pub const NULL: JSValue = JSValue(0x2, PhantomData);
-+    #[cfg(target_pointer_width = "64")]
      pub const TRUE: JSValue = JSValue(0x7, PhantomData);
-+    #[cfg(target_pointer_width = "64")]
-     pub const FALSE: JSValue = JSValue(0x6, PhantomData);
-+    // JSVALUE32_64 (JSCJSValue.h): tag in the high word, payload low.
-+    // UndefinedTag=0xfffffffc NullTag=0xfffffffd BooleanTag=0xfffffffe.
-+    #[cfg(target_pointer_width = "32")]
-+    pub const UNDEFINED: JSValue = JSValue(0xfffffffc_00000000, PhantomData);
-+    #[cfg(target_pointer_width = "32")]
-+    pub const NULL: JSValue = JSValue(0xfffffffd_00000000, PhantomData);
-+    #[cfg(target_pointer_width = "32")]
-+    pub const TRUE: JSValue = JSValue(0xfffffffe_00000001, PhantomData);
-+    #[cfg(target_pointer_width = "32")]
-+    pub const FALSE: JSValue = JSValue(0xfffffffe_00000000, PhantomData);
- 
-     /// `JSC::JSValue::ValueDeleted` (0x4) — sentinel returned by
-     /// `getIfPropertyExistsImpl` / `fastGet` when the property does not exist.
-     /// Deleted is a special encoding used in JSC hash-map internals for the
-     /// null state; it is re-used here for "not present".
-+    #[cfg(target_pointer_width = "64")]
-     pub(crate) const PROPERTY_DOES_NOT_EXIST: JSValue = JSValue(0x4, PhantomData);
-+    // DeletedValueTag = 0xfffffff9.
-+    #[cfg(target_pointer_width = "32")]
-+    pub(crate) const PROPERTY_DOES_NOT_EXIST: JSValue = JSValue(0xfffffff9_00000000, PhantomData);
+@@ -54,25 +69,27 @@ impl JSValue {
  
      /// Construct a JSValue from an opaque encoded bit-pattern.
      #[inline]
@@ -1978,25 +1958,19 @@ index ed019c91..1e64e281 100644
  
 -    /// Wrap a JSCell pointer as a JSValue (cell-tagged JSValues *are* the
 -    /// pointer — `NotCellMask` bits are zero). Mirrors `JSValue.fromCell`.
-+    /// Wrap a JSCell pointer as a JSValue. On JSVALUE64 cell-tagged values
-+    /// *are* the pointer (`NotCellMask` bits zero); JSVALUE32_64 adds the
-+    /// CellTag high word. Mirrors `JSValue.fromCell`.
-+    #[cfg(target_pointer_width = "64")]
++    /// Wrap a JSCell pointer as a JSValue. On JSVALUE64 cell values *are* the
++    /// pointer (`NotCellMask` bits zero). On wasm32 the 32-bit pointer is
++    /// zero-extended into the 64-bit word (high word 0), matching the fork's
++    /// `union { int64_t; JSCell*; }`. Mirrors `JSValue.fromCell`.
      #[inline]
      pub fn from_cell<T>(cell: *const T) -> JSValue {
          debug_assert!(!cell.is_null());
-         JSValue(cell as usize, PhantomData)
+-        JSValue(cell as usize, PhantomData)
++        JSValue(cell as usize as EncodedBits, PhantomData)
      }
-+    #[cfg(target_pointer_width = "32")]
-+    #[inline]
-+    pub fn from_cell<T>(cell: *const T) -> JSValue {
-+        debug_assert!(!cell.is_null());
-+        JSValue((0xfffffffbu64 << 32) | (cell as usize as u64), PhantomData)
-+    }
  
      /// `JSValue.fromPtrAddress` — encode an arbitrary native pointer as a JS
-     /// number (round-trips via `as_promise_ptr`). Used to smuggle a `*mut T`
-@@ -185,7 +222,7 @@ impl JSValue {
+@@ -185,7 +202,7 @@ impl JSValue {
      /// Reinterpret a raw pointer's address as a JSValue bit-pattern.
      #[inline]
      pub fn cast<T>(ptr: *const T) -> JSValue {
@@ -2005,131 +1979,38 @@ index ed019c91..1e64e281 100644
      }
  }
  
-@@ -209,10 +246,17 @@ impl JSValue {
-     pub fn is_null(self) -> bool {
-         self.0 == Self::NULL.0
-     }
-+    #[cfg(target_pointer_width = "64")]
-     #[inline]
-     pub fn is_undefined_or_null(self) -> bool {
-         (self.0 | 0x8) == 0xa
-     }
-+    #[cfg(target_pointer_width = "32")]
-+    #[inline]
-+    pub fn is_undefined_or_null(self) -> bool {
-+        // UndefinedTag | 1 == NullTag.
-+        (self.tag() | 1) == 0xfffffffd
-+    }
-     #[inline]
-     pub fn is_empty_or_undefined_or_null(self) -> bool {
-         self.is_empty() || self.is_undefined_or_null()
-@@ -221,22 +265,47 @@ impl JSValue {
-     pub fn is_boolean(self) -> bool {
-         self.0 == Self::TRUE.0 || self.0 == Self::FALSE.0
-     }
-+    #[cfg(target_pointer_width = "64")]
+@@ -224,17 +241,17 @@ impl JSValue {
      #[inline]
      pub fn is_cell(self) -> bool {
          // NotCellMask = NumberTag | OtherTag (0xfffe_0000_0000_0000 | 0x2).
-         const NOT_CELL_MASK: usize = 0xfffe_0000_0000_0002;
+-        const NOT_CELL_MASK: usize = 0xfffe_0000_0000_0002;
++        const NOT_CELL_MASK: EncodedBits = 0xfffe_0000_0000_0002;
          !self.is_empty() && (self.0 & NOT_CELL_MASK) == 0
      }
-+    #[cfg(target_pointer_width = "32")]
-+    #[inline]
-+    pub fn is_cell(self) -> bool {
-+        self.tag() == 0xfffffffb // CellTag
-+    }
-+    #[cfg(target_pointer_width = "64")]
      #[inline]
      pub fn is_int32(self) -> bool {
-         const NUMBER_TAG: usize = 0xfffe_0000_0000_0000;
+-        const NUMBER_TAG: usize = 0xfffe_0000_0000_0000;
++        const NUMBER_TAG: EncodedBits = 0xfffe_0000_0000_0000;
          (self.0 & NUMBER_TAG) == NUMBER_TAG
      }
-+    #[cfg(target_pointer_width = "32")]
-+    #[inline]
-+    pub fn is_int32(self) -> bool {
-+        self.tag() == 0xffffffff // Int32Tag
-+    }
-+    #[cfg(target_pointer_width = "64")]
      #[inline]
      pub fn is_number(self) -> bool {
-         const NUMBER_TAG: usize = 0xfffe_0000_0000_0000;
+-        const NUMBER_TAG: usize = 0xfffe_0000_0000_0000;
++        const NUMBER_TAG: EncodedBits = 0xfffe_0000_0000_0000;
          (self.0 & NUMBER_TAG) != 0
      }
-+    #[cfg(target_pointer_width = "32")]
-+    #[inline]
-+    pub fn is_number(self) -> bool {
-+        // Doubles are any tag below LowestTag (DeletedValueTag = 0xfffffff9).
-+        self.is_int32() || self.tag() < 0xfffffff9
-+    }
-+    /// JSVALUE32_64's high word.
-+    #[cfg(target_pointer_width = "32")]
-+    #[inline]
-+    pub(crate) fn tag(self) -> u32 {
-+        (self.0 >> 32) as u32
-+    }
      #[inline]
-     pub fn is_double(self) -> bool {
-         self.is_number() && !self.is_int32()
-@@ -467,12 +536,18 @@ impl JSValue {
-     pub fn js_boolean(b: bool) -> JSValue {
-         if b { Self::TRUE } else { Self::FALSE }
-     }
-+    #[cfg(target_pointer_width = "64")]
+@@ -470,8 +487,8 @@ impl JSValue {
      #[inline]
      pub fn js_number_from_int32(i: i32) -> JSValue {
          // NumberTag | i (low 32 bits).
-         const NUMBER_TAG: usize = 0xfffe_0000_0000_0000;
-         JSValue(NUMBER_TAG | (i as u32 as usize), PhantomData)
+-        const NUMBER_TAG: usize = 0xfffe_0000_0000_0000;
+-        JSValue(NUMBER_TAG | (i as u32 as usize), PhantomData)
++        const NUMBER_TAG: EncodedBits = 0xfffe_0000_0000_0000;
++        JSValue(NUMBER_TAG | (i as u32 as EncodedBits), PhantomData)
      }
-+    #[cfg(target_pointer_width = "32")]
-+    #[inline]
-+    pub fn js_number_from_int32(i: i32) -> JSValue {
-+        JSValue((0xffffffffu64 << 32) | u64::from(i as u32), PhantomData)
-+    }
      pub fn js_number_from_uint64(i: u64) -> JSValue {
          if i <= i32::MAX as u64 {
-             Self::js_number_from_int32(i as i32)
-@@ -510,11 +585,19 @@ impl JSValue {
-     /// *always* as a double-encoded immediate (no int32 fast path). Required
-     /// when the consumer round-trips through `f64::to_bits` / `as_number` and
-     /// must see the original bit pattern (e.g. [`from_ptr_address`]).
-+    #[cfg(target_pointer_width = "64")]
-     #[inline]
-     pub(crate) fn js_double_number(n: f64) -> JSValue {
-         const DOUBLE_ENCODE_OFFSET: i64 = 1i64 << 49;
-         JSValue::from_raw((n.to_bits() as i64).wrapping_add(DOUBLE_ENCODE_OFFSET))
-     }
-+    #[cfg(target_pointer_width = "32")]
-+    #[inline]
-+    pub(crate) fn js_double_number(n: f64) -> JSValue {
-+        // JSVALUE32_64 stores doubles unboxed; purifyNaN keeps the tag space
-+        // (high word >= LowestTag) unreachable.
-+        JSValue(Self::purify_nan(n).to_bits(), PhantomData)
-+    }
-     pub fn js_empty_string(global: &JSGlobalObject) -> JSValue {
-         JSC__JSValue__jsEmptyString(global)
-     }
-@@ -722,12 +805,19 @@ impl JSValue {
-         debug_assert!(self.is_int32());
-         (self.0 & 0xffff_ffff) as u32 as i32
-     }
-+    #[cfg(target_pointer_width = "64")]
-     #[inline]
-     pub fn as_double(self) -> f64 {
-         debug_assert!(self.is_double());
-         // Subtract DoubleEncodeOffset, bitcast to f64.
-         f64::from_bits((self.0 as i64).wrapping_sub(ffi::DOUBLE_ENCODE_OFFSET) as u64)
-     }
-+    #[cfg(target_pointer_width = "32")]
-+    #[inline]
-+    pub fn as_double(self) -> f64 {
-+        debug_assert!(self.is_double());
-+        f64::from_bits(self.0)
-+    }
-     /// Asserts this is a number, undefined, null, or a boolean.
-     pub fn as_number(self) -> f64 {
-         if self.is_int32() {
 diff --git a/src/jsc/StringBuilder.rs b/src/jsc/StringBuilder.rs
 index 8161b439..84732916 100644
 --- a/src/jsc/StringBuilder.rs
