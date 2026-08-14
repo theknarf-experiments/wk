@@ -2360,6 +2360,64 @@ index 700eb630..edecdc65 100644
  impl bun_io::pipe_writer::PosixStreamingWriterParent for Terminal {
      const POLL_OWNER_TAG: bun_io::PollTag = bun_io::posix_event_loop::poll_tag::TERMINAL_POLL;
      const HAS_ON_READY: bool = true;
+diff --git a/src/runtime/api/bun/js_bun_spawn_bindings.rs b/src/runtime/api/bun/js_bun_spawn_bindings.rs
+index 698ea540..b6bedfd5 100644
+--- a/src/runtime/api/bun/js_bun_spawn_bindings.rs
++++ b/src/runtime/api/bun/js_bun_spawn_bindings.rs
+@@ -18,12 +18,14 @@ use bun_jsc::{JsCell, SysErrorJsc as _};
+ #[cfg(unix)]
+ use bun_sys::Fd;
+ use bun_sys::UV_E;
+-use bun_sys::{self as sys, FdExt as _, SignalCode};
++use bun_sys::{self as sys, SignalCode};
++#[cfg(not(target_os = "wasi"))]
++use bun_sys::FdExt as _;
+ 
+ // Process / spawn machinery is local to this crate (api/bun/process.rs).
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ use crate::api::bun_process::ExtraPipe;
+-#[cfg(not(windows))]
++#[cfg(any(unix, target_os = "wasi"))]
+ use crate::api::bun_process::SpawnResultExt as _;
+ use crate::api::bun_process::{self as spawn, CStrPtr, Process, Rusage, SpawnOptions};
+ // User-facing JS `Stdio` enum (extract/as_spawn_option/is_piped).
+@@ -808,7 +810,7 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
+                                 "terminal slave fd is no longer valid"
+                             )));
+                         }
+-                        #[cfg(not(unix))]
++                        #[cfg(windows)]
+                         if term.get_pseudoconsole().is_none() {
+                             return Err(global_this.throw_invalid_arguments(format_args!(
+                                 "terminal pseudoconsole is no longer valid"
+@@ -871,7 +873,7 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
+                         stdio[1] = Stdio::Fd(slave_fd);
+                         stdio[2] = Stdio::Fd(slave_fd);
+                     }
+-                    #[cfg(not(unix))]
++                    #[cfg(windows)]
+                     {
+                         // On Windows, ConPTY supplies stdio via PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE.
+                         // Set stdio to .ignore so spawnProcessWindows doesn't allocate pipes.
+@@ -1411,7 +1413,7 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
+                     }
+                 }
+             }
+-            #[cfg(not(unix))]
++            #[cfg(windows)]
+             {
+                 use bun_libuv_sys::UvHandle as _;
+                 for r in [spawned_stdout, spawned_stderr] {
+@@ -1582,7 +1584,7 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
+                 v[usize::try_from(ipc_channel).expect("int cast")] = ExtraPipe::Unavailable;
+             });
+         }
+-        #[cfg(not(unix))]
++        #[cfg(windows)]
+         {
+             use crate::node::MaybeExt as _;
+             let idx = usize::try_from(ipc_channel).expect("int cast");
 diff --git a/src/runtime/cli/bunx_command.rs b/src/runtime/cli/bunx_command.rs
 index 15e2b228..6730c1eb 100644
 --- a/src/runtime/cli/bunx_command.rs
@@ -2452,6 +2510,27 @@ index 72c9fd15..4c3d644a 100644
          {
              self.stdout_reader
                  .reader
+diff --git a/src/runtime/node/StatFS.rs b/src/runtime/node/StatFS.rs
+index daf0254f..a248a493 100644
+--- a/src/runtime/node/StatFS.rs
++++ b/src/runtime/node/StatFS.rs
+@@ -66,6 +66,7 @@ macro_rules! define_statfs_type {
+                     target_os = "android",
+                     target_os = "macos",
+                     target_os = "freebsd",
++                    target_os = "wasi",
+                     windows
+                 ))]
+                 let (fstype_, bsize_, blocks_, bfree_, bavail_, files_, ffree_) = (
+@@ -83,8 +84,6 @@ macro_rules! define_statfs_type {
+                 let frsize_ = statfs_.f_frsize;
+                 #[cfg(not(target_os = "linux"))]
+                 let frsize_ = bsize_;
+-                #[cfg(target_arch = "wasm32")]
+-                compile_error!("Unsupported OS");
+ 
+                 // Platform field types vary (u32/i64/u64); `as i64` is lossless
+                 // for the in-range values statfs reports.
 diff --git a/src/runtime/node/node_fs.rs b/src/runtime/node/node_fs.rs
 index 6046c4ad..e0c40c2b 100644
 --- a/src/runtime/node/node_fs.rs
