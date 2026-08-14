@@ -80,6 +80,16 @@ await $`bun ${dir}/bun/src/codegen/generate-host-exports.ts ${dir}/codegen`.cwd(
 // strips the `namespace JSC` wrapper the raw perl adds — the .cpp reference
 // the tables unqualified). TARGET_PLATFORM=linux matches the runtime codegen.
 await $`bun ${dir}/bun/src/codegen/bindgen.ts --codegen-root=${dir}/codegen`.cwd(dir + "/bun");
+// bindgenv2 is a *separate* generator (src/codegen/bindgenv2/script.ts) driven
+// off `.bindv2.ts` option-structs (SSLConfig, SocketConfig, FakeTimersConfig).
+// It emits the `bindgenConvertJSTo<Name>` C++ shims that `src/jsc/generated.rs`
+// declares extern — without it those symbols are undefined and every
+// Bun.serve/listen/connect config parse traps. Sources must be absolute.
+const bindv2Sources = (await $`bash -c ${"find " + dir + "/bun/src -name '*.bindv2.ts'"}`.text())
+  .trim()
+  .split("\n")
+  .join(",");
+await $`bun ${dir}/bun/src/codegen/bindgenv2/script.ts --command=generate --sources=${bindv2Sources} --codegen-path=${dir}/codegen`.cwd(dir + "/bun");
 const lutPairs: [string, string][] = [
   ["src/jsc/bindings/BunObject.cpp", "BunObject.lut.h"],
   ["src/jsc/bindings/ZigGlobalObject.lut.txt", "ZigGlobalObject.lut.h"],

@@ -2,9 +2,6 @@
 #include <stddef.h>
 void __archive_read_program(void) {}
 void ares_tvnow(void) {}
-void bindgenConvertJSToSocketConfig(void) {}
-void bindgenConvertJSToSocketConfigHandlers(void) {}
-void bindgenConvertJSToSSLConfig(void) {}
 void chown(void) {}
 void fchown(void) {}
 void getgid(void) {}
