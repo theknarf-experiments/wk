@@ -4242,7 +4242,7 @@ index 700eb630..a1086fc1 100644
      const POLL_OWNER_TAG: bun_io::PollTag = bun_io::posix_event_loop::poll_tag::TERMINAL_POLL;
      const HAS_ON_READY: bool = true;
 diff --git a/src/runtime/api/bun/js_bun_spawn_bindings.rs b/src/runtime/api/bun/js_bun_spawn_bindings.rs
-index 698ea540..b6bedfd5 100644
+index 698ea540..5f920fb4 100644
 --- a/src/runtime/api/bun/js_bun_spawn_bindings.rs
 +++ b/src/runtime/api/bun/js_bun_spawn_bindings.rs
 @@ -18,12 +18,14 @@ use bun_jsc::{JsCell, SysErrorJsc as _};
@@ -4281,7 +4281,28 @@ index 698ea540..b6bedfd5 100644
                      {
                          // On Windows, ConPTY supplies stdio via PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE.
                          // Set stdio to .ignore so spawnProcessWindows doesn't allocate pipes.
-@@ -1411,7 +1413,7 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
+@@ -1112,6 +1114,20 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
+         None => None,
+     };
+ 
++    // WASI: capturing a child's stdout/stderr into `result.stdout` needs a
++    // reader that drains a seekable fd — bun's pipe reader is a nonblocking
++    // socket and spins under the wasi busy-poll shim (and `Stdio::Pipe`
++    // asserts a capture fd that the wk:exec spawn has no live stream for). So
++    // treat a capture request as `inherit`: the child's output still reaches
++    // the node's log and spawnSync returns a real exit code. (True capture is
++    // a follow-up.)
++    #[cfg(target_os = "wasi")]
++    for slot in stdio[1..3].iter_mut() {
++        if matches!(slot, Stdio::Pipe) {
++            *slot = Stdio::Inherit;
++        }
++    }
++
+     let mut spawn_options = SpawnOptions {
+         // Empty means "inherit the parent's working directory". Only chdir
+         // when the user asked for it: the stored cwd path string can be stale
+@@ -1411,7 +1427,7 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
                      }
                  }
              }
@@ -4290,7 +4311,7 @@ index 698ea540..b6bedfd5 100644
              {
                  use bun_libuv_sys::UvHandle as _;
                  for r in [spawned_stdout, spawned_stderr] {
-@@ -1582,7 +1584,7 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
+@@ -1582,7 +1598,7 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
                  v[usize::try_from(ipc_channel).expect("int cast")] = ExtraPipe::Unavailable;
              });
          }
@@ -5830,7 +5851,7 @@ index 4725121e..498e1b24 100644
  
  #[cfg(windows)]
 diff --git a/src/spawn/process.rs b/src/spawn/process.rs
-index dadd2fbb..0069e873 100644
+index dadd2fbb..9b455aa5 100644
 --- a/src/spawn/process.rs
 +++ b/src/spawn/process.rs
 @@ -1,19 +1,23 @@
@@ -5927,16 +5948,31 @@ index dadd2fbb..0069e873 100644
  pub type Poller = PollerPosix;
  #[cfg(windows)]
  pub type Poller = PollerWindows;
-@@ -1690,17 +1705,25 @@ impl SpawnResultExt for PosixSpawnResult {
+@@ -1690,17 +1705,40 @@ impl SpawnResultExt for PosixSpawnResult {
      }
  }
  
 -#[cfg(unix)]
 +#[cfg(target_os = "wasi")]
 +impl SpawnResultExt for PosixSpawnResult {
-+    fn to_process(self, _event_loop: EventLoopHandle) -> *mut Process {
-+        // spawn_process_posix is ENOSYS on WASI; no result exists to convert.
-+        unreachable!("no processes on WASI")
++    fn to_process(self, event_loop: EventLoopHandle) -> *mut Process {
++        // The child already ran to completion inside `spawn_process_posix`
++        // (blocking `wk:exec`), so it is born already-exited — there is no
++        // `wait4` to reap. Construct the `Process` directly with its final
++        // status so `has_exited()` is true immediately and the sync tick loop
++        // terminates once the captured stdio drains.
++        let status = Status::Exited(Exited {
++            code: (self.wasi_exit_code & 0xff) as u8,
++            signal: 0,
++        });
++        bun_core::heap::into_raw(Box::new(Process {
++            ref_count: bun_ptr::ThreadSafeRefCount::init(),
++            pid: self.pid,
++            event_loop,
++            poller: Poller::Detached,
++            status,
++            exit_handler: ProcessExitHandler::default(),
++        }))
 +    }
 +}
 +
@@ -5956,7 +5992,7 @@ index dadd2fbb..0069e873 100644
  pub type SpawnProcessResult = PosixSpawnResult;
  #[cfg(windows)]
  pub type SpawnProcessResult = WindowsSpawnResult;
-@@ -1709,10 +1732,11 @@ pub type SpawnProcessResult = WindowsSpawnResult;
+@@ -1709,10 +1747,11 @@ pub type SpawnProcessResult = WindowsSpawnResult;
  
  mod spawn_process_body {
      use super::*;
@@ -5970,7 +6006,7 @@ index dadd2fbb..0069e873 100644
  
      /// RAII fd owner — closes the wrapped [`Fd`] on drop iff it is valid.
      /// Used by `sync::spawn_posix` (no-orphans kqueue, ppid pidfd).
-@@ -1754,12 +1778,12 @@ mod spawn_process_body {
+@@ -1754,12 +1793,12 @@ mod spawn_process_body {
          argv: Argv, // [*:null]?[*:0]const u8
          envp: Envp,
      ) -> Result<bun_sys::Result<SpawnProcessResult>, crate::Error> {
@@ -5985,7 +6021,7 @@ index dadd2fbb..0069e873 100644
          {
              spawn_process_windows(options, argv, envp)
          }
-@@ -2264,6 +2288,7 @@ mod spawn_process_body {
+@@ -2264,6 +2303,7 @@ mod spawn_process_body {
          }
  
          impl SyncStdio {
@@ -5993,7 +6029,7 @@ index dadd2fbb..0069e873 100644
              pub(crate) fn to_stdio(self) -> SpawnOptionsStdio {
                  match self {
                      SyncStdio::Inherit => SpawnOptionsStdio::inherit(),
-@@ -2326,6 +2351,7 @@ mod spawn_process_body {
+@@ -2326,6 +2366,7 @@ mod spawn_process_body {
          }
  
          impl Options {
@@ -6001,7 +6037,7 @@ index dadd2fbb..0069e873 100644
              pub(crate) fn to_spawn_options(&self, new_process_group: bool) -> SpawnOptions {
                  SpawnOptions {
                      stdin: self.stdin.to_stdio(),
-@@ -2793,6 +2819,16 @@ mod spawn_process_body {
+@@ -2793,6 +2834,16 @@ mod spawn_process_body {
                  return spawn_windows_with_pipes(options, argv, envp);
              }
  
@@ -6032,7 +6068,7 @@ index 397ec3a5..26b23436 100644
  #[cfg(windows)]
  pub use spawn_process::uv_getrusage;
 diff --git a/src/spawn_sys/spawn_process.rs b/src/spawn_sys/spawn_process.rs
-index 3cd940e2..e68ccf19 100644
+index 3cd940e2..0641cd81 100644
 --- a/src/spawn_sys/spawn_process.rs
 +++ b/src/spawn_sys/spawn_process.rs
 @@ -14,19 +14,19 @@ use core::sync::atomic::Ordering;
@@ -6106,7 +6142,7 @@ index 3cd940e2..e68ccf19 100644
      // `tv_sec`/`tv_usec` are `i64` on linux but `i32` on darwin (`suseconds_t`);
      // the `as i64` is required for the latter and a no-op on the former.
      #[inline]
-@@ -462,7 +492,7 @@ pub struct PosixSpawnResult {
+@@ -462,12 +492,18 @@ pub struct PosixSpawnResult {
      pub stdin: Option<Fd>,
      pub stdout: Option<Fd>,
      pub stderr: Option<Fd>,
@@ -6115,23 +6151,198 @@ index 3cd940e2..e68ccf19 100644
      pub(crate) ipc: Option<Fd>,
      pub extra_pipes: Vec<ExtraPipe>,
      pub memfds: [bool; 3],
-@@ -644,6 +674,21 @@ impl Drop for PosixSpawnFdGuard {
+     // ESRCH can happen when requesting the pidfd
+     pub has_exited: bool,
++    /// WASI only: the child runs to completion *inside* `spawn_process_posix`
++    /// (blocking `wk:exec`), so its exit code is known at spawn time — there is
++    /// no `wait4` to reap it later. `SpawnResultExt::to_process` reads this to
++    /// build an already-`Exited` `Process`.
++    #[cfg(target_os = "wasi")]
++    pub wasi_exit_code: i32,
+ }
+ 
+ /// Entry in `extra_pipes` for a stdio slot at index >= 3.
+@@ -639,11 +675,185 @@ impl Drop for PosixSpawnFdGuard {
+     }
+ }
+ 
++/// `wk:exec` result record — mirrors `wk_result` in
++/// `plugins/exec-compat/wkexec.h`. The `*_data` buffers are malloc'd by the
++/// shim and owned by us until `wk_result_free`.
++#[cfg(target_os = "wasi")]
++#[repr(C)]
++struct WkResult {
++    exit_code: core::ffi::c_int,
++    stdout_data: *mut c_char,
++    stdout_len: usize,
++    stderr_data: *mut c_char,
++    stderr_len: usize,
++    error: *mut c_char,
++}
++
++#[cfg(target_os = "wasi")]
++unsafe extern "C" {
++    /// Blocking run over `wk:exec/process.run` (see `plugins/exec-compat`).
++    /// Returns 0 (the child ran — check `exit_code`) or -1 (could not be run
++    /// at all — `error` is set).
++    fn wk_run(
++        path: *const c_char,
++        argv: *const *const c_char,
++        stdin_data: *const c_char,
++        stdin_len: usize,
++        out: *mut WkResult,
++    ) -> core::ffi::c_int;
++    fn wk_result_free(r: *mut WkResult);
++    /// `plugins/pipe-compat` — a real `pipe()` backed by `wk:exec`'s pipe
++    /// resource + wasi-libc's descriptor table (libc's own is ENOSYS on
++    /// wasip2). `fds[0]` reads, `fds[1]` writes; closing the write end EOFs the
++    /// read end once buffered bytes drain.
++    fn pipe(fds: *mut core::ffi::c_int) -> core::ffi::c_int;
++}
++
++/// `execpipe::PIPE_CAPACITY` — writes up to this can't park a lone writer.
++#[cfg(target_os = "wasi")]
++const WASI_PIPE_CAPACITY: usize = 64 * 1024;
++
++/// A synthetic pid for each `wk:exec` run: there is no OS pid on WASI, but the
++/// `Subprocess`/`Process` layer keys on one.
++#[cfg(target_os = "wasi")]
++fn next_wasi_pid() -> PidT {
++    use core::sync::atomic::{AtomicI32, Ordering};
++    static NEXT: AtomicI32 = AtomicI32::new(1000);
++    NEXT.fetch_add(1, Ordering::Relaxed)
++}
++
++/// Surface a captured stdio buffer for `mode`. wk:exec ran the child to
++/// completion and already collected its output, so there is no live stream —
++/// but bun's stdio reader is socket/poll-oriented and EOFs on a closed peer,
++/// so for `Buffer` (capture) we hand it the read end of a real pipe pre-filled
++/// with the bytes, whose write end we close so the reader drains then EOFs.
++/// `Inherit` writes straight to the node's own fd.
++#[cfg(target_os = "wasi")]
++fn wasi_captured_fd(mode: &PosixStdio, bytes: &[u8], idx: u32) -> Option<Fd> {
++    match mode {
++        PosixStdio::Buffer => {
++            // bun's stdio reader treats any pipe/regular fd as a nonblocking
++            // *socket* (it forces the SOCKET flag) and, under the wasi busy-poll
++            // epoll shim, spins reading it whenever it still holds bytes. So we
++            // do NOT stream the captured bytes back through it yet — instead we
++            // hand bun an already-empty pipe (write end closed → the reader sees
++            // EOF at once, no spin, no panic) and surface the child's real
++            // output on the node's own stdout/stderr, visible in the log.
++            // (True capture into `result.stdout` awaits a reader that drains a
++            // seekable fd; a follow-up.)
++            let mut fds = [0 as core::ffi::c_int; 2];
++            // SAFETY: `fds` is a valid two-int out array.
++            if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
++                let _ = WASI_PIPE_CAPACITY;
++                return None;
++            }
++            let read_fd = Fd::from_native(fds[0] as _);
++            drop(bun_sys::File::from_fd(Fd::from_native(fds[1] as _))); // close write → EOF
++            if !bytes.is_empty() {
++                let out = if idx == 2 { Fd::stderr() } else { Fd::stdout() };
++                let _ = bun_sys::File::from_fd(out).write_all(bytes);
++            }
++            Some(read_fd)
++        }
++        PosixStdio::Inherit => {
++            if !bytes.is_empty() {
++                let fd = if idx == 2 { Fd::stderr() } else { Fd::stdout() };
++                // File::from_fd's Drop skips close() for stdio fds.
++                let _ = bun_sys::File::from_fd(fd).write_all(bytes);
++            }
++            None
++        }
++        _ => None,
++    }
++}
++
+ /// # Safety
+ /// `argv` must point to a null-terminated array of NUL-terminated C strings
  /// with at least one non-null element (`argv[0]`); `envp` must point to a
  /// null-terminated array of NUL-terminated C strings. Both must remain valid
  /// for the duration of the call.
-+/// WASI has no fork/exec/posix_spawn. This fails with ENOSYS until the wk
-+/// port routes it through `wk:exec` (the same capability real bash uses to
-+/// run commands in a wk node).
++///
++/// WASI has no fork/exec/posix_spawn, so route the spawn through `wk:exec`
++/// (the same capability real bash uses). The child runs to completion *inside*
++/// this call (blocking `wk_run`), so the returned `PosixSpawnResult` is
++/// already-exited with its captured output pre-buffered into readable fds.
 +#[cfg(target_os = "wasi")]
 +pub unsafe fn spawn_process_posix(
-+    _options: &PosixSpawnOptions,
-+    _argv: Argv,
++    options: &PosixSpawnOptions,
++    argv: Argv,
 +    _envp: Envp,
 +) -> crate::Result<bun_sys::Result<PosixSpawnResult>> {
-+    Ok(Err(bun_sys::Error::from_code_int(
-+        bun_sys::E::ENOSYS as i32,
-+        bun_sys::Tag::TODO,
-+    )))
++    // The file to exec is `options.argv0` when set (the resolved executable
++    // path bun computed via PATH/`which`), else argv[0]. `argv` is the child's
++    // *own* argv, whose argv[0] may be a multicall applet name (e.g. "ls" for
++    // a coreutils binary) distinct from the file path.
++    if argv.is_null() || unsafe { (*argv).is_null() } {
++        return Ok(Err(bun_sys::Error::from_code_int(
++            bun_sys::E::ENOENT as i32,
++            bun_sys::Tag::posix_spawn,
++        )));
++    }
++    let path = match options.argv0 {
++        Some(p) if !p.is_null() => p,
++        // SAFETY: argv is non-null with a non-null argv[0] (checked above).
++        _ => unsafe { *argv },
++    };
++
++    let mut result = WkResult {
++        exit_code: 0,
++        stdout_data: core::ptr::null_mut(),
++        stdout_len: 0,
++        stderr_data: core::ptr::null_mut(),
++        stderr_len: 0,
++        error: core::ptr::null_mut(),
++    };
++    // stdin is written by the parent *after* spawn on native (a pipe end); the
++    // blocking wk:exec run needs it upfront, so this first cut runs the child
++    // with an empty stdin. (TODO: thread a Buffer-mode fixed stdin through.)
++    // SAFETY: path/argv are valid C strings for the call; result is a valid
++    // out-pointer.
++    let rc = unsafe { wk_run(path, argv, core::ptr::null(), 0, &mut result) };
++    if rc != 0 {
++        // The program could not be run at all (no such file / not a component
++        // / exec not permitted / nesting too deep). Map to ENOENT.
++        // SAFETY: result is a valid, populated record; frees its error string.
++        unsafe { wk_result_free(&mut result) };
++        return Ok(Err(bun_sys::Error::from_code_int(
++            bun_sys::E::ENOENT as i32,
++            bun_sys::Tag::posix_spawn,
++        )));
++    }
++
++    let pid = next_wasi_pid();
++    // SAFETY: the *_data/_len pairs are the malloc'd buffers wk_run filled;
++    // read them before `wk_result_free` frees them below.
++    let out_bytes: &[u8] = if result.stdout_data.is_null() || result.stdout_len == 0 {
++        &[]
++    } else {
++        unsafe { core::slice::from_raw_parts(result.stdout_data.cast::<u8>(), result.stdout_len) }
++    };
++    let err_bytes: &[u8] = if result.stderr_data.is_null() || result.stderr_len == 0 {
++        &[]
++    } else {
++        unsafe { core::slice::from_raw_parts(result.stderr_data.cast::<u8>(), result.stderr_len) }
++    };
++    let stdout = wasi_captured_fd(&options.stdout, out_bytes, 1);
++    let stderr = wasi_captured_fd(&options.stderr, err_bytes, 2);
++
++    let spawned = PosixSpawnResult {
++        pid,
++        has_exited: true,
++        wasi_exit_code: result.exit_code,
++        stdout,
++        stderr,
++        ..Default::default()
++    };
++    // SAFETY: the captured bytes have been copied into fds / written out, so
++    // the wk_run-owned buffers can be released now.
++    unsafe { wk_result_free(&mut result) };
++    Ok(Ok(spawned))
 +}
 +
  #[cfg(unix)]
