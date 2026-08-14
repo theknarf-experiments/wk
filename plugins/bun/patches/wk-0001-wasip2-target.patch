@@ -2796,6 +2796,32 @@ index 363ce0d9..e5609d52 100644
          }
      }
  
+diff --git a/src/jsc/bindings/SecretsLinux.cpp b/src/jsc/bindings/SecretsLinux.cpp
+index 4aa6ef78..4da89a41 100644
+--- a/src/jsc/bindings/SecretsLinux.cpp
++++ b/src/jsc/bindings/SecretsLinux.cpp
+@@ -403,3 +403,21 @@ bool deletePassword(const CString& service, const CString& name, Error& err)
+ } // namespace Bun
+ 
+ #endif // OS(LINUX) || OS(FREEBSD)
++
++#if defined(__wasi__)
++// No OS keychain on wasm; report unsupported.
++#include "Secrets.h"
++namespace Bun { namespace Secrets {
++Error setPassword(const WTF::CString&, const WTF::CString&, WTF::CString&&, bool) {
++    return Error { ErrorType::PlatformError, "secrets unavailable on WASI"_s, 0 };
++}
++std::optional<WTF::Vector<uint8_t>> getPassword(const WTF::CString&, const WTF::CString&, Error& error) {
++    error = Error { ErrorType::PlatformError, "secrets unavailable on WASI"_s, 0 };
++    return std::nullopt;
++}
++bool deletePassword(const WTF::CString&, const WTF::CString&, Error& error) {
++    error = Error { ErrorType::PlatformError, "secrets unavailable on WASI"_s, 0 };
++    return false;
++}
++} }
++#endif
 diff --git a/src/jsc/bindings/StringBuilderBinding.cpp b/src/jsc/bindings/StringBuilderBinding.cpp
 index 4e397570..007b0136 100644
 --- a/src/jsc/bindings/StringBuilderBinding.cpp

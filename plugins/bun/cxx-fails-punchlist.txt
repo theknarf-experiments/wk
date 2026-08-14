@@ -1,26 +1,27 @@
-=== VENDORED-C LINK PHASE: 703 -> ~560 undefined; BoringSSL DONE ===
+=== VENDORED-C LINK: 1287 -> 587 undefined; 12+ libs cross-built ===
 
-Progress this phase (link undefined 1287 -> 703, dropping as libs land):
-  DONE: BoringSSL (530 syms, the hardest) — crypto+bcm+ssl/pki/decrepit
-        cross-built -DOPENSSL_NO_ASM; zstd, brotli.
-  uSockets (packages/bun-usockets, ~333 syms) IN PROGRESS: compiles per-file
-    with -DLIBUS_USE_EPOLL -I mimalloc/include -include wasi-compat/sys/
-    socket_compat.h (adds CMSG_*/SO_*/mmsghdr/recvmsg/socketpair wasi gates
-    out). loop.c(24)/socket.c(61)/context.c(33)/udp.c(24) = 142 us_* symbols
-    COMPILE. BLOCKER: bsd.c uses AF_UNIX sun_path — wasi's struct sockaddr_un
-    is a member-less stub. Needs source gating of the unix-domain-socket path
-    in bsd.c (#if !defined(__wasi__)), OR a wasi backend. Plus the epoll
-    eventing backend (epoll_kqueue.c) needs the wasi-compat/sys/epoll.h shim
-    (inert — real networking needs [[wk-userspace-network]] smoltcp).
+100% of bun's C++/Rust/JSC links. Vendored C libs built (undefined 1287->587):
+  BoringSSL(530), uSockets+uWebSockets+root_certs(~380), c-ares(~330),
+  zlib-ng(15), libarchive tar/gzip(~410), zstd, brotli, hdrhistogram,
+  simdutf(62, from WTF), secrets(wasi stub arm in SecretsLinux.cpp).
 
-STILL TO BUILD (each a focused wasi cross-build):
-  libarchive 37, c-ares 29 — have source in native/; need their cmake-
-    generated config headers (ares_config.h / archive config.h).
-  zlib(-ng) 15, simdutf 15, WebP 15 — NOT fetched into native/ yet.
-  Bun::Secrets 3 — OS keychain; STUB (no wasi equiv).
-  v8::shim::GlobalInternals::s_info +misc singles — v8 shim (excluded); stub.
+REMAINING 587, by cluster:
+  ~198 QUIC/HTTP3 — us_nq_*/us_create_quic_*/uws_h3_*/lsquic_*/lsxpack_*.
+        Needs lsquic + lsxpack (NOT fetched — oven-sh/lsquic; big HTTP/3 lib).
+        THE dominant remaining piece. Build quic.c + node_quic_shim.c + the
+        h3 C API against lsquic, OR stub the whole QUIC/H3 surface.
+   26 LIBARCHIVE — the disk/pwd files skipped (archive_read_disk/write_disk
+        use getpwuid/open/waitpid); add wasi shims or stub those ~5 funcs.
+   15 WEBP — libwebp NOT fetched (scripts/build/deps/libwebp.ts has commit).
+        + 1 tj3SetScalingFactor (libjpeg-turbo), 1 uv_hrtime (libuv stub).
+    2 v8::shim::GlobalInternals (v8 shim excluded) — stub.
+    1 WTFTimer__fire, 1 WebCore::ScriptWrappable::wrapper — bun/WTF singles;
+        find defining file (likely a wrongly-excluded .cpp) or stub.
 
-RECIPES (plugins/bun/link/): link.sh, build_boringssl.sh, build_bssl_ssl.sh,
-build-vendored.sh (zstd/brotli), wasi-stubs.c, undefined-symbols.txt.
-KEY: -fno-rtti on ALL C++; BoringSSL needs -I crypto/fipsmodule for bcm's
-.cc.inc; shell while-read skips a trailing-newline-less last line.
+Build scripts + configs: plugins/bun/link/ (build_*.sh, link.sh, configs/,
+README.md). KEY GOTCHAS: -fno-rtti everywhere; BoringSSL bcm needs
+-I crypto/fipsmodule + explicit compile (while-read skips last line);
+uWebSockets needs -include root.h (bmalloc backend); c-ares needs
+HAVE_STRUCT_* so it doesn't redefine wasi's sockaddr_in6/addrinfo;
+zlib-ng compat: gen zlib.h from zlib.h.in (NOT zlib-ng.h.in); simdutf is
+in WTF (compile src/simdutf_sys/bun-simdutf.cpp, no fetch).
