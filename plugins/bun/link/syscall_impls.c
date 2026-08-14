@@ -16,3 +16,9 @@ int eventfd(unsigned int initval, int flags) {
 // inert webview surface gets).
 void Bun__WebView__closeAllForTermination(void) {}
 void Bun__WebViewHost__childDied(void) {}
+// bun_epoll_pwait2 probes the epoll_pwait2 syscall first; there's none on wasi,
+// so return -ENOSYS to make it fall back to the epoll_pwait shim (which sleeps).
+#include <errno.h>
+long sys_epoll_pwait2(int epfd, void* ev, int maxev, const void* to, const void* mask) {
+    (void)epfd;(void)ev;(void)maxev;(void)to;(void)mask; return -ENOSYS;
+}

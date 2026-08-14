@@ -1,4 +1,4 @@
-// Auto-generated blind stubs for inert QUIC/HTTP3 + unavailable-on-wasi syscalls.
+// Blind stubs for inert QUIC/HTTP3 + unavailable-on-wasi syscalls.
 #include <stddef.h>
 void __archive_read_program(void) {}
 void ares_tvnow(void) {}
@@ -80,7 +80,6 @@ void sni_free(void) {}
 void sni_new(void) {}
 void sni_remove(void) {}
 void sqlite3_load_extension(void) {}
-void sys_epoll_pwait2(void) {}
 void tcc_delete(void) {}
 void us_create_quic_client_context(void) {}
 void us_load_system_certificates_linux(void) {}
