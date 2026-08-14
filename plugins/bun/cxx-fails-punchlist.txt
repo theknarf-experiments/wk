@@ -1,35 +1,25 @@
-=== C++ bindings: 509/520 non-v8 compile (98%); +42 v8 shim excluded ===
-=== Remaining 8 ===
+=== C++ bindings: ALL 520 non-v8 files compile for wasm32-wasip2 (0 fails) ===
 
---- EXCLUDABLE optional subsystems (whole-file; not needed for `bun run`) ---
-Exclude from the wasi link like the v8 shim; stub their Rust-facing extern
-"C" exports at link time (the linker will name the undefined symbols).
-  Inspector (REMOTE_INSPECTOR=0): BunDebugger.cpp, InspectorBunFrontendDevServerAgent.cpp,
-    InspectorHTTPServerAgent.cpp, InspectorLifecycleAgent.cpp
-  Profiler (SAMPLING_PROFILER=0): BunCPUProfiler.cpp
-  Wasm streaming (WEBASSEMBLY=0): webcore/JSWasmStreamingCompiler.cpp
-  sqlite (optional): sqlite/NodeSqlite.cpp — uses JSC::DestructionMode/
-    NeedsDestruction, a USE_BUN_JSC_ADDITIONS type absent from our JSC build.
+The entire hand-written + optional C++ bindings layer builds. StrongRef's
+32-bit GC-handle redesign (the last core blocker) is done; the 6 optional
+subsystems (inspector/profiler/wasm-streaming/sqlite) are gated to their
+ENABLE flags with linkable no-op stubs for Rust-called exports.
 
---- THE ONE CORE BLOCKER: StrongRef.cpp (32-bit GC-handle redesign) ---
-StrongRef packs (48-bit slot ptr | 16-bit index) into ONE pointer-sized
-handle; static_assert(sizeof(uintptr_t)==8). On wasm32 a pointer is 32 bits
-— can't pack both. Must stay ABI-consistent with src/jsc/Strong.rs (whose
-32-bit path currently treats handle == raw slot pointer, index 0 — WRONG
-for a multi-slot block).
-  StrongRootBlock: JSCell in an IsoSubspace/MarkedBlock, capacity=960
-  WriteBarrier slots; set/write/clear all need block+index for GC write
-  barriers + occupancy bits.
-  DESIGN for 32-bit (both sides): make StrongRefImpl a heap {block*, index}
-  pair; handle = ptr to it. Rust Strong.rs get() derefs handle->block->
-  slotAt(index) instead of reading handle as slot. Needs alloc/free of the
-  pair (mind leaks). ~half-day focused task + testing. Core (GC handles used
-  everywhere), so NOT excludable — this gates a working `bun run`.
+=== REMAINING to a linked `bun run` component ===
+1. GENERATED .cpp — compile GeneratedBindings.cpp, WebCoreJSBuiltins.cpp,
+   JSSink.cpp, ZigGeneratedClasses.cpp, ErrorCode.cpp, etc. (codegen/*.cpp
+   from bindgen.ts/bundle-functions.ts/generate-classes.ts) with the same
+   cxx-flags.rsp.
+2. v8 SHIM (42 files, src/jsc/bindings/v8/**) — real V8 headers reject
+   wasm32 ("Host architecture not supported"). Native addons can't load on
+   wasm, so EXCLUDE from the link and stub whatever napi/runtime symbols the
+   linker reports undefined.
+3. VENDORED C LIBS — cross-compile to .a for wasi: boringssl, zlib(-ng),
+   lshpack, lolhtml, cares, brotli, zstd, libarchive, picohttpparser,
+   bun-usockets, mimalloc, tinycc(?). Headers already fetched in native/.
+4. LINK: libbun_rust.a + all bindings .o + generated .o + vendored .a +
+   {JSC,WTF,bmalloc,ICU,c++,c++abi,setjmp,wasi-emulated-*} + -z stack-size=8M
+   via wasm-component-ld → the bun-run component.
 
-=== SESSION-CLEARED (this iteration): ~13 files ===
-JSBuffer/napi BigInt asserts (digit-agnostic), JSONRowsToJS layout asserts
-(target-aware), StringBuilder/TopExceptionScope 32-bit ABI (+Strong.rs),
-BunProcess (~25 wasi arms: process-compat/grp/signal shims, dep-versions,
-v8-assert gating, arch/platform/rss/rusage), SerializedScriptValue narrowing,
-InternalModuleRegistry+ConsoleObject+NodeVM* (inspector/JIT/wasm gates),
-ZigGlobalObject (wasm-streaming gated, core), bit_cast fixes throughout.
+Recipe: plugins/bun/cxx-flags.rsp (clang response file, $BUN_NATIVE/$BUN_CODEGEN
+/$BUN_PLUGIN placeholders). All codegen headers reproduced via gen-codegen.ts.
