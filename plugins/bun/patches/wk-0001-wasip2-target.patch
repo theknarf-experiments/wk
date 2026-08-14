@@ -1075,7 +1075,7 @@ index a5cb8c89..cf8d1321 100644
              let sig = reason.terminal_signal();
  
 diff --git a/src/dns/lib.rs b/src/dns/lib.rs
-index ff2f42fb..4908c1af 100644
+index ff2f42fb..56411398 100644
 --- a/src/dns/lib.rs
 +++ b/src/dns/lib.rs
 @@ -15,9 +15,25 @@ use bun_wyhash::Wyhash11 as Wyhash;
@@ -1135,6 +1135,27 @@ index ff2f42fb..4908c1af 100644
  
  #[derive(Default)]
  pub struct GetAddrInfo {
+@@ -283,7 +308,19 @@ impl Backend {
+         Backend::System
+     }
+ 
+-    #[cfg(all(not(any(target_os = "macos", windows)), not(target_os = "android")))]
++    // wasi has no c-ares resolver (no /etc/resolv.conf, no UDP nameserver to
++    // query), so CAres hangs/fails. wasi-libc's getaddrinfo resolves via
++    // wasi:sockets/ip-name-lookup, which the wk fabric serves — use Libc.
++    #[cfg(target_os = "wasi")]
++    pub const fn default() -> Backend {
++        Backend::Libc
++    }
++
++    #[cfg(all(
++        not(any(target_os = "macos", windows)),
++        not(target_os = "android"),
++        not(target_os = "wasi")
++    ))]
+     pub const fn default() -> Backend {
+         Backend::CAres
+     }
 diff --git a/src/errno/lib.rs b/src/errno/lib.rs
 index 09e327f8..436acd53 100644
 --- a/src/errno/lib.rs
