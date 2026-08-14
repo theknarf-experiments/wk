@@ -4562,7 +4562,7 @@ index 3551e861..47168c5c 100644
          // SAFETY: dlerror is safe to call from any thread
          let msg: &[u8] = unsafe {
 diff --git a/src/runtime/jsc_hooks.rs b/src/runtime/jsc_hooks.rs
-index e43b3eed..670d0e4d 100644
+index e43b3eed..6b7c1083 100644
 --- a/src/runtime/jsc_hooks.rs
 +++ b/src/runtime/jsc_hooks.rs
 @@ -1094,7 +1094,9 @@ unsafe fn auto_tick(vm: *mut VirtualMachine) {
@@ -4602,6 +4602,20 @@ index e43b3eed..670d0e4d 100644
      let _ = state;
  
      // SAFETY: per fn contract.
+@@ -4558,6 +4561,13 @@ unsafe fn transpile_file(
+     bun_jsc::node_compile_cache::init_from_env_once();
+ 
+     'transpile_async: {
++        // Single-threaded wasi has no worker thread to run the concurrent
++        // transpiler, so a scheduled transpile would never complete and the
++        // module-load promise would hang forever. Always fall through to the
++        // synchronous loader below.
++        #[cfg(target_os = "wasi")]
++        break 'transpile_async;
++        #[allow(unreachable_code)]
+         let concurrent_loader = lr.loader.unwrap_or(Loader::File);
+         // SAFETY: per fn contract — `jsc_vm` is the live per-thread VM.
+         let (has_loaded, is_in_preload, plugin_runner_is_none, store_enabled) = unsafe {
 diff --git a/src/runtime/napi/napi_body.rs b/src/runtime/napi/napi_body.rs
 index 4ad87609..9d89388f 100644
 --- a/src/runtime/napi/napi_body.rs
