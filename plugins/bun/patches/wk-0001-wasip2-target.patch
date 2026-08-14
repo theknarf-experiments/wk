@@ -2124,6 +2124,38 @@ index ed019c91..1e64e281 100644
      /// Asserts this is a number, undefined, null, or a boolean.
      pub fn as_number(self) -> f64 {
          if self.is_int32() {
+diff --git a/src/jsc/StringBuilder.rs b/src/jsc/StringBuilder.rs
+index 8161b439..84732916 100644
+--- a/src/jsc/StringBuilder.rs
++++ b/src/jsc/StringBuilder.rs
+@@ -3,14 +3,26 @@ use core::ffi::c_void;
+ use crate::{JSGlobalObject, JSValue, JsResult};
+ use bun_core::String;
+ 
++// C++ WTF::StringBuilder is 24 bytes / 8-align on LP64, 16 / 4 on wasm32
++// (32-bit StringImpl*). Both are asserted against sizeof in
++// StringBuilderBinding.cpp.
++#[cfg(target_pointer_width = "64")]
+ const SIZE: usize = 24;
+-// alignment = 8 is encoded in #[repr(align(8))] below.
++#[cfg(target_pointer_width = "32")]
++const SIZE: usize = 16;
+ 
+ /// Opaque inline storage for a C++ `WTF::StringBuilder`.
++#[cfg(target_pointer_width = "64")]
+ #[repr(C, align(8))]
+ pub struct StringBuilder {
+     bytes: [u8; SIZE],
+ }
++/// Opaque inline storage for a C++ `WTF::StringBuilder` (wasm32).
++#[cfg(target_pointer_width = "32")]
++#[repr(C, align(4))]
++pub struct StringBuilder {
++    bytes: [u8; SIZE],
++}
+ 
+ impl StringBuilder {
+     #[inline]
 diff --git a/src/jsc/Strong.rs b/src/jsc/Strong.rs
 index 44ca97cd..994d0309 100644
 --- a/src/jsc/Strong.rs
@@ -2141,6 +2173,156 @@ index 44ca97cd..994d0309 100644
  
      #[inline(always)]
      fn slot_ptr(this: NonNull<Impl>) -> *mut crate::DecodedJSValue {
+diff --git a/src/jsc/bindings/BunProcess.cpp b/src/jsc/bindings/BunProcess.cpp
+index 10210178..376f4b32 100644
+--- a/src/jsc/bindings/BunProcess.cpp
++++ b/src/jsc/bindings/BunProcess.cpp
+@@ -1,3 +1,5 @@
++#include "wasi_process_compat.h"
++#include "wasi_signal_compat.h"
+ #include "ModuleLoader.h"
+ #include "napi.h"
+ 
+@@ -195,6 +197,9 @@ static JSValue constructArch(VM& vm, JSObject* processObject)
+     return JSC::jsString(vm, makeAtomString("x64"_s));
+ #elif CPU(ARM64)
+     return JSC::jsString(vm, makeAtomString("arm64"_s));
++#elif defined(__wasm__)
++    // Matches the Rust install_types Architecture::CURRENT wasi choice.
++    return JSC::jsString(vm, makeAtomString("x64"_s));
+ #else
+ #error "Unknown architecture"
+ #endif
+@@ -212,6 +217,8 @@ static JSValue constructPlatform(VM& vm, JSObject* processObject)
+     return JSC::jsString(vm, makeAtomString("freebsd"_s));
+ #elif OS(WINDOWS)
+     return JSC::jsString(vm, makeAtomString("win32"_s));
++#elif defined(__wasi__)
++    return JSC::jsString(vm, makeAtomString("linux"_s));
+ #else
+ #error "Unknown platform"
+ #endif
+@@ -777,7 +784,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionDlopen, (JSC::JSGlobalObject * globalOb
+         .reserved = {},
+     };
+ 
++#if UINTPTR_MAX > 0xffffffffu
+     static_assert(sizeof(napi_value) == sizeof(EncodedJSValue), "EncodedJSValue must be reinterpretable as a pointer");
++#endif
+ 
+     auto env = globalObject->makeNapiEnv(nmodule);
+     env->filename = filename_cstr;
+@@ -796,6 +805,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionDlopen, (JSC::JSGlobalObject * globalOb
+         const char** pointer_to_plugin_name = (const char**)dlsym(handle, "BUN_PLUGIN_NAME");
+ #elif OS(WINDOWS)
+         const char** pointer_to_plugin_name = (const char**)GetProcAddress(handle, "BUN_PLUGIN_NAME");
++#else
++        // No dynamic loading on WASI; native plugins can't load.
++        const char** pointer_to_plugin_name = nullptr;
+ #endif
+         if (pointer_to_plugin_name) {
+             // TODO: think about the finalizer here
+@@ -1635,6 +1647,9 @@ static void onDidChangeListeners(EventEmitter& eventEmitter, const Identifier& e
+ #elif OS(WINDOWS)
+             // windows has no SIGSTOP
+             if (signalNumber != SIGKILL) {
++#elif defined(__wasi__)
++            // No signal delivery on wasm; the listener is inert.
++            if (signalNumber != SIGKILL && signalNumber != SIGSTOP) {
+ #else
+ #error unknown OS
+ #endif
+@@ -2381,9 +2396,13 @@ static JSValue constructReportObjectComplete(VM& vm, Zig::GlobalObject* globalOb
+         JSC::JSObject* resourceUsage = JSC::constructEmptyObject(globalObject, globalObject->objectPrototype(), 11);
+         RETURN_IF_EXCEPTION(scope, {});
+ 
++#if defined(__wasi__)
++        BunWasiRusage usage {};
++#else
+         rusage usage;
+ 
+         getrusage(RUSAGE_SELF, &usage);
++#endif
+ 
+         resourceUsage->putDirect(vm, JSC::Identifier::fromString(vm, "free_memory"_s), JSC::jsNumber(usage.ru_maxrss), 0);
+         resourceUsage->putDirect(vm, JSC::Identifier::fromString(vm, "total_memory"_s), JSC::jsNumber(usage.ru_maxrss), 0);
+@@ -2842,7 +2861,7 @@ static JSValue constructProcessConfigObject(VM& vm, JSObject* processObject)
+ #if CPU(ARM64)
+     variables->putDirect(vm, JSC::Identifier::fromString(vm, "arm_fpu"_s), JSC::jsString(vm, String("neon"_s)), 0);
+ #endif
+-#elif OS(LINUX) || OS(FREEBSD)
++#elif OS(LINUX) || OS(FREEBSD) || defined(__wasi__)
+     variables->putDirect(vm, JSC::Identifier::fromString(vm, "control_flow_guard"_s), JSC::jsBoolean(false), 0);
+     variables->putDirect(vm, JSC::Identifier::fromString(vm, "coverage"_s), JSC::jsBoolean(false), 0);
+     variables->putDirect(vm, JSC::Identifier::fromString(vm, "dcheck_always_on"_s), JSC::jsNumber(0), 0);
+@@ -2868,6 +2887,9 @@ static JSValue constructProcessConfigObject(VM& vm, JSObject* processObject)
+ #elif CPU(ARM64)
+     variables->putDirect(vm, JSC::Identifier::fromString(vm, "host_arch"_s), JSC::jsString(vm, String("arm64"_s)), 0);
+     variables->putDirect(vm, JSC::Identifier::fromString(vm, "target_arch"_s), JSC::jsString(vm, String("arm64"_s)), 0);
++#elif defined(__wasm__)
++    variables->putDirect(vm, JSC::Identifier::fromString(vm, "host_arch"_s), JSC::jsString(vm, String("x64"_s)), 0);
++    variables->putDirect(vm, JSC::Identifier::fromString(vm, "target_arch"_s), JSC::jsString(vm, String("x64"_s)), 0);
+ #else
+ #error "Unsupported architecture"
+ #endif
+@@ -3780,7 +3802,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionResourceUsage, (JSC::JSGlobalObject * g
+     auto& vm = JSC::getVM(globalObject);
+     auto throwScope = DECLARE_THROW_SCOPE(vm);
+ 
+-#if !OS(WINDOWS)
++#if defined(__wasi__)
++    BunWasiRusage rusage {};
++#elif !OS(WINDOWS)
+     struct rusage rusage;
+     if (getrusage(RUSAGE_SELF, &rusage) != 0) {
+         throwSystemError(throwScope, globalObject, "Failed to get resource usage"_s, "getrusage"_s, errno);
+@@ -3828,7 +3852,9 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionCpuUsage, (JSC::JSGlobalObject * global
+ {
+     auto& vm = JSC::getVM(globalObject);
+     auto throwScope = DECLARE_THROW_SCOPE(vm);
+-#if !OS(WINDOWS)
++#if defined(__wasi__)
++    BunWasiRusage rusage {};
++#elif !OS(WINDOWS)
+     struct rusage rusage;
+     if (getrusage(RUSAGE_SELF, &rusage) != 0) {
+         throwSystemError(throwScope, globalObject, "Failed to get CPU usage"_s, "getrusage"_s, errno);
+@@ -3955,10 +3981,15 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionThreadCpuUsage, (JSC::JSGlobalObject *
+     }
+     user = 1e6 * info.user_time.seconds + info.user_time.microseconds;
+     system = 1e6 * info.system_time.seconds + info.system_time.microseconds;
+-#elif OS(LINUX) || OS(FREEBSD)
++#elif OS(LINUX) || OS(FREEBSD) || defined(__wasi__)
+     // FreeBSD has supported RUSAGE_THREAD since 8.1; the #else branch must
+     // stay Windows-only because uv_getrusage_thread is an aborting stub in
+     // uv-posix-stubs.c on the POSIX targets that link it.
++#if defined(__wasi__)
++    // No per-thread CPU accounting on wasm.
++    user = 0;
++    system = 0;
++#else
+     struct rusage threadUsage;
+     if (getrusage(RUSAGE_THREAD, &threadUsage) != 0) {
+         throwSystemError(throwScope, globalObject, "Failed to get thread CPU usage"_s, "getrusage"_s, errno);
+@@ -3966,6 +3997,7 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionThreadCpuUsage, (JSC::JSGlobalObject *
+     }
+     user = 1e6 * threadUsage.ru_utime.tv_sec + threadUsage.ru_utime.tv_usec;
+     system = 1e6 * threadUsage.ru_stime.tv_sec + threadUsage.ru_stime.tv_usec;
++#endif
+ #else
+     uv_rusage_t threadUsage;
+     int err = uv_getrusage_thread(&threadUsage);
+@@ -4079,6 +4111,10 @@ err:
+     return 0;
+ #elif OS(WINDOWS)
+     return uv_resident_set_memory(rss);
++#elif defined(__wasi__)
++    // No RSS accounting on wasm.
++    *rss = 0;
++    return 0;
+ #else
+ #error "Unknown platform"
+ #endif
 diff --git a/src/jsc/bindings/CPUFeatures.cpp b/src/jsc/bindings/CPUFeatures.cpp
 index d1b15605..e8ada386 100644
 --- a/src/jsc/bindings/CPUFeatures.cpp
@@ -2154,6 +2336,23 @@ index d1b15605..e8ada386 100644
  #else
  #error "Unknown architecture"
  #endif
+diff --git a/src/jsc/bindings/JSBuffer.cpp b/src/jsc/bindings/JSBuffer.cpp
+index 217d2970..1ce41bbc 100644
+--- a/src/jsc/bindings/JSBuffer.cpp
++++ b/src/jsc/bindings/JSBuffer.cpp
+@@ -99,7 +99,12 @@ extern "C" BunString Bun__inspect_singleline(JSC::JSGlobalObject* globalObject,
+ using namespace JSC;
+ using namespace WebCore;
+ 
++// The Buffer BigInt functions go through the digit-agnostic public API
++// (JSValue::toBigUInt64 / jsBigIntFromUint64), so the 64-bit-digit
++// assumption only held on 64-bit targets; wasm32 JSC uses 32-bit digits.
++#if UINTPTR_MAX > 0xffffffffu
+ static_assert(std::is_same_v<JSBigInt::Digit, uint64_t>, "all Buffer BigInt functions assume bigint digits are 64 bits");
++#endif
+ 
+ JSC_DECLARE_HOST_FUNCTION(constructJSBuffer);
+ JSC_DECLARE_HOST_FUNCTION(callJSBuffer);
 diff --git a/src/jsc/bindings/JSBundlerPlugin.cpp b/src/jsc/bindings/JSBundlerPlugin.cpp
 index a6d60de0..070f8799 100644
 --- a/src/jsc/bindings/JSBundlerPlugin.cpp
@@ -2226,6 +2425,74 @@ index f0f42016..89b0c8b6 100644
              returnValueIndex = returnValuesArray->length() - 1;
          } else {
              JSC::ObjectInitializationScope object(vm);
+diff --git a/src/jsc/bindings/JSONRowsToJS.cpp b/src/jsc/bindings/JSONRowsToJS.cpp
+index cf0c96f3..7b02be0c 100644
+--- a/src/jsc/bindings/JSONRowsToJS.cpp
++++ b/src/jsc/bindings/JSONRowsToJS.cpp
+@@ -21,7 +21,9 @@ struct __attribute__((packed, aligned(4))) RowStr {
+     uint32_t len;
+     std::span<const Latin1Character> span() const { return { ptr, len }; }
+ };
+-static_assert(sizeof(RowStr) == 12);
++// ptr(pointer-width) + u32; 12 on LP64, 8 on wasm32. The Rust #[repr(C)]
++// mirror shrinks identically with the target pointer width.
++static_assert(sizeof(RowStr) == sizeof(void*) + 4);
+ 
+ struct __attribute__((packed, aligned(4))) RowRef {
+     const void* ptr;
+@@ -49,14 +51,18 @@ struct RowValue {
+         RowRef array;
+     };
+ };
++#if UINTPTR_MAX > 0xffffffffu
+ static_assert(sizeof(RowValue) == 16);
++#endif
+ 
+ struct RowProperty {
+     RowStr key;
+     int32_t keyLoc;
+     RowValue value;
+ };
++#if UINTPTR_MAX > 0xffffffffu
+ static_assert(sizeof(RowProperty) == 32);
++#endif
+ 
+ // `ObjectJSON` / `ArrayJSON`: a span of the tape (only the leading fields are read).
+ struct RowSpan {
+@@ -66,9 +72,15 @@ struct RowSpan {
+ };
+ 
+ // Kept in step with the `offset_of!` assertions next to the Rust definitions.
++#if UINTPTR_MAX > 0xffffffffu
+ static_assert(offsetof(RowValue, tag) == 0 && offsetof(RowValue, string) == 4);
++#endif
++#if UINTPTR_MAX > 0xffffffffu
+ static_assert(offsetof(RowProperty, key) == 0 && offsetof(RowProperty, keyLoc) == 12 && offsetof(RowProperty, value) == 16);
++#endif
++#if UINTPTR_MAX > 0xffffffffu
+ static_assert(offsetof(RowSpan, tape) == 0 && offsetof(RowSpan, first) == 8 && offsetof(RowSpan, count) == 12);
++#endif
+ 
+ // `E::StrEncoding`: how the bytes behind every string on one tape are encoded.
+ enum class RowEncoding : uint8_t {
+diff --git a/src/jsc/bindings/StringBuilderBinding.cpp b/src/jsc/bindings/StringBuilderBinding.cpp
+index 4e397570..007b0136 100644
+--- a/src/jsc/bindings/StringBuilderBinding.cpp
++++ b/src/jsc/bindings/StringBuilderBinding.cpp
+@@ -2,8 +2,13 @@
+ #include "BunString.h"
+ #include "headers-handwritten.h"
+ 
++#if UINTPTR_MAX > 0xffffffffu
+ static_assert(sizeof(WTF::StringBuilder) == 24, "src/jsc/StringBuilder.rs assumes WTF::StringBuilder is 24 bytes");
+ static_assert(alignof(WTF::StringBuilder) == 8, "src/jsc/StringBuilder.rs assumes WTF::StringBuilder is 8-byte aligned");
++#else
++static_assert(sizeof(WTF::StringBuilder) == 16, "src/jsc/StringBuilder.rs (wasm32) assumes WTF::StringBuilder is 16 bytes");
++static_assert(alignof(WTF::StringBuilder) == 4, "src/jsc/StringBuilder.rs (wasm32) assumes WTF::StringBuilder is 4-byte aligned");
++#endif
+ 
+ extern "C" void StringBuilder__init(WTF::StringBuilder* ptr)
+ {
 diff --git a/src/jsc/bindings/c-bindings.cpp b/src/jsc/bindings/c-bindings.cpp
 index 1ead5980..3584d2ac 100644
 --- a/src/jsc/bindings/c-bindings.cpp
@@ -2269,6 +2536,20 @@ index 1ead5980..3584d2ac 100644
  #else
  
  #error "TODO"
+diff --git a/src/jsc/bindings/napi.cpp b/src/jsc/bindings/napi.cpp
+index e7f5eebd..86ec29bc 100644
+--- a/src/jsc/bindings/napi.cpp
++++ b/src/jsc/bindings/napi.cpp
+@@ -2876,7 +2876,9 @@ extern "C" napi_status napi_typeof(napi_env env, napi_value val,
+     return napi_set_last_error(env, napi_generic_failure);
+ }
+ 
++#if UINTPTR_MAX > 0xffffffffu
+ static_assert(std::is_same_v<JSBigInt::Digit, uint64_t>, "All NAPI bigint functions assume that bigint words are 64 bits");
++#endif
+ #if USE(BIGINT32)
+ #error All NAPI bigint functions assume that BIGINT32 is disabled
+ #endif
 diff --git a/src/jsc/bindings/napi.h b/src/jsc/bindings/napi.h
 index 05b95066..c0153e3e 100644
 --- a/src/jsc/bindings/napi.h
@@ -2292,6 +2573,83 @@ index daa0f782..dbcbf8ee 100644
  #include <spawn.h>
  #include <signal.h>
  
+diff --git a/src/jsc/bindings/v8/V8EscapableHandleScope.h b/src/jsc/bindings/v8/V8EscapableHandleScope.h
+index 205f56c8..d66ddf76 100644
+--- a/src/jsc/bindings/v8/V8EscapableHandleScope.h
++++ b/src/jsc/bindings/v8/V8EscapableHandleScope.h
+@@ -18,6 +18,8 @@ public:
+     }
+ };
+ 
++#if UINTPTR_MAX > 0xffffffffu
+ static_assert(sizeof(EscapableHandleScope) == 32, "EscapableHandleScope has wrong layout");
++#endif
+ 
+ } // namespace v8
+diff --git a/src/jsc/bindings/v8/V8HandleScope.h b/src/jsc/bindings/v8/V8HandleScope.h
+index eae0556f..b30ca096 100644
+--- a/src/jsc/bindings/v8/V8HandleScope.h
++++ b/src/jsc/bindings/v8/V8HandleScope.h
+@@ -80,6 +80,8 @@ private:
+     BUN_EXPORT void DeleteExtensions(Isolate* isolate);
+ };
+ 
++#if UINTPTR_MAX > 0xffffffffu
+ static_assert(sizeof(HandleScope) == 24, "HandleScope has wrong layout");
++#endif
+ 
+ } // namespace v8
+diff --git a/src/jsc/bindings/v8/V8TimeTicks.h b/src/jsc/bindings/v8/V8TimeTicks.h
+index c8307b5c..9e507799 100644
+--- a/src/jsc/bindings/v8/V8TimeTicks.h
++++ b/src/jsc/bindings/v8/V8TimeTicks.h
+@@ -26,7 +26,9 @@ private:
+     [[maybe_unused]] int64_t m_us;
+ };
+ 
++#if UINTPTR_MAX > 0xffffffffu
+ static_assert(sizeof(TimeTicks) == sizeof(int64_t), "v8::base::TimeTicks must be a bare int64_t");
++#endif
+ 
+ } // namespace base
+ } // namespace v8
+diff --git a/src/jsc/bindings/v8/shim/Map.h b/src/jsc/bindings/v8/shim/Map.h
+index b7c153b4..093fe31f 100644
+--- a/src/jsc/bindings/v8/shim/Map.h
++++ b/src/jsc/bindings/v8/shim/Map.h
+@@ -69,9 +69,15 @@ struct Map {
+     }
+ };
+ 
++#if UINTPTR_MAX > 0xffffffffu
+ static_assert(sizeof(Map) == 16, "Map has wrong layout");
++#endif
++#if UINTPTR_MAX > 0xffffffffu
+ static_assert(offsetof(Map, m_metaMap) == 0, "Map has wrong layout");
++#endif
++#if UINTPTR_MAX > 0xffffffffu
+ static_assert(offsetof(Map, m_instanceType) == 12, "Map has wrong layout");
++#endif
+ 
+ } // namespace shim
+ } // namespace v8
+diff --git a/src/jsc/bindings/v8/v8_compatibility_assertions.h b/src/jsc/bindings/v8/v8_compatibility_assertions.h
+index 12afc8b6..dc55ef47 100644
+--- a/src/jsc/bindings/v8/v8_compatibility_assertions.h
++++ b/src/jsc/bindings/v8/v8_compatibility_assertions.h
+@@ -24,6 +24,7 @@
+     using V8Type = TYPENAME;                                                          \
+     }                                                                                 \
+                                                                                       \
++#if UINTPTR_MAX > 0xffffffffu
+     static_assert(sizeof(DeclareBunType::BunType) == sizeof(DeclareV8Type::V8Type),   \
+         "size of " #TYPENAME " does not match between Bun and V8");                   \
+     static_assert(alignof(DeclareBunType::BunType) == alignof(DeclareV8Type::V8Type), \
+@@ -52,3 +53,4 @@
+ #define ASSERT_V8_ENUM_MATCHES(ENUM_NAME, ENUMERATOR_NAME)                                             \
+     static_assert((int)::v8::ENUM_NAME::ENUMERATOR_NAME == (int)::real_v8::ENUM_NAME::ENUMERATOR_NAME, \
+         "enumerator " #ENUM_NAME "::" #ENUMERATOR_NAME " does not match between Bun and V8");
++#endif
 diff --git a/src/jsc/bindings/vm/SigintWatcher.cpp b/src/jsc/bindings/vm/SigintWatcher.cpp
 index 0c2c99a1..4c2de2a9 100644
 --- a/src/jsc/bindings/vm/SigintWatcher.cpp

@@ -9,6 +9,8 @@ extern "C" {
 #endif
 static inline struct passwd *getpwuid(uid_t u){(void)u;return 0;}
 static inline int getpwuid_r(uid_t u,struct passwd*p,char*b,size_t s,struct passwd**r){(void)u;(void)p;(void)b;(void)s;if(r)*r=0;return 0;}
+static inline struct passwd *getpwnam(const char*n){(void)n;return 0;}
+static inline int getpwnam_r(const char*n,struct passwd*p,char*b,size_t s,struct passwd**r){(void)n;(void)p;(void)b;(void)s;if(r)*r=0;return 0;}
 #ifdef __cplusplus
 }
 #endif
