@@ -2721,6 +2721,54 @@ index b7393f89..6ed60dcd 100644
          {
              // Windows: `.ipc` extra_fd creates a duplex `uv.Pipe` (named pipe
              // under the hood, UV_READABLE | UV_WRITABLE | UV_OVERLAPPED) and
+diff --git a/src/runtime/dispatch.rs b/src/runtime/dispatch.rs
+index df0996b0..73167418 100644
+--- a/src/runtime/dispatch.rs
++++ b/src/runtime/dispatch.rs
+@@ -444,14 +444,14 @@ pub(crate) fn run_task(
+ 
+         // ── process / signals ────────────────────────────────────────────
+         task_tag::ProcessWaiterThreadTask => {
+-            #[cfg(not(windows))]
++            #[cfg(unix)]
+             {
+                 // SAFETY: tag identifies pointee; heap-allocated in WaiterThread.
+                 let t =
+                     unsafe { bun_core::heap::take(cast_ptr!(ProcessWaiterThreadTask<Process>)) };
+                 t.run_from_js_thread();
+             }
+-            #[cfg(windows)]
++            #[cfg(not(unix))]
+             unreachable!("posix-only");
+         }
+         task_tag::PosixSignalTask => {
+@@ -703,7 +703,14 @@ pub(crate) unsafe fn __bun_run_file_poll(poll: *mut FilePoll, size_or_offset: i6
+             // by the trailing `deref`, so keep raw provenance end-to-end.
+             let proc = owner.ptr.cast::<Process>();
+             // SAFETY: `proc` carries the +1 ref taken at queue time; this drops it.
++            // No process waitpid path on WASI (spawn is ENOSYS); never reached.
++            #[cfg(unix)]
+             unsafe { Process::on_wait_pid_from_event_loop_task(proc) };
++            #[cfg(not(unix))]
++            {
++                let _ = proc;
++                unreachable!("no processes on this target");
++            }
+         }
+         poll_tag::MEMORY_PRESSURE => {
+             // SAFETY: `poll` is live per `__bun_run_file_poll`'s contract.
+@@ -1224,9 +1231,9 @@ fn __bun_release_task_unrun(task: bun_event_loop::Task) {
+         task_tag::PosixSignalTask => release!(PosixSignalTask),
+         task_tag::MemoryPressureTask => release!(crate::node::memory_pressure::MemoryPressureTask),
+         task_tag::ProcessWaiterThreadTask => {
+-            #[cfg(not(windows))]
++            #[cfg(unix)]
+             release!(ProcessWaiterThreadTask<Process>);
+-            #[cfg(windows)]
++            #[cfg(not(unix))]
+             unreachable!("posix-only tag");
+         }
+         task_tag::FlushPendingFileSinkTask => release!(FlushPendingFileSinkTask),
 diff --git a/src/runtime/node/StatFS.rs b/src/runtime/node/StatFS.rs
 index daf0254f..a248a493 100644
 --- a/src/runtime/node/StatFS.rs
