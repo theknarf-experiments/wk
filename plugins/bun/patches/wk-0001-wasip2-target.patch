@@ -1183,10 +1183,63 @@ index d91f9c8b..d855057b 100644
          #[cfg(windows)]
          let new_handle: VmEventLoopHandle = Some(
 diff --git a/src/http/HTTPThread.rs b/src/http/HTTPThread.rs
-index 09e3273c..c71b38f0 100644
+index 09e3273c..825c65bc 100644
 --- a/src/http/HTTPThread.rs
 +++ b/src/http/HTTPThread.rs
-@@ -1372,7 +1372,7 @@ mod _event_loop_draft {
+@@ -1277,15 +1277,28 @@ mod _event_loop_draft {
+         crate::HTTP_THREAD_INIT.store(true, core::sync::atomic::Ordering::Release);
+         bun_libdeflate_sys::libdeflate::load();
+         let opts_copy = opts.clone();
+-        let thread = std::thread::Builder::new()
+-            .stack_size(bun_threading::thread_pool::DEFAULT_THREAD_STACK_SIZE as usize)
+-            .spawn(move || on_start(opts_copy));
+-        match thread {
+-            // detach — see HTTP_THREAD_HANDLE note above re: LSAN reachability
+-            Ok(t) => {
+-                let _ = HTTP_THREAD_HANDLE.set(t);
++        // Single-threaded wasi has no thread to run the HTTP client loop. Run
++        // `on_start`'s setup inline on the JS thread; the main event loop then
++        // pumps this loop each tick via `http_thread_tick` (see jsc_hooks
++        // auto_tick). `on_start` itself skips the blocking daemon loop on wasi.
++        #[cfg(target_os = "wasi")]
++        {
++            on_start(opts_copy);
++        }
++        #[cfg(not(target_os = "wasi"))]
++        {
++            let thread = std::thread::Builder::new()
++                .stack_size(bun_threading::thread_pool::DEFAULT_THREAD_STACK_SIZE as usize)
++                .spawn(move || on_start(opts_copy));
++            match thread {
++                // detach — see HTTP_THREAD_HANDLE note above re: LSAN reachability
++                Ok(t) => {
++                    let _ = HTTP_THREAD_HANDLE.set(t);
++                }
++                Err(err) => {
++                    Output::panic(format_args!("Failed to start HTTP Client thread: {}", err))
++                }
+             }
+-            Err(err) => Output::panic(format_args!("Failed to start HTTP Client thread: {}", err)),
+         }
+     }
+ 
+@@ -1366,13 +1379,23 @@ mod _event_loop_draft {
+         // Release: publishes `uws_loop`/`loop_` to cross-thread `wakeup()`
+         // readers (which Acquire-load `has_awoken`).
+         thread.has_awoken.store(true, Ordering::Release);
++        // On wasi there is no dedicated HTTP thread: setup ran inline on the JS
++        // thread and the main event loop pumps this loop via
++        // `process_events_once`. Prime num_polls like `process_events` does,
++        // then return. Elsewhere, enter the blocking daemon loop.
++        #[cfg(target_os = "wasi")]
++        {
++            let uws_loop = thread.uws_loop_mut();
++            uws_loop.num_polls = uws_loop.num_polls.max(2);
++        }
++        #[cfg(not(target_os = "wasi"))]
+         thread.process_events();
+     }
+ 
      impl HttpThread {
          fn process_events(&mut self) -> ! {
              let uws_loop = self.uws_loop_mut();
@@ -1195,6 +1248,28 @@ index 09e3273c..c71b38f0 100644
              {
                  uws_loop.num_polls = uws_loop.num_polls.max(2);
              }
+@@ -1420,6 +1443,21 @@ mod _event_loop_draft {
+                 }
+             }
+         }
++
++        // One iteration of `process_events`, for the single-threaded wasi pump
++        // (`crate::http_thread_tick`). Mirrors the loop body — drain queued
++        // requests, tick the HTTP uSockets loop, run deferred frees — minus the
++        // shutdown park (wasi tears down via the JS thread directly).
++        #[cfg(target_os = "wasi")]
++        pub(crate) fn process_events_once(&mut self) {
++            self.drain_events();
++            let uws_loop = self.uws_loop_mut();
++            uws_loop.inc();
++            uws_loop.tick();
++            uws_loop.dec();
++            // SAFETY: same as `process_events`' per-iteration deferred-free.
++            unsafe { (*self.loop_.cast_mut()).on_after_event_loop() };
++        }
+     }
+ }
+ 
 diff --git a/src/http/SendFile.rs b/src/http/SendFile.rs
 index 2c7ed2d2..7e5825ca 100644
 --- a/src/http/SendFile.rs
@@ -1223,10 +1298,28 @@ index 2c7ed2d2..7e5825ca 100644
      Again,
  }
 diff --git a/src/http/lib.rs b/src/http/lib.rs
-index 57bfb2fc..e3b30257 100644
+index 57bfb2fc..116a64a9 100644
 --- a/src/http/lib.rs
 +++ b/src/http/lib.rs
-@@ -3409,12 +3409,12 @@ impl<'a> HTTPClient<'a> {
+@@ -976,6 +976,17 @@ pub fn http_thread() -> &'static mut HTTPThread {
+     // `on_start`); the `ThreadCell` owner assert covers debug.
+     unsafe { (*HTTP_THREAD.get()).assume_init_mut() }
+ }
++
++/// Pump the HTTP client loop once from the JS thread. wasi has no dedicated
++/// HTTP thread (`HTTPThread::init` runs the loop setup inline), so the main
++/// event loop calls this each tick to make outbound `fetch` requests progress.
++/// No-op until the HTTP thread has been initialized.
++#[cfg(target_os = "wasi")]
++pub fn http_thread_tick() {
++    if HTTP_THREAD_INIT.load(core::sync::atomic::Ordering::Acquire) {
++        http_thread().process_events_once();
++    }
++}
+ #[inline]
+ pub(crate) fn http_thread_mut() -> &'static mut HTTPThread {
+     http_thread()
+@@ -3409,12 +3420,12 @@ impl<'a> HTTPClient<'a> {
  
                          // sendfile.write() takes the raw fd, not the socket handle.
                          match sendfile.write(socket.fd()) {
@@ -4606,7 +4699,7 @@ index 3551e861..47168c5c 100644
          // SAFETY: dlerror is safe to call from any thread
          let msg: &[u8] = unsafe {
 diff --git a/src/runtime/jsc_hooks.rs b/src/runtime/jsc_hooks.rs
-index e43b3eed..6b7c1083 100644
+index e43b3eed..0a25ee30 100644
 --- a/src/runtime/jsc_hooks.rs
 +++ b/src/runtime/jsc_hooks.rs
 @@ -1094,7 +1094,9 @@ unsafe fn auto_tick(vm: *mut VirtualMachine) {
@@ -4620,16 +4713,20 @@ index e43b3eed..6b7c1083 100644
      {
          // Note (§Forbidden aliased-&mut): `drain_timers` fires user
          // `setTimeout` callbacks which may re-enter `timer::All::insert`/
-@@ -1105,7 +1107,7 @@ unsafe fn auto_tick(vm: *mut VirtualMachine) {
+@@ -1105,7 +1107,11 @@ unsafe fn auto_tick(vm: *mut VirtualMachine) {
          // field address is stable for the VM lifetime.
          unsafe { timer::All::drain_timers(&mut (*state).timer, vm.cast()) };
      }
 -    #[cfg(not(unix))]
++    // wasi has no dedicated HTTP client thread, so pump its loop each tick here
++    // to make outbound `fetch` requests progress on the JS thread.
++    #[cfg(target_os = "wasi")]
++    bun_http::http_thread_tick();
 +    #[cfg(not(any(unix, target_os = "wasi")))]
      let _ = state;
  
      // SAFETY: per fn contract.
-@@ -1221,13 +1223,14 @@ unsafe fn auto_tick_active(vm: *mut VirtualMachine) {
+@@ -1221,13 +1227,18 @@ unsafe fn auto_tick_active(vm: *mut VirtualMachine) {
          }
      }
  
@@ -4642,11 +4739,15 @@ index e43b3eed..6b7c1083 100644
          unsafe { timer::All::drain_timers(&mut (*state).timer, vm.cast()) };
      }
 -    #[cfg(not(unix))]
++    // wasi has no dedicated HTTP client thread, so pump its loop each tick here
++    // to make outbound `fetch` requests progress on the JS thread.
++    #[cfg(target_os = "wasi")]
++    bun_http::http_thread_tick();
 +    #[cfg(not(any(unix, target_os = "wasi")))]
      let _ = state;
  
      // SAFETY: per fn contract.
-@@ -4558,6 +4561,13 @@ unsafe fn transpile_file(
+@@ -4558,6 +4569,13 @@ unsafe fn transpile_file(
      bun_jsc::node_compile_cache::init_from_env_once();
  
      'transpile_async: {
