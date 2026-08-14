@@ -3476,22 +3476,6 @@ index 88a58421..a9d5702f 100644
  
 +
  } // namespace WebCore
-diff --git a/src/jsc/bindings/webcore/BunScriptWrappableWrapper.cpp b/src/jsc/bindings/webcore/BunScriptWrappableWrapper.cpp
-new file mode 100644
-index 00000000..1d1aa14e
---- /dev/null
-+++ b/src/jsc/bindings/webcore/BunScriptWrappableWrapper.cpp
-@@ -0,0 +1,10 @@
-+// Out-of-line definition of the inline ScriptWrappable::wrapper(). WebCore inlines
-+// it everywhere, so no TU emits the out-of-line body — but non-inlined references
-+// (e.g. AbortSignal::markAborted) need the symbol. Defined here without including
-+// ScriptWrappableInlines.h to avoid an inline redefinition.
-+#include "root.h"
-+#include "ScriptWrappable.h"
-+#include <JavaScriptCore/WeakInlines.h>
-+namespace WebCore {
-+JSDOMObject* ScriptWrappable::wrapper() const { return m_wrapper.get(); }
-+}
 diff --git a/src/jsc/bindings/webcore/EventContext.cpp b/src/jsc/bindings/webcore/EventContext.cpp
 index b618b830..448cd541 100644
 --- a/src/jsc/bindings/webcore/EventContext.cpp
@@ -4577,6 +4561,47 @@ index 3551e861..47168c5c 100644
      {
          // SAFETY: dlerror is safe to call from any thread
          let msg: &[u8] = unsafe {
+diff --git a/src/runtime/jsc_hooks.rs b/src/runtime/jsc_hooks.rs
+index e43b3eed..670d0e4d 100644
+--- a/src/runtime/jsc_hooks.rs
++++ b/src/runtime/jsc_hooks.rs
+@@ -1094,7 +1094,9 @@ unsafe fn auto_tick(vm: *mut VirtualMachine) {
+         }
+     }
+ 
+-    #[cfg(unix)]
++    // wasi is not `unix`, but its event loop has no OS timer-callback path
++    // either, so it must drain due timers here just like unix.
++    #[cfg(any(unix, target_os = "wasi"))]
+     {
+         // Note (§Forbidden aliased-&mut): `drain_timers` fires user
+         // `setTimeout` callbacks which may re-enter `timer::All::insert`/
+@@ -1105,7 +1107,7 @@ unsafe fn auto_tick(vm: *mut VirtualMachine) {
+         // field address is stable for the VM lifetime.
+         unsafe { timer::All::drain_timers(&mut (*state).timer, vm.cast()) };
+     }
+-    #[cfg(not(unix))]
++    #[cfg(not(any(unix, target_os = "wasi")))]
+     let _ = state;
+ 
+     // SAFETY: per fn contract.
+@@ -1221,13 +1223,14 @@ unsafe fn auto_tick_active(vm: *mut VirtualMachine) {
+         }
+     }
+ 
+-    #[cfg(unix)]
++    // wasi drains due timers here too — see the note in `auto_tick`.
++    #[cfg(any(unix, target_os = "wasi"))]
+     {
+         // SAFETY: `state` is the live per-thread `RuntimeState`; see Note
+         // on `auto_tick` re: aliased-&mut across `fire()`.
+         unsafe { timer::All::drain_timers(&mut (*state).timer, vm.cast()) };
+     }
+-    #[cfg(not(unix))]
++    #[cfg(not(any(unix, target_os = "wasi")))]
+     let _ = state;
+ 
+     // SAFETY: per fn contract.
 diff --git a/src/runtime/napi/napi_body.rs b/src/runtime/napi/napi_body.rs
 index 4ad87609..9d89388f 100644
 --- a/src/runtime/napi/napi_body.rs
