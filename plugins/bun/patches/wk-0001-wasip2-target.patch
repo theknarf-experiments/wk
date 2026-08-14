@@ -2769,6 +2769,39 @@ index df0996b0..73167418 100644
              unreachable!("posix-only tag");
          }
          task_tag::FlushPendingFileSinkTask => release!(FlushPendingFileSinkTask),
+diff --git a/src/runtime/ffi/ffi_body.rs b/src/runtime/ffi/ffi_body.rs
+index 679a87b1..56b78742 100644
+--- a/src/runtime/ffi/ffi_body.rs
++++ b/src/runtime/ffi/ffi_body.rs
+@@ -1469,6 +1469,10 @@ impl FFI {
+                 () => b"dylib",
+                 #[cfg(windows)]
+                 () => b"dll",
++                // FFI dlopen can't work in a wasm guest, but the shared-lib
++                // extension keeps the match total; the load fails later.
++                #[cfg(target_os = "wasi")]
++                () => b"wasm",
+                 // No arm for other targets (e.g. wasm) — the match fails to
+                 // compile there.
+             };
+@@ -2382,7 +2386,7 @@ impl CompilerRT {
+     /// keeps the leading characters and the extension random, so a generated
+     /// short (8.3) alias of the directory is random as well.
+     fn fresh_compiler_rt_dir_name() -> Option<ZBox> {
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "wasi"))]
+         {
+             let mut name_buf = PathBuffer::uninit();
+             let name = Fs::FileSystem::tmpname(b"bun-cc", &mut name_buf.0, bun_core::fast_random())
+@@ -2440,7 +2444,7 @@ impl CompilerRT {
+     /// Write one staged header without following a pre-planted symlinked
+     /// entry inside the header directory.
+     fn write_compiler_rt_file(dir: &bun_sys::Dir, name: &[u8], source: &[u8]) -> bool {
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "wasi"))]
+         {
+             let Ok(file) = dir.open_file(
+                 name,
 diff --git a/src/runtime/node/StatFS.rs b/src/runtime/node/StatFS.rs
 index daf0254f..a248a493 100644
 --- a/src/runtime/node/StatFS.rs
