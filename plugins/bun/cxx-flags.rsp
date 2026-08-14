@@ -50,3 +50,9 @@ $BUN_NATIVE/icu-wasi/install/include
 -I$BUN_NATIVE/cares/include
 -I$BUN_NATIVE/brotli/c/include
 -I$BUN_NATIVE/jsc-build/JavaScriptCore/PrivateHeaders/JavaScriptCore
+-idirafter $BUN_PLUGIN/wasi-compat
+-I$BUN_NATIVE/lshpack
+-I$BUN_NATIVE/zstd/lib
+-I$BUN_NATIVE/libarchive/libarchive
+-idirafter
+$BUN_NATIVE/lshpack/compat/queue
