@@ -22,3 +22,14 @@ void Bun__WebViewHost__childDied(void) {}
 long sys_epoll_pwait2(int epfd, void* ev, int maxev, const void* to, const void* mask) {
     (void)epfd;(void)ev;(void)maxev;(void)to;(void)mask; return -ENOSYS;
 }
+// libuv monotonic high-resolution clock (nanoseconds). node:http's
+// JSConnectionsList calls uv_hrtime() for per-connection timing and expects a
+// real uint64_t; the QUIC blind stub declared it () -> void, which LLD turned
+// into a signature_mismatch trap. wasip2 has a working monotonic clock.
+#include <time.h>
+#include <stdint.h>
+uint64_t uv_hrtime(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}

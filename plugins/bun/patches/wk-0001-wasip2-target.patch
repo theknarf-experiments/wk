@@ -2968,6 +2968,39 @@ index 57f53d11..296d2543 100644
      auto& vm = JSC::getVM(globalObject);
      JSC::JSValue wrappedFn = JSC::JSValue::decode(wrappedFnEncoded);
      auto function = JSWrappingFunction::create(vm, globalObject, symbolName, functionPointer, wrappedFn);
+diff --git a/src/jsc/bindings/NodeHTTP.cpp b/src/jsc/bindings/NodeHTTP.cpp
+index 367d067c..865e7432 100644
+--- a/src/jsc/bindings/NodeHTTP.cpp
++++ b/src/jsc/bindings/NodeHTTP.cpp
+@@ -1076,24 +1076,24 @@ extern "C" bool NodeHTTPServer__writeHead_http(
+     JSC::JSGlobalObject* globalObject,
+     const char* statusMessage,
+     size_t statusMessageLength,
+-    JSValue headersObjectValue,
++    EncodedJSValue headersObjectValue,
+     uint32_t autoHeaderBits,
+     uint32_t keepAliveTimeoutSecs,
+     uWS::HttpResponse<false>* response)
+ {
+-    return NodeHTTPServer__writeHead<false>(globalObject, statusMessage, statusMessageLength, headersObjectValue, autoHeaderBits, keepAliveTimeoutSecs, response);
++    return NodeHTTPServer__writeHead<false>(globalObject, statusMessage, statusMessageLength, JSValue::decode(headersObjectValue), autoHeaderBits, keepAliveTimeoutSecs, response);
+ }
+ 
+ extern "C" bool NodeHTTPServer__writeHead_https(
+     JSC::JSGlobalObject* globalObject,
+     const char* statusMessage,
+     size_t statusMessageLength,
+-    JSValue headersObjectValue,
++    EncodedJSValue headersObjectValue,
+     uint32_t autoHeaderBits,
+     uint32_t keepAliveTimeoutSecs,
+     uWS::HttpResponse<true>* response)
+ {
+-    return NodeHTTPServer__writeHead<true>(globalObject, statusMessage, statusMessageLength, headersObjectValue, autoHeaderBits, keepAliveTimeoutSecs, response);
++    return NodeHTTPServer__writeHead<true>(globalObject, statusMessage, statusMessageLength, JSValue::decode(headersObjectValue), autoHeaderBits, keepAliveTimeoutSecs, response);
+ }
+ 
+ extern "C" EncodedJSValue NodeHTTPServer__onRequest_http(
 diff --git a/src/jsc/bindings/NodeVM.cpp b/src/jsc/bindings/NodeVM.cpp
 index 54a3d25d..37631791 100644
 --- a/src/jsc/bindings/NodeVM.cpp
@@ -3187,110 +3220,6 @@ index eb0f9e43..099245e8 100644
  #endif
  
  static_assert(sizeof(TopExceptionScope) == ExpectedTopExceptionScopeSize, "src/jsc/TopExceptionScope.rs assumes TopExceptionScope is 56 bytes");
-diff --git a/src/jsc/bindings/ZigGlobalObject.cpp b/src/jsc/bindings/ZigGlobalObject.cpp
-index 3022c09c..d7027775 100644
---- a/src/jsc/bindings/ZigGlobalObject.cpp
-+++ b/src/jsc/bindings/ZigGlobalObject.cpp
-@@ -145,10 +145,13 @@
- #include "streams/JSTextDecoderStream.h"
- #include "streams/JSTransformStream.h"
- #include "streams/JSTransformStreamDefaultController.h"
-+#include <wtf/SetForScope.h>
- #include "JSURLPattern.h"
- #include "JSURLSearchParams.h"
-+#if ENABLE(WEBASSEMBLY)
- #include "JSWasmStreamingCompiler.h"
- #include <JavaScriptCore/WebAssemblyCompileOptions.h>
-+#endif
- #include "JSWebSocket.h"
- #include "JSWorker.h"
- #include "streams/JSWritableStream.h"
-@@ -302,10 +305,21 @@ extern "C" void JSCInitialize(const char* envp[], size_t envc, void (*onCrash)(c
-         // useWasmFaultSignalHandler/FastMemory when ASAN_OPTIONS lacks
-         // allow_user_segv_handler=1, so we don't force it off here.
-         JSC::initialize([&] {
-+#if defined(__wasi__)
-+            // The wasi JSC build is cloop/no-JIT and ships no WebAssembly engine
-+            // tier (neither BBQ JIT nor IPInt), so leaving useWasm on trips
-+            // assertOptionsAreCoherent ("at least one of useWasmIPInt or
-+            // useBBQJIT must be true"). Everything runs in the interpreter.
-+            JSC::Options::useWasm() = false;
-+            JSC::Options::useJIT() = false;
-+            JSC::Options::useBBQJIT() = false;
-+            JSC::Options::useConcurrentJIT() = false;
-+#else
-             JSC::Options::useWasm() = true;
-             JSC::Options::useJIT() = true;
-             JSC::Options::useBBQJIT() = true;
-             JSC::Options::useConcurrentJIT() = true;
-+#endif
-             // JSC::Options::useSigillCrashAnalyzer() = true;
-             JSC::Options::useSourceProviderCache() = true;
-             // JSC::Options::useUnlinkedCodeBlockJettisoning() = false;
-@@ -999,8 +1013,13 @@ const JSC::GlobalObjectMethodTable& GlobalObject::globalObjectMethodTable()
-         &scriptExecutionStatus,
-         &unsafeEvalNoop, // reportViolationForUnsafeEval
-         nullptr, // defaultLanguage
-+#if ENABLE(WEBASSEMBLY)
-         &compileStreaming,
-         &instantiateStreaming,
-+#else
-+        nullptr, // compileStreaming (WebAssembly disabled)
-+        nullptr, // instantiateStreaming
-+#endif
-         &Zig::deriveShadowRealmGlobalObject,
-         &codeForEval, // codeForEval
-         &canCompileStrings, // canCompileStrings
-@@ -1027,8 +1046,13 @@ const JSC::GlobalObjectMethodTable& EvalGlobalObject::globalObjectMethodTable()
-         &scriptExecutionStatus,
-         &unsafeEvalNoop, // reportViolationForUnsafeEval
-         nullptr, // defaultLanguage
-+#if ENABLE(WEBASSEMBLY)
-         &compileStreaming,
-         &instantiateStreaming,
-+#else
-+        nullptr, // compileStreaming (WebAssembly disabled)
-+        nullptr, // instantiateStreaming
-+#endif
-         &Zig::deriveShadowRealmGlobalObject,
-         &codeForEval, // codeForEval
-         &canCompileStrings, // canCompileStrings
-@@ -1332,8 +1356,8 @@ JSC_DEFINE_HOST_FUNCTION(functionNativeMicrotaskTrampoline,
-     double cellPtr = callFrame->uncheckedArgument(0).asNumber();
-     double callbackPtr = callFrame->uncheckedArgument(1).asNumber();
- 
--    void* cell = reinterpret_cast<void*>(std::bit_cast<uintptr_t>(cellPtr));
--    auto* callback = reinterpret_cast<MicrotaskCallback>(std::bit_cast<uintptr_t>(callbackPtr));
-+    void* cell = reinterpret_cast<void*>(static_cast<uintptr_t>(std::bit_cast<uint64_t>(cellPtr)));
-+    auto* callback = reinterpret_cast<MicrotaskCallback>(static_cast<uintptr_t>(std::bit_cast<uint64_t>(callbackPtr)));
-     callback(cell);
-     return JSValue::encode(jsUndefined());
- }
-@@ -3598,7 +3622,7 @@ extern "C" void JSC__JSGlobalObject__queueMicrotaskCallback(Zig::GlobalObject* g
- 
-     // Do not use JSCell* here because the GC will try to visit it.
-     // Use BunInvokeJobWithArguments to pass the two arguments (ptr and callback) to the trampoline function
--    JSC::QueuedTask task { nullptr, JSC::InternalMicrotask::BunInvokeJobWithArguments, 0, globalObject, function, JSValue(std::bit_cast<double>(reinterpret_cast<uintptr_t>(ptr))), JSValue(std::bit_cast<double>(reinterpret_cast<uintptr_t>(callback))) };
-+    JSC::QueuedTask task { nullptr, JSC::InternalMicrotask::BunInvokeJobWithArguments, 0, globalObject, function, JSValue(std::bit_cast<double>(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ptr)))), JSValue(std::bit_cast<double>(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(callback)))) };
-     globalObject->vm().queueMicrotask(WTF::move(task));
- }
- 
-@@ -3993,6 +4017,7 @@ JSC::JSValue EvalGlobalObject::moduleLoaderEvaluate(JSGlobalObject* lexicalGloba
-     return result;
- }
- 
-+#if ENABLE(WEBASSEMBLY)
- extern "C" JSC::EncodedJSValue Zig__GlobalObject__getBodyStreamOrBytesForWasmStreaming(JSGlobalObject*, EncodedJSValue response, JSC::Wasm::StreamingCompiler* compiler);
- 
- extern "C" void JSC__Wasm__StreamingCompiler__addBytes(JSC::Wasm::StreamingCompiler* compiler, const uint8_t* spanPtr, size_t spanSize)
-@@ -4055,6 +4080,7 @@ void GlobalObject::instantiateStreaming(JSGlobalObject* globalObject, JSC::JSPro
- {
-     handleResponseOnStreamingAction(globalObject, promise, source, JSC::Wasm::CompilerMode::FullCompile, importObject, WTF::move(compileOptions));
- }
-+#endif // ENABLE(WEBASSEMBLY)
- 
- GlobalObject::PromiseFunctions GlobalObject::promiseHandlerID(Zig::FFIFunction handler)
- {
 diff --git a/src/jsc/bindings/bindings.cpp b/src/jsc/bindings/bindings.cpp
 index 40e19b3e..3340610b 100644
 --- a/src/jsc/bindings/bindings.cpp
@@ -5528,6 +5457,35 @@ index af51dd28..7465fb4f 100644
  use bun_jsc::JsCell;
  use bun_sys::{self as sys, Fd};
  use bun_uws::{AnyResponse, WriteResult};
+diff --git a/src/runtime/server/NodeHTTPResponse.rs b/src/runtime/server/NodeHTTPResponse.rs
+index 59caf52d..65d7b08f 100644
+--- a/src/runtime/server/NodeHTTPResponse.rs
++++ b/src/runtime/server/NodeHTTPResponse.rs
+@@ -344,8 +344,13 @@ extern "C" fn on_auto_flush_trampoline(ctx: *mut c_void) -> bool {
+ /// The Rust `AnyServer` stores `(tag, ptr)` unpacked, so map the wire tag back
+ /// to `AnyServerTag` here.
+ #[inline]
+-fn any_server_from_packed(packed: u64) -> AnyServer {
+-    let repr = bun_ptr::TaggedPtr::from(packed);
++fn any_server_from_packed(packed: usize) -> AnyServer {
++    // `AnyServer::to_packed()` builds this word via `TaggedPtr::to()`, which on
++    // wasm32 folds the variant tag into the pointer's low bits (a 32-bit
++    // `*mut c_void` can't carry the tag in bits 49..64 the way a 64-bit word
++    // does). Unpack through the same `*mut c_void` path so the fold is reversed;
++    // on 64-bit this is the identity round-trip through the raw word.
++    let repr = bun_ptr::TaggedPtr::from(packed as *mut c_void);
+     let tag = match repr.data() {
+         1024 => AnyServerTag::HTTPServer,
+         1023 => AnyServerTag::HTTPSServer,
+@@ -2716,7 +2721,7 @@ pub(crate) unsafe extern "C" fn NodeHTTPResponse__adoptRawRequestHeaders(
+ /// call; `has_body` and `node_response_ptr` must be writable.
+ #[unsafe(no_mangle)]
+ pub(crate) unsafe extern "C" fn NodeHTTPResponse__createForJS(
+-    any_server_tag: u64,
++    any_server_tag: usize,
+     global_object: &JSGlobalObject,
+     has_body: *mut bool,
+     request: *mut uws_sys::Request,
 diff --git a/src/runtime/server/server_body.rs b/src/runtime/server/server_body.rs
 index f0a724ef..3eca41fe 100644
 --- a/src/runtime/server/server_body.rs

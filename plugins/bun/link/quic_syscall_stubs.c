@@ -167,7 +167,9 @@ void us_quic_stream_socket(void) {}
 void us_quic_stream_want_read(void) {}
 void us_quic_stream_want_write(void) {}
 void us_quic_stream_write(void) {}
-void uv_hrtime(void) {}
+// uv_hrtime is a REAL function (node:http JSConnectionsList timing); implemented
+// for real in syscall_impls.c. A blind () -> void stub here would shadow it and
+// trap with signature_mismatch.
 void uws_h3_app_add_server_name(void) {}
 void uws_h3_app_any(void) {}
 void uws_h3_app_clear_routes(void) {}
