@@ -33,3 +33,12 @@ uint64_t uv_hrtime(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
+// wasip2 has no users. bun reads uid/gid for cache / `bunx` temp-dir prefixes
+// and ownership checks; report root (0). These were blind `() -> void` stubs
+// (quic_syscall_stubs.c) that mismatched the real `() -> uid_t` references and
+// trapped `signature_mismatch:getuid` (e.g. `bunx`).
+unsigned int getuid(void) { return 0; }
+unsigned int getgid(void) { return 0; }
+// umask sets/reads the file-mode-creation mask; the wk VFS has no permissions,
+// so report an empty mask. (Was a `() -> void` trap stub in trap_stubs_v8.c.)
+unsigned int umask(unsigned int mask) { (void)mask; return 0; }

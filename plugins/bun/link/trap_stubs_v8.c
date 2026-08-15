@@ -187,7 +187,6 @@ void v183(void) __asm__("_ZNK2v88External5ValueEv"); void v183(void){__builtin_t
 void v184(void) __asm__("_ZNK2v88Function11NewInstanceENS_5LocalINS_7ContextEEEiPNS1_INS_5ValueEEE"); void v184(void){__builtin_trap();}
 void v185(void) __asm__("_ZNK2v88Function7GetNameEv"); void v185(void){__builtin_trap();}
 void fchdir(void){__builtin_trap();}
-void umask(void){__builtin_trap();}
 void uv_os_getpid(void){__builtin_trap();}
 void uv_os_getppid(void){__builtin_trap();}
 void Bun__setSamplingInterval(void){__builtin_trap();}

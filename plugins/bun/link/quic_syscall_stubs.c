@@ -4,8 +4,6 @@ void __archive_read_program(void) {}
 void ares_tvnow(void) {}
 void chown(void) {}
 void fchown(void) {}
-void getgid(void) {}
-void getuid(void) {}
 void lchown(void) {}
 void lsquic_conn_abort(void) {}
 void lsquic_conn_abort_error(void) {}
