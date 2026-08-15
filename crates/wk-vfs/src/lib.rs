@@ -1362,15 +1362,56 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
     ) -> Result<std::result::Result<(), ErrorCode>> {
         Ok(Ok(()))
     }
+    /// Create a hard link: a second directory entry pointing at the *same*
+    /// node id as an existing file. No node is allocated (that is what makes it
+    /// a hard link, as opposed to `symlink_at`). The node is freed only once
+    /// its last directory entry is removed (see `unlink`).
     fn link_at(
         &mut self,
-        _fd: Resource<Descriptor>,
-        _old_path_flags: PathFlags,
-        _old_path: String,
-        _new_descriptor: Resource<Descriptor>,
-        _new_path: String,
+        fd: Resource<Descriptor>,
+        old_path_flags: PathFlags,
+        old_path: String,
+        new_descriptor: Resource<Descriptor>,
+        new_path: String,
     ) -> Result<std::result::Result<(), ErrorCode>> {
-        err(ErrorCode::Unsupported)
+        let (fs, old_start) = fd_fs(self, &fd)?;
+        let new_start = self.table().get(&new_descriptor)?.node;
+        // Hard links can't cross filesystems (node ids are per-fs).
+        if !Arc::ptr_eq(&fs, &self.table().get(&new_descriptor)?.fs) {
+            return err(ErrorCode::CrossDevice);
+        }
+        let mut g = fs.lock().unwrap();
+        // POSIX link(2) does not follow a trailing symlink unless
+        // AT_SYMLINK_FOLLOW (SYMLINK_FOLLOW) is set.
+        let follow = old_path_flags.contains(PathFlags::SYMLINK_FOLLOW);
+        let Some(src_id) = resolve_at(&g, old_start, &old_path, follow) else {
+            return err(ErrorCode::NoEntry);
+        };
+        // Directories cannot be hard-linked; a read-only (layer) node cannot
+        // gain a writable-namespace alias.
+        match g.nodes.get(&src_id) {
+            Some(Node::Dir(_)) => return err(ErrorCode::NotPermitted),
+            None => return err(ErrorCode::NoEntry),
+            Some(_) => {}
+        }
+        if g.readonly.contains(&src_id) {
+            return err(ErrorCode::NotPermitted);
+        }
+        let Some((new_parent, new_name)) = resolve_parent(&g, new_start, &new_path) else {
+            return err(ErrorCode::NoEntry);
+        };
+        match g.nodes.get(&new_parent) {
+            Some(Node::Dir(children)) => {
+                if children.contains_key(&new_name) {
+                    return err(ErrorCode::Exist);
+                }
+            }
+            _ => return err(ErrorCode::NotDirectory),
+        }
+        if let Some(Node::Dir(children)) = g.nodes.get_mut(&new_parent) {
+            children.insert(new_name, src_id);
+        }
+        Ok(Ok(()))
     }
     /// Create a symlink at `dest_path` pointing at `src_path`. The target is
     /// stored verbatim (it may dangle, exactly as POSIX allows) and resolved
@@ -1459,11 +1500,25 @@ fn unlink<T: VfsView>(
         (false, Some(Node::Dir(_))) | (false, None) => return err(ErrorCode::IsDirectory),
         (false, _) => {}
     }
-    g.nodes.remove(&id);
+    // Remove the directory entry first, then free the node only if no other
+    // entry still references it — hard links (see `link_at`) share a node id,
+    // so the backing content must survive until the last name is gone.
     if let Some(Node::Dir(c)) = g.nodes.get_mut(&parent) {
         c.remove(&name);
     }
+    if !node_is_referenced(&g, id) {
+        g.nodes.remove(&id);
+    }
     Ok(Ok(()))
+}
+
+/// True if any directory entry still maps to `id` (i.e. the node has remaining
+/// hard links). Linear scan over all nodes; only the cold unlink path calls it.
+fn node_is_referenced(fs: &Fs, id: u64) -> bool {
+    fs.nodes.values().any(|n| match n {
+        Node::Dir(children) => children.values().any(|&v| v == id),
+        _ => false,
+    })
 }
 
 fn stat_node(fs: &Fs, id: u64) -> Option<DescriptorStat> {
