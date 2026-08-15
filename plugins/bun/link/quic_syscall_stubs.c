@@ -64,7 +64,6 @@ void lsquic_stream_shutdown_internal(void) {}
 void lsquic_stream_wantread(void) {}
 void lsquic_stream_wantwrite(void) {}
 void lsquic_stream_write(void) {}
-void phr_parse_response(void) {}
 void recvmmsg(void) {}
 void sem_destroy(void) {}
 void sem_init(void) {}
