@@ -805,6 +805,46 @@ index 1e90288e..e03355f3 100644
              }
          }
          #[cfg(windows)]
+diff --git a/src/bundler/BundleThread.rs b/src/bundler/BundleThread.rs
+index cef2a048..aa4a2eca 100644
+--- a/src/bundler/BundleThread.rs
++++ b/src/bundler/BundleThread.rs
+@@ -411,8 +411,35 @@ pub mod singleton {
+         let completion = NonNull::new(completion).unwrap_or_else(|| {
+             Output::panic(format_args!("BundleThread enqueue: null completion"))
+         });
++        // wasip2 has no threads (`std::thread::spawn` is ENOSYS), so there is no
++        // bundle thread to enqueue to. Run the build inline on the calling (JS)
++        // thread — a straight port of `thread_main`'s per-completion loop body.
++        // `generate_in_new_thread` drives parsing through the `WorkPool`, which
++        // also runs inline on wasi, so the whole build is synchronous and
++        // `complete_on_bundle_thread()` still posts the result to the JS loop.
++        #[cfg(target_os = "wasi")]
++        {
++            let c = completion.as_ptr();
++            // SAFETY: `c` is the non-null completion validated above; these
++            // CompletionStruct calls mirror their use in `thread_main`.
++            unsafe {
++                if !(*c).try_start() {
++                    C::free_released_unstarted(c);
++                    return;
++                }
++                match BundleThread::<C>::generate_in_new_thread(&mut *c, bun_core::Generation::default()) {
++                    Ok(()) => {}
++                    Err(err) => {
++                        (*c).set_result(BundleV2Result::Err(err));
++                        (*c).complete_on_bundle_thread();
++                    }
++                }
++            }
++            return;
++        }
+         // SAFETY: `get()` returns the leaked 'static singleton whose bundle thread is
+         // running; `BundleThread::enqueue` only performs raw-ptr field projections.
++        #[cfg(not(target_os = "wasi"))]
+         unsafe { BundleThread::enqueue(get::<C>(), completion.as_ptr()) };
+     }
+ }
 diff --git a/src/bundler/ParseTask.rs b/src/bundler/ParseTask.rs
 index e051a225..fc6b0d2b 100644
 --- a/src/bundler/ParseTask.rs
@@ -4339,6 +4379,47 @@ index fdedb2be..7a73070d 100644
                  };
  
                  #[cfg(target_os = "linux")]
+diff --git a/src/runtime/api/JSBundler.rs b/src/runtime/api/JSBundler.rs
+index 24817615..82e1d1fa 100644
+--- a/src/runtime/api/JSBundler.rs
++++ b/src/runtime/api/JSBundler.rs
+@@ -913,6 +913,7 @@ pub mod js_bundler {
+                 let _close = scopeguard::guard(dir, |d| d.close());
+ 
+                 let mut rootdir_buf = bun_paths::PathBuffer::uninit();
++                #[cfg(not(target_os = "wasi"))]
+                 let rootdir = match bun_sys::get_fd_path(*_close, &mut rootdir_buf) {
+                     Ok(p) => p,
+                     Err(err) => {
+@@ -923,6 +924,28 @@ pub mod js_bundler {
+                         )));
+                     }
+                 };
++                // wasip2 exposes no fd->path (`get_fd_path` is ENOSYS — no
++                // F_GETPATH, no /proc/self/fd). The directory opened cleanly
++                // above, so absolutize the input path against cwd directly; the
++                // fabric VFS has no symlinks needing kernel realpath resolution,
++                // so this yields the same canonical root a native build would.
++                #[cfg(target_os = "wasi")]
++                let rootdir: &[u8] = {
++                    let p = path.slice();
++                    let mut cwd_buf = bun_paths::PathBuffer::default();
++                    if p.first() == Some(&b'/') {
++                        bun_paths::resolve_path::join_string_buf::<bun_paths::resolve_path::platform::Posix>(
++                            &mut rootdir_buf[..],
++                            &[p],
++                        )
++                    } else {
++                        let cn = bun_sys::getcwd(&mut cwd_buf[..]).unwrap_or(0);
++                        bun_paths::resolve_path::join_string_buf::<bun_paths::resolve_path::platform::Posix>(
++                            &mut rootdir_buf[..],
++                            &[&cwd_buf[..cn], p],
++                        )
++                    }
++                };
+                 this.rootdir.append_slice_exact(rootdir)?;
+                 drop(path);
+             }
 diff --git a/src/runtime/api/bun/Terminal.rs b/src/runtime/api/bun/Terminal.rs
 index 700eb630..a1086fc1 100644
 --- a/src/runtime/api/bun/Terminal.rs
@@ -7676,6 +7757,53 @@ index 3d2b2376..0102d7f1 100644
      }
  }
  
+diff --git a/src/threading/ThreadPool.rs b/src/threading/ThreadPool.rs
+index 2b8e5bbe..10181182 100644
+--- a/src/threading/ThreadPool.rs
++++ b/src/threading/ThreadPool.rs
+@@ -629,14 +629,42 @@ impl ThreadPool {
+ 
+     /// Schedule a batch of tasks to be executed by some thread on the thread pool.
+     pub fn schedule(&self, batch: Batch) {
++        #[cfg(target_os = "wasi")]
++        {
++            self.run_batch_inline(batch);
++            return;
++        }
++        #[cfg(not(target_os = "wasi"))]
+         self.schedule_impl(&batch, false);
+     }
+ 
+     /// This function should only be called from threads that are part of the thread pool.
+     pub fn schedule_inside_thread_pool(&self, batch: Batch) {
++        #[cfg(target_os = "wasi")]
++        {
++            self.run_batch_inline(batch);
++            return;
++        }
++        #[cfg(not(target_os = "wasi"))]
+         self.schedule_impl(&batch, true);
+     }
+ 
++    /// wasip2 has no worker threads — `std::thread::spawn` returns ENOSYS, so a
++    /// batch queued for the pool would never be picked up (and `force_spawn`
++    /// errors). Run every task's callback inline on the calling thread instead;
++    /// nested scheduling recurses through this same path, and `wait_for_all`
++    /// becomes a no-op since the wait group is never incremented. This mirrors
++    /// the single-threaded `WorkPool`/`HTTPThread` treatment used elsewhere.
++    #[cfg(target_os = "wasi")]
++    fn run_batch_inline(&self, mut batch: Batch) {
++        while let Some(task) = batch.pop() {
++            // SAFETY: `task` was just popped from the batch we own; its callback
++            // was installed by the producer and honours the documented
++            // `unsafe fn(*mut Task)` contract.
++            unsafe { ((*task.as_ptr()).callback)(task.as_ptr()) };
++        }
++    }
++
+     /// Wait for all tasks to complete. This does not shut down or deinit the thread pool.
+     pub fn wait_for_all(&self) {
+         self.wait_group.wait();
 diff --git a/src/threading/work_pool.rs b/src/threading/work_pool.rs
 index 60f4a0c9..91700446 100644
 --- a/src/threading/work_pool.rs
