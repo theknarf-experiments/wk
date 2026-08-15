@@ -4514,7 +4514,7 @@ index 700eb630..a1086fc1 100644
      const POLL_OWNER_TAG: bun_io::PollTag = bun_io::posix_event_loop::poll_tag::TERMINAL_POLL;
      const HAS_ON_READY: bool = true;
 diff --git a/src/runtime/api/bun/js_bun_spawn_bindings.rs b/src/runtime/api/bun/js_bun_spawn_bindings.rs
-index 698ea540..f9621580 100644
+index 698ea540..a5dd8bd6 100644
 --- a/src/runtime/api/bun/js_bun_spawn_bindings.rs
 +++ b/src/runtime/api/bun/js_bun_spawn_bindings.rs
 @@ -18,12 +18,14 @@ use bun_jsc::{JsCell, SysErrorJsc as _};
@@ -4553,7 +4553,7 @@ index 698ea540..f9621580 100644
                      {
                          // On Windows, ConPTY supplies stdio via PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE.
                          // Set stdio to .ignore so spawnProcessWindows doesn't allocate pipes.
-@@ -1112,6 +1114,22 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
+@@ -1112,6 +1114,30 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
          None => None,
      };
  
@@ -4569,6 +4569,14 @@ index 698ea540..f9621580 100644
 +        };
 +        if !bytes.is_empty() {
 +            stdio[0] = Stdio::Ignore;
++        } else if matches!(stdio[0], Stdio::Pipe | Stdio::ReadableStream(_)) {
++            // Async spawn wires stdin as a live pipe (or a ReadableStream), but
++            // wk:exec already ran the child to completion in this call — there
++            // is no process left to stream into. Drop it to `Ignore` so
++            // `Writable::init` returns `Writable::Ignore` instead of building a
++            // FileSink over the absent pipe fd (its `result.unwrap()` on the
++            // `None` StdioResult would panic — the async `cp.exec` crash).
++            stdio[0] = Stdio::Ignore;
 +        }
 +        bytes
 +    };
@@ -4576,7 +4584,7 @@ index 698ea540..f9621580 100644
      let mut spawn_options = SpawnOptions {
          // Empty means "inherit the parent's working directory". Only chdir
          // when the user asked for it: the stored cwd path string can be stale
-@@ -1174,6 +1192,8 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
+@@ -1174,6 +1200,8 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
          },
          #[cfg(any(target_os = "linux", target_os = "android"))]
          cgroup_fd: cgroup_dir.as_ref().map(|c| c.dir.handle()),
@@ -4585,7 +4593,7 @@ index 698ea540..f9621580 100644
          ..Default::default()
      };
  
-@@ -1411,7 +1431,7 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
+@@ -1411,7 +1439,7 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
                      }
                  }
              }
@@ -4594,7 +4602,7 @@ index 698ea540..f9621580 100644
              {
                  use bun_libuv_sys::UvHandle as _;
                  for r in [spawned_stdout, spawned_stderr] {
-@@ -1582,7 +1602,7 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
+@@ -1582,7 +1610,7 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
                  v[usize::try_from(ipc_channel).expect("int cast")] = ExtraPipe::Unavailable;
              });
          }
@@ -4603,6 +4611,34 @@ index 698ea540..f9621580 100644
          {
              use crate::node::MaybeExt as _;
              let idx = usize::try_from(ipc_channel).expect("int cast");
+@@ -1708,6 +1736,7 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
+             Subprocess::js::terminal_set_cached(out, global_this, terminal_js_value);
+         }
+ 
++        #[cfg(not(target_os = "wasi"))]
+         match subprocess.process_mut().watch() {
+             sys::Result::Ok(()) => {}
+             sys::Result::Err(_) => {
+@@ -1715,6 +1744,19 @@ fn spawn_maybe_sync<const IS_SYNC: bool>(
+                 lazy = false;
+             }
+         }
++        // wk:exec ran the child to completion *inside* spawn_process, so it has
++        // already exited and watch() registers no poll — nothing will ever
++        // deliver the exit. Drive the exit handler directly (the defer below
++        // calls on_exit since has_exited()) so onExit/`exec` callbacks fire and
++        // the streams close, and force eager (non-lazy) reads: the captured
++        // stdout/stderr are regular files, so the poll-driven lazy read would
++        // never wake.
++        #[cfg(target_os = "wasi")]
++        {
++            let _ = subprocess.process_mut().watch();
++            send_exit_notification = true;
++            lazy = false;
++        }
+     }
+ 
+     // Note: reshaped for borrowck — copy `subprocess_ptr` so the
 diff --git a/src/runtime/api/bun/spawn/stdio.rs b/src/runtime/api/bun/spawn/stdio.rs
 index a6ba3faf..71d4d67e 100644
 --- a/src/runtime/api/bun/spawn/stdio.rs
