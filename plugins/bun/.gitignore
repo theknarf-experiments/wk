@@ -2,3 +2,4 @@ bun/
 codegen/
 native/
 bun-transpile.wasm
+bun-run.wasm

@@ -10,4 +10,9 @@ COPY bash.wasm /bin/bash.wasm
 COPY coreutils.wasm /bin/coreutils.wasm
 COPY bin/ /bin/
 ENV PATH=/bin
+# A writable temp dir the way every base image ships one: tools that spill to a
+# scratch file (tac, sort on large input, mktemp) fail without it. The node's
+# root fs is writable at runtime, so an empty dir baked here is enough.
+RUN ["/bin/bash.wasm", "-c", "mkdir -p /tmp /var/tmp"]
+ENV TMPDIR=/tmp
 ENTRYPOINT ["/bin/bash.wasm"]
