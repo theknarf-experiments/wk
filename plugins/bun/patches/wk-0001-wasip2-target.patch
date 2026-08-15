@@ -1423,20 +1423,21 @@ index 57bfb2fc..116a64a9 100644
                                  self.close_and_fail::<IS_SSL>(err, socket);
                                  return;
 diff --git a/src/install/PackageInstall.rs b/src/install/PackageInstall.rs
-index 43521627..d7634157 100644
+index 43521627..1c8349b5 100644
 --- a/src/install/PackageInstall.rs
 +++ b/src/install/PackageInstall.rs
-@@ -150,6 +150,18 @@ impl Method {
+@@ -150,6 +150,19 @@ impl Method {
          })
      }
  
-+    /// wk's vfs supports hard links and symlinks, so WASI matches Linux.
++    /// wk's vfs has no hardlinks (guest `link()` → ENOTSUP), but supports
++    /// symlinks and plain file copies — copyfile/symlink are the usable backends.
 +    #[cfg(target_os = "wasi")]
 +    fn wasi() -> BackendSupport {
 +        enum_map::EnumMap::from_fn(|k| match k {
 +            Method::Clonefile => false,
 +            Method::ClonefileEachDir => false,
-+            Method::Hardlink => true,
++            Method::Hardlink => false,
 +            Method::Copyfile => true,
 +            Method::Symlink => true,
 +        })
@@ -1445,7 +1446,7 @@ index 43521627..d7634157 100644
      #[inline]
      pub(crate) fn is_supported(self) -> bool {
          #[cfg(target_os = "macos")]
-@@ -157,6 +169,8 @@ impl Method {
+@@ -157,6 +170,8 @@ impl Method {
          // Android is listed explicitly: `target_os = "linux"` does not cover the Android ABI.
          #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
          return Self::linux()[self];
@@ -1454,7 +1455,7 @@ index 43521627..d7634157 100644
          #[cfg(windows)]
          return Self::windows()[self];
          #[cfg(not(any(
-@@ -164,6 +178,7 @@ impl Method {
+@@ -164,6 +179,7 @@ impl Method {
              target_os = "linux",
              target_os = "android",
              target_os = "freebsd",
@@ -1462,7 +1463,18 @@ index 43521627..d7634157 100644
              windows
          )))]
          return false;
-@@ -1603,7 +1618,7 @@ impl<'a> PackageInstall<'a> {
+@@ -251,6 +267,10 @@ impl Step {
+ // so `Relaxed` adds no contention).
+ pub(crate) static SUPPORTED_METHOD: AtomicU8 = AtomicU8::new(if cfg!(target_os = "macos") {
+     Method::Clonefile as u8
++} else if cfg!(target_os = "wasi") {
++    // wk's VFS has no hardlinks (guest `link()` → ENOTSUP); copyfile is a
++    // plain read+write copy that works.
++    Method::Copyfile as u8
+ } else {
+     Method::Hardlink as u8
+ });
+@@ -1603,7 +1623,7 @@ impl<'a> PackageInstall<'a> {
                          break;
                      }
                  };
@@ -1471,7 +1483,7 @@ index 43521627..d7634157 100644
                  {
                      match entry.kind {
                          EntryKind::Directory => {
-@@ -1649,7 +1664,7 @@ impl<'a> PackageInstall<'a> {
+@@ -1649,7 +1669,7 @@ impl<'a> PackageInstall<'a> {
                          _ => {}
                      }
                  }
@@ -1480,7 +1492,7 @@ index 43521627..d7634157 100644
                  {
                      match entry.kind {
                          EntryKind::File => {}
-@@ -1756,7 +1771,7 @@ impl<'a> PackageInstall<'a> {
+@@ -1756,7 +1776,7 @@ impl<'a> PackageInstall<'a> {
          let mut buf2 = PathBuffer::uninit();
          #[cfg(not(windows))]
          let to_copy_buf2_offset: usize;
@@ -1489,7 +1501,7 @@ index 43521627..d7634157 100644
          {
              let cache_dir_path = sys::get_fd_path(state.cached_package_dir.fd(), &mut buf2)?;
              let cache_len = cache_dir_path.len();
-@@ -1796,7 +1811,7 @@ impl<'a> PackageInstall<'a> {
+@@ -1796,7 +1816,7 @@ impl<'a> PackageInstall<'a> {
              #[cfg(not(windows))]
              let _ = (to_copy_into1_offset, head1);
              while let Some(entry) = walker.next()? {
@@ -1498,7 +1510,7 @@ index 43521627..d7634157 100644
                  {
                      match entry.kind {
                          EntryKind::Directory => {
-@@ -1827,7 +1842,7 @@ impl<'a> PackageInstall<'a> {
+@@ -1827,7 +1847,7 @@ impl<'a> PackageInstall<'a> {
                          _ => {}
                      }
                  }
@@ -1547,6 +1559,26 @@ index 43570af6..cb68f828 100644
              {
                  break 'brk Dir::from_fd(
                      bun_sys::open_dir_at_windows_a(
+diff --git a/src/install/PackageManager.rs b/src/install/PackageManager.rs
+index a23f5df1..a2b97874 100644
+--- a/src/install/PackageManager.rs
++++ b/src/install/PackageManager.rs
+@@ -1027,6 +1027,15 @@ impl PackageManager {
+             is_done: fn(&mut C) -> bool,
+         }
+         fn trampoline<C>(p: *mut c_void) -> bool {
++            // wasip2 has no HTTP worker thread: bun's HTTP client runs inline on
++            // the main loop and is normally pumped by the JS event loop's
++            // auto_tick (drain events, tick the uSockets loop, flush deferred
++            // frees). The package-manager MiniEventLoop never runs that, so the
++            // registry network tasks would never make progress ("Resolving
++            // dependencies" hangs). Pump it here, once per tick iteration; it's a
++            // no-op until the HTTP client is initialized.
++            #[cfg(target_os = "wasi")]
++            bun_http::http_thread_tick();
+             let erased = p as *const Erased<C>;
+             // SAFETY: `p` is the `Erased<C>` local we pass to `tick_raw` below. We only
+             // read its two POD fields here (no `&mut Erased` materialized — the local
 diff --git a/src/install/PackageManager/security_scanner.rs b/src/install/PackageManager/security_scanner.rs
 index a8bad273..62cd1c5c 100644
 --- a/src/install/PackageManager/security_scanner.rs
@@ -1630,6 +1662,26 @@ index fea6db69..abc796c5 100644
                      {
                          // Ownership transfers to `spawned.stderr`.
                          bun_spawn::Stdio::Buffer(bun_core::heap::into_raw(Box::new(
+diff --git a/src/install/npm.rs b/src/install/npm.rs
+index 3af91eae..9a6387c0 100644
+--- a/src/install/npm.rs
++++ b/src/install/npm.rs
+@@ -1355,9 +1355,12 @@ pub mod package_manifest {
+                 [0u8; ("18446744073709551615".len() * 2) + "_".len() + ".npm".len() + 1];
+             let mut dest_path_stream = bun_io::FixedBufferStream::new_mut(&mut dest_path_buf);
+             let file_id_hex_fmt = bun_fmt::hex_int_lower::<16>(file_id);
+-            let hex_timestamp: usize =
+-                usize::try_from(bun_core::time::milli_timestamp().max(0)).expect("int cast");
+-            let hex_timestamp_fmt = bun_fmt::hex_int_lower::<16>(hex_timestamp as u64);
++            // A millisecond timestamp (~1.7e12) overflows a 32-bit `usize` on
++            // wasm32; it is only used as a `u64` for the hex filename, so carry
++            // it as `u64` directly (identical on 64-bit).
++            let hex_timestamp: u64 =
++                u64::try_from(bun_core::time::milli_timestamp().max(0)).expect("int cast");
++            let hex_timestamp_fmt = bun_fmt::hex_int_lower::<16>(hex_timestamp);
+             write!(
+                 dest_path_stream,
+                 "{}.npm-{}",
 diff --git a/src/install_types/resolver_hooks.rs b/src/install_types/resolver_hooks.rs
 index 90292158..97dbd3fd 100644
 --- a/src/install_types/resolver_hooks.rs
