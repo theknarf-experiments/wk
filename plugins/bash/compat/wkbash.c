@@ -331,3 +331,126 @@ int wk_bash_comsub_wait(int tok) {
         comsub_depth--;
     return status;
 }
+
+/* --- subshells: `( ... )` groups and compound pipeline stages --------------
+ *
+ * A subshell is a child the shell would fork; there is none here. Run it as a
+ * second bash through wk:exec, like command substitution above, but with its
+ * stdio wired where a subshell's belongs. `script' is its text (from
+ * make_command_string); `in_fd'/`out_fd' are the pipeline pipe endpoints, or -1
+ * for a standalone `( ... )`. A stage that feeds another (out_fd set) streams
+ * into it and is left running — its status is not the pipeline's; anything else
+ * is captured, replayed to this shell's stdout/stderr, and its real status
+ * returned, exactly as the forked path would have waited for it.
+ *
+ * Like command substitution, the child inherits only the exported environment —
+ * unexported variables and functions are not visible to another instance. */
+int wk_bash_subshell(const char *shell, const char *script, char **envp,
+                     int in_fd, int out_fd) {
+    if (!shell || !*shell || !script)
+        return 126;
+
+    size_t nenv = 0;
+    while (envp && envp[nenv])
+        nenv++;
+    exec_host_list_tuple2_string_string_t wenv = {NULL, 0};
+    if (nenv) {
+        wenv.ptr = malloc(nenv * sizeof *wenv.ptr);
+        if (!wenv.ptr)
+            return 126;
+        for (size_t i = 0; i < nenv; i++) {
+            const char *eq = strchr(envp[i], '=');
+            size_t nlen = eq ? (size_t)(eq - envp[i]) : strlen(envp[i]);
+            exec_host_string_t k, v;
+            k.ptr = (uint8_t *)envp[i];
+            k.len = nlen;
+            v.ptr = (uint8_t *)(eq ? eq + 1 : "");
+            v.len = eq ? strlen(eq + 1) : 0;
+            wenv.ptr[i].f0 = k;
+            wenv.ptr[i].f1 = v;
+        }
+        wenv.len = nenv;
+    }
+
+    exec_host_string_t wpath;
+    exec_host_string_set(&wpath, shell);
+    exec_host_string_t wargs_buf[3];
+    exec_host_string_set(&wargs_buf[0], (char *)shell);
+    exec_host_string_set(&wargs_buf[1], "-c");
+    exec_host_string_set(&wargs_buf[2], (char *)script);
+    exec_host_list_string_t wargs = {wargs_buf, 3};
+
+    /* stdin: a pipeline stage reads the pipe it was handed; a standalone
+     * subshell reads this shell's own stdin — a pipe streams, a regular file is
+     * read here, a terminal gives nothing (the three ways wk_bash_run picks). */
+    wk_exec_process_stdin_from_t win;
+    wk_exec_process_borrow_pipe_t inp;
+    char *inbytes = NULL;
+    size_t inbytes_len = 0;
+    int wire_in = in_fd >= 0 ? in_fd : STDIN_FILENO;
+    if (wk_pipe_of_fd(wire_in, &inp)) {
+        win.tag = WK_EXEC_PROCESS_STDIN_FROM_PIPE_END;
+        win.val.pipe_end = inp;
+    } else if (in_fd < 0 && (inbytes = stdin_bytes(&inbytes_len)) != NULL) {
+        win.tag = WK_EXEC_PROCESS_STDIN_FROM_BYTES;
+        win.val.bytes.ptr = (uint8_t *)inbytes;
+        win.val.bytes.len = inbytes_len;
+    } else {
+        win.tag = WK_EXEC_PROCESS_STDIN_FROM_EMPTY;
+    }
+
+    /* stdout: stream into the next stage if there is one, else capture. */
+    wk_exec_process_stdout_to_t wout, werr;
+    wk_exec_process_borrow_pipe_t outp;
+    int streaming = 0;
+    if (out_fd >= 0 && wk_pipe_of_fd(out_fd, &outp)) {
+        wout.tag = WK_EXEC_PROCESS_STDOUT_TO_PIPE_END;
+        wout.val.pipe_end = outp;
+        streaming = 1;
+    } else {
+        wout.tag = WK_EXEC_PROCESS_STDOUT_TO_CAPTURE;
+    }
+    werr.tag = WK_EXEC_PROCESS_STDOUT_TO_CAPTURE;
+
+    /* The shell's own buffered output goes out before the child's, which is
+     * written straight to the descriptors below. */
+    fflush(stdout);
+    fflush(stderr);
+
+    wk_exec_process_own_child_t ochild;
+    exec_host_string_t err = {NULL, 0};
+    bool ok = wk_exec_process_spawn(&wpath, &wargs, &wenv, &win, &wout, &werr,
+                                    &ochild, &err);
+    free(wenv.ptr);
+    free(inbytes);
+    if (!ok) {
+        fprintf(stderr, "%s\n", err.len ? (char *)err.ptr : "cannot start subshell");
+        exec_host_string_free(&err);
+        return 126;
+    }
+
+    wk_child child;
+    child.h = ochild.__handle;
+
+    if (streaming) {
+        /* Left running like any non-final pipeline stage — released, not waited
+         * for (waiting would deadlock a reader that leaves early). */
+        if (npending < WK_MAX_STAGES)
+            pending[npending++] = child;
+        else
+            wk_child_detach(child);
+        return 0; /* EXECUTION_SUCCESS — a mid-pipeline stage's status is unused */
+    }
+
+    wk_result r;
+    int status = 126;
+    if (wk_wait(child, &r) == 0) {
+        write_all(STDOUT_FILENO, r.stdout_data, r.stdout_len);
+        write_all(STDERR_FILENO, r.stderr_data, r.stderr_len);
+        status = r.exit_code;
+    } else if (r.error) {
+        fprintf(stderr, "%s\n", r.error);
+    }
+    wk_result_free(&r);
+    return status;
+}
