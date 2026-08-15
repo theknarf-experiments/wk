@@ -6803,7 +6803,7 @@ index 4e423c09..3b94faff 100644
              {
                  debug_assert!(self.native() >= 0);
 diff --git a/src/sys/lib.rs b/src/sys/lib.rs
-index c2e8b817..143498ec 100644
+index c2e8b817..0a8c1a84 100644
 --- a/src/sys/lib.rs
 +++ b/src/sys/lib.rs
 @@ -106,8 +106,11 @@ pub use bun_core::FileKind as EntryKind;
@@ -7465,7 +7465,78 @@ index c2e8b817..143498ec 100644
      #[cfg(unix)]
      {
          let h = handle.unwrap_or(core::ptr::null_mut());
-@@ -7392,7 +7621,7 @@ fn exists_at_type_nt(dir: Fd, mut path: &[u16]) -> Maybe<ExistsAtType> {
+@@ -6327,6 +6556,56 @@ macro_rules! dlsym_with_handle {
+ pub fn open_a(path: &[u8], flags: i32, perm: Mode) -> Maybe<Fd> {
+     openat_a(Fd::cwd(), path, flags, perm)
+ }
++
++// wasip2 has no way to recover a path from an fd (no F_GETPATH, no
++// /proc/self/fd), so `get_fd_path` is otherwise ENOSYS. Record the absolute
++// path of every fd opened through the `openat_a` choke point (used by
++// `open_a`/`open_dir_at`) in a thread-local table (single-threaded on wasi) so
++// `get_fd_path` can look it up. The fabric VFS has no symlinks, so the recorded
++// path is the canonical one. fd reuse is handled by overwrite-on-open; entries
++// for closed-and-not-reopened fds simply linger (bounded by max fd) and are
++// never queried (get_fd_path is only called on live fds).
++#[cfg(target_os = "wasi")]
++pub(crate) mod wasi_fd_path {
++    use super::*;
++    use std::cell::RefCell;
++    use std::collections::HashMap;
++    thread_local! {
++        static TABLE: RefCell<HashMap<i32, Box<[u8]>>> = RefCell::new(HashMap::new());
++    }
++    fn abs_of(dir: Fd, path: &[u8]) -> Vec<u8> {
++        use bun_paths::resolve_path;
++        if path.first() == Some(&b'/') {
++            return resolve_path::join::<resolve_path::platform::Posix>(&[path]).to_vec();
++        }
++        let base: Vec<u8> = if dir.native() == Fd::cwd().native() {
++            let mut b = bun_paths::PathBuffer::default();
++            match getcwd(&mut b[..]) {
++                Ok(n) => b[..n].to_vec(),
++                Err(_) => return path.to_vec(),
++            }
++        } else if let Some(p) = TABLE.with(|t| t.borrow().get(&dir.native()).cloned()) {
++            p.to_vec()
++        } else {
++            let mut b = bun_paths::PathBuffer::default();
++            match getcwd(&mut b[..]) {
++                Ok(n) => b[..n].to_vec(),
++                Err(_) => return path.to_vec(),
++            }
++        };
++        resolve_path::join::<resolve_path::platform::Posix>(&[&base, path]).to_vec()
++    }
++    pub(crate) fn record_open(dir: Fd, path: &[u8], fd: Fd) {
++        let abs = abs_of(dir, path);
++        TABLE.with(|t| {
++            t.borrow_mut().insert(fd.native(), abs.into_boxed_slice());
++        });
++    }
++    pub(crate) fn lookup(fd: Fd) -> Option<Box<[u8]>> {
++        TABLE.with(|t| t.borrow().get(&fd.native()).cloned())
++    }
++}
++
+ /// `openatA` — like `openat` but takes a non-NUL-terminated slice.
+ pub fn openat_a(dir: impl AsFd, path: &[u8], flags: i32, perm: Mode) -> Maybe<Fd> {
+     let dir = dir.as_fd();
+@@ -6338,7 +6617,12 @@ pub fn openat_a(dir: impl AsFd, path: &[u8], flags: i32, perm: Mode) -> Maybe<Fd
+     buf.0[path.len()] = 0;
+     // SAFETY: NUL-terminated above.
+     let z = ZStr::from_buf(&buf.0[..], path.len());
+-    openat(dir, z, flags, perm)
++    let res = openat(dir, z, flags, perm);
++    #[cfg(target_os = "wasi")]
++    if let Ok(fd) = res {
++        wasi_fd_path::record_open(dir, path, fd);
++    }
++    res
+ }
+ /// `openatOSPath` — `openat` taking a platform-native path
+ /// (`OSPathSliceZ` = `ZStr` on POSIX, `WStr` on Windows). On POSIX this is
+@@ -7392,7 +7676,7 @@ fn exists_at_type_nt(dir: Fd, mut path: &[u16]) -> Maybe<ExistsAtType> {
  }
  /// `fstatat` then `S_ISDIR`.
  pub fn exists_at_type(dir: Fd, sub: &ZStr) -> Maybe<ExistsAtType> {
@@ -7474,7 +7545,7 @@ index c2e8b817..143498ec 100644
      {
          let st = fstatat(dir, sub)?;
          Ok(if S::ISDIR(st.st_mode as _) {
-@@ -7443,7 +7672,7 @@ pub fn directory_exists_at_w(dir: Fd, sub: &[u16]) -> Maybe<bool> {
+@@ -7443,7 +7727,7 @@ pub fn directory_exists_at_w(dir: Fd, sub: &[u16]) -> Maybe<bool> {
  // ── fcntl / nonblocking / dup ──
  
  /// `fcntl(fd, F_GETFL, 0)`.
@@ -7483,7 +7554,7 @@ index c2e8b817..143498ec 100644
  pub fn get_fcntl_flags(fd: Fd) -> Maybe<FcntlInt> {
      fcntl(fd, libc::F_GETFL, 0)
  }
-@@ -7457,7 +7686,7 @@ pub fn set_nonblocking(fd: Fd) -> Maybe<()> {
+@@ -7457,7 +7741,7 @@ pub fn set_nonblocking(fd: Fd) -> Maybe<()> {
  }
  /// GETFL → toggle O_NONBLOCK → SETFL (only if changed).
  pub fn update_nonblocking(fd: Fd, nonblocking: bool) -> Maybe<()> {
@@ -7492,7 +7563,23 @@ index c2e8b817..143498ec 100644
      {
          let cur = get_fcntl_flags(fd)? as i32;
          let new = if nonblocking {
-@@ -7833,7 +8062,7 @@ pub fn get_fd_path_w(_fd: Fd, _out: &mut [u16]) -> Maybe<&mut [u16]> {
+@@ -7799,6 +8083,15 @@ pub fn get_fd_path<'a>(fd: Fd, out: &'a mut bun_paths::PathBuffer) -> Maybe<&'a
+         windows
+     )))]
+     {
++        // wasi: no F_GETPATH / /proc/self/fd — recover the path from the
++        // open-time table (see `wasi_fd_path`); ENOSYS only if the fd wasn't
++        // opened through the bun_sys `openat_a` choke point.
++        #[cfg(target_os = "wasi")]
++        if let Some(p) = wasi_fd_path::lookup(fd) {
++            let n = p.len().min(out.0.len());
++            out.0[..n].copy_from_slice(&p[..n]);
++            return Ok(&mut out.0[..n]);
++        }
+         let _ = (fd, out);
+         Err(Error::from_code_int(libc::ENOSYS, Tag::readlink))
+     }
+@@ -7833,7 +8126,7 @@ pub fn get_fd_path_w(_fd: Fd, _out: &mut [u16]) -> Maybe<&mut [u16]> {
  /// SAFETY note: the returned slice borrows the libc `environ` global; do not
  /// mutate the environment concurrently.
  pub fn environ() -> &'static [*const c_char] {
@@ -7501,7 +7588,7 @@ index c2e8b817..143498ec 100644
      {
          // SAFETY: `environ` is a process-global NULL-terminated array.
          unsafe {
-@@ -7868,7 +8097,7 @@ pub fn environ() -> &'static [*const c_char] {
+@@ -7868,7 +8161,7 @@ pub fn environ() -> &'static [*const c_char] {
  /// global pointer (already NULL-terminated) rather than a length-bounded
  /// borrowed slice, so it is suitable to pass directly as `envp`.
  pub fn environ_ptr() -> *const *const c_char {
@@ -7510,7 +7597,7 @@ index c2e8b817..143498ec 100644
      {
          bun_core::c_environ()
      }
-@@ -7990,6 +8219,8 @@ pub(crate) fn make_path_w(dir: Fd, sub_path: &[u16]) -> Maybe<()> {
+@@ -7990,6 +8283,8 @@ pub(crate) fn make_path_w(dir: Fd, sub_path: &[u16]) -> Maybe<()> {
  // ──────────────────────────────────────────────────────────────────────────
  pub mod posix {
      pub use bun_errno::posix::*;
@@ -7519,7 +7606,7 @@ index c2e8b817..143498ec 100644
      use core::ffi::c_int;
      #[cfg(any(
          target_os = "macos",
-@@ -8105,10 +8336,19 @@ pub mod posix {
+@@ -8105,10 +8400,19 @@ pub mod posix {
      /// `gethostname(2)` into `buf`. On success the hostname is NUL-terminated
      /// somewhere in `buf` (POSIX guarantees truncation+NUL when `buf` is at
      /// least `HOST_NAME_MAX+1`).
@@ -7540,7 +7627,7 @@ index c2e8b817..143498ec 100644
          let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len() as _) };
          if rc != 0 {
              return Err(super::err_with(super::Tag::TODO));
-@@ -8155,9 +8395,9 @@ pub mod posix {
+@@ -8155,9 +8459,9 @@ pub mod posix {
          pub const INET: c_int = bun_windows_sys::ws2_32::AF_INET;
          #[cfg(windows)]
          pub const INET6: c_int = bun_windows_sys::ws2_32::AF_INET6;
@@ -7552,7 +7639,7 @@ index c2e8b817..143498ec 100644
          pub const INET6: c_int = libc::AF_INET6;
      }
  
-@@ -8169,7 +8409,7 @@ pub mod posix {
+@@ -8169,7 +8473,7 @@ pub mod posix {
      pub const INET6_ADDRSTRLEN: usize = 46;
  
      // ── sockaddr family ──
@@ -7561,7 +7648,7 @@ index c2e8b817..143498ec 100644
      pub use libc::{sockaddr, sockaddr_in, sockaddr_in6, sockaddr_storage};
      // Route through `bun_libuv_sys` (not `bun_windows_sys::ws2_32`) so types
      // returned by libuv APIs (`uv_interface_address_t`, `uv_udp_*`) are the
-@@ -8189,23 +8429,23 @@ pub mod posix {
+@@ -8189,23 +8493,23 @@ pub mod posix {
      // ── stat mode-kind tests ──
      // `libc::S_IF*` is `mode_t` (u32 on Linux, u16 on Darwin/FreeBSD); widen to
      // `u32` so the `m: u32` (== `bun_core::Mode`) comparison is uniform.
@@ -7589,7 +7676,7 @@ index c2e8b817..143498ec 100644
      pub use libc::sigset_t;
      /// `sigaction(sig, &act, *oact)`.
      #[cfg(unix)]
-@@ -8217,9 +8457,9 @@ pub mod posix {
+@@ -8217,9 +8521,9 @@ pub mod posix {
      }
  
      // ── time ──
@@ -7601,7 +7688,7 @@ index c2e8b817..143498ec 100644
      pub use libc::timeval;
  
      #[cfg(windows)]
-@@ -8231,7 +8471,7 @@ pub mod posix {
+@@ -8231,7 +8535,7 @@ pub mod posix {
      }
  
      // ── raw I/O (no `Maybe` wrapping) ──
@@ -7610,7 +7697,7 @@ index c2e8b817..143498ec 100644
      #[inline]
      pub unsafe fn read(fd: c_int, buf: *mut u8, count: usize) -> isize {
          #[cfg(any(target_os = "linux", target_os = "android"))]
-@@ -8245,7 +8485,7 @@ pub mod posix {
+@@ -8245,7 +8549,7 @@ pub mod posix {
              unsafe { libc::read(fd, buf.cast(), count) }
          }
      }
@@ -7619,7 +7706,7 @@ index c2e8b817..143498ec 100644
      #[inline]
      pub unsafe fn write(fd: c_int, buf: *const u8, count: usize) -> isize {
          #[cfg(any(target_os = "linux", target_os = "android"))]
-@@ -8337,7 +8577,7 @@ pub mod posix {
+@@ -8337,7 +8641,7 @@ pub mod posix {
      }
  
      // ── rlimit ──
@@ -7628,7 +7715,7 @@ index c2e8b817..143498ec 100644
      #[repr(C)]
      #[derive(Clone, Copy)]
      pub struct Rlimit {
-@@ -8345,9 +8585,9 @@ pub mod posix {
+@@ -8345,9 +8649,9 @@ pub mod posix {
          pub max: u64,
      }
      // SAFETY: two `u64`; all-zero is a valid `Rlimit`.
@@ -7640,7 +7727,7 @@ index c2e8b817..143498ec 100644
      #[derive(Clone, Copy)]
      #[repr(i32)]
      pub enum RlimitResource {
-@@ -8355,7 +8595,7 @@ pub mod posix {
+@@ -8355,7 +8659,7 @@ pub mod posix {
          STACK = libc::RLIMIT_STACK as _,
          CORE = libc::RLIMIT_CORE as _,
      }
@@ -7649,7 +7736,7 @@ index c2e8b817..143498ec 100644
      pub fn getrlimit(res: RlimitResource) -> core::result::Result<Rlimit, super::Error> {
          let mut r = libc::rlimit {
              rlim_cur: 0,
-@@ -8370,7 +8610,7 @@ pub mod posix {
+@@ -8370,7 +8674,7 @@ pub mod posix {
              max: r.rlim_max as u64,
          })
      }
@@ -7658,7 +7745,7 @@ index c2e8b817..143498ec 100644
      pub fn setrlimit(res: RlimitResource, lim: Rlimit) -> core::result::Result<(), super::Error> {
          let r = libc::rlimit {
              rlim_cur: lim.cur as _,
-@@ -8394,7 +8634,7 @@ pub mod net {
+@@ -8394,7 +8698,7 @@ pub mod net {
  
      // POSIX libc has `sockaddr_*` at the crate root; MSVC libc does not. Route
      // both through a private `sock` shim so the body below is target-agnostic.
@@ -7667,7 +7754,7 @@ index c2e8b817..143498ec 100644
      mod sock {
          pub(super) use libc::{
              AF_INET, AF_INET6, sockaddr, sockaddr_in, sockaddr_in6, sockaddr_storage,
-@@ -8426,9 +8666,9 @@ pub mod net {
+@@ -8426,9 +8730,9 @@ pub mod net {
      // so struct-update initializers (`..sockaddr_in::ZEROED`)
      // work uniformly on all targets and in `const` context.
      // ──────────────────────────────────────────────────────────────────────
@@ -7679,7 +7766,7 @@ index c2e8b817..143498ec 100644
      pub type in_port_t = libc::in_port_t;
      #[cfg(windows)]
      pub type sa_family_t = u16; // ws2def.h: `typedef USHORT ADDRESS_FAMILY;`
-@@ -8439,6 +8679,9 @@ pub mod net {
+@@ -8439,6 +8743,9 @@ pub mod net {
      // the `ZEROED` initializer — Rust accepts outer attributes on struct-
      // expression fields, so a single body suffices on all targets.
      #[repr(C)]
@@ -7689,7 +7776,7 @@ index c2e8b817..143498ec 100644
      #[derive(Copy, Clone)]
      pub struct sockaddr_in {
          #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-@@ -8460,6 +8703,7 @@ pub mod net {
+@@ -8460,6 +8767,7 @@ pub mod net {
      }
  
      #[repr(C)]
@@ -7697,7 +7784,7 @@ index c2e8b817..143498ec 100644
      #[derive(Copy, Clone)]
      pub struct sockaddr_in6 {
          #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-@@ -8691,7 +8935,7 @@ pub mod elf {
+@@ -8691,7 +8999,7 @@ pub mod elf {
  
      /// Result of [`find_loaded_module`]: the loaded ELF object whose `PT_LOAD`
      /// segment spans a given address.
@@ -7706,7 +7793,7 @@ index c2e8b817..143498ec 100644
      pub struct LoadedModule {
          /// `dlpi_addr` — link-map base address (subtract from the lookup address
          /// to get an image-relative offset).
-@@ -8705,7 +8949,7 @@ pub mod elf {
+@@ -8705,7 +9013,7 @@ pub mod elf {
      /// via `dl_iterate_phdr`, returning the one whose `PT_LOAD` segment contains
      /// `address`. Shared by `bun_crash_handler::StackLine::from_address` and
      /// `bun_jsc::btjs::SelfInfo::lookup_module_dl` / `lookup_module_name_dl`.
