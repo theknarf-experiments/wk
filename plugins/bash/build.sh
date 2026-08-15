@@ -152,7 +152,12 @@ if [ ! -f Makefile ]; then
         --disable-job-control --disable-readline --disable-history \
         --disable-nls --without-bash-malloc \
         ac_cv_have_sig_atomic_t=yes bash_cv_signal_vintage=posix \
-        ac_cv_func_getcwd=yes bash_cv_getcwd_malloc=yes
+        ac_cv_func_getcwd=yes bash_cv_getcwd_malloc=yes \
+        bash_cv_dev_stdin=absent
+    # bash_cv_dev_stdin=absent: the container has no /dev/std{in,out,err} files,
+    # so tell bash to handle those redirection targets itself — it dup2s fd
+    # 0/1/2 (F_DUPFD works on wasi-sdk 34) instead of open()ing a path that is
+    # not there. Without this `>/dev/stdout` silently created a regular file.
     printf '%s' "$TOOLCHAIN" > .wk-toolchain
 fi
 
