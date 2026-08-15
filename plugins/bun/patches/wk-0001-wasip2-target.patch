@@ -3404,6 +3404,19 @@ index 05b95066..c0153e3e 100644
  #include <JavaScriptCore/JSWeakValue.h>
  #include "JSFFIFunction.h"
  #include "ZigGlobalObject.h"
+diff --git a/src/jsc/bindings/node/JSNodeHTTPServerSocket.cpp b/src/jsc/bindings/node/JSNodeHTTPServerSocket.cpp
+index 441e75d4..b2d2fa7c 100644
+--- a/src/jsc/bindings/node/JSNodeHTTPServerSocket.cpp
++++ b/src/jsc/bindings/node/JSNodeHTTPServerSocket.cpp
+@@ -17,7 +17,7 @@ extern "C" void Bun__NodeHTTPResponse_setClosed(void* zigResponse);
+ extern "C" void Bun__NodeHTTPResponse_markTunneled(void* zigResponse);
+ extern "C" void Bun__NodeHTTPResponse_onClose(void* zigResponse, JSC::EncodedJSValue jsValue);
+ extern "C" void us_socket_free_stream_buffer(us_socket_stream_buffer_t* streamBuffer);
+-extern "C" uint64_t uws_res_get_remote_address_info(void* res, const char** dest, int* port, bool* is_ipv6);
++extern "C" size_t uws_res_get_remote_address_info(void* res, const char** dest, int* port, bool* is_ipv6);
+ extern "C" uint64_t uws_res_get_local_address_info(void* res, const char** dest, int* port, bool* is_ipv6);
+ extern "C" EncodedJSValue us_socket_buffered_js_write(void* socket, bool is_ssl, bool ended, us_socket_stream_buffer_t* streamBuffer, JSC::JSGlobalObject* globalObject, JSC::EncodedJSValue data, JSC::EncodedJSValue encoding);
+ extern "C" int us_socket_is_ssl_handshake_finished(struct us_socket_t* s);
 diff --git a/src/jsc/bindings/node/JSNodeHTTPServerSocketPrototype.cpp b/src/jsc/bindings/node/JSNodeHTTPServerSocketPrototype.cpp
 index 59e3be68..4239d9cd 100644
 --- a/src/jsc/bindings/node/JSNodeHTTPServerSocketPrototype.cpp
@@ -7557,6 +7570,19 @@ index a820e388..b225eea8 100644
      "SocketGroup layout drifted from us_socket_group_t"
  );
  const _: () = assert!(
+diff --git a/src/uws_sys/libuwsockets.cpp b/src/uws_sys/libuwsockets.cpp
+index 89a62dcc..d18cc6b5 100644
+--- a/src/uws_sys/libuwsockets.cpp
++++ b/src/uws_sys/libuwsockets.cpp
+@@ -2025,7 +2025,7 @@ __attribute__((callback (corker, ctx)))
+ 
+   // Gets the remote address and port
+   // Returns 0 if failure / unix socket
+-  uint64_t uws_res_get_remote_address_info(uws_res_r res, const char **dest, int *port, bool *is_ipv6)
++  size_t uws_res_get_remote_address_info(uws_res_r res, const char **dest, int *port, bool *is_ipv6)
+   {
+     // This function is manual inlining + modification of
+     //      us_socket_remote_address
 diff --git a/src/watcher/Watcher.rs b/src/watcher/Watcher.rs
 index 796f0b07..4c94296a 100644
 --- a/src/watcher/Watcher.rs
