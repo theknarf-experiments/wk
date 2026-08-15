@@ -25,3 +25,13 @@ clap = { version = "4.6.1", features = ["derive"] }
 libc = "0.2.189"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Optimize dependency crates even in debug builds. The wk daemon runs wasmtime,
+# which AOT-compiles guest components (e.g. the 181 MB bun-run.wasm) via
+# cranelift-codegen when a node starts — at opt-level 0 that takes minutes, so a
+# plain `cargo build -p wk` (debug) is unusable for iterating on wasm guests.
+# Optimizing dependencies (wasmtime, cranelift-codegen, regalloc2, …) keeps that
+# compile fast; the workspace crates stay unoptimized so editing wk still builds
+# quickly. Deps are cached, so the cost is a one-time first build.
+[profile.dev.package."*"]
+opt-level = 3
