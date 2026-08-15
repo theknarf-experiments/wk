@@ -454,3 +454,136 @@ int wk_bash_subshell(const char *shell, const char *script, char **envp,
     wk_result_free(&r);
     return status;
 }
+
+/* --- background jobs: `cmd &' and `wait' ------------------------------------
+ *
+ * `&' needs a process to run in the background; there is no fork. Run the
+ * command's text in a detached second bash through wk:exec — spawn returns at
+ * once and the child runs concurrently — and track it under a synthetic pid so
+ * the `wait' builtin and `$!' can find it. Its stdout/stderr go live to this
+ * shell's own (a background job writes as it runs, not when it is reaped). */
+#define WK_MAX_BG 64
+static struct {
+    int pid;
+    wk_child child;
+    int reaped;
+    int status;
+} bg[WK_MAX_BG];
+static int nbg;
+static int bg_next_pid = 100000; /* no real pids exist here; keep clear of small ones */
+
+/* Spawn `shell -c script' detached; returns its synthetic pid, or -1. */
+int wk_bash_async_spawn(const char *shell, const char *script, char **envp) {
+    if (!shell || !*shell || !script)
+        return -1;
+
+    /* Drop already-reaped slots if the table is full. */
+    if (nbg >= WK_MAX_BG) {
+        int w = 0;
+        for (int i = 0; i < nbg; i++)
+            if (!bg[i].reaped)
+                bg[w++] = bg[i];
+        nbg = w;
+        if (nbg >= WK_MAX_BG)
+            return -1;
+    }
+
+    size_t nenv = 0;
+    while (envp && envp[nenv])
+        nenv++;
+    exec_host_list_tuple2_string_string_t wenv = {NULL, 0};
+    if (nenv) {
+        wenv.ptr = malloc(nenv * sizeof *wenv.ptr);
+        if (!wenv.ptr)
+            return -1;
+        for (size_t i = 0; i < nenv; i++) {
+            const char *eq = strchr(envp[i], '=');
+            size_t nlen = eq ? (size_t)(eq - envp[i]) : strlen(envp[i]);
+            exec_host_string_t k, v;
+            k.ptr = (uint8_t *)envp[i];
+            k.len = nlen;
+            v.ptr = (uint8_t *)(eq ? eq + 1 : "");
+            v.len = eq ? strlen(eq + 1) : 0;
+            wenv.ptr[i].f0 = k;
+            wenv.ptr[i].f1 = v;
+        }
+        wenv.len = nenv;
+    }
+
+    exec_host_string_t wpath;
+    exec_host_string_set(&wpath, shell);
+    exec_host_string_t wargs_buf[3];
+    exec_host_string_set(&wargs_buf[0], (char *)shell);
+    exec_host_string_set(&wargs_buf[1], "-c");
+    exec_host_string_set(&wargs_buf[2], (char *)script);
+    exec_host_list_string_t wargs = {wargs_buf, 3};
+
+    /* stdin: nothing (a background job reading the terminal would fight the
+     * foreground shell for it). stdout/stderr are captured and replayed when
+     * the job is reaped — not streamed live: several background jobs sharing
+     * the shell's fd 1 race there and lose each other's output, and the outer
+     * capture (bun's spawn) collects the shell's output as a whole anyway. */
+    wk_exec_process_stdin_from_t win;
+    win.tag = WK_EXEC_PROCESS_STDIN_FROM_EMPTY;
+    wk_exec_process_stdout_to_t wout, werr;
+    wout.tag = WK_EXEC_PROCESS_STDOUT_TO_CAPTURE;
+    werr.tag = WK_EXEC_PROCESS_STDOUT_TO_CAPTURE;
+
+    fflush(stdout);
+    fflush(stderr);
+
+    wk_exec_process_own_child_t ochild;
+    exec_host_string_t err = {NULL, 0};
+    bool ok = wk_exec_process_spawn(&wpath, &wargs, &wenv, &win, &wout, &werr,
+                                    &ochild, &err);
+    free(wenv.ptr);
+    if (!ok) {
+        exec_host_string_free(&err);
+        return -1;
+    }
+
+    int pid = bg_next_pid++;
+    bg[nbg].pid = pid;
+    bg[nbg].child.h = ochild.__handle;
+    bg[nbg].reaped = 0;
+    bg[nbg].status = 0;
+    nbg++;
+    return pid;
+}
+
+/* If `pid' names a background job, wait for it (once) and return 1 with its
+ * exit status in *status_out; otherwise return 0. */
+int wk_bash_bg_reap(int pid, int *status_out) {
+    for (int i = 0; i < nbg; i++) {
+        if (bg[i].pid != pid)
+            continue;
+        if (!bg[i].reaped) {
+            wk_result r;
+            if (wk_wait(bg[i].child, &r) == 0) {
+                /* Empty when the output was streamed live; the captured
+                 * fallback is replayed here. */
+                write_all(STDOUT_FILENO, r.stdout_data, r.stdout_len);
+                write_all(STDERR_FILENO, r.stderr_data, r.stderr_len);
+                bg[i].status = r.exit_code;
+            } else {
+                bg[i].status = 127;
+            }
+            wk_result_free(&r);
+            bg[i].reaped = 1;
+        }
+        if (status_out)
+            *status_out = bg[i].status;
+        return 1;
+    }
+    return 0;
+}
+
+/* Reap every still-running background job (for `wait' with no arguments).
+ * Returns how many were waited for. */
+int wk_bash_bg_reap_all(void) {
+    int n = 0, st;
+    for (int i = 0; i < nbg; i++)
+        if (!bg[i].reaped && wk_bash_bg_reap(bg[i].pid, &st))
+            n++;
+    return n;
+}

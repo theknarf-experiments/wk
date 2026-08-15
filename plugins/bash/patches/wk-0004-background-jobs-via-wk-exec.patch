@@ -1,0 +1,37 @@
+--- a/nojobs.c
++++ b/nojobs.c
+@@ -659,6 +659,17 @@
+   WAIT status;
+   int pstatus;
+ 
++#if defined (WK_EXEC)
++  /* wk: a background `cmd &' is a detached second bash tracked by a synthetic
++     pid, not a real child. If this is one, reap it through wk:exec. */
++  {
++    extern int wk_bash_bg_reap PARAMS((int, int *));
++    int wkstatus;
++    if (wk_bash_bg_reap ((int)pid, &wkstatus))
++      return (wkstatus);
++  }
++#endif
++
+   pstatus = find_status_by_pid (pid);
+ 
+   if (pstatus == PROC_BAD)
+@@ -721,6 +732,16 @@
+      4.2 BSD-based and System V-based systems. */
+ 
+   njobs = 0;
++
++#if defined (WK_EXEC)
++  /* wk: reap every detached `cmd &' background job first (there are no real
++     children to wait on). */
++  {
++    extern int wk_bash_bg_reap_all PARAMS((void));
++    njobs += wk_bash_bg_reap_all ();
++  }
++#endif
++
+   siginterrupt (SIGINT, 1);
+ 
+   /* Wait for ECHILD */
