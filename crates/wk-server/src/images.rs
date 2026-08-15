@@ -80,6 +80,9 @@ pub fn mount(fs: &crate::vfs::SharedFs, setup: &ContainerSetup) -> Result<(), St
         })?;
         crate::layers::apply(fs, &layer, "");
     }
+    // Give the container the standard device files (/dev/null) its programs
+    // expect, unless a layer already provided them.
+    crate::vfs::ensure_standard_devices(fs);
     Ok(())
 }
 

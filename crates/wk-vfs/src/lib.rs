@@ -125,6 +125,10 @@ enum Node {
     /// coreutils provides its hundred command names *as symlinks* to one
     /// executable, and plenty of OCI images are built the same way.
     Symlink(String),
+    /// The null device (`/dev/null`): every write is discarded, every read is
+    /// end-of-file. Provisioned into each container so the ubiquitous
+    /// `2>/dev/null` / `>/dev/null` / `</dev/null` work without a growing file.
+    Null,
 }
 
 const ROOT: u64 = 0;
@@ -359,6 +363,9 @@ impl Fs {
                     Some(Node::File(_)) => PathKind::PrivateFile,
                     Some(Node::Shared(_) | Node::Host(_)) => PathKind::Mounted,
                     Some(Node::Symlink(target)) => PathKind::Symlink(target.clone()),
+                    // The null device is provisioned at runtime, not build
+                    // content — keep it out of layer diffs.
+                    Some(Node::Null) => continue,
                     None => continue,
                 };
                 let is_dir = kind == PathKind::Dir;
@@ -493,6 +500,7 @@ impl Fs {
                 Some(buf)
             }
             Node::Dir(_) => None,
+            Node::Null => Some(Vec::new()),
         }
     }
 }
@@ -567,6 +575,24 @@ fn mount_node_at(fs: &SharedFs, at: &str, node: Node, readonly: bool) {
     }
     if let Some(Node::Dir(children)) = g.nodes.get_mut(&parent) {
         children.insert((*name).to_string(), id);
+    }
+}
+
+/// Provision the standard device files a container expects — currently
+/// `/dev/null`. Idempotent: an entry already at that path (e.g. from an image
+/// layer) is left alone. Call once after an image's layers are mounted so the
+/// ubiquitous `2>/dev/null` / `>/dev/null` / `</dev/null` work.
+pub fn ensure_standard_devices(fs: &SharedFs) {
+    let mut g = fs.lock().unwrap();
+    if resolve_at(&g, ROOT, "dev/null", true).is_some() || g.at_capacity() {
+        return;
+    }
+    let Some(dev) = g.ensure_dir_path("dev") else {
+        return;
+    };
+    let id = g.alloc(Node::Null);
+    if let Some(Node::Dir(children)) = g.nodes.get_mut(&dev) {
+        children.insert("null".to_string(), id);
     }
 }
 
@@ -653,6 +679,7 @@ fn node_type(fs: &Fs, id: u64) -> DescriptorType {
     match fs.nodes.get(&id) {
         Some(Node::Dir(_)) => DescriptorType::Directory,
         Some(Node::Symlink(_)) => DescriptorType::SymbolicLink,
+        Some(Node::Null) => DescriptorType::CharacterDevice,
         _ => DescriptorType::RegularFile,
     }
 }
@@ -717,6 +744,26 @@ impl OutputStream for VfsOutputStream {
     }
     fn check_write(&mut self) -> std::result::Result<usize, StreamError> {
         Ok(1024 * 1024)
+    }
+}
+
+/// The null device's output stream: every write is accepted and discarded.
+struct NullOutputStream;
+
+#[async_trait]
+impl Pollable for NullOutputStream {
+    async fn ready(&mut self) {}
+}
+
+impl OutputStream for NullOutputStream {
+    fn write(&mut self, _bytes: Bytes) -> std::result::Result<(), StreamError> {
+        Ok(())
+    }
+    fn flush(&mut self) -> std::result::Result<(), StreamError> {
+        Ok(())
+    }
+    fn check_write(&mut self) -> std::result::Result<usize, StreamError> {
+        Ok(usize::MAX)
     }
 }
 
@@ -888,6 +935,8 @@ enum Kind {
     Shared(SharedFile),
     Host(std::path::PathBuf),
     Dir,
+    /// The null device — writes discarded, reads at end-of-file.
+    Null,
     Missing,
 }
 
@@ -907,6 +956,7 @@ fn node_kind(fs: &SharedFs, node: u64) -> Kind {
             Some(Node::Shared(sh)) => Kind::Shared(sh.clone()),
             Some(Node::Host(p)) => Kind::Host(p.clone()),
             Some(Node::Dir(_)) => Kind::Dir,
+            Some(Node::Null) => Kind::Null,
             // Nothing reads or writes through an open link handle; readlink
             // and lstat work on the path, not the descriptor.
             Some(Node::Symlink(_)) | None => Kind::Missing,
@@ -961,6 +1011,7 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
                 let start = (offset as usize).min(d.len());
                 Bytes::copy_from_slice(&d[start..])
             }
+            Kind::Null => Bytes::new(),
             Kind::Dir => return err(ErrorCode::IsDirectory),
             Kind::Missing => return err(ErrorCode::NoEntry),
         };
@@ -982,6 +1033,7 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
             Kind::File | Kind::Ro(_) => Box::new(VfsOutputStream { fs, node, offset }),
             Kind::Shared(data) => Box::new(SharedOutputStream { data, offset }),
             Kind::Host(path) => Box::new(HostOutputStream { path, offset }),
+            Kind::Null => Box::new(NullOutputStream),
             _ => return err(ErrorCode::IsDirectory),
         };
         Ok(Ok(self.table().push(stream)?))
@@ -1016,6 +1068,7 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
                 let offset = host_size(&path);
                 Box::new(HostOutputStream { path, offset })
             }
+            Kind::Null => Box::new(NullOutputStream),
             Kind::Dir => return err(ErrorCode::IsDirectory),
             Kind::Missing => return err(ErrorCode::NoEntry),
         };
@@ -1040,6 +1093,7 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
             Kind::Ro(d) => Ok(Ok(read_at(&d, offset, len))),
             Kind::Shared(sh) => Ok(Ok(read_at(&sh.lock().unwrap(), offset, len))),
             Kind::Host(p) => Ok(Ok(read_at(&host_read(&p), offset, len))),
+            Kind::Null => Ok(Ok((Vec::new(), true))),
             Kind::Dir => err(ErrorCode::IsDirectory),
             Kind::Missing => err(ErrorCode::NoEntry),
         }
@@ -1071,6 +1125,7 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
                     return err(ErrorCode::FileTooLarge);
                 }
             }
+            Kind::Null => {} // discard every byte
             Kind::Host(p) => {
                 if host_write_at(&p, offset, &buf).is_err() {
                     return err(ErrorCode::Io);
@@ -1215,6 +1270,7 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
                     Err(_) => err(ErrorCode::Io),
                 }
             }
+            Kind::Null => Ok(Ok(())), // nothing to size
             _ => err(ErrorCode::IsDirectory),
         }
     }
@@ -1581,6 +1637,7 @@ fn stat_node(fs: &Fs, id: u64) -> Option<DescriptorStat> {
         Node::Shared(sh) => (DescriptorType::RegularFile, sh.lock().unwrap().len() as u64),
         Node::Host(p) => (DescriptorType::RegularFile, host_size(p)),
         Node::Symlink(target) => (DescriptorType::SymbolicLink, target.len() as u64),
+        Node::Null => (DescriptorType::CharacterDevice, 0),
     };
     Some(DescriptorStat {
         type_: ty,
@@ -1896,6 +1953,35 @@ mod tests {
         g.close_ref(id);
         assert_eq!(g.open_count(id), 0);
         assert!(!g.nodes.contains_key(&id));
+    }
+
+    #[test]
+    fn provisions_a_null_device() {
+        let fs = new_fs();
+        ensure_standard_devices(&fs);
+        let g = fs.lock().unwrap();
+        let id = resolve(&g, ROOT, "/dev/null").expect("/dev/null exists");
+        assert!(matches!(g.nodes.get(&id), Some(Node::Null)));
+        assert_eq!(node_type(&g, id), DescriptorType::CharacterDevice);
+    }
+
+    #[test]
+    fn ensure_standard_devices_is_idempotent_and_keeps_existing() {
+        let fs = new_fs();
+        // An image already shipped its own /dev/null as a regular file.
+        {
+            let mut g = fs.lock().unwrap();
+            let dev = g.ensure_dir_path("dev").unwrap();
+            let existing = g.alloc(Node::File(b"real".to_vec()));
+            if let Some(Node::Dir(c)) = g.nodes.get_mut(&dev) {
+                c.insert("null".to_string(), existing);
+            }
+        }
+        ensure_standard_devices(&fs);
+        let g = fs.lock().unwrap();
+        let id = resolve(&g, ROOT, "/dev/null").unwrap();
+        // Left the layer's file alone rather than replacing it with a device.
+        assert!(matches!(g.nodes.get(&id), Some(Node::File(_))));
     }
 
     #[test]
