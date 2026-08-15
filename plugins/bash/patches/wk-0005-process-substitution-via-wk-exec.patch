@@ -1,0 +1,31 @@
+--- a/subst.c
++++ b/subst.c
+@@ -6498,6 +6498,28 @@
+ 
+   if (!string || !*string || wordexp_only)
+     return ((char *)NULL);
++
++#if defined (WK_EXEC)
++  /* wk: `<(cmd)` (open_for_read_in_child == 0) needs a concurrent writer whose
++     output the reader opens by /dev/fd path; there is no fork, and a wk:exec
++     child does not inherit the pipe fd. Run the command now, capture its output
++     to a temp file, and return that file's path — the reader opens it like any
++     file. `>(cmd)` (== 1) would need the reverse and is not handled here. */
++  if (open_for_read_in_child == 0)
++    {
++      extern char *wk_bash_procsub_read PARAMS((const char *, const char *, char **));
++      char *wk_shell, *wk_path;
++
++      wk_shell = get_string_value ("BASH");
++      if (wk_shell == 0 || *wk_shell != '/')
++	wk_shell = shell_name;
++      maybe_make_export_env ();
++      wk_path = wk_bash_procsub_read (wk_shell, string, export_env);
++      if (wk_path)
++	return (wk_path);
++      /* Could not run it: fall through and fail as it would without this. */
++    }
++#endif
+ 
+ #if !defined (HAVE_DEV_FD)
+   pathname = make_named_pipe ();

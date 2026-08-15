@@ -17,6 +17,7 @@
  * command's redirections around this call, so fd 1 already points wherever
  * `>` sent it by the time we write.
  */
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -586,4 +587,96 @@ int wk_bash_bg_reap_all(void) {
         if (!bg[i].reaped && wk_bash_bg_reap(bg[i].pid, &st))
             n++;
     return n;
+}
+
+/* --- process substitution: `<(cmd)` ----------------------------------------
+ *
+ * `<(cmd)` normally forks a writer whose output flows down a pipe the reader
+ * opens by /dev/fd path. There is no fork, and a wk:exec child does not inherit
+ * the pipe fd, so instead run the command now, capture its output to a temp
+ * file, and hand back that file's path — the reader opens it like any file.
+ * The command runs to completion first rather than streaming, which is what a
+ * reader that consumes the whole substitution (diff, cat, sort) wants anyway.
+ * Returns a malloc'd path, or NULL. (`>(cmd)` — the reverse — is not handled.) */
+char *wk_bash_procsub_read(const char *shell, const char *script, char **envp) {
+    if (!shell || !*shell || !script)
+        return NULL;
+
+    size_t nenv = 0;
+    while (envp && envp[nenv])
+        nenv++;
+    exec_host_list_tuple2_string_string_t wenv = {NULL, 0};
+    if (nenv) {
+        wenv.ptr = malloc(nenv * sizeof *wenv.ptr);
+        if (!wenv.ptr)
+            return NULL;
+        for (size_t i = 0; i < nenv; i++) {
+            const char *eq = strchr(envp[i], '=');
+            size_t nlen = eq ? (size_t)(eq - envp[i]) : strlen(envp[i]);
+            exec_host_string_t k, v;
+            k.ptr = (uint8_t *)envp[i];
+            k.len = nlen;
+            v.ptr = (uint8_t *)(eq ? eq + 1 : "");
+            v.len = eq ? strlen(eq + 1) : 0;
+            wenv.ptr[i].f0 = k;
+            wenv.ptr[i].f1 = v;
+        }
+        wenv.len = nenv;
+    }
+
+    exec_host_string_t wpath;
+    exec_host_string_set(&wpath, shell);
+    exec_host_string_t wargs_buf[3];
+    exec_host_string_set(&wargs_buf[0], (char *)shell);
+    exec_host_string_set(&wargs_buf[1], "-c");
+    exec_host_string_set(&wargs_buf[2], (char *)script);
+    exec_host_list_string_t wargs = {wargs_buf, 3};
+
+    wk_exec_process_stdin_from_t win;
+    win.tag = WK_EXEC_PROCESS_STDIN_FROM_EMPTY;
+    wk_exec_process_stdout_to_t wout, werr;
+    wout.tag = WK_EXEC_PROCESS_STDOUT_TO_CAPTURE;
+    werr.tag = WK_EXEC_PROCESS_STDOUT_TO_CAPTURE;
+
+    fflush(stdout);
+    fflush(stderr);
+
+    wk_exec_process_own_child_t ochild;
+    exec_host_string_t err = {NULL, 0};
+    bool ok = wk_exec_process_spawn(&wpath, &wargs, &wenv, &win, &wout, &werr,
+                                    &ochild, &err);
+    free(wenv.ptr);
+    if (!ok) {
+        exec_host_string_free(&err);
+        return NULL;
+    }
+
+    wk_child child;
+    child.h = ochild.__handle;
+    wk_result r;
+    if (wk_wait(child, &r) != 0) {
+        wk_result_free(&r);
+        return NULL;
+    }
+
+    static int psub_seq;
+    char *path = malloc(48);
+    if (!path) {
+        wk_result_free(&r);
+        return NULL;
+    }
+    snprintf(path, 48, "/tmp/.bash-psub-%d", psub_seq++);
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        free(path);
+        wk_result_free(&r);
+        return NULL;
+    }
+    write_all(fd, r.stdout_data, r.stdout_len);
+    close(fd);
+    /* Its stderr was captured too; pass it through where it would have gone. */
+    write_all(STDERR_FILENO, r.stderr_data, r.stderr_len);
+    wk_result_free(&r);
+    return path;
 }
