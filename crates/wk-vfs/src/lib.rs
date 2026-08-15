@@ -14,7 +14,7 @@
 
 pub mod layers;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use wasmtime::component::{HasData, Linker, Resource, ResourceTable};
@@ -138,6 +138,12 @@ pub struct Fs {
     /// how a token that grants `read` but not `write` on a file is enforced.
     /// Ids are never reused, so stale entries after an unmount are inert.
     readonly: HashSet<u64>,
+    /// Number of open descriptors per node id. A node whose last directory
+    /// entry is unlinked while a descriptor is still open must survive (POSIX
+    /// unlinked-but-open files): `tac`/`sort` mkstemp a scratch file, unlink it
+    /// immediately, then keep writing and seeking the open fd. Freed only when
+    /// both the link count (dir entries) and this count reach zero.
+    open_fds: HashMap<u64, u32>,
 }
 
 impl Default for Fs {
@@ -148,6 +154,7 @@ impl Default for Fs {
             nodes,
             next: 1,
             readonly: HashSet::new(),
+            open_fds: HashMap::new(),
         }
     }
 }
@@ -168,6 +175,31 @@ impl Fs {
         self.next += 1;
         self.nodes.insert(id, node);
         id
+    }
+
+    /// Register an opened descriptor against `id` (keeps the node alive even if
+    /// its last directory entry is later unlinked).
+    fn open_ref(&mut self, id: u64) {
+        *self.open_fds.entry(id).or_insert(0) += 1;
+    }
+
+    /// Drop an opened descriptor. When the last one closes and no directory
+    /// entry names the node any more, its content is finally freed — the moment
+    /// a POSIX unlinked-but-open file actually disappears.
+    fn close_ref(&mut self, id: u64) {
+        if let Some(count) = self.open_fds.get_mut(&id) {
+            *count -= 1;
+            if *count == 0 {
+                self.open_fds.remove(&id);
+                if id != ROOT && !node_is_referenced(self, id) {
+                    self.drop_subtree(id);
+                }
+            }
+        }
+    }
+
+    fn open_count(&self, id: u64) -> u32 {
+        self.open_fds.get(&id).copied().unwrap_or(0)
     }
 
     /// Insert `node` as a child named `name` under `parent` (a directory).
@@ -631,6 +663,23 @@ pub struct Descriptor {
     node: u64,
 }
 
+impl Descriptor {
+    /// Open a descriptor onto `node`, counting the reference so an unlink while
+    /// this is open does not free the node out from under it.
+    fn open(fs: SharedFs, node: u64) -> Self {
+        fs.lock().unwrap().open_ref(node);
+        Descriptor { fs, node }
+    }
+}
+
+impl Drop for Descriptor {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.fs.lock() {
+            g.close_ref(self.node);
+        }
+    }
+}
+
 /// A snapshot directory listing.
 pub struct DirEntryStream {
     entries: Vec<DirectoryEntry>,
@@ -868,7 +917,7 @@ fn node_kind(fs: &SharedFs, node: u64) -> Kind {
 impl<T: VfsView> wasi::filesystem::preopens::Host for VfsImpl<T> {
     fn get_directories(&mut self) -> Result<Vec<(Resource<Descriptor>, String)>> {
         let fs = self.fs();
-        let root = self.table().push(Descriptor { fs, node: ROOT })?;
+        let root = self.table().push(Descriptor::open(fs, ROOT))?;
         Ok(vec![(root, "/".to_string())])
     }
 }
@@ -1231,7 +1280,7 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
                 }
             }
         };
-        Ok(Ok(self.table().push(Descriptor { fs, node })?))
+        Ok(Ok(self.table().push(Descriptor::open(fs, node))?))
     }
 
     fn remove_directory_at(
@@ -1506,7 +1555,10 @@ fn unlink<T: VfsView>(
     if let Some(Node::Dir(c)) = g.nodes.get_mut(&parent) {
         c.remove(&name);
     }
-    if !node_is_referenced(&g, id) {
+    // Free the content only once no name AND no open descriptor remains. A file
+    // still held open (POSIX unlinked-but-open — `tac`/`sort` rely on it) lives
+    // on until its last descriptor drops (see `Fs::close_ref`).
+    if !node_is_referenced(&g, id) && g.open_count(id) == 0 {
         g.nodes.remove(&id);
     }
     Ok(Ok(()))
@@ -1816,6 +1868,46 @@ mod tests {
             .add_child(ROOT, "secret", Node::File(b"x".to_vec()));
         assert!(resolve(&a.lock().unwrap(), ROOT, "/secret").is_some());
         assert!(resolve(&b.lock().unwrap(), ROOT, "/secret").is_none());
+    }
+
+    #[test]
+    fn unlinked_but_open_file_survives_until_last_close() {
+        // POSIX unlinked-but-open semantics: `tac`/`sort` mkstemp a scratch
+        // file, unlink it while the fd is open, then keep writing/seeking it.
+        let fs = new_fs();
+        let mut g = fs.lock().unwrap();
+        g.add_child(ROOT, "scratch", Node::File(b"data".to_vec()));
+        let id = resolve(&g, ROOT, "/scratch").unwrap();
+
+        // Two open descriptors, then drop the only directory entry (unlink).
+        g.open_ref(id);
+        g.open_ref(id);
+        if let Some(Node::Dir(children)) = g.nodes.get_mut(&ROOT) {
+            children.remove("scratch");
+        }
+        assert!(!node_is_referenced(&g, id));
+
+        // First close: another descriptor is still open, so content is intact.
+        g.close_ref(id);
+        assert_eq!(g.open_count(id), 1);
+        assert!(matches!(g.nodes.get(&id), Some(Node::File(d)) if d == b"data"));
+
+        // Last close: the orphan is finally freed.
+        g.close_ref(id);
+        assert_eq!(g.open_count(id), 0);
+        assert!(!g.nodes.contains_key(&id));
+    }
+
+    #[test]
+    fn closing_a_still_linked_file_keeps_it() {
+        // A descriptor closing must not free a node that still has a name.
+        let fs = new_fs();
+        let mut g = fs.lock().unwrap();
+        g.add_child(ROOT, "keep", Node::File(b"x".to_vec()));
+        let id = resolve(&g, ROOT, "/keep").unwrap();
+        g.open_ref(id);
+        g.close_ref(id);
+        assert!(g.nodes.contains_key(&id));
     }
 
     #[test]
