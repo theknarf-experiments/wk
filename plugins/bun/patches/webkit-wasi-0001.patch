@@ -147,6 +147,42 @@ index 7b58015d90..ea7183ad41 100644
  template<>
  std::optional<OptionsStorage::Size> parse(const char* string)
  {
+diff --git a/Source/JavaScriptCore/runtime/Structure.cpp b/Source/JavaScriptCore/runtime/Structure.cpp
+index bd9e01f437..dc91245b1e 100644
+--- a/Source/JavaScriptCore/runtime/Structure.cpp
++++ b/Source/JavaScriptCore/runtime/Structure.cpp
+@@ -42,6 +42,31 @@
+ 
+ WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
+ 
++// wasip2 / conservative-GC workaround. JSC's GC finds C++ roots by
++// conservatively scanning the machine stack + registers. On wasm32 the
++// "registers" are the wasm value-stack locals, which are NOT in linear memory
++// and cannot be scanned (StackBounds only covers the shadow/data stack). A
++// JSCell* held only in such a local across a GC-triggering allocation is
++// therefore invisible and can be swept while still live.
++//
++// A structure transition (`obj.prop = x` adding a property) hits this: while
++// `Structure::addNewPropertyTransition` allocates the *new* Structure, the base
++// (`this`) Structure is live only through an optimized local, so an eden GC can
++// reclaim it — leaving the object with a dangling structure that reads back as
++// garbage (e.g. `typeof` of a fresh once-wrapper closure returning "object",
++// which broke node:http's `listen`).
++//
++// At -O0, clang keeps locals in `alloca`s on the (scannable) shadow stack
++// instead of promoting them to wasm locals via mem2reg, so the conservative
++// scan finds them. Disabling optimization for this TU is a targeted, correct
++// (if slower) fix — the file's hot property-lookup fast paths are inlined from
++// StructureInlines.h into callers and are unaffected; only out-of-line
++// transition/table code (rare after shapes stabilize) is slowed. The proper
++// long-term fix is precise GC roots for the wasm target.
++#if defined(__wasi__)
++#pragma clang optimize off
++#endif
++
+ namespace JSC {
+ 
+ template<typename DetailsFunc>
 diff --git a/Source/WTF/wtf/FastMalloc.cpp b/Source/WTF/wtf/FastMalloc.cpp
 index ae00355743..82976bf528 100644
 --- a/Source/WTF/wtf/FastMalloc.cpp
