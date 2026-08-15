@@ -94,7 +94,7 @@ if [ ! -d "$SRC" ]; then
     rm -f "$SRC.tar.gz"
     # Run external commands through wk:exec instead of fork+exec, and give
     # the unwind-protect cleanups the type wasm insists they be called with.
-    for p in ../patches/wk-*.patch; do
+    for p in "$PWD"/patches/wk-*.patch; do
         ( cd "$SRC" && patch -p1 --forward < "$p" )
     done
 fi
