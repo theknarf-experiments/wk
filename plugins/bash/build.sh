@@ -114,7 +114,7 @@ CFLAGS="--target=wasm32-wasip2 -O2 -DWK_EXEC=1 -I$COMPAT -I$EXEC -I$EXECGEN -I$P
 # ../pipe-compat gives bash a real pipe(): wasi-libc's is ENOSYS on wasip2, and
 # without it `a | b` fails before it can even reach a stage.
 for src in "$COMPAT/compat.c" "$TTY/termios.c" "$TTYGEN/terminal.c" \
-           "$COMPAT/wkbash.c" "$EXEC/wkexec.c" "$EXECGEN/exec_host.c" \
+           "$COMPAT/wkbash.c" "$COMPAT/exit_shim.c" "$EXEC/wkexec.c" "$EXECGEN/exec_host.c" \
            "$PIPE/pipe.c"; do
     obj="$COMPAT/$(basename "${src%.c}").o"
     "$WASI_SDK/bin/clang" --target=wasm32-wasip2 -O2 \
@@ -125,7 +125,7 @@ done
 
 # --target here as well: see the note above about the link step.
 LDFLAGS="--target=wasm32-wasip2 $COMPAT/compat.o $COMPAT/termios.o $COMPAT/terminal.o \
-    $COMPAT/wkbash.o $COMPAT/wkexec.o $COMPAT/exec_host.o $COMPAT/pipe.o \
+    $COMPAT/wkbash.o $COMPAT/exit_shim.o $COMPAT/wkexec.o $COMPAT/exec_host.o $COMPAT/pipe.o \
     $TTYGEN/terminal_component_type.o $EXECGEN/exec_host_component_type.o -lsetjmp \
     -lwasi-emulated-signal -lwasi-emulated-process-clocks -lwasi-emulated-getpid"
 

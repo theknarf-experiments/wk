@@ -83,11 +83,16 @@ CFLAGS="--target=wasm32-wasip2 -O2 -I$COMPAT \
     -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID"
 
 # The shim is linked in as an object (it defines what wasi-libc leaves out).
-"$WASI_SDK/bin/clang" --target=wasm32-wasip2 -O2 -I"$COMPAT" \
-    -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID \
-    -c "$COMPAT/compat.c" -o "$COMPAT/compat.o"
+# exit_shim.o routes exit through wasi:cli/exit.exit-with-code so a tool's real
+# status (e.g. `false` -> 1, `test` -> 1/0) reaches the host instead of the
+# boolean ok/err the default exit() collapses to.
+for src in compat exit_shim; do
+    "$WASI_SDK/bin/clang" --target=wasm32-wasip2 -O2 -I"$COMPAT" \
+        -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID \
+        -c "$COMPAT/$src.c" -o "$COMPAT/$src.o"
+done
 
-LDFLAGS="$COMPAT/compat.o -lsetjmp \
+LDFLAGS="$COMPAT/compat.o $COMPAT/exit_shim.o -lsetjmp \
     -lwasi-emulated-signal -lwasi-emulated-process-clocks -lwasi-emulated-getpid"
 
 cd "$SRC"
@@ -133,6 +138,9 @@ fi
 # actually want: the multicall binary.
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 env PATH="$BUILD_PATH" make -k CFLAGS="$CFLAGS" LDFLAGS="$LDFLAGS" -j"$JOBS" || true
+# make tracks neither LDFLAGS nor the shim objects, so drop the binary to force
+# the final link every run (it is only the link — a second or two).
+rm -f src/coreutils
 env PATH="$BUILD_PATH" make src/coreutils \
     CFLAGS="$CFLAGS" LDFLAGS="$LDFLAGS" -j"$JOBS"
 

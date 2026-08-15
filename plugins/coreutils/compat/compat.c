@@ -128,12 +128,8 @@ mode_t umask(mode_t mask) {
 #include <sys/resource.h>
 #include <sys/wait.h>
 
-int dup(int fd) { (void)fd; errno = ENOSYS; return -1; }
-int dup2(int oldfd, int newfd) {
-  (void)oldfd; (void)newfd;
-  errno = ENOSYS;
-  return -1;
-}
+/* dup/dup2 are real in wasi-sdk 34's wasi-libc (they were missing in 33, when
+ * these stubs were needed); defining them here now collides with libc.a. */
 
 char *ttyname(int fd) { (void)fd; errno = ENOTTY; return NULL; }
 int ttyname_r(int fd, char *buf, size_t buflen) {
