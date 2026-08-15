@@ -192,5 +192,11 @@ for a in "[" b2sum base32 base64 basename basenc cat chcon chgrp chmod chown \
          tty uname unexpand uniq unlink vdir wc whoami yes; do
     ln -sf coreutils.wasm "bin/$a"
 done
+# bash under its own name, plus `sh` (POSIX mode via argv[0]) — so anything that
+# execs `/bin/sh -c ...` (a shell script, a `system()` call, node's
+# child_process) finds a real shell on PATH, the same layout a Unix base image
+# ships.
+ln -sf bash.wasm bin/bash
+ln -sf bash.wasm bin/sh
 echo "built plugins/bash/bash.wasm (GNU bash $BASH_VER, wasm32-wasip2 component)"
 echo "package it with: wk images build plugins/bash/Dockerfile --tag wk-shell"
