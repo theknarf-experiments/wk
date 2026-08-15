@@ -2825,6 +2825,28 @@ index a6d60de0..070f8799 100644
  
  /// These are native callbacks to be run after their associated JS version is run
  extern "C" void JSBundlerPlugin__addError(void*, void*, JSC::EncodedJSValue, JSC::EncodedJSValue);
+diff --git a/src/jsc/bindings/JSCommonJSExtensions.cpp b/src/jsc/bindings/JSCommonJSExtensions.cpp
+index eb8baaf5..357c23db 100644
+--- a/src/jsc/bindings/JSCommonJSExtensions.cpp
++++ b/src/jsc/bindings/JSCommonJSExtensions.cpp
+@@ -139,7 +139,7 @@ extern "C" void NodeModuleModule__onRequireExtensionModify(
+     Zig::GlobalObject* globalObject,
+     const BunString* key,
+     BunLoaderType loader,
+-    JSC::JSValue value);
++    JSC::EncodedJSValue value);
+ 
+ extern "C" void NodeModuleModule__onRequireExtensionModifyNonFunction(
+     Zig::GlobalObject* globalObject,
+@@ -169,7 +169,7 @@ void onAssign(Zig::GlobalObject* globalObject, JSC::PropertyName propertyName, J
+             loader = BunLoaderTypeTS;
+         }
+     }
+-    NodeModuleModule__onRequireExtensionModify(globalObject, &ext, loader, value);
++    NodeModuleModule__onRequireExtensionModify(globalObject, &ext, loader, JSValue::encode(value));
+ }
+ 
+ bool JSCommonJSExtensions::defineOwnProperty(JSC::JSObject* object, JSC::JSGlobalObject* globalObject, JSC::PropertyName propertyName, const JSC::PropertyDescriptor& descriptor, bool shouldThrow)
 diff --git a/src/jsc/bindings/JSCommonJSModule.cpp b/src/jsc/bindings/JSCommonJSModule.cpp
 index 7b78b335..9d26937d 100644
 --- a/src/jsc/bindings/JSCommonJSModule.cpp
@@ -3667,6 +3689,30 @@ index 19bb33fc..9aa864cf 100644
              if (throwScope.exception()) [[unlikely]]
                  return;
              throwTypeError(&lexicalGlobalObject, throwScope, makeString("MessageEvent constructor: Expected eventInitDict.source (\""_s, inspected, "\") to be an instance of MessagePort."_s));
+diff --git a/src/jsc/bindings/webcore/JSTextEncoder.cpp b/src/jsc/bindings/webcore/JSTextEncoder.cpp
+index a82a257a..c8d82a48 100644
+--- a/src/jsc/bindings/webcore/JSTextEncoder.cpp
++++ b/src/jsc/bindings/webcore/JSTextEncoder.cpp
+@@ -59,8 +59,8 @@ using namespace JSC;
+ 
+ extern "C" JSC::EncodedJSValue TextEncoder__encode8(JSC::JSGlobalObject* global, const Latin1Character* stringPtr, size_t stringLen);
+ extern "C" JSC::EncodedJSValue TextEncoder__encode16(JSC::JSGlobalObject* global, const char16_t* stringPtr, size_t stringLen);
+-extern "C" size_t TextEncoder__encodeInto8(const Latin1Character* stringPtr, size_t stringLen, void* ptr, size_t len);
+-extern "C" size_t TextEncoder__encodeInto16(const char16_t* stringPtr, size_t stringLen, void* ptr, size_t len);
++extern "C" uint64_t TextEncoder__encodeInto8(const Latin1Character* stringPtr, size_t stringLen, void* ptr, size_t len);
++extern "C" uint64_t TextEncoder__encodeInto16(const char16_t* stringPtr, size_t stringLen, void* ptr, size_t len);
+ extern "C" JSC::EncodedJSValue TextEncoder__encodeRopeString(JSC::JSGlobalObject* lexicalGlobalObject, JSC::JSString* str);
+ 
+ template<> TextEncoder::EncodeIntoResult convertDictionary<TextEncoder::EncodeIntoResult>(JSGlobalObject& lexicalGlobalObject, JSValue value)
+@@ -345,7 +345,7 @@ static inline JSC::EncodedJSValue jsTextEncoderPrototypeFunction_encodeIntoBody(
+         return {};
+     }
+ 
+-    size_t res = 0;
++    uint64_t res = 0;
+     if (!source->is8Bit()) {
+         const auto span = source->span16();
+         res = TextEncoder__encodeInto16(span.data(), span.size(), destination->vector(), destination->byteLength());
 diff --git a/src/jsc/bindings/webcore/JSWasmStreamingCompiler.cpp b/src/jsc/bindings/webcore/JSWasmStreamingCompiler.cpp
 index befcdaab..034b1f28 100644
 --- a/src/jsc/bindings/webcore/JSWasmStreamingCompiler.cpp
@@ -3844,6 +3890,24 @@ index 4597cdd1..050af5e7 100644
  }
  
  JSC_DECLARE_HOST_FUNCTION(functionGenerateHeapSnapshotForDebugging);
+diff --git a/src/jsc/modules/NodeModuleModule.cpp b/src/jsc/modules/NodeModuleModule.cpp
+index b8732d7d..12e8c1e9 100644
+--- a/src/jsc/modules/NodeModuleModule.cpp
++++ b/src/jsc/modules/NodeModuleModule.cpp
+@@ -821,11 +821,11 @@ JSC_DEFINE_CUSTOM_GETTER(moduleRunMain,
+ }
+ 
+ extern "C" void Bun__VirtualMachine__setOverrideModuleRunMain(void* bunVM, bool isOriginal);
+-extern "C" JSC::EncodedJSValue NodeModuleModule__callOverriddenRunMain(Zig::GlobalObject* global, JSValue argv1)
++extern "C" JSC::EncodedJSValue NodeModuleModule__callOverriddenRunMain(Zig::GlobalObject* global, JSC::EncodedJSValue argv1)
+ {
+     auto overrideHandler = uncheckedDowncast<JSObject>(global->m_moduleRunMainFunction.get(global));
+     MarkedArgumentBuffer args;
+-    args.append(argv1);
++    args.append(JSValue::decode(argv1));
+     return JSC::JSValue::encode(JSC::profiledCall(global, JSC::ProfilingReason::API, overrideHandler, JSC::getCallData(overrideHandler), global, args));
+ }
+ 
 diff --git a/src/jsc/modules/ObjectModule.cpp b/src/jsc/modules/ObjectModule.cpp
 index b24970a2..40381271 100644
 --- a/src/jsc/modules/ObjectModule.cpp
@@ -3882,10 +3946,22 @@ index c81f5f14..a4e6194e 100644
      crate::mark_binding!();
  
 diff --git a/src/libarchive/lib.rs b/src/libarchive/lib.rs
-index 3965e9b4..6c30a3d8 100644
+index 3965e9b4..d4d888bc 100644
 --- a/src/libarchive/lib.rs
 +++ b/src/libarchive/lib.rs
-@@ -282,7 +282,7 @@ pub mod lib {
+@@ -33,7 +33,10 @@ pub mod lib {
+ 
+     pub type la_ssize_t = isize;
+     pub(crate) type la_int64_t = i64;
+-    type time_t = isize;
++    // wasm32-wasip2 (like all modern targets) has a 64-bit time_t; `isize`
++    // would be 32-bit on wasm32 and truncate the seconds returned by
++    // archive_entry_mtime (and mismatch the linked libarchive's ABI).
++    type time_t = i64;
+ 
+     bun_opaque::opaque_ffi! {
+         /// Opaque libarchive `struct archive`. Always used behind `*mut Archive`.
+@@ -282,7 +285,7 @@ pub mod lib {
                  // Track the furthest point we need to write to (for final truncation)
                  final_offset = final_offset.max(block.offset + data.len() as i64);
  
@@ -7524,6 +7600,28 @@ index 5120f7d8..476bddf4 100644
  
  /// Loop handler trait with optional `pre`/`post` hooks. Implementors override
  /// `PRE`/`POST` if they have them.
+diff --git a/src/uws_sys/Response.rs b/src/uws_sys/Response.rs
+index d0650880..8efcdad3 100644
+--- a/src/uws_sys/Response.rs
++++ b/src/uws_sys/Response.rs
+@@ -259,7 +259,7 @@ impl<const SSL: bool> Response<SSL> {
+     }
+ 
+     pub(crate) fn get_buffered_amount(&mut self) -> u64 {
+-        c::uws_res_get_buffered_amount(Self::ssl_flag(), self.as_raw())
++        c::uws_res_get_buffered_amount(Self::ssl_flag(), self.as_raw()) as u64
+     }
+ 
+     pub(crate) fn write(&mut self, data: &[u8]) -> WriteResult {
+@@ -1152,7 +1152,7 @@ pub mod c {
+         pub(crate) safe fn uws_res_timeout(ssl: i32, res: &mut uws_res, timeout: u8);
+         pub(crate) safe fn uws_res_reset_timeout(ssl: i32, res: &mut uws_res);
+         pub(crate) safe fn uws_res_close_if_done_and_marked(ssl: i32, res: &mut uws_res);
+-        pub(crate) safe fn uws_res_get_buffered_amount(ssl: i32, res: &mut uws_res) -> u64;
++        pub(crate) safe fn uws_res_get_buffered_amount(ssl: i32, res: &mut uws_res) -> usize;
+         pub(crate) fn uws_res_write(
+             ssl: i32,
+             res: *mut uws_res,
 diff --git a/src/uws_sys/SocketContext.rs b/src/uws_sys/SocketContext.rs
 index a61ef554..c602d105 100644
 --- a/src/uws_sys/SocketContext.rs
