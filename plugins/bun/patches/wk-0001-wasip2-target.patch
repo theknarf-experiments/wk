@@ -4955,6 +4955,48 @@ index 5f31eb8f..be0d36de 100644
                      {
                          write!(&mut prefix, "bunx-{}-", bun_sys::windows::user_unique_id())
                              .expect("unreachable");
+diff --git a/src/runtime/cli/run_command.rs b/src/runtime/cli/run_command.rs
+index c8ddbe0d..f2fbb819 100644
+--- a/src/runtime/cli/run_command.rs
++++ b/src/runtime/cli/run_command.rs
+@@ -268,9 +268,6 @@ Full documentation is available at <magenta>https://bun.com/docs/cli/run<r>
+         use_system_shell: bool,
+         shell_path: Option<&[u8]>,
+     ) -> crate::Result<()> {
+-        let shell_search_path = shell_path.unwrap_or_else(|| env.get(b"PATH").unwrap_or(b""));
+-        let shell_bin =
+-            Self::find_shell(shell_search_path, cwd).ok_or(crate::Error::MissingShell)?;
+         env.map
+             .put(b"npm_lifecycle_event", name)
+             .expect("unreachable");
+@@ -362,6 +359,14 @@ Full documentation is available at <magenta>https://bun.com/docs/cli/run<r>
+             return Ok(());
+         }
+ 
++        // System-shell path only: locate an external shell here rather than
++        // unconditionally above, since the Bun Shell path needs none — wasip2
++        // has no /bin/sh, so requiring one up front made `bun run <script>`
++        // fail with MissingShell even though Bun Shell would have handled it.
++        let shell_search_path = shell_path.unwrap_or_else(|| env.get(b"PATH").unwrap_or(b""));
++        let shell_bin =
++            Self::find_shell(shell_search_path, cwd).ok_or(crate::Error::MissingShell)?;
++
+         use crate::api::bun_process::{Status as SpawnStatus, sync};
+ 
+         let argv: Vec<Box<[u8]>> = vec![
+@@ -2427,7 +2432,12 @@ impl RunCommand {
+                         // takes `&mut ContextData`; clone the slice up-front.
+                         let passthrough: Vec<Box<[u8]>> = ctx.passthrough.clone();
+                         let silent = ctx.debug.silent;
++                        // wasip2 has no external shell (/bin/sh); Bun Shell runs
++                        // package.json scripts, so never require the system shell.
++                        #[cfg(not(target_os = "wasi"))]
+                         let use_system_shell = ctx.debug.use_system_shell;
++                        #[cfg(target_os = "wasi")]
++                        let use_system_shell = false;
+ 
+                         if let Some(&prescript) = scripts.get(&temp_script_buffer[1..]) {
+                             Self::run_package_script_foreground_with_shell_path(
 diff --git a/src/runtime/cli/test/parallel/Coordinator.rs b/src/runtime/cli/test/parallel/Coordinator.rs
 index c68a8df2..381ce532 100644
 --- a/src/runtime/cli/test/parallel/Coordinator.rs
@@ -5841,6 +5883,28 @@ index f0a724ef..3eca41fe 100644
              OperatingSystem::Android => b"android",
              OperatingSystem::Freebsd => b"freebsd",
          }
+diff --git a/src/runtime/shell/IOWriter.rs b/src/runtime/shell/IOWriter.rs
+index 4f8d012c..091f7dc8 100644
+--- a/src/runtime/shell/IOWriter.rs
++++ b/src/runtime/shell/IOWriter.rs
+@@ -351,6 +351,17 @@ impl IOWriter {
+ 
+     fn __start(&self) -> sys::Result<()> {
+         let s = self.state();
++        // wasip2: real fds (stdout/stderr, pipes) can't be poll-driven for
++        // writes through the epoll shim, so a pollable writer waits forever for
++        // a writable event that never fires (the shell's output silently hangs).
++        // Always write blocking here — mirrors the non-pollable File reader used
++        // for spawn stdout capture.
++        #[cfg(target_os = "wasi")]
++        {
++            s.flags.pollable = false;
++            s.flags.nonblock = false;
++            s.flags.is_socket = false;
++        }
+         crate::shell_log!("IOWriter(fd={}) __start()", s.fd);
+         if let Err(e) = s.writer.start(s.fd, s.flags.pollable) {
+             #[cfg(not(windows))]
 diff --git a/src/runtime/shell/interpreter.rs b/src/runtime/shell/interpreter.rs
 index 9ee2ebb9..2ade76d1 100644
 --- a/src/runtime/shell/interpreter.rs
