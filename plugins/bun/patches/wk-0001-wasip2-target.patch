@@ -4322,10 +4322,27 @@ index fedfe150..0d570fe3 100644
      {
          Timespec {
 diff --git a/src/resolver/lib.rs b/src/resolver/lib.rs
-index 23bed025..be20f546 100644
+index 23bed025..df5027b7 100644
 --- a/src/resolver/lib.rs
 +++ b/src/resolver/lib.rs
-@@ -1758,6 +1758,9 @@ pub mod fs {
+@@ -1102,7 +1102,15 @@ pub mod fs {
+                 )
+                 .map_err(Into::into);
+             }
+-            #[cfg(not(windows))]
++            #[cfg(all(not(windows), target_os = "wasi"))]
++            {
++                // wasip2's path_open rejects a bare `O_DIRECTORY` open (no access
++                // mode / cloexec) with EINVAL. Go through `open_dir_at` from cwd,
++                // which passes `O_DIRECTORY | O_CLOEXEC | O_RDONLY` like the rest
++                // of the port and resolves absolute paths against the preopens.
++                bun_sys::open_dir_at(bun_sys::Fd::cwd(), unsafe_dir_string).map_err(Into::into)
++            }
++            #[cfg(all(not(windows), not(target_os = "wasi")))]
+             {
+                 // `open(path, O_DIRECTORY)`; route through
+                 // `bun_sys::open_a` for the NUL-termination handling.
+@@ -1758,6 +1766,9 @@ pub mod fs {
              // uniform on all `unix`.
              #[cfg(unix)]
              let mtime: i128 = (stat.st_mtime as i128) * NS_PER_S + stat.st_mtime_nsec as i128;
