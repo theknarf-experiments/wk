@@ -3242,6 +3242,110 @@ index eb0f9e43..099245e8 100644
  #endif
  
  static_assert(sizeof(TopExceptionScope) == ExpectedTopExceptionScopeSize, "src/jsc/TopExceptionScope.rs assumes TopExceptionScope is 56 bytes");
+diff --git a/src/jsc/bindings/ZigGlobalObject.cpp b/src/jsc/bindings/ZigGlobalObject.cpp
+index 3022c09c..d7027775 100644
+--- a/src/jsc/bindings/ZigGlobalObject.cpp
++++ b/src/jsc/bindings/ZigGlobalObject.cpp
+@@ -145,10 +145,13 @@
+ #include "streams/JSTextDecoderStream.h"
+ #include "streams/JSTransformStream.h"
+ #include "streams/JSTransformStreamDefaultController.h"
++#include <wtf/SetForScope.h>
+ #include "JSURLPattern.h"
+ #include "JSURLSearchParams.h"
++#if ENABLE(WEBASSEMBLY)
+ #include "JSWasmStreamingCompiler.h"
+ #include <JavaScriptCore/WebAssemblyCompileOptions.h>
++#endif
+ #include "JSWebSocket.h"
+ #include "JSWorker.h"
+ #include "streams/JSWritableStream.h"
+@@ -302,10 +305,21 @@ extern "C" void JSCInitialize(const char* envp[], size_t envc, void (*onCrash)(c
+         // useWasmFaultSignalHandler/FastMemory when ASAN_OPTIONS lacks
+         // allow_user_segv_handler=1, so we don't force it off here.
+         JSC::initialize([&] {
++#if defined(__wasi__)
++            // The wasi JSC build is cloop/no-JIT and ships no WebAssembly engine
++            // tier (neither BBQ JIT nor IPInt), so leaving useWasm on trips
++            // assertOptionsAreCoherent ("at least one of useWasmIPInt or
++            // useBBQJIT must be true"). Everything runs in the interpreter.
++            JSC::Options::useWasm() = false;
++            JSC::Options::useJIT() = false;
++            JSC::Options::useBBQJIT() = false;
++            JSC::Options::useConcurrentJIT() = false;
++#else
+             JSC::Options::useWasm() = true;
+             JSC::Options::useJIT() = true;
+             JSC::Options::useBBQJIT() = true;
+             JSC::Options::useConcurrentJIT() = true;
++#endif
+             // JSC::Options::useSigillCrashAnalyzer() = true;
+             JSC::Options::useSourceProviderCache() = true;
+             // JSC::Options::useUnlinkedCodeBlockJettisoning() = false;
+@@ -999,8 +1013,13 @@ const JSC::GlobalObjectMethodTable& GlobalObject::globalObjectMethodTable()
+         &scriptExecutionStatus,
+         &unsafeEvalNoop, // reportViolationForUnsafeEval
+         nullptr, // defaultLanguage
++#if ENABLE(WEBASSEMBLY)
+         &compileStreaming,
+         &instantiateStreaming,
++#else
++        nullptr, // compileStreaming (WebAssembly disabled)
++        nullptr, // instantiateStreaming
++#endif
+         &Zig::deriveShadowRealmGlobalObject,
+         &codeForEval, // codeForEval
+         &canCompileStrings, // canCompileStrings
+@@ -1027,8 +1046,13 @@ const JSC::GlobalObjectMethodTable& EvalGlobalObject::globalObjectMethodTable()
+         &scriptExecutionStatus,
+         &unsafeEvalNoop, // reportViolationForUnsafeEval
+         nullptr, // defaultLanguage
++#if ENABLE(WEBASSEMBLY)
+         &compileStreaming,
+         &instantiateStreaming,
++#else
++        nullptr, // compileStreaming (WebAssembly disabled)
++        nullptr, // instantiateStreaming
++#endif
+         &Zig::deriveShadowRealmGlobalObject,
+         &codeForEval, // codeForEval
+         &canCompileStrings, // canCompileStrings
+@@ -1332,8 +1356,8 @@ JSC_DEFINE_HOST_FUNCTION(functionNativeMicrotaskTrampoline,
+     double cellPtr = callFrame->uncheckedArgument(0).asNumber();
+     double callbackPtr = callFrame->uncheckedArgument(1).asNumber();
+ 
+-    void* cell = reinterpret_cast<void*>(std::bit_cast<uintptr_t>(cellPtr));
+-    auto* callback = reinterpret_cast<MicrotaskCallback>(std::bit_cast<uintptr_t>(callbackPtr));
++    void* cell = reinterpret_cast<void*>(static_cast<uintptr_t>(std::bit_cast<uint64_t>(cellPtr)));
++    auto* callback = reinterpret_cast<MicrotaskCallback>(static_cast<uintptr_t>(std::bit_cast<uint64_t>(callbackPtr)));
+     callback(cell);
+     return JSValue::encode(jsUndefined());
+ }
+@@ -3598,7 +3622,7 @@ extern "C" void JSC__JSGlobalObject__queueMicrotaskCallback(Zig::GlobalObject* g
+ 
+     // Do not use JSCell* here because the GC will try to visit it.
+     // Use BunInvokeJobWithArguments to pass the two arguments (ptr and callback) to the trampoline function
+-    JSC::QueuedTask task { nullptr, JSC::InternalMicrotask::BunInvokeJobWithArguments, 0, globalObject, function, JSValue(std::bit_cast<double>(reinterpret_cast<uintptr_t>(ptr))), JSValue(std::bit_cast<double>(reinterpret_cast<uintptr_t>(callback))) };
++    JSC::QueuedTask task { nullptr, JSC::InternalMicrotask::BunInvokeJobWithArguments, 0, globalObject, function, JSValue(std::bit_cast<double>(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ptr)))), JSValue(std::bit_cast<double>(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(callback)))) };
+     globalObject->vm().queueMicrotask(WTF::move(task));
+ }
+ 
+@@ -3993,6 +4017,7 @@ JSC::JSValue EvalGlobalObject::moduleLoaderEvaluate(JSGlobalObject* lexicalGloba
+     return result;
+ }
+ 
++#if ENABLE(WEBASSEMBLY)
+ extern "C" JSC::EncodedJSValue Zig__GlobalObject__getBodyStreamOrBytesForWasmStreaming(JSGlobalObject*, EncodedJSValue response, JSC::Wasm::StreamingCompiler* compiler);
+ 
+ extern "C" void JSC__Wasm__StreamingCompiler__addBytes(JSC::Wasm::StreamingCompiler* compiler, const uint8_t* spanPtr, size_t spanSize)
+@@ -4055,6 +4080,7 @@ void GlobalObject::instantiateStreaming(JSGlobalObject* globalObject, JSC::JSPro
+ {
+     handleResponseOnStreamingAction(globalObject, promise, source, JSC::Wasm::CompilerMode::FullCompile, importObject, WTF::move(compileOptions));
+ }
++#endif // ENABLE(WEBASSEMBLY)
+ 
+ GlobalObject::PromiseFunctions GlobalObject::promiseHandlerID(Zig::FFIFunction handler)
+ {
 diff --git a/src/jsc/bindings/bindings.cpp b/src/jsc/bindings/bindings.cpp
 index 40e19b3e..3340610b 100644
 --- a/src/jsc/bindings/bindings.cpp
@@ -3931,20 +4035,31 @@ index b24970a2..40381271 100644
          }
      };
 diff --git a/src/jsc/virtual_machine_exports.rs b/src/jsc/virtual_machine_exports.rs
-index c81f5f14..a4e6194e 100644
+index c81f5f14..009701cd 100644
 --- a/src/jsc/virtual_machine_exports.rs
 +++ b/src/jsc/virtual_machine_exports.rs
-@@ -72,6 +72,10 @@ pub fn is_bun_main(global: &JSGlobalObject, str: &BunString) -> bool {
+@@ -72,7 +72,12 @@ pub fn is_bun_main(global: &JSGlobalObject, str: &BunString) -> bool {
  }
  
  // HOST_EXPORT(Bun__reportUnhandledError, c)
-+// NOTE: JSC's prebuilt code references this as `-> void` but the generated host
-+// export wrapper returns JSValue, so it stays signature-mismatched on wasm32
-+// (only reachable on VM-level unhandled rejections). Fixing it needs the
-+// host-export codegen to emit a void return.
- pub fn report_unhandled_error(global: &JSGlobalObject, value: JSValue) -> JSValue {
+-pub fn report_unhandled_error(global: &JSGlobalObject, value: JSValue) -> JSValue {
++// Returns `()` to match JSC's prebuilt `-> void` reference: every C++ caller
++// ignores the (always-UNDEFINED) return, and on wasm32 a `-> JSValue` (i64)
++// export called as `-> void` is a hard `signature_mismatch` trap — which would
++// crash the runtime on a throwing timer callback / unhandled EventEmitter
++// 'error' instead of reporting it.
++pub fn report_unhandled_error(global: &JSGlobalObject, value: JSValue) {
      crate::mark_binding!();
  
+     if !value.is_termination_exception() {
+@@ -81,7 +86,6 @@ pub fn report_unhandled_error(global: &JSGlobalObject, value: JSValue) -> JSValu
+             .as_mut()
+             .uncaught_exception(global, value, false);
+     }
+-    JSValue::UNDEFINED
+ }
+ 
+ /// `ScriptExecutionContext::postTask` — the context addresses the thread's VM
 diff --git a/src/libarchive/lib.rs b/src/libarchive/lib.rs
 index 3965e9b4..d4d888bc 100644
 --- a/src/libarchive/lib.rs
