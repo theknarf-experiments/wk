@@ -1,0 +1,8 @@
+package wk:libfuse;
+
+/// The guest side of the libfuse shim: a FUSE daemon compiled unmodified
+/// against our fuse.h serves its filesystem through wk:fs/provider — its
+/// `fuse_main` becomes the serve loop.
+world wkfuse {
+    import wk:fs/provider;
+}

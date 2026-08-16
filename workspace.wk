@@ -21,6 +21,9 @@ dependencies {
     hellofs "plugins/hellofs/target/wasm32-wasip1/debug/hellofs.wasm" {
         description "a node that IS a filesystem (wk:fs provider) — wire into an app, ls the mount"
     }
+    hellofuse "plugins/hellofuse/hellofuse.wasm" {
+        description "libfuse's unmodified hello example via the libfuse-compat shim — real FUSE code as a node"
+    }
     piano "plugins/piano/target/wasm32-wasip1/debug/piano.wasm" {
         description "on-screen keyboard emitting MIDI"
     }

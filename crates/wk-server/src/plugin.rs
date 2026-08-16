@@ -1957,6 +1957,179 @@ mod tests {
         );
     }
 
+    /// The libfuse-compat shim end to end: libfuse's UNMODIFIED upstream
+    /// hello.c example, compiled against our fuse.h, serves its filesystem
+    /// as a wk:fs provider node — `hello` reads "Hello World!\n", the root
+    /// lists it, and writes are refused exactly as hello_open's -EACCES /
+    /// missing write op dictate. Skipped when the artifact isn't built.
+    #[test]
+    fn hellofuse_unmodified_libfuse_example_serves() {
+        use wk_vfs::wasi::filesystem::preopens::Host as Preopens;
+        use wk_vfs::wasi::filesystem::types::{
+            DescriptorFlags, ErrorCode, HostDescriptor, OpenFlags, PathFlags,
+        };
+
+        let wasm =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/hellofuse/hellofuse.wasm");
+        if !wasm.exists() {
+            eprintln!("skipping: build plugins/hellofuse first (./build.sh)");
+            return;
+        }
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        host.spawn(
+            &wasm,
+            "hellofuse",
+            id,
+            &[],
+            Arc::new(Mutex::new(Vec::new())),
+            nodes.clone(),
+            Vec::new(),
+            None,
+        )
+        .expect("spawn");
+        let node = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                if let Some(n) = nodes.lock().unwrap().iter().find(|n| n.id == id).cloned() {
+                    if n.serves_fs() && n.fs_serve.is_serving() {
+                        break n;
+                    }
+                    assert!(
+                        !n.finished.load(Ordering::Relaxed),
+                        "hellofuse exited before serving"
+                    );
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "hellofuse never started serving"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        struct ConsumerStore {
+            table: ResourceTable,
+            fs: crate::vfs::SharedFs,
+        }
+        impl wasmtime_wasi_io::IoView for ConsumerStore {
+            fn table(&mut self) -> &mut ResourceTable {
+                &mut self.table
+            }
+        }
+        impl wk_vfs::VfsView for ConsumerStore {
+            fn fs(&mut self) -> crate::vfs::SharedFs {
+                self.fs.clone()
+            }
+        }
+        let fs = crate::vfs::new_fs();
+        crate::vfs::mount_provider(&fs, "/mnt", node.fs_serve.clone(), true);
+        let mut store = wk_vfs::VfsImpl(ConsumerStore {
+            table: ResourceTable::new(),
+            fs,
+        });
+        let root = Preopens::get_directories(&mut store)
+            .expect("preopen")
+            .remove(0)
+            .0;
+        let root_fd = || wasmtime::component::Resource::new_own(root.rep());
+
+        // The canonical hello file, served by unmodified libfuse example code.
+        let fd = HostDescriptor::open_at(
+            &mut store,
+            root_fd(),
+            PathFlags::SYMLINK_FOLLOW,
+            "mnt/hello".into(),
+            OpenFlags::empty(),
+            DescriptorFlags::empty(),
+        )
+        .unwrap()
+        .expect("opens hello");
+        let (bytes, eof) = HostDescriptor::read(
+            &mut store,
+            wasmtime::component::Resource::new_own(fd.rep()),
+            64,
+            0,
+        )
+        .unwrap()
+        .expect("reads hello");
+        assert_eq!(bytes, b"Hello World!\n");
+        assert!(eof);
+
+        // stat crosses to hello_getattr.
+        let st = HostDescriptor::stat_at(
+            &mut store,
+            root_fd(),
+            PathFlags::SYMLINK_FOLLOW,
+            "mnt/hello".into(),
+        )
+        .unwrap()
+        .expect("stats hello");
+        assert_eq!(st.size, 13);
+
+        // readdir crosses to hello_readdir (which fills ".", "..", "hello" —
+        // the shim strips the dot entries).
+        let dirfd = HostDescriptor::open_at(
+            &mut store,
+            root_fd(),
+            PathFlags::SYMLINK_FOLLOW,
+            "mnt".into(),
+            OpenFlags::DIRECTORY,
+            DescriptorFlags::empty(),
+        )
+        .unwrap()
+        .expect("opens the mount root");
+        let stream = HostDescriptor::read_directory(&mut store, dirfd)
+            .unwrap()
+            .expect("lists");
+        let mut names = Vec::new();
+        loop {
+            use wk_vfs::wasi::filesystem::types::HostDirectoryEntryStream;
+            match HostDirectoryEntryStream::read_directory_entry(
+                &mut store,
+                wasmtime::component::Resource::new_own(stream.rep()),
+            )
+            .unwrap()
+            .unwrap()
+            {
+                Some(e) => names.push(e.name),
+                None => break,
+            }
+        }
+        assert_eq!(names, ["hello"]);
+
+        // hello has no write op: mutations come back NotPermitted, and a
+        // missing file is the daemon's own -ENOENT.
+        assert_eq!(
+            HostDescriptor::write(
+                &mut store,
+                wasmtime::component::Resource::new_own(fd.rep()),
+                b"x".to_vec(),
+                0,
+            )
+            .unwrap()
+            .unwrap_err(),
+            ErrorCode::NotPermitted
+        );
+        assert_eq!(
+            HostDescriptor::open_at(
+                &mut store,
+                root_fd(),
+                PathFlags::SYMLINK_FOLLOW,
+                "mnt/nope".into(),
+                OpenFlags::empty(),
+                DescriptorFlags::empty(),
+            )
+            .unwrap()
+            .unwrap_err(),
+            ErrorCode::NoEntry
+        );
+
+        node.kill.store(true, Ordering::Relaxed);
+    }
+
     /// Outbound wasi:http is denied unless the node's fabric stack has host
     /// access (i.e. it's wired to a Gateway) — the same gate as raw sockets.
     /// A stackless store (pure-http node / serve store) is always denied.
