@@ -42,6 +42,17 @@ fn frame_dst(frame: &[u8]) -> Option<IpAddress> {
     }
 }
 
+/// A destination a node reaches by talking to itself: `127.0.0.0/8` or `::1`.
+/// Such a frame never leaves the node — the hub loops it straight back into the
+/// sender's own receive queue, so `localhost` works inside a node the way it
+/// does on a real host (a server and a client in one node can connect).
+fn is_loopback(dst: IpAddress) -> bool {
+    match dst {
+        IpAddress::Ipv4(a) => a.octets()[0] == 127,
+        IpAddress::Ipv6(a) => a == Ipv6Address::LOCALHOST,
+    }
+}
+
 type Queue = Arc<Mutex<VecDeque<Frame>>>;
 
 fn queue() -> Queue {
@@ -350,6 +361,11 @@ impl NetHub {
         iface.update_ip_addrs(|addrs| {
             let _ = addrs.push(IpCidr::new(ip.into(), 24));
             let _ = addrs.push(IpCidr::new(ip6.into(), 64));
+            // Loopback, so a node can reach a service it hosts via 127.0.0.1 /
+            // ::1. On-link here only makes smoltcp emit the frame; the hub loops
+            // it back to this same node (see `is_loopback` in `step`).
+            let _ = addrs.push(IpCidr::new(Ipv4Address::new(127, 0, 0, 1).into(), 8));
+            let _ = addrs.push(IpCidr::new(Ipv6Address::LOCALHOST.into(), 128));
         });
         let stack = Arc::new(Mutex::new(NodeStack {
             iface,
@@ -427,7 +443,13 @@ impl NetHub {
             let ip = *ip;
             let ip6 = *ip6;
             for frame in device.drain_tx() {
-                outbound.push((net, frame));
+                // A frame to 127.0.0.0/8 or ::1 is the node talking to itself:
+                // loop it straight back into this NIC rather than onto the net.
+                if frame_dst(&frame).is_some_and(is_loopback) {
+                    device.deliver(frame);
+                } else {
+                    outbound.push((net, frame));
+                }
             }
             routes.push((net, ip, ip6, s.clone()));
         }
@@ -564,6 +586,61 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(&got, b"hello v6 net");
+    }
+
+    /// A single node reaches a service it hosts on `127.0.0.1`: the frame never
+    /// leaves the node — the hub loops it back — so a server and a client in one
+    /// node connect, the way `localhost` works on a real host.
+    #[test]
+    fn loopback_within_a_node() {
+        let hub = NetHub::new();
+        let net = NodeId::nil();
+        let node = hub.attach(net, Ipv4Address::new(10, 0, 0, 1), "solo");
+
+        let server_h = {
+            let mut g = node.lock().unwrap();
+            let h = g.sockets.add(tcp_socket());
+            g.sockets.get_mut::<tcp::Socket>(h).listen(80).unwrap();
+            h
+        };
+        let client_h = {
+            let mut g = node.lock().unwrap();
+            let h = g.sockets.add(tcp_socket());
+            let NodeStack { iface, sockets, .. } = &mut *g;
+            sockets
+                .get_mut::<tcp::Socket>(h)
+                .connect(iface.context(), (Ipv4Address::new(127, 0, 0, 1), 80), 49152)
+                .unwrap();
+            h
+        };
+
+        let mut sent = false;
+        let mut got: Vec<u8> = Vec::new();
+        for _ in 0..500 {
+            hub.step();
+            {
+                let mut g = node.lock().unwrap();
+                let cs = g.sockets.get_mut::<tcp::Socket>(client_h);
+                if cs.can_send() && !sent {
+                    cs.send_slice(b"loopback works").unwrap();
+                    sent = true;
+                }
+            }
+            {
+                let mut g = node.lock().unwrap();
+                let ss = g.sockets.get_mut::<tcp::Socket>(server_h);
+                if ss.can_recv() {
+                    let mut buf = [0u8; 64];
+                    let n = ss.recv_slice(&mut buf).unwrap();
+                    got.extend_from_slice(&buf[..n]);
+                }
+            }
+            if got.len() >= 14 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(&got, b"loopback works");
     }
 
     /// Two nodes on the same virtual network exchange a UDP datagram via the hub

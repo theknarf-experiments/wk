@@ -8,7 +8,9 @@ description = "wk's userspace network fabric: per-node smoltcp stacks routed by 
 wk-protocol = { path = "../wk-protocol" }
 anyhow = "1"
 bytes = "1"
-smoltcp = "0.13.1"
+# iface-max-addr-count-4: each node carries its fabric v4+v6 addresses AND a
+# v4+v6 loopback (127.0.0.1 / ::1); smoltcp's default cap is 2.
+smoltcp = { version = "0.13.1", features = ["iface-max-addr-count-4"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 iroh = "1"
 iroh-tickets = "1"

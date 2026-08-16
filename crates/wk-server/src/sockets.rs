@@ -693,15 +693,19 @@ impl Pollable for HostEventPollable {
     }
 }
 
-/// Is `ip` on the virtual fabric (IPv4 `10.0.0.0/24` or IPv6 ULA `fd00::/8`)
-/// rather than the host network?
+/// Does `ip` route on the node's own smoltcp stack rather than out to the host
+/// network? True for the virtual fabric (IPv4 `10.0.0.0/24`, IPv6 ULA `fd00::/8`)
+/// and for loopback (`127.0.0.0/8`, `::1`) — the hub loops a node's loopback
+/// frames straight back, so `localhost` works without a Gateway.
 fn on_fabric(ip: smoltcp::wire::IpAddress) -> bool {
     match ip {
         smoltcp::wire::IpAddress::Ipv4(v4) => {
             let o = v4.octets();
-            o[0] == 10 && o[1] == 0 && o[2] == 0
+            (o[0] == 10 && o[1] == 0 && o[2] == 0) || o[0] == 127
         }
-        smoltcp::wire::IpAddress::Ipv6(v6) => v6.octets()[0] == 0xfd,
+        smoltcp::wire::IpAddress::Ipv6(v6) => {
+            v6 == smoltcp::wire::Ipv6Address::LOCALHOST || v6.octets()[0] == 0xfd
+        }
     }
 }
 
@@ -1209,7 +1213,13 @@ impl wasi::sockets::ip_name_lookup::Host for HostState {
                 s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
             )));
         };
-        if let Ok(v4) = name.parse::<std::net::Ipv4Addr>() {
+        if name == "localhost" {
+            // Loopback, always — a node's own `localhost` resolves the same with
+            // or without a network or Gateway; the connect then loops back on the
+            // node's own stack (see `on_fabric`). IPv4 first, as for peer names.
+            push_v4(&mut addrs, std::net::Ipv4Addr::new(127, 0, 0, 1));
+            push_v6(&mut addrs, std::net::Ipv6Addr::LOCALHOST);
+        } else if let Ok(v4) = name.parse::<std::net::Ipv4Addr>() {
             push_v4(&mut addrs, v4);
         } else if let Ok(v6) = name.parse::<std::net::Ipv6Addr>() {
             push_v6(&mut addrs, v6);
