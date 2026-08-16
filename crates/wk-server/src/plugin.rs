@@ -157,6 +157,11 @@ pub struct Node {
     /// Whether this node may run programs via `wk:exec`, refreshed from its
     /// capability token each tick so attenuation revokes it live.
     pub exec_permit: crate::exec::ExecPermit,
+    /// This node's `wk:fs` conduit: the queue its serve loop (if it imports
+    /// `wk:fs/provider`) pulls from, and consumers with this node mounted push
+    /// into. Exists on every node so a consumer can be wired before the
+    /// provider runs — calls fail fast (EIO) until a serve loop attaches.
+    pub fs_serve: Arc<wk_vfs::ProviderConn>,
 }
 
 /// A node's compiled component plus how to run and wire it — published once the
@@ -180,6 +185,9 @@ pub struct NodeSetup {
     /// Whether the component imports `wk:capture` — the UI only draws a Capture
     /// port on nodes that actually consume captured frames.
     pub capture: bool,
+    /// Whether the component imports `wk:fs/provider` — it serves a filesystem,
+    /// so other nodes may mount it (the UI offers it as a mount source).
+    pub fs_provider: bool,
 }
 
 /// What [`PluginHost::run_node`] needs to (re)start a node's guest, reused across
@@ -214,6 +222,11 @@ impl Node {
     /// `false` until the component has finished compiling.
     pub fn imports_capture(&self) -> bool {
         self.setup.get().is_some_and(|s| s.capture)
+    }
+    /// Whether this node serves a filesystem (imports `wk:fs/provider`), so
+    /// other nodes may mount it. `false` until the component has compiled.
+    pub fn serves_fs(&self) -> bool {
+        self.setup.get().is_some_and(|s| s.fs_provider)
     }
     pub fn is_runnable(&self) -> bool {
         self.setup.get().is_some_and(|s| s.run.is_some())
@@ -336,6 +349,10 @@ pub struct HostState {
     /// This node's network context (smoltcp stack on the fabric) — `Some` only
     /// for nodes that import wasi:sockets. Backs wk's own wasi:sockets impl.
     pub(crate) net: Option<crate::sockets::NetCtx>,
+    /// What this store needs to serve `wk:fs` (be a filesystem other nodes
+    /// mount). `None` for contexts that don't serve — exec children, build
+    /// steps, per-request http stores.
+    pub(crate) fs_serve: Option<crate::fsprov::FsServeCtx>,
     /// This store's RNG, backing the standard `wasi:random` interface (needed by
     /// e.g. a guest's `HashMap`).
     random_ctx: wasmtime_wasi::random::WasiRandomCtx,
@@ -823,6 +840,15 @@ fn component_imports_capture(component: &Component, engine: &Engine) -> bool {
         .any(|(name, _)| name.starts_with("wk:capture/"))
 }
 
+/// Whether a component imports `wk:fs/provider` — i.e. it serves a filesystem
+/// other nodes can mount, so the server offers it as a mount source.
+fn component_imports_fs_provider(component: &Component, engine: &Engine) -> bool {
+    component
+        .component_type()
+        .imports(engine)
+        .any(|(name, _)| name.starts_with("wk:fs/"))
+}
+
 /// Whether a component is a `wasi:http` server (exports `incoming-handler`).
 fn component_is_proxy(component: &Component, engine: &Engine) -> bool {
     component
@@ -964,6 +990,7 @@ impl PluginHost {
             scene_reg: crate::scene::new_registry(),
             options: crate::options::new_options(Vec::new()),
             net: None,
+            fs_serve: None,
             random_ctx: wasmtime_wasi::random::WasiRandomCtx::default(),
             http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
             http_hooks: GatedHttpHooks { stack: None },
@@ -1124,6 +1151,7 @@ impl crate::images::BuildRunner for PluginHost {
             scene_reg: crate::scene::new_registry(),
             options: crate::options::new_options(Vec::new()),
             net: None,
+            fs_serve: None,
             random_ctx: wasmtime_wasi::random::WasiRandomCtx::default(),
             http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
             // No fabric stack at build time: outbound http is denied, keeping
@@ -1271,6 +1299,8 @@ impl PluginHost {
         crate::scene::add_to_linker(&mut linker)?;
         // wk:exec — running another program from the node's own filesystem.
         crate::exec::add_to_linker(&mut linker)?;
+        // wk:fs — a node serving a filesystem other nodes mount (wk's FUSE).
+        crate::fsprov::add_to_linker(&mut linker)?;
         crate::options::add_to_linker(&mut linker)?;
         crate::tty::add_to_linker(&mut linker)?;
         crate::capture::add_to_linker(&mut linker)?;
@@ -1344,6 +1374,7 @@ impl PluginHost {
             scene_reg: crate::scene::new_registry(),
             options: crate::options::new_options(Vec::new()),
             net: None,
+            fs_serve: None,
             random_ctx: wasmtime_wasi::random::WasiRandomCtx::default(),
             http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
             // A per-request serve store has no fabric stack, so outbound http is
@@ -1445,6 +1476,7 @@ impl PluginHost {
             // Allowed until the server's reconciler says otherwise (it runs
             // before the guest does).
             exec_permit: crate::exec::new_permit(true),
+            fs_serve: wk_vfs::ProviderConn::new(),
         });
         nodes.lock().unwrap().push(node.clone());
 
@@ -1498,6 +1530,7 @@ impl PluginHost {
         let imports_sockets = component_imports_sockets(&component, &self.engine);
         let imports_midi = component_imports_midi(&component, &self.engine);
         let imports_capture = component_imports_capture(&component, &self.engine);
+        let imports_fs_provider = component_imports_fs_provider(&component, &self.engine);
         let net_stack = if !is_http && imports_sockets {
             // Seeded from the node id so a node keeps its address across
             // re-runs; alloc_ip skips octets already taken by other stacks.
@@ -1518,6 +1551,7 @@ impl PluginHost {
             midi: imports_midi,
             net: imports_sockets,
             capture: imports_capture,
+            fs_provider: imports_fs_provider,
         };
         // Publish; the server now sees a ready node.
         let _ = node.setup.set(setup);
@@ -1616,6 +1650,10 @@ impl PluginHost {
             scene_reg: self.scene.clone(),
             options: node.options.clone(),
             net,
+            fs_serve: Some(crate::fsprov::FsServeCtx {
+                conn: node.fs_serve.clone(),
+                kill: node.kill.clone(),
+            }),
             random_ctx: wasmtime_wasi::random::WasiRandomCtx::default(),
             http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
             http_hooks: GatedHttpHooks { stack: http_stack },
@@ -1637,6 +1675,12 @@ impl PluginHost {
         let finished = node.finished.clone();
         let running = node.running.clone();
         let kill = node.kill.clone();
+        // A provider node's conduit accepts consumer calls only while its
+        // serve loop can answer them; otherwise they fail fast (EIO).
+        let fs_conn = node.serves_fs().then(|| node.fs_serve.clone());
+        if let Some(conn) = &fs_conn {
+            conn.begin_serving();
+        }
         std::thread::spawn(move || {
             // Drive the guest on a Tokio current-thread runtime (not pollster):
             // wasmtime-wasi's monotonic clock / timers need a Tokio reactor, so a
@@ -1665,6 +1709,11 @@ impl PluginHost {
                     compositor.call_run(&mut store).await
                 }
             });
+            // The serve loop is gone with the guest: fail in-flight consumer
+            // calls and refuse new ones (mounts read EIO until a re-run).
+            if let Some(conn) = &fs_conn {
+                conn.end_serving();
+            }
             finished.store(true, Ordering::Relaxed);
             running.store(false, Ordering::Relaxed);
             match result {
@@ -1715,6 +1764,165 @@ mod tests {
         assert_eq!(bytes, w as usize * h as usize * 4);
         // Zero clamps up to 1 — no zero-area (empty-buffer) surface.
         assert_eq!(surface_dims(0, 0), (1, 1, 4));
+    }
+
+    /// wk's FUSE, end to end with real wasm: the hellofs plugin (a `wk:fs`
+    /// provider) is spawned as a node, its served tree is mounted into a
+    /// consumer filesystem, and reads/writes cross the mount into the running
+    /// guest. Skipped (with a note) when the plugin artifact isn't built.
+    #[test]
+    fn hellofs_node_serves_a_mounted_filesystem() {
+        use wk_vfs::wasi::filesystem::preopens::Host as Preopens;
+        use wk_vfs::wasi::filesystem::types::{
+            DescriptorFlags, HostDescriptor, OpenFlags, PathFlags,
+        };
+
+        let wasm = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../plugins/hellofs/target/wasm32-wasip1/debug/hellofs.wasm");
+        if !wasm.exists() {
+            eprintln!("skipping: build plugins/hellofs first (cargo component build)");
+            return;
+        }
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        host.spawn(
+            &wasm,
+            "hellofs",
+            id,
+            &[],
+            Arc::new(Mutex::new(Vec::new())),
+            nodes.clone(),
+            Vec::new(),
+            None,
+        )
+        .expect("spawn");
+
+        // Wait for the background compile to publish setup and the guest to
+        // start serving.
+        let node = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                if let Some(n) = nodes.lock().unwrap().iter().find(|n| n.id == id).cloned() {
+                    if n.serves_fs() && n.fs_serve.is_serving() {
+                        break n;
+                    }
+                    assert!(
+                        !n.finished.load(Ordering::Relaxed),
+                        "hellofs exited before serving"
+                    );
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "hellofs never started serving"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        // A consumer node's filesystem with the provider mounted at /hellofs.
+        struct ConsumerStore {
+            table: ResourceTable,
+            fs: crate::vfs::SharedFs,
+        }
+        impl wasmtime_wasi_io::IoView for ConsumerStore {
+            fn table(&mut self) -> &mut ResourceTable {
+                &mut self.table
+            }
+        }
+        impl wk_vfs::VfsView for ConsumerStore {
+            fn fs(&mut self) -> crate::vfs::SharedFs {
+                self.fs.clone()
+            }
+        }
+        let fs = crate::vfs::new_fs();
+        crate::vfs::mount_provider(&fs, "/hellofs", node.fs_serve.clone(), true);
+        let mut store = wk_vfs::VfsImpl(ConsumerStore {
+            table: ResourceTable::new(),
+            fs: fs.clone(),
+        });
+        let root = Preopens::get_directories(&mut store)
+            .expect("preopen")
+            .remove(0)
+            .0;
+        let root_fd = || wasmtime::component::Resource::new_own(root.rep());
+
+        // Read the served greeting through the mount.
+        let fd = HostDescriptor::open_at(
+            &mut store,
+            root_fd(),
+            PathFlags::SYMLINK_FOLLOW,
+            "hellofs/hello.txt".into(),
+            OpenFlags::empty(),
+            DescriptorFlags::empty(),
+        )
+        .unwrap()
+        .expect("opens the served file");
+        let (bytes, _) = HostDescriptor::read(
+            &mut store,
+            wasmtime::component::Resource::new_own(fd.rep()),
+            256,
+            0,
+        )
+        .unwrap()
+        .expect("reads the served file");
+        assert_eq!(bytes, b"Hello from another node's filesystem!\n");
+
+        // Write a new file into the provider and read it back: the guest's
+        // memfs really holds it.
+        let wfd = HostDescriptor::open_at(
+            &mut store,
+            root_fd(),
+            PathFlags::SYMLINK_FOLLOW,
+            "hellofs/from-consumer.txt".into(),
+            OpenFlags::CREATE,
+            DescriptorFlags::empty(),
+        )
+        .unwrap()
+        .expect("creates through the mount");
+        HostDescriptor::write(
+            &mut store,
+            wasmtime::component::Resource::new_own(wfd.rep()),
+            b"round trip".to_vec(),
+            0,
+        )
+        .unwrap()
+        .expect("writes through the mount");
+        let (bytes, _) = HostDescriptor::read(
+            &mut store,
+            wasmtime::component::Resource::new_own(wfd.rep()),
+            64,
+            0,
+        )
+        .unwrap()
+        .expect("reads back");
+        assert_eq!(bytes, b"round trip");
+
+        // Kill the node: its serve loop sees `none`, the conduit detaches, and
+        // the mount degrades to EIO instead of hanging.
+        node.kill.store(true, Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while node.running.load(Ordering::Relaxed) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hellofs didn't stop after kill"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            HostDescriptor::open_at(
+                &mut store,
+                root_fd(),
+                PathFlags::SYMLINK_FOLLOW,
+                "hellofs/hello.txt".into(),
+                OpenFlags::empty(),
+                DescriptorFlags::empty(),
+            )
+            .unwrap()
+            .is_err(),
+            "a dead provider's mount fails instead of hanging"
+        );
     }
 
     /// Outbound wasi:http is denied unless the node's fabric stack has host

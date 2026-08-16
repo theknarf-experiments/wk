@@ -1325,7 +1325,20 @@ impl Server {
             Some(Wire::Net(app, net)) => self.toggle_net(app, net),
             Some(Wire::Capture(app, cap)) => self.toggle_capture(app, cap),
             Some(Wire::Api(app, api)) => self.toggle_api(app, api),
-            Some(Wire::Midi(src, dst)) => self.toggle_midi(src, dst),
+            Some(Wire::Midi(src, dst)) => {
+                // Two apps normally wire MIDI — but if one of them serves a
+                // filesystem (imports `wk:fs/provider`), the wire is a mount:
+                // the provider's tree appears in the other app's vfs, exactly
+                // like a Volume bind (same relation, same tokens, same
+                // per-connection mount path).
+                if self.app_node(src).is_some_and(|n| n.serves_fs()) {
+                    self.toggle_file(src, dst)
+                } else if self.app_node(dst).is_some_and(|n| n.serves_fs()) {
+                    self.toggle_file(dst, src)
+                } else {
+                    self.toggle_midi(src, dst)
+                }
+            }
             None => {}
         }
     }
@@ -1745,6 +1758,9 @@ impl Server {
                     .file_nodes
                     .get(&volume)
                     .map(|f| f.name().to_string())
+                    // A provider app's tree mounts under the app's name by
+                    // default, like a volume mounts under its own.
+                    .or_else(|| self.app_node(volume).map(|n| n.name.clone()))
                     .unwrap_or_default()
             })
     }
@@ -1944,11 +1960,22 @@ impl Server {
         for (file, app) in plan.add {
             let writable = self.node_may_use(app, "file", file, "write");
             let path = self.mount_path_for(file, app);
-            let (Some(f), Some(node)) = (self.graph.file_nodes.get(&file), self.app_node(app))
-            else {
+            let Some(node) = self.app_node(app) else {
                 continue; // a node isn't resolvable yet — retried next reconcile
             };
-            f.mount(&node.fs, &path, writable);
+            if let Some(f) = self.graph.file_nodes.get(&file) {
+                f.mount(&node.fs, &path, writable);
+            } else if let Some(provider) = self.app_node(file) {
+                // The source is an app serving `wk:fs`: mount its live tree.
+                // Until its component has compiled, `serves_fs` is false and
+                // the mount waits (retried next reconcile).
+                if !provider.serves_fs() {
+                    continue;
+                }
+                crate::vfs::mount_provider(&node.fs, &path, provider.fs_serve.clone(), writable);
+            } else {
+                continue;
+            }
             self.mounted
                 .insert((file, app), (path, node.fs.clone(), writable));
         }
@@ -1981,6 +2008,12 @@ impl Server {
         if let Some(f) = self.graph.file_nodes.get(&pair.0) {
             f.mount(&fs, &at, writable);
             self.mounted.insert(pair, (at, fs, writable));
+        } else if let Some(provider) = self.app_node(pair.0) {
+            // A provider-app mount re-applies the same way.
+            if provider.serves_fs() {
+                crate::vfs::mount_provider(&fs, &at, provider.fs_serve.clone(), writable);
+                self.mounted.insert(pair, (at, fs, writable));
+            }
         }
     }
 

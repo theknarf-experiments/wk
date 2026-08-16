@@ -13,6 +13,11 @@
 //! calling [`add_to_linker`].
 
 pub mod layers;
+pub mod provider;
+
+pub use provider::{
+    FsDirent, FsEntryKind, FsError, FsOp, FsOpened, FsReplyData, FsStat, ProviderConn,
+};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -137,6 +142,12 @@ enum Node {
     /// The random devices (`/dev/urandom`, `/dev/random`): writes discarded,
     /// reads return endless OS-random bytes (`head -c 32 /dev/urandom`).
     Random,
+    /// A provider mount: the root of a subtree served live by another node's
+    /// program (wk's FUSE). A path walk stops here and every operation on the
+    /// residual path is forwarded over the [`ProviderConn`] to that node's
+    /// serve loop — lookup, readdir, create and all; nothing under this point
+    /// exists in this `Fs`.
+    Provider(Arc<ProviderConn>),
 }
 
 const ROOT: u64 = 0;
@@ -371,9 +382,9 @@ impl Fs {
                     Some(Node::File(_)) => PathKind::PrivateFile,
                     Some(Node::Shared(_) | Node::Host(_)) => PathKind::Mounted,
                     Some(Node::Symlink(target)) => PathKind::Symlink(target.clone()),
-                    // Device nodes are provisioned at runtime, not build
-                    // content — keep them out of layer diffs.
-                    Some(Node::Null | Node::Zero | Node::Random) => continue,
+                    // Device nodes and provider mounts are provisioned at
+                    // runtime, not build content — keep them out of layer diffs.
+                    Some(Node::Null | Node::Zero | Node::Random | Node::Provider(_)) => continue,
                     None => continue,
                 };
                 let is_dir = kind == PathKind::Dir;
@@ -454,12 +465,14 @@ impl Fs {
                 let origin = match self.nodes.get(&cid) {
                     Some(Node::Dir(_)) => PathKind::Dir,
                     Some(Node::RoFile(_)) => PathKind::LayerFile,
-                    Some(Node::Shared(_) | Node::Host(_)) => PathKind::Mounted,
+                    Some(Node::Shared(_) | Node::Host(_) | Node::Provider(_)) => PathKind::Mounted,
                     _ => PathKind::PrivateFile,
                 };
+                let is_dir = origin == PathKind::Dir
+                    || matches!(self.nodes.get(&cid), Some(Node::Provider(_)));
                 DirEntry {
                     name: name.clone(),
-                    is_dir: origin == PathKind::Dir,
+                    is_dir,
                     size: self.file_len(cid),
                     origin,
                 }
@@ -509,6 +522,9 @@ impl Fs {
             }
             Node::Dir(_) => None,
             Node::Null | Node::Zero | Node::Random => Some(Vec::new()),
+            // Previewing inside a provider would block the UI on a guest;
+            // the file inspector shows the mount point, not its contents.
+            Node::Provider(_) => None,
         }
     }
 }
@@ -584,6 +600,14 @@ fn mount_node_at(fs: &SharedFs, at: &str, node: Node, readonly: bool) {
     if let Some(Node::Dir(children)) = g.nodes.get_mut(&parent) {
         children.insert((*name).to_string(), id);
     }
+}
+
+/// Mount another node's served filesystem into `fs` at `at` (wk's FUSE): the
+/// subtree under `at` is answered live by that node's `wk:fs` serve loop via
+/// `conn`. Path semantics as [`mount_file`]. `writable = false` refuses every
+/// mutation host-side before it reaches the provider.
+pub fn mount_provider(fs: &SharedFs, at: &str, conn: Arc<ProviderConn>, writable: bool) {
+    mount_node_at(fs, at, Node::Provider(conn), !writable);
 }
 
 /// Provision the standard device files a container expects: `/dev/null`,
@@ -694,17 +718,53 @@ fn resolve_parent(fs: &Fs, start: u64, path: &str) -> Option<(u64, String)> {
 
 fn node_type(fs: &Fs, id: u64) -> DescriptorType {
     match fs.nodes.get(&id) {
-        Some(Node::Dir(_)) => DescriptorType::Directory,
+        Some(Node::Dir(_) | Node::Provider(_)) => DescriptorType::Directory,
         Some(Node::Symlink(_)) => DescriptorType::SymbolicLink,
         Some(Node::Null | Node::Zero | Node::Random) => DescriptorType::CharacterDevice,
         _ => DescriptorType::RegularFile,
     }
 }
 
-/// A descriptor handle: an open file or directory in some app node's `Fs`.
+/// An open entry behind a provider mount: everything needed to forward
+/// descriptor operations to the serving node.
+#[derive(Clone)]
+struct RemoteDesc {
+    conn: Arc<ProviderConn>,
+    /// The serve-loop incarnation this descriptor's `handle` belongs to; a
+    /// provider restart bumps it and stale handles are refused (EIO), never
+    /// replayed against the new incarnation.
+    generation: u64,
+    /// Path relative to the provider's root (`""` = the root itself).
+    path: String,
+    /// The provider's handle for an *opened* entry (present after `open_at`;
+    /// absent for path-only descriptors like the walk's synthesized dirs).
+    handle: Option<u64>,
+    kind: FsEntryKind,
+    /// Mounted read-only: refuse mutations host-side, before the provider.
+    readonly: bool,
+}
+
+impl RemoteDesc {
+    /// Whether `handle` is still valid — i.e. the same serve loop that minted
+    /// it is the one that would receive it.
+    fn live(&self) -> bool {
+        self.conn.generation() == self.generation
+    }
+}
+
+/// Where a descriptor points: a node in this `Fs`, or an entry served by a
+/// provider node across a mount boundary.
+#[derive(Clone)]
+enum DescPlace {
+    Local(u64),
+    Remote(RemoteDesc),
+}
+
+/// A descriptor handle: an open file or directory in some app node's `Fs`, or
+/// an open entry forwarded to a provider mount.
 pub struct Descriptor {
     fs: SharedFs,
-    node: u64,
+    place: DescPlace,
 }
 
 impl Descriptor {
@@ -712,15 +772,212 @@ impl Descriptor {
     /// this is open does not free the node out from under it.
     fn open(fs: SharedFs, node: u64) -> Self {
         fs.lock().unwrap().open_ref(node);
-        Descriptor { fs, node }
+        Descriptor {
+            fs,
+            place: DescPlace::Local(node),
+        }
+    }
+
+    fn remote(fs: SharedFs, r: RemoteDesc) -> Self {
+        Descriptor {
+            fs,
+            place: DescPlace::Remote(r),
+        }
     }
 }
 
 impl Drop for Descriptor {
     fn drop(&mut self) {
-        if let Ok(mut g) = self.fs.lock() {
-            g.close_ref(self.node);
+        match &self.place {
+            DescPlace::Local(node) => {
+                if let Ok(mut g) = self.fs.lock() {
+                    g.close_ref(*node);
+                }
+            }
+            // Let the provider free its handle; fire-and-forget, because a
+            // Drop must not block on a slow guest.
+            DescPlace::Remote(r) => {
+                if let Some(handle) = r.handle {
+                    if r.live() {
+                        r.conn.cast(FsOp::Release { handle });
+                    }
+                }
+            }
         }
+    }
+}
+
+/// Map a provider/conduit error onto the `wasi:filesystem` error the consumer
+/// guest sees. Conduit failures (dead provider, timeout) are EIO — the FUSE
+/// convention for a daemon that went away.
+fn provider_err(e: FsError) -> ErrorCode {
+    match e {
+        FsError::NoEntry => ErrorCode::NoEntry,
+        FsError::NotDir => ErrorCode::NotDirectory,
+        FsError::IsDir => ErrorCode::IsDirectory,
+        FsError::Exist => ErrorCode::Exist,
+        FsError::NotPermitted => ErrorCode::NotPermitted,
+        FsError::TooLarge => ErrorCode::FileTooLarge,
+        FsError::Unsupported => ErrorCode::Unsupported,
+        FsError::Io | FsError::Dead | FsError::Timeout => ErrorCode::Io,
+    }
+}
+
+/// Join a path onto a remote base path (both provider-relative). A leading `/`
+/// cannot re-anchor at the consumer's root — the fd is the anchor in wasi, so
+/// the provider root is as far up as a remote path can reach.
+fn remote_join(base: &str, path: &str) -> String {
+    let mut comps = components(base);
+    comps.extend(components(path));
+    comps.join("/")
+}
+
+/// Where a path walk from a local directory ends up.
+enum Resolved {
+    Local(u64),
+    /// The walk crossed a provider mount: the remaining path is the provider's
+    /// to answer (it may or may not exist there — that, too, is its answer).
+    Remote {
+        conn: Arc<ProviderConn>,
+        path: String,
+        readonly: bool,
+    },
+    /// The walk ended nowhere, locally (create may follow).
+    Missing,
+}
+
+/// Resolve `path` from `start` like [`resolve_at`], but stop at a provider
+/// mount boundary and hand the residual path to the caller for forwarding.
+/// The boundary check happens on every component, so `mnt/p/a/b` forwards
+/// `a/b` no matter how deep the mount sits.
+fn resolve_place(fs: &Fs, start: u64, path: &str, follow_final: bool) -> Resolved {
+    let mut hops = 0usize;
+    let mut todo: Vec<String> = components(path)
+        .into_iter()
+        .rev()
+        .map(str::to_string)
+        .collect();
+    let mut cur = if path.starts_with('/') { ROOT } else { start };
+    // `start` may itself be a provider mount point reached by an earlier open.
+    if let Some(Node::Provider(conn)) = fs.nodes.get(&cur) {
+        let mut rest: Vec<String> = todo;
+        rest.reverse();
+        return Resolved::Remote {
+            conn: conn.clone(),
+            path: rest.join("/"),
+            readonly: fs.readonly.contains(&cur),
+        };
+    }
+    while let Some(comp) = todo.pop() {
+        let next = match fs.nodes.get(&cur) {
+            Some(Node::Dir(children)) => match children.get(&comp) {
+                Some(id) => *id,
+                None => return Resolved::Missing,
+            },
+            _ => return Resolved::Missing,
+        };
+        let is_final = todo.is_empty();
+        match fs.nodes.get(&next) {
+            Some(Node::Provider(conn)) => {
+                // Everything still on the worklist belongs to the provider.
+                let mut rest: Vec<String> = std::mem::take(&mut todo);
+                rest.reverse();
+                return Resolved::Remote {
+                    conn: conn.clone(),
+                    path: rest.join("/"),
+                    readonly: fs.readonly.contains(&next),
+                };
+            }
+            Some(Node::Symlink(target)) if !is_final || follow_final => {
+                hops += 1;
+                if hops > MAX_SYMLINK_HOPS {
+                    return Resolved::Missing; // ELOOP
+                }
+                if target.starts_with('/') {
+                    cur = ROOT;
+                }
+                for c in components(target).into_iter().rev() {
+                    todo.push(c.to_string());
+                }
+            }
+            Some(_) => cur = next,
+            None => return Resolved::Missing,
+        }
+    }
+    Resolved::Local(cur)
+}
+
+/// An input stream over an opened provider file: each read is one forwarded
+/// `read` op at a moving offset, capped like local file reads.
+struct ProviderInputStream {
+    remote: RemoteDesc,
+    handle: u64,
+    offset: u64,
+}
+
+#[async_trait]
+impl Pollable for ProviderInputStream {
+    async fn ready(&mut self) {}
+}
+
+impl InputStream for ProviderInputStream {
+    fn read(&mut self, size: usize) -> std::result::Result<Bytes, StreamError> {
+        if !self.remote.live() {
+            return Err(StreamError::Closed);
+        }
+        let len = size.min(FILE_READ_CHUNK) as u32;
+        match self.remote.conn.call(FsOp::Read {
+            handle: self.handle,
+            offset: self.offset,
+            len,
+        }) {
+            Ok(FsReplyData::Data { bytes, eof }) => {
+                self.offset += bytes.len() as u64;
+                if bytes.is_empty() && eof {
+                    return Err(StreamError::Closed);
+                }
+                Ok(Bytes::from(bytes))
+            }
+            _ => Err(StreamError::Closed),
+        }
+    }
+}
+
+/// An output stream over an opened provider file: forwarded `write` ops at a
+/// moving offset.
+struct ProviderOutputStream {
+    remote: RemoteDesc,
+    handle: u64,
+    offset: u64,
+}
+
+#[async_trait]
+impl Pollable for ProviderOutputStream {
+    async fn ready(&mut self) {}
+}
+
+impl OutputStream for ProviderOutputStream {
+    fn write(&mut self, bytes: Bytes) -> std::result::Result<(), StreamError> {
+        if !self.remote.live() {
+            return Err(StreamError::Closed);
+        }
+        match self.remote.conn.call(FsOp::Write {
+            handle: self.handle,
+            offset: self.offset,
+            data: bytes.to_vec(),
+        }) {
+            Ok(FsReplyData::Written(n)) => {
+                self.offset += n;
+                Ok(())
+            }
+            _ => Err(StreamError::Closed),
+        }
+    }
+    fn flush(&mut self) -> std::result::Result<(), StreamError> {
+        Ok(())
+    }
+    fn check_write(&mut self) -> std::result::Result<usize, StreamError> {
+        Ok(1024 * 1024)
     }
 }
 
@@ -1039,11 +1296,89 @@ enum Kind {
     Missing,
 }
 
-/// Clone the `fs` Arc for the descriptor `fd` (all this node's descriptors
-/// share the one filesystem).
-fn fd_fs<T: VfsView>(view: &mut T, fd: &Resource<Descriptor>) -> Result<(SharedFs, u64)> {
+/// Clone the `fs` Arc and place for the descriptor `fd` (all this node's
+/// descriptors share the one filesystem).
+fn fd_place<T: VfsView>(view: &mut T, fd: &Resource<Descriptor>) -> Result<(SharedFs, DescPlace)> {
     let d = view.table().get(fd)?;
-    Ok((d.fs.clone(), d.node))
+    Ok((d.fs.clone(), d.place.clone()))
+}
+
+/// A stable-enough identity for a remote path (`metadata_hash`): FNV-1a over
+/// the provider-relative path, with `upper = 1` so it can't collide with local
+/// node ids (which use `upper = 0`).
+fn remote_path_hash(path: &str) -> MetadataHashValue {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in path.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    MetadataHashValue { lower: h, upper: 1 }
+}
+
+/// Forward an `open` across a provider mount and mint the remote descriptor.
+fn remote_open<T: VfsView>(
+    view: &mut T,
+    fs: SharedFs,
+    conn: Arc<ProviderConn>,
+    readonly: bool,
+    path: String,
+    oflags: OpenFlags,
+) -> Result<std::result::Result<Resource<Descriptor>, ErrorCode>> {
+    let create = oflags.contains(OpenFlags::CREATE);
+    let truncate = oflags.contains(OpenFlags::TRUNCATE);
+    let exclusive = oflags.contains(OpenFlags::EXCLUSIVE);
+    if readonly && (create || truncate) {
+        return err(ErrorCode::NotPermitted);
+    }
+    let generation = conn.generation();
+    match conn.call(FsOp::Open {
+        path: path.clone(),
+        create,
+        truncate,
+        exclusive,
+    }) {
+        Ok(FsReplyData::Opened(o)) => {
+            if oflags.contains(OpenFlags::DIRECTORY) && o.kind != FsEntryKind::Dir {
+                conn.cast(FsOp::Release { handle: o.handle });
+                return err(ErrorCode::NotDirectory);
+            }
+            let desc = Descriptor::remote(
+                fs,
+                RemoteDesc {
+                    conn,
+                    generation,
+                    path,
+                    handle: Some(o.handle),
+                    kind: o.kind,
+                    readonly,
+                },
+            );
+            Ok(Ok(view.table().push(desc)?))
+        }
+        Ok(_) => err(ErrorCode::Io),
+        Err(e) => err(provider_err(e)),
+    }
+}
+
+/// Forward `getattr` for a remote path and shape it as a `DescriptorStat`.
+fn remote_stat(conn: &ProviderConn, path: &str) -> std::result::Result<DescriptorStat, ErrorCode> {
+    match conn.call(FsOp::Getattr {
+        path: path.to_string(),
+    }) {
+        Ok(FsReplyData::Attr(st)) => Ok(DescriptorStat {
+            type_: match st.kind {
+                FsEntryKind::Dir => DescriptorType::Directory,
+                FsEntryKind::File => DescriptorType::RegularFile,
+            },
+            link_count: 1,
+            size: st.size,
+            data_access_timestamp: None,
+            data_modification_timestamp: None,
+            status_change_timestamp: None,
+        }),
+        Ok(_) => Err(ErrorCode::Io),
+        Err(e) => Err(provider_err(e)),
+    }
 }
 
 /// What `node` is, cloning shared handles so callers can act without the lock.
@@ -1054,7 +1389,10 @@ fn node_kind(fs: &SharedFs, node: u64) -> Kind {
             Some(Node::RoFile(d)) => Kind::Ro(d.clone()),
             Some(Node::Shared(sh)) => Kind::Shared(sh.clone()),
             Some(Node::Host(p)) => Kind::Host(p.clone()),
-            Some(Node::Dir(_)) => Kind::Dir,
+            // Descriptors never land on a provider mount point (resolution
+            // turns it into a remote descriptor), but a stray local id still
+            // presents as the directory it stats as.
+            Some(Node::Dir(_) | Node::Provider(_)) => Kind::Dir,
             Some(Node::Null) => Kind::Null,
             Some(Node::Zero) => Kind::Zero,
             Some(Node::Random) => Kind::Random,
@@ -1088,7 +1426,24 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         fd: Resource<Descriptor>,
         offset: Filesize,
     ) -> Result<std::result::Result<Resource<DynInputStream>, ErrorCode>> {
-        let (fs, node) = fd_fs(self, &fd)?;
+        let (fs, place) = fd_place(self, &fd)?;
+        let node = match place {
+            DescPlace::Local(n) => n,
+            DescPlace::Remote(r) => {
+                let Some(handle) = r.handle else {
+                    return err(ErrorCode::IsDirectory);
+                };
+                if !r.live() {
+                    return err(ErrorCode::Io);
+                }
+                let stream: DynInputStream = Box::new(ProviderInputStream {
+                    remote: r.clone(),
+                    handle,
+                    offset,
+                });
+                return Ok(Ok(self.table().push(stream)?));
+            }
+        };
         // The endless devices produce their own on-demand streams; everything
         // else serves a fixed byte range through a MemoryInputPipe.
         let bytes = match node_kind(&fs, node) {
@@ -1135,7 +1490,27 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         fd: Resource<Descriptor>,
         offset: Filesize,
     ) -> Result<std::result::Result<Resource<DynOutputStream>, ErrorCode>> {
-        let (fs, node) = fd_fs(self, &fd)?;
+        let (fs, place) = fd_place(self, &fd)?;
+        let node = match place {
+            DescPlace::Local(n) => n,
+            DescPlace::Remote(r) => {
+                if r.readonly {
+                    return err(ErrorCode::NotPermitted);
+                }
+                let Some(handle) = r.handle else {
+                    return err(ErrorCode::IsDirectory);
+                };
+                if !r.live() {
+                    return err(ErrorCode::Io);
+                }
+                let stream: DynOutputStream = Box::new(ProviderOutputStream {
+                    remote: r.clone(),
+                    handle,
+                    offset,
+                });
+                return Ok(Ok(self.table().push(stream)?));
+            }
+        };
         if is_readonly(&fs, node) {
             return err(ErrorCode::NotPermitted);
         }
@@ -1154,7 +1529,32 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         &mut self,
         fd: Resource<Descriptor>,
     ) -> Result<std::result::Result<Resource<DynOutputStream>, ErrorCode>> {
-        let (fs, node) = fd_fs(self, &fd)?;
+        let (fs, place) = fd_place(self, &fd)?;
+        let node = match place {
+            DescPlace::Local(n) => n,
+            DescPlace::Remote(r) => {
+                if r.readonly {
+                    return err(ErrorCode::NotPermitted);
+                }
+                let Some(handle) = r.handle else {
+                    return err(ErrorCode::IsDirectory);
+                };
+                if !r.live() {
+                    return err(ErrorCode::Io);
+                }
+                // Append starts at the provider's current size.
+                let offset = match remote_stat(&r.conn, &r.path) {
+                    Ok(st) => st.size,
+                    Err(code) => return err(code),
+                };
+                let stream: DynOutputStream = Box::new(ProviderOutputStream {
+                    remote: r.clone(),
+                    handle,
+                    offset,
+                });
+                return Ok(Ok(self.table().push(stream)?));
+            }
+        };
         if is_readonly(&fs, node) {
             return err(ErrorCode::NotPermitted);
         }
@@ -1192,11 +1592,31 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         len: Filesize,
         offset: Filesize,
     ) -> Result<std::result::Result<(Vec<u8>, bool), ErrorCode>> {
-        let (fs, node) = fd_fs(self, &fd)?;
+        let (fs, place) = fd_place(self, &fd)?;
         // Bound one read's result (see FILE_READ_CHUNK): a large single transfer
         // to the guest trips the component "cannot leave component instance"
         // trap. Short reads are valid — the caller loops for the rest.
         let len = len.min(FILE_READ_CHUNK as u64);
+        let node = match place {
+            DescPlace::Local(n) => n,
+            DescPlace::Remote(r) => {
+                let Some(handle) = r.handle else {
+                    return err(ErrorCode::IsDirectory);
+                };
+                if !r.live() {
+                    return err(ErrorCode::Io);
+                }
+                return match r.conn.call(FsOp::Read {
+                    handle,
+                    offset,
+                    len: len as u32,
+                }) {
+                    Ok(FsReplyData::Data { bytes, eof }) => Ok(Ok((bytes, eof))),
+                    Ok(_) => err(ErrorCode::Io),
+                    Err(e) => err(provider_err(e)),
+                };
+            }
+        };
         match node_kind(&fs, node) {
             Kind::File => {
                 let g = fs.lock().unwrap();
@@ -1229,7 +1649,30 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         buf: Vec<u8>,
         offset: Filesize,
     ) -> Result<std::result::Result<Filesize, ErrorCode>> {
-        let (fs, node) = fd_fs(self, &fd)?;
+        let (fs, place) = fd_place(self, &fd)?;
+        let node = match place {
+            DescPlace::Local(n) => n,
+            DescPlace::Remote(r) => {
+                if r.readonly {
+                    return err(ErrorCode::NotPermitted);
+                }
+                let Some(handle) = r.handle else {
+                    return err(ErrorCode::IsDirectory);
+                };
+                if !r.live() {
+                    return err(ErrorCode::Io);
+                }
+                return match r.conn.call(FsOp::Write {
+                    handle,
+                    offset,
+                    data: buf,
+                }) {
+                    Ok(FsReplyData::Written(n)) => Ok(Ok(n)),
+                    Ok(_) => err(ErrorCode::Io),
+                    Err(e) => err(provider_err(e)),
+                };
+            }
+        };
         if is_readonly(&fs, node) {
             return err(ErrorCode::NotPermitted);
         }
@@ -1265,7 +1708,32 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         &mut self,
         fd: Resource<Descriptor>,
     ) -> Result<std::result::Result<Resource<DirEntryStream>, ErrorCode>> {
-        let (fs, node) = fd_fs(self, &fd)?;
+        let (fs, place) = fd_place(self, &fd)?;
+        let node = match place {
+            DescPlace::Remote(r) => {
+                if r.kind != FsEntryKind::Dir {
+                    return err(ErrorCode::NotDirectory);
+                }
+                let entries = match r.conn.call(FsOp::Readdir {
+                    path: r.path.clone(),
+                }) {
+                    Ok(FsReplyData::Entries(list)) => list
+                        .into_iter()
+                        .map(|d| DirectoryEntry {
+                            type_: match d.kind {
+                                FsEntryKind::Dir => DescriptorType::Directory,
+                                FsEntryKind::File => DescriptorType::RegularFile,
+                            },
+                            name: d.name,
+                        })
+                        .collect(),
+                    Ok(_) => return err(ErrorCode::Io),
+                    Err(e) => return err(provider_err(e)),
+                };
+                return Ok(Ok(self.table().push(DirEntryStream { entries, pos: 0 })?));
+            }
+            DescPlace::Local(n) => n,
+        };
         let entries = {
             let g = fs.lock().unwrap();
             match g.nodes.get(&node) {
@@ -1288,7 +1756,40 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         fd: Resource<Descriptor>,
         path: String,
     ) -> Result<std::result::Result<(), ErrorCode>> {
-        let (fs, node) = fd_fs(self, &fd)?;
+        let (fs, place) = fd_place(self, &fd)?;
+        // A walk that crosses a provider mount forwards the mkdir; a remote
+        // start descriptor forwards with its base path joined on.
+        let target = match &place {
+            DescPlace::Local(start) => {
+                let g = fs.lock().unwrap();
+                resolve_place(&g, *start, &path, true)
+            }
+            DescPlace::Remote(r) => Resolved::Remote {
+                conn: r.conn.clone(),
+                path: remote_join(&r.path, &path),
+                readonly: r.readonly,
+            },
+        };
+        match target {
+            Resolved::Remote {
+                conn,
+                path,
+                readonly,
+            } => {
+                if readonly {
+                    return err(ErrorCode::NotPermitted);
+                }
+                return match conn.call(FsOp::Mkdir { path }) {
+                    Ok(_) => Ok(Ok(())),
+                    Err(e) => err(provider_err(e)),
+                };
+            }
+            Resolved::Local(_) => return err(ErrorCode::Exist),
+            Resolved::Missing => {}
+        }
+        let DescPlace::Local(node) = place else {
+            return err(ErrorCode::NoEntry);
+        };
         let mut g = fs.lock().unwrap();
         let Some((parent, name)) = resolve_parent(&g, node, &path) else {
             return err(ErrorCode::NoEntry);
@@ -1312,7 +1813,16 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         &mut self,
         fd: Resource<Descriptor>,
     ) -> Result<std::result::Result<DescriptorStat, ErrorCode>> {
-        let (fs, node) = fd_fs(self, &fd)?;
+        let (fs, place) = fd_place(self, &fd)?;
+        let node = match place {
+            DescPlace::Local(n) => n,
+            DescPlace::Remote(r) => {
+                return match remote_stat(&r.conn, &r.path) {
+                    Ok(s) => Ok(Ok(s)),
+                    Err(code) => err(code),
+                }
+            }
+        };
         let g = fs.lock().unwrap();
         match stat_node(&g, node) {
             Some(s) => Ok(Ok(s)),
@@ -1326,13 +1836,34 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         path_flags: PathFlags,
         path: String,
     ) -> Result<std::result::Result<DescriptorStat, ErrorCode>> {
-        let (fs, node) = fd_fs(self, &fd)?;
-        let g = fs.lock().unwrap();
+        let (fs, place) = fd_place(self, &fd)?;
         // Without SYMLINK_FOLLOW this is `lstat`: report the link itself.
         let follow = path_flags.contains(PathFlags::SYMLINK_FOLLOW);
-        match resolve_at(&g, node, &path, follow).and_then(|id| stat_node(&g, id)) {
-            Some(s) => Ok(Ok(s)),
-            None => err(ErrorCode::NoEntry),
+        let target = match &place {
+            DescPlace::Local(start) => {
+                let g = fs.lock().unwrap();
+                match resolve_place(&g, *start, &path, follow) {
+                    Resolved::Local(id) => {
+                        return match stat_node(&g, id) {
+                            Some(s) => Ok(Ok(s)),
+                            None => err(ErrorCode::NoEntry),
+                        }
+                    }
+                    other => other,
+                }
+            }
+            DescPlace::Remote(r) => Resolved::Remote {
+                conn: r.conn.clone(),
+                path: remote_join(&r.path, &path),
+                readonly: r.readonly,
+            },
+        };
+        match target {
+            Resolved::Remote { conn, path, .. } => match remote_stat(&conn, &path) {
+                Ok(s) => Ok(Ok(s)),
+                Err(code) => err(code),
+            },
+            _ => err(ErrorCode::NoEntry),
         }
     }
 
@@ -1340,7 +1871,16 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         &mut self,
         fd: Resource<Descriptor>,
     ) -> Result<std::result::Result<DescriptorType, ErrorCode>> {
-        let (fs, node) = fd_fs(self, &fd)?;
+        let (fs, place) = fd_place(self, &fd)?;
+        let node = match place {
+            DescPlace::Local(n) => n,
+            DescPlace::Remote(r) => {
+                return Ok(Ok(match r.kind {
+                    FsEntryKind::Dir => DescriptorType::Directory,
+                    FsEntryKind::File => DescriptorType::RegularFile,
+                }))
+            }
+        };
         let g = fs.lock().unwrap();
         Ok(Ok(node_type(&g, node)))
     }
@@ -1349,7 +1889,17 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         &mut self,
         fd: Resource<Descriptor>,
     ) -> Result<std::result::Result<DescriptorFlags, ErrorCode>> {
-        let (fs, node) = fd_fs(self, &fd)?;
+        let (fs, place) = fd_place(self, &fd)?;
+        let node = match place {
+            DescPlace::Local(n) => n,
+            DescPlace::Remote(r) => {
+                return Ok(Ok(if r.readonly {
+                    DescriptorFlags::READ
+                } else {
+                    DescriptorFlags::READ | DescriptorFlags::WRITE
+                }))
+            }
+        };
         if is_readonly(&fs, node) {
             return Ok(Ok(DescriptorFlags::READ));
         }
@@ -1361,7 +1911,25 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         fd: Resource<Descriptor>,
         size: Filesize,
     ) -> Result<std::result::Result<(), ErrorCode>> {
-        let (fs, node) = fd_fs(self, &fd)?;
+        let (fs, place) = fd_place(self, &fd)?;
+        let node = match place {
+            DescPlace::Local(n) => n,
+            DescPlace::Remote(r) => {
+                if r.readonly {
+                    return err(ErrorCode::NotPermitted);
+                }
+                let Some(handle) = r.handle else {
+                    return err(ErrorCode::IsDirectory);
+                };
+                if !r.live() {
+                    return err(ErrorCode::Io);
+                }
+                return match r.conn.call(FsOp::SetSize { handle, size }) {
+                    Ok(_) => Ok(Ok(())),
+                    Err(e) => err(provider_err(e)),
+                };
+            }
+        };
         if is_readonly(&fs, node) {
             return err(ErrorCode::NotPermitted);
         }
@@ -1407,10 +1975,34 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         oflags: OpenFlags,
         _flags: DescriptorFlags,
     ) -> Result<std::result::Result<Resource<Descriptor>, ErrorCode>> {
-        let (fs, start) = fd_fs(self, &fd)?;
+        let (fs, place) = fd_place(self, &fd)?;
         // Opening follows the final link unless the caller says otherwise;
         // wasi-libc asks for SYMLINK_FOLLOW on an ordinary open().
         let follow = path_flags.contains(PathFlags::SYMLINK_FOLLOW);
+        let start = match &place {
+            DescPlace::Local(start) => *start,
+            DescPlace::Remote(r) => {
+                let joined = remote_join(&r.path, &path);
+                return remote_open(self, fs, r.conn.clone(), r.readonly, joined, oflags);
+            }
+        };
+        // A walk that crosses a provider mount forwards the whole open —
+        // including creates: whether the residual path exists is the
+        // provider's answer, not ours.
+        let crossed = {
+            let g = fs.lock().unwrap();
+            match resolve_place(&g, start, &path, follow) {
+                Resolved::Remote {
+                    conn,
+                    path,
+                    readonly,
+                } => Some((conn, path, readonly)),
+                _ => None,
+            }
+        };
+        if let Some((conn, rpath, readonly)) = crossed {
+            return remote_open(self, fs, conn, readonly, rpath, oflags);
+        }
         let node = {
             let mut g = fs.lock().unwrap();
             match resolve_at(&g, start, &path, follow) {
@@ -1486,12 +2078,78 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         new_fd: Resource<Descriptor>,
         new_path: String,
     ) -> Result<std::result::Result<(), ErrorCode>> {
-        let (fs, old_start) = fd_fs(self, &fd)?;
-        let new_start = self.table().get(&new_fd)?.node;
+        let (fs, old_place) = fd_place(self, &fd)?;
+        let (new_fs_arc, new_place) = fd_place(self, &new_fd)?;
         // Rename only within one filesystem (node ids are per-fs).
-        if !Arc::ptr_eq(&fs, &self.table().get(&new_fd)?.fs) {
+        if !Arc::ptr_eq(&fs, &new_fs_arc) {
             return err(ErrorCode::CrossDevice);
         }
+        // Work out where each side lands; a provider crossing on either side
+        // means the rename happens remotely (same provider) or not at all.
+        let side = |place: &DescPlace, path: &str, g: &Fs| -> Resolved {
+            match place {
+                DescPlace::Local(start) => match resolve_place(g, *start, path, false) {
+                    // For rename we only care whether the walk crossed; a
+                    // local hit or miss both mean "local side".
+                    Resolved::Remote {
+                        conn,
+                        path,
+                        readonly,
+                    } => Resolved::Remote {
+                        conn,
+                        path,
+                        readonly,
+                    },
+                    other => other,
+                },
+                DescPlace::Remote(r) => Resolved::Remote {
+                    conn: r.conn.clone(),
+                    path: remote_join(&r.path, path),
+                    readonly: r.readonly,
+                },
+            }
+        };
+        let (old_side, new_side) = {
+            let g = fs.lock().unwrap();
+            (
+                side(&old_place, &old_path, &g),
+                side(&new_place, &new_path, &g),
+            )
+        };
+        match (&old_side, &new_side) {
+            (
+                Resolved::Remote {
+                    conn: a,
+                    path: from,
+                    readonly,
+                },
+                Resolved::Remote {
+                    conn: b, path: to, ..
+                },
+            ) => {
+                if !Arc::ptr_eq(a, b) {
+                    return err(ErrorCode::CrossDevice);
+                }
+                if *readonly {
+                    return err(ErrorCode::NotPermitted);
+                }
+                return match a.call(FsOp::Rename {
+                    from: from.clone(),
+                    to: to.clone(),
+                }) {
+                    Ok(_) => Ok(Ok(())),
+                    Err(e) => err(provider_err(e)),
+                };
+            }
+            (Resolved::Remote { .. }, _) | (_, Resolved::Remote { .. }) => {
+                return err(ErrorCode::CrossDevice);
+            }
+            _ => {}
+        }
+        let (DescPlace::Local(old_start), DescPlace::Local(new_start)) = (old_place, new_place)
+        else {
+            return err(ErrorCode::CrossDevice);
+        };
         let mut g = fs.lock().unwrap();
         let Some((old_parent, old_name)) = resolve_parent(&g, old_start, &old_path) else {
             return err(ErrorCode::NoEntry);
@@ -1520,19 +2178,28 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
     }
 
     fn is_same_object(&mut self, a: Resource<Descriptor>, b: Resource<Descriptor>) -> Result<bool> {
-        let (afs, an) = fd_fs(self, &a)?;
-        let (bfs, bn) = fd_fs(self, &b)?;
-        Ok(Arc::ptr_eq(&afs, &bfs) && an == bn)
+        let (afs, ap) = fd_place(self, &a)?;
+        let (bfs, bp) = fd_place(self, &b)?;
+        Ok(match (&ap, &bp) {
+            (DescPlace::Local(an), DescPlace::Local(bn)) => Arc::ptr_eq(&afs, &bfs) && an == bn,
+            (DescPlace::Remote(ra), DescPlace::Remote(rb)) => {
+                Arc::ptr_eq(&ra.conn, &rb.conn) && ra.path == rb.path
+            }
+            _ => false,
+        })
     }
 
     fn metadata_hash(
         &mut self,
         fd: Resource<Descriptor>,
     ) -> Result<std::result::Result<MetadataHashValue, ErrorCode>> {
-        let (_fs, node) = fd_fs(self, &fd)?;
-        Ok(Ok(MetadataHashValue {
-            lower: node,
-            upper: 0,
+        let (_fs, place) = fd_place(self, &fd)?;
+        Ok(Ok(match place {
+            DescPlace::Local(node) => MetadataHashValue {
+                lower: node,
+                upper: 0,
+            },
+            DescPlace::Remote(r) => remote_path_hash(&r.path),
         }))
     }
 
@@ -1542,14 +2209,21 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         _path_flags: PathFlags,
         path: String,
     ) -> Result<std::result::Result<MetadataHashValue, ErrorCode>> {
-        let (fs, node) = fd_fs(self, &fd)?;
+        let (fs, place) = fd_place(self, &fd)?;
+        let start = match &place {
+            DescPlace::Local(start) => *start,
+            DescPlace::Remote(r) => {
+                return Ok(Ok(remote_path_hash(&remote_join(&r.path, &path))));
+            }
+        };
         let g = fs.lock().unwrap();
-        match resolve(&g, node, &path) {
-            Some(id) => Ok(Ok(MetadataHashValue {
+        match resolve_place(&g, start, &path, true) {
+            Resolved::Local(id) => Ok(Ok(MetadataHashValue {
                 lower: id,
                 upper: 0,
             })),
-            None => err(ErrorCode::NoEntry),
+            Resolved::Remote { path, .. } => Ok(Ok(remote_path_hash(&path))),
+            Resolved::Missing => err(ErrorCode::NoEntry),
         }
     }
 
@@ -1603,12 +2277,17 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         new_descriptor: Resource<Descriptor>,
         new_path: String,
     ) -> Result<std::result::Result<(), ErrorCode>> {
-        let (fs, old_start) = fd_fs(self, &fd)?;
-        let new_start = self.table().get(&new_descriptor)?.node;
-        // Hard links can't cross filesystems (node ids are per-fs).
-        if !Arc::ptr_eq(&fs, &self.table().get(&new_descriptor)?.fs) {
+        let (fs, old_place) = fd_place(self, &fd)?;
+        let (new_fs_arc, new_place) = fd_place(self, &new_descriptor)?;
+        // Hard links can't cross filesystems (node ids are per-fs), and a
+        // provider serves plain trees — no hard links across the boundary.
+        if !Arc::ptr_eq(&fs, &new_fs_arc) {
             return err(ErrorCode::CrossDevice);
         }
+        let (DescPlace::Local(old_start), DescPlace::Local(new_start)) = (old_place, new_place)
+        else {
+            return err(ErrorCode::Unsupported);
+        };
         let mut g = fs.lock().unwrap();
         // POSIX link(2) does not follow a trailing symlink unless
         // AT_SYMLINK_FOLLOW (SYMLINK_FOLLOW) is set.
@@ -1651,8 +2330,18 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         src_path: String,
         dest_path: String,
     ) -> Result<std::result::Result<(), ErrorCode>> {
-        let (fs, start) = fd_fs(self, &fd)?;
+        let (fs, place) = fd_place(self, &fd)?;
+        // Providers serve plain trees: no symlink creation across the boundary.
+        let DescPlace::Local(start) = place else {
+            return err(ErrorCode::Unsupported);
+        };
         let mut g = fs.lock().unwrap();
+        if matches!(
+            resolve_place(&g, start, &dest_path, false),
+            Resolved::Remote { .. }
+        ) {
+            return err(ErrorCode::Unsupported);
+        }
         let Some((parent, name)) = resolve_parent(&g, start, &dest_path) else {
             return err(ErrorCode::NoEntry);
         };
@@ -1680,7 +2369,11 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         fd: Resource<Descriptor>,
         path: String,
     ) -> Result<std::result::Result<String, ErrorCode>> {
-        let (fs, start) = fd_fs(self, &fd)?;
+        let (fs, place) = fd_place(self, &fd)?;
+        // Providers serve plain trees: nothing behind a mount is a symlink.
+        let DescPlace::Local(start) = place else {
+            return err(ErrorCode::Invalid);
+        };
         let g = fs.lock().unwrap();
         let Some(id) = resolve_at(&g, start, &path, false) else {
             return err(ErrorCode::NoEntry);
@@ -1705,7 +2398,39 @@ fn unlink<T: VfsView>(
     path: &str,
     dir: bool,
 ) -> Result<std::result::Result<(), ErrorCode>> {
-    let (fs, start) = fd_fs(view, &fd)?;
+    let (fs, place) = fd_place(view, &fd)?;
+    // A removal behind a provider mount is the provider's to perform.
+    let target = match &place {
+        DescPlace::Local(start) => {
+            let g = fs.lock().unwrap();
+            match resolve_place(&g, *start, path, false) {
+                Resolved::Remote {
+                    conn,
+                    path,
+                    readonly,
+                } => Some((conn, path, readonly)),
+                _ => None,
+            }
+        }
+        DescPlace::Remote(r) => Some((r.conn.clone(), remote_join(&r.path, path), r.readonly)),
+    };
+    if let Some((conn, rpath, readonly)) = target {
+        if readonly {
+            return err(ErrorCode::NotPermitted);
+        }
+        let op = if dir {
+            FsOp::Rmdir { path: rpath }
+        } else {
+            FsOp::Unlink { path: rpath }
+        };
+        return match conn.call(op) {
+            Ok(_) => Ok(Ok(())),
+            Err(e) => err(provider_err(e)),
+        };
+    }
+    let DescPlace::Local(start) = place else {
+        return err(ErrorCode::NoEntry);
+    };
     let mut g = fs.lock().unwrap();
     let Some((parent, name)) = resolve_parent(&g, start, path) else {
         return err(ErrorCode::NoEntry);
@@ -1762,6 +2487,9 @@ fn stat_node(fs: &Fs, id: u64) -> Option<DescriptorStat> {
         Node::Host(p) => (DescriptorType::RegularFile, host_size(p)),
         Node::Symlink(target) => (DescriptorType::SymbolicLink, target.len() as u64),
         Node::Null | Node::Zero | Node::Random => (DescriptorType::CharacterDevice, 0),
+        // The mount point itself stats as a directory; anything *inside* is
+        // resolved remotely and never reaches this local-id path.
+        Node::Provider(_) => (DescriptorType::Directory, 0),
     };
     Some(DescriptorStat {
         type_: ty,
@@ -1812,6 +2540,415 @@ mod tests {
         }
     }
 
+    /// A minimal in-memory provider: a map of path -> bytes served over a
+    /// `ProviderConn` on its own thread, the way a wk:fs guest node would.
+    /// Returns the join handle and a stop flag.
+    fn spawn_memfs_provider(
+        conn: Arc<ProviderConn>,
+        seed: &[(&str, &[u8])],
+    ) -> (
+        std::thread::JoinHandle<()>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        let files: HashMap<String, Vec<u8>> = seed
+            .iter()
+            .map(|(p, b)| (p.to_string(), b.to_vec()))
+            .collect();
+        let stop2 = stop.clone();
+        conn.begin_serving();
+        let t = std::thread::spawn(move || {
+            let mut files = files;
+            let mut dirs: HashSet<String> = HashSet::new();
+            let mut handles: HashMap<u64, String> = HashMap::new();
+            let mut next_handle = 1u64;
+            let is_dir = |files: &HashMap<String, Vec<u8>>, dirs: &HashSet<String>, p: &str| {
+                p.is_empty()
+                    || dirs.contains(p)
+                    || files.keys().any(|f| f.starts_with(&format!("{p}/")))
+            };
+            while !stop2.load(Ordering::Relaxed) {
+                let Some((id, op)) = conn.next_request(std::time::Duration::from_millis(20)) else {
+                    continue;
+                };
+                let reply = match op {
+                    FsOp::Getattr { path } => {
+                        if is_dir(&files, &dirs, &path) {
+                            Ok(FsReplyData::Attr(FsStat {
+                                kind: FsEntryKind::Dir,
+                                size: 0,
+                            }))
+                        } else if let Some(b) = files.get(&path) {
+                            Ok(FsReplyData::Attr(FsStat {
+                                kind: FsEntryKind::File,
+                                size: b.len() as u64,
+                            }))
+                        } else {
+                            Err(FsError::NoEntry)
+                        }
+                    }
+                    FsOp::Readdir { path } => {
+                        if !is_dir(&files, &dirs, &path) {
+                            Err(FsError::NotDir)
+                        } else {
+                            let prefix = if path.is_empty() {
+                                String::new()
+                            } else {
+                                format!("{path}/")
+                            };
+                            let mut seen = HashSet::new();
+                            let mut entries = Vec::new();
+                            for f in files.keys().chain(dirs.iter()) {
+                                let Some(rest) = f.strip_prefix(&prefix) else {
+                                    continue;
+                                };
+                                if rest.is_empty() {
+                                    continue;
+                                }
+                                let first = rest.split('/').next().unwrap();
+                                if seen.insert(first.to_string()) {
+                                    let full = format!("{prefix}{first}");
+                                    entries.push(FsDirent {
+                                        name: first.to_string(),
+                                        kind: if is_dir(&files, &dirs, &full)
+                                            && !files.contains_key(&full)
+                                        {
+                                            FsEntryKind::Dir
+                                        } else {
+                                            FsEntryKind::File
+                                        },
+                                    });
+                                }
+                            }
+                            Ok(FsReplyData::Entries(entries))
+                        }
+                    }
+                    FsOp::Open {
+                        path,
+                        create,
+                        truncate,
+                        exclusive,
+                    } => {
+                        let exists = files.contains_key(&path) || is_dir(&files, &dirs, &path);
+                        if exists && exclusive {
+                            Err(FsError::Exist)
+                        } else if !exists && !create {
+                            Err(FsError::NoEntry)
+                        } else {
+                            if !exists || (truncate && files.contains_key(&path)) {
+                                files.insert(path.clone(), Vec::new());
+                            }
+                            let kind = if files.contains_key(&path) {
+                                FsEntryKind::File
+                            } else {
+                                FsEntryKind::Dir
+                            };
+                            let size = files.get(&path).map_or(0, |b| b.len() as u64);
+                            let handle = next_handle;
+                            next_handle += 1;
+                            handles.insert(handle, path);
+                            Ok(FsReplyData::Opened(FsOpened { handle, kind, size }))
+                        }
+                    }
+                    FsOp::Read {
+                        handle,
+                        offset,
+                        len,
+                    } => match handles.get(&handle).and_then(|p| files.get(p)) {
+                        Some(b) => {
+                            let (bytes, eof) = read_at(b, offset, len as u64);
+                            Ok(FsReplyData::Data { bytes, eof })
+                        }
+                        None => Err(FsError::NoEntry),
+                    },
+                    FsOp::Write {
+                        handle,
+                        offset,
+                        data,
+                    } => match handles.get(&handle).cloned() {
+                        Some(p) => {
+                            let b = files.entry(p).or_default();
+                            let n = data.len() as u64;
+                            write_at(b, offset, &data).unwrap();
+                            Ok(FsReplyData::Written(n))
+                        }
+                        None => Err(FsError::NoEntry),
+                    },
+                    FsOp::Release { handle } => {
+                        handles.remove(&handle);
+                        Ok(FsReplyData::Done)
+                    }
+                    FsOp::SetSize { handle, size } => match handles.get(&handle).cloned() {
+                        Some(p) => {
+                            files.entry(p).or_default().resize(size as usize, 0);
+                            Ok(FsReplyData::Done)
+                        }
+                        None => Err(FsError::NoEntry),
+                    },
+                    FsOp::Mkdir { path } => {
+                        dirs.insert(path);
+                        Ok(FsReplyData::Done)
+                    }
+                    FsOp::Unlink { path } => match files.remove(&path) {
+                        Some(_) => Ok(FsReplyData::Done),
+                        None => Err(FsError::NoEntry),
+                    },
+                    FsOp::Rmdir { path } => {
+                        if dirs.remove(&path) {
+                            Ok(FsReplyData::Done)
+                        } else {
+                            Err(FsError::NoEntry)
+                        }
+                    }
+                    FsOp::Rename { from, to } => match files.remove(&from) {
+                        Some(b) => {
+                            files.insert(to, b);
+                            Ok(FsReplyData::Done)
+                        }
+                        None => Err(FsError::NoEntry),
+                    },
+                };
+                conn.reply(id, reply);
+            }
+        });
+        (t, stop)
+    }
+
+    /// The FUSE loop end to end: a provider node's tree mounted at /mnt/p,
+    /// driven through the same `wasi:filesystem` surface a guest hits —
+    /// lookup, readdir, read, write-back, mkdir, unlink, and death semantics.
+    #[test]
+    fn provider_mount_serves_a_live_subtree() {
+        use std::sync::atomic::Ordering;
+        use wasi::filesystem::types::HostDescriptor;
+
+        let conn = ProviderConn::new();
+        let (t, stop) = spawn_memfs_provider(
+            conn.clone(),
+            &[
+                ("hello.txt", b"served by another node"),
+                ("sub/inner.txt", b"nested"),
+            ],
+        );
+
+        let fs = new_fs();
+        fs.lock()
+            .unwrap()
+            .put_file_at("local.txt", b"local".to_vec());
+        mount_provider(&fs, "/mnt/p", conn.clone(), true);
+
+        let mut store = VfsImpl(TestStore {
+            table: ResourceTable::new(),
+            fs: fs.clone(),
+        });
+        let root = store
+            .0
+            .table
+            .push(Descriptor::open(fs.clone(), ROOT))
+            .unwrap();
+        let root_fd = || Resource::<Descriptor>::new_own(root.rep());
+
+        // stat_at through the mount reaches the provider.
+        let st = HostDescriptor::stat_at(
+            &mut store,
+            root_fd(),
+            PathFlags::SYMLINK_FOLLOW,
+            "mnt/p/hello.txt".into(),
+        )
+        .unwrap()
+        .expect("stat crosses the mount");
+        assert_eq!(st.type_, DescriptorType::RegularFile);
+        assert_eq!(st.size, 22);
+
+        // Open + read a provider file.
+        let fd = HostDescriptor::open_at(
+            &mut store,
+            root_fd(),
+            PathFlags::SYMLINK_FOLLOW,
+            "mnt/p/hello.txt".into(),
+            OpenFlags::empty(),
+            DescriptorFlags::empty(),
+        )
+        .unwrap()
+        .expect("opens across the mount");
+        let (bytes, eof) = HostDescriptor::read(&mut store, Resource::new_own(fd.rep()), 64, 0)
+            .unwrap()
+            .expect("reads");
+        assert_eq!(bytes, b"served by another node");
+        assert!(eof);
+
+        // Write back through the same descriptor; the provider sees it.
+        HostDescriptor::write(
+            &mut store,
+            Resource::new_own(fd.rep()),
+            b"SERVED".to_vec(),
+            0,
+        )
+        .unwrap()
+        .expect("writes");
+        let (bytes, _) = HostDescriptor::read(&mut store, Resource::new_own(fd.rep()), 6, 0)
+            .unwrap()
+            .expect("re-reads");
+        assert_eq!(bytes, b"SERVED");
+
+        // readdir of the mount root lists provider entries; a nested dir walks.
+        let dirfd = HostDescriptor::open_at(
+            &mut store,
+            root_fd(),
+            PathFlags::SYMLINK_FOLLOW,
+            "mnt/p".into(),
+            OpenFlags::DIRECTORY,
+            DescriptorFlags::empty(),
+        )
+        .unwrap()
+        .expect("opens the mount root");
+        let stream = HostDescriptor::read_directory(&mut store, dirfd)
+            .unwrap()
+            .expect("lists");
+        let mut names = Vec::new();
+        loop {
+            use wasi::filesystem::types::HostDirectoryEntryStream;
+            match HostDirectoryEntryStream::read_directory_entry(
+                &mut store,
+                Resource::new_own(stream.rep()),
+            )
+            .unwrap()
+            .unwrap()
+            {
+                Some(e) => names.push(e.name),
+                None => break,
+            }
+        }
+        names.sort();
+        assert_eq!(names, ["hello.txt", "sub"]);
+        assert_eq!(
+            HostDescriptor::stat_at(
+                &mut store,
+                root_fd(),
+                PathFlags::SYMLINK_FOLLOW,
+                "mnt/p/sub/inner.txt".into(),
+            )
+            .unwrap()
+            .expect("nested stat")
+            .size,
+            6
+        );
+
+        // Create, mkdir, unlink — all forwarded.
+        HostDescriptor::open_at(
+            &mut store,
+            root_fd(),
+            PathFlags::SYMLINK_FOLLOW,
+            "mnt/p/new.txt".into(),
+            OpenFlags::CREATE,
+            DescriptorFlags::empty(),
+        )
+        .unwrap()
+        .expect("creates remotely");
+        HostDescriptor::create_directory_at(&mut store, root_fd(), "mnt/p/made".into())
+            .unwrap()
+            .expect("mkdir remotely");
+        HostDescriptor::unlink_file_at(&mut store, root_fd(), "mnt/p/new.txt".into())
+            .unwrap()
+            .expect("unlinks remotely");
+
+        // Local files are untouched by all of this.
+        assert_eq!(
+            fs.lock().unwrap().read_file("/local.txt", 64).as_deref(),
+            Some(&b"local"[..])
+        );
+
+        // Provider death: in-flight and future ops fail as EIO, fast.
+        stop.store(true, Ordering::Relaxed);
+        t.join().unwrap();
+        conn.end_serving();
+        assert_eq!(
+            HostDescriptor::stat_at(
+                &mut store,
+                root_fd(),
+                PathFlags::SYMLINK_FOLLOW,
+                "mnt/p/hello.txt".into(),
+            )
+            .unwrap()
+            .unwrap_err(),
+            ErrorCode::Io
+        );
+        // A handle from the dead incarnation is refused, not replayed.
+        assert_eq!(
+            HostDescriptor::read(&mut store, fd, 4, 0)
+                .unwrap()
+                .unwrap_err(),
+            ErrorCode::Io
+        );
+    }
+
+    /// A read-only provider mount refuses every mutation host-side.
+    #[test]
+    fn read_only_provider_mount_refuses_mutations() {
+        use std::sync::atomic::Ordering;
+        use wasi::filesystem::types::HostDescriptor;
+
+        let conn = ProviderConn::new();
+        let (t, stop) = spawn_memfs_provider(conn.clone(), &[("f.txt", b"ro")]);
+        let fs = new_fs();
+        mount_provider(&fs, "/mnt/ro", conn.clone(), false);
+
+        let mut store = VfsImpl(TestStore {
+            table: ResourceTable::new(),
+            fs: fs.clone(),
+        });
+        let root = store
+            .0
+            .table
+            .push(Descriptor::open(fs.clone(), ROOT))
+            .unwrap();
+        let root_fd = || Resource::<Descriptor>::new_own(root.rep());
+
+        let fd = HostDescriptor::open_at(
+            &mut store,
+            root_fd(),
+            PathFlags::SYMLINK_FOLLOW,
+            "mnt/ro/f.txt".into(),
+            OpenFlags::empty(),
+            DescriptorFlags::empty(),
+        )
+        .unwrap()
+        .expect("read-only open works");
+        let (bytes, _) = HostDescriptor::read(&mut store, Resource::new_own(fd.rep()), 8, 0)
+            .unwrap()
+            .expect("reads");
+        assert_eq!(bytes, b"ro");
+        assert_eq!(
+            HostDescriptor::write(&mut store, Resource::new_own(fd.rep()), b"x".to_vec(), 0)
+                .unwrap()
+                .unwrap_err(),
+            ErrorCode::NotPermitted
+        );
+        assert_eq!(
+            HostDescriptor::open_at(
+                &mut store,
+                root_fd(),
+                PathFlags::SYMLINK_FOLLOW,
+                "mnt/ro/new.txt".into(),
+                OpenFlags::CREATE,
+                DescriptorFlags::empty(),
+            )
+            .unwrap()
+            .unwrap_err(),
+            ErrorCode::NotPermitted
+        );
+        assert_eq!(
+            HostDescriptor::unlink_file_at(&mut store, root_fd(), "mnt/ro/f.txt".into())
+                .unwrap()
+                .unwrap_err(),
+            ErrorCode::NotPermitted
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        t.join().unwrap();
+    }
+
     #[test]
     fn a_file_stream_hands_back_bounded_chunks() {
         // A large module once crashed loading because `read_via_stream` returned
@@ -1860,10 +2997,7 @@ mod tests {
         let root = store
             .0
             .table
-            .push(Descriptor {
-                fs: fs.clone(),
-                node: ROOT,
-            })
+            .push(Descriptor::open(fs.clone(), ROOT))
             .unwrap();
         let open = |st: &mut VfsImpl<TestStore>, root: &Resource<Descriptor>, of: OpenFlags| {
             HostDescriptor::open_at(
@@ -1951,10 +3085,7 @@ mod tests {
         let root2 = store2
             .0
             .table
-            .push(Descriptor {
-                fs: rw.clone(),
-                node: ROOT,
-            })
+            .push(Descriptor::open(rw.clone(), ROOT))
             .unwrap();
         let fd2 = HostDescriptor::open_at(
             &mut store2,
@@ -2017,10 +3148,7 @@ mod tests {
         let root = store
             .0
             .table
-            .push(Descriptor {
-                fs: fs.clone(),
-                node: ROOT,
-            })
+            .push(Descriptor::open(fs.clone(), ROOT))
             .unwrap();
 
         // readlink reports the link itself, never its target's contents.

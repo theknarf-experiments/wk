@@ -18,6 +18,9 @@ dependencies {
     file_demo "plugins/file-demo/target/wasm32-wasip1/debug/file_demo.wasm" {
         description "shows the file node wired into it"
     }
+    hellofs "plugins/hellofs/target/wasm32-wasip1/debug/hellofs.wasm" {
+        description "a node that IS a filesystem (wk:fs provider) — wire into an app, ls the mount"
+    }
     piano "plugins/piano/target/wasm32-wasip1/debug/piano.wasm" {
         description "on-screen keyboard emitting MIDI"
     }

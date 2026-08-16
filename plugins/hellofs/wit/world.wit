@@ -1,0 +1,12 @@
+package wk:hellofs;
+
+/// The first wk:fs citizen: a node that *is* a filesystem. Its `run()` is a
+/// FUSE-style serve loop — pull a request, answer it — over a small in-memory
+/// tree seeded with a hello file. Wire it into any app node and the tree
+/// appears at the wire's mount path in that app's filesystem, served live by
+/// this code (writes and all).
+world hellofs {
+    import wk:fs/provider;
+
+    export run: func();
+}

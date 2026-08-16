@@ -1,0 +1,148 @@
+package wk:fs;
+
+/// Serving a filesystem from inside a node — wk's FUSE.
+///
+/// A node importing this interface can *be* a filesystem: other nodes wired to
+/// it mount its tree at a path in their own vfs, and every operation on that
+/// subtree — lookup, readdir, open, read, write, create, remove — is answered
+/// by this node's code instead of the host's in-memory tree. That turns the
+/// canvas's "mount = wire" metaphor from passive bytes (a Volume) into live
+/// behavior: synthetic control filesystems, network filesystems, archive
+/// views, lazily-fetched image layers.
+///
+/// Control is inverted, exactly like `/dev/fuse`: a running component instance
+/// cannot be re-entered from outside to call an export, so the provider's own
+/// `run()` loop *pulls* requests with a blocking `next-request` and answers
+/// with `reply`. A portable libfuse shim can map `fuse_operations` callbacks
+/// onto this loop, the same way the termios shim maps onto `wk:tty` — real
+/// FUSE filesystems become wk provider nodes.
+///
+/// Providers serve plain trees (files and directories; no symlinks or devices
+/// across the boundary), and paths are relative to the provider's root with
+/// `""` naming the root itself. The host enforces a consumer's read-only wire
+/// before anything reaches the provider, and maps a dead or unresponsive
+/// provider to EIO on the consumer — a mount never hangs a guest forever.
+interface provider {
+    /// What an entry is.
+    enum entry-kind {
+        file,
+        dir,
+    }
+
+    /// `getattr`'s answer.
+    record stat {
+        kind: entry-kind,
+        size: u64,
+    }
+
+    /// One entry of a `readdir` listing.
+    record dirent {
+        name: string,
+        kind: entry-kind,
+    }
+
+    /// `open`'s answer: the provider's chosen handle for the entry, plus
+    /// enough metadata to type the consumer's descriptor without another
+    /// round-trip. Handles die with the serve loop: after the provider node
+    /// restarts, old handles are never replayed against it.
+    record opened {
+        handle: u64,
+        kind: entry-kind,
+        size: u64,
+    }
+
+    record open-args {
+        path: string,
+        create: bool,
+        truncate: bool,
+        exclusive: bool,
+    }
+
+    record read-args {
+        handle: u64,
+        offset: u64,
+        len: u32,
+    }
+
+    record write-args {
+        handle: u64,
+        offset: u64,
+        data: list<u8>,
+    }
+
+    record set-size-args {
+        handle: u64,
+        size: u64,
+    }
+
+    record rename-args {
+        src: string,
+        dest: string,
+    }
+
+    /// One forwarded filesystem operation.
+    variant op {
+        getattr(string),
+        readdir(string),
+        open(open-args),
+        read(read-args),
+        write(write-args),
+        /// The consumer's descriptor closed; free the handle. No reply is
+        /// awaited (but reply anyway — unknown ids are dropped harmlessly).
+        release(u64),
+        set-size(set-size-args),
+        mkdir(string),
+        unlink(string),
+        rmdir(string),
+        rename(rename-args),
+    }
+
+    /// A request to answer: reply to `id` with `reply`.
+    record request {
+        id: u64,
+        op: op,
+    }
+
+    /// The errors a provider may report; the host maps them onto
+    /// `wasi:filesystem` error codes for the consumer.
+    enum error {
+        no-entry,
+        not-dir,
+        is-dir,
+        exist,
+        not-permitted,
+        io,
+        too-large,
+        unsupported,
+    }
+
+    /// A successful reply's payload; which variant is legal depends on the op
+    /// (`attr` for getattr, `entries` for readdir, `opened` for open, `data`
+    /// for read, `written` for write, `done` for the rest).
+    variant reply-data {
+        done,
+        attr(stat),
+        entries(list<dirent>),
+        opened(opened),
+        /// `read`'s bytes; `eof` true when the read reached end-of-file.
+        data(read-result),
+        written(u64),
+    }
+
+    record read-result {
+        bytes: list<u8>,
+        eof: bool,
+    }
+
+    /// Block until a consumer issues an operation. `none` means the node is
+    /// shutting down — return from `run()`.
+    next-request: func() -> option<request>;
+
+    /// Answer a previously received request.
+    reply: func(id: u64, outcome: result<reply-data, error>);
+}
+
+/// The host side: wk implements (imports) the provider conduit for guests.
+world fs-provider-host {
+    import provider;
+}
