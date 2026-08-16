@@ -6103,7 +6103,7 @@ index 2179a5c1..4ba629b2 100644
                  #[cfg(unix)]
                  let r = bun_sys::socketpair_for_shell(libc::AF_UNIX, libc::SOCK_STREAM, 0, false);
 diff --git a/src/runtime/shell/subproc.rs b/src/runtime/shell/subproc.rs
-index 2eee1305..84a74150 100644
+index 2eee1305..d1a65a8d 100644
 --- a/src/runtime/shell/subproc.rs
 +++ b/src/runtime/shell/subproc.rs
 @@ -1,7 +1,7 @@
@@ -6147,6 +6147,26 @@ index 2eee1305..84a74150 100644
                  Stdio::Inherit => Ok(Writable::Inherit),
                  Stdio::Path(_) | Stdio::Ignore => Ok(Writable::Ignore),
                  Stdio::Ipc | Stdio::Capture(_) => Ok(Writable::Ignore),
+@@ -1867,8 +1883,18 @@ impl PipeReader {
+             return self.reader.start_with_current_pipe();
+         }
+ 
++        // On wasi the captured stdio is a regular file staged by
++        // `wasi_captured_fd`, which is not pollable. Start it non-pollable so
++        // `read` drains it as a `FileType::File` to EOF (firing `on_reader_done`
++        // → `buffered_output_close`, which is what lets the command finish),
++        // instead of registering a poll on a file fd that never wakes — which
++        // left every external `$` command hanging even after it had exited.
++        #[cfg(target_os = "wasi")]
++        let pollable = false;
++        #[cfg(not(target_os = "wasi"))]
++        let pollable = true;
+         #[cfg(not(windows))]
+-        match self.reader.start(self.stdio_result.unwrap(), true) {
++        match self.reader.start(self.stdio_result.unwrap(), pollable) {
+             bun_sys::Result::Err(err) => bun_sys::Result::Err(err),
+             bun_sys::Result::Ok(()) => {
+                 // `reader.start` reports a poll-registration failure through
 diff --git a/src/runtime/socket/SocketAddress.rs b/src/runtime/socket/SocketAddress.rs
 index fd9432d6..4ea4e0d0 100644
 --- a/src/runtime/socket/SocketAddress.rs
