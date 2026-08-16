@@ -13,7 +13,17 @@ extern void* signal(int, void*);
 // init is deferred (see environ_defer.c) and driven once from here, where the
 // wasip2 monotonic clock is callable and before bun reads process.env.
 extern void __wasilibc_initialize_environ(void);
+// mimalloc's arena/hole purging reads the monotonic clock to time when to
+// decommit freed pages. On wasm that clock is a component import; when a purge
+// fires from inside `cabi_realloc` (e.g. the host lowering an input-stream.read
+// result during a TCP recv), calling the import traps "cannot leave component
+// instance". Purging can't hand memory back to an OS on wasm anyway (linear
+// memory only grows), so disable it — freed pages stay in mimalloc's own free
+// lists for reuse, and the clock is never called from the allocator.
+#include <mimalloc.h>
 int __main_argc_argv(int argc, char** argv) {
+    mi_option_set(mi_option_purge_delay, -1);
+    mi_option_set_enabled(mi_option_purge_holes, false);
     __wasilibc_initialize_environ();
     init_argv(argc, argv);
     crash_init();
