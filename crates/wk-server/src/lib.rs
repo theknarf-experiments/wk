@@ -25,6 +25,7 @@ pub mod runtime;
 pub mod scene;
 pub mod server;
 pub mod sockets;
+pub mod sockets_p3;
 pub mod terminal;
 pub mod tty;
 pub mod wiring;

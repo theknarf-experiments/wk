@@ -50,8 +50,8 @@ use wasi::sockets::network::{
 };
 use wasi::sockets::tcp::ShutdownType;
 
-const TCP_BUF: usize = 64 * 1024;
-const UDP_BUF: usize = 64 * 1024;
+pub(crate) const TCP_BUF: usize = 64 * 1024;
+pub(crate) const UDP_BUF: usize = 64 * 1024;
 
 /// How many sockets listen on a port at once (the accept backlog). smoltcp gives
 /// one listening socket one connection, so with a single listener a second
@@ -61,7 +61,7 @@ const UDP_BUF: usize = 64 * 1024;
 /// preallocated sockets (`TCP_BUF` each way), so this is a memory/burst
 /// trade-off — 64 is ~8 MiB per listened port, negligible beside the runtime,
 /// and absorbs a reconnect storm that all lands in one poll.
-const LISTEN_BACKLOG: usize = 64;
+pub(crate) const LISTEN_BACKLOG: usize = 64;
 /// Number of datagram slots in a UDP socket's packet ring buffers.
 const UDP_SLOTS: usize = 64;
 
@@ -81,6 +81,13 @@ impl NetCtx {
             next_port: 49152,
             hub,
         }
+    }
+
+    /// Hand out the next ephemeral local port (wrapping back to 49152).
+    pub(crate) fn alloc_port(&mut self) -> u16 {
+        let p = self.next_port;
+        self.next_port = self.next_port.checked_add(1).unwrap_or(49152);
+        p
     }
 }
 
@@ -111,12 +118,12 @@ pub struct TcpSock {
 }
 
 #[derive(Default)]
-struct Pipe {
-    buf: std::collections::VecDeque<u8>,
-    closed: bool,
-    wakers: Vec<std::task::Waker>,
+pub(crate) struct Pipe {
+    pub(crate) buf: std::collections::VecDeque<u8>,
+    pub(crate) closed: bool,
+    pub(crate) wakers: Vec<std::task::Waker>,
 }
-type SharedPipe = std::sync::Arc<std::sync::Mutex<Pipe>>;
+pub(crate) type SharedPipe = std::sync::Arc<std::sync::Mutex<Pipe>>;
 
 fn wake_pipe(p: &SharedPipe) {
     for w in p.lock().unwrap().wakers.drain(..) {
@@ -128,15 +135,15 @@ fn wake_pipe(p: &SharedPipe) {
 /// when a guest stops reading (host→guest) or floods a slow host (guest→host):
 /// the pump stops reading past this (TCP backpressure to the remote), and the
 /// guest's output stream reports no write space until it drains.
-const HOST_BUF_CAP: usize = 256 * 1024;
+pub(crate) const HOST_BUF_CAP: usize = 256 * 1024;
 
 /// A connection to the real host network, bridged to the guest's byte streams by
 /// a per-connection thread. Created only for nodes wired to a Gateway node.
-struct HostConn {
-    incoming: SharedPipe, // host -> guest
-    outgoing: SharedPipe, // guest -> host
-    connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+pub(crate) struct HostConn {
+    pub(crate) incoming: SharedPipe, // host -> guest
+    pub(crate) outgoing: SharedPipe, // guest -> host
+    pub(crate) connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Set when the guest drops the socket, so `host_pump` exits and closes the
     /// real host FD promptly instead of lingering until the remote closes.
     abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -156,7 +163,7 @@ impl Drop for HostConn {
 }
 
 impl HostConn {
-    fn connect(ip: smoltcp::wire::IpAddress, port: u16) -> HostConn {
+    pub(crate) fn connect(ip: smoltcp::wire::IpAddress, port: u16) -> HostConn {
         use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
         let incoming: SharedPipe = Default::default();
@@ -332,7 +339,10 @@ fn from_smol(ip: smoltcp::wire::IpAddress, port: u16) -> IpSocketAddress {
 }
 
 /// This node's own fabric address in the family of `remote` (v4 or v6).
-fn local_ip_for(stack: &SharedStack, remote: smoltcp::wire::IpAddress) -> smoltcp::wire::IpAddress {
+pub(crate) fn local_ip_for(
+    stack: &SharedStack,
+    remote: smoltcp::wire::IpAddress,
+) -> smoltcp::wire::IpAddress {
     let g = stack.lock().unwrap();
     match remote {
         smoltcp::wire::IpAddress::Ipv4(_) => g.ip.into(),
@@ -345,6 +355,62 @@ impl HostState {
     fn stack(&self) -> Option<SharedStack> {
         self.net.as_ref().map(|n| n.stack.clone())
     }
+}
+
+/// A fresh fabric TCP socket with the standard per-direction buffers.
+pub(crate) fn fabric_tcp_socket() -> tcp::Socket<'static> {
+    tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
+        tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
+    )
+}
+
+/// Resolve `name` the fabric way — shared by the 0.2 and 0.3 ip-name-lookup
+/// impls so both generations see identical results: `localhost` always,
+/// numeric addresses as-is, peer node names on this node's virtual network
+/// (IPv4 first — the canonical fabric address — then the ULA), and real names
+/// via the host resolver only when the node has host access (wired to a
+/// Gateway). `None` means unresolvable.
+pub(crate) fn resolve_name(net: Option<&NetCtx>, name: &str) -> Option<Vec<std::net::IpAddr>> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let mut addrs: Vec<IpAddr> = Vec::new();
+    if name == "localhost" {
+        // Loopback, always — a node's own `localhost` resolves the same with
+        // or without a network or Gateway; the connect then loops back on the
+        // node's own stack (see `on_fabric`). IPv4 first, as for peer names.
+        addrs.push(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        addrs.push(IpAddr::V6(Ipv6Addr::LOCALHOST));
+    } else if let Ok(v4) = name.parse::<Ipv4Addr>() {
+        addrs.push(IpAddr::V4(v4));
+    } else if let Ok(v6) = name.parse::<Ipv6Addr>() {
+        addrs.push(IpAddr::V6(v6));
+    } else if let Some((net_id, hub)) = net
+        .map(|n| (n.stack.lock().unwrap().net, n.hub.clone()))
+        .filter(|(net_id, hub)| hub.resolve(*net_id, name).is_some())
+    {
+        // A peer node on this node's virtual network, resolved by name —
+        // offer both its IPv4 and IPv6 fabric addresses. IPv4 comes first:
+        // the fabric is addressed as `10.0.0.x` everywhere (that is a
+        // node's canonical address), and resolvers try results in order, so
+        // a bare `dns.lookup(name)` / `fetch("http://name")` must land on
+        // the IPv4. (The `fd00::x` ULA is a secondary form.)
+        if let Some(v4) = hub.resolve(net_id, name) {
+            addrs.push(IpAddr::V4(v4));
+        }
+        if let Some(v6) = hub.resolve6(net_id, name) {
+            addrs.push(IpAddr::V6(v6));
+        }
+    } else if net.is_some_and(|n| n.stack.lock().unwrap().host_access) {
+        // Gatewayed node: resolve real names via the host resolver (v4 + v6).
+        match std::net::ToSocketAddrs::to_socket_addrs(&(name, 0)) {
+            Ok(iter) => addrs.extend(iter.map(|sa| sa.ip())),
+            Err(_) => return None,
+        }
+    } else {
+        // No gateway: only numeric addresses resolve on the fabric.
+        return None;
+    }
+    Some(addrs)
 }
 
 struct HasSock;
@@ -366,7 +432,7 @@ pub fn add_to_linker(l: &mut Linker<HostState>) -> Result<()> {
 
 /// What a socket pollable is waiting for.
 #[derive(Clone, Copy)]
-enum Want {
+pub(crate) enum Want {
     /// A connect/listen/accept handshake to settle (not mid-handshake).
     Event(SocketHandle),
     /// Readable: data available or peer closed.
@@ -393,10 +459,10 @@ impl Pollable for SockPollable {
     }
 }
 
-struct WantReady {
-    stack: SharedStack,
-    want: Want,
-    gen: u64,
+pub(crate) struct WantReady {
+    pub(crate) stack: SharedStack,
+    pub(crate) want: Want,
+    pub(crate) gen: u64,
 }
 
 impl Future for WantReady {
@@ -478,11 +544,11 @@ impl Future for AcceptReady {
 }
 
 /// Ready when a UDP socket can send (`send`) or has a datagram queued (`!send`).
-struct UdpReady {
-    stack: SharedStack,
-    handle: SocketHandle,
-    gen: u64,
-    send: bool,
+pub(crate) struct UdpReady {
+    pub(crate) stack: SharedStack,
+    pub(crate) handle: SocketHandle,
+    pub(crate) gen: u64,
+    pub(crate) send: bool,
 }
 impl Future for UdpReady {
     type Output = ();
@@ -635,10 +701,10 @@ impl Future for PipeReady {
 }
 
 /// Ready when a host connect attempt has settled (connected or failed).
-struct ConnReady {
-    pipe: SharedPipe,
-    connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+pub(crate) struct ConnReady {
+    pub(crate) pipe: SharedPipe,
+    pub(crate) connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl Future for ConnReady {
     type Output = ();
@@ -756,7 +822,7 @@ impl Pollable for HostEventPollable {
 /// network? True for the virtual fabric (IPv4 `10.0.0.0/24`, IPv6 ULA `fd00::/8`)
 /// and for loopback (`127.0.0.0/8`, `::1`) — the hub loops a node's loopback
 /// frames straight back, so `localhost` works without a Gateway.
-fn on_fabric(ip: smoltcp::wire::IpAddress) -> bool {
+pub(crate) fn on_fabric(ip: smoltcp::wire::IpAddress) -> bool {
     match ip {
         smoltcp::wire::IpAddress::Ipv4(v4) => {
             let o = v4.octets();
@@ -798,10 +864,7 @@ impl wasi::sockets::tcp_create_socket::Host for HostState {
             return Ok(Err(ErrorCode::AccessDenied));
         };
         let (handle, gen) = {
-            let sock = tcp::Socket::new(
-                tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
-                tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
-            );
+            let sock = fabric_tcp_socket();
             let mut g = stack.lock().unwrap();
             let h = g.sockets.add(sock);
             let gen = g.track(h);
@@ -994,11 +1057,7 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
             // each incoming SYN to any socket that is listening on the port.
             let mut backlog = Vec::with_capacity(LISTEN_BACKLOG - 1);
             for _ in 1..LISTEN_BACKLOG {
-                let sock = tcp::Socket::new(
-                    tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
-                    tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
-                );
-                let h = g.sockets.add(sock);
+                let h = g.sockets.add(fabric_tcp_socket());
                 let gen = g.track(h);
                 if g.sockets.get_mut::<tcp::Socket>(h).listen(port).is_err() {
                     g.begin_close(h, wk_fabric::netstack::SockKind::Tcp);
@@ -1064,11 +1123,7 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
             let local = sock.local_endpoint().map(|ep| from_smol(ep.addr, ep.port));
             let remote = sock.remote_endpoint().map(|ep| from_smol(ep.addr, ep.port));
             // Replenish the consumed slot with a fresh listener.
-            let fresh = tcp::Socket::new(
-                tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
-                tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
-            );
-            let new_listen = g.sockets.add(fresh);
+            let new_listen = g.sockets.add(fabric_tcp_socket());
             let new_gen = g.track(new_listen);
             if g.sockets
                 .get_mut::<tcp::Socket>(new_listen)
@@ -1326,68 +1381,22 @@ impl wasi::sockets::ip_name_lookup::Host for HostState {
         _network: Resource<Net>,
         name: String,
     ) -> Result<std::result::Result<Resource<ResolveStream>, ErrorCode>> {
-        let mut addrs = std::collections::VecDeque::new();
-        let push_v4 = |addrs: &mut std::collections::VecDeque<IpAddress>,
-                       v4: std::net::Ipv4Addr| {
-            let o = v4.octets();
-            addrs.push_back(IpAddress::Ipv4((o[0], o[1], o[2], o[3])));
-        };
-        let push_v6 = |addrs: &mut std::collections::VecDeque<IpAddress>,
-                       v6: std::net::Ipv6Addr| {
-            let s = v6.segments();
-            addrs.push_back(IpAddress::Ipv6((
-                s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-            )));
-        };
-        if name == "localhost" {
-            // Loopback, always — a node's own `localhost` resolves the same with
-            // or without a network or Gateway; the connect then loops back on the
-            // node's own stack (see `on_fabric`). IPv4 first, as for peer names.
-            push_v4(&mut addrs, std::net::Ipv4Addr::new(127, 0, 0, 1));
-            push_v6(&mut addrs, std::net::Ipv6Addr::LOCALHOST);
-        } else if let Ok(v4) = name.parse::<std::net::Ipv4Addr>() {
-            push_v4(&mut addrs, v4);
-        } else if let Ok(v6) = name.parse::<std::net::Ipv6Addr>() {
-            push_v6(&mut addrs, v6);
-        } else if let Some((net, hub)) = self
-            .net
-            .as_ref()
-            .map(|n| (n.stack.lock().unwrap().net, n.hub.clone()))
-            .filter(|(net, hub)| hub.resolve(*net, &name).is_some())
-        {
-            // A peer node on this node's virtual network, resolved by name —
-            // offer both its IPv4 and IPv6 fabric addresses. IPv4 comes first:
-            // the fabric is addressed as `10.0.0.x` everywhere (that is a
-            // node's canonical address), and resolvers try results in order, so
-            // a bare `dns.lookup(name)` / `fetch("http://name")` must land on
-            // the IPv4. (The `fd00::x` ULA is a secondary form.)
-            if let Some(v4) = hub.resolve(net, &name) {
-                push_v4(&mut addrs, v4);
-            }
-            if let Some(v6) = hub.resolve6(net, &name) {
-                push_v6(&mut addrs, v6);
-            }
-        } else if self
-            .net
-            .as_ref()
-            .is_some_and(|n| n.stack.lock().unwrap().host_access)
-        {
-            // Gatewayed node: resolve real names via the host resolver (v4 + v6).
-            match std::net::ToSocketAddrs::to_socket_addrs(&(name.as_str(), 0)) {
-                Ok(iter) => {
-                    for sa in iter {
-                        match sa.ip() {
-                            std::net::IpAddr::V4(v4) => push_v4(&mut addrs, v4),
-                            std::net::IpAddr::V6(v6) => push_v6(&mut addrs, v6),
-                        }
-                    }
-                }
-                Err(_) => return Ok(Err(ErrorCode::NameUnresolvable)),
-            }
-        } else {
-            // No gateway: only numeric addresses resolve on the fabric.
+        let Some(list) = resolve_name(self.net.as_ref(), &name) else {
             return Ok(Err(ErrorCode::NameUnresolvable));
-        }
+        };
+        let addrs = list
+            .into_iter()
+            .map(|ip| match ip {
+                std::net::IpAddr::V4(v4) => {
+                    let o = v4.octets();
+                    IpAddress::Ipv4((o[0], o[1], o[2], o[3]))
+                }
+                std::net::IpAddr::V6(v6) => {
+                    let s = v6.segments();
+                    IpAddress::Ipv6((s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]))
+                }
+            })
+            .collect();
         Ok(Ok(self.table().push(ResolveStream { addrs })?))
     }
 }
@@ -1409,7 +1418,7 @@ impl wasi::sockets::ip_name_lookup::HostResolveAddressStream for HostState {
     }
 }
 
-fn udp_packet_buffer() -> udp::PacketBuffer<'static> {
+pub(crate) fn udp_packet_buffer() -> udp::PacketBuffer<'static> {
     udp::PacketBuffer::new(
         vec![udp::PacketMetadata::EMPTY; UDP_SLOTS],
         vec![0u8; UDP_BUF],

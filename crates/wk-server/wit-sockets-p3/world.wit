@@ -1,0 +1,11 @@
+package wk:sockets-host3;
+
+/// The host side of `wasi:sockets@0.3`: wk implements these so wasip3 guests'
+/// sockets ride the same userspace network fabric (per-node smoltcp stacks,
+/// hub-routed packets, Gateway-gated host access) as wasip2 guests' do. The
+/// 0.3 generation replaces the 0.2 start/finish dances and `wasi:io` streams
+/// with component-model-native `stream`/`future` and async functions.
+world sockets-host-p3 {
+    import wasi:sockets/types@0.3.0;
+    import wasi:sockets/ip-name-lookup@0.3.0;
+}

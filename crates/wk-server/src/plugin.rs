@@ -1307,13 +1307,15 @@ impl PluginHost {
         // NOT added — wk's in-memory vfs provides `wasi:filesystem@0.3.0`
         // below, so a 0.3 guest sees the same layers/mounts/devices/provider
         // mounts as a 0.2 guest (previously 0.3 guests saw an empty fs).
-        // (0.3 sockets are wasmtime's host-OS impl gated by `WasiCtx`, which
-        // wk never grants network access — deny-all, same as before; routing
-        // them over the fabric like 0.2 is its own follow-up.)
+        // wasmtime's own 0.3 *sockets* are likewise NOT added — wk's own
+        // `wasi:sockets@0.3.0` below rides the same fabric as the 0.2 impl
+        // (smoltcp stacks, hub routing, Gateway-gated host access), so a 0.3
+        // guest sees its node's virtual network, not the host OS (previously
+        // 0.3 sockets were wasmtime's deny-all host-OS impl).
         wasmtime_wasi::p3::cli::add_to_linker(&mut linker)?;
         wasmtime_wasi::p3::clocks::add_to_linker(&mut linker)?;
         wasmtime_wasi::p3::random::add_to_linker(&mut linker)?;
-        wasmtime_wasi::p3::sockets::add_to_linker(&mut linker)?;
+        crate::sockets_p3::add_to_linker(&mut linker)?;
         crate::vfs::p3::add_to_linker(&mut linker)?;
         // Only the wasi:http interfaces (outgoing-handler + types); the rest of
         // the wasi world is already linked above.
