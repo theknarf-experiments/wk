@@ -789,6 +789,16 @@ impl OutputStream for NullOutputStream {
 /// for more, exactly as it would against a real endless device.
 const DEVICE_READ_CHUNK: usize = 1 << 20; // 1 MiB
 
+/// Cap on the bytes one regular-file read returns to the guest. A `read` that
+/// hands back a large `list<u8>` makes wasmtime lower it into guest memory in
+/// one shot (via the guest's `cabi_realloc`); past a threshold that trips the
+/// component model's "cannot leave component instance" reentrancy trap, which
+/// crashed loading any module over a few tens of KB (e.g. a bundled React app).
+/// Returning a short read instead — every reader loops for the rest — keeps each
+/// host→guest transfer small. 32 KiB is within the range already exercised on
+/// every load (the resolver's 16 KiB probe read, then the remainder).
+const FILE_READ_CHUNK: usize = 32 * 1024;
+
 /// OS-random bytes for `/dev/urandom`; falls back to zeros rather than error
 /// (a device read must not fail) in the extraordinarily unlikely getrandom miss.
 fn random_bytes(n: usize) -> Vec<u8> {
@@ -822,6 +832,33 @@ impl Pollable for RandomInputStream {
 impl InputStream for RandomInputStream {
     fn read(&mut self, size: usize) -> std::result::Result<Bytes, StreamError> {
         Ok(Bytes::from(random_bytes(size.min(DEVICE_READ_CHUNK))))
+    }
+}
+
+/// A regular file's bytes served as an input stream, but at most FILE_READ_CHUNK
+/// per read. `wasmtime_wasi`'s `MemoryInputPipe` hands back its whole remaining
+/// buffer in one read, which for a large file is exactly the oversized
+/// host→guest transfer that trips the component reentrancy trap (see
+/// FILE_READ_CHUNK). The guest loops for the rest, so short reads are transparent.
+struct BoundedFileStream {
+    bytes: Bytes,
+    pos: usize,
+}
+
+#[async_trait]
+impl Pollable for BoundedFileStream {
+    async fn ready(&mut self) {}
+}
+
+impl InputStream for BoundedFileStream {
+    fn read(&mut self, size: usize) -> std::result::Result<Bytes, StreamError> {
+        if self.pos >= self.bytes.len() {
+            return Err(StreamError::Closed);
+        }
+        let n = size.min(FILE_READ_CHUNK).min(self.bytes.len() - self.pos);
+        let chunk = self.bytes.slice(self.pos..self.pos + n);
+        self.pos += n;
+        Ok(chunk)
     }
 }
 
@@ -1089,7 +1126,7 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
             Kind::Dir => return err(ErrorCode::IsDirectory),
             Kind::Missing => return err(ErrorCode::NoEntry),
         };
-        let stream: DynInputStream = Box::new(wasmtime_wasi::p2::pipe::MemoryInputPipe::new(bytes));
+        let stream: DynInputStream = Box::new(BoundedFileStream { bytes, pos: 0 });
         Ok(Ok(self.table().push(stream)?))
     }
 
@@ -1156,6 +1193,10 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         offset: Filesize,
     ) -> Result<std::result::Result<(Vec<u8>, bool), ErrorCode>> {
         let (fs, node) = fd_fs(self, &fd)?;
+        // Bound one read's result (see FILE_READ_CHUNK): a large single transfer
+        // to the guest trips the component "cannot leave component instance"
+        // trap. Short reads are valid — the caller loops for the rest.
+        let len = len.min(FILE_READ_CHUNK as u64);
         match node_kind(&fs, node) {
             Kind::File => {
                 let g = fs.lock().unwrap();
@@ -1769,6 +1810,40 @@ mod tests {
         fn fs(&mut self) -> SharedFs {
             self.fs.clone()
         }
+    }
+
+    #[test]
+    fn a_file_stream_hands_back_bounded_chunks() {
+        // A large module once crashed loading because `read_via_stream` returned
+        // the whole file in one oversized transfer. `BoundedFileStream` caps each
+        // read; the guest loops for the rest.
+        let size = 100 * 1024;
+        let mut s = BoundedFileStream {
+            bytes: Bytes::from(vec![7u8; size]),
+            pos: 0,
+        };
+        let mut total = 0usize;
+        let mut reads = 0usize;
+        loop {
+            match s.read(1 << 30) {
+                Ok(b) => {
+                    assert!(
+                        b.len() <= FILE_READ_CHUNK,
+                        "one read exceeded the chunk cap"
+                    );
+                    assert!(!b.is_empty(), "a non-EOF read returned nothing");
+                    total += b.len();
+                    reads += 1;
+                }
+                Err(StreamError::Closed) => break,
+                Err(e) => panic!("unexpected stream error: {e:?}"),
+            }
+        }
+        assert_eq!(total, size, "every byte is delivered across the chunks");
+        assert!(
+            reads >= size / FILE_READ_CHUNK,
+            "large file read in >1 chunk"
+        );
     }
 
     #[test]
