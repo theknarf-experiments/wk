@@ -190,6 +190,9 @@ pub struct View {
     /// Per-bind mount-path overrides as (volume, app) → in-app path. Absent = the
     /// default (the volume's name at the root); the UI shows/edits these.
     pub mount_paths: HashMap<(NodeId, NodeId), String>,
+    /// App nodes whose component serves a filesystem (imports
+    /// `wk:fs/provider`) — mount sources the UI wires into apps like volumes.
+    pub fs_providers: HashSet<NodeId>,
     pub midi_links: Vec<(NodeId, NodeId)>,
     pub net_links: Vec<(NodeId, NodeId)>,
     /// Screen-capture grants as (app, Capture node).
@@ -289,6 +292,7 @@ impl View {
             uplinks: keep_map(&self.uplinks, mine),
             connections: keep_pairs(&self.connections, mine),
             mount_paths: keep_pair_map(&self.mount_paths, mine),
+            fs_providers: keep_set(&self.fs_providers, mine),
             midi_links: keep_pairs(&self.midi_links, mine),
             net_links: keep_pairs(&self.net_links, mine),
             capture_links: keep_pairs(&self.capture_links, mine),
@@ -3079,6 +3083,13 @@ impl Server {
             .filter(|(_, r)| r.kind == Kind::Api)
             .map(|(&id, _)| id)
             .collect();
+        // Provider capability comes from the compiled component (like the typed
+        // MIDI/Net ports), not the graph — empty until a compile publishes it.
+        let fs_providers = nodes
+            .iter()
+            .filter(|n| n.serves_fs())
+            .map(|n| n.id)
+            .collect();
         let uplinks = self
             .uplinks
             .iter()
@@ -3128,6 +3139,7 @@ impl Server {
             uplinks,
             connections: self.graph.connections.clone(),
             mount_paths: self.graph.mount_paths.clone(),
+            fs_providers,
             midi_links: self.graph.midi_links.clone(),
             net_links: self.graph.net_links.clone(),
             capture_links: self.graph.capture_links.clone(),
@@ -3532,6 +3544,68 @@ mod model_tests {
         let v2 = full.for_workspace(ws2);
         assert_eq!(v2.host_ports.len(), 1);
         assert_eq!(v2.net_nodes.len(), 0, "ws2 has no network");
+    }
+
+    /// `view().fs_providers` reports the app nodes whose compiled component
+    /// serves a filesystem (imports `wk:fs/provider`) — nothing while a node is
+    /// still compiling — and `for_workspace` scopes the set to its tab.
+    #[test]
+    fn view_reports_fs_provider_apps() {
+        use crate::plugin::{Node, NodeSetup};
+        let mut s = fresh_server();
+        let ws1 = s.graph.workspaces[0];
+        let ws2 = NodeId::new();
+        s.apply(Command::Create(Resource::Workspace { id: ws2 }));
+
+        // Two live app nodes (registry stubs — `serves_fs` reads the published
+        // setup, not real wasm): one provider in ws1, one plain app in ws2.
+        let stub = |id: NodeId, name: &str, fs_provider: bool| {
+            let node = Arc::new(Node {
+                id,
+                name: name.to_string(),
+                term_io: crate::terminal::TermIo::new(),
+                fs: crate::vfs::new_fs(),
+                midi_in: crate::midi::new_inbox(),
+                options: crate::options::new_options(Vec::new()),
+                finished: Arc::new(AtomicBool::new(false)),
+                running: Arc::new(AtomicBool::new(false)),
+                kill: Arc::new(AtomicBool::new(false)),
+                setup: std::sync::OnceLock::new(),
+                env: Vec::new(),
+                layers: Vec::new(),
+                capture_src: crate::capture::new_src(),
+                exec_permit: crate::exec::new_permit(true),
+                fs_serve: wk_vfs::ProviderConn::new(),
+            });
+            let _ = node.setup.set(NodeSetup {
+                net_stack: None,
+                http_path: None,
+                run: None,
+                midi: false,
+                net: false,
+                capture: false,
+                fs_provider,
+            });
+            node
+        };
+        let provider = NodeId::new();
+        s.place(provider, Kind::App, ws1, [0.0, 0.0], [100.0, 100.0]);
+        s.node_reg.lock().unwrap().push(stub(provider, "srv", true));
+        let plain = NodeId::new();
+        s.place(plain, Kind::App, ws2, [0.0, 0.0], [100.0, 100.0]);
+        s.node_reg.lock().unwrap().push(stub(plain, "app", false));
+        // A third app still compiling (no setup): never a provider.
+        let compiling = NodeId::new();
+        s.place(compiling, Kind::App, ws1, [0.0, 0.0], [100.0, 100.0]);
+
+        let full = s.view();
+        assert_eq!(
+            full.fs_providers,
+            HashSet::from([provider]),
+            "only the app whose setup serves wk:fs"
+        );
+        assert!(full.for_workspace(ws1).fs_providers.contains(&provider));
+        assert!(full.for_workspace(ws2).fs_providers.is_empty());
     }
 
     /// A HostPort's localhost port can be set absolutely via `port_set` (what

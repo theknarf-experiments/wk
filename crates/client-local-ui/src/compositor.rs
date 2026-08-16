@@ -269,6 +269,9 @@ struct App {
     editing_args: Option<(NodeId, String)>,
     /// When editing a note's text: its id and the in-progress text.
     editing_note: Option<(NodeId, String)>,
+    /// When editing a bind wire's mount path (via its wire label): the wire's
+    /// `(source, app)` pair and the in-progress text.
+    editing_mount: Option<((NodeId, NodeId), String)>,
     /// Frame counter for throttling canvas readback (Screen Capture nodes).
     capture_tick: u64,
     /// When inspecting a node's virtual filesystem (a modal overlay).
@@ -363,6 +366,7 @@ impl App {
             kbd_focus: None,
             editing_args: None,
             editing_note: None,
+            editing_mount: None,
             capture_tick: 0,
             inspect: None,
             logs: None,
@@ -436,14 +440,17 @@ impl App {
             // An app node. Every app can mount a volume (Bind); the other ports
             // appear only on apps whose component actually imports the matching
             // capability: MIDI (`wk:midi`), Capture (`wk:capture`), Network
-            // (`wasi:sockets`), and Serve (a `wasi:http` server, or a networked
-            // node whose port a HostPort can forward). While the component is
-            // still compiling these all read false, so the ports appear once it's
+            // (`wasi:sockets`), Serve (a `wasi:http` server, or a networked
+            // node whose port a HostPort can forward), and a Bind *output* on
+            // fs providers (`wk:fs/provider` — the app's served tree mounts
+            // into other apps like a volume). While the component is still
+            // compiling these all read false, so the ports appear once it's
             // ready.
             let node = v.app_node(id);
             let midi = node.as_ref().is_some_and(|n| n.imports_midi());
             let net = node.as_ref().is_some_and(|n| n.imports_net());
             let capture = node.as_ref().is_some_and(|n| n.imports_capture());
+            let provides_fs = v.fs_providers.contains(&id);
             // The API is reached over the app's virtual network, so the port
             // appears on any app that can speak to a network at all.
             let api = node.as_ref().is_some_and(|n| n.imports_net());
@@ -468,6 +475,12 @@ impl App {
             }
             if api {
                 ports.push(Port { kind: Api, dir: In });
+            }
+            if provides_fs {
+                ports.push(Port {
+                    kind: Bind,
+                    dir: Out,
+                });
             }
             if midi {
                 ports.push(Port {
@@ -816,6 +829,65 @@ impl App {
             }
         }
         best.map(|(_, w)| w)
+    }
+
+    /// The selected bind wire's mount-path label text — the in-progress edit
+    /// (with a caret) when that wire's path is being edited.
+    fn mount_label_text(&self, src: NodeId, app: NodeId) -> String {
+        match &self.editing_mount {
+            Some((w, s)) if *w == (src, app) => format!("mount: {s}\u{2588}"),
+            _ => format!("mount: {}", mount_path(&self.view, src, app)),
+        }
+    }
+
+    /// The screen rect of a bind wire's mount-path label, centred on the
+    /// wire's midpoint. Clicking it edits the path.
+    fn mount_label_rect(&self, fonts: &Fonts, src: NodeId, app: NodeId) -> Option<[f32; 4]> {
+        let (a, b) = self.wire_endpoints(Wire::Bind(src, app))?;
+        let zf = self.cam.zoom;
+        let arrow = connection_arrow(a, b, zf);
+        // The quadratic bezier at t = 0.5.
+        let mid = [
+            0.25 * (arrow.start.0 + arrow.end.0) + 0.5 * arrow.control.0,
+            0.25 * (arrow.start.1 + arrow.end.1) + 0.5 * arrow.control.1,
+        ];
+        let w = fonts.measure(&self.mount_label_text(src, app)) as f32 + 2.0 * PAD;
+        let h = fonts.line_height() as f32 + PAD;
+        Some([
+            mid[0] - w * 0.5,
+            mid[1] - h * 0.5,
+            mid[0] + w * 0.5,
+            mid[1] + h * 0.5,
+        ])
+    }
+
+    /// Handle a key press while editing a bind wire's mount path. Enter commits
+    /// (a blank path resets to the default); Escape cancels.
+    fn editing_mount_key(&mut self, code: KeyCode, text: Option<&str>) {
+        match code {
+            KeyCode::Escape => self.editing_mount = None,
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                if let Some(((src, app), path)) = self.editing_mount.take() {
+                    self.conn.send(Command::SetMount {
+                        volume: src,
+                        app,
+                        path: path.trim().to_string(),
+                    });
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some((_, s)) = self.editing_mount.as_mut() {
+                    s.pop();
+                }
+            }
+            _ => {
+                if let (Some((_, s)), Some(t)) = (self.editing_mount.as_mut(), text) {
+                    for ch in t.chars().filter(|c| !c.is_control()) {
+                        s.push(ch);
+                    }
+                }
+            }
+        }
     }
 
     /// All command-palette entries (label + action) for the current state.
@@ -3170,6 +3242,11 @@ impl App {
                 self.editing_note = None;
             }
         }
+        if let Some((pair, _)) = &self.editing_mount {
+            if !self.view.connections.contains(pair) {
+                self.editing_mount = None;
+            }
+        }
         if self
             .kbd_focus
             .is_some_and(|id| !self.view.win_pos.contains_key(&id))
@@ -3373,9 +3450,26 @@ impl App {
                     self.commit_note();
                 }
             }
-            // Any fresh click clears the wire selection; a click that lands on a
-            // wire (empty-canvas branch below) re-selects it.
-            self.wire_sel = None;
+            // A click on the selected bind wire's mount-path label starts (or
+            // continues) editing the in-app mount path; any other fresh click
+            // clears the wire selection — a click that lands on a wire
+            // (empty-canvas branch below) re-selects it.
+            let mount_label_hit = match self.wire_sel {
+                Some(Wire::Bind(f, a)) => self
+                    .mount_label_rect(&gfx.fonts, f, a)
+                    .filter(|r| contains(*r, mp))
+                    .map(|_| (f, a)),
+                _ => None,
+            };
+            if let Some((f, a)) = mount_label_hit {
+                if self.editing_mount.as_ref().map(|(w, _)| *w) != Some((f, a)) {
+                    self.editing_mount = Some(((f, a), mount_path(&self.view, f, a)));
+                }
+                consumed = true;
+            } else {
+                self.editing_mount = None;
+                self.wire_sel = None;
+            }
             // The filesystem inspector is modal: navigate on a row click,
             // dismiss on the close box or a click outside the panel.
             if let Some(insp) = &self.inspect {
@@ -4409,6 +4503,33 @@ impl App {
             self.draw_typed_ports(&mut quads, gfx.renderer.circle, id, zf, mp, full);
         }
 
+        // The selected bind wire's mount-path label, at the wire's midpoint:
+        // where the source (volume or fs-provider app) mounts inside the app.
+        // Click it to edit — Enter commits (blank resets to the default),
+        // Escape cancels.
+        if let Some(Wire::Bind(f, a)) = self.wire_sel {
+            if let Some(r) = self.mount_label_rect(&gfx.fonts, f, a) {
+                quads.push(Quad::solid(white, r, BORDER_COL, full));
+                let inset = [r[0] + 1.0, r[1] + 1.0, r[2] - 1.0, r[3] - 1.0];
+                quads.push(Quad::solid(white, inset, MENU_BG, full));
+                let label = self.mount_label_text(f, a);
+                let lh = gfx.fonts.line_height() as f32;
+                self.text_cache.draw(
+                    &mut quads,
+                    &mut gfx.renderer,
+                    &gfx.fonts,
+                    &gfx.device,
+                    &gfx.queue,
+                    &label,
+                    r[0] + PAD,
+                    r[1] + (r[3] - r[1] - lh) * 0.5,
+                    1.0,
+                    TEXT,
+                    full,
+                );
+            }
+        }
+
         // The wire being dragged out of a typed output port toward the cursor —
         // same curved arrow as a finished connection, in that kind's colour.
         if let Some(d) = &self.drag {
@@ -4680,8 +4801,33 @@ impl App {
                     col,
                     [rr[0], rr[1], rr[2] - PAD, rr[3]],
                 );
-                if !e.is_dir {
-                    use wk_server::vfs::PathKind;
+                use wk_server::vfs::PathKind;
+                if e.is_dir {
+                    // A directory entry with a `Mounted` origin is a provider
+                    // mount point (an fs-provider app's served tree). Name the
+                    // provider — the wires + mount paths already say which one
+                    // lands here, so no guest is asked.
+                    if e.origin == PathKind::Mounted {
+                        let tag =
+                            provider_serving(&self.view, insp.node, &insp.child_path(&e.name))
+                                .map(|n| format!("served by {n}"))
+                                .unwrap_or_else(|| "mount".to_string());
+                        let tw = gfx.fonts.measure(&tag) as f32 * 0.85;
+                        self.text_cache.draw(
+                            &mut quads,
+                            &mut gfx.renderer,
+                            &gfx.fonts,
+                            &gfx.device,
+                            &gfx.queue,
+                            &tag,
+                            rr[2] - PAD - tw,
+                            rr[1] + (row_h - lh * 0.85) * 0.5,
+                            0.85,
+                            [0.72, 0.58, 0.85, 1.0],
+                            rr,
+                        );
+                    }
+                } else {
                     // Provenance badge: canvas mounts always; layer/edited
                     // distinctions only for container nodes (a plain node's
                     // files are all "written" — no signal in saying so).
@@ -5514,6 +5660,15 @@ impl ApplicationHandler for App {
                         }
                         return;
                     }
+                    // While editing a bind wire's mount path, keystrokes edit
+                    // that text (so Backspace edits rather than deleting the
+                    // selected wire).
+                    if self.editing_mount.is_some() {
+                        if pressed {
+                            self.editing_mount_key(code, event.text.as_deref());
+                        }
+                        return;
+                    }
                     // Escape quits wk only when nothing is focused; otherwise it
                     // belongs to the focused app/terminal (vim lives on Escape).
                     if code == KeyCode::Escape && pressed && self.kbd_focus.is_none() {
@@ -5567,6 +5722,33 @@ impl wk_protocol::Client<ServerHandle> for WindowClient {
     }
 }
 
+/// The in-app path a bind wire mounts at: the per-connection override if set,
+/// else the source's own name — a file node's name, or an fs-provider app's
+/// (mirrors the server's `mount_path_for`).
+fn mount_path(v: &View, src: NodeId, app: NodeId) -> String {
+    v.mount_paths.get(&(src, app)).cloned().unwrap_or_else(|| {
+        v.file_nodes
+            .get(&src)
+            .map(|f| f.name.clone())
+            .or_else(|| v.app_node(src).map(|n| n.name.clone()))
+            .unwrap_or_default()
+    })
+}
+
+/// The name of the fs-provider app whose served tree is mounted at `path`
+/// inside `node`, if any — derived from the graph alone (the provider bind
+/// wires into `node` and their mount paths), never by asking the guest.
+fn provider_serving(v: &View, node: NodeId, path: &str) -> Option<String> {
+    let want = path.trim_start_matches('/');
+    v.connections.iter().find_map(|&(src, dst)| {
+        (dst == node
+            && v.fs_providers.contains(&src)
+            && mount_path(v, src, dst).trim_start_matches('/') == want)
+            .then(|| v.app_node(src).map(|n| n.name.clone()))
+            .flatten()
+    })
+}
+
 #[cfg(test)]
 mod inspect_tests {
     use super::*;
@@ -5612,6 +5794,68 @@ mod inspect_tests {
         assert_ne!(a[0][1], a[2][1]);
         // The single output centres vertically.
         assert!((a[1][1] - 150.0).abs() < 0.01);
+    }
+
+    /// A registry stub for an app node (no wasm), enough for name lookups.
+    fn stub_node(id: NodeId, name: &str) -> SharedNode {
+        use std::sync::atomic::AtomicBool;
+        Arc::new(wk_server::plugin::Node {
+            id,
+            name: name.to_string(),
+            term_io: wk_server::terminal::TermIo::new(),
+            fs: wk_server::vfs::new_fs(),
+            midi_in: wk_server::midi::new_inbox(),
+            options: wk_server::options::new_options(Vec::new()),
+            finished: Arc::new(AtomicBool::new(false)),
+            running: Arc::new(AtomicBool::new(false)),
+            kill: Arc::new(AtomicBool::new(false)),
+            setup: std::sync::OnceLock::new(),
+            env: Vec::new(),
+            layers: Vec::new(),
+            capture_src: wk_server::capture::new_src(),
+            exec_permit: wk_server::exec::new_permit(true),
+            fs_serve: wk_server::vfs::ProviderConn::new(),
+        })
+    }
+
+    /// A bind wire's mount path defaults to its source's name — a file node's
+    /// or an fs-provider app's — with the per-connection override winning; the
+    /// provider serving a mount point resolves through those same paths.
+    #[test]
+    fn mount_paths_and_provider_badges_resolve_from_the_view() {
+        let (vol, srv, app) = (NodeId::new(), NodeId::new(), NodeId::new());
+        let mut v = View::default();
+        v.file_nodes.insert(
+            vol,
+            wk_server::server::FileMeta {
+                name: "data".into(),
+                size: 0,
+                host_mapped: false,
+                is_dir: false,
+                persist: false,
+            },
+        );
+        v.nodes.push(stub_node(srv, "srv"));
+        v.fs_providers.insert(srv);
+        v.connections.push((vol, app));
+        v.connections.push((srv, app));
+
+        // Defaults: the source's own name.
+        assert_eq!(mount_path(&v, vol, app), "data");
+        assert_eq!(mount_path(&v, srv, app), "srv");
+        // A provider mount at its default path names the serving node…
+        assert_eq!(provider_serving(&v, app, "/srv").as_deref(), Some("srv"));
+        // …a plain volume mount doesn't (no provider serves it).
+        assert_eq!(provider_serving(&v, app, "/data"), None);
+
+        // An override moves the mount; lookups follow it (slash-agnostic).
+        v.mount_paths.insert((srv, app), "/mnt/shared".into());
+        assert_eq!(mount_path(&v, srv, app), "/mnt/shared");
+        assert_eq!(
+            provider_serving(&v, app, "/mnt/shared").as_deref(),
+            Some("srv")
+        );
+        assert_eq!(provider_serving(&v, app, "/srv"), None);
     }
 
     /// The log panel strips ANSI escapes, normalises control bytes, and hard-
