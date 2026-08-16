@@ -8,6 +8,7 @@
 FROM scratch
 COPY bash.wasm /bin/bash.wasm
 COPY coreutils.wasm /bin/coreutils.wasm
+COPY grep.wasm /bin/grep.wasm
 COPY bin/ /bin/
 ENV PATH=/bin
 # A writable temp dir the way every base image ships one: tools that spill to a

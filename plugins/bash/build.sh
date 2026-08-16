@@ -186,6 +186,12 @@ cp "$SRC/bash" bash.wasm
 # wk-shell image — the same one-binary-many-links layout coreutils installs.
 cp ../coreutils/coreutils.wasm coreutils.wasm 2>/dev/null || \
     echo "note: build plugins/coreutils first for a shell that can run commands"
+# GNU grep, the first tool a base image is expected to have that coreutils does
+# not provide. A single binary; grep 3.x no longer switches personality on
+# argv[0] (egrep/fgrep are separate wrapper scripts upstream), so only `grep`
+# is linked — use `grep -E` / `grep -F` for extended/fixed patterns.
+cp ../grep/grep.wasm grep.wasm 2>/dev/null || \
+    echo "note: build plugins/grep first for a shell with grep"
 rm -rf bin && mkdir -p bin
 for a in "[" b2sum base32 base64 basename basenc cat chcon chgrp chmod chown \
          cksum comm cp csplit cut date dd dir dircolors dirname du echo expand \
@@ -203,5 +209,10 @@ done
 # ships.
 ln -sf bash.wasm bin/bash
 ln -sf bash.wasm bin/sh
+# grep (egrep/fgrep are upstream wrapper scripts, not an argv[0] personality of
+# the binary, so they are deliberately not linked — use grep -E / grep -F).
+if [ -f grep.wasm ]; then
+    ln -sf grep.wasm bin/grep
+fi
 echo "built plugins/bash/bash.wasm (GNU bash $BASH_VER, wasm32-wasip2 component)"
 echo "package it with: wk images build plugins/bash/Dockerfile --tag wk-shell"
