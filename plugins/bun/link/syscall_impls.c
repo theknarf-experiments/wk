@@ -1,4 +1,7 @@
 // Functional wasi impls for syscalls the runtime calls at startup (uSockets loop).
+// _GNU_SOURCE exposes struct mmsghdr + the sendmmsg/recvmmsg decls (sys/socket.h)
+// that the UDP emulation below defines — mirrors how uSockets compiles bsd.c.
+#define _GNU_SOURCE 1
 #include <unistd.h>
 #include <errno.h>
 // eventfd stand-in: wasip2 has no eventfd and pipe() isn't wired under wasmtime,
@@ -42,3 +45,66 @@ unsigned int getgid(void) { return 0; }
 // umask sets/reads the file-mode-creation mask; the wk VFS has no permissions,
 // so report an empty mask. (Was a `() -> void` trap stub in trap_stubs_v8.c.)
 unsigned int umask(unsigned int mask) { (void)mask; return 0; }
+
+// uSockets' UDP path (bsd_sendmmsg/bsd_recvmmsg → sendmmsg/recvmmsg) is what
+// node:dgram / Bun.udpSocket ride on. wasi-libc DECLARES both (sys/socket.h)
+// but ships no implementation, and has no sendmsg/recvmsg either — so the blind
+// `void sendmmsg(void)`/`void recvmmsg(void)` stubs (quic_syscall_stubs.c) LLD
+// picked up turned every UDP send into a `signature_mismatch:sendmmsg` trap.
+// Emulate the Linux batch calls over sendto/recvfrom, one datagram per mmsghdr
+// (uSockets uses a single iov per UDP message; gather defensively if not).
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <string.h>
+int sendmmsg(int fd, struct mmsghdr *msgvec, unsigned int vlen, unsigned int flags) {
+    // wasi-libc's sendto rejects any nonzero flags (MSG_DONTWAIT / MSG_NOSIGNAL,
+    // which uSockets always sets) with ENOTSUP — wasi:sockets has no such flags.
+    // The datagram stream is already non-blocking and signal-free, so drop them.
+    (void)flags;
+    for (unsigned int i = 0; i < vlen; i++) {
+        struct msghdr *mh = &msgvec[i].msg_hdr;
+        const void *buf;
+        size_t len;
+        char gather[65536];
+        if (mh->msg_iovlen == 1) {
+            buf = mh->msg_iov[0].iov_base;
+            len = mh->msg_iov[0].iov_len;
+        } else {
+            len = 0;
+            for (size_t k = 0; k < (size_t)mh->msg_iovlen && len < sizeof gather; k++) {
+                size_t n = mh->msg_iov[k].iov_len;
+                if (n > sizeof gather - len) n = sizeof gather - len;
+                memcpy(gather + len, mh->msg_iov[k].iov_base, n);
+                len += n;
+            }
+            buf = gather;
+        }
+        ssize_t ret = sendto(fd, buf, len, 0,
+                             (struct sockaddr *)mh->msg_name, mh->msg_namelen);
+        if (ret < 0) {
+            // Report a partial batch if any datagram already went out; otherwise
+            // surface the error (errno set by sendto), matching Linux sendmmsg.
+            return i > 0 ? (int)i : -1;
+        }
+        msgvec[i].msg_len = (unsigned int)ret;
+    }
+    return (int)vlen;
+}
+int recvmmsg(int fd, struct mmsghdr *msgvec, unsigned int vlen, unsigned int flags,
+             struct timespec *timeout) {
+    (void)timeout; // caller (uSockets) always passes MSG_DONTWAIT + NULL timeout
+    (void)flags;   // see sendmmsg: wasi-libc recvfrom rejects nonzero flags
+    for (unsigned int i = 0; i < vlen; i++) {
+        struct msghdr *mh = &msgvec[i].msg_hdr;
+        socklen_t namelen = mh->msg_namelen;
+        ssize_t ret = recvfrom(fd, mh->msg_iov[0].iov_base, mh->msg_iov[0].iov_len,
+                               0, (struct sockaddr *)mh->msg_name, &namelen);
+        if (ret < 0) {
+            // EAGAIN after the first datagram just means "batch drained".
+            return i > 0 ? (int)i : -1;
+        }
+        mh->msg_namelen = namelen;
+        msgvec[i].msg_len = (unsigned int)ret;
+    }
+    return (int)vlen;
+}

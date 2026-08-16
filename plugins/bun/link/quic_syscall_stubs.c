@@ -62,12 +62,10 @@ void lsquic_stream_shutdown_internal(void) {}
 void lsquic_stream_wantread(void) {}
 void lsquic_stream_wantwrite(void) {}
 void lsquic_stream_write(void) {}
-void recvmmsg(void) {}
 void sem_destroy(void) {}
 void sem_init(void) {}
 void sem_post(void) {}
 void sem_wait(void) {}
-void sendmmsg(void) {}
 void sni_add(void) {}
 void sni_find(void) {}
 void sni_free(void) {}
