@@ -813,6 +813,50 @@ fn component_is_command(component: &Component, engine: &Engine) -> bool {
         .any(|(name, _)| name == "wasi:cli/run" || name.starts_with("wasi:cli/run@"))
 }
 
+/// Whether a component is a *wasip3* command (exports `wasi:cli/run@0.3.x`):
+/// it must be instantiated against the 0.3 world and driven through the
+/// component-model-async `run_concurrent` machinery, not the 0.2 `call_run`.
+fn component_is_p3_command(component: &Component, engine: &Engine) -> bool {
+    component
+        .component_type()
+        .exports(engine)
+        .any(|(name, _)| name.starts_with("wasi:cli/run@0.3"))
+}
+
+/// Run a `wasi:cli/run` command component to completion — either WASI
+/// generation, chosen by the version the component exports. Returns the
+/// guest's exit code (`exit(n)` and a failed `run` both count as status, not
+/// host errors); `Err` is a real trap or instantiation failure.
+async fn run_command(
+    store: &mut Store<HostState>,
+    component: &Component,
+    linker: &Linker<HostState>,
+) -> Result<i32> {
+    let engine = store.engine().clone();
+    let outcome = if component_is_p3_command(component, &engine) {
+        let command =
+            wasmtime_wasi::p3::bindings::Command::instantiate_async(&mut *store, component, linker)
+                .await?;
+        store
+            .run_concurrent(async move |acc| command.wasi_cli_run().call_run(acc).await)
+            .await?
+    } else {
+        let command =
+            wasmtime_wasi::p2::bindings::Command::instantiate_async(&mut *store, component, linker)
+                .await?;
+        command.wasi_cli_run().call_run(&mut *store).await
+    };
+    match outcome {
+        Ok(Ok(())) => Ok(0),
+        Ok(Err(())) => Ok(1),
+        Err(e) => match e.downcast_ref::<wasmtime_wasi::I32Exit>() {
+            // exit(n) is how a CLI reports status, not a failure.
+            Some(wasmtime_wasi::I32Exit(code)) => Ok(*code),
+            None => Err(e),
+        },
+    }
+}
+
 /// Whether a component imports `wasi:sockets` — i.e. it does networking and so
 /// needs a NIC on the fabric.
 fn component_imports_sockets(component: &Component, engine: &Engine) -> bool {
@@ -1017,20 +1061,9 @@ impl PluginHost {
                     .build()
                     .map_err(|e| format!("tokio runtime: {e}"))?;
                 rt.block_on(async move {
-                    let command = wasmtime_wasi::p2::bindings::Command::instantiate_async(
-                        &mut store, &component, &linker,
-                    )
-                    .await
-                    .map_err(|e| format!("instantiate: {e:#}"))?;
-                    match command.wasi_cli_run().call_run(&mut store).await {
-                        Ok(Ok(())) => Ok(0),
-                        Ok(Err(())) => Ok(1),
-                        Err(e) => match e.downcast_ref::<wasmtime_wasi::I32Exit>() {
-                            // exit(n) is how a CLI reports status, not a failure.
-                            Some(wasmtime_wasi::I32Exit(code)) => Ok(*code),
-                            None => Err(format!("trapped: {e:#}")),
-                        },
-                    }
+                    run_command(&mut store, &component, &linker)
+                        .await
+                        .map_err(|e| format!("run: {e:#}"))
                 })
             })
             .map_err(|e| format!("spawn child thread: {e}"))?;
@@ -1170,21 +1203,10 @@ impl crate::images::BuildRunner for PluginHost {
             .build()
             .map_err(|e| format!("tokio runtime: {e}"))?;
         rt.block_on(async move {
-            let command = wasmtime_wasi::p2::bindings::Command::instantiate_async(
-                &mut store, &component, &linker,
-            )
-            .await
-            .map_err(|e| format!("instantiate RUN step: {e:#}"))?;
-            match command.wasi_cli_run().call_run(&mut store).await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(())) => Err("RUN step exited with failure".to_string()),
-                Err(e) => match e.downcast_ref::<wasmtime_wasi::I32Exit>() {
-                    Some(wasmtime_wasi::I32Exit(0)) => Ok(()),
-                    Some(wasmtime_wasi::I32Exit(code)) => {
-                        Err(format!("RUN step exited with status {code}"))
-                    }
-                    None => Err(format!("RUN step trapped: {e:#}")),
-                },
+            match run_command(&mut store, &component, &linker).await {
+                Ok(0) => Ok(()),
+                Ok(code) => Err(format!("RUN step exited with status {code}")),
+                Err(e) => Err(format!("RUN step trapped: {e:#}")),
             }
         })
     }
@@ -1696,18 +1718,13 @@ impl PluginHost {
                 .expect("tokio runtime");
             let result: Result<()> = rt.block_on(async move {
                 if is_command {
-                    let command = wasmtime_wasi::p2::bindings::Command::instantiate_async(
-                        &mut store, &component, &linker,
-                    )
-                    .await?;
-                    // A clean `exit()` (incl. `main` returning) surfaces as an
-                    // `I32Exit` trap; that's a normal end, not a host error. The
-                    // run result's inner Err is just a non-zero exit code.
-                    match command.wasi_cli_run().call_run(&mut store).await {
-                        Ok(_) => Ok(()),
-                        Err(e) if e.downcast_ref::<wasmtime_wasi::I32Exit>().is_some() => Ok(()),
-                        Err(e) => Err(e),
-                    }
+                    // Either WASI generation, by the `wasi:cli/run` version the
+                    // component exports. A clean `exit()` (incl. `main`
+                    // returning) or a non-zero status is a normal end, not a
+                    // host error.
+                    run_command(&mut store, &component, &linker)
+                        .await
+                        .map(|_| ())
                 } else {
                     let compositor =
                         Compositor::instantiate_async(&mut store, &component, &linker).await?;
