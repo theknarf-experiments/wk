@@ -66,11 +66,6 @@ void sem_destroy(void) {}
 void sem_init(void) {}
 void sem_post(void) {}
 void sem_wait(void) {}
-void sni_add(void) {}
-void sni_find(void) {}
-void sni_free(void) {}
-void sni_new(void) {}
-void sni_remove(void) {}
 void sqlite3_load_extension(void) {}
 void tcc_delete(void) {}
 void us_create_quic_client_context(void) {}
