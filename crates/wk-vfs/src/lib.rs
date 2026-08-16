@@ -23,7 +23,9 @@ use wasmtime_wasi::WasiView;
 use wasmtime_wasi_io::async_trait;
 use wasmtime_wasi_io::bytes::Bytes;
 use wasmtime_wasi_io::poll::Pollable;
-use wasmtime_wasi_io::streams::{DynInputStream, DynOutputStream, OutputStream, StreamError};
+use wasmtime_wasi_io::streams::{
+    DynInputStream, DynOutputStream, InputStream, OutputStream, StreamError,
+};
 use wasmtime_wasi_io::IoView;
 
 wasmtime::component::bindgen!({
@@ -129,6 +131,12 @@ enum Node {
     /// end-of-file. Provisioned into each container so the ubiquitous
     /// `2>/dev/null` / `>/dev/null` / `</dev/null` work without a growing file.
     Null,
+    /// The zero device (`/dev/zero`): writes discarded, reads return endless
+    /// `\0` bytes (`head -c N /dev/zero`, `dd if=/dev/zero`).
+    Zero,
+    /// The random devices (`/dev/urandom`, `/dev/random`): writes discarded,
+    /// reads return endless OS-random bytes (`head -c 32 /dev/urandom`).
+    Random,
 }
 
 const ROOT: u64 = 0;
@@ -363,9 +371,9 @@ impl Fs {
                     Some(Node::File(_)) => PathKind::PrivateFile,
                     Some(Node::Shared(_) | Node::Host(_)) => PathKind::Mounted,
                     Some(Node::Symlink(target)) => PathKind::Symlink(target.clone()),
-                    // The null device is provisioned at runtime, not build
-                    // content — keep it out of layer diffs.
-                    Some(Node::Null) => continue,
+                    // Device nodes are provisioned at runtime, not build
+                    // content — keep them out of layer diffs.
+                    Some(Node::Null | Node::Zero | Node::Random) => continue,
                     None => continue,
                 };
                 let is_dir = kind == PathKind::Dir;
@@ -500,7 +508,7 @@ impl Fs {
                 Some(buf)
             }
             Node::Dir(_) => None,
-            Node::Null => Some(Vec::new()),
+            Node::Null | Node::Zero | Node::Random => Some(Vec::new()),
         }
     }
 }
@@ -578,21 +586,30 @@ fn mount_node_at(fs: &SharedFs, at: &str, node: Node, readonly: bool) {
     }
 }
 
-/// Provision the standard device files a container expects — currently
-/// `/dev/null`. Idempotent: an entry already at that path (e.g. from an image
-/// layer) is left alone. Call once after an image's layers are mounted so the
-/// ubiquitous `2>/dev/null` / `>/dev/null` / `</dev/null` work.
+/// Provision the standard device files a container expects: `/dev/null`,
+/// `/dev/zero`, `/dev/urandom`, `/dev/random`. Idempotent per name — an entry
+/// already at that path (e.g. from an image layer) is left alone. Call once
+/// after an image's layers are mounted so the ubiquitous `2>/dev/null`,
+/// `head -c N /dev/urandom`, `dd if=/dev/zero`, … work.
 pub fn ensure_standard_devices(fs: &SharedFs) {
     let mut g = fs.lock().unwrap();
-    if resolve_at(&g, ROOT, "dev/null", true).is_some() || g.at_capacity() {
-        return;
-    }
     let Some(dev) = g.ensure_dir_path("dev") else {
         return;
     };
-    let id = g.alloc(Node::Null);
-    if let Some(Node::Dir(children)) = g.nodes.get_mut(&dev) {
-        children.insert("null".to_string(), id);
+    for (name, kind) in [
+        ("null", Node::Null),
+        ("zero", Node::Zero),
+        ("urandom", Node::Random),
+        ("random", Node::Random),
+    ] {
+        let present = matches!(g.nodes.get(&dev), Some(Node::Dir(c)) if c.contains_key(name));
+        if present || g.at_capacity() {
+            continue;
+        }
+        let id = g.alloc(kind);
+        if let Some(Node::Dir(children)) = g.nodes.get_mut(&dev) {
+            children.insert(name.to_string(), id);
+        }
     }
 }
 
@@ -679,7 +696,7 @@ fn node_type(fs: &Fs, id: u64) -> DescriptorType {
     match fs.nodes.get(&id) {
         Some(Node::Dir(_)) => DescriptorType::Directory,
         Some(Node::Symlink(_)) => DescriptorType::SymbolicLink,
-        Some(Node::Null) => DescriptorType::CharacterDevice,
+        Some(Node::Null | Node::Zero | Node::Random) => DescriptorType::CharacterDevice,
         _ => DescriptorType::RegularFile,
     }
 }
@@ -764,6 +781,47 @@ impl OutputStream for NullOutputStream {
     }
     fn check_write(&mut self) -> std::result::Result<usize, StreamError> {
         Ok(usize::MAX)
+    }
+}
+
+/// Cap on the bytes one device read produces, so a caller asking for a huge
+/// count (or `usize::MAX`) can't force an unbounded allocation. The reader loops
+/// for more, exactly as it would against a real endless device.
+const DEVICE_READ_CHUNK: usize = 1 << 20; // 1 MiB
+
+/// OS-random bytes for `/dev/urandom`; falls back to zeros rather than error
+/// (a device read must not fail) in the extraordinarily unlikely getrandom miss.
+fn random_bytes(n: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; n];
+    let _ = getrandom::fill(&mut buf);
+    buf
+}
+
+/// `/dev/zero`'s input stream: an endless run of `\0`.
+struct ZeroInputStream;
+
+#[async_trait]
+impl Pollable for ZeroInputStream {
+    async fn ready(&mut self) {}
+}
+
+impl InputStream for ZeroInputStream {
+    fn read(&mut self, size: usize) -> std::result::Result<Bytes, StreamError> {
+        Ok(Bytes::from(vec![0u8; size.min(DEVICE_READ_CHUNK)]))
+    }
+}
+
+/// `/dev/urandom` / `/dev/random`'s input stream: an endless run of OS-random.
+struct RandomInputStream;
+
+#[async_trait]
+impl Pollable for RandomInputStream {
+    async fn ready(&mut self) {}
+}
+
+impl InputStream for RandomInputStream {
+    fn read(&mut self, size: usize) -> std::result::Result<Bytes, StreamError> {
+        Ok(Bytes::from(random_bytes(size.min(DEVICE_READ_CHUNK))))
     }
 }
 
@@ -937,6 +995,10 @@ enum Kind {
     Dir,
     /// The null device — writes discarded, reads at end-of-file.
     Null,
+    /// The zero device — writes discarded, reads return `\0` forever.
+    Zero,
+    /// A random device — writes discarded, reads return OS-random bytes.
+    Random,
     Missing,
 }
 
@@ -957,6 +1019,8 @@ fn node_kind(fs: &SharedFs, node: u64) -> Kind {
             Some(Node::Host(p)) => Kind::Host(p.clone()),
             Some(Node::Dir(_)) => Kind::Dir,
             Some(Node::Null) => Kind::Null,
+            Some(Node::Zero) => Kind::Zero,
+            Some(Node::Random) => Kind::Random,
             // Nothing reads or writes through an open link handle; readlink
             // and lstat work on the path, not the descriptor.
             Some(Node::Symlink(_)) | None => Kind::Missing,
@@ -988,7 +1052,17 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
         offset: Filesize,
     ) -> Result<std::result::Result<Resource<DynInputStream>, ErrorCode>> {
         let (fs, node) = fd_fs(self, &fd)?;
+        // The endless devices produce their own on-demand streams; everything
+        // else serves a fixed byte range through a MemoryInputPipe.
         let bytes = match node_kind(&fs, node) {
+            Kind::Zero => {
+                let stream: DynInputStream = Box::new(ZeroInputStream);
+                return Ok(Ok(self.table().push(stream)?));
+            }
+            Kind::Random => {
+                let stream: DynInputStream = Box::new(RandomInputStream);
+                return Ok(Ok(self.table().push(stream)?));
+            }
             Kind::File => {
                 let g = fs.lock().unwrap();
                 let Some(Node::File(data)) = g.nodes.get(&node) else {
@@ -1033,7 +1107,7 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
             Kind::File | Kind::Ro(_) => Box::new(VfsOutputStream { fs, node, offset }),
             Kind::Shared(data) => Box::new(SharedOutputStream { data, offset }),
             Kind::Host(path) => Box::new(HostOutputStream { path, offset }),
-            Kind::Null => Box::new(NullOutputStream),
+            Kind::Null | Kind::Zero | Kind::Random => Box::new(NullOutputStream),
             _ => return err(ErrorCode::IsDirectory),
         };
         Ok(Ok(self.table().push(stream)?))
@@ -1068,7 +1142,7 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
                 let offset = host_size(&path);
                 Box::new(HostOutputStream { path, offset })
             }
-            Kind::Null => Box::new(NullOutputStream),
+            Kind::Null | Kind::Zero | Kind::Random => Box::new(NullOutputStream),
             Kind::Dir => return err(ErrorCode::IsDirectory),
             Kind::Missing => return err(ErrorCode::NoEntry),
         };
@@ -1094,6 +1168,15 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
             Kind::Shared(sh) => Ok(Ok(read_at(&sh.lock().unwrap(), offset, len))),
             Kind::Host(p) => Ok(Ok(read_at(&host_read(&p), offset, len))),
             Kind::Null => Ok(Ok((Vec::new(), true))),
+            // Endless devices: `len` bytes, never end-of-file.
+            Kind::Zero => Ok(Ok((
+                vec![0u8; (len as usize).min(DEVICE_READ_CHUNK)],
+                false,
+            ))),
+            Kind::Random => Ok(Ok((
+                random_bytes((len as usize).min(DEVICE_READ_CHUNK)),
+                false,
+            ))),
             Kind::Dir => err(ErrorCode::IsDirectory),
             Kind::Missing => err(ErrorCode::NoEntry),
         }
@@ -1125,7 +1208,7 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
                     return err(ErrorCode::FileTooLarge);
                 }
             }
-            Kind::Null => {} // discard every byte
+            Kind::Null | Kind::Zero | Kind::Random => {} // discard every byte
             Kind::Host(p) => {
                 if host_write_at(&p, offset, &buf).is_err() {
                     return err(ErrorCode::Io);
@@ -1270,7 +1353,7 @@ impl<T: VfsView> wasi::filesystem::types::HostDescriptor for VfsImpl<T> {
                     Err(_) => err(ErrorCode::Io),
                 }
             }
-            Kind::Null => Ok(Ok(())), // nothing to size
+            Kind::Null | Kind::Zero | Kind::Random => Ok(Ok(())), // nothing to size
             _ => err(ErrorCode::IsDirectory),
         }
     }
@@ -1637,7 +1720,7 @@ fn stat_node(fs: &Fs, id: u64) -> Option<DescriptorStat> {
         Node::Shared(sh) => (DescriptorType::RegularFile, sh.lock().unwrap().len() as u64),
         Node::Host(p) => (DescriptorType::RegularFile, host_size(p)),
         Node::Symlink(target) => (DescriptorType::SymbolicLink, target.len() as u64),
-        Node::Null => (DescriptorType::CharacterDevice, 0),
+        Node::Null | Node::Zero | Node::Random => (DescriptorType::CharacterDevice, 0),
     };
     Some(DescriptorStat {
         type_: ty,
@@ -1963,6 +2046,21 @@ mod tests {
         let id = resolve(&g, ROOT, "/dev/null").expect("/dev/null exists");
         assert!(matches!(g.nodes.get(&id), Some(Node::Null)));
         assert_eq!(node_type(&g, id), DescriptorType::CharacterDevice);
+
+        // The full standard device set, each a character device.
+        for (path, want_zero) in [
+            ("/dev/zero", true),
+            ("/dev/urandom", false),
+            ("/dev/random", false),
+        ] {
+            let id = resolve(&g, ROOT, path).unwrap_or_else(|| panic!("{path} exists"));
+            assert_eq!(node_type(&g, id), DescriptorType::CharacterDevice);
+            assert_eq!(
+                matches!(g.nodes.get(&id), Some(Node::Zero)),
+                want_zero,
+                "{path}"
+            );
+        }
     }
 
     #[test]
