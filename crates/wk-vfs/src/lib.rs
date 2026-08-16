@@ -13,6 +13,7 @@
 //! calling [`add_to_linker`].
 
 pub mod layers;
+pub mod p3;
 pub mod provider;
 
 pub use provider::{
@@ -1173,6 +1174,22 @@ impl OutputStream for HostOutputStream {
 /// Read the whole host file (a missing file reads as empty).
 fn host_read(path: &std::path::Path) -> Vec<u8> {
     std::fs::read(path).unwrap_or_default()
+}
+
+/// The remaining bytes of a readable node from `offset`, as one snapshot —
+/// the 0.2 and 0.3 stream reads share this copy-on-read semantics.
+fn snapshot_from(g: &Fs, node: u64, offset: u64) -> Option<Bytes> {
+    let slice = |data: &[u8]| {
+        let start = (offset as usize).min(data.len());
+        Bytes::copy_from_slice(&data[start..])
+    };
+    match g.nodes.get(&node)? {
+        Node::File(d) => Some(slice(d)),
+        Node::RoFile(d) => Some(slice(d)),
+        Node::Shared(sh) => Some(slice(&sh.lock().unwrap())),
+        Node::Host(p) => Some(slice(&host_read(p))),
+        _ => None,
+    }
 }
 
 /// Size of the host file in bytes (0 if it doesn't exist yet).

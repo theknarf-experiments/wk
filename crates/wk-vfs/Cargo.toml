@@ -5,12 +5,15 @@ edition = "2021"
 description = "wk's per-node in-memory virtual filesystem: sandboxed wasi:filesystem host with immutable, Arc-shared OCI image layers (copy-on-write), canvas file mounts, and build-time snapshot/diff."
 
 [dependencies]
-wasmtime = { version = "46", features = ["component-model", "async"] }
+wasmtime = { version = "46", features = ["component-model", "component-model-async", "async"] }
 wasmtime-wasi = "46"
 wasmtime-wasi-io = "46"
 tar = "0.4"
 flate2 = "1"
 getrandom = "0.3"
+# `oneshot` result futures for the wasi 0.3 filesystem's stream/future pairs.
+tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
 proptest = "1"
+tokio = { version = "1", features = ["sync", "rt", "macros"] }

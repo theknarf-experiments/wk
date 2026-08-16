@@ -11027,6 +11027,7 @@ dependencies = [
  "getrandom 0.3.4",
  "proptest",
  "tar",
+ "tokio",
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-io",

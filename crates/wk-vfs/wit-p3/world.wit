@@ -1,0 +1,11 @@
+package wk:fshost3;
+
+/// The host side of `wasi:filesystem@0.3`: wk implements these so wasip3
+/// guests see the same in-memory virtual filesystem (layers, mounts, device
+/// nodes, provider mounts) as wasip2 guests do. The 0.3 generation replaces
+/// `wasi:io` streams with component-model-native `stream`/`future` and makes
+/// every path operation an async function.
+world fs-host-p3 {
+    import wasi:filesystem/types@0.3.0;
+    import wasi:filesystem/preopens@0.3.0;
+}

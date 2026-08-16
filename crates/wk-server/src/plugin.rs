@@ -1210,6 +1210,10 @@ impl PluginHost {
         // form cranelift supports. This unlocks interpreters (Lua) and the whole
         // error-recovery class of recompiled C/C++.
         config.wasm_exceptions(true);
+        // Component-model native async (`stream`/`future`/async funcs), the
+        // substrate of every WASI 0.3 interface — required to *instantiate* a
+        // wasip3 guest against the 0.3 imports linked below.
+        config.wasm_component_model_async(true);
         // Lets the server stop a runaway node: increment_epoch() each frame
         // trips the per-store deadline callback, which traps on `kill`.
         config.epoch_interruption(true);
@@ -1271,23 +1275,24 @@ impl PluginHost {
         // wk's own wasi:sockets over the userspace network fabric (smoltcp), so
         // networked guests' BSD sockets are routed by wk, not the host OS.
         crate::sockets::add_to_linker(&mut linker)?;
-        // WASI 0.3 (`@0.3.0`) interfaces — cli, clocks, filesystem, random,
-        // sockets — built on the Component Model's native async (no `wasi:io`).
-        // Added alongside the 0.2 set above (different version namespaces, no
-        // clash) so a guest compiled against either WASI generation runs. p3 in
-        // wasmtime-wasi is still experimental; it reuses our existing `WasiCtx`
-        // (`HostState: WasiView`), so it's purely additive.
-        //
-        // FOLLOW-UP: 0.3 guests get wasmtime's real (sandboxed, no-preopen)
-        // filesystem here rather than our in-memory vfs — so they effectively see
-        // no files and can't reach Volume/BindMount nodes. Backing 0.3
-        // with the vfs means a from-scratch host impl of `wasi:filesystem@0.3.0`'s
-        // ~26 async (`stream`/`future`, component-model-async) methods over
-        // `crate::vfs::Fs` — comparable in size to the 0.2 vfs. Deferred until a
-        // wasip3 toolchain exists to build a 0.3 guest to verify it against (the
-        // newest stable Clang target is wasm32-wasip2). Until then this is
-        // unverifiable, so we keep the host-backed (empty) 0.3 fs as a stub.
-        wasmtime_wasi::p3::add_to_linker(&mut linker)?;
+        // WASI 0.3 (`@0.3.0`) interfaces — cli, clocks, random, sockets from
+        // wasmtime-wasi, built on the Component Model's native async (no
+        // `wasi:io`). Added alongside the 0.2 set above (different version
+        // namespaces, no clash) so a guest compiled against either WASI
+        // generation runs. p3 in wasmtime-wasi is still experimental; it
+        // reuses our existing `WasiCtx` (`HostState: WasiView`), so it's
+        // purely additive. wasmtime's own 0.3 *filesystem* is deliberately
+        // NOT added — wk's in-memory vfs provides `wasi:filesystem@0.3.0`
+        // below, so a 0.3 guest sees the same layers/mounts/devices/provider
+        // mounts as a 0.2 guest (previously 0.3 guests saw an empty fs).
+        // (0.3 sockets are wasmtime's host-OS impl gated by `WasiCtx`, which
+        // wk never grants network access — deny-all, same as before; routing
+        // them over the fabric like 0.2 is its own follow-up.)
+        wasmtime_wasi::p3::cli::add_to_linker(&mut linker)?;
+        wasmtime_wasi::p3::clocks::add_to_linker(&mut linker)?;
+        wasmtime_wasi::p3::random::add_to_linker(&mut linker)?;
+        wasmtime_wasi::p3::sockets::add_to_linker(&mut linker)?;
+        crate::vfs::p3::add_to_linker(&mut linker)?;
         // Only the wasi:http interfaces (outgoing-handler + types); the rest of
         // the wasi world is already linked above.
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
