@@ -45,10 +45,12 @@ int wk_run(const char *path, const char *const *argv,
            const char *stdin_data, size_t stdin_len, wk_result *out);
 
 /* Like wk_run, but `envp` (a null-terminated `KEY=VALUE` vector, or null to
- * inherit the node's environment) becomes the child's environment. */
+ * inherit the node's environment) becomes the child's environment, and `cwd`
+ * (or null) the directory it starts in — passed as __WK_EXEC_CWD for
+ * chdir_shim.c to apply, so it only takes effect alongside a non-empty env. */
 int wk_run_env(const char *path, const char *const *argv,
-               const char *const *envp, const char *stdin_data,
-               size_t stdin_len, wk_result *out);
+               const char *const *envp, const char *cwd,
+               const char *stdin_data, size_t stdin_len, wk_result *out);
 
 void wk_result_free(wk_result *r);
 
@@ -88,6 +90,13 @@ typedef struct {
 int wk_spawn(const char *path, const char *const *argv,
              const wk_stdio *in, const wk_stdio *out_io, const wk_stdio *err_io,
              wk_child *out, char **error);
+
+/* Like wk_spawn, but `envp` becomes the child's environment and `cwd` (or null)
+ * its working directory (via __WK_EXEC_CWD, see wk_run_env / chdir_shim.c). */
+int wk_spawn_env(const char *path, const char *const *argv,
+                 const char *const *envp, const char *cwd, const wk_stdio *in,
+                 const wk_stdio *out_io, const wk_stdio *err_io, wk_child *out,
+                 char **error);
 
 /* Block until `child` exits, reporting its status and any *captured* output
  * (a stream sent to a pipe has already gone to whoever read it). Consumes the

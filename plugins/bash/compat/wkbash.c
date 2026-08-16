@@ -124,10 +124,14 @@ int wk_bash_run_stage(const char *command, char **argv, const char *typed,
     if (has_out)
         out_io.pipe_borrow = &outp;
 
+    extern char **environ;
+    char cwdbuf[4096];
+    const char *cwd = getcwd(cwdbuf, sizeof cwdbuf);
     wk_child child;
     char *err = NULL;
-    if (wk_spawn(command, (const char *const *)argv, has_in ? &in_io : NULL,
-                 has_out ? &out_io : NULL, NULL, &child, &err)) {
+    if (wk_spawn_env(command, (const char *const *)argv, (const char *const *)environ,
+                     cwd, has_in ? &in_io : NULL, has_out ? &out_io : NULL, NULL,
+                     &child, &err)) {
         fprintf(stderr, "%s: %s\n", typed ? typed : command, err ? err : "cannot run");
         free(err);
         return 126;
@@ -169,10 +173,14 @@ int wk_bash_run(const char *command, char **argv, const char *typed) {
     if (wk_pipe_of_fd(STDIN_FILENO, &inpipe)) {
         wk_stdio in_io = {0};
         in_io.pipe_borrow = &inpipe;
+        extern char **environ;
+        char cwdbuf[4096];
+        const char *cwd = getcwd(cwdbuf, sizeof cwdbuf);
         wk_child child;
         char *err = NULL;
-        if (wk_spawn(command, (const char *const *)argv, &in_io, NULL, NULL,
-                     &child, &err)) {
+        if (wk_spawn_env(command, (const char *const *)argv,
+                         (const char *const *)environ, cwd, &in_io, NULL, NULL,
+                         &child, &err)) {
             fprintf(stderr, "%s: %s\n", typed ? typed : command,
                     err ? err : "cannot run");
             free(err);
@@ -194,7 +202,15 @@ int wk_bash_run(const char *command, char **argv, const char *typed) {
     size_t in_len;
     char *in = stdin_bytes(&in_len);
     wk_result r;
-    int rc = wk_run(command, (const char *const *)argv, in, in_len, &r);
+    /* Hand the child this shell's environment and working directory, so a `cd`
+     * before the command reaches it (wk:exec can't set a cwd; chdir_shim.c in
+     * the child applies __WK_EXEC_CWD). Passing `environ` also gives the child
+     * the shell's exported variables rather than only the node's. */
+    extern char **environ;
+    char cwdbuf[4096];
+    const char *cwd = getcwd(cwdbuf, sizeof cwdbuf);
+    int rc = wk_run_env(command, (const char *const *)argv,
+                        (const char *const *)environ, cwd, in, in_len, &r);
     free(in);
     if (rc != 0 || r.error) {
         if (r.error)

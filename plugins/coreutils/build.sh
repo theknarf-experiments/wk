@@ -86,13 +86,15 @@ CFLAGS="--target=wasm32-wasip2 -O2 -I$COMPAT \
 # exit_shim.o routes exit through wasi:cli/exit.exit-with-code so a tool's real
 # status (e.g. `false` -> 1, `test` -> 1/0) reaches the host instead of the
 # boolean ok/err the default exit() collapses to.
-for src in compat exit_shim; do
+# chdir_shim.o chdir()s to __WK_EXEC_CWD at startup so a `cd` before an external
+# command, or Bun.spawn's `cwd`, reaches the tool (wk:exec can't set a cwd).
+for src in compat exit_shim chdir_shim; do
     "$WASI_SDK/bin/clang" --target=wasm32-wasip2 -O2 -I"$COMPAT" \
         -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID \
         -c "$COMPAT/$src.c" -o "$COMPAT/$src.o"
 done
 
-LDFLAGS="$COMPAT/compat.o $COMPAT/exit_shim.o -lsetjmp \
+LDFLAGS="$COMPAT/compat.o $COMPAT/exit_shim.o $COMPAT/chdir_shim.o -lsetjmp \
     -lwasi-emulated-signal -lwasi-emulated-process-clocks -lwasi-emulated-getpid"
 
 cd "$SRC"

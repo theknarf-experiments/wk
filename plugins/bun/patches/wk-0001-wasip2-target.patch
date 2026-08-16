@@ -6554,7 +6554,7 @@ index 397ec3a5..26b23436 100644
  #[cfg(windows)]
  pub use spawn_process::uv_getrusage;
 diff --git a/src/spawn_sys/spawn_process.rs b/src/spawn_sys/spawn_process.rs
-index 3cd940e2..18296115 100644
+index 3cd940e2..dd464c3d 100644
 --- a/src/spawn_sys/spawn_process.rs
 +++ b/src/spawn_sys/spawn_process.rs
 @@ -14,19 +14,19 @@ use core::sync::atomic::Ordering;
@@ -6669,7 +6669,7 @@ index 3cd940e2..18296115 100644
  }
  
  /// Entry in `extra_pipes` for a stdio slot at index >= 3.
-@@ -639,11 +682,189 @@ impl Drop for PosixSpawnFdGuard {
+@@ -639,11 +682,205 @@ impl Drop for PosixSpawnFdGuard {
      }
  }
  
@@ -6700,11 +6700,13 @@ index 3cd940e2..18296115 100644
 +        out: *mut WkResult,
 +    ) -> core::ffi::c_int;
 +    /// Like `wk_run`, but `envp` (a null-terminated `KEY=VALUE` vector, or null
-+    /// to inherit the node's env) becomes the child's environment.
++    /// to inherit the node's env) becomes the child's environment, and `cwd`
++    /// (or null) the directory it starts in.
 +    fn wk_run_env(
 +        path: *const c_char,
 +        argv: *const *const c_char,
 +        envp: *const *const c_char,
++        cwd: *const c_char,
 +        stdin_data: *const c_char,
 +        stdin_len: usize,
 +        out: *mut WkResult,
@@ -6810,11 +6812,25 @@ index 3cd940e2..18296115 100644
 +            options.wasi_stdin.len(),
 +        )
 +    };
-+    // SAFETY: path/argv/envp/stdin are valid for the call; result is a valid
-+    // out-pointer. `envp` is the child's environment the binding computed
++    // The child's working directory (null-terminated); empty means the node's
++    // default. wk:exec can't set a cwd, so it rides along as __WK_EXEC_CWD for
++    // the child's chdir shim — which only sees it when the env is non-empty,
++    // and the binding always passes the (inherited or overridden) process env.
++    let cwd_z: Option<Vec<u8>> = if options.cwd.is_empty() {
++        None
++    } else {
++        let mut v = options.cwd.to_vec();
++        v.push(0);
++        Some(v)
++    };
++    let cwd_ptr = cwd_z
++        .as_ref()
++        .map_or(core::ptr::null(), |v| v.as_ptr().cast::<c_char>());
++    // SAFETY: path/argv/envp/cwd/stdin are valid for the call; result is a
++    // valid out-pointer. `envp` is the child's environment the binding computed
 +    // (inherited process env by default, or a caller-supplied `env`); a null
 +    // vector inherits the node's environment.
-+    let rc = unsafe { wk_run_env(path, argv, envp, stdin_ptr, stdin_len, &mut result) };
++    let rc = unsafe { wk_run_env(path, argv, envp, cwd_ptr, stdin_ptr, stdin_len, &mut result) };
 +    if rc != 0 {
 +        // The program could not be run at all (no such file / not a component
 +        // / exec not permitted / nesting too deep). Map to ENOENT.
