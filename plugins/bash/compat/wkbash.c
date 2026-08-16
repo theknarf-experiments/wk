@@ -42,17 +42,22 @@ static void write_all(int fd, const char *buf, size_t len) {
  * `< file` redirection — which the caller has already applied to fd 0 — has to
  * be read here and passed along.
  *
- * Only for a regular file. A terminal has no end: slurping it would hang the
- * shell waiting for the input the child was supposed to consume. Reading from
- * the current offset and leaving it at EOF is what the child would have done
- * to the shared file description anyway. */
+ * Anything but a terminal: a tty has no end, so slurping it would hang the
+ * shell waiting for the input the child was supposed to consume. A regular
+ * file, and also the finite stream wk:exec hands us as fd 0 when the node
+ * itself was given stdin (e.g. execSync's `input`, which arrives as the
+ * shell's own stdin and must reach the command it runs) — both end, so both
+ * are safe to read. Reading from the current offset and leaving it at EOF is
+ * what the child would have done to the shared file description anyway. */
 static char *stdin_bytes(size_t *len) {
     struct stat st;
     char *buf = NULL;
     size_t cap = 0, used = 0;
 
     *len = 0;
-    if (fstat(STDIN_FILENO, &st) != 0 || !S_ISREG(st.st_mode))
+    if (fstat(STDIN_FILENO, &st) != 0)
+        return NULL;
+    if (!S_ISREG(st.st_mode) && isatty(STDIN_FILENO))
         return NULL;
 
     for (;;) {
