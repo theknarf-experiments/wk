@@ -52,6 +52,13 @@ use wasi::sockets::tcp::ShutdownType;
 
 const TCP_BUF: usize = 64 * 1024;
 const UDP_BUF: usize = 64 * 1024;
+
+/// How many sockets listen on a port at once (the accept backlog). smoltcp gives
+/// one listening socket one connection, so with a single listener a second
+/// connection arriving before the guest re-listens is refused — concurrent
+/// clients mostly failed. A pool lets that many SYNs land at once; `accept`
+/// drains and replenishes it.
+const LISTEN_BACKLOG: usize = 16;
 /// Number of datagram slots in a UDP socket's packet ring buffers.
 const UDP_SLOTS: usize = 64;
 
@@ -91,6 +98,10 @@ pub struct TcpSock {
     local: Option<IpSocketAddress>,
     remote: Option<IpSocketAddress>,
     listening: bool,
+    /// Extra sockets listening on `bound_port` alongside `handle` — the accept
+    /// backlog (see LISTEN_BACKLOG). Empty until `start-listen`; `accept` returns
+    /// whichever pool socket a peer reached and replenishes that slot.
+    backlog: Vec<(SocketHandle, u64)>,
     /// Set when the socket connects off-fabric through a host gateway; its bytes
     /// flow over a real host socket instead of smoltcp.
     host: Option<HostConn>,
@@ -409,6 +420,51 @@ impl Future for WantReady {
                 Want::Write(_) => s.can_send() || !s.may_send(),
             }
         };
+        if ready {
+            Poll::Ready(())
+        } else {
+            g.park(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+/// Readiness for a listening socket: ready once any socket in the accept pool
+/// (primary + backlog) has a peer, so a single `poll` on the listener wakes the
+/// guest to `accept` no matter which pool socket the connection landed on.
+struct AcceptPollable {
+    stack: SharedStack,
+    pool: Vec<(SocketHandle, u64)>,
+}
+
+#[async_trait]
+impl Pollable for AcceptPollable {
+    async fn ready(&mut self) {
+        AcceptReady {
+            stack: self.stack.clone(),
+            pool: self.pool.clone(),
+        }
+        .await
+    }
+}
+
+struct AcceptReady {
+    stack: SharedStack,
+    pool: Vec<(SocketHandle, u64)>,
+}
+impl Future for AcceptReady {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
+        let mut g = self.stack.lock().unwrap();
+        let ready = self.pool.iter().any(|&(h, gen)| {
+            // A recycled slot resolves so the guest re-checks; otherwise a peer
+            // arrived once the socket left the listening handshake states.
+            !g.is_current(h, gen)
+                || !matches!(
+                    g.sockets.get::<tcp::Socket>(h).state(),
+                    tcp::State::Listen | tcp::State::SynSent | tcp::State::SynReceived
+                )
+        });
         if ready {
             Poll::Ready(())
         } else {
@@ -756,6 +812,7 @@ impl wasi::sockets::tcp_create_socket::Host for HostState {
             local: None,
             remote: None,
             listening: false,
+            backlog: Vec::new(),
             host: None,
         })?))
     }
@@ -900,7 +957,7 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
             let s = self.table().get(&this)?;
             (s.handle, s.bound_port)
         };
-        {
+        let backlog = {
             let mut g = stack.lock().unwrap();
             if g.sockets
                 .get_mut::<tcp::Socket>(handle)
@@ -909,8 +966,28 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
             {
                 return Ok(Err(ErrorCode::InvalidState));
             }
-        }
-        self.table().get_mut(&this)?.listening = true;
+            // A pool of extra listeners on the same port, so several peers can
+            // connect at once instead of all but one being refused. smoltcp hands
+            // each incoming SYN to any socket that is listening on the port.
+            let mut backlog = Vec::with_capacity(LISTEN_BACKLOG - 1);
+            for _ in 1..LISTEN_BACKLOG {
+                let sock = tcp::Socket::new(
+                    tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
+                    tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
+                );
+                let h = g.sockets.add(sock);
+                let gen = g.track(h);
+                if g.sockets.get_mut::<tcp::Socket>(h).listen(port).is_err() {
+                    g.begin_close(h, wk_fabric::netstack::SockKind::Tcp);
+                    continue;
+                }
+                backlog.push((h, gen));
+            }
+            backlog
+        };
+        let s = self.table().get_mut(&this)?;
+        s.listening = true;
+        s.backlog = backlog;
         Ok(Ok(()))
     }
     fn finish_listen(
@@ -936,27 +1013,34 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
         let Some(stack) = self.stack() else {
             return Ok(Err(ErrorCode::AccessDenied));
         };
-        let (listen_handle, family, port, listen_gen) = {
+        let (family, port, pool) = {
             let s = self.table().get(&this)?;
-            (s.handle, s.family, s.bound_port, s.gen)
+            let mut pool = Vec::with_capacity(1 + s.backlog.len());
+            pool.push((s.handle, s.gen));
+            pool.extend_from_slice(&s.backlog);
+            (s.family, s.bound_port, pool)
         };
-        // A peer has connected once the listening socket reaches Established.
-        let (conn_handle, conn_local, conn_remote) = {
+        // A peer has connected once one of the pool's sockets reaches
+        // Established. Take that one as the accepted connection and put a fresh
+        // listener back in its slot, so the pool keeps its size.
+        let (conn_handle, conn_gen, conn_local, conn_remote) = {
             let mut g = stack.lock().unwrap();
-            let sock = g.sockets.get::<tcp::Socket>(listen_handle);
-            let st = sock.state();
-            if st != tcp::State::Established {
+            let Some(idx) = pool.iter().position(|&(h, gen)| {
+                g.is_current(h, gen)
+                    && g.sockets.get::<tcp::Socket>(h).state() == tcp::State::Established
+            }) else {
                 return Ok(Err(ErrorCode::WouldBlock));
-            }
+            };
+            let (conn_handle, conn_gen) = pool[idx];
             // Capture the connection's endpoints so `local-address` /
             // `remote-address` (getsockname/getpeername) work on the accepted
             // socket — wasi-libc's accept() calls remote-address to fill the
             // sockaddr, and a runtime like CPython treats a failure there as a
             // failed accept, silently dropping the connection.
+            let sock = g.sockets.get::<tcp::Socket>(conn_handle);
             let local = sock.local_endpoint().map(|ep| from_smol(ep.addr, ep.port));
             let remote = sock.remote_endpoint().map(|ep| from_smol(ep.addr, ep.port));
-            // Keep accepting: add a fresh listening socket on the same port and
-            // hand the established one out as the accepted connection.
+            // Replenish the consumed slot with a fresh listener.
             let fresh = tcp::Socket::new(
                 tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
                 tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
@@ -970,33 +1054,38 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
             {
                 return Ok(Err(ErrorCode::Unknown));
             }
-            // Point the listener resource at the new socket. The accepted
-            // connection keeps the listener's original handle+generation (still
-            // live), so its streams below stay valid.
+            // Write the refreshed pool back onto the resource: slot 0 is the
+            // primary handle, the rest are the backlog. The accepted connection
+            // keeps its own handle+generation (still live), so its streams below
+            // stay valid.
+            let mut new_pool = pool.clone();
+            new_pool[idx] = (new_listen, new_gen);
             let sm = self.table().get_mut(&this)?;
-            sm.handle = new_listen;
-            sm.gen = new_gen;
-            (listen_handle, local, remote)
+            sm.handle = new_pool[0].0;
+            sm.gen = new_pool[0].1;
+            sm.backlog = new_pool[1..].to_vec();
+            (conn_handle, conn_gen, local, remote)
         };
         let conn = self.table().push(TcpSock {
             handle: conn_handle,
-            gen: listen_gen,
+            gen: conn_gen,
             family,
             bound_port: port,
             local: conn_local,
             remote: conn_remote,
             listening: false,
+            backlog: Vec::new(),
             host: None,
         })?;
         let input: DynInputStream = Box::new(TcpInput {
             stack: stack.clone(),
             handle: conn_handle,
-            gen: listen_gen,
+            gen: conn_gen,
         });
         let output: DynOutputStream = Box::new(TcpOutput {
             stack,
             handle: conn_handle,
-            gen: listen_gen,
+            gen: conn_gen,
         });
         let i = self.table().push(input)?;
         let o = self.table().push(output)?;
@@ -1045,10 +1134,18 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
             return subscribe(self.table(), p);
         }
         let stack = self.stack().expect("socket exists => has a stack");
-        let (handle, gen) = {
+        let (handle, gen, listening, backlog) = {
             let s = self.table().get(&this)?;
-            (s.handle, s.gen)
+            (s.handle, s.gen, s.listening, s.backlog.clone())
         };
+        // A listener wakes when any pool socket (primary + backlog) has a peer.
+        if listening {
+            let mut pool = Vec::with_capacity(1 + backlog.len());
+            pool.push((handle, gen));
+            pool.extend_from_slice(&backlog);
+            let p = self.table().push(AcceptPollable { stack, pool })?;
+            return subscribe(self.table(), p);
+        }
         let p = self.table().push(SockPollable {
             stack,
             want: Want::Event(handle),
@@ -1080,17 +1177,23 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
         // connections would otherwise leak a socket per connection. The guest is
         // done with it (its byte streams do no I/O after the socket is dropped).
         if let Some(stack) = self.stack() {
-            let (handle, gen) = {
+            let (handle, gen, backlog) = {
                 let s = self.table().get(&rep)?;
-                (s.handle, s.gen)
+                (s.handle, s.gen, s.backlog.clone())
             };
             let mut g = stack.lock().unwrap();
             // Queue a graceful FIN, then hand the socket to the hub to reap once
-            // its pending data and FIN have flushed.
+            // its pending data and FIN have flushed. The backlog listeners never
+            // carried data, so just reap them.
             if g.is_current(handle, gen) {
                 g.sockets.get_mut::<tcp::Socket>(handle).close();
             }
             g.begin_close(handle, wk_fabric::netstack::SockKind::Tcp);
+            for (h, hg) in backlog {
+                if g.is_current(h, hg) {
+                    g.begin_close(h, wk_fabric::netstack::SockKind::Tcp);
+                }
+            }
         }
         self.table().delete(rep)?;
         Ok(())

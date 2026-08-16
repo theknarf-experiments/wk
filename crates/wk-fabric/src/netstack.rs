@@ -588,6 +588,57 @@ mod tests {
         assert_eq!(&got, b"hello v6 net");
     }
 
+    /// Several sockets can listen on one port at once, and concurrent peers each
+    /// land on a distinct one — the accept backlog wk-server relies on so a
+    /// server doesn't refuse all-but-one simultaneous client.
+    #[test]
+    fn concurrent_peers_land_on_a_pool_of_listeners() {
+        let hub = NetHub::new();
+        let net = NodeId::nil();
+        let server = hub.attach(net, Ipv4Address::new(10, 0, 0, 1), "server");
+        let server_ip = server.lock().unwrap().ip;
+
+        // A pool of three listeners on the same port.
+        let listeners: Vec<SocketHandle> = (0..3)
+            .map(|_| {
+                let mut g = server.lock().unwrap();
+                let h = g.sockets.add(tcp_socket());
+                g.sockets.get_mut::<tcp::Socket>(h).listen(80).unwrap();
+                h
+            })
+            .collect();
+
+        // Three clients dial the server at the same time.
+        let clients: Vec<SharedStack> = (0..3)
+            .map(|i| hub.attach(net, Ipv4Address::new(10, 0, 0, 2 + i), "client"))
+            .collect();
+        for (i, c) in clients.iter().enumerate() {
+            let mut g = c.lock().unwrap();
+            let h = g.sockets.add(tcp_socket());
+            let NodeStack { iface, sockets, .. } = &mut *g;
+            sockets
+                .get_mut::<tcp::Socket>(h)
+                .connect(iface.context(), (server_ip, 80), 49152 + i as u16)
+                .unwrap();
+        }
+
+        let mut established = 0;
+        for _ in 0..500 {
+            hub.step();
+            let g = server.lock().unwrap();
+            established = listeners
+                .iter()
+                .filter(|&&h| g.sockets.get::<tcp::Socket>(h).state() == tcp::State::Established)
+                .count();
+            drop(g);
+            if established == 3 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(established, 3, "all three concurrent peers were accepted");
+    }
+
     /// A single node reaches a service it hosts on `127.0.0.1`: the frame never
     /// leaves the node — the hub loops it back — so a server and a client in one
     /// node connect, the way `localhost` works on a real host.
