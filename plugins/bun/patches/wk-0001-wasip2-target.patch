@@ -6103,7 +6103,7 @@ index 2179a5c1..4ba629b2 100644
                  #[cfg(unix)]
                  let r = bun_sys::socketpair_for_shell(libc::AF_UNIX, libc::SOCK_STREAM, 0, false);
 diff --git a/src/runtime/shell/subproc.rs b/src/runtime/shell/subproc.rs
-index 2eee1305..d6bf0691 100644
+index 2eee1305..84a74150 100644
 --- a/src/runtime/shell/subproc.rs
 +++ b/src/runtime/shell/subproc.rs
 @@ -1,7 +1,7 @@
@@ -6123,6 +6123,30 @@ index 2eee1305..d6bf0691 100644
          let mut spawn_options = SpawnOptions {
              cwd: spawn_args.cwd.into(),
              stdin: stdin_opt,
+@@ -1171,7 +1172,22 @@ impl Writable {
+                         core::mem::ManuallyDrop::new(core::mem::replace(&mut stdio, Stdio::Ignore));
+                     Ok(Writable::Memfd(fd))
+                 }
+-                Stdio::Fd(_) => Ok(Writable::Fd(result.unwrap())),
++                Stdio::Fd(_) => {
++                    // On wasi the child already ran to completion inline (wk:exec
++                    // is blocking) and consumed any fixed stdin up front, so there
++                    // is no live descriptor to write to and the spawn returns no
++                    // stdin fd. `result.unwrap()` on that absent fd panicked deep
++                    // in the shell spawn — which hangs rather than unwinds — so
++                    // treat inherited stdin as no-input here.
++                    #[cfg(target_os = "wasi")]
++                    {
++                        Ok(Writable::Ignore)
++                    }
++                    #[cfg(not(target_os = "wasi"))]
++                    {
++                        Ok(Writable::Fd(result.unwrap()))
++                    }
++                }
+                 Stdio::Inherit => Ok(Writable::Inherit),
+                 Stdio::Path(_) | Stdio::Ignore => Ok(Writable::Ignore),
+                 Stdio::Ipc | Stdio::Capture(_) => Ok(Writable::Ignore),
 diff --git a/src/runtime/socket/SocketAddress.rs b/src/runtime/socket/SocketAddress.rs
 index fd9432d6..4ea4e0d0 100644
 --- a/src/runtime/socket/SocketAddress.rs
@@ -6405,7 +6429,7 @@ index 4725121e..498e1b24 100644
  
  #[cfg(windows)]
 diff --git a/src/spawn/process.rs b/src/spawn/process.rs
-index dadd2fbb..9b455aa5 100644
+index dadd2fbb..ac081799 100644
 --- a/src/spawn/process.rs
 +++ b/src/spawn/process.rs
 @@ -1,19 +1,23 @@
@@ -6444,20 +6468,31 @@ index dadd2fbb..9b455aa5 100644
          let _ = sync_;
      }
  
-@@ -372,6 +377,12 @@ impl Process {
+@@ -372,6 +377,23 @@ impl Process {
              return Ok(());
          }
  
-+        // Processes never spawn on WASI (spawn_process_posix is ENOSYS), so
-+        // there is nothing to watch.
++        // `spawn_process_posix` runs the child to completion inline through
++        // wk:exec (a blocking capability), so by the time anyone watches, the
++        // process has already exited. Report "no such process" so the caller
++        // takes its already-exited path (Cmd.rs fires `on_exit` after the
++        // spawn-time setup) instead of waiting forever for an async exit event
++        // that will never be delivered — which hung `Bun.$` on every external
++        // command.
 +        #[cfg(target_os = "wasi")]
 +        {
++            if self.has_exited() {
++                return Err(bun_sys::Error::from_code_int(
++                    bun_sys::E::ESRCH as i32,
++                    bun_sys::Tag::waitpid,
++                ));
++            }
 +            return Ok(());
 +        }
          #[cfg(unix)]
          {
              let ctx = self.event_loop_ctx();
-@@ -627,6 +638,9 @@ impl Process {
+@@ -627,6 +649,9 @@ impl Process {
      }
  
      pub fn kill(&mut self, signal: u8) -> Maybe<()> {
@@ -6467,7 +6502,7 @@ index dadd2fbb..9b455aa5 100644
          #[cfg(unix)]
          {
              // Detached is a deliberate no-op: spawnSync's `read_all()` runs
-@@ -809,7 +823,7 @@ impl core::fmt::Display for Status {
+@@ -809,7 +834,7 @@ impl core::fmt::Display for Status {
      }
  }
  
@@ -6476,7 +6511,7 @@ index dadd2fbb..9b455aa5 100644
  pub enum PollerPosix {
      /// Hive-allocated `bun_io::FilePoll` slot. Pointer (not `Box`) because the
      /// poll lives in `Store`; freed via `FilePoll::deinit`,
-@@ -819,7 +833,7 @@ pub enum PollerPosix {
+@@ -819,7 +844,7 @@ pub enum PollerPosix {
      Detached,
  }
  
@@ -6485,7 +6520,7 @@ index dadd2fbb..9b455aa5 100644
  impl PollerPosix {
      /// NOT `impl Drop`: this enum is reassigned freely (`self.poller =
      /// Poller::Detached`, `Poller::WaiterThread(..)`, etc.) and `close()`
-@@ -836,6 +850,7 @@ impl PollerPosix {
+@@ -836,6 +861,7 @@ impl PollerPosix {
          }
      }
  
@@ -6493,7 +6528,7 @@ index dadd2fbb..9b455aa5 100644
      fn into_fd(self) -> Option<core::ptr::NonNull<FilePoll>> {
          match self {
              PollerPosix::Fd(f) => Some(f),
-@@ -879,7 +894,7 @@ impl PollerPosix {
+@@ -879,7 +905,7 @@ impl PollerPosix {
      }
  }
  
@@ -6502,7 +6537,7 @@ index dadd2fbb..9b455aa5 100644
  pub type Poller = PollerPosix;
  #[cfg(windows)]
  pub type Poller = PollerWindows;
-@@ -1690,17 +1705,40 @@ impl SpawnResultExt for PosixSpawnResult {
+@@ -1690,17 +1716,40 @@ impl SpawnResultExt for PosixSpawnResult {
      }
  }
  
@@ -6546,7 +6581,7 @@ index dadd2fbb..9b455aa5 100644
  pub type SpawnProcessResult = PosixSpawnResult;
  #[cfg(windows)]
  pub type SpawnProcessResult = WindowsSpawnResult;
-@@ -1709,10 +1747,11 @@ pub type SpawnProcessResult = WindowsSpawnResult;
+@@ -1709,10 +1758,11 @@ pub type SpawnProcessResult = WindowsSpawnResult;
  
  mod spawn_process_body {
      use super::*;
@@ -6560,7 +6595,7 @@ index dadd2fbb..9b455aa5 100644
  
      /// RAII fd owner — closes the wrapped [`Fd`] on drop iff it is valid.
      /// Used by `sync::spawn_posix` (no-orphans kqueue, ppid pidfd).
-@@ -1754,12 +1793,12 @@ mod spawn_process_body {
+@@ -1754,12 +1804,12 @@ mod spawn_process_body {
          argv: Argv, // [*:null]?[*:0]const u8
          envp: Envp,
      ) -> Result<bun_sys::Result<SpawnProcessResult>, crate::Error> {
@@ -6575,7 +6610,7 @@ index dadd2fbb..9b455aa5 100644
          {
              spawn_process_windows(options, argv, envp)
          }
-@@ -2264,6 +2303,7 @@ mod spawn_process_body {
+@@ -2264,6 +2314,7 @@ mod spawn_process_body {
          }
  
          impl SyncStdio {
@@ -6583,7 +6618,7 @@ index dadd2fbb..9b455aa5 100644
              pub(crate) fn to_stdio(self) -> SpawnOptionsStdio {
                  match self {
                      SyncStdio::Inherit => SpawnOptionsStdio::inherit(),
-@@ -2326,6 +2366,7 @@ mod spawn_process_body {
+@@ -2326,6 +2377,7 @@ mod spawn_process_body {
          }
  
          impl Options {
@@ -6591,7 +6626,7 @@ index dadd2fbb..9b455aa5 100644
              pub(crate) fn to_spawn_options(&self, new_process_group: bool) -> SpawnOptions {
                  SpawnOptions {
                      stdin: self.stdin.to_stdio(),
-@@ -2793,6 +2834,16 @@ mod spawn_process_body {
+@@ -2793,6 +2845,16 @@ mod spawn_process_body {
                  return spawn_windows_with_pipes(options, argv, envp);
              }
  
@@ -6622,7 +6657,7 @@ index 397ec3a5..26b23436 100644
  #[cfg(windows)]
  pub use spawn_process::uv_getrusage;
 diff --git a/src/spawn_sys/spawn_process.rs b/src/spawn_sys/spawn_process.rs
-index 3cd940e2..dd464c3d 100644
+index 3cd940e2..5e330039 100644
 --- a/src/spawn_sys/spawn_process.rs
 +++ b/src/spawn_sys/spawn_process.rs
 @@ -14,19 +14,19 @@ use core::sync::atomic::Ordering;
@@ -6737,7 +6772,7 @@ index 3cd940e2..dd464c3d 100644
  }
  
  /// Entry in `extra_pipes` for a stdio slot at index >= 3.
-@@ -639,11 +682,205 @@ impl Drop for PosixSpawnFdGuard {
+@@ -639,11 +682,211 @@ impl Drop for PosixSpawnFdGuard {
      }
  }
  
@@ -6801,7 +6836,13 @@ index 3cd940e2..dd464c3d 100644
 +#[cfg(target_os = "wasi")]
 +fn wasi_captured_fd(mode: &PosixStdio, bytes: &[u8], pid: PidT, idx: u32) -> Option<Fd> {
 +    match mode {
-+        PosixStdio::Buffer => {
++        // Buffer (Bun.spawn's captured stdio) and Pipe (Bun's shell / `$` wires
++        // command stdout through a pipe and reads the other end) both need the
++        // captured bytes handed back as a readable fd: there's no live child
++        // writing incrementally, and the wasi subprocess reader drains
++        // `result.stdout` (not the caller's pipe). Stage the bytes in a file and
++        // return a read-only fd at offset 0 for either.
++        PosixStdio::Buffer | PosixStdio::Pipe(_) => {
 +            // Write it, then hand back a fresh read-only fd positioned at 0.
 +            let path = format!("/.bun-spawn-{pid}-{idx}");
 +            {
