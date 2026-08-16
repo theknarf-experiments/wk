@@ -6028,10 +6028,34 @@ index f0a724ef..3eca41fe 100644
              OperatingSystem::Freebsd => b"freebsd",
          }
 diff --git a/src/runtime/shell/IOWriter.rs b/src/runtime/shell/IOWriter.rs
-index 4f8d012c..091f7dc8 100644
+index 4f8d012c..176f439c 100644
 --- a/src/runtime/shell/IOWriter.rs
 +++ b/src/runtime/shell/IOWriter.rs
-@@ -351,6 +351,17 @@ impl IOWriter {
+@@ -316,6 +316,23 @@ impl IOWriter {
+         self.state().fd
+     }
+ 
++    /// wasi: close this writer's pipe fd *now* and disarm the `Drop`-close.
++    ///
++    /// A pipeline stage runs to completion synchronously under the blocking
++    /// `wk:exec` model and the next stage's stdin drain runs on the same call
++    /// stack — so the write end has to be closed here (delivering EOF to the
++    /// reader) rather than when the owning `Cmd` tears down, which happens only
++    /// after every stage has already spawned. Setting `fd = INVALID` keeps the
++    /// later `Drop` from double-closing the (possibly reused) number.
++    #[cfg(target_os = "wasi")]
++    pub(crate) fn wasi_close_fd(&self) {
++        let s = self.state();
++        if s.fd != Fd::INVALID {
++            let _ = sys::close(s.fd);
++            s.fd = Fd::INVALID;
++        }
++    }
++
+     #[inline]
+     #[cfg(windows)]
+     pub(crate) fn evtloop(&self) -> EventLoopHandle {
+@@ -351,6 +368,17 @@ impl IOWriter {
  
      fn __start(&self) -> sys::Result<()> {
          let s = self.state();
@@ -6103,7 +6127,7 @@ index 2179a5c1..4ba629b2 100644
                  #[cfg(unix)]
                  let r = bun_sys::socketpair_for_shell(libc::AF_UNIX, libc::SOCK_STREAM, 0, false);
 diff --git a/src/runtime/shell/subproc.rs b/src/runtime/shell/subproc.rs
-index 2eee1305..d1a65a8d 100644
+index 2eee1305..bc316ef6 100644
 --- a/src/runtime/shell/subproc.rs
 +++ b/src/runtime/shell/subproc.rs
 @@ -1,7 +1,7 @@
@@ -6123,7 +6147,44 @@ index 2eee1305..d1a65a8d 100644
          let mut spawn_options = SpawnOptions {
              cwd: spawn_args.cwd.into(),
              stdin: stdin_opt,
-@@ -1171,7 +1172,22 @@ impl Writable {
+@@ -785,6 +786,13 @@ impl ShellSubprocess {
+         let stdio1 = core::mem::replace(&mut stdio_guard[1], Stdio::Ignore);
+         let stdio2 = core::mem::replace(&mut stdio_guard[2], Stdio::Ignore);
+ 
++        // wasi: a `Stdio::Fd` stdout/stderr is a downstream pipeline pipe. Its
++        // bytes were pushed into the pipe by the blocking spawn; close the write
++        // end below so the next stage's stdin drain sees EOF (see `wasi_close_fd`).
++        #[cfg(target_os = "wasi")]
++        let (stdout_is_pipe_fd, stderr_is_pipe_fd) =
++            (matches!(stdio1, Stdio::Fd(_)), matches!(stdio2, Stdio::Fd(_)));
++
+         // `to_process` consumes the result for pid/pidfd; pull the fd handles out first.
+         let spawn_stdin = spawn_result.stdin.take();
+         let spawn_stdout = spawn_result.stdout.take();
+@@ -832,6 +840,22 @@ impl ShellSubprocess {
+             true,
+         );
+ 
++        // wasi: close the downstream pipe write ends now so the next stage sees
++        // EOF on its stdin drain (the blocking model gives no async pump).
++        #[cfg(target_os = "wasi")]
++        {
++            if stdout_is_pipe_fd {
++                if let Some(w) = &shellio.stdout {
++                    w.wasi_close_fd();
++                }
++            }
++            if stderr_is_pipe_fd {
++                if let Some(w) = &shellio.stderr {
++                    w.wasi_close_fd();
++                }
++            }
++        }
++
+         // SAFETY: `subprocess` points to uninitialised memory of the right
+         // size/align (Box::new_uninit). `ptr::write` populates it without
+         // dropping garbage.
+@@ -1171,7 +1195,22 @@ impl Writable {
                          core::mem::ManuallyDrop::new(core::mem::replace(&mut stdio, Stdio::Ignore));
                      Ok(Writable::Memfd(fd))
                  }
@@ -6147,7 +6208,22 @@ index 2eee1305..d1a65a8d 100644
                  Stdio::Inherit => Ok(Writable::Inherit),
                  Stdio::Path(_) | Stdio::Ignore => Ok(Writable::Ignore),
                  Stdio::Ipc | Stdio::Capture(_) => Ok(Writable::Ignore),
-@@ -1867,8 +1883,18 @@ impl PipeReader {
+@@ -1343,6 +1382,14 @@ impl Readable {
+                 Stdio::Inherit => Readable::Inherit,
+                 Stdio::Ipc | Stdio::Dup2(_) | Stdio::Ignore => Readable::Ignore,
+                 Stdio::Path(_) => Readable::Ignore,
++                // wasi: a pipeline stage's stdout is `Stdio::Fd(pipe_write_fd)`.
++                // The blocking spawn already pushed the captured bytes into the
++                // pipe (`wasi_fill_stdout_pipe`) and the caller closes the write
++                // end right after, so there's no captured read fd to expose —
++                // `result` is `None`, so don't `unwrap` it.
++                #[cfg(target_os = "wasi")]
++                Stdio::Fd(_) => Readable::Ignore,
++                #[cfg(not(target_os = "wasi"))]
+                 Stdio::Fd(_) => Readable::Fd(result.unwrap()),
+                 // blobs are immutable, so we should only ever get the case
+                 // where the user passed in a Blob with an fd
+@@ -1867,8 +1914,18 @@ impl PipeReader {
              return self.reader.start_with_current_pipe();
          }
  
@@ -6677,7 +6753,7 @@ index 397ec3a5..26b23436 100644
  #[cfg(windows)]
  pub use spawn_process::uv_getrusage;
 diff --git a/src/spawn_sys/spawn_process.rs b/src/spawn_sys/spawn_process.rs
-index 3cd940e2..5e330039 100644
+index 3cd940e2..d79fd878 100644
 --- a/src/spawn_sys/spawn_process.rs
 +++ b/src/spawn_sys/spawn_process.rs
 @@ -14,19 +14,19 @@ use core::sync::atomic::Ordering;
@@ -6792,7 +6868,7 @@ index 3cd940e2..5e330039 100644
  }
  
  /// Entry in `extra_pipes` for a stdio slot at index >= 3.
-@@ -639,11 +682,211 @@ impl Drop for PosixSpawnFdGuard {
+@@ -639,11 +682,307 @@ impl Drop for PosixSpawnFdGuard {
      }
  }
  
@@ -6846,6 +6922,83 @@ index 3cd940e2..5e330039 100644
 +    NEXT.fetch_add(1, Ordering::Relaxed)
 +}
 +
++// From pipe-compat's `pipe.c` (linked as `pipe.o`): true when `fd` is one of our
++// pipe-compat pipe ends. `out` receives a borrow handle we don't use — a small
++// scratch buffer is enough to satisfy the ABI.
++#[cfg(target_os = "wasi")]
++unsafe extern "C" {
++    fn wk_pipe_of_fd(fd: i32, out: *mut core::ffi::c_void) -> bool;
++}
++
++/// True only for a real wk pipeline pipe end. A pipeline stage's stdin can be
++/// either an upstream pipe (drain it — it reaches EOF when the upstream stage
++/// closes its write end) or the shell's *inherited* stdin (the node's own stdin,
++/// which never reaches EOF and must not be drained). Both look like
++/// `PosixStdio::Pipe`, so gate the drain on this.
++#[cfg(target_os = "wasi")]
++fn wasi_fd_is_wk_pipe(raw: i32) -> bool {
++    let mut scratch = [0u8; 16];
++    // SAFETY: `scratch` is a valid, sufficiently large out buffer for the
++    // borrow-handle struct wk_pipe_of_fd writes on success.
++    unsafe { wk_pipe_of_fd(raw, scratch.as_mut_ptr().cast()) }
++}
++
++/// Drain a pipeline stage's stdin fd to EOF. In `a | b`, stage `b`'s stdin is a
++/// real pipe-compat read end (`PosixStdio::Pipe`) that the preceding stage
++/// filled and closed while it completed — pipeline stages run serially under the
++/// blocking `wk:exec` model, so by the time `b` spawns the write end is closed
++/// and this read reaches EOF instead of blocking. The bytes become `b`'s
++/// `wasi_stdin`. The fd is owned by the shell's `IOReader`; we only read, never
++/// close.
++#[cfg(target_os = "wasi")]
++fn wasi_drain_stdin_pipe(fd: Fd) -> Vec<u8> {
++    let raw = fd.native();
++    let mut out = Vec::new();
++    let mut chunk = [0u8; 65536];
++    loop {
++        // SAFETY: `raw` is a live pipe-compat read fd; `chunk` is a valid buffer.
++        let n = unsafe { libc::read(raw, chunk.as_mut_ptr().cast(), chunk.len()) };
++        if n > 0 {
++            out.extend_from_slice(&chunk[..n as usize]);
++        } else {
++            // 0 == EOF (write end closed); < 0 == error — stop either way.
++            break;
++        }
++    }
++    out
++}
++
++/// Push an external pipeline stage's captured stdout/stderr into its pipe write
++/// end synchronously. The blocking `wk:exec` model runs each stage to completion
++/// inside `spawn_process_posix`, so a following stage's `wasi_drain_stdin_pipe`
++/// runs on the *same* call stack before the event loop could pump bun's async
++/// `PipeReader → IOWriter` path — writing here (instead of via that path) is what
++/// makes `printf … | wc` work rather than deadlock. The fd stays owned by the
++/// shell's `IOWriter`, which closes it as the stage tears down (delivering EOF to
++/// the reader); we only write. Bounded: the wk pipe buffer is 64 KiB and nothing
++/// reads it until the next stage spawns, so output larger than that would block.
++#[cfg(target_os = "wasi")]
++fn wasi_fill_stdout_pipe(fd: Fd, bytes: &[u8]) {
++    let raw = fd.native();
++    let mut off = 0usize;
++    while off < bytes.len() {
++        // SAFETY: `raw` is a live pipe-compat write fd; the slice is in bounds.
++        let n = unsafe {
++            libc::write(
++                raw,
++                bytes[off..].as_ptr().cast(),
++                bytes.len() - off,
++            )
++        };
++        if n > 0 {
++            off += n as usize;
++        } else {
++            // < 0 == error (e.g. reader gone / EPIPE); 0 shouldn't happen — stop.
++            break;
++        }
++    }
++}
++
 +/// Surface a captured stdio buffer for `mode`. wk:exec ran the child to
 +/// completion and already collected its output, so there is no live stream.
 +/// For `Buffer` (capture) we materialize the bytes as a **seekable** regular
@@ -6856,13 +7009,16 @@ index 3cd940e2..5e330039 100644
 +#[cfg(target_os = "wasi")]
 +fn wasi_captured_fd(mode: &PosixStdio, bytes: &[u8], pid: PidT, idx: u32) -> Option<Fd> {
 +    match mode {
-+        // Buffer (Bun.spawn's captured stdio) and Pipe (Bun's shell / `$` wires
-+        // command stdout through a pipe and reads the other end) both need the
-+        // captured bytes handed back as a readable fd: there's no live child
-+        // writing incrementally, and the wasi subprocess reader drains
-+        // `result.stdout` (not the caller's pipe). Stage the bytes in a file and
-+        // return a read-only fd at offset 0 for either.
-+        PosixStdio::Buffer | PosixStdio::Pipe(_) => {
++        // A pipeline stage's stdout/stderr (`Pipe`) is written straight into the
++        // pipe fd by `wasi_fill_stdout_pipe` before we get here, so there's no
++        // captured read fd to hand back — returning `None` keeps bun's async
++        // `PipeReader`/`IOWriter` from also draining and double-writing.
++        PosixStdio::Pipe(_) => None,
++        // Buffer (Bun.spawn's captured stdio) needs the captured bytes handed
++        // back as a readable fd: there's no live child writing incrementally, and
++        // the wasi subprocess reader drains `result.stdout`. Stage the bytes in a
++        // file and return a read-only fd at offset 0.
++        PosixStdio::Buffer => {
 +            // Write it, then hand back a fresh read-only fd positioned at 0.
 +            let path = format!("/.bun-spawn-{pid}-{idx}");
 +            {
@@ -6930,10 +7086,17 @@ index 3cd940e2..5e330039 100644
 +        stderr_len: 0,
 +        error: core::ptr::null_mut(),
 +    };
-+    // The blocking wk:exec run needs stdin up front; the binding pulled any
-+    // fixed Buffer/Blob input out of stdio[0] into `wasi_stdin` (a streamed
-+    // stdin isn't supported — it stays empty).
-+    let (stdin_ptr, stdin_len) = if options.wasi_stdin.is_empty() {
++    // The blocking wk:exec run needs stdin up front. A pipeline stage's stdin is
++    // a real pipe read end (`PosixStdio::Pipe`) filled by the previous stage —
++    // drain it to EOF. Otherwise the binding pulled any fixed Buffer/Blob input
++    // out of stdio[0] into `wasi_stdin` (a live streamed stdin isn't supported).
++    let piped_stdin: Vec<u8> = match &options.stdin {
++        PosixStdio::Pipe(fd) if wasi_fd_is_wk_pipe(fd.native()) => wasi_drain_stdin_pipe(*fd),
++        _ => Vec::new(),
++    };
++    let (stdin_ptr, stdin_len) = if !piped_stdin.is_empty() {
++        (piped_stdin.as_ptr().cast::<c_char>(), piped_stdin.len())
++    } else if options.wasi_stdin.is_empty() {
 +        (core::ptr::null(), 0)
 +    } else {
 +        (
@@ -6984,6 +7147,15 @@ index 3cd940e2..5e330039 100644
 +    } else {
 +        unsafe { core::slice::from_raw_parts(result.stderr_data.cast::<u8>(), result.stderr_len) }
 +    };
++    // A pipeline stage wired to a downstream pipe: push its output into the pipe
++    // synchronously (see `wasi_fill_stdout_pipe`) before returning, so the next
++    // stage's blocking stdin drain finds the bytes waiting.
++    if let PosixStdio::Pipe(fd) = &options.stdout {
++        wasi_fill_stdout_pipe(*fd, out_bytes);
++    }
++    if let PosixStdio::Pipe(fd) = &options.stderr {
++        wasi_fill_stdout_pipe(*fd, err_bytes);
++    }
 +    let stdout = wasi_captured_fd(&options.stdout, out_bytes, pid, 1);
 +    let stderr = wasi_captured_fd(&options.stderr, err_bytes, pid, 2);
 +

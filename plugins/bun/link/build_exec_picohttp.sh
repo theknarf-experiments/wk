@@ -17,7 +17,12 @@
 #     wasip1+adapter) and WITHOUT its own component `new` — the type object is
 #     what makes bun-run.wasm `import wk:exec/process`.
 #
-# Emits /tmp/{picohttpparser,exec_host,wkexec}.o for link_all.sh.
+#   * pipe.o — pipe-compat's real `pipe()` (a wk:exec bounded-buffer pipe behind
+#     a wasi-libc descriptor-table fd) plus `wk_pipe_of_fd`. Bun's shell (`Bun.$`)
+#     wires pipeline stages through these fds, and the wasi spawn arm uses
+#     `wk_pipe_of_fd` to tell a real pipeline pipe from the node's inherited stdin.
+#
+# Emits /tmp/{picohttpparser,exec_host,wkexec,pipe}.o for link_all.sh.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -46,4 +51,10 @@ fi
 "$CC" --target=wasm32-wasip2 -O2 -I "$EXEC" -I "$EXEC/gen" -c "$EXEC/gen/exec_host.c" -o /tmp/exec_host.o
 "$CC" --target=wasm32-wasip2 -O2 -I "$EXEC" -I "$EXEC/gen" -c "$EXEC/wkexec.c" -o /tmp/wkexec.o
 
-echo "built /tmp/{picohttpparser,exec_host,wkexec}.o (+ $EXEC/gen/exec_host_component_type.o)"
+# --- pipe-compat's pipe() (wasip2) ----------------------------------------
+# Reuses the same wk:exec bindings (exec_host.h) as wkexec.o; adds the
+# descriptor-table-backed pipe and wk_pipe_of_fd.
+PIPE="$(cd ../../pipe-compat && pwd)"
+"$CC" --target=wasm32-wasip2 -O2 -I "$PIPE" -I "$EXEC" -I "$EXEC/gen" -c "$PIPE/pipe.c" -o /tmp/pipe.o
+
+echo "built /tmp/{picohttpparser,exec_host,wkexec,pipe}.o (+ $EXEC/gen/exec_host_component_type.o)"
