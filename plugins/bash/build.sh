@@ -188,8 +188,8 @@ cp ../coreutils/coreutils.wasm coreutils.wasm 2>/dev/null || \
     echo "note: build plugins/coreutils first for a shell that can run commands"
 rm -rf bin && mkdir -p bin
 for a in "[" b2sum base32 base64 basename basenc cat chcon chgrp chmod chown \
-         cksum comm cp csplit cut date dir dircolors dirname du echo expand \
-         expr factor false fmt fold groups head hostid id join link ln logname \
+         cksum comm cp csplit cut date dd dir dircolors dirname du echo expand \
+         expr factor false fmt fold groups head hostid id install join link ln logname \
          ls md5sum mkdir mkfifo mknod mktemp mv nl nproc numfmt od paste \
          pathchk pr printenv printf ptx pwd readlink realpath rm rmdir seq \
          sha1sum sha224sum sha256sum sha384sum sha512sum shred shuf sleep sort \
