@@ -718,7 +718,7 @@ index 2e7a65b2..9e311f47 100644
  // WTF-backed `String` with refcount = 1; caller must `deref()` (or transfer).
  unsafe extern "C" {
 diff --git a/src/bun_core/util.rs b/src/bun_core/util.rs
-index 1e90288e..e03355f3 100644
+index 1e90288e..46659948 100644
 --- a/src/bun_core/util.rs
 +++ b/src/bun_core/util.rs
 @@ -352,7 +352,7 @@ pub fn getenv_z(key: &ZStr) -> Option<&'static [u8]> {
@@ -771,7 +771,34 @@ index 1e90288e..e03355f3 100644
          #[cfg(windows)]
          {
              // Store the WTF-8 form. `into_string()` rejects unpaired
-@@ -4487,7 +4503,13 @@ pub fn reload_process(clear_terminal: bool, may_return: bool) {
+@@ -2956,12 +2972,22 @@ pub fn __runtime_embed_load(kind: EmbedKind, sub: &'static str) -> String {
+         }
+     };
+     p.push(sub);
+-    ::std::fs::read_to_string(&p).unwrap_or_else(|e| {
+-        panic!(
++    match ::std::fs::read_to_string(&p) {
++        Ok(s) => s,
++        // On wasm there is no build tree to read from at runtime (this build
++        // doesn't set `bun_codegen_embed`). These assets are only reached
++        // lazily — e.g. the dev-mode error page — so degrade to an empty string
++        // instead of panicking, which would crash the whole runtime on the
++        // first server error. Native builds keep panicking to catch a missing
++        // embed during iteration.
++        #[cfg(target_family = "wasm")]
++        Err(_) => String::new(),
++        #[cfg(not(target_family = "wasm"))]
++        Err(e) => panic!(
+             "Failed to load '{}': {e}\n\nTo improve iteration speed, some files are not embedded but loaded at runtime, at the cost of making the binary non-portable. To fix this, build with codegen_embed.",
+             p.display(),
+-        )
+-    })
++        ),
++    }
+ }
+ 
+ /// Per-call-site embedded file.
+@@ -4487,7 +4513,13 @@ pub fn reload_process(clear_terminal: bool, may_return: bool) {
          panic!("Unexpected error while reloading: errno {}", errno);
      }
  
@@ -786,7 +813,7 @@ index 1e90288e..e03355f3 100644
      {
          // Bun only targets POSIX + Windows; any other target
          // is a build-time error, not a runtime panic.
-@@ -5065,7 +5087,7 @@ impl Timespec {
+@@ -5065,7 +5097,7 @@ impl Timespec {
      }
  
      fn now_real() -> Timespec {
@@ -795,7 +822,7 @@ index 1e90288e..e03355f3 100644
          {
              let mut ts = libc::timespec {
                  tv_sec: 0,
-@@ -5074,7 +5096,8 @@ impl Timespec {
+@@ -5074,7 +5106,8 @@ impl Timespec {
              clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
              Timespec {
                  sec: ts.tv_sec,
