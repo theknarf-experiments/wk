@@ -68,16 +68,15 @@ pub struct ContainerSetup {
     pub env: Vec<(String, String)>,
 }
 
-/// Mount `setup`'s image layers into a node's filesystem, in order. Layer
-/// content loads through the shared cache, so N nodes running one image store
-/// its bytes once.
+/// Mount `setup`'s image layers into a node's filesystem, in order. Each layer
+/// is *indexed* from its stored tar (paths, sizes and data offsets — no file
+/// contents), and a file's bytes load from disk only when a node first reads
+/// them. The index goes through the shared cache, so N nodes running one image
+/// share the one lazily-materialized copy per file.
 pub fn mount(fs: &crate::vfs::SharedFs, setup: &ContainerSetup) -> Result<(), String> {
     for digest in &setup.layers {
-        let layer = crate::layers::cached(digest, || {
-            let bytes = std::fs::read(layer_path(digest))
-                .map_err(|e| format!("read layer {digest}: {e}"))?;
-            crate::layers::from_tar_bytes(&bytes)
-        })?;
+        let layer =
+            crate::layers::cached(digest, || crate::layers::from_tar_file(&layer_path(digest)))?;
         crate::layers::apply(fs, &layer, "");
     }
     // Give the container the standard device files (/dev/null) its programs
@@ -623,11 +622,15 @@ pub fn store_pulled_image(
         .or(manifest.cmd.first())
         .cloned()
         .ok_or_else(|| format!("{reference}: image config has no Entrypoint or Cmd"))?;
+    // The layers were just stored, so index them lazily from disk: only the
+    // entrypoint's own bytes materialize, not the whole rootfs.
     let rootfs = crate::vfs::new_fs();
     for digest in &manifest.layers {
-        let bytes =
-            std::fs::read(layer_path(digest)).map_err(|e| format!("read layer {digest}: {e}"))?;
-        crate::layers::apply(&rootfs, &crate::layers::from_tar_bytes(&bytes)?, "");
+        crate::layers::apply(
+            &rootfs,
+            &crate::layers::from_tar_file(&layer_path(digest))?,
+            "",
+        );
     }
     let wasm = rootfs
         .lock()
@@ -926,12 +929,12 @@ pub fn build_with_runner(
                                  (FROM scratch, or pull/build+tag it first)"
                                 )
                             })?;
+                        // Indexed lazily from the store: a RUN or COPY --from
+                        // materializes only the base files it actually reads.
                         for digest in &base.layers {
-                            let bytes = std::fs::read(layer_path(digest))
-                                .map_err(|e| format!("read layer {digest}: {e}"))?;
                             crate::layers::apply(
                                 &rootfs,
-                                &crate::layers::from_tar_bytes(&bytes)?,
+                                &crate::layers::from_tar_file(&layer_path(digest))?,
                                 "",
                             );
                         }
@@ -1068,6 +1071,81 @@ mod tests {
         assert!(a.starts_with("sha256-"));
         assert!(layer_path(&a).is_file());
         assert!(layer_path(&c).is_file());
+    }
+
+    /// The memory-cost property behind registry pull: mounting a stored image
+    /// into N nodes reads no file contents; sizes come from the tar index; the
+    /// first actual read materializes exactly that file, shared by every node.
+    #[test]
+    fn mounting_a_stored_layer_is_lazy_until_first_read() {
+        use crate::layers::{LayerBytes, LayerEntry};
+        isolated_store("lazymount");
+        // Content unique to this test: the layer cache is process-wide and
+        // keyed by content digest.
+        let payload = b"lazy-mount-unique-payload";
+        let mut b = tar::Builder::new(Vec::new());
+        tar_file(&mut b, "data/big.bin", payload).unwrap();
+        tar_file(&mut b, "data/other.bin", b"lazy-mount-other").unwrap();
+        let digest = put_layer(&b.into_inner().unwrap()).unwrap();
+        let setup = ContainerSetup {
+            layers: vec![digest.clone()],
+            env: vec![],
+        };
+
+        let fs1 = crate::vfs::new_fs();
+        let fs2 = crate::vfs::new_fs();
+        mount(&fs1, &setup).unwrap();
+        mount(&fs2, &setup).unwrap();
+
+        // Probe the cached index the mounts share.
+        let layer = crate::layers::cached(&digest, || unreachable!("mount cached it")).unwrap();
+        let files: Vec<(&String, &std::sync::Arc<LayerBytes>)> = layer
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                LayerEntry::File(p, b) => Some((p, b)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(files.len(), 2);
+        assert!(
+            files.iter().all(|(_, b)| !b.is_materialized()),
+            "mounting into two nodes must read no contents"
+        );
+
+        // Listing reports header sizes without materializing.
+        let sizes = fs1.lock().unwrap().list_dir("/data").unwrap();
+        assert!(sizes
+            .iter()
+            .any(|e| e.name == "big.bin" && e.size == payload.len()));
+        assert!(
+            files.iter().all(|(_, b)| !b.is_materialized()),
+            "stat/list must not materialize"
+        );
+
+        // First read materializes just that file; both nodes then share it.
+        assert_eq!(
+            fs1.lock()
+                .unwrap()
+                .read_file("/data/big.bin", 64)
+                .as_deref(),
+            Some(&payload[..])
+        );
+        assert_eq!(
+            fs2.lock()
+                .unwrap()
+                .read_file("/data/big.bin", 64)
+                .as_deref(),
+            Some(&payload[..])
+        );
+        let big = files.iter().find(|(p, _)| *p == "data/big.bin").unwrap().1;
+        let other = files
+            .iter()
+            .find(|(p, _)| *p == "data/other.bin")
+            .unwrap()
+            .1;
+        assert!(big.is_materialized());
+        assert!(!other.is_materialized(), "the unread sibling stays on disk");
     }
 
     #[test]

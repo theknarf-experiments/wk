@@ -125,8 +125,10 @@ enum Node {
     /// layer source). The bytes are `Arc`-shared with every other node running
     /// the same layer and never mutated: a write first replaces this with a
     /// private [`Node::File`] copy (file-granularity copy-up, like overlayfs —
-    /// see [`Fs::copy_up`]).
-    RoFile(Arc<Vec<u8>>),
+    /// see [`Fs::copy_up`]). A layer indexed from the on-disk store holds a
+    /// lazy [`layers::LayerBytes`]: stat and listing use the header length,
+    /// and the content loads from disk on the first read (then stays, shared).
+    RoFile(Arc<layers::LayerBytes>),
     /// A symbolic link: the stored string is the target path, resolved when a
     /// path walk crosses it (or returned verbatim by `readlink`). Real links
     /// matter beyond POSIX fidelity — a multicall binary like busybox or GNU
@@ -242,7 +244,10 @@ impl Fs {
     /// The shared layer bytes are untouched; every write path calls this first.
     fn copy_up(&mut self, id: u64) {
         if let Some(Node::RoFile(bytes)) = self.nodes.get(&id) {
-            let private = bytes.as_ref().clone();
+            // `bytes()` materializes a lazy layer file first — the private
+            // copy needs the real content, and later readers of the layer
+            // share the materialization anyway.
+            let private = bytes.bytes().as_ref().clone();
             self.nodes.insert(id, Node::File(private));
         }
     }
@@ -280,7 +285,7 @@ impl Fs {
 
     /// Place a shared read-only layer file at `path`, creating parent
     /// directories and replacing any existing entry (a later layer wins).
-    pub fn put_ro_file_at(&mut self, path: &str, bytes: Arc<Vec<u8>>) {
+    pub fn put_ro_file_at(&mut self, path: &str, bytes: Arc<layers::LayerBytes>) {
         let comps = components(path);
         let Some((name, dirs)) = comps.split_last() else {
             return;
@@ -509,7 +514,8 @@ impl Fs {
         let id = resolve(self, ROOT, path)?;
         match self.nodes.get(&id)? {
             Node::File(d) => Some(d.iter().take(cap).copied().collect()),
-            Node::RoFile(d) => Some(d.iter().take(cap).copied().collect()),
+            // A preview is a read: a lazy layer file materializes here.
+            Node::RoFile(d) => Some(d.bytes().iter().take(cap).copied().collect()),
             Node::Shared(sh) => Some(sh.lock().unwrap().iter().take(cap).copied().collect()),
             // resolve() follows links, so reaching one here means it dangles.
             Node::Symlink(_) => None,
@@ -1185,7 +1191,7 @@ fn snapshot_from(g: &Fs, node: u64, offset: u64) -> Option<Bytes> {
     };
     match g.nodes.get(&node)? {
         Node::File(d) => Some(slice(d)),
-        Node::RoFile(d) => Some(slice(d)),
+        Node::RoFile(d) => Some(slice(&d.bytes())),
         Node::Shared(sh) => Some(slice(&sh.lock().unwrap())),
         Node::Host(p) => Some(slice(&host_read(p))),
         _ => None,
@@ -1403,7 +1409,11 @@ fn node_kind(fs: &SharedFs, node: u64) -> Kind {
     {
         match fs.lock().unwrap().nodes.get(&node) {
             Some(Node::File(_)) => Kind::File,
-            Some(Node::RoFile(d)) => Kind::Ro(d.clone()),
+            // Every `node_kind` caller is a data path (read/write/stream
+            // dispatch), so materializing a lazy layer file here is exactly
+            // "first access"; the stat paths go through `stat_node`/`file_len`,
+            // which use the header length and never call this.
+            Some(Node::RoFile(d)) => Kind::Ro(d.bytes()),
             Some(Node::Shared(sh)) => Kind::Shared(sh.clone()),
             Some(Node::Host(p)) => Kind::Host(p.clone()),
             // Descriptors never land on a provider mount point (resolution
@@ -2540,6 +2550,11 @@ impl<T: VfsView> wasi::filesystem::types::HostDirectoryEntryStream for VfsImpl<T
 mod tests {
     use super::*;
 
+    /// Eager layer bytes for tests that plant `RoFile`s directly.
+    fn ro_bytes(data: &[u8]) -> Arc<layers::LayerBytes> {
+        Arc::new(layers::LayerBytes::eager(Arc::new(data.to_vec())))
+    }
+
     /// A minimal store so tests can drive the generated `wasi:filesystem`
     /// methods (the same surface a guest hits) without a live wasm instance.
     struct TestStore {
@@ -3369,7 +3384,7 @@ mod tests {
         let shared: SharedFile = Arc::new(Mutex::new(b"chan".to_vec()));
         {
             let mut g = fs.lock().unwrap();
-            g.put_ro_file_at("from-layer.txt", Arc::new(b"ro".to_vec()));
+            g.put_ro_file_at("from-layer.txt", ro_bytes(b"ro"));
             g.add_child(ROOT, "written.txt", Node::File(b"w".to_vec()));
             g.add_child(ROOT, "chan", Node::Shared(shared.clone()));
         }
@@ -3433,9 +3448,11 @@ mod tests {
         // on the read paths: size, preview, listing.
         let fs = new_fs();
         let bytes: Arc<Vec<u8>> = Arc::new(b"from a layer".to_vec());
-        fs.lock()
-            .unwrap()
-            .add_child(ROOT, "ro", Node::RoFile(bytes.clone()));
+        fs.lock().unwrap().add_child(
+            ROOT,
+            "ro",
+            Node::RoFile(Arc::new(layers::LayerBytes::eager(bytes.clone()))),
+        );
         let g = fs.lock().unwrap();
         let node = resolve(&g, ROOT, "/ro").expect("resolves");
         assert_eq!(stat_node(&g, node).unwrap().size, 12);
@@ -3454,12 +3471,16 @@ mod tests {
         let bytes: Arc<Vec<u8>> = Arc::new(b"immutable".to_vec());
         let a = new_fs();
         let b = new_fs();
-        a.lock()
-            .unwrap()
-            .add_child(ROOT, "f", Node::RoFile(bytes.clone()));
-        b.lock()
-            .unwrap()
-            .add_child(ROOT, "f", Node::RoFile(bytes.clone()));
+        a.lock().unwrap().add_child(
+            ROOT,
+            "f",
+            Node::RoFile(Arc::new(layers::LayerBytes::eager(bytes.clone()))),
+        );
+        b.lock().unwrap().add_child(
+            ROOT,
+            "f",
+            Node::RoFile(Arc::new(layers::LayerBytes::eager(bytes.clone()))),
+        );
 
         {
             let mut g = a.lock().unwrap();
@@ -3488,6 +3509,50 @@ mod tests {
     }
 
     #[test]
+    fn copy_up_materializes_a_lazy_layer_file() {
+        // A lazy (disk-indexed) layer applied to two nodes: writing in one
+        // must materialize a *private* copy there, while the other node and
+        // the shared layer bytes stay exactly the on-disk content.
+        let dir = std::env::temp_dir().join("wk-vfs-lazy-copyup");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tar_path = dir.join("layer.tar");
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_size(9);
+        h.set_cksum();
+        b.append_data(&mut h, "f", &b"immutable"[..]).unwrap();
+        std::fs::write(&tar_path, b.into_inner().unwrap()).unwrap();
+
+        let layer = layers::from_tar_file(&tar_path).expect("indexes");
+        let a = new_fs();
+        let bfs = new_fs();
+        layers::apply(&a, &layer, "");
+        layers::apply(&bfs, &layer, "");
+
+        {
+            let mut g = a.lock().unwrap();
+            let id = resolve(&g, ROOT, "/f").unwrap();
+            g.copy_up(id);
+            match g.nodes.get_mut(&id) {
+                Some(Node::File(data)) => write_at(data, 0, b"MUTATED!!").unwrap(),
+                _ => panic!("copy_up should yield a private File"),
+            }
+        }
+        assert_eq!(
+            a.lock().unwrap().read_file("/f", 64).as_deref(),
+            Some(&b"MUTATED!!"[..])
+        );
+        assert_eq!(
+            bfs.lock().unwrap().read_file("/f", 64).as_deref(),
+            Some(&b"immutable"[..]),
+            "the other node still reads the layer's on-disk bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn copy_up_is_a_no_op_for_private_and_dir_nodes() {
         let fs = new_fs();
         {
@@ -3512,7 +3577,7 @@ mod tests {
         let fs = new_fs();
         {
             let mut g = fs.lock().unwrap();
-            g.put_ro_file_at("layered/ro.txt", Arc::new(b"layer".to_vec()));
+            g.put_ro_file_at("layered/ro.txt", ro_bytes(b"layer"));
             g.put_file_at("written/out.txt", b"private".to_vec());
             g.ensure_dir_path("empty");
         }
