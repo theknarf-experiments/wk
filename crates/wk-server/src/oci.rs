@@ -56,7 +56,28 @@ fn client_for(image: &Reference) -> Client {
     Client::new(config)
 }
 
+// Test-only per-thread override of the cache root. Plain `cargo test` runs
+// tests as threads in one process, so redirecting the store via the
+// process-global `XDG_CACHE_HOME` would let parallel tests yank each other's
+// store mid-test; a thread-local keeps each test's store its own (and works
+// the same under nextest's process-per-test model).
+#[cfg(test)]
+thread_local! {
+    static TEST_CACHE_ROOT: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Point this thread's cache/store at `root` (tests only).
+#[cfg(test)]
+pub(crate) fn set_test_cache_root(root: &std::path::Path) {
+    TEST_CACHE_ROOT.with(|r| *r.borrow_mut() = Some(root.to_path_buf()));
+}
+
 pub(crate) fn cache_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = TEST_CACHE_ROOT.with(|r| r.borrow().clone()) {
+        return root.join("wk").join("oci");
+    }
     std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
@@ -359,13 +380,14 @@ mod tests {
         assert!(!a.file_name().unwrap().to_string_lossy().contains('/'));
     }
 
-    /// Point the cache at a fresh temp dir (nextest = one process per test, so
-    /// setting the env var is safe).
+    /// Point this test's cache at a fresh temp dir. Thread-local (not an env
+    /// var), so parallel tests under plain `cargo test` can't redirect each
+    /// other's caches.
     fn isolated_cache(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("wk-oci-cache-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("XDG_CACHE_HOME", &dir);
+        set_test_cache_root(&dir);
         dir
     }
 

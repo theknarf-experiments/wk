@@ -1046,13 +1046,14 @@ pub fn build_with_runner(
 mod tests {
     use super::*;
 
-    /// Point the store at a fresh temp dir (nextest = one process per test, so
-    /// setting the env var is safe) and return its root.
+    /// Point this test's store at a fresh temp dir and return its root.
+    /// Thread-local (not an env var), so parallel tests under plain
+    /// `cargo test` can't redirect each other's stores.
     fn isolated_store(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("wk-image-store-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("XDG_CACHE_HOME", &dir);
+        crate::oci::set_test_cache_root(&dir);
         dir
     }
 
