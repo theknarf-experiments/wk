@@ -44,6 +44,12 @@ typedef struct {
 int wk_run(const char *path, const char *const *argv,
            const char *stdin_data, size_t stdin_len, wk_result *out);
 
+/* Like wk_run, but `envp` (a null-terminated `KEY=VALUE` vector, or null to
+ * inherit the node's environment) becomes the child's environment. */
+int wk_run_env(const char *path, const char *const *argv,
+               const char *const *envp, const char *stdin_data,
+               size_t stdin_len, wk_result *out);
+
 void wk_result_free(wk_result *r);
 
 /* ---------------------------------------------------------------------------

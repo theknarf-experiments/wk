@@ -18,8 +18,9 @@ static char *dup_bytes(const uint8_t *p, size_t n) {
     return out;
 }
 
-int wk_run(const char *path, const char *const *argv,
-           const char *stdin_data, size_t stdin_len, wk_result *out) {
+int wk_run_env(const char *path, const char *const *argv,
+               const char *const *envp, const char *stdin_data,
+               size_t stdin_len, wk_result *out) {
     memset(out, 0, sizeof *out);
 
     exec_host_string_t wpath;
@@ -41,9 +42,32 @@ int wk_run(const char *path, const char *const *argv,
             exec_host_string_set(&wargs.ptr[i], argv[i]);
     }
 
-    /* The child inherits no environment of its own here; wk gives it the
-     * node's. (Adding per-call env is a matter of filling this list.) */
+    /* Per-call environment, split from the caller's `KEY=VALUE` vector. When
+     * `envp` is null the child inherits the node's environment (wk supplies
+     * it); when given, this is the child's environment (e.g. Bun.spawn's
+     * `env`). */
+    size_t envc = 0;
+    if (envp)
+        while (envp[envc])
+            envc++;
     exec_host_list_tuple2_string_string_t wenv = {NULL, 0};
+    if (envc) {
+        wenv.ptr = malloc(envc * sizeof *wenv.ptr);
+        if (!wenv.ptr) {
+            free(wargs.ptr);
+            out->error = strdup("out of memory");
+            return -1;
+        }
+        wenv.len = envc;
+        for (size_t i = 0; i < envc; i++) {
+            const char *eq = strchr(envp[i], '=');
+            size_t klen = eq ? (size_t)(eq - envp[i]) : strlen(envp[i]);
+            wenv.ptr[i].f0.ptr = (uint8_t *)envp[i];
+            wenv.ptr[i].f0.len = klen;
+            wenv.ptr[i].f1.ptr = (uint8_t *)(eq ? eq + 1 : "");
+            wenv.ptr[i].f1.len = eq ? strlen(eq + 1) : 0;
+        }
+    }
 
     exec_host_list_u8_t win = {NULL, 0};
     if (stdin_len) {
@@ -55,6 +79,7 @@ int wk_run(const char *path, const char *const *argv,
     exec_host_string_t err;
     bool ok = wk_exec_process_run(&wpath, &wargs, &wenv, &win, &res, &err);
     free(wargs.ptr);
+    free(wenv.ptr);
 
     if (!ok) {
         out->error = dup_bytes(err.ptr, err.len);
@@ -71,6 +96,12 @@ int wk_run(const char *path, const char *const *argv,
     exec_host_list_u8_free(&res.stdout);
     exec_host_list_u8_free(&res.stderr);
     return 0;
+}
+
+/* Env-less form: the child inherits the node's environment. */
+int wk_run(const char *path, const char *const *argv,
+           const char *stdin_data, size_t stdin_len, wk_result *out) {
+    return wk_run_env(path, argv, NULL, stdin_data, stdin_len, out);
 }
 
 void wk_result_free(wk_result *r) {
