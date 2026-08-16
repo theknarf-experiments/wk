@@ -57,8 +57,11 @@ const UDP_BUF: usize = 64 * 1024;
 /// one listening socket one connection, so with a single listener a second
 /// connection arriving before the guest re-listens is refused — concurrent
 /// clients mostly failed. A pool lets that many SYNs land at once; `accept`
-/// drains and replenishes it.
-const LISTEN_BACKLOG: usize = 16;
+/// drains and replenishes it. Unlike a kernel SYN queue these are real
+/// preallocated sockets (`TCP_BUF` each way), so this is a memory/burst
+/// trade-off — 64 is ~8 MiB per listened port, negligible beside the runtime,
+/// and absorbs a reconnect storm that all lands in one poll.
+const LISTEN_BACKLOG: usize = 64;
 /// Number of datagram slots in a UDP socket's packet ring buffers.
 const UDP_SLOTS: usize = 64;
 
