@@ -1764,10 +1764,18 @@ mod tests {
     fn host_links_wasi_0_3_alongside_0_2() {
         let mut config = Config::new();
         config.wasm_component_model(true);
+        config.wasm_component_model_async(true);
         let engine = Engine::new(&config).expect("engine");
         let mut linker: Linker<HostState> = Linker::new(&engine);
         crate::vfs::add_wasi_except_fs(&mut linker).expect("wasi 0.2 (minus fs) links");
-        wasmtime_wasi::p3::add_to_linker(&mut linker).expect("wasi 0.3 links");
+        // The actual 0.3 composition build_linker uses: wasmtime's
+        // cli/clocks/random plus wk's own filesystem and sockets — NOT
+        // wasmtime's p3::add_to_linker, whose fs/sockets wk replaces.
+        wasmtime_wasi::p3::cli::add_to_linker(&mut linker).expect("wasi 0.3 cli links");
+        wasmtime_wasi::p3::clocks::add_to_linker(&mut linker).expect("wasi 0.3 clocks links");
+        wasmtime_wasi::p3::random::add_to_linker(&mut linker).expect("wasi 0.3 random links");
+        crate::sockets_p3::add_to_linker(&mut linker).expect("wk sockets 0.3 links");
+        crate::vfs::p3::add_to_linker(&mut linker).expect("wk vfs 0.3 links");
     }
 
     /// The full host linker — every wk interface (wasi-gfx, audio, midi, the 0.2
