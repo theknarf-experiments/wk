@@ -838,8 +838,28 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
     }
     fn finish_bind(
         &mut self,
-        _this: Resource<TcpSock>,
+        this: Resource<TcpSock>,
     ) -> Result<std::result::Result<(), ErrorCode>> {
+        // Assign an ephemeral port when the guest bound to port 0. smoltcp's
+        // `listen(0)` is rejected, so `port: 0` — Bun's test-suite default and
+        // node:net's ephemeral listen — needs a concrete port here; the guest
+        // then reads it back via `local-address`. Mirrors the UDP bind path.
+        let (port, local) = {
+            let s = self.table().get(&this)?;
+            (s.bound_port, s.local)
+        };
+        if port == 0 {
+            if let Some(ctx) = self.net.as_mut() {
+                let newport = ctx.next_port;
+                ctx.next_port = ctx.next_port.checked_add(1).unwrap_or(49152);
+                let s = self.table().get_mut(&this)?;
+                s.bound_port = newport;
+                if let Some(addr) = local {
+                    let (ip, _) = to_smol(addr);
+                    s.local = Some(from_smol(ip, newport));
+                }
+            }
+        }
         Ok(Ok(()))
     }
 
