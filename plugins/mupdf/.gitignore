@@ -1,0 +1,7 @@
+# Upstream sources + artifacts, all fetched/derived by build.sh — only
+# build.sh, viewer_wk.c, compat/, test/, Dockerfile, mise.toml are tracked.
+mupdf-*-source/
+mupdf-*-source.tar.gz
+mupdf-view.wasm
+mupdf-view.core.wasm
+obj/

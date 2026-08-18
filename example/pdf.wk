@@ -1,0 +1,33 @@
+// vim: set filetype=kdl :
+// A PDF reader as a wk node. Run with:
+//
+//   wk run example/pdf.wk
+//
+// The mupdf node is a wasm container (docker://plugins/mupdf/Dockerfile):
+// unmodified upstream MuPDF — fitz plus every vendored thirdparty dep,
+// base-14 fonts embedded — cross-compiled to wasm32-wasip1, with a thin
+// viewer main drawing pages on a wasi-gfx surface through the shared
+// gfx-compat shim. Build it first:
+//
+//   cd plugins/mupdf && mise run build
+//
+// No document is baked into the image: the PDF arrives over the bindmount
+// wire below (it lands at /red-box.pdf, and the viewer scans / for the first
+// *.pdf). Point the bindmount at any PDF of yours to read it.
+import "../workspace.wk"
+workspace "01KWPDFDEM000000000000WS00" {
+    node "mupdf" "01KWPDFDEM000000000000MP01" {
+        pos 80.0 80.0
+        size 520.0 660.0
+    }
+    bindmount "plugins/mupdf/test/red-box.pdf" "01KWPDFDEM000000000000BM02" {
+        pos 80.0 820.0
+        size 220.0 120.0
+    }
+    note "01KWPDFDEM000000000000NT03" {
+        text "MuPDF reader\n\nPgDn/PgUp or Left/Right: turn pages\n+/-: zoom (fit-width is 1.0)\nScroll or Up/Down: pan\nHome/End: first/last page\n\nSwap the bindmount's path for any\nPDF on your disk — it mounts at\n/<name> and the viewer picks up\nthe first *.pdf it sees."
+        pos 680.0 80.0
+        size 340.0 260.0
+    }
+    connection "01KWPDFDEM000000000000BM02" "01KWPDFDEM000000000000MP01"
+}
