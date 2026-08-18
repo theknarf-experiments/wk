@@ -13,8 +13,8 @@
  *
  * Pacing: DG_DrawFrame presents the frame, then blocks on the compositor's
  * frame event and drains that frame's input into a small key queue that
- * DG_GetKey pops. Sound stays off (doomgeneric's default: FEATURE_SOUND is
- * never defined).
+ * DG_GetKey pops. Sound effects live in i_wksound.c (FEATURE_SOUND, mixed
+ * onto wk:webaudio through the shared ../audio-compat shim); music is off.
  */
 #include <stdint.h>
 #include <time.h>

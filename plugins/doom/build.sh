@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Build UNMODIFIED upstream doomgeneric (https://github.com/ozkl/doomgeneric)
 # into a wk graphics node: the real DOOM engine, its window a wasi-gfx surface
-# through the shared ../gfx-compat shim. Only this script and doomgeneric_wk.c
-# (the platform file every doomgeneric port provides) live in the repo — the
-# game sources are fetched at build, pinned to a commit, and gitignored.
+# through the shared ../gfx-compat shim and its sound effects mixed onto
+# wk:webaudio through the shared ../audio-compat shim. Only this script,
+# doomgeneric_wk.c (the platform file every doomgeneric port provides) and
+# i_wksound.c (the sound module every port provides under FEATURE_SOUND) live
+# in the repo — the game sources are fetched at build, pinned to a commit,
+# and gitignored.
 #
 # Also fetches Freedoom Phase 1 (freedoom1.wad, pinned release) so the
 # Dockerfile can ship a playable image out of the box.
@@ -44,6 +47,13 @@ GFXGEN="$GFXCOMPAT/gen"
 mkdir -p "$GFXGEN"
 wit-bindgen c --world wkgfx "$GFXCOMPAT/wit" --out-dir "$GFXGEN"
 
+# Shared audio shim + its wk:webaudio bindings (regenerated each build) — the
+# pcm-queue that i_wksound.c mixes sound effects onto.
+AUDIOCOMPAT="$(pwd)/../audio-compat"
+AUDIOGEN="$AUDIOCOMPAT/gen"
+mkdir -p "$AUDIOGEN"
+wit-bindgen c --world wkaudio "$AUDIOCOMPAT/wit" --out-dir "$AUDIOGEN"
+
 # WASIp1→component adapter, pinned to our wasmtime (46); fetched and cached if a
 # registry copy isn't present. Named `wasi_snapshot_preview1=` so wasm-tools
 # binds it regardless of the file's stem.
@@ -77,11 +87,18 @@ GAME_SRCS=(
 SRCS=()
 for s in "${GAME_SRCS[@]}"; do SRCS+=("$SRC/$s"); done
 
+# -DFEATURE_SOUND turns upstream i_sound.c's dispatch on; it then routes
+# through `DG_sound_module` / `DG_music_module`, which i_sdlsound.c /
+# i_sdlmusic.c (never compiled here) define upstream and i_wksound.c defines
+# for us — so no upstream edit is needed. i_sound.c's `#include
+# <SDL_mixer.h>` under the same define is satisfied by the empty stub in
+# compat/.
 "$CLANG" --target=wasm32-wasip1 -O2 \
-    -DNORMALUNIX -DLINUX -DSNDSERV -D_DEFAULT_SOURCE \
-    -I"$SRC" -I"$GFXCOMPAT" -I"$GFXGEN" -Icompat \
-    "${SRCS[@]}" doomgeneric_wk.c compat/system_stub.c \
+    -DNORMALUNIX -DLINUX -DSNDSERV -D_DEFAULT_SOURCE -DFEATURE_SOUND \
+    -I"$SRC" -I"$GFXCOMPAT" -I"$GFXGEN" -I"$AUDIOCOMPAT" -I"$AUDIOGEN" -Icompat \
+    "${SRCS[@]}" doomgeneric_wk.c i_wksound.c compat/system_stub.c \
     "$GFXCOMPAT/wkgfx.c" "$GFXGEN/wkgfx.c" "$GFXGEN/wkgfx_component_type.o" \
+    "$AUDIOCOMPAT/wkaudio.c" "$AUDIOGEN/wkaudio.c" "$AUDIOGEN/wkaudio_component_type.o" \
     -o doom.core.wasm
 
 wasm-tools component new doom.core.wasm --adapt "wasi_snapshot_preview1=$ADAPTER" -o doom.wasm

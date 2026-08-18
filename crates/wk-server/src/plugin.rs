@@ -2057,6 +2057,14 @@ mod tests {
     /// test. Generous deadlines: first-ever wasmtime compile of the engine
     /// plus WAD lump loading can take a while. Skipped when the artifacts
     /// (doom.wasm + freedoom1.wad, both produced by ./build.sh) are missing.
+    ///
+    /// doom.wasm is built with FEATURE_SOUND (i_wksound.c over wk:webaudio),
+    /// and the host constructs a real `AudioContext` — an output device via
+    /// cpal — the moment the guest opens audio. That works even headless (and
+    /// the Enter below would audibly play the menu switch sound), but tests
+    /// must not open sound devices (see audio.rs), so boot with doom's own
+    /// vanilla `-nosound` flag: the sound-compiled binary still links and
+    /// boots, and no wk:webaudio call is ever made.
     #[test]
     fn doom_boots_freedoom_and_takes_keys() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/doom");
@@ -2075,7 +2083,11 @@ mod tests {
             &wasm,
             "doom",
             id,
-            &["-iwad".to_string(), "/freedoom1.wad".to_string()],
+            &[
+                "-iwad".to_string(),
+                "/freedoom1.wad".to_string(),
+                "-nosound".to_string(),
+            ],
             surfaces.clone(),
             nodes.clone(),
             Vec::new(),

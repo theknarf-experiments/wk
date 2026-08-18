@@ -1,0 +1,59 @@
+package wk:webaudio;
+
+interface audio {
+    enum oscillator-type {
+        sine,
+        square,
+        sawtooth,
+        triangle,
+    }
+
+    enum filter-type {
+        lowpass,
+        highpass,
+        bandpass,
+    }
+
+    resource context {
+        constructor();
+        sample-rate: func() -> f32;
+        current-time: func() -> f64;
+        create-oscillator: func() -> oscillator;
+        create-gain: func() -> gain;
+        create-biquad-filter: func() -> biquad-filter;
+        create-pcm-queue: func(sample-rate: f32, channels: u32) -> pcm-queue;
+    }
+
+    resource pcm-queue {
+        buffered: func() -> f64;
+        write: func(samples: list<f32>);
+        connect: func(dst: borrow<gain>);
+        connect-destination: func();
+    }
+
+    resource oscillator {
+        set-type: func(ty: oscillator-type);
+        set-frequency: func(hz: f32);
+        set-detune: func(cents: f32);
+        connect: func(dst: borrow<gain>);
+        connect-filter: func(dst: borrow<biquad-filter>);
+        connect-destination: func();
+        start: func(when: f64);
+        stop: func(when: f64);
+    }
+
+    resource gain {
+        set-gain: func(value: f32);
+        ramp-to: func(value: f32, seconds: f32);
+        connect: func(dst: borrow<gain>);
+        connect-destination: func();
+    }
+
+    resource biquad-filter {
+        set-type: func(ty: filter-type);
+        set-frequency: func(hz: f32);
+        set-q: func(value: f32);
+        connect: func(dst: borrow<gain>);
+        connect-destination: func();
+    }
+}

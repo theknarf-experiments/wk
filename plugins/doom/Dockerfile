@@ -4,7 +4,8 @@
 # fetches freedoom1.wad (both pinned; see build.sh).
 #
 # Controls: arrows move/turn, Ctrl fires, Space uses, Enter/Escape drive the
-# menus. Sound is off (doomgeneric's default).
+# menus. Sound effects play through wk:webaudio (i_wksound.c + the shared
+# audio-compat shim); music is off (no OPL emulation).
 FROM scratch
 COPY doom.wasm /doom.wasm
 COPY freedoom1.wad /freedoom1.wad

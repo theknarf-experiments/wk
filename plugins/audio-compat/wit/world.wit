@@ -1,0 +1,10 @@
+package wk:audiocompat;
+
+/// The guest side of the wk:webaudio shim: a C program compiled against
+/// wkaudio.h pushes interleaved f32 PCM to the speakers through wk's Web
+/// Audio host (the pcm-queue resource) — the audio sibling of ../gfx-compat's
+/// wkgfx world. The interface itself is vendored under wit/deps like
+/// plugins/synth does.
+world wkaudio {
+    import wk:webaudio/audio;
+}
