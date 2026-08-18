@@ -1,0 +1,6 @@
+# build products — everything here is reproduced by build-deps.sh
+sysroot/
+tarballs/
+src/
+logs/
+.toolbin/
