@@ -73,6 +73,9 @@ dependencies {
     wordpress "image://wordpress" {
         description "WordPress (PHP + SQLite), assembled by plugins/wordpress/Dockerfile — build it first with `mise run build`"
     }
+    doctools "image://doctools" {
+        description "doc-tools: real pandoc + pdfTeX on the wk-shell (plugins/doctools/Dockerfile) — build it first with `mise run build`"
+    }
     curl "plugins/curl/curl.wasm" {
         description "GNU curl 8.11.1, cross-compiled to wasm32-wasip2 (real curl over the fabric)"
     }
@@ -98,8 +101,17 @@ dependencies {
     doom "docker://plugins/doom/Dockerfile" {
         description "DOOM (unmodified doomgeneric + Freedoom Phase 1) on a wasi-gfx surface"
     }
+    quake "docker://plugins/quake/Dockerfile" {
+        description "Quake (unmodified quakegeneric + id 1.06 shareware episode) on a wasi-gfx surface"
+    }
+    fluidsynth "docker://plugins/fluidsynth/Dockerfile" {
+        description "SoundFont synth (FluidLite engine + TimGM6mb.sf2): MIDI in, real instruments out"
+    }
     netsurf "docker://plugins/netsurf/Dockerfile" {
-        description "NetSurf 3.11 web browser (framebuffer frontend, HTTP over the fabric; no TLS/JS)"
+        description "NetSurf 3.11 web browser (framebuffer frontend; HTTP+HTTPS over the fabric via wolfSSL-curl; no JS)"
+    }
+    mupdf "docker://plugins/mupdf/Dockerfile" {
+        description "MuPDF PDF reader (wire a PDF in; PgUp/PgDn pages, +/- zoom, scroll pans)"
     }
 }
 workspace "01KXNW9K5HE8SA351748KG6GFA" {

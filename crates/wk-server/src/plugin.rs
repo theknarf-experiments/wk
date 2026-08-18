@@ -2199,6 +2199,130 @@ mod tests {
         node.kill.store(true, Ordering::Relaxed);
     }
 
+    /// The real thing, Quake edition: UNMODIFIED quakegeneric (plugins/quake)
+    /// boots the id 1.06 shareware episode as a wk node. The engine loads
+    /// pak0.pak, sets its palette, and paints the console/title through
+    /// gfx-compat onto a [`VirtualSurface`]; then its `startdemos` loop keeps
+    /// the frame changing with no input at all — so the test pumps frames
+    /// headless and asserts non-uniform, then still-changing, pixels.
+    /// Generous deadlines: first-ever wasmtime compile of the engine (with
+    /// setjmp/longjmp lowered to exnref EH) plus pak loading can take a
+    /// while. Skipped when the artifacts (quake.wasm + pak0.pak, both
+    /// produced by ./build.sh) are missing.
+    ///
+    /// No `-nosound` needed (unlike doom): quakegeneric compiles snd_null.c
+    /// and exposes no audio hook, so the node is silent by design and no
+    /// audio device is ever opened.
+    #[test]
+    fn quake_boots_shareware_and_animates() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/quake");
+        let wasm = dir.join("quake.wasm");
+        let pak = dir.join("pak0.pak");
+        if !wasm.exists() || !pak.exists() {
+            eprintln!("skipping: build plugins/quake first (./build.sh)");
+            return;
+        }
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let surfaces: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        host.spawn(
+            &wasm,
+            "quake",
+            id,
+            &["-basedir".to_string(), "/".to_string()],
+            surfaces.clone(),
+            nodes.clone(),
+            Vec::new(),
+            None,
+        )
+        .expect("spawn");
+
+        // The node registers synchronously; seed the pak into its filesystem
+        // before the (much slower) background compile lets the guest run —
+        // standing in for the container image's COPY pak0.pak to /id1/.
+        let node = nodes
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|n| n.id == id)
+            .cloned()
+            .expect("node registered");
+        node.fs
+            .lock()
+            .unwrap()
+            .put_file_at("id1/pak0.pak", std::fs::read(&pak).expect("read pak"));
+
+        // Engine compile + Host_Init, then the surface appears from QG_Init.
+        let surface = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            loop {
+                if let Some(s) = surfaces.lock().unwrap().first().cloned() {
+                    break s;
+                }
+                assert!(
+                    !node.finished.load(Ordering::Relaxed),
+                    "quake exited before opening a surface"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "quake never opened a surface"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+        let pump_frame = || {
+            let mut s = surface.lock().unwrap();
+            s.frame_ready = true;
+            s.wake();
+        };
+
+        // Pump until the console lands: non-uniform pixels through the
+        // 8-bit-palette-to-RGBA conversion (pak lumps load on the way, so
+        // keep the deadline generous).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            let s = surface.lock().unwrap();
+            let non_uniform = s.pixels.chunks_exact(4).any(|px| px != &s.pixels[0..4]);
+            if non_uniform {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "quake never painted its console"
+            );
+        }
+
+        // The engine animates on its own (console scroll-up, then the
+        // shareware demo loop): keep pumping and the frame must change with
+        // no input ever queued.
+        let before: Vec<u8> = surface.lock().unwrap().pixels.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            let s = surface.lock().unwrap();
+            if s.pixels != before {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "quake never animated past its first frame"
+            );
+        }
+
+        // Shut down: close the surface and trip the kill switch.
+        {
+            let mut s = surface.lock().unwrap();
+            s.closed = true;
+            s.wake();
+        }
+        node.kill.store(true, Ordering::Relaxed);
+    }
+
     /// wk's FUSE, end to end with real wasm: the hellofs plugin (a `wk:fs`
     /// provider) is spawned as a node, its served tree is mounted into a
     /// consumer filesystem, and reads/writes cross the mount into the running
@@ -3511,6 +3635,192 @@ mod tests {
         kill_srv.store(true, Ordering::Relaxed);
     }
 
+    /// The real thing, part three — and the regression test for the
+    /// accept-family trap: `example/browser.wk`'s topology with a REAL guest
+    /// server. A CPython node runs the example's `http.server`
+    /// (`browser-www/server.py`, a v4 wildcard bind) on a shared network;
+    /// NetSurf is launched at `http://python:8000/`. Fabric DNS resolves the
+    /// name to both fabric addresses and curl may dial the v6 ULA — which
+    /// must be REFUSED (family-scoped listeners), never delivered to the v4
+    /// listener: wasi-libc's accept() aborts converting a v6 peer for a v4
+    /// socket, trapping the interpreter mid-serve. The test asserts the
+    /// python-served red page renders AND python outlives the visit.
+    #[test]
+    fn python_http_server_survives_netsurf_over_the_fabric() {
+        let pydir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/python");
+        let python_wasm = pydir.join("python.wasm");
+        let stdlib = pydir.join("lib/python3.14");
+        if !python_wasm.exists() || !stdlib.exists() {
+            eprintln!("skipping: build plugins/python first (mise run build)");
+            return;
+        }
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let surfaces: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
+
+        let ns_id = NodeId::new();
+        let Some(netsurf) = spawn_netsurf(&host, ns_id, &surfaces, &nodes) else {
+            return;
+        };
+
+        // The python node: python.wasm with its Dockerfile's environment,
+        // the stdlib seeded into the node's filesystem, and /app holding the
+        // example's real webserver plus a solid-red index page (the same
+        // pixel proof as the fabric fetch test).
+        let py_id = NodeId::new();
+        host.spawn(
+            &python_wasm,
+            "python",
+            py_id,
+            &[],
+            surfaces.clone(),
+            nodes.clone(),
+            Vec::new(),
+            Some(crate::images::ContainerSetup {
+                layers: Vec::new(),
+                env: vec![
+                    ("PYTHONHOME".into(), "/usr/local".into()),
+                    ("PYTHONDONTWRITEBYTECODE".into(), "1".into()),
+                    ("HOME".into(), "/root".into()),
+                ],
+            }),
+        )
+        .expect("spawn python");
+        let python = nodes
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|n| n.id == py_id)
+            .cloned()
+            .expect("python registered");
+        {
+            let mut fsg = python.fs.lock().unwrap();
+            let libroot = pydir.join("lib");
+            let mut dirs = vec![stdlib.clone()];
+            while let Some(dir) = dirs.pop() {
+                for entry in std::fs::read_dir(&dir).expect("read stdlib dir") {
+                    let path = entry.expect("stdlib entry").path();
+                    if path.is_dir() {
+                        dirs.push(path);
+                        continue;
+                    }
+                    let rel = path.strip_prefix(&libroot).expect("under lib/");
+                    fsg.put_file_at(
+                        &format!("usr/local/lib/{}", rel.display()),
+                        std::fs::read(&path).expect("read stdlib file"),
+                    );
+                }
+            }
+            let server_py =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../example/browser-www/server.py");
+            fsg.put_file_at(
+                "app/server.py",
+                std::fs::read(&server_py).expect("read example server.py"),
+            );
+            fsg.put_file_at(
+                "app/index.html",
+                b"<html><head><title>fabric</title></head>\
+                  <body style=\"background-color: #ff0000\"></body></html>"
+                    .to_vec(),
+            );
+        }
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+            while !python.is_runnable() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "python never compiled"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        // One shared Network, like browser.wk's netlinks.
+        let shared_net = NodeId::new();
+        for n in [&netsurf, &python] {
+            n.net_stack().expect("fabric stack").lock().unwrap().net = shared_net;
+        }
+
+        // Start python first (the example's instruction), and wait until its
+        // http.server actually listens before pointing the browser at it.
+        host.run_node(&python, &["/app/server.py".to_string(), "8000".to_string()])
+            .expect("run python");
+        {
+            let stack = python.net_stack().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            loop {
+                let listening = {
+                    let g = stack.lock().unwrap();
+                    let any = g.sockets.iter().any(|(_, s)| {
+                        matches!(
+                            s,
+                            smoltcp::socket::Socket::Tcp(t)
+                                if t.state() == smoltcp::socket::tcp::State::Listen
+                        )
+                    });
+                    any
+                };
+                if listening {
+                    break;
+                }
+                assert!(
+                    !python.finished.load(Ordering::Relaxed),
+                    "python exited before listening"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "python never started listening"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        host.run_node(&netsurf, &["http://python:8000/".to_string()])
+            .expect("run netsurf");
+        let surface = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                if let Some(s) = surfaces.lock().unwrap().first().cloned() {
+                    break s;
+                }
+                assert!(
+                    !netsurf.finished.load(Ordering::Relaxed),
+                    "netsurf exited before opening a surface"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "netsurf never opened a surface"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        // The page arrives only if python's accept loop survives the visit:
+        // a trap mid-serve is caught immediately (finished flips), not as a
+        // 120s render timeout.
+        pump_until(&surface, "rendered python's red page", |s| {
+            assert!(
+                !python.finished.load(Ordering::Relaxed),
+                "python trapped while netsurf connected — accept must never \
+                 surface a peer of another family than the socket's own"
+            );
+            let red = s
+                .pixels
+                .chunks_exact(4)
+                .filter(|px| px[0] == 0xff && px[1] == 0 && px[2] == 0)
+                .count();
+            red >= s.width as usize
+        });
+        assert!(
+            !python.finished.load(Ordering::Relaxed),
+            "python survived serving the browser"
+        );
+
+        netsurf.kill.store(true, Ordering::Relaxed);
+        python.kill.store(true, Ordering::Relaxed);
+    }
+
     /// Outbound wasi:http is denied unless the node's fabric stack has host
     /// access (i.e. it's wired to a Gateway) — the same gate as raw sockets.
     /// A stackless store (pure-http node / serve store) is always denied.
@@ -3533,5 +3843,532 @@ mod tests {
         // Wiring to a Gateway sets host_access → allowed.
         stack.lock().unwrap().host_access = true;
         assert!(hooks.host_allowed());
+    }
+
+    /// wk's MIDI story end to end: the fluidsynth node (the real FluidLite
+    /// engine — FluidSynth's synthesis core — built by plugins/fluidsynth)
+    /// loads a SoundFont from its vfs, and MIDI injected through the router
+    /// (standing in for a piano or hardware MidiIn node wired on the canvas)
+    /// reaches it through `wk:midi` and the midi-compat shim.
+    ///
+    /// Boots with `--dry-run`: the synth consumes MIDI and renders blocks but
+    /// never calls wkaudio_open, because tests must not open real audio
+    /// devices (the same reason the doom test passes -nosound). The node's
+    /// terminal log is the observable: it prints the soundfont load and each
+    /// note event. Skipped when the artifacts (fluidsynth.wasm +
+    /// soundfont.sf2, both produced by ./build.sh) are missing.
+    #[test]
+    fn fluidsynth_sounds_injected_midi_from_a_soundfont() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/fluidsynth");
+        let wasm = dir.join("fluidsynth.wasm");
+        let sf2 = dir.join("soundfont.sf2");
+        if !wasm.exists() || !sf2.exists() {
+            eprintln!("skipping: build plugins/fluidsynth first (./build.sh)");
+            return;
+        }
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        host.spawn(
+            &wasm,
+            "fluidsynth",
+            id,
+            &["--dry-run".to_string(), "/soundfont.sf2".to_string()],
+            Arc::new(Mutex::new(Vec::new())),
+            nodes.clone(),
+            Vec::new(),
+            None,
+        )
+        .expect("spawn");
+
+        // The node registers synchronously; seed the SoundFont into its
+        // filesystem before the (much slower) background compile lets the
+        // guest run — standing in for the image's COPY soundfont.sf2.
+        let node = nodes
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|n| n.id == id)
+            .cloned()
+            .expect("node registered");
+        node.fs
+            .lock()
+            .unwrap()
+            .put_file_at("soundfont.sf2", std::fs::read(&sf2).expect("read sf2"));
+
+        // Wire a phantom keyboard onto the node exactly the way the server
+        // wires a canvas "midi" connection: router entry into its inbox.
+        // Messages queue there even before the guest opens its input port,
+        // so injecting early can't race the boot.
+        let kbd = NodeId::nil();
+        host.midi()
+            .lock()
+            .unwrap()
+            .connect(kbd, id, node.midi_in.clone());
+
+        // The node's terminal (its stdout) is the observable.
+        let log = || String::from_utf8_lossy(&node.term_io.log_read(0).0).into_owned();
+        let wait_for = |what: &str, secs: u64| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            loop {
+                if log().contains(what) {
+                    break;
+                }
+                assert!(
+                    !node.finished.load(Ordering::Relaxed),
+                    "fluidsynth exited before logging {what:?}; log:\n{}",
+                    log()
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fluidsynth never logged {what:?}; log:\n{}",
+                    log()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        // Engine compile, then the guest parses the ~6 MB SF2 from its vfs.
+        wait_for("soundfont loaded: /soundfont.sf2", 300);
+
+        // Note-on and note-off round-trip: router -> inbox -> wk:midi receive
+        // -> midi-compat shim -> fluid_synth_noteon/noteoff, each logged.
+        let midi = host.midi();
+        midi.lock().unwrap().send_from(kbd, &vec![0x90, 60, 100]);
+        wait_for("note-on ch=0 key=60 vel=100", 60);
+        midi.lock().unwrap().send_from(kbd, &vec![0x80, 60, 0]);
+        wait_for("note-off ch=0 key=60", 60);
+
+        // Still rendering — no trap on the way.
+        assert!(
+            !node.finished.load(Ordering::Relaxed),
+            "fluidsynth trapped after the notes; log:\n{}",
+            log()
+        );
+        node.kill.store(true, Ordering::Relaxed);
+    }
+
+    /// HTTPS lands on the fabric: a rustls listener joins the node's net as
+    /// the named peer "tlssrv" (rcgen self-signed CA cert for that name), the
+    /// guest is the real curl.wasm with its wolfSSL backend, and the CA is
+    /// seeded at /etc/ssl/cacert.pem — the exact path plugins/curl baked in
+    /// via --with-ca-bundle, so this exercises default trust, no --cacert
+    /// flag. The body arriving in the terminal log proves the whole chain:
+    /// fabric DNS, TCP over smoltcp, the wolfSSL<->rustls handshake, cert
+    /// verification against the vfs bundle, HTTP over the encrypted stream.
+    #[test]
+    fn curl_fetches_https_over_the_fabric() {
+        use std::io::{Read, Write};
+
+        let wasm = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/curl/curl.wasm");
+        if !wasm.exists() {
+            eprintln!("skipping: build plugins/curl first (./build.sh)");
+            return;
+        }
+
+        // A self-signed CA that doubles as the server cert for "tlssrv".
+        // CA:TRUE matters: wolfSSL only takes basic-constraint CAs from a
+        // bundle, so a plain self-signed leaf would be rejected as an anchor.
+        let mut params =
+            rcgen::CertificateParams::new(vec!["tlssrv".to_string()]).expect("cert params");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let key = rcgen::KeyPair::generate().expect("keypair");
+        let cert = params.self_signed(&key).expect("self-signed cert");
+
+        // ring explicitly: two providers are linked into the test binary, so
+        // rustls's process default would be ambiguous.
+        let tls_config = {
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            Arc::new(
+                rustls::ServerConfig::builder_with_provider(provider)
+                    .with_safe_default_protocol_versions()
+                    .expect("protocol versions")
+                    .with_no_client_auth()
+                    .with_single_cert(
+                        vec![cert.der().clone()],
+                        rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+                    )
+                    .expect("server config"),
+            )
+        };
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        host.spawn(
+            &wasm,
+            "curl",
+            id,
+            &[],
+            Arc::new(Mutex::new(Vec::new())),
+            nodes.clone(),
+            Vec::new(),
+            None,
+        )
+        .expect("spawn");
+        // curl imports wasi:sockets, so it waits to be Run; the first-ever
+        // compile of a 2.4 MB tool can take minutes, cached runs are instant.
+        let node = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            loop {
+                if let Some(n) = nodes.lock().unwrap().iter().find(|n| n.id == id).cloned() {
+                    if n.is_runnable() {
+                        break n;
+                    }
+                }
+                assert!(std::time::Instant::now() < deadline, "curl never compiled");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        // What the images' COPY cacert.pem provides: trust on the baked path.
+        node.fs
+            .lock()
+            .unwrap()
+            .put_file_at("etc/ssl/cacert.pem", cert.pem().into_bytes());
+
+        // One HTTPS response, served through rustls over the accepted fabric
+        // connection (the netsurf websrv pattern, plus the TLS wrap).
+        let body = "tls over the fabric works";
+        let kill_srv = Arc::new(AtomicBool::new(false));
+        wk_fabric::listen::listen(
+            host.hub(),
+            node.net_stack().expect("curl has a fabric stack"),
+            "tlssrv",
+            8443,
+            kill_srv.clone(),
+            Arc::new(move |mut s: std::os::unix::net::UnixStream| {
+                let tls_config = tls_config.clone();
+                std::thread::spawn(move || {
+                    let mut conn = rustls::ServerConnection::new(tls_config).expect("tls conn");
+                    let mut tls = rustls::Stream::new(&mut conn, &mut s);
+                    let mut req = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !req.ends_with(b"\r\n\r\n") {
+                        match tls.read(&mut byte) {
+                            Ok(1) => req.push(byte[0]),
+                            _ => return,
+                        }
+                    }
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = tls.write_all(reply.as_bytes());
+                    let _ = tls.flush();
+                    tls.conn.send_close_notify();
+                    let _ = tls.flush();
+                });
+            }),
+        );
+
+        host.run_node(
+            &node,
+            &["-sS".to_string(), "https://tlssrv:8443/".to_string()],
+        )
+        .expect("run curl");
+
+        // The body in the terminal log is the proof; -sS prints only the
+        // payload on success and a bare error line on failure.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let (bytes, _) = node.term_io.log_read(0);
+            let out = String::from_utf8_lossy(&bytes).to_string();
+            if out.contains(body) {
+                break;
+            }
+            if node.finished.load(Ordering::Relaxed) {
+                // Re-read once: the last write can land right at exit.
+                let (bytes, _) = node.term_io.log_read(0);
+                let out = String::from_utf8_lossy(&bytes).to_string();
+                assert!(
+                    out.contains(body),
+                    "curl exited without the body; output:\n{out}"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "curl never printed the fetched body; output:\n{out}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+
+        node.kill.store(true, Ordering::Relaxed);
+        kill_srv.store(true, Ordering::Relaxed);
+    }
+
+    /// A real PDF reader: UNMODIFIED MuPDF (plugins/mupdf — fitz plus its
+    /// vendored thirdparty tree, cross-compiled by mupdf's own Makefile)
+    /// renders the checked-in single-page test PDF (test/red-box.pdf: a big
+    /// red rectangle plus a line of base-14 text) onto a [`VirtualSurface`]
+    /// through the shared gfx-compat shim. The test seeds the PDF into the
+    /// node's vfs — standing in for the bindmount wire; the argv-less viewer
+    /// scans / for the first *.pdf — pumps frames headless exactly like the
+    /// doom test, asserts a long run of red page pixels, then injects a `-`
+    /// zoom-out key and asserts the frame changes (the PDF has one page, so
+    /// page-turn would be a no-op; zoom is the observable control). Skipped
+    /// when the artifact (mupdf-view.wasm, from ./build.sh) is missing.
+    #[test]
+    fn mupdf_renders_red_box_pdf_and_zooms() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/mupdf");
+        let wasm = dir.join("mupdf-view.wasm");
+        let pdf = dir.join("test/red-box.pdf");
+        if !wasm.exists() {
+            eprintln!("skipping: build plugins/mupdf first (./build.sh)");
+            return;
+        }
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let surfaces: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        host.spawn(
+            &wasm,
+            "mupdf",
+            id,
+            &[],
+            surfaces.clone(),
+            nodes.clone(),
+            Vec::new(),
+            None,
+        )
+        .expect("spawn");
+
+        // The node registers synchronously; seed the document before the
+        // (much slower) background compile lets the guest run — a wired PDF
+        // lands at /<name>, which is exactly where the viewer scans.
+        let node = nodes
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|n| n.id == id)
+            .cloned()
+            .expect("node registered");
+        node.fs
+            .lock()
+            .unwrap()
+            .put_file_at("red-box.pdf", std::fs::read(&pdf).expect("read pdf"));
+
+        // Engine compile + fitz boot, then the surface appears.
+        let surface = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            loop {
+                if let Some(s) = surfaces.lock().unwrap().first().cloned() {
+                    break s;
+                }
+                assert!(
+                    !node.finished.load(Ordering::Relaxed),
+                    "mupdf exited before opening a surface"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "mupdf never opened a surface"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+        let pump_frame = || {
+            let mut s = surface.lock().unwrap();
+            s.frame_ready = true;
+            s.wake();
+        };
+
+        // The PDF fills most of its page with pure-red (1 0 0 rg) — at
+        // fit-width that is a run of hundreds of red pixels mid-frame, and
+        // nothing else in the composition (white mat, dark text, error
+        // screen) comes close. Require a healthy run to rule out artifacts.
+        let red_run = |pixels: &[u8]| {
+            let mut best = 0usize;
+            let mut run = 0usize;
+            for px in pixels.chunks_exact(4) {
+                if px[0] > 200 && px[1] < 60 && px[2] < 60 {
+                    run += 1;
+                    best = best.max(run);
+                } else {
+                    run = 0;
+                }
+            }
+            best
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            let s = surface.lock().unwrap();
+            if red_run(&s.pixels) >= 100 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "mupdf never painted the red page"
+            );
+        }
+
+        // Zoom out: `-` round-trips through gfx-compat into the viewer,
+        // which re-renders the page smaller (white mat appears at the
+        // sides), so the frame must change once the key queues drain.
+        let before: Vec<u8> = surface.lock().unwrap().pixels.clone();
+        {
+            let mut s = surface.lock().unwrap();
+            let minus = KeyEvent {
+                key: Some(Key::Minus),
+                text: None,
+                alt_key: false,
+                ctrl_key: false,
+                meta_key: false,
+                shift_key: false,
+                repeat: false,
+            };
+            s.key_down.push_back(minus.clone());
+            s.key_up.push_back(minus);
+            s.wake();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            let s = surface.lock().unwrap();
+            if s.key_down.is_empty() && s.key_up.is_empty() && s.pixels != before {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "mupdf never consumed the zoom key / repainted"
+            );
+        }
+        // Still a red page after the zoom — the document survived, smaller.
+        assert!(
+            red_run(&surface.lock().unwrap().pixels) >= 50,
+            "the page vanished after zooming out"
+        );
+
+        // Shut down: close the surface and trip the kill switch.
+        {
+            let mut s = surface.lock().unwrap();
+            s.closed = true;
+            s.wake();
+        }
+        node.kill.store(true, Ordering::Relaxed);
+    }
+
+    /// doc-tools: the real pandoc (3.5, the upstream GHC-wasm build) and the
+    /// real pdfTeX (1.40.29, cross-compiled from TeX Live source) layered on
+    /// the bash image, exercised end-to-end through wk's own machinery. The
+    /// test builds both images into an isolated store — the doctools
+    /// Dockerfile's RUN steps dump latex.fmt with the *wasm* pdftex during
+    /// the build — then mounts the image like a node and runs bash, which
+    /// PATH-searches /bin and execs each tool via wk:exec. Finishes with the
+    /// pipeline the image exists for: markdown -> LaTeX -> a real PDF in the
+    /// node's vfs. Skipped when the artifacts aren't built
+    /// (plugins/doctools: ./build.sh, which needs plugins/bash built first).
+    /// SLOW by nature: pandoc is a 50 MB GHC-wasm module, and this test has
+    /// consistently spent ~11 minutes single-core on it per run (the compile
+    /// cache that makes the CLI's reruns quick has not been kicking in under
+    /// the test harness — measured, not assumed). nextest reports it slow
+    /// and moves on; it has no timeout.
+    #[test]
+    #[ignore = "~11 min: pandoc's 50MB GHC-wasm module compiles cold each run; run with --run-ignored"]
+    fn doctools_image_execs_pandoc_and_pdflatex() {
+        let doctools = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/doctools");
+        let bash = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/bash");
+        for needed in [
+            bash.join("bash.wasm"),
+            bash.join("bin"),
+            doctools.join("pandoc.wasm"),
+            doctools.join("pdftex.wasm"),
+            doctools.join("texmf/texmf-dist/tex/latex/base/latex.ltx"),
+        ] {
+            if !needed.exists() {
+                eprintln!("skipping: build plugins/doctools first (./build.sh)");
+                return;
+            }
+        }
+
+        // An isolated image store (thread-local), so the build neither reads
+        // nor pollutes the user's.
+        let store = std::env::temp_dir().join("wk-image-store-doctools-exec");
+        let _ = std::fs::remove_dir_all(&store);
+        std::fs::create_dir_all(&store).unwrap();
+        crate::oci::set_test_cache_root(&store);
+
+        let host = PluginHost::new().expect("host");
+        let bash_id =
+            crate::images::build_with_runner(&bash.join("Dockerfile"), Some(&host), false)
+                .expect("bash base image builds");
+        crate::images::set_tag("bash", &bash_id).unwrap();
+        let id = crate::images::build_with_runner(&doctools.join("Dockerfile"), Some(&host), false)
+            .expect("doctools image builds (pdftex -ini dumps latex.fmt in a RUN)");
+
+        // A node running this image: rootfs layers mounted lazily, the
+        // image's env, and the shell exec'ing tools out of its own /bin.
+        let m = crate::images::load_image(&id).expect("manifest stored");
+        let fs = crate::vfs::new_fs();
+        crate::images::mount(&fs, &m.container_setup()).expect("mount image");
+        let sh = fs
+            .lock()
+            .unwrap()
+            .read_file("/bin/bash.wasm", usize::MAX)
+            .expect("the base image's shell is in the rootfs");
+
+        let run = |cmd: &str| {
+            let argv = vec!["bash".to_string(), "-c".to_string(), cmd.to_string()];
+            host.run_program(&sh, &argv, &m.env, &fs, Vec::new(), 0)
+                .unwrap_or_else(|e| panic!("bash -c {cmd:?}: {e}"))
+        };
+
+        let out = run("pandoc --version");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert_eq!(
+            out.exit_code,
+            0,
+            "pandoc --version: {stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("pandoc 3.5"),
+            "unexpected pandoc banner: {stdout}"
+        );
+
+        let out = run("pdftex --version");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert_eq!(
+            out.exit_code,
+            0,
+            "pdftex --version: {stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("pdfTeX 3.14"),
+            "unexpected pdftex banner: {stdout}"
+        );
+
+        // The pipeline: pandoc's standalone LaTeX through pdflatex (argv[0]
+        // picks the format), typeset against the image's minimal texmf.
+        fs.lock().unwrap().put_file_at(
+            "work/notes.md",
+            b"# Hello\n\nA *small* doc with math: $x^2$.\n".to_vec(),
+        );
+        let out = run("cd /work && pandoc notes.md -s -o notes.tex \
+             && pdflatex -interaction=nonstopmode notes.tex");
+        assert_eq!(
+            out.exit_code,
+            0,
+            "pipeline: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let pdf = fs
+            .lock()
+            .unwrap()
+            .read_file("/work/notes.pdf", usize::MAX)
+            .expect("pdflatex produced notes.pdf");
+        assert!(
+            pdf.starts_with(b"%PDF-"),
+            "notes.pdf does not look like a PDF"
+        );
     }
 }
