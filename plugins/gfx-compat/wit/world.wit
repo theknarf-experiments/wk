@@ -1,0 +1,10 @@
+package wk:gfx;
+
+/// The guest side of the wasi-gfx shim: a C program compiled against wkgfx.h
+/// gets a raw-pixel surface (window) from the wk compositor through the
+/// standard wasi-gfx interfaces — the same ones plugins/paint uses from Rust.
+world wkgfx {
+    import wasi:surface/surface@0.0.2;
+    import wasi:graphics-context/graphics-context@0.0.1;
+    import wasi:frame-buffer/frame-buffer@0.0.1;
+}

@@ -1,0 +1,23 @@
+// vim: set filetype=kdl :
+// DOOM as a wk node. Run with:
+//
+//   wk run example/doom.wk
+//
+// The doom node is a wasm container (docker://plugins/doom/Dockerfile):
+// UNMODIFIED upstream doomgeneric compiled to wasm32-wasip1, drawing on a
+// wasi-gfx surface through the shared gfx-compat shim, with Freedoom Phase 1
+// baked into the image as /freedoom1.wad. Build it first:
+//
+//   cd plugins/doom && mise run build
+import "../workspace.wk"
+workspace "01KWD8DEM0000000000000WS00" {
+    node "doom" "01KWD8DEM0000000000000DM01" {
+        pos 80.0 80.0
+        size 660.0 440.0
+    }
+    note "01KWD8DEM0000000000000NT02" {
+        text "DOOM (Freedoom Phase 1)\n\nEnter/Escape: menus\nArrows: move + turn\nCtrl: fire\nSpace: use (doors, switches)\nShift: run   Tab: automap\n1-7: weapons\n\nSound is off (doomgeneric\ndefault) - pcm wiring is a\nlater follow-up."
+        pos 780.0 80.0
+        size 320.0 240.0
+    }
+}

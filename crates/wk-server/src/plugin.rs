@@ -1909,6 +1909,284 @@ mod tests {
         assert_eq!(surface_dims(0, 0), (1, 1, 4));
     }
 
+    /// The gfx-compat shim end to end: a C `main()` guest (gfx-smoke) built
+    /// against ../../plugins/gfx-compat opens a wasi-gfx surface, paints, and
+    /// consumes @0.0.2 input events (a right-button pointer-down and a scroll).
+    /// With no compositor client connected the test pumps frames itself: it
+    /// plays the server's per-frame role — set `frame_ready` on the
+    /// [`VirtualSurface`] and wake its parked pollables — and reads back the
+    /// pixels the guest presented. Skipped when the artifact isn't built.
+    #[test]
+    fn gfx_smoke_c_guest_paints_and_consumes_events() {
+        let wasm =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/gfx-smoke/gfx-smoke.wasm");
+        if !wasm.exists() {
+            eprintln!("skipping: build plugins/gfx-smoke first (./build.sh)");
+            return;
+        }
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let surfaces: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        host.spawn(
+            &wasm,
+            "gfx-smoke",
+            id,
+            &[],
+            surfaces.clone(),
+            nodes.clone(),
+            Vec::new(),
+            None,
+        )
+        .expect("spawn");
+
+        // The surface appears once the background compile finishes and the
+        // guest's wkgfx_open runs.
+        let surface = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                if let Some(s) = surfaces.lock().unwrap().first().cloned() {
+                    break s;
+                }
+                if let Some(n) = nodes.lock().unwrap().iter().find(|n| n.id == id) {
+                    assert!(
+                        !n.finished.load(Ordering::Relaxed),
+                        "gfx-smoke exited before opening a surface"
+                    );
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "gfx-smoke never opened a surface"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        // Headless frame pacing: signal one frame and wake the guest's parked
+        // frame pollable, exactly what the server does per compositor frame.
+        let pump_frame = || {
+            let mut s = surface.lock().unwrap();
+            s.frame_ready = true;
+            s.wake();
+        };
+
+        // Pump until the guest paints something non-uniform (the gradient).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            let s = surface.lock().unwrap();
+            let non_uniform = s.pixels.chunks_exact(4).any(|px| px != &s.pixels[0..4]);
+            if non_uniform {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "gfx-smoke never painted a non-uniform frame"
+            );
+        }
+
+        // Queue a right-button pointer-down (the @0.0.2 button field) and a
+        // scroll event (the new @0.0.2 scroll queue), then pump until the
+        // guest has drained both.
+        let (px, py) = (30u32, 40u32);
+        {
+            let mut s = surface.lock().unwrap();
+            s.pointer_down.push_back(PointerEvent {
+                x: px as f64,
+                y: py as f64,
+                button: Some(PointerButton::Right),
+            });
+            s.pointer_scroll.push_back(ScrollEvent {
+                x: px as f64,
+                y: py as f64,
+                delta_x: 0.0,
+                delta_y: -1.0,
+            });
+            s.wake();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            let s = surface.lock().unwrap();
+            if s.pointer_down.is_empty() && s.pointer_scroll.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "gfx-smoke never consumed the queued pointer-down + scroll"
+            );
+        }
+
+        // The events had a visible effect: the guest draws its square at the
+        // pointer, so after a couple more frames the clicked pixel is white
+        // (the gradient is never white there: red = x/W caps well below 255).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            let s = surface.lock().unwrap();
+            let i = ((py * s.width + px) * 4) as usize;
+            if s.pixels.len() >= i + 4 && s.pixels[i..i + 3] == [255, 255, 255] {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the square never appeared at the queued pointer position"
+            );
+        }
+
+        // Close the surface: the guest traps on its next get-frame and exits.
+        {
+            let mut s = surface.lock().unwrap();
+            s.closed = true;
+            s.wake();
+        }
+        let node = nodes.lock().unwrap().iter().find(|n| n.id == id).cloned();
+        if let Some(n) = node {
+            n.kill.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The real thing: UNMODIFIED doomgeneric (plugins/doom) boots Freedoom
+    /// Phase 1 as a wk node. The engine decompresses the WAD, draws its title
+    /// screen through gfx-compat onto a [`VirtualSurface`], and consumes key
+    /// events — the test pumps frames headless exactly like the gfx-smoke
+    /// test. Generous deadlines: first-ever wasmtime compile of the engine
+    /// plus WAD lump loading can take a while. Skipped when the artifacts
+    /// (doom.wasm + freedoom1.wad, both produced by ./build.sh) are missing.
+    #[test]
+    fn doom_boots_freedoom_and_takes_keys() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/doom");
+        let wasm = dir.join("doom.wasm");
+        let wad = dir.join("freedoom1.wad");
+        if !wasm.exists() || !wad.exists() {
+            eprintln!("skipping: build plugins/doom first (./build.sh)");
+            return;
+        }
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let surfaces: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        host.spawn(
+            &wasm,
+            "doom",
+            id,
+            &["-iwad".to_string(), "/freedoom1.wad".to_string()],
+            surfaces.clone(),
+            nodes.clone(),
+            Vec::new(),
+            None,
+        )
+        .expect("spawn");
+
+        // The node registers synchronously; seed the IWAD into its filesystem
+        // before the (much slower) background compile lets the guest run —
+        // standing in for the container image's COPY freedoom1.wad.
+        let node = nodes
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|n| n.id == id)
+            .cloned()
+            .expect("node registered");
+        node.fs
+            .lock()
+            .unwrap()
+            .put_file_at("freedoom1.wad", std::fs::read(&wad).expect("read wad"));
+
+        // Engine compile + boot, then the surface appears from DG_Init.
+        let surface = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            loop {
+                if let Some(s) = surfaces.lock().unwrap().first().cloned() {
+                    break s;
+                }
+                assert!(
+                    !node.finished.load(Ordering::Relaxed),
+                    "doom exited before opening a surface"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "doom never opened a surface"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+        let pump_frame = || {
+            let mut s = surface.lock().unwrap();
+            s.frame_ready = true;
+            s.wake();
+        };
+
+        // Pump until the title screen lands: non-uniform pixels (WAD lumps
+        // decompress on the way, so keep the deadline generous).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            let s = surface.lock().unwrap();
+            let non_uniform = s.pixels.chunks_exact(4).any(|px| px != &s.pixels[0..4]);
+            if non_uniform {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "doom never painted its title screen"
+            );
+        }
+
+        // Enter opens the main menu: the key round-trips through gfx-compat
+        // into doom's event loop, and the frame keeps changing.
+        let before: Vec<u8> = surface.lock().unwrap().pixels.clone();
+        {
+            let mut s = surface.lock().unwrap();
+            let enter = |sur: &mut VirtualSurface, down: bool| {
+                let ev = KeyEvent {
+                    key: Some(Key::Enter),
+                    text: None,
+                    alt_key: false,
+                    ctrl_key: false,
+                    meta_key: false,
+                    shift_key: false,
+                    repeat: false,
+                };
+                if down {
+                    sur.key_down.push_back(ev);
+                } else {
+                    sur.key_up.push_back(ev);
+                }
+            };
+            enter(&mut s, true);
+            enter(&mut s, false);
+            s.wake();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            let s = surface.lock().unwrap();
+            if s.key_down.is_empty() && s.key_up.is_empty() && s.pixels != before {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "doom never consumed the Enter key / repainted"
+            );
+        }
+
+        // Shut down: close the surface and trip the kill switch.
+        {
+            let mut s = surface.lock().unwrap();
+            s.closed = true;
+            s.wake();
+        }
+        node.kill.store(true, Ordering::Relaxed);
+    }
+
     /// wk's FUSE, end to end with real wasm: the hellofs plugin (a `wk:fs`
     /// provider) is spawned as a node, its served tree is mounted into a
     /// consumer filesystem, and reads/writes cross the mount into the running

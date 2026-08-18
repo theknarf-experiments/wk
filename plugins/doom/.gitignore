@@ -1,0 +1,7 @@
+# Upstream sources + artifacts, all fetched/derived by build.sh — only
+# build.sh, doomgeneric_wk.c, compat/, Dockerfile, mise.toml are tracked.
+doomgeneric-*/
+doom.wasm
+doom.core.wasm
+freedoom1.wad
+freedoom.zip
