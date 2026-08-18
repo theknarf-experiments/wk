@@ -610,6 +610,11 @@ pub struct Server {
     /// graph), kept as `(ws, relation, a, b)` so save round-trips them and an
     /// unplaced node comes back still wired once it can materialize.
     unplaced_wires: Vec<(NodeId, WireRel, NodeId, NodeId)>,
+    /// App↔app wires whose kind (MIDI vs provider mount) can't be decided
+    /// yet: `serves_fs()` is unknowable while an endpoint's component is
+    /// still compiling. Re-tried each tick; applied through the normal
+    /// classification once both endpoints have published their setup.
+    pending_app_wires: Vec<(NodeId, NodeId)>,
 
     /// Node-capability auth: the token service's public key plus the base node
     /// token every app node holds by default (its authority block carries the
@@ -668,6 +673,7 @@ impl Server {
             attached: std::collections::HashSet::new(),
             unplaced: Vec::new(),
             unplaced_wires: Vec::new(),
+            pending_app_wires: Vec::new(),
             node_auth: None,
             auth_cache: HashMap::new(),
             undo: Vec::new(),
@@ -721,17 +727,44 @@ impl Server {
                 }
             }
         }
-        let wires: Vec<(NodeId, NodeId)> = saved
-            .connections
-            .iter()
-            .chain(&saved.midi)
-            .chain(&saved.serves)
-            .chain(&saved.net_links)
-            .chain(&saved.capture_links)
-            .chain(&saved.api_links)
-            .copied()
-            .collect();
-        self.rewire(&wires);
+        // Re-apply each saved relation AS ITS OWN KIND — the file already
+        // distinguishes them. Flattening everything through `rewire` (which
+        // re-classifies by node kind) mistyped provider mounts: an app→app
+        // `connection` classifies by `serves_fs()`, which is still false
+        // while the provider's component compiles in the background, so the
+        // wire landed in the MIDI relation and the mount never happened.
+        let exists =
+            |s: &Self, a: NodeId, b: NodeId| s.node_exists(a) && s.node_exists(b) && !s.wired(a, b);
+        for &(f, a) in &saved.connections {
+            if exists(self, f, a) {
+                self.toggle_file(f, a);
+            }
+        }
+        for &(s, d) in &saved.midi {
+            if exists(self, s, d) {
+                self.toggle_midi(s, d);
+            }
+        }
+        for &(h, p) in &saved.serves {
+            if exists(self, h, p) {
+                self.toggle_serve(h, p);
+            }
+        }
+        for &(m, n) in &saved.net_links {
+            if exists(self, m, n) {
+                self.toggle_net(m, n);
+            }
+        }
+        for &(a, c) in &saved.capture_links {
+            if exists(self, a, c) {
+                self.toggle_capture(a, c);
+            }
+        }
+        for &(a, n) in &saved.api_links {
+            if exists(self, a, n) {
+                self.toggle_api(a, n);
+            }
+        }
         // Restore per-bind mount paths, then re-apply so mounts land at them.
         for (&pair, path) in &saved.mount_paths {
             self.graph.mount_paths.insert(pair, path.clone());
@@ -1334,8 +1367,13 @@ impl Server {
                 // filesystem (imports `wk:fs/provider`), the wire is a mount:
                 // the provider's tree appears in the other app's vfs, exactly
                 // like a Volume bind (same relation, same tokens, same
-                // per-connection mount path).
-                if self.app_node(src).is_some_and(|n| n.serves_fs()) {
+                // per-connection mount path). While either endpoint is still
+                // compiling that distinction is unknowable, so the wire waits
+                // in `pending_app_wires` for the tick reconciler.
+                let loading = |s: &Self, id: NodeId| s.app_node(id).is_some_and(|n| n.is_loading());
+                if loading(self, src) || loading(self, dst) {
+                    self.pending_app_wires.push((src, dst));
+                } else if self.app_node(src).is_some_and(|n| n.serves_fs()) {
                     self.toggle_file(src, dst)
                 } else if self.app_node(dst).is_some_and(|n| n.serves_fs()) {
                     self.toggle_file(dst, src)
@@ -1938,6 +1976,31 @@ impl Server {
         self.write_token_file(id);
     }
 
+    /// Apply app↔app wires that were waiting on a compiling endpoint (see
+    /// `pending_app_wires`): once both components have published their setup,
+    /// the MIDI-vs-provider-mount classification is decidable and the wire
+    /// goes through `connect_toggle` for real. A wire whose endpoint
+    /// disappeared is dropped.
+    fn sync_pending_app_wires(&mut self) {
+        if self.pending_app_wires.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_app_wires);
+        for (a, b) in pending {
+            if !self.node_exists(a) || !self.node_exists(b) {
+                continue;
+            }
+            let loading = |s: &Self, id: NodeId| s.app_node(id).is_some_and(|n| n.is_loading());
+            if loading(self, a) || loading(self, b) {
+                self.pending_app_wires.push((a, b));
+                continue;
+            }
+            if !self.wired(a, b) {
+                self.connect_toggle(a, b);
+            }
+        }
+    }
+
     /// Reconcile the actual file mounts against the desired `connections`: mount
     /// each newly-wired volume into its app's fs at its mount path, unmount ones
     /// no longer wired. Idempotent; runs after any connection change and once per
@@ -2197,6 +2260,7 @@ impl Server {
         // before reconciling serves so a just-started node gets published this
         // same tick.
         self.drain_pending_run();
+        self.sync_pending_app_wires();
         self.sync_mounts();
         self.sync_midi();
         self.sync_net_membership();
@@ -3606,6 +3670,88 @@ mod model_tests {
         );
         assert!(full.for_workspace(ws1).fs_providers.contains(&provider));
         assert!(full.for_workspace(ws2).fs_providers.is_empty());
+    }
+
+    /// A provider wire must survive the window where its endpoint is still
+    /// compiling. Two paths: a *saved* app→app connection loads as a
+    /// connection (the .wk file already names the relation — classifying it
+    /// at load mistyped it as MIDI, the filesystems.wk regression), and an
+    /// *interactive* app↔app wire made during the window defers in
+    /// `pending_app_wires` until both setups publish, then classifies right.
+    #[test]
+    fn provider_wires_survive_a_compiling_provider() {
+        use crate::plugin::{Node, NodeSetup};
+        let mut s = fresh_server();
+        let ws = s.graph.workspaces[0];
+        let stub = |id: NodeId, name: &str| {
+            Arc::new(Node {
+                id,
+                name: name.to_string(),
+                term_io: crate::terminal::TermIo::new(),
+                fs: crate::vfs::new_fs(),
+                midi_in: crate::midi::new_inbox(),
+                options: crate::options::new_options(Vec::new()),
+                finished: Arc::new(AtomicBool::new(false)),
+                running: Arc::new(AtomicBool::new(false)),
+                kill: Arc::new(AtomicBool::new(false)),
+                setup: std::sync::OnceLock::new(),
+                env: Vec::new(),
+                layers: Vec::new(),
+                capture_src: crate::capture::new_src(),
+                exec_permit: crate::exec::new_permit(true),
+                fs_serve: wk_vfs::ProviderConn::new(),
+            })
+        };
+        let published = |node: &Arc<Node>, fs_provider: bool| {
+            let _ = node.setup.set(NodeSetup {
+                net_stack: None,
+                http_path: None,
+                run: None,
+                midi: false,
+                net: false,
+                capture: false,
+                fs_provider,
+            });
+        };
+
+        // Both apps exist but are still compiling (no setup published).
+        let provider = NodeId::new();
+        let consumer = NodeId::new();
+        s.place(provider, Kind::App, ws, [0.0, 0.0], [100.0, 100.0]);
+        s.place(consumer, Kind::App, ws, [0.0, 0.0], [100.0, 100.0]);
+        let pnode = stub(provider, "zipfs");
+        let cnode = stub(consumer, "bash");
+        s.node_reg.lock().unwrap().push(pnode.clone());
+        s.node_reg.lock().unwrap().push(cnode.clone());
+
+        // Load path: the saved relation is applied as itself, compiling or not.
+        let mut saved = crate::workspace::Workspace::new();
+        saved.id = ws;
+        saved.connections.push((provider, consumer));
+        s.instantiate(&saved);
+        assert!(
+            s.graph.connections.contains(&(provider, consumer)),
+            "a saved connection stays a connection"
+        );
+        assert!(s.graph.midi_links.is_empty(), "never mistyped as MIDI");
+
+        // Interactive path: a wire drawn during the window waits, then
+        // classifies as a mount once the provider's setup publishes.
+        s.graph.connections.clear();
+        s.pending_app_wires.clear();
+        s.connect_toggle(provider, consumer);
+        assert!(s.graph.connections.is_empty() && s.graph.midi_links.is_empty());
+        assert_eq!(s.pending_app_wires.len(), 1, "deferred while compiling");
+        published(&pnode, true);
+        s.sync_pending_app_wires();
+        assert_eq!(s.pending_app_wires.len(), 1, "waits for BOTH endpoints");
+        published(&cnode, false);
+        s.sync_pending_app_wires();
+        assert!(
+            s.graph.connections.contains(&(provider, consumer)),
+            "classified as a provider mount once decidable"
+        );
+        assert!(s.graph.midi_links.is_empty());
     }
 
     /// A HostPort's localhost port can be set absolutely via `port_set` (what
