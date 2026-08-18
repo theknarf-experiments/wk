@@ -33,7 +33,9 @@ wasmtime::component::bindgen!({
 });
 
 use wasi::surface::surface::{CreateDesc, FrameEvent};
-pub use wasi::surface::surface::{Key, KeyEvent, PointerEvent, ResizeEvent};
+pub use wasi::surface::surface::{
+    Key, KeyEvent, PointerButton, PointerEvent, ResizeEvent, ScrollEvent,
+};
 use wk_protocol::NodeId;
 
 pub struct VirtualSurface {
@@ -52,6 +54,11 @@ pub struct VirtualSurface {
     pub pointer_move: VecDeque<PointerEvent>,
     pub pointer_down: VecDeque<PointerEvent>,
     pub pointer_up: VecDeque<PointerEvent>,
+    pub pointer_scroll: VecDeque<ScrollEvent>,
+    /// Set once the guest first subscribes to scroll events. The compositor
+    /// reads it to decide wheel routing: scroll goes to a surface that asked
+    /// for it, and keeps panning the canvas over one that never did.
+    pub wants_scroll: bool,
     pub key_down: VecDeque<KeyEvent>,
     pub key_up: VecDeque<KeyEvent>,
     /// Wakers parked on this surface's pollables; woken when state changes.
@@ -102,6 +109,8 @@ impl VirtualSurface {
             pointer_move: VecDeque::new(),
             pointer_down: VecDeque::new(),
             pointer_up: VecDeque::new(),
+            pointer_scroll: VecDeque::new(),
+            wants_scroll: false,
             key_down: VecDeque::new(),
             key_up: VecDeque::new(),
             wakers: Vec::new(),
@@ -267,6 +276,7 @@ enum PollKind {
     PointerMove,
     PointerDown,
     PointerUp,
+    PointerScroll,
     KeyDown,
     KeyUp,
 }
@@ -307,6 +317,7 @@ impl Future for WaitCondition {
             PollKind::PointerMove => !s.pointer_move.is_empty(),
             PollKind::PointerDown => !s.pointer_down.is_empty(),
             PollKind::PointerUp => !s.pointer_up.is_empty(),
+            PollKind::PointerScroll => !s.pointer_scroll.is_empty(),
             PollKind::KeyDown => !s.key_down.is_empty(),
             PollKind::KeyUp => !s.key_up.is_empty(),
         };
@@ -664,6 +675,24 @@ impl wasi::surface::surface::HostSurface for HostState {
             .lock()
             .unwrap()
             .pointer_move
+            .pop_front())
+    }
+
+    fn subscribe_pointer_scroll(
+        &mut self,
+        self_: Resource<SurfaceState>,
+    ) -> Result<Resource<DynPollable>> {
+        // Subscribing is the guest's declaration that it consumes scroll —
+        // the compositor routes the wheel to this surface from here on.
+        self.surface_shared(&self_)?.lock().unwrap().wants_scroll = true;
+        self.subscribe_kind(&self_, PollKind::PointerScroll)
+    }
+    fn get_pointer_scroll(&mut self, self_: Resource<SurfaceState>) -> Result<Option<ScrollEvent>> {
+        Ok(self
+            .surface_shared(&self_)?
+            .lock()
+            .unwrap()
+            .pointer_scroll
             .pop_front())
     }
 
@@ -1785,6 +1814,88 @@ mod tests {
     fn full_host_linker_builds() {
         let host = PluginHost::new().expect("host");
         host.build_linker().expect("full linker builds");
+    }
+
+    /// Input events queued on a [`VirtualSurface`] come back out through the
+    /// wasi:surface host methods with their full payloads: a scroll event via
+    /// `get-pointer-scroll` (whose subscribe also flips `wants_scroll`, the
+    /// compositor's wheel-routing flag) and a pointer-down carrying its button.
+    #[test]
+    fn scroll_and_button_events_surface_through_the_host() {
+        use wasi::surface::surface::HostSurface;
+
+        let host = PluginHost::new().expect("host");
+        let mut state = HostState {
+            ctx: WasiCtxBuilder::new().build(),
+            table: ResourceTable::new(),
+            registry: Arc::new(Mutex::new(Vec::new())),
+            node_id: NodeId::nil(),
+            fs: crate::vfs::new_fs(),
+            term_io: crate::terminal::TermIo::new(),
+            capture_src: crate::capture::new_src(),
+            capture_seq: 0,
+            exec: None,
+            midi_in: crate::midi::new_inbox(),
+            midi_router: host.midi.clone(),
+            scene_reg: crate::scene::new_registry(),
+            options: crate::options::new_options(Vec::new()),
+            net: None,
+            fs_serve: None,
+            random_ctx: wasmtime_wasi::random::WasiRandomCtx::default(),
+            http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
+            http_hooks: GatedHttpHooks { stack: None },
+            gpu: Arc::clone(&host.gpu),
+        };
+
+        let res = HostSurface::new(
+            &mut state,
+            CreateDesc {
+                width: None,
+                height: None,
+            },
+        )
+        .expect("surface");
+        let shared = state.registry.lock().unwrap()[0].clone();
+
+        // Subscribing to scroll marks the surface as a scroll consumer.
+        assert!(!shared.lock().unwrap().wants_scroll);
+        state
+            .subscribe_pointer_scroll(Resource::new_own(res.rep()))
+            .expect("subscribe scroll");
+        assert!(shared.lock().unwrap().wants_scroll);
+
+        // A queued scroll event comes out of get-pointer-scroll intact.
+        {
+            let mut s = shared.lock().unwrap();
+            s.pointer_scroll.push_back(ScrollEvent {
+                x: 12.0,
+                y: 34.0,
+                delta_x: 0.5,
+                delta_y: -3.0,
+            });
+            s.pointer_down.push_back(PointerEvent {
+                x: 12.0,
+                y: 34.0,
+                button: Some(PointerButton::Right),
+            });
+        }
+        let ev = state
+            .get_pointer_scroll(Resource::new_own(res.rep()))
+            .expect("get scroll")
+            .expect("a queued scroll event");
+        assert_eq!((ev.x, ev.y), (12.0, 34.0));
+        assert_eq!((ev.delta_x, ev.delta_y), (0.5, -3.0));
+        assert!(state
+            .get_pointer_scroll(Resource::new_own(res.rep()))
+            .expect("get scroll")
+            .is_none());
+
+        // A queued pointer-down surfaces its button identity.
+        let down = state
+            .get_pointer_down(Resource::new_own(res.rep()))
+            .expect("get down")
+            .expect("a queued pointer-down");
+        assert_eq!(down.button, Some(PointerButton::Right));
     }
 
     /// A guest-requested surface size is clamped and its RGBA8 byte length is

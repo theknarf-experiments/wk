@@ -10,7 +10,7 @@ package wk:recorder;
 /// Recording is gated on the capture grant: the wire IS the on switch —
 /// disconnect it to stop, exactly like every other wk capability.
 world recorder {
-    import wasi:surface/surface@0.0.1;
+    import wasi:surface/surface@0.0.2;
     import wasi:graphics-context/graphics-context@0.0.1;
     import wasi:frame-buffer/frame-buffer@0.0.1;
     import wk:capture/frames;

@@ -24,7 +24,9 @@ use crate::render2d::{Quad, Renderer, TextureId};
 use crate::render3d::{MeshDraw, MeshGpu, Quad3, Renderer3d};
 use crate::text::Fonts;
 use wk_protocol::{Command, NodeId, NodeKind, NodePatch, Resource, ResourceRef, Wire};
-use wk_server::plugin::{Key, KeyEvent, PointerEvent, ResizeEvent, SharedNode, SharedSurface};
+use wk_server::plugin::{
+    Key, KeyEvent, PointerButton, PointerEvent, ResizeEvent, ScrollEvent, SharedNode, SharedSurface,
+};
 use wk_server::runtime::ServerHandle;
 use wk_server::scene::RayEvent;
 use wk_server::server::{View, FILE_H, FILE_W, NOTE_H, NOTE_W};
@@ -191,6 +193,15 @@ struct Detached {
     mouse: [f32; 2],
     lmb: bool,
     prev_lmb: bool,
+    // Right/middle buttons: nothing in a detached window uses them for canvas
+    // interactions, so they go to the node with their button identity.
+    rmb: bool,
+    prev_rmb: bool,
+    mmb: bool,
+    prev_mmb: bool,
+    /// Wheel events (pointer position + line deltas) queued for the node; only
+    /// delivered if its surface subscribed to scroll, dropped otherwise.
+    scroll: Vec<ScrollEvent>,
     key_events: Vec<(KeyEvent, bool)>,
     term_input: Vec<u8>,
 }
@@ -324,8 +335,15 @@ struct App {
     lmb: bool,
     prev_lmb: bool,
     /// Right button + accumulated drag (mouse look) and scroll travel, and the
-    /// currently held keys (WASD flight) — all only read in the 3D view.
+    /// currently held keys (WASD flight). Look mode only reads `rmb` in the 3D
+    /// view; on the 2D canvas the right button is free, so its edges
+    /// (`prev_rmb`) route right-clicks to the surface under the cursor.
     rmb: bool,
+    prev_rmb: bool,
+    /// Middle button: no canvas interaction uses it anywhere, so it always
+    /// routes to the surface under the cursor.
+    mmb: bool,
+    prev_mmb: bool,
     look_delta: [f32; 2],
     fly_scroll: f32,
     keys_down: HashSet<KeyCode>,
@@ -411,6 +429,9 @@ impl App {
             lmb: false,
             prev_lmb: false,
             rmb: false,
+            prev_rmb: false,
+            mmb: false,
+            prev_mmb: false,
             look_delta: [0.0, 0.0],
             fly_scroll: 0.0,
             keys_down: HashSet::new(),
@@ -692,6 +713,11 @@ impl App {
                             mouse: [0.0, 0.0],
                             lmb: false,
                             prev_lmb: false,
+                            rmb: false,
+                            prev_rmb: false,
+                            mmb: false,
+                            prev_mmb: false,
+                            scroll: Vec::new(),
                             key_events: Vec::new(),
                             term_input: Vec::new(),
                         },
@@ -733,13 +759,29 @@ impl App {
                     det.mouse = [(position.x / scale) as f32, (position.y / scale) as f32];
                 }
             }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => {
+            WindowEvent::MouseInput { state, button, .. } => {
                 if let Some(det) = self.detached.get_mut(&node_id) {
-                    det.lmb = state == ElementState::Pressed;
+                    let held = state == ElementState::Pressed;
+                    match button {
+                        MouseButton::Left => det.lmb = held,
+                        MouseButton::Right => det.rmb = held,
+                        MouseButton::Middle => det.mmb = held,
+                        _ => {}
+                    }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if let Some(det) = self.detached.get_mut(&node_id) {
+                    let (dx, dy) = match delta {
+                        MouseScrollDelta::LineDelta(x, y) => (x, y),
+                        MouseScrollDelta::PixelDelta(p) => (p.x as f32 / 50.0, p.y as f32 / 50.0),
+                    };
+                    det.scroll.push(ScrollEvent {
+                        x: det.mouse[0] as f64,
+                        y: det.mouse[1] as f64,
+                        delta_x: dx as f64,
+                        delta_y: dy as f64,
+                    });
                 }
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
@@ -754,7 +796,8 @@ impl App {
                                 det.term_input.extend(bytes);
                             }
                         }
-                        det.key_events.push((key_event(code, mods), pressed));
+                        det.key_events
+                            .push((key_event(code, mods, event.repeat), pressed));
                     }
                 }
             }
@@ -2683,17 +2726,26 @@ impl App {
                             if let (Some((pw, ph)), Some(surf)) =
                                 (p.surface_px, node_surface.get(&p.id))
                             {
-                                let local = PointerEvent {
+                                let at = |button| PointerEvent {
                                     x: ((lu + p.w * 0.5) / p.w * pw as f32) as f64,
                                     y: ((p.h * 0.5 - lv) / p.h * ph as f32) as f64,
+                                    button,
                                 };
                                 let mut s = surf.lock().unwrap();
-                                s.pointer_move.push_back(local);
+                                s.pointer_move.push_back(at(None));
                                 if down_edge {
-                                    s.pointer_down.push_back(local);
+                                    s.pointer_down.push_back(at(Some(PointerButton::Left)));
                                 }
                                 if up_edge {
-                                    s.pointer_up.push_back(local);
+                                    s.pointer_up.push_back(at(Some(PointerButton::Left)));
+                                }
+                                // Middle button is free in 3D too (the right
+                                // button is look mode — the canvas keeps it).
+                                if self.mmb && !self.prev_mmb {
+                                    s.pointer_down.push_back(at(Some(PointerButton::Middle)));
+                                }
+                                if !self.mmb && self.prev_mmb {
+                                    s.pointer_up.push_back(at(Some(PointerButton::Middle)));
                                 }
                             }
                         }
@@ -3303,6 +3355,12 @@ impl App {
         let lmb = self.lmb;
         let down_edge = lmb && !self.prev_lmb;
         let up_edge = !lmb && self.prev_lmb;
+        // Right/middle button edges: unused by the 2D canvas (the right button
+        // only drives look mode in 3D), so they route to the hovered surface.
+        let rmb_down = self.rmb && !self.prev_rmb;
+        let rmb_up = !self.rmb && self.prev_rmb;
+        let mmb_down = self.mmb && !self.prev_mmb;
+        let mmb_up = !self.mmb && self.prev_mmb;
         let zf = self.cam.zoom;
         let fb = [
             gfx.surface_desc.width as f32,
@@ -3376,6 +3434,8 @@ impl App {
                 up_edge,
             );
             self.prev_lmb = lmb;
+            self.prev_rmb = self.rmb;
+            self.prev_mmb = self.mmb;
             self.gfx = Some(gfx);
             return;
         }
@@ -3805,17 +3865,24 @@ impl App {
                 let ca = content_rect(r, zf);
                 if contains(ca, mp) {
                     if let Some(surf) = node_surface.get(&id) {
-                        let local = PointerEvent {
+                        let at = |button| PointerEvent {
                             x: ((mp[0] - ca[0]) / zf) as f64,
                             y: ((mp[1] - ca[1]) / zf) as f64,
+                            button,
                         };
                         let mut s = surf.lock().unwrap();
-                        s.pointer_move.push_back(local);
-                        if down_edge {
-                            s.pointer_down.push_back(local);
-                        }
-                        if up_edge {
-                            s.pointer_up.push_back(local);
+                        s.pointer_move.push_back(at(None));
+                        for (btn, down, up) in [
+                            (PointerButton::Left, down_edge, up_edge),
+                            (PointerButton::Right, rmb_down, rmb_up),
+                            (PointerButton::Middle, mmb_down, mmb_up),
+                        ] {
+                            if down {
+                                s.pointer_down.push_back(at(Some(btn)));
+                            }
+                            if up {
+                                s.pointer_up.push_back(at(Some(btn)));
+                            }
                         }
                     }
                 }
@@ -5316,32 +5383,45 @@ impl App {
         self.detached.retain(|id, _| all_node_ids.contains(id));
         let det_ids: Vec<NodeId> = self.detached.keys().copied().collect();
         for id in det_ids {
-            let (mouse, lmb_d, prev_d, keys, term_in) = {
+            let (mouse, buttons, keys, term_in, scroll) = {
                 let det = self.detached.get_mut(&id).unwrap();
                 let out = (
                     det.mouse,
-                    det.lmb,
-                    det.prev_lmb,
+                    [
+                        (PointerButton::Left, det.lmb, det.prev_lmb),
+                        (PointerButton::Right, det.rmb, det.prev_rmb),
+                        (PointerButton::Middle, det.mmb, det.prev_mmb),
+                    ],
                     std::mem::take(&mut det.key_events),
                     std::mem::take(&mut det.term_input),
+                    std::mem::take(&mut det.scroll),
                 );
                 det.prev_lmb = det.lmb;
+                det.prev_rmb = det.rmb;
+                det.prev_mmb = det.mmb;
                 out
             };
             // Forward the detached window's input straight to the node — the
             // window's size is the surface size, so coordinates map 1:1.
             if let Some(surf) = node_surface.get(&id) {
                 let mut s = surf.lock().unwrap();
-                let local = PointerEvent {
+                let at = |button| PointerEvent {
                     x: mouse[0] as f64,
                     y: mouse[1] as f64,
+                    button,
                 };
-                s.pointer_move.push_back(local);
-                if lmb_d && !prev_d {
-                    s.pointer_down.push_back(local);
+                s.pointer_move.push_back(at(None));
+                for (btn, held, prev) in buttons {
+                    if held && !prev {
+                        s.pointer_down.push_back(at(Some(btn)));
+                    }
+                    if !held && prev {
+                        s.pointer_up.push_back(at(Some(btn)));
+                    }
                 }
-                if !lmb_d && prev_d {
-                    s.pointer_up.push_back(local);
+                // Wheel events reach the node only if it asked for them.
+                if s.wants_scroll {
+                    s.pointer_scroll.extend(scroll);
                 }
                 for (ev, down) in &keys {
                     if *down {
@@ -5364,6 +5444,8 @@ impl App {
         }
 
         self.prev_lmb = lmb;
+        self.prev_rmb = self.rmb;
+        self.prev_mmb = self.mmb;
         self.gfx = Some(gfx);
     }
 }
@@ -5507,6 +5589,11 @@ impl ApplicationHandler for App {
                 button: MouseButton::Right,
                 ..
             } => self.rmb = state == ElementState::Pressed,
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Middle,
+                ..
+            } => self.mmb = state == ElementState::Pressed,
             WindowEvent::MouseWheel { delta, .. } => {
                 let (dx, dy) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (x, y),
@@ -5574,7 +5661,38 @@ impl ApplicationHandler for App {
                         return;
                     }
                 }
-                if self.mods.control_key() || self.mods.super_key() {
+                // Over the content of a surface that subscribed to scroll (and
+                // with no zoom modifier held), the wheel belongs to the guest:
+                // deliver a surface-local scroll event instead of panning.
+                // Surfaces that never subscribed (paint, piano, …) keep the
+                // canvas panning over them exactly as before.
+                let zooming = self.mods.control_key() || self.mods.super_key();
+                if !zooming && self.drag.is_none() {
+                    if let Some(id) = self.topmost_under(self.mouse) {
+                        let ca = content_rect(self.rect_of(id), self.cam.zoom);
+                        if contains(ca, self.mouse) {
+                            if let Some(surf) = self
+                                .view
+                                .surfaces
+                                .iter()
+                                .find(|s| s.lock().unwrap().node_id == id)
+                            {
+                                let mut s = surf.lock().unwrap();
+                                if s.wants_scroll {
+                                    let zf = self.cam.zoom;
+                                    s.pointer_scroll.push_back(ScrollEvent {
+                                        x: ((self.mouse[0] - ca[0]) / zf) as f64,
+                                        y: ((self.mouse[1] - ca[1]) / zf) as f64,
+                                        delta_x: dx as f64,
+                                        delta_y: dy as f64,
+                                    });
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                if zooming {
                     self.zoom_factor *= ZOOM_STEP.powf(dy);
                     self.zoom_focus = self.mouse;
                 } else {
@@ -5636,7 +5754,8 @@ impl ApplicationHandler for App {
                                     self.term_input.extend(bytes);
                                 }
                             }
-                            self.key_events.push((key_event(code, self.mods), pressed));
+                            self.key_events
+                                .push((key_event(code, self.mods, event.repeat), pressed));
                             return;
                         }
                         if pressed && !event.repeat && code == KeyCode::KeyF {
@@ -5780,7 +5899,8 @@ impl ApplicationHandler for App {
                             self.term_input.extend(bytes);
                         }
                     }
-                    self.key_events.push((key_event(code, self.mods), pressed));
+                    self.key_events
+                        .push((key_event(code, self.mods, event.repeat), pressed));
                 }
             }
             _ => {}

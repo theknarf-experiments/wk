@@ -5,7 +5,7 @@ package wk:screenview;
 /// canvas. The simplest consumer of the capture capability, and the seed of an
 /// OBS-shaped pipeline (recorders and encoders poll the same interface).
 world screenview {
-    import wasi:surface/surface@0.0.1;
+    import wasi:surface/surface@0.0.2;
     import wasi:graphics-context/graphics-context@0.0.1;
     import wasi:frame-buffer/frame-buffer@0.0.1;
     import wk:capture/frames;

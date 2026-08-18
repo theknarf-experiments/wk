@@ -130,7 +130,7 @@ fn map_key(code: KeyCode) -> Option<Key> {
     })
 }
 
-pub(super) fn key_event(code: KeyCode, mods: ModifiersState) -> KeyEvent {
+pub(super) fn key_event(code: KeyCode, mods: ModifiersState, repeat: bool) -> KeyEvent {
     KeyEvent {
         key: map_key(code),
         text: None,
@@ -138,5 +138,6 @@ pub(super) fn key_event(code: KeyCode, mods: ModifiersState) -> KeyEvent {
         ctrl_key: mods.control_key(),
         meta_key: mods.super_key(),
         shift_key: mods.shift_key(),
+        repeat,
     }
 }

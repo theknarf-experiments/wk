@@ -10,7 +10,7 @@ package wk:sequencer;
 /// (UI) with wk:midi (note transport in and out) and wk:options (the saved
 /// pattern).
 world sequencer {
-    import wasi:surface/surface@0.0.1;
+    import wasi:surface/surface@0.0.2;
     import wasi:graphics-context/graphics-context@0.0.1;
     import wasi:frame-buffer/frame-buffer@0.0.1;
     import wk:midi/midi;

@@ -1,4 +1,4 @@
-package wasi:surface@0.0.1;
+package wasi:surface@0.0.2;
 
 world imports {
   import surface;
@@ -38,6 +38,9 @@ interface surface {
     subscribe-pointer-move: func() -> pollable;
     get-pointer-move: func() -> option<pointer-event>;
 
+    subscribe-pointer-scroll: func() -> pollable;
+    get-pointer-scroll: func() -> option<scroll-event>;
+
     subscribe-key-up: func() -> pollable;
     get-key-up: func() -> option<key-event>;
 
@@ -56,9 +59,30 @@ interface surface {
     nothing: bool,
   }
 
+  // W3C button order: https://w3c.github.io/pointerevents/#the-button-property
+  enum pointer-button {
+    left,
+    middle,
+    right,
+    back,
+    forward,
+  }
+
   record pointer-event {
     x: f64,
     y: f64,
+    /// Which button changed state: `some` on down/up, `none` on move.
+    button: option<pointer-button>,
+  }
+
+  /// A wheel/trackpad scroll over the surface. `x`/`y` are the pointer's
+  /// surface-local position; the deltas are in lines (pixel deltas are
+  /// converted by the compositor).
+  record scroll-event {
+    x: f64,
+    y: f64,
+    delta-x: f64,
+    delta-y: f64,
   }
 
   record key-event {
@@ -68,6 +92,8 @@ interface surface {
     ctrl-key: bool,
     meta-key: bool,
     shift-key: bool,
+    /// Auto-repeat: true for the repeated key-down events of a held key.
+    repeat: bool,
   }
 
   // corresponds with https://w3c.github.io/uievents-code/#code-value-tables

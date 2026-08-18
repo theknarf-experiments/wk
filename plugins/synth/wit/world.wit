@@ -5,7 +5,7 @@ package wk:synth;
 /// through wk's Web Audio host, with on-screen knobs for volume, waveform and
 /// tuning. Combines wasi-gfx (knob UI) with wk:midi + wk:webaudio.
 world synth {
-    import wasi:surface/surface@0.0.1;
+    import wasi:surface/surface@0.0.2;
     import wasi:graphics-context/graphics-context@0.0.1;
     import wasi:frame-buffer/frame-buffer@0.0.1;
     import wk:midi/midi;
