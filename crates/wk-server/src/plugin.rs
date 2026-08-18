@@ -2767,6 +2767,84 @@ mod tests {
         kill_srv.store(true, Ordering::Relaxed);
     }
 
+    /// GNU bash with readline, live: tab completion happens guest-side (the
+    /// UI just forwards \t), so feeding "ech<TAB>" must make readline echo
+    /// the completed builtin back. Drives the real bash.wasm through a node's
+    /// terminal ring. Skipped when the artifact isn't built (plugins/bash).
+    #[test]
+    fn bash_readline_completes_on_tab() {
+        let wasm = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/bash/bash.wasm");
+        if !wasm.exists() {
+            eprintln!("skipping: build plugins/bash first (./build.sh)");
+            return;
+        }
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        host.spawn(
+            &wasm,
+            "bash",
+            id,
+            &[],
+            Arc::new(Mutex::new(Vec::new())),
+            nodes.clone(),
+            Vec::new(),
+            None,
+        )
+        .expect("spawn");
+        // bash imports wasi:sockets (/dev/tcp), so it's a networked node and
+        // waits to be Run rather than auto-starting. First-ever compile of a
+        // 2 MB shell can take minutes; cached runs break out in milliseconds.
+        let node = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            loop {
+                if let Some(n) = nodes.lock().unwrap().iter().find(|n| n.id == id).cloned() {
+                    if n.is_runnable() {
+                        break n;
+                    }
+                }
+                assert!(std::time::Instant::now() < deadline, "bash never compiled");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        host.run_node(&node, &[]).expect("run bash");
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !node.running.load(Ordering::Relaxed) {
+                assert!(std::time::Instant::now() < deadline, "bash never started");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        // Wait for readline's prompt, then complete a builtin.
+        let wait_for = |needle: &str, from: u64| -> u64 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let (bytes, upto) = node.term_io.log_read(from);
+                if String::from_utf8_lossy(&bytes).contains(needle) {
+                    return upto;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "never saw {needle:?} in bash output"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+        };
+        let after_prompt = wait_for("bash-5.2", 0);
+
+        // "ech" + TAB: readline completes the builtin and echoes "echo".
+        node.term_io.feed_in(b"ech\t");
+        let after_complete = wait_for("echo", after_prompt);
+
+        // Finish the line: the completed command actually runs.
+        node.term_io.feed_in(b"readline-works\n");
+        wait_for("readline-works", after_complete);
+
+        node.kill.store(true, Ordering::Relaxed);
+    }
+
     /// Outbound wasi:http is denied unless the node's fabric stack has host
     /// access (i.e. it's wired to a Gateway) — the same gate as raw sockets.
     /// A stackless store (pure-http node / serve store) is always denied.

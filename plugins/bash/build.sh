@@ -76,7 +76,21 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-WASI_SDK="${WASI_SDK:-$HOME/wasi-sdk}"
+# Default to the mise-pinned toolchain when present; ~/wasi-sdk may be a
+# stale side install (it was, once — see the guard below).
+MISE_SDK="$HOME/.local/share/mise/installs/github-web-assembly-wasi-sdk/wasi-sdk-34-rc.2"
+WASI_SDK="${WASI_SDK:-$([ -d "$MISE_SDK" ] && echo "$MISE_SDK" || echo "$HOME/wasi-sdk")}"
+# Same refusal as pipe-compat/build.sh: the pipe shim transcribes wasi-libc
+# descriptor-table internals from exactly this SDK's libc, and a mismatch is
+# silent corruption (or, kinder, missing symbols at link).
+EXPECT="wasi-sdk-34-rc.2"
+case "$WASI_SDK" in
+    *"$EXPECT"*) ;;
+    *)
+        echo "bash: expected $EXPECT (set WASI_SDK), got: $WASI_SDK" >&2
+        exit 1
+        ;;
+esac
 BASH_VER=5.2.37
 SRC="bash-$BASH_VER"
 COMPAT="$PWD/compat"
@@ -106,7 +120,7 @@ wit-bindgen c --world terminal "$TTY/wit/tty.wit" --out-dir "$TTYGEN"
 wit-bindgen c --world exec-host "$EXEC/wit" --out-dir "$EXECGEN"
 
 CFLAGS="--target=wasm32-wasip2 -O2 -DWK_EXEC=1 -I$COMPAT -I$EXEC -I$EXECGEN -I$PIPE -I$TTY -I$TTYGEN \
-    -DHAVE_TERMIOS_H=1 -DHAVE_TCGETATTR=1 \
+    -DHAVE_TERMIOS_H=1 -DHAVE_TCGETATTR=1 -DNEED_EXTERN_PC \
     -Wno-implicit-function-declaration -Wno-deprecated-non-prototype \
     -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false \
     -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID"
@@ -143,14 +157,19 @@ if [ -f Makefile ] && [ "$(cat .wk-toolchain 2>/dev/null)" != "$TOOLCHAIN" ]; th
     rm -f .wk-toolchain
 fi
 if [ ! -f Makefile ]; then
+    # Configure's probes link with the shims (their answers must match the
+    # real link — e.g. compat.c provides strsignal, so bash must not build
+    # its own siglist) — but WITHOUT exit_shim.o: its exit-with-code import
+    # is feature-gated in wasm-component-ld's bundled WIT, and a bare
+    # conftest component can't resolve it, failing the "compiler works"
+    # check. Nothing configure probes needs the exit override.
     CC="$WASI_SDK/bin/clang" \
     AR="$WASI_SDK/bin/llvm-ar" \
     RANLIB="$WASI_SDK/bin/llvm-ranlib" \
     CC_FOR_BUILD=/usr/bin/cc CFLAGS_FOR_BUILD="-O1" \
-    CFLAGS="$CFLAGS" LDFLAGS="$LDFLAGS" \
+    CFLAGS="$CFLAGS" LDFLAGS="${LDFLAGS/$COMPAT\/exit_shim.o /}" \
     ./configure --host=wasm32-wasi \
-        --disable-job-control --disable-readline --disable-history \
-        --disable-nls --without-bash-malloc \
+        --disable-job-control --disable-nls --without-bash-malloc \
         ac_cv_have_sig_atomic_t=yes bash_cv_signal_vintage=posix \
         ac_cv_func_getcwd=yes bash_cv_getcwd_malloc=yes \
         bash_cv_dev_stdin=absent
