@@ -1,0 +1,69 @@
+// vim: set filetype=kdl :
+// Nodes as filesystems — wk's FUSE (wk:fs), shown four ways. Run with:
+//
+//   wk run example/filesystems.wk
+//
+// Every wire into bash below is a live mount: the app on the other end
+// ANSWERS the filesystem operations. In the bash terminal, try:
+//
+//   ls /hellofuse && cat /hellofuse/hello     # unmodified libfuse hello.c
+//   ls -R /zip && cat /zip/readme.md          # a zip browsed in place (miniz)
+//   echo hi > /peer/shared-notes.txt          # passfs re-exports ITS files —
+//   cat /peer/shared-notes.txt                # ...writable, straight through
+//   cat /hellofs/counter                      # hellofs synthesizes per open
+//
+// The chain behind /peer is the fun one: a Volume is bind-mounted into the
+// passfs node, whose unmodified libfuse passthrough.c mirrors its own
+// filesystem — so bash sees the volume THROUGH another node's daemon, and
+// writes travel the whole way back.
+//
+// Build the providers first (each is `mise run build` in its plugin dir):
+// hellofuse, passfs, zipfs, and hellofs (cargo component build). bash is the
+// docker:// dep from workspace.wk. Also try httpfs — a network filesystem
+// over the fabric — by pointing its args at any HTTP file server node on
+// its network: `httpfs http://filesrv:8080`.
+import "../workspace.wk"
+workspace "01KWFSDEM0000000000000WS00" {
+    node "bash" "01KWFSDEM0000000000000SH01" {
+        pos 700.0 300.0
+        size 560.0 340.0
+    }
+    node "hellofuse" "01KWFSDEM0000000000000HF02" {
+        pos 80.0 80.0
+        size 300.0 160.0
+    }
+    node "zipfs" "01KWFSDEM0000000000000ZF03" {
+        pos 80.0 300.0
+        size 300.0 160.0
+    }
+    node "passfs" "01KWFSDEM0000000000000PF04" {
+        pos 80.0 520.0
+        size 300.0 160.0
+    }
+    node "hellofs" "01KWFSDEM0000000000000MF05" {
+        pos 80.0 740.0
+        size 300.0 160.0
+    }
+    bindmount "example/demo-archive.zip" "01KWFSDEM0000000000000BM06" {
+        pos 420.0 740.0
+        size 220.0 120.0
+    }
+    volume "shared-notes.txt" "01KWFSDEM0000000000000VL07" {
+        pos 420.0 520.0
+        size 220.0 120.0
+    }
+    note "01KWFSDEM0000000000000NT08" {
+        text "Every wire into bash is a live mount:\nthe node on the other end answers\nopen/read/readdir like a FUSE daemon.\n\nhellofuse + passfs run libfuse's own\nexamples, compiled unmodified.\n\nThe zip is browsed in place — never\nunpacked. The volume reaches bash\nTHROUGH passfs's daemon, writable."
+        pos 700.0 60.0
+        size 340.0 210.0
+    }
+    // The archive feeds zipfs; the volume feeds passfs. Both nodes then
+    // serve what they were given, each through its own daemon.
+    connection "01KWFSDEM0000000000000BM06" "01KWFSDEM0000000000000ZF03"
+    connection "01KWFSDEM0000000000000VL07" "01KWFSDEM0000000000000PF04"
+    // Provider mounts into bash, each at its own path.
+    connection "01KWFSDEM0000000000000HF02" "01KWFSDEM0000000000000SH01" "/hellofuse"
+    connection "01KWFSDEM0000000000000ZF03" "01KWFSDEM0000000000000SH01" "/zip"
+    connection "01KWFSDEM0000000000000PF04" "01KWFSDEM0000000000000SH01" "/peer"
+    connection "01KWFSDEM0000000000000MF05" "01KWFSDEM0000000000000SH01" "/hellofs"
+}

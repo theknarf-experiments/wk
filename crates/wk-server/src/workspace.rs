@@ -1425,6 +1425,36 @@ mod tests {
     }
 
     #[test]
+    fn filesystems_example_wires_provider_mounts() {
+        // The nodes-as-filesystems showcase: app→app connections (provider
+        // mounts) ride the same relation as volume binds, each with its own
+        // mount path, and every provider dep resolves via the root import.
+        let example = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example/filesystems.wk"
+        ));
+        let doc = Document::load_resolved(example).expect("filesystems.wk resolves");
+        let names: Vec<&str> = doc.dependencies.iter().map(|d| d.name.as_str()).collect();
+        for want in ["bash", "hellofuse", "passfs", "zipfs", "hellofs", "httpfs"] {
+            assert!(names.contains(&want), "{want} available via import");
+        }
+        let ws = doc
+            .workspaces
+            .iter()
+            .find(|w| !w.nodes.is_empty())
+            .expect("demo workspace");
+        // Two feeds (zip→zipfs, volume→passfs) + four provider mounts.
+        assert_eq!(ws.connections.len(), 6);
+        let paths: Vec<&str> = ws.mount_paths.values().map(|s| s.as_str()).collect();
+        for want in ["/hellofuse", "/zip", "/peer", "/hellofs"] {
+            assert!(paths.contains(&want), "{want} mount path present");
+        }
+        assert!(ws.nodes.iter().any(
+            |n| matches!(&n.kind, SnapKind::BindMount { path } if path.ends_with("demo-archive.zip"))
+        ));
+    }
+
+    #[test]
     fn imports_are_cycle_safe() {
         let dir = std::env::temp_dir().join("wk-import-cycle");
         let _ = std::fs::remove_dir_all(&dir);
