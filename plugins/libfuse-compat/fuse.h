@@ -38,6 +38,19 @@ extern "C" {
 #error "define FUSE_USE_VERSION before including fuse.h"
 #endif
 
+/* ---- POSIX bits wasi-libc doesn't declare ----
+ *
+ * Daemons like passthrough.c call these unconditionally; wasi-libc has no
+ * declarations (or definitions) for them. Declared here — fuse.h is the
+ * first include in a FUSE daemon — with shim stubs that fail with ENOSYS
+ * (umask is an accepted no-op). wk's provider protocol never issues the
+ * operations that would reach them, so daemons behave as if the underlying
+ * filesystem simply doesn't support device nodes or ownership. */
+int lchown(const char *path, uid_t uid, gid_t gid);
+int mkfifoat(int dirfd, const char *path, mode_t mode);
+int mknodat(int dirfd, const char *path, mode_t mode, dev_t dev);
+mode_t umask(mode_t mask);
+
 /* ---- fuse_common.h surface ---- */
 
 struct fuse_file_info {

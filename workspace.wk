@@ -24,6 +24,9 @@ dependencies {
     hellofuse "plugins/hellofuse/hellofuse.wasm" {
         description "libfuse's unmodified hello example via the libfuse-compat shim — real FUSE code as a node"
     }
+    passfs "plugins/passfs/passfs.wasm" {
+        description "libfuse's unmodified passthrough example — re-exports this node's own filesystem to whoever wires it"
+    }
     piano "plugins/piano/target/wasm32-wasip1/debug/piano.wasm" {
         description "on-screen keyboard emitting MIDI"
     }

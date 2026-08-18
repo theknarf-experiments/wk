@@ -2130,6 +2130,194 @@ mod tests {
         node.kill.store(true, Ordering::Relaxed);
     }
 
+    /// libfuse's UNMODIFIED upstream passthrough.c as a provider node: it
+    /// mirrors "the underlying filesystem", which in wk is the node's OWN
+    /// vfs — so the node re-exports its filesystem to whoever wires it. The
+    /// full chain both ways: a consumer's wasi:filesystem ops cross the
+    /// provider mount into the shim, into xmp_* callbacks, into wasi-libc,
+    /// into the passfs node's vfs — and its writes are visible right back
+    /// in that vfs from the host side. Skipped when the artifact isn't built.
+    #[test]
+    fn passfs_reexports_its_own_vfs() {
+        use wk_vfs::wasi::filesystem::preopens::Host as Preopens;
+        use wk_vfs::wasi::filesystem::types::{
+            DescriptorFlags, HostDescriptor, OpenFlags, PathFlags,
+        };
+
+        let wasm = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/passfs/passfs.wasm");
+        if !wasm.exists() {
+            eprintln!("skipping: build plugins/passfs first (./build.sh)");
+            return;
+        }
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        host.spawn(
+            &wasm,
+            "passfs",
+            id,
+            &[],
+            Arc::new(Mutex::new(Vec::new())),
+            nodes.clone(),
+            Vec::new(),
+            None,
+        )
+        .expect("spawn");
+        let node = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                if let Some(n) = nodes.lock().unwrap().iter().find(|n| n.id == id).cloned() {
+                    if n.serves_fs() && n.fs_serve.is_serving() {
+                        break n;
+                    }
+                    assert!(
+                        !n.finished.load(Ordering::Relaxed),
+                        "passfs exited before serving"
+                    );
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "passfs never started serving"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        // Seed the provider's OWN filesystem — what passthrough.c mirrors.
+        {
+            let mut g = node.fs.lock().unwrap();
+            g.ensure_dir_path("srv");
+            g.put_file_at("srv/motd.txt", b"from the node's own vfs".to_vec());
+        }
+
+        struct ConsumerStore {
+            table: ResourceTable,
+            fs: crate::vfs::SharedFs,
+        }
+        impl wasmtime_wasi_io::IoView for ConsumerStore {
+            fn table(&mut self) -> &mut ResourceTable {
+                &mut self.table
+            }
+        }
+        impl wk_vfs::VfsView for ConsumerStore {
+            fn fs(&mut self) -> crate::vfs::SharedFs {
+                self.fs.clone()
+            }
+        }
+        let fs = crate::vfs::new_fs();
+        crate::vfs::mount_provider(&fs, "/peer", node.fs_serve.clone(), true);
+        let mut store = wk_vfs::VfsImpl(ConsumerStore {
+            table: ResourceTable::new(),
+            fs,
+        });
+        let root = Preopens::get_directories(&mut store)
+            .expect("preopen")
+            .remove(0)
+            .0;
+        let root_fd = || wasmtime::component::Resource::new_own(root.rep());
+
+        // Read a seeded file through the whole chain.
+        let fd = HostDescriptor::open_at(
+            &mut store,
+            root_fd(),
+            PathFlags::SYMLINK_FOLLOW,
+            "peer/srv/motd.txt".into(),
+            OpenFlags::empty(),
+            DescriptorFlags::empty(),
+        )
+        .unwrap()
+        .expect("opens the mirrored file");
+        let (bytes, _) = HostDescriptor::read(
+            &mut store,
+            wasmtime::component::Resource::new_own(fd.rep()),
+            64,
+            0,
+        )
+        .unwrap()
+        .expect("reads through passthrough");
+        assert_eq!(bytes, b"from the node's own vfs");
+
+        // Directory kinds survive the d_type mapping: `srv` lists as a dir.
+        let dirfd = HostDescriptor::open_at(
+            &mut store,
+            root_fd(),
+            PathFlags::SYMLINK_FOLLOW,
+            "peer".into(),
+            OpenFlags::DIRECTORY,
+            DescriptorFlags::empty(),
+        )
+        .unwrap()
+        .expect("opens the mount root");
+        let stream = HostDescriptor::read_directory(&mut store, dirfd)
+            .unwrap()
+            .expect("lists");
+        let mut entries = Vec::new();
+        loop {
+            use wk_vfs::wasi::filesystem::types::HostDirectoryEntryStream;
+            match HostDirectoryEntryStream::read_directory_entry(
+                &mut store,
+                wasmtime::component::Resource::new_own(stream.rep()),
+            )
+            .unwrap()
+            .unwrap()
+            {
+                Some(e) => entries.push((e.name, e.type_)),
+                None => break,
+            }
+        }
+        use wk_vfs::wasi::filesystem::types::DescriptorType;
+        assert!(entries
+            .iter()
+            .any(|(n, t)| n == "srv" && *t == DescriptorType::Directory));
+
+        // Write back through the mount: create + write land in the provider
+        // node's own vfs, visible from the host side.
+        let wfd = HostDescriptor::open_at(
+            &mut store,
+            root_fd(),
+            PathFlags::SYMLINK_FOLLOW,
+            "peer/srv/note.txt".into(),
+            OpenFlags::CREATE,
+            DescriptorFlags::WRITE,
+        )
+        .unwrap()
+        .expect("creates through passthrough");
+        HostDescriptor::write(
+            &mut store,
+            wasmtime::component::Resource::new_own(wfd.rep()),
+            b"written across the wire".to_vec(),
+            0,
+        )
+        .unwrap()
+        .expect("writes through passthrough");
+        assert_eq!(
+            node.fs
+                .lock()
+                .unwrap()
+                .read_file("/srv/note.txt", 64)
+                .as_deref(),
+            Some(&b"written across the wire"[..]),
+            "the write landed in the provider's own vfs"
+        );
+
+        // mkdir + unlink round-trip the same way.
+        HostDescriptor::create_directory_at(&mut store, root_fd(), "peer/made".into())
+            .unwrap()
+            .expect("mkdir through passthrough");
+        assert!(node.fs.lock().unwrap().list_dir("/made").is_some());
+        HostDescriptor::unlink_file_at(&mut store, root_fd(), "peer/srv/note.txt".into())
+            .unwrap()
+            .expect("unlinks through passthrough");
+        assert_eq!(
+            node.fs.lock().unwrap().read_file("/srv/note.txt", 8),
+            None,
+            "the unlink landed in the provider's own vfs"
+        );
+
+        node.kill.store(true, Ordering::Relaxed);
+    }
+
     /// Outbound wasi:http is denied unless the node's fabric stack has host
     /// access (i.e. it's wired to a Gateway) — the same gate as raw sockets.
     /// A stackless store (pure-http node / serve store) is always denied.

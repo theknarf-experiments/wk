@@ -275,7 +275,11 @@ static int dir_fill(void *buf, const char *name, const struct stat *stbuf,
         b->cap = cap;
     }
     wk_fs_provider_entry_kind_t kind = WK_FS_PROVIDER_ENTRY_KIND_FILE;
-    if (stbuf) {
+    /* Trust the daemon's stbuf only when it carries a recognizable type:
+       daemons that synthesize st_mode as `d_type << 12` (passthrough.c)
+       assume Linux's DT↔S_IF correspondence, which wasi-libc's d_type
+       values don't follow — an unrecognizable mode falls back to getattr. */
+    if (stbuf && (S_ISDIR(stbuf->st_mode) || S_ISREG(stbuf->st_mode))) {
         kind = S_ISDIR(stbuf->st_mode) ? WK_FS_PROVIDER_ENTRY_KIND_DIR
                                        : WK_FS_PROVIDER_ENTRY_KIND_FILE;
     } else {
@@ -642,4 +646,37 @@ int fuse_main_real(int argc, char *argv[], const struct fuse_operations *op,
     if (g_ops.destroy)
         g_ops.destroy(g_ctx.private_data);
     return 0;
+}
+
+/* ---- POSIX stubs for daemons that reference what wasi has no kernel for
+ * (see the declarations in fuse.h). ---- */
+
+int lchown(const char *path, uid_t uid, gid_t gid) {
+    (void)path;
+    (void)uid;
+    (void)gid;
+    errno = ENOSYS;
+    return -1;
+}
+
+int mkfifoat(int dirfd, const char *path, mode_t mode) {
+    (void)dirfd;
+    (void)path;
+    (void)mode;
+    errno = ENOSYS;
+    return -1;
+}
+
+int mknodat(int dirfd, const char *path, mode_t mode, dev_t dev) {
+    (void)dirfd;
+    (void)path;
+    (void)mode;
+    (void)dev;
+    errno = ENOSYS;
+    return -1;
+}
+
+mode_t umask(mode_t mask) {
+    (void)mask;
+    return 0; /* no process umask on wasi; accepted and ignored */
 }

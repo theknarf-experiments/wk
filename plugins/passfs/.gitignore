@@ -1,0 +1,4 @@
+passthrough.c
+passthrough_helpers.h
+passfs.wasm
+*.core.wasm
