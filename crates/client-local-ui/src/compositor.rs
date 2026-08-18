@@ -279,6 +279,10 @@ struct App {
     /// Background-fetched listings/previews for inspector paths that cross a
     /// provider mount (the render thread never blocks on a guest).
     browse: ProviderBrowse,
+    /// OS file drag-and-drop: whether a drag is hovering the window, and how
+    /// many files of the current drop have landed (staggers their nodes).
+    drop_hovering: bool,
+    drop_stagger: u32,
     /// When viewing a node's output log (a modal overlay). Mutually exclusive
     /// with `inspect` — one panel at a time.
     logs: Option<LogView>,
@@ -373,6 +377,8 @@ impl App {
             capture_tick: 0,
             inspect: None,
             browse: ProviderBrowse::new(),
+            drop_hovering: false,
+            drop_stagger: 0,
             logs: None,
             log_max_scroll: 0.0,
             clipboard: arboard::Clipboard::new().ok(),
@@ -5409,6 +5415,38 @@ impl ApplicationHandler for App {
                 // (3D look mode reads raw `DeviceEvent::MouseMotion` deltas —
                 // the cursor is grabbed and frozen while it's held.)
                 self.mouse = [(position.x / scale) as f32, (position.y / scale) as f32];
+            }
+            // OS file drag-and-drop: each dropped path becomes a BindMount
+            // node already pointed at it — one undoable create, no
+            // create-then-type-the-path dance. Placed at the cursor's canvas
+            // spot in 2D (winit reports no drop coordinates, so this is the
+            // last position the window saw — usually where the drag entered);
+            // the 3D view uses the palette's usual staggered slot. A
+            // multi-file drop staggers so nodes don't stack.
+            WindowEvent::HoveredFile(_) if !self.drop_hovering => {
+                self.drop_hovering = true;
+                self.drop_stagger = 0;
+            }
+            WindowEvent::HoveredFile(_) => {}
+            WindowEvent::HoveredFileCancelled => self.drop_hovering = false,
+            WindowEvent::DroppedFile(path) => {
+                self.drop_hovering = false;
+                let n = self.drop_stagger as f32;
+                self.drop_stagger += 1;
+                let pos = if self.mode_3d {
+                    self.next_file_pos()
+                } else {
+                    let c = self.cam.to_canvas(self.mouse);
+                    [
+                        c[0] - FILE_W * 0.5 + n * 28.0,
+                        c[1] - FILE_H * 0.5 + n * 28.0,
+                    ]
+                };
+                self.conn.send(Command::Create(Resource::HostMount {
+                    path: path.to_string_lossy().into_owned(),
+                    pos,
+                    ws: self.active_ws,
+                }));
             }
             WindowEvent::MouseInput {
                 state,

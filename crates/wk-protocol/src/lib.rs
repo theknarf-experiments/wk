@@ -164,6 +164,14 @@ pub enum Resource {
         pos: [f32; 2],
         ws: NodeId,
     },
+    /// A BindMount node already pointed at a host path (a file or a folder) —
+    /// what dropping a file from the OS onto the canvas creates, in one
+    /// undoable step instead of create-then-point.
+    HostMount {
+        path: String,
+        pos: [f32; 2],
+        ws: NodeId,
+    },
     /// A connection between two nodes (the kind is inferred from them). No-op if
     /// they are already wired — removal is [`ResourceRef::Wire`] + Delete, never
     /// a side effect of create.
@@ -262,7 +270,9 @@ impl Command {
     /// to apply this command.
     pub fn required(&self) -> (ResourceKind, Action) {
         match self {
-            Command::Create(Resource::Node { .. }) => (ResourceKind::Node, Action::Create),
+            Command::Create(Resource::Node { .. } | Resource::HostMount { .. }) => {
+                (ResourceKind::Node, Action::Create)
+            }
             Command::Create(Resource::Wire { .. }) => (ResourceKind::Wire, Action::Create),
             Command::Create(Resource::Workspace { .. }) => {
                 (ResourceKind::Workspace, Action::Create)

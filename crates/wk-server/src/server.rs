@@ -876,6 +876,20 @@ impl Server {
             .insert(id, FileNode::Bind(BindMount { name, path }));
     }
 
+    /// Create a BindMount node already pointed at `path` — what an OS
+    /// drag-and-drop onto the canvas delivers. Same node the palette's
+    /// create-then-point produces, minus the placeholder file: the dropped
+    /// path exists by definition.
+    fn add_host_mount(&mut self, path: PathBuf, pos: [f32; 2], ws: NodeId) {
+        let id = self.alloc_id();
+        let name = host_file_name(&path);
+        self.place(id, Kind::File, ws, pos, [FILE_W, FILE_H]);
+        self.graph
+            .file_nodes
+            .insert(id, FileNode::Bind(BindMount { name, path }));
+        self.sync_mounts();
+    }
+
     /// Create a HostPort node at `pos` (auto-assigned localhost port).
     fn add_host_port(&mut self, pos: [f32; 2], ws: NodeId) {
         let id = self.alloc_id();
@@ -2444,7 +2458,8 @@ impl Server {
     pub fn apply(&mut self, cmd: Command) {
         match &cmd {
             // Node creates: run, then record removal of whatever node appeared.
-            Command::Create(Resource::Node { .. }) | Command::Duplicate(_) => {
+            Command::Create(Resource::Node { .. } | Resource::HostMount { .. })
+            | Command::Duplicate(_) => {
                 let before: HashSet<NodeId> = self.graph.nodes.keys().copied().collect();
                 self.dispatch(cmd);
                 let created: Vec<NodeId> = self
@@ -2584,6 +2599,9 @@ impl Server {
             },
             // Create is create only: a wire that already exists is left alone
             // (removal is Delete, so a create-only token can never disconnect).
+            Command::Create(Resource::HostMount { path, pos, ws }) => {
+                self.add_host_mount(PathBuf::from(path), pos, ws)
+            }
             Command::Create(Resource::Wire { a, b }) => {
                 if !self.wired(a, b) {
                     self.connect_toggle(a, b);
@@ -3752,6 +3770,36 @@ mod model_tests {
             "classified as a provider mount once decidable"
         );
         assert!(s.graph.midi_links.is_empty());
+    }
+
+    /// Dropping a file from the OS creates a BindMount already pointed at
+    /// the path (Resource::HostMount), named by its basename, in one
+    /// undoable step.
+    #[test]
+    fn host_mount_creates_a_pointed_bind_in_one_step() {
+        let mut s = fresh_server();
+        let ws = s.graph.workspaces[0];
+        s.apply(Command::Create(Resource::HostMount {
+            path: "/some/where/data.csv".into(),
+            pos: [10.0, 20.0],
+            ws,
+        }));
+        let (&id, bind) = s
+            .graph
+            .file_nodes
+            .iter()
+            .find_map(|(id, f)| match f {
+                FileNode::Bind(b) => Some((id, b)),
+                _ => None,
+            })
+            .expect("a bind node exists");
+        assert_eq!(bind.name, "data.csv", "named by basename");
+        assert_eq!(bind.path, PathBuf::from("/some/where/data.csv"));
+        assert!(s.graph.nodes.contains_key(&id), "placed on the canvas");
+
+        // One undo removes it — the create was recorded as a single step.
+        s.apply(Command::Undo);
+        assert!(s.graph.file_nodes.is_empty(), "undo uncreates the mount");
     }
 
     /// A HostPort's localhost port can be set absolutely via `port_set` (what
