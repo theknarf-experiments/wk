@@ -159,3 +159,13 @@ plugins/pipe-compat/*.o
 plugins/bash/coreutils.wasm
 plugins/bash/grep.wasm
 plugins/bash/bin/
+
+# doctools (pandoc fetched from its upstream CI deploy + componentized by
+# build.sh; the symlink farm is staged; the TeX build tree is derived)
+plugins/doctools/pandoc-core.wasm
+plugins/doctools/pandoc.wasm
+plugins/doctools/pdftex.wasm
+plugins/doctools/adapter/
+plugins/doctools/bin/
+plugins/doctools/tex/
+plugins/doctools/texmf/

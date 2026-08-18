@@ -1,0 +1,48 @@
+% kpathsea configuration for the doctools image — a deliberately small texmf:
+% enough of TeX Live (latex-base level, cm fonts, l3kernel) to dump latex.fmt
+% and run pdflatex on simple documents. Found via TEXMFCNF (set by the image's
+% ENV) at $TEXMFDIST/web2c/texmf.cnf.
+TEXMFROOT = /usr/share/texlive
+TEXMFDIST = $TEXMFROOT/texmf-dist
+TEXMFVAR = /var/lib/texmf
+TEXMFCONFIG = $TEXMFVAR/config
+TEXMF = {$TEXMFVAR,$TEXMFDIST}
+% No ls-R databases in the image: plain recursive search over the small tree
+% (TEXMFDBS deliberately not set to empty: kpathsea warns on a valueless line).
+
+TEXINPUTS.pdflatex = .;$TEXMF/tex/{latex,generic,}//
+TEXINPUTS.pdftex = .;$TEXMF/tex/{plain,generic,}//
+TEXINPUTS = .;$TEXMF/tex/{generic,}//
+
+TEXFORMATS = .;$TEXMF/web2c{/pdftex,}//
+TEXPOOL = .;$TEXMF/web2c//
+TFMFONTS = .;$TEXMF/fonts/tfm//
+T1FONTS = .;$TEXMF/fonts/type1//
+ENCFONTS = .;$TEXMF/fonts/enc//
+TEXFONTMAPS = .;$TEXMF/fonts/map/{pdftex,dvips,}//
+VFFONTS = .;$TEXMF/fonts/vf//
+
+% No processes on WASI: no shell escape, no mktex font generation.
+shell_escape = f
+MKTEXTFM = 0
+MKTEXPK = 0
+
+% TeX memory: comfortable defaults for real documents.
+main_memory = 5000000
+extra_mem_top = 0
+extra_mem_bot = 0
+pool_size = 6250000
+max_strings = 500000
+font_mem_size = 8000000
+hash_extra = 600000
+save_size = 100000
+stack_size = 10000
+param_size = 20000
+nest_size = 1000
+max_in_open = 100
+buf_size = 200000
+expand_depth = 10000
+dvi_buf_size = 16384
+error_line = 79
+half_error_line = 50
+max_print_line = 79

@@ -1,0 +1,53 @@
+// vim: set filetype=kdl :
+// doc-tools: the real pandoc (3.5, built upstream by the GHC WebAssembly
+// backend) AND the real pdfTeX (1.40.29, cross-compiled from TeX Live
+// source), layered on the wk-shell image — document conversion and
+// typesetting entirely inside wk. In the doctools terminal, try:
+//
+//   pandoc --version
+//   pdftex --version
+//   cd /docs
+//   pandoc sample.md -s -o sample.tex      # markdown -> standalone LaTeX
+//   pdflatex -interaction=nonstopmode sample.tex   # LaTeX -> sample.pdf
+//   pandoc sample.md -t html               # ...or HTML to stdout
+//
+// latex.fmt was dumped by `pdftex -ini` DURING the image build (wk executes
+// wasm in RUN steps), against a minimal ~35 MB texmf (latex-base, l3kernel,
+// cm + Latin Modern with real Type1s, and the packages pandoc's standalone
+// template loads). Exotic \usepackage's beyond that set won't resolve.
+//
+// The vim node edits the same /docs/sample.md — change it there, re-run the
+// pipeline in the shell (both nodes mount the example/doctools-docs
+// directory).
+//
+// Build the image once (fetches the pinned upstream pandoc.wasm, cross-builds
+// pdfTeX + the texmf tree, then builds + tags the bash base and doctools
+// images — the TeX cross-build takes a while the first time):
+//   (cd plugins/bash && mise run build)       # if bash.wasm isn't built yet
+//   (cd plugins/doctools && mise run build)
+// Then, from the repo root:
+//   wk run example/doctools.wk
+import "../workspace.wk"
+workspace "01KZDCT000000000000000WS01" {
+    node "doctools" "01KZDCT000000000000000AP02" {
+        pos 620.0 300.0
+        size 560.0 340.0
+    }
+    node "vim" "01KZDCT000000000000000VM03" {
+        pos 620.0 700.0
+        size 560.0 340.0
+        args "/docs/sample.md"
+    }
+    bindmount "example/doctools-docs" "01KZDCT000000000000000BM04" {
+        pos 300.0 520.0
+        size 220.0 120.0
+    }
+    note "01KZDCT000000000000000NT05" {
+        text "pandoc + pdfTeX, for real, in a wasm\ncontainer.\n\nThe doctools image is FROM the bash\nimage + /bin/pandoc (upstream GHC-wasm\nbuild) + /bin/pdftex (cross-compiled\nfrom TeX Live source) + a minimal\ntexmf. bash runs them through wk:exec —\nno fork/exec needed. latex.fmt was\ndumped by pdftex -ini during the image\nbuild.\n\nBoth nodes mount example/doctools-docs\nat /docs: edit sample.md in vim, then\nin the shell:\n\n  cd /docs\n  pandoc sample.md -s -o sample.tex\n  pdflatex -interaction=nonstopmode \\\n      sample.tex"
+        pos 140.0 40.0
+        size 400.0 340.0
+    }
+    // The docs directory into both nodes, at the same mount path.
+    connection "01KZDCT000000000000000BM04" "01KZDCT000000000000000AP02" "/docs"
+    connection "01KZDCT000000000000000BM04" "01KZDCT000000000000000VM03" "/docs"
+}

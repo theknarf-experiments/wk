@@ -1,0 +1,18 @@
+diff --git a/texk/kpathsea/progname.c b/texk/kpathsea/progname.c
+index a984eabc..0e3feeba 100644
+--- a/texk/kpathsea/progname.c
++++ b/texk/kpathsea/progname.c
+@@ -365,7 +365,12 @@ kpathsea_selfdir (kpathsea kpse, const_string argv0)
+          only executable by some classes and not others.  See the
+          `file_status' function in execute_cmd.c in bash for what's
+          necessary if we were to do it right.  */
+-      if (stat (name, &s) == 0 && s.st_mode & (S_IXUSR|S_IXGRP|S_IXOTH)
++      if (stat (name, &s) == 0
++#ifndef __wasi__
++                               /* No execute bits in a wk/WASI vfs; a stat-able
++                                  non-directory on PATH is the program. */
++                               && s.st_mode & (S_IXUSR|S_IXGRP|S_IXOTH)
++#endif
+                                /* Do not stop at directories. */
+                                && !S_ISDIR(s.st_mode))
+         self = name;
