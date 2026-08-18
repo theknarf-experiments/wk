@@ -44,4 +44,9 @@ impl wk::tty::control::Host for HostState {
         self.term_io.set_tty(echo, canonical);
         Ok(())
     }
+
+    fn set_output_nl(&mut self, nl: bool) -> Result<()> {
+        self.term_io.set_output_nl(nl);
+        Ok(())
+    }
 }

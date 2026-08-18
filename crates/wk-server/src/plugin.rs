@@ -2838,9 +2838,19 @@ mod tests {
         node.term_io.feed_in(b"ech\t");
         let after_complete = wait_for("echo", after_prompt);
 
-        // Finish the line: the completed command actually runs.
+        // Finish the line: the completed command actually runs, and its
+        // output carries the pty-style CRLF — the write-time ONLCR that the
+        // shim's OPOST transport enables (without it, a readline session
+        // holds the terminal raw at the prompt and cooked output renders
+        // under raw rules: the staircase-alignment regression).
         node.term_io.feed_in(b"readline-works\n");
-        wait_for("readline-works", after_complete);
+        let upto = wait_for("readline-works", after_complete);
+        let (bytes, _) = node.term_io.log_read(0);
+        let _ = upto;
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("readline-works\r\n"),
+            "command output is CRLF-translated at write time"
+        );
 
         node.kill.store(true, Ordering::Relaxed);
     }

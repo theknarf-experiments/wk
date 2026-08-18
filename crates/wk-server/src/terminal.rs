@@ -74,6 +74,11 @@ pub struct TermIo {
     /// non-destructive, so it never competes with the terminal renderer.
     log: Mutex<LogRing>,
     inp: Mutex<InpState>,
+    /// Output post-processing (termios `OPOST|ONLCR`), reported by the guest
+    /// via `wk:tty/control.set-output-nl`. `None` = the guest never said
+    /// (built before the function existed): fall back to the old heuristic
+    /// of translating only in canonical mode.
+    out_nl: Mutex<Option<bool>>,
     tty: Mutex<TtyMode>,
     /// The grid size (cols, rows) the client has sized this terminal to. The
     /// guest reads it via `wk:tty/control`/`ioctl(TIOCGWINSZ)` and polls it for
@@ -119,6 +124,7 @@ impl TermIo {
         Arc::new(TermIo {
             out: Mutex::new(VecDeque::new()),
             log: Mutex::new(LogRing::default()),
+            out_nl: Mutex::new(None),
             inp: Mutex::new(InpState {
                 buf: VecDeque::new(),
                 waker: None,
@@ -166,6 +172,30 @@ impl TermIo {
     }
 
     fn write_out(&self, b: &[u8]) {
+        // Output post-processing (a kernel pty's ONLCR), applied AT WRITE
+        // TIME with the mode in effect right now. Rendering used to translate
+        // instead, sampling the mode at frame time — with readline flipping
+        // the terminal raw again before the next frame, a command's cooked
+        // output rendered under raw rules and stair-stepped.
+        let translate = self
+            .out_nl
+            .lock()
+            .unwrap()
+            .unwrap_or_else(|| !self.is_raw());
+        let translated;
+        let b: &[u8] = if translate && b.contains(&b'\n') {
+            let mut t = Vec::with_capacity(b.len() + 8);
+            for &c in b {
+                if c == b'\n' {
+                    t.push(b'\r');
+                }
+                t.push(c);
+            }
+            translated = t;
+            &translated
+        } else {
+            b
+        };
         let mut o = self.out.lock().unwrap();
         // Bound the backlog so a guest that floods stdout can't grow it forever.
         if o.len() < (4 << 20) {
@@ -174,6 +204,11 @@ impl TermIo {
         drop(o);
         // Also retain it in the (bounded) log ring for non-destructive reads.
         self.log.lock().unwrap().push(b);
+    }
+
+    /// The guest declared its output post-processing (see `out_nl`).
+    pub fn set_output_nl(&self, nl: bool) {
+        *self.out_nl.lock().unwrap() = Some(nl);
     }
 
     /// Take everything the guest has written to stdout since the last call.
@@ -209,6 +244,9 @@ impl TermIo {
     /// old guest saw EOF and exited; the new one starts from a clean stream.
     pub fn reopen(&self) {
         self.inp.lock().unwrap().closed = false;
+        // The next guest may be a different binary that never declares its
+        // output mode; start from the legacy heuristic again.
+        *self.out_nl.lock().unwrap() = None;
     }
 }
 
@@ -448,23 +486,12 @@ impl Terminal {
     }
 
     /// Feed guest stdout bytes through the VT parser, updating the grid.
+    /// Output post-processing (ONLCR) already happened at write time in
+    /// [`TermIo::write_out`], with the mode in effect when the guest wrote —
+    /// translating here sampled the mode at frame time, which raced a
+    /// readline guest flipping the terminal back to raw before the frame.
     pub fn feed(&mut self, bytes: &[u8]) {
-        // Raw vs cooked comes from the guest via `wk:tty/control` (read off the
-        // shared `TermIo`), not from sniffing the byte stream. In cooked mode do
-        // ONLCR — a bare LF also returns the carriage — so naive `println!`
-        // guests don't stair-step; a raw TUI emits its own CRLF.
-        if self.io.is_raw() {
-            self.parser.advance(&mut self.term, bytes);
-            return;
-        }
-        let mut buf = Vec::with_capacity(bytes.len());
-        for &b in bytes {
-            if b == b'\n' {
-                buf.push(b'\r');
-            }
-            buf.push(b);
-        }
-        self.parser.advance(&mut self.term, &buf);
+        self.parser.advance(&mut self.term, bytes);
     }
 
     /// The non-blank cells currently displayed.
@@ -646,10 +673,13 @@ mod tests {
 
     #[test]
     fn bare_newline_returns_carriage() {
-        // With LNM enabled by default, a lone `\n` drops to the next row AND
-        // returns to column 0 (so `println!`-style output doesn't stair-step).
-        let mut term = Terminal::new(TermIo::new());
-        term.feed(b"a\nb");
+        // ONLCR happens at WRITE time (a kernel pty's output post-processing),
+        // so `println!`-style output doesn't stair-step no matter what mode
+        // the terminal is in by the time a frame renders it.
+        let io = TermIo::new();
+        let mut term = Terminal::new(io.clone());
+        io.write_out(b"a\nb");
+        term.feed(&io.drain_out());
         let cells = term.cells();
         assert!(cells
             .iter()
@@ -657,6 +687,32 @@ mod tests {
         assert!(cells
             .iter()
             .any(|c| c.ch == 'b' && c.row == 1 && c.col == 0));
+    }
+
+    #[test]
+    fn output_translation_follows_the_guest_declaration() {
+        // A guest that declares OPOST|ONLCR on (readline: raw input, cooked
+        // output) gets CRLF even while input is raw — the staircase
+        // regression. One that clears OPOST (cfmakeraw: a full-screen TUI)
+        // gets its bytes verbatim. An undeclared guest falls back to the old
+        // input-mode heuristic.
+        let io = TermIo::new();
+        io.set_tty(false, false); // raw input, like readline at the prompt
+        io.set_output_nl(true);
+        io.write_out(b"x\n");
+        assert_eq!(io.drain_out(), b"x\r\n");
+
+        io.set_output_nl(false); // cfmakeraw
+        io.write_out(b"x\n");
+        assert_eq!(io.drain_out(), b"x\n");
+
+        // reopen (a restarted guest) forgets the declaration: heuristic again.
+        io.reopen();
+        io.write_out(b"x\n");
+        assert_eq!(io.drain_out(), b"x\n", "raw input, undeclared: verbatim");
+        io.set_tty(true, true);
+        io.write_out(b"x\n");
+        assert_eq!(io.drain_out(), b"x\r\n", "cooked, undeclared: translated");
     }
 
     #[test]
@@ -702,25 +758,28 @@ mod tests {
     #[test]
     fn raw_mode_follows_the_shared_tty_state() {
         // Raw mode is driven by the guest through wk:tty/control (shared TermIo),
-        // not by a byte-stream escape. A fresh terminal is cooked.
+        // not by a byte-stream escape. A fresh terminal is cooked, and the
+        // write path translates for it (ONLCR); raw stops the translation
+        // for undeclared guests (see output_translation_follows_the_guest_
+        // declaration for the declared cases). The renderer itself is a
+        // straight VT feed either way.
         let io = TermIo::new();
         let mut term = Terminal::new(io.clone());
         assert!(!term.is_raw());
-
-        // Cooked: a bare LF gets a carriage return (ONLCR), so text doesn't
-        // stair-step.
-        term.feed(b"a\nb");
+        io.write_out(b"a\nb");
+        term.feed(&io.drain_out());
         let cells = term.cells();
         assert!(cells
             .iter()
             .any(|c| c.ch == 'b' && c.col == 0 && c.row == 1));
 
-        // Guest goes raw (canonical off): the terminal reports it, and ONLCR
-        // stops (the app is responsible for its own CRLF).
+        // Guest goes raw (canonical off): the terminal reports it, and an
+        // undeclared guest's bytes pass verbatim (the app owns its CRLF).
         io.set_tty(false, false);
         assert!(term.is_raw());
         let mut term = Terminal::new(io.clone());
-        term.feed(b"a\nb");
+        io.write_out(b"a\nb");
+        term.feed(&io.drain_out());
         let cells = term.cells();
         assert!(cells
             .iter()

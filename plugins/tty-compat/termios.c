@@ -73,6 +73,12 @@ int tcsetattr(int fd, int optional_actions, const struct termios *t) {
         return -1;
     }
     wk_tty_control_set((t->c_lflag & ECHO) != 0, (t->c_lflag & ICANON) != 0);
+    /* Output post-processing crosses too: a kernel pty returns the carriage
+     * on LF whenever OPOST|ONLCR is set — which readline leaves on, and
+     * cfmakeraw (full-screen apps) clears. Without this the host can only
+     * guess from the input mode, which readline holds raw at the prompt. */
+    wk_tty_control_set_output_nl((t->c_oflag & OPOST) != 0 &&
+                                 (t->c_oflag & ONLCR) != 0);
     return 0;
 }
 

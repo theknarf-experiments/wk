@@ -32,6 +32,13 @@ interface control {
     /// Set the line discipline. `echo` mirrors termios `ECHO`; `canonical`
     /// mirrors `ICANON`. The window size is host-owned and unaffected.
     set: func(echo: bool, canonical: bool);
+
+    /// Set output post-processing: `nl` mirrors termios `OPOST|ONLCR` — the
+    /// host returns the carriage on a bare LF, like a kernel pty. Additive
+    /// (guests built before this function existed never call it): for those
+    /// the host falls back to translating only in canonical mode, its old
+    /// heuristic.
+    set-output-nl: func(nl: bool);
 }
 
 /// The host side: wk implements (imports) the tty control interface for guests.
