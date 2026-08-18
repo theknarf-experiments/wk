@@ -283,9 +283,15 @@ struct App {
     /// many files of the current drop have landed (staggers their nodes).
     drop_hovering: bool,
     drop_stagger: u32,
-    /// Palette "Go headless": exit the event loop but tell the host process
-    /// to keep the server running with no client attached.
+    /// Palette "Go headless": drop every window but keep pumping the event
+    /// loop — the server (and every node) runs on, with no client drawn.
+    /// Leaving the loop instead would beachball on macOS: a parked main
+    /// thread stops servicing the app's runloop, and even the window's own
+    /// close needs events pumped.
     request_headless: bool,
+    headless: bool,
+    /// The host's Ctrl-C flag: checked each pass; exits gracefully.
+    interrupt: Arc<std::sync::atomic::AtomicBool>,
     /// When viewing a node's output log (a modal overlay). Mutually exclusive
     /// with `inspect` — one panel at a time.
     logs: Option<LogView>,
@@ -335,7 +341,10 @@ struct App {
 }
 
 impl App {
-    fn new(conn: ServerHandle) -> Result<Self, String> {
+    fn new(
+        conn: ServerHandle,
+        interrupt: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Self, String> {
         let full = conn.view();
         let active_ws = full.workspaces.first().copied().unwrap_or_else(NodeId::new);
         let tabs = full.workspaces.clone();
@@ -383,6 +392,8 @@ impl App {
             drop_hovering: false,
             drop_stagger: 0,
             request_headless: false,
+            headless: false,
+            interrupt,
             logs: None,
             log_max_scroll: 0.0,
             clipboard: arboard::Clipboard::new().ok(),
@@ -1329,10 +1340,7 @@ impl App {
                 }
             }
             PaletteCmd::Quit => self.request_exit = true,
-            PaletteCmd::Headless => {
-                self.request_headless = true;
-                self.request_exit = true;
-            }
+            PaletteCmd::Headless => self.request_headless = true,
         }
     }
 
@@ -5362,7 +5370,7 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.gfx.is_none() {
+        if self.gfx.is_none() && !self.headless {
             match Gfx::new(event_loop) {
                 Ok(gfx) => self.gfx = Some(gfx),
                 Err(e) => {
@@ -5389,10 +5397,38 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // The host's Ctrl-C: leave the loop gracefully (the caller shuts the
+        // server down, which persists). The only exit from headless mode.
+        if self.interrupt.load(std::sync::atomic::Ordering::Relaxed) {
+            event_loop.exit();
+            return;
+        }
         // A palette "Quit" command asks to exit on the next loop.
         if self.request_exit {
             event_loop.exit();
             return;
+        }
+        // Palette "Go headless": drop every window and keep pumping — the
+        // server and its nodes run on. Never leave the loop: on macOS a
+        // parked main thread stops servicing the app runloop (beachball),
+        // and window teardown itself needs events pumped.
+        if self.request_headless && !self.headless {
+            self.request_headless = false;
+            self.headless = true;
+            self.detached.clear();
+            self.gfx = None;
+            #[cfg(target_os = "macos")]
+            {
+                use winit::platform::macos::ActiveEventLoopExtMacOS;
+                event_loop.hide_application();
+            }
+            eprintln!(
+                "wk: headless — nodes keep running; `wk ps`/`logs`/`attach` still work; Ctrl-C stops and saves"
+            );
+            return;
+        }
+        if self.headless {
+            return; // nothing to draw, nobody watching
         }
         if self.gfx.is_some() {
             self.sync_look_capture();
@@ -5755,29 +5791,36 @@ impl ApplicationHandler for App {
 /// The single-player front-end: a wgpu window driven by winit. It owns all the
 /// view/input state ([`App`]) and forwards mutations to the server as
 /// [`Command`]s over its [`ServerHandle`]. See [`wk_protocol::Client`].
-pub struct WindowClient;
+pub struct WindowClient {
+    /// Set (by the host's Ctrl-C handler) to interrupt the loop gracefully —
+    /// the only way out of a headless (windowless) session.
+    pub interrupt: Arc<std::sync::atomic::AtomicBool>,
+}
 
 impl wk_protocol::Client<ServerHandle> for WindowClient {
-    fn run(self: Box<Self>, conn: ServerHandle) -> Result<wk_protocol::ClientExit, String> {
+    fn run(self: Box<Self>, conn: ServerHandle) -> Result<(), String> {
         let mut event_loop = EventLoop::builder().build().map_err(|e| e.to_string())?;
-        let mut app = App::new(conn)?;
+        let mut app = App::new(conn, self.interrupt)?;
         loop {
             // Pump (and render, via `about_to_wait`) with the handler set the
             // whole time, blocking up to a frame for events — this paces ~60fps
             // when idle and leaves no window where a macOS event has no handler
             // to run. A quit calls `ActiveEventLoop::exit()`, so the next pump
             // returns Exit.
-            if let PumpStatus::Exit(_) = event_loop.pump_app_events(Some(FRAME), &mut app) {
+            // Headless needs no frame pacing — just stay responsive to the
+            // OS and to Ctrl-C.
+            let wait = if app.headless {
+                Duration::from_millis(250)
+            } else {
+                FRAME
+            };
+            if let PumpStatus::Exit(_) = event_loop.pump_app_events(Some(wait), &mut app) {
                 break;
             }
         }
-        // The server owns persistence; the window closing just detaches this
-        // client. "Go headless" additionally asks the host to keep serving.
-        Ok(if app.request_headless {
-            wk_protocol::ClientExit::Headless
-        } else {
-            wk_protocol::ClientExit::Quit
-        })
+        // The server owns persistence; the window closing (or the headless
+        // loop interrupting) just detaches this client.
+        Ok(())
     }
 }
 

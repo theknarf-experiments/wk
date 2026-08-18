@@ -4,6 +4,9 @@ use wk_server::runtime::ServerRuntime;
 use wk_server::workspace;
 use wk_token_service::TokenService;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+
 use clap::CommandFactory;
 use clap::Parser;
 use clap::Subcommand;
@@ -544,24 +547,27 @@ fn run(file: &Path, headless: bool) -> Result<(), String> {
         // needs it.
         let token = tokens.mint_admin()?;
         let conn = runtime.handle().with_token(token);
-        match Box::new(WindowClient).run(conn) {
-            // Palette "Go headless": the window is gone but the server (and
-            // every node) keeps running — same as `wk run --headless` from
-            // here on, Ctrl-C (or killing the process) stops and persists.
-            Ok(wk_protocol::ClientExit::Headless) => {
-                runtime.block_until_ctrl_c();
-                Ok(())
+        // Ctrl-C interrupts the client loop instead of killing the process:
+        // the loop exits, the shutdown below runs, and the workspace
+        // persists. This is what makes the palette's "Go headless" stoppable
+        // (its windowless loop has no other input), and it fixes windowed
+        // Ctrl-C, which used to die without saving.
+        let interrupt = Arc::new(AtomicBool::new(false));
+        #[cfg(unix)]
+        {
+            static SIGINT_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+            extern "C" fn on_sigint(_: libc::c_int) {
+                if let Some(f) = SIGINT_FLAG.get() {
+                    f.store(true, Ordering::Relaxed);
+                }
             }
-            // Window closed or "Quit wk": stop the server, which persists
-            // the state.
-            Ok(wk_protocol::ClientExit::Quit) => {
-                runtime.shutdown();
-                Ok(())
-            }
-            Err(e) => {
-                runtime.shutdown();
-                Err(e)
-            }
+            let _ = SIGINT_FLAG.set(interrupt.clone());
+            let handler = on_sigint as *const () as libc::sighandler_t;
+            unsafe { libc::signal(libc::SIGINT, handler) };
         }
+        let result = Box::new(WindowClient { interrupt }).run(conn);
+        // Window closed (or errored): stop the server, which persists the state.
+        runtime.shutdown();
+        result
     }
 }
