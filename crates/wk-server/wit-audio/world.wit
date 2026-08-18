@@ -28,6 +28,9 @@ interface audio {
         create-oscillator: func() -> oscillator;
         create-gain: func() -> gain;
         create-biquad-filter: func() -> biquad-filter;
+        /// Create a push-style PCM sink at its own sample rate and channel
+        /// count (1 or 2 channels).
+        create-pcm-queue: func(sample-rate: f32, channels: u32) -> pcm-queue;
     }
 
     /// A periodic-waveform source.
@@ -57,6 +60,20 @@ interface audio {
         /// Route this gain into another gain node.
         connect: func(dst: borrow<gain>);
         /// Route this gain to the speakers.
+        connect-destination: func();
+    }
+
+    /// A push-style PCM sink — the SDL_QueueAudio analogue. Interleaved f32
+    /// samples are scheduled gaplessly onto the context clock.
+    resource pcm-queue {
+        /// Seconds of audio queued but not yet played.
+        buffered: func() -> f64;
+        /// Queue interleaved f32 samples (sample count must be a multiple of
+        /// the channel count).
+        write: func(samples: list<f32>);
+        /// Route through a gain node instead of straight to the speakers.
+        connect: func(dst: borrow<gain>);
+        /// Route this queue to the speakers.
         connect-destination: func();
     }
 
