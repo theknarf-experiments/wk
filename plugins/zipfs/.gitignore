@@ -1,0 +1,4 @@
+miniz.c
+miniz.h
+zipfs.wasm
+*.core.wasm

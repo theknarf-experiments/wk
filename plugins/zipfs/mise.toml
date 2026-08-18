@@ -1,0 +1,5 @@
+# Build this plugin: `mise run build`
+[tasks.build]
+description = "Build zipfs (miniz archive view as a wk:fs provider)"
+dir = "{{config_root}}"
+run = "./build.sh"

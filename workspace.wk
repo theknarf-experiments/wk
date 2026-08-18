@@ -27,6 +27,12 @@ dependencies {
     passfs "plugins/passfs/passfs.wasm" {
         description "libfuse's unmodified passthrough example — re-exports this node's own filesystem to whoever wires it"
     }
+    zipfs "plugins/zipfs/zipfs.wasm" {
+        description "archive view (miniz): wire a .zip in, the archive's tree mounts wherever this node is wired"
+    }
+    httpfs "plugins/httpfs/httpfs.wasm" {
+        description "network filesystem over the fabric: mounts an HTTP file server by name (httpfs http://filesrv:8080)"
+    }
     piano "plugins/piano/target/wasm32-wasip1/debug/piano.wasm" {
         description "on-screen keyboard emitting MIDI"
     }

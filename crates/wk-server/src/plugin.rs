@@ -2318,6 +2318,420 @@ mod tests {
         node.kill.store(true, Ordering::Relaxed);
     }
 
+    /// zipfs (miniz + the libfuse shim) serves a zip archive's tree: the
+    /// archive is wired into the node's own vfs AFTER it starts (the lazy
+    /// index), and a consumer browses and reads the members through the
+    /// mount. Read-only: the daemon has no write ops.
+    #[test]
+    fn zipfs_serves_an_archive_wired_in_later() {
+        use std::io::Write;
+        use wk_vfs::wasi::filesystem::preopens::Host as Preopens;
+        use wk_vfs::wasi::filesystem::types::{
+            DescriptorFlags, DescriptorType, ErrorCode, HostDescriptor, OpenFlags, PathFlags,
+        };
+
+        let wasm = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/zipfs/zipfs.wasm");
+        if !wasm.exists() {
+            eprintln!("skipping: build plugins/zipfs first (./build.sh)");
+            return;
+        }
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        host.spawn(
+            &wasm,
+            "zipfs",
+            id,
+            &[],
+            Arc::new(Mutex::new(Vec::new())),
+            nodes.clone(),
+            Vec::new(),
+            None,
+        )
+        .expect("spawn");
+        let node = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                if let Some(n) = nodes.lock().unwrap().iter().find(|n| n.id == id).cloned() {
+                    if n.serves_fs() && n.fs_serve.is_serving() {
+                        break n;
+                    }
+                    assert!(
+                        !n.finished.load(Ordering::Relaxed),
+                        "zipfs exited before serving"
+                    );
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "zipfs never started serving"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        // A real archive, wired in AFTER the daemon is already serving —
+        // exactly how a BindMount lands on a running node.
+        let archive = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            let mut w = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default();
+            w.start_file("top.txt", opts).unwrap();
+            w.write_all(b"at the top").unwrap();
+            w.start_file("docs/readme.md", opts).unwrap();
+            w.write_all(b"# from inside a zip\n").unwrap();
+            w.finish().unwrap();
+            buf.into_inner()
+        };
+        node.fs.lock().unwrap().put_file_at("archive.zip", archive);
+
+        struct ConsumerStore {
+            table: ResourceTable,
+            fs: crate::vfs::SharedFs,
+        }
+        impl wasmtime_wasi_io::IoView for ConsumerStore {
+            fn table(&mut self) -> &mut ResourceTable {
+                &mut self.table
+            }
+        }
+        impl wk_vfs::VfsView for ConsumerStore {
+            fn fs(&mut self) -> crate::vfs::SharedFs {
+                self.fs.clone()
+            }
+        }
+        let fs = crate::vfs::new_fs();
+        crate::vfs::mount_provider(&fs, "/z", node.fs_serve.clone(), true);
+        let mut store = wk_vfs::VfsImpl(ConsumerStore {
+            table: ResourceTable::new(),
+            fs,
+        });
+        let root = Preopens::get_directories(&mut store)
+            .expect("preopen")
+            .remove(0)
+            .0;
+        let root_fd = || wasmtime::component::Resource::new_own(root.rep());
+
+        // A nested member reads back through miniz's decompression.
+        let fd = HostDescriptor::open_at(
+            &mut store,
+            root_fd(),
+            PathFlags::SYMLINK_FOLLOW,
+            "z/docs/readme.md".into(),
+            OpenFlags::empty(),
+            DescriptorFlags::empty(),
+        )
+        .unwrap()
+        .expect("opens a member");
+        let (bytes, _) = HostDescriptor::read(
+            &mut store,
+            wasmtime::component::Resource::new_own(fd.rep()),
+            64,
+            0,
+        )
+        .unwrap()
+        .expect("reads a member");
+        assert_eq!(bytes, b"# from inside a zip\n");
+
+        // The listing shows the file and the synthesized directory, typed.
+        let dirfd = HostDescriptor::open_at(
+            &mut store,
+            root_fd(),
+            PathFlags::SYMLINK_FOLLOW,
+            "z".into(),
+            OpenFlags::DIRECTORY,
+            DescriptorFlags::empty(),
+        )
+        .unwrap()
+        .expect("opens the archive root");
+        let stream = HostDescriptor::read_directory(&mut store, dirfd)
+            .unwrap()
+            .expect("lists");
+        let mut entries = Vec::new();
+        loop {
+            use wk_vfs::wasi::filesystem::types::HostDirectoryEntryStream;
+            match HostDirectoryEntryStream::read_directory_entry(
+                &mut store,
+                wasmtime::component::Resource::new_own(stream.rep()),
+            )
+            .unwrap()
+            .unwrap()
+            {
+                Some(e) => entries.push((e.name, e.type_)),
+                None => break,
+            }
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].0 == "docs" && entries[0].1 == DescriptorType::Directory);
+        assert!(entries[1].0 == "top.txt" && entries[1].1 == DescriptorType::RegularFile);
+
+        // Read-only: the daemon has no write callbacks.
+        assert_eq!(
+            HostDescriptor::write(
+                &mut store,
+                wasmtime::component::Resource::new_own(fd.rep()),
+                b"x".to_vec(),
+                0,
+            )
+            .unwrap()
+            .unwrap_err(),
+            ErrorCode::NotPermitted
+        );
+
+        node.kill.store(true, Ordering::Relaxed);
+    }
+
+    /// httpfs: a network-backed filesystem whose network is the fabric. A
+    /// host-side HTTP file server listens as the named fabric peer
+    /// "filesrv" on the node's net; httpfs dials it BY NAME over its BSD
+    /// sockets, and a consumer browses/reads the server's files through the
+    /// provider mount — every filesystem op is an HTTP exchange riding the
+    /// userspace netstack. Offset reads exercise Range requests.
+    #[test]
+    fn httpfs_mounts_a_fabric_http_server() {
+        use std::io::{Read, Write};
+        use wk_vfs::wasi::filesystem::preopens::Host as Preopens;
+        use wk_vfs::wasi::filesystem::types::{
+            DescriptorFlags, HostDescriptor, OpenFlags, PathFlags,
+        };
+
+        let wasm = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/httpfs/httpfs.wasm");
+        if !wasm.exists() {
+            eprintln!("skipping: build plugins/httpfs first (./build.sh)");
+            return;
+        }
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        host.spawn(
+            &wasm,
+            "httpfs",
+            id,
+            &[],
+            Arc::new(Mutex::new(Vec::new())),
+            nodes.clone(),
+            Vec::new(),
+            None,
+        )
+        .expect("spawn");
+
+        // Networked nodes don't auto-run: wait for the compile, then start
+        // the server peer, then run the guest against it.
+        let node = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                if let Some(n) = nodes.lock().unwrap().iter().find(|n| n.id == id).cloned() {
+                    if n.serves_fs() && n.net_stack().is_some() {
+                        break n;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "httpfs never finished compiling"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        // The file server: a named fabric peer on the node's own net. The
+        // listing convention is httpfs's documented one — text/plain, one
+        // entry per line, directories with a trailing slash.
+        let big: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        let big_clone = big.clone();
+        let kill_srv = Arc::new(AtomicBool::new(false));
+        wk_fabric::listen::listen(
+            host.hub(),
+            node.net_stack().unwrap(),
+            "filesrv",
+            8080,
+            kill_srv.clone(),
+            Arc::new(move |mut s: std::os::unix::net::UnixStream| {
+                let big = big_clone.clone();
+                std::thread::spawn(move || {
+                    let mut req = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !req.ends_with(b"\r\n\r\n") {
+                        match s.read(&mut byte) {
+                            Ok(1) => req.push(byte[0]),
+                            _ => return,
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&req).to_string();
+                    let mut lines = req.split("\r\n");
+                    let mut first = lines.next().unwrap_or("").split(' ');
+                    let method = first.next().unwrap_or("");
+                    let path = first.next().unwrap_or("");
+                    let range = req
+                        .split("\r\n")
+                        .find_map(|l| l.strip_prefix("Range: bytes="))
+                        .and_then(|r| {
+                            let (a, b) = r.split_once('-')?;
+                            Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+                        });
+                    let file: Option<&[u8]> = match path {
+                        "/data/hello.txt" => Some(b"hello over the fabric"),
+                        "/data/big.bin" => Some(&big),
+                        _ => None,
+                    };
+                    let listing: Option<&str> = match path {
+                        "/" => Some("data/\n"),
+                        "/data/" => Some("hello.txt\nbig.bin\n"),
+                        _ => None,
+                    };
+                    let reply = if let Some(bytes) = file {
+                        if method == "HEAD" {
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", bytes.len())
+                                .into_bytes()
+                        } else if let Some((a, b)) = range {
+                            let end = (b + 1).min(bytes.len());
+                            let slice = &bytes[a.min(end)..end];
+                            let mut r = format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\r\n",
+                                slice.len()
+                            )
+                            .into_bytes();
+                            r.extend_from_slice(slice);
+                            r
+                        } else {
+                            let mut r = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                                bytes.len()
+                            )
+                            .into_bytes();
+                            r.extend_from_slice(bytes);
+                            r
+                        }
+                    } else if let Some(text) = listing {
+                        let mut r =
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", text.len())
+                                .into_bytes();
+                        if method != "HEAD" {
+                            r.extend_from_slice(text.as_bytes());
+                        }
+                        r
+                    } else {
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec()
+                    };
+                    let _ = s.write_all(&reply);
+                });
+            }),
+        );
+
+        host.run_node(&node, &["http://filesrv:8080".to_string()])
+            .expect("run httpfs");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !node.fs_serve.is_serving() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "httpfs never started serving"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        struct ConsumerStore {
+            table: ResourceTable,
+            fs: crate::vfs::SharedFs,
+        }
+        impl wasmtime_wasi_io::IoView for ConsumerStore {
+            fn table(&mut self) -> &mut ResourceTable {
+                &mut self.table
+            }
+        }
+        impl wk_vfs::VfsView for ConsumerStore {
+            fn fs(&mut self) -> crate::vfs::SharedFs {
+                self.fs.clone()
+            }
+        }
+        let fs = crate::vfs::new_fs();
+        crate::vfs::mount_provider(&fs, "/web", node.fs_serve.clone(), true);
+        let mut store = wk_vfs::VfsImpl(ConsumerStore {
+            table: ResourceTable::new(),
+            fs,
+        });
+        let root = Preopens::get_directories(&mut store)
+            .expect("preopen")
+            .remove(0)
+            .0;
+        let root_fd = || wasmtime::component::Resource::new_own(root.rep());
+
+        // Read a file: mount → shim → HTTP GET over the fabric → server.
+        let fd = HostDescriptor::open_at(
+            &mut store,
+            root_fd(),
+            PathFlags::SYMLINK_FOLLOW,
+            "web/data/hello.txt".into(),
+            OpenFlags::empty(),
+            DescriptorFlags::empty(),
+        )
+        .unwrap()
+        .expect("opens over http");
+        let (bytes, _) = HostDescriptor::read(
+            &mut store,
+            wasmtime::component::Resource::new_own(fd.rep()),
+            64,
+            0,
+        )
+        .unwrap()
+        .expect("reads over http");
+        assert_eq!(bytes, b"hello over the fabric");
+
+        // An offset read of the big file exercises a Range request.
+        let bfd = HostDescriptor::open_at(
+            &mut store,
+            root_fd(),
+            PathFlags::SYMLINK_FOLLOW,
+            "web/data/big.bin".into(),
+            OpenFlags::empty(),
+            DescriptorFlags::empty(),
+        )
+        .unwrap()
+        .expect("opens big.bin");
+        let (bytes, _) = HostDescriptor::read(
+            &mut store,
+            wasmtime::component::Resource::new_own(bfd.rep()),
+            100,
+            40_000,
+        )
+        .unwrap()
+        .expect("range-reads big.bin");
+        assert_eq!(bytes, big[40_000..40_100]);
+
+        // The autoindex becomes a directory listing.
+        let dirfd = HostDescriptor::open_at(
+            &mut store,
+            root_fd(),
+            PathFlags::SYMLINK_FOLLOW,
+            "web/data".into(),
+            OpenFlags::DIRECTORY,
+            DescriptorFlags::empty(),
+        )
+        .unwrap()
+        .expect("opens the http dir");
+        let stream = HostDescriptor::read_directory(&mut store, dirfd)
+            .unwrap()
+            .expect("lists over http");
+        let mut names = Vec::new();
+        loop {
+            use wk_vfs::wasi::filesystem::types::HostDirectoryEntryStream;
+            match HostDirectoryEntryStream::read_directory_entry(
+                &mut store,
+                wasmtime::component::Resource::new_own(stream.rep()),
+            )
+            .unwrap()
+            .unwrap()
+            {
+                Some(e) => names.push(e.name),
+                None => break,
+            }
+        }
+        names.sort();
+        assert_eq!(names, ["big.bin", "hello.txt"]);
+
+        node.kill.store(true, Ordering::Relaxed);
+        kill_srv.store(true, Ordering::Relaxed);
+    }
+
     /// Outbound wasi:http is denied unless the node's fabric stack has host
     /// access (i.e. it's wired to a Gateway) — the same gate as raw sockets.
     /// A stackless store (pure-http node / serve store) is always denied.
