@@ -2808,6 +2808,13 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         };
+        // What the image's COPY etc/ /etc/ provides: GNU termcap's database,
+        // without which readline's clear-screen degrades to a newline.
+        let termcap = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/bash/etc/termcap"),
+        )
+        .expect("plugins/bash/etc/termcap");
+        node.fs.lock().unwrap().put_file_at("etc/termcap", termcap);
         host.run_node(&node, &[]).expect("run bash");
         {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -2851,6 +2858,23 @@ mod tests {
             String::from_utf8_lossy(&bytes).contains("readline-works\r\n"),
             "command output is CRLF-translated at write time"
         );
+
+        // Ctrl+L: readline's clear-screen, which needs the termcap `cl`
+        // capability — with /etc/termcap in place it emits a real clear
+        // sequence instead of degrading to a newline.
+        node.term_io.feed_in(b"\x0c");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let (bytes, _) = node.term_io.log_read(0);
+            if bytes.windows(4).any(|w| w == b"\x1b[2J") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Ctrl+L never emitted a clear-screen sequence"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
 
         node.kill.store(true, Ordering::Relaxed);
     }

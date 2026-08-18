@@ -233,5 +233,11 @@ ln -sf bash.wasm bin/sh
 if [ -f grep.wasm ]; then
     ln -sf grep.wasm bin/grep
 fi
+# clear(1)/reset(1): one tiny multicall component, symlinked from bin/ the
+# same way the coreutils farm is (bin/clear -> termutils.wasm).
+"$WASI_SDK/bin/clang" --target=wasm32-wasip2 -O2 -o termutils.wasm termutils.c
+ln -sf termutils.wasm bin/clear
+ln -sf termutils.wasm bin/reset
+
 echo "built plugins/bash/bash.wasm (GNU bash $BASH_VER, wasm32-wasip2 component)"
 echo "package it with: wk images build plugins/bash/Dockerfile --tag wk-shell"

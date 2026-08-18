@@ -1,0 +1,14 @@
+# Minimal termcap for the wk-shell image. wk's terminal is an xterm-family
+# VT emulator and sets TERM=xterm-256color; bash's bundled GNU termcap reads
+# this file so readline gets real capabilities (clear-screen for Ctrl+L,
+# cursor motion for long-line redisplay) instead of degrading to newlines.
+xterm-256color|xterm-color|xterm|ansi:\
+	:am:km:mi:ms:xn:bs:\
+	:co#80:li#24:it#8:\
+	:cl=\E[H\E[2J:cd=\E[J:ce=\E[K:ho=\E[H:\
+	:cm=\E[%i%d;%dH:up=\E[A:do=^J:nd=\E[C:le=^H:cr=^M:bl=^G:ta=^I:\
+	:sc=\E7:rc=\E8:al=\E[L:dl=\E[M:dc=\E[P:im=\E[4h:ei=\E[4l:\
+	:so=\E[7m:se=\E[27m:us=\E[4m:ue=\E[24m:md=\E[1m:me=\E[m:\
+	:ks=\E[?1h\E=:ke=\E[?1l\E>:ku=\EOA:kd=\EOB:kr=\EOC:kl=\EOD:
+dumb:\
+	:am:co#80:do=^J:

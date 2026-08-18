@@ -140,6 +140,7 @@ plugins/coreutils/compat/*.o
 # bash (upstream source fetched + built by build.sh; artifacts derived)
 plugins/bash/bash-*/
 plugins/bash/bash.wasm
+plugins/bash/termutils.wasm
 plugins/bash/compat/*.o
 plugins/bash/compat/wasi_snapshot_preview1.command.wasm
 

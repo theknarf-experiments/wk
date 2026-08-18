@@ -9,7 +9,12 @@ FROM scratch
 COPY bash.wasm /bin/bash.wasm
 COPY coreutils.wasm /bin/coreutils.wasm
 COPY grep.wasm /bin/grep.wasm
+COPY termutils.wasm /bin/termutils.wasm
 COPY bin/ /bin/
+# GNU termcap's database: readline's clear-screen (Ctrl+L) and long-line
+# redisplay need real capabilities. Vim carries builtin termcaps and needs
+# nothing; GNU termcap has no builtins, so the image ships the file.
+COPY etc/ /etc/
 ENV PATH=/bin
 # A writable temp dir the way every base image ships one: tools that spill to a
 # scratch file (tac, sort on large input, mktemp) fail without it. The node's
