@@ -1,0 +1,13 @@
+package wk:midi;
+
+interface midi {
+    resource input {
+        constructor();
+        receive: func() -> option<list<u8>>;
+    }
+
+    resource output {
+        constructor();
+        send: func(data: list<u8>);
+    }
+}

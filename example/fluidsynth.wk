@@ -1,0 +1,29 @@
+// vim: set filetype=kdl :
+// A real SoundFont synthesizer. The on-screen piano emits MIDI; the fluidsynth
+// node (the FluidLite engine — FluidSynth's synthesis core — with the TimGM6mb
+// General MIDI soundfont baked into its container image) renders it through
+// wk:webaudio to the speakers. Note events log to the node's terminal.
+//
+// The piano stands in for any MIDI source: replace it with a hardware `midiin`
+// node (see example/midi.wk) to play the soundfont from a physical keyboard,
+// or feed it from the sequencer.
+//
+// Build the image first:  cd plugins/fluidsynth && mise run build
+// From the repo root:     wk run example/fluidsynth.wk
+import "../workspace.wk"
+workspace "01M0FSYN00000000000000WS01" {
+    node "piano" "01M0FSYN00000000000000PN02" {
+        pos -300.0 380.0
+        size 560.0 220.0
+    }
+    node "fluidsynth" "01M0FSYN00000000000000FS03" {
+        pos 340.0 360.0
+        size 420.0 260.0
+    }
+    note "01M0FSYN00000000000000NT04" {
+        text "Piano -> fluidsynth: play the keys and\na real soundfont sounds them.\n\nThe synth node is FluidLite (the\nFluidSynth engine) + TimGM6mb.sf2,\nrendering to wk:webaudio. Its terminal\nlogs the soundfont load and each note.\n\nA hardware MidiIn node can replace the\npiano — wire it the same way."
+        pos 40.0 40.0
+        size 340.0 230.0
+    }
+    midi "01M0FSYN00000000000000PN02" "01M0FSYN00000000000000FS03"
+}

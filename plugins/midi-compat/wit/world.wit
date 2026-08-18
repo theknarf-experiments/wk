@@ -1,0 +1,10 @@
+package wk:midicompat;
+
+/// The guest side of the wk:midi shim: a C program compiled against wkmidi.h
+/// drains raw MIDI messages from this node's input port (fed by whatever the
+/// node is wired to on the canvas — a piano node, a hardware MidiIn node, a
+/// sequencer). The MIDI sibling of ../audio-compat's wkaudio world; the
+/// interface itself is vendored under wit/deps like plugins/synth does.
+world wkmidi {
+    import wk:midi/midi;
+}

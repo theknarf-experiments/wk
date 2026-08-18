@@ -1,0 +1,6 @@
+# Fetched at build (pinned in build.sh) + build products.
+FluidLite-*/
+soundfont.sf2
+gen/
+fluidsynth.wasm
+*.core.wasm
