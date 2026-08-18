@@ -283,6 +283,9 @@ struct App {
     /// many files of the current drop have landed (staggers their nodes).
     drop_hovering: bool,
     drop_stagger: u32,
+    /// Palette "Go headless": exit the event loop but tell the host process
+    /// to keep the server running with no client attached.
+    request_headless: bool,
     /// When viewing a node's output log (a modal overlay). Mutually exclusive
     /// with `inspect` — one panel at a time.
     logs: Option<LogView>,
@@ -379,6 +382,7 @@ impl App {
             browse: ProviderBrowse::new(),
             drop_hovering: false,
             drop_stagger: 0,
+            request_headless: false,
             logs: None,
             log_max_scroll: 0.0,
             clipboard: arboard::Clipboard::new().ok(),
@@ -1018,6 +1022,11 @@ impl App {
                 PaletteCmd::GoTo(id),
             ));
         }
+        v.push(PaletteRow::new(
+            "Go headless (close UI, keep nodes running)",
+            None,
+            PaletteCmd::Headless,
+        ));
         v.push(PaletteRow::new("Quit wk", None, PaletteCmd::Quit));
         v
     }
@@ -1320,6 +1329,10 @@ impl App {
                 }
             }
             PaletteCmd::Quit => self.request_exit = true,
+            PaletteCmd::Headless => {
+                self.request_headless = true;
+                self.request_exit = true;
+            }
         }
     }
 
@@ -5745,7 +5758,7 @@ impl ApplicationHandler for App {
 pub struct WindowClient;
 
 impl wk_protocol::Client<ServerHandle> for WindowClient {
-    fn run(self: Box<Self>, conn: ServerHandle) -> Result<(), String> {
+    fn run(self: Box<Self>, conn: ServerHandle) -> Result<wk_protocol::ClientExit, String> {
         let mut event_loop = EventLoop::builder().build().map_err(|e| e.to_string())?;
         let mut app = App::new(conn)?;
         loop {
@@ -5759,8 +5772,12 @@ impl wk_protocol::Client<ServerHandle> for WindowClient {
             }
         }
         // The server owns persistence; the window closing just detaches this
-        // client.
-        Ok(())
+        // client. "Go headless" additionally asks the host to keep serving.
+        Ok(if app.request_headless {
+            wk_protocol::ClientExit::Headless
+        } else {
+            wk_protocol::ClientExit::Quit
+        })
     }
 }
 

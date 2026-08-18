@@ -544,9 +544,24 @@ fn run(file: &Path, headless: bool) -> Result<(), String> {
         // needs it.
         let token = tokens.mint_admin()?;
         let conn = runtime.handle().with_token(token);
-        let result = Box::new(WindowClient).run(conn);
-        // Window closed (or errored): stop the server, which persists the state.
-        runtime.shutdown();
-        result
+        match Box::new(WindowClient).run(conn) {
+            // Palette "Go headless": the window is gone but the server (and
+            // every node) keeps running — same as `wk run --headless` from
+            // here on, Ctrl-C (or killing the process) stops and persists.
+            Ok(wk_protocol::ClientExit::Headless) => {
+                runtime.block_until_ctrl_c();
+                Ok(())
+            }
+            // Window closed or "Quit wk": stop the server, which persists
+            // the state.
+            Ok(wk_protocol::ClientExit::Quit) => {
+                runtime.shutdown();
+                Ok(())
+            }
+            Err(e) => {
+                runtime.shutdown();
+                Err(e)
+            }
+        }
     }
 }

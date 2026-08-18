@@ -324,5 +324,16 @@ impl Command {
 /// stays free of the server's internals. Boxed-`self` so a caller can pick a
 /// client at runtime behind `dyn Client<C>`.
 pub trait Client<C> {
-    fn run(self: Box<Self>, conn: C) -> Result<(), String>;
+    fn run(self: Box<Self>, conn: C) -> Result<ClientExit, String>;
+}
+
+/// How a client's run ended — and what the host process should do with the
+/// server it owns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientExit {
+    /// Shut the server down too (window closed, "Quit wk").
+    Quit,
+    /// Keep the server running with no client attached ("Go headless"):
+    /// nodes keep serving, the CLI socket stays up, Ctrl-C stops it.
+    Headless,
 }

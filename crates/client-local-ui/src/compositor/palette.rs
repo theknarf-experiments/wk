@@ -29,6 +29,8 @@ pub(super) enum PaletteCmd {
     /// Toggle the 3D camera between grounded walking and free flight.
     ToggleFly,
     Quit,
+    /// Close the UI but keep the server (and every node) running.
+    Headless,
 }
 
 /// One command-palette row: a label, an optional dim description drawn after
