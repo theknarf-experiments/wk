@@ -2271,6 +2271,41 @@ mod tests {
             .iter()
             .any(|(n, t)| n == "srv" && *t == DescriptorType::Directory));
 
+        // Files inside a listing must type as files: passthrough fills
+        // st_mode as `d_type << 12`, and on wasi a regular file's d_type (4)
+        // lands exactly on S_IFDIR — the shim must not take its word for it
+        // (the "shared-notes.txt shows as an empty directory" regression).
+        let srvfd = HostDescriptor::open_at(
+            &mut store,
+            root_fd(),
+            PathFlags::SYMLINK_FOLLOW,
+            "peer/srv".into(),
+            OpenFlags::DIRECTORY,
+            DescriptorFlags::empty(),
+        )
+        .unwrap()
+        .expect("opens srv");
+        let stream = HostDescriptor::read_directory(&mut store, srvfd)
+            .unwrap()
+            .expect("lists srv");
+        let mut srv_entries = Vec::new();
+        loop {
+            use wk_vfs::wasi::filesystem::types::HostDirectoryEntryStream;
+            match HostDirectoryEntryStream::read_directory_entry(
+                &mut store,
+                wasmtime::component::Resource::new_own(stream.rep()),
+            )
+            .unwrap()
+            .unwrap()
+            {
+                Some(e) => srv_entries.push((e.name, e.type_)),
+                None => break,
+            }
+        }
+        assert!(srv_entries
+            .iter()
+            .any(|(n, t)| n == "motd.txt" && *t == DescriptorType::RegularFile));
+
         // Write back through the mount: create + write land in the provider
         // node's own vfs, visible from the host side.
         let wfd = HostDescriptor::open_at(

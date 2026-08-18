@@ -14,8 +14,9 @@
  *   hello expect to see) and create/truncate imply O_RDWR. Daemons that
  *   check fi->flags in write() would see O_RDONLY there; the common ones
  *   don't.
- * - `readdir` kind per entry: the filler's stbuf when the daemon provides
- *   one, else a getattr per entry (cheap: same process, no I/O).
+ * - `readdir` kind per entry: a stbuf claiming S_IFREG is trusted; every
+ *   other claim (or none) is resolved by a getattr per entry — see
+ *   dir_fill for why wasi makes directory claims untrustworthy.
  * - FUSE's offset-paged readdir protocol (filler returning 1) is not
  *   driven: the shim always collects the whole listing in one pass, which
  *   is the mode simple daemons use (filler(buf, name, NULL, 0, 0)).
@@ -275,13 +276,16 @@ static int dir_fill(void *buf, const char *name, const struct stat *stbuf,
         b->cap = cap;
     }
     wk_fs_provider_entry_kind_t kind = WK_FS_PROVIDER_ENTRY_KIND_FILE;
-    /* Trust the daemon's stbuf only when it carries a recognizable type:
-       daemons that synthesize st_mode as `d_type << 12` (passthrough.c)
-       assume Linux's DT↔S_IF correspondence, which wasi-libc's d_type
-       values don't follow — an unrecognizable mode falls back to getattr. */
-    if (stbuf && (S_ISDIR(stbuf->st_mode) || S_ISREG(stbuf->st_mode))) {
-        kind = S_ISDIR(stbuf->st_mode) ? WK_FS_PROVIDER_ENTRY_KIND_DIR
-                                       : WK_FS_PROVIDER_ENTRY_KIND_FILE;
+    /* The daemon's stbuf is only half-trustworthy: the classic
+       `st_mode = d_type << 12` readdir idiom (passthrough.c) assumes
+       Linux's DT↔S_IF correspondence, and on wasi-libc it produces modes
+       that are valid but WRONG — a regular file's d_type (4) lands
+       exactly on S_IFDIR. No wasi d_type shifted by 12 can produce
+       S_IFREG though, so a claimed file is honest; a claimed directory
+       (or anything else) is confirmed by a getattr per entry — an
+       in-process callback, no I/O, and dirs are the minority. */
+    if (stbuf && S_ISREG(stbuf->st_mode)) {
+        kind = WK_FS_PROVIDER_ENTRY_KIND_FILE;
     } else {
         /* The daemon didn't provide attributes (the common `filler(buf,
            name, NULL, 0, 0)` form): ask it. Same process, no I/O. */
