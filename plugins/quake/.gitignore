@@ -1,0 +1,8 @@
+# Upstream sources + artifacts, all fetched/derived by build.sh — only
+# build.sh, quakegeneric_wk.c, Dockerfile, mise.toml are tracked.
+quakegeneric-*/
+quake.wasm
+quake.core.wasm
+pak0.pak
+quakesw.tar.gz
+id1/

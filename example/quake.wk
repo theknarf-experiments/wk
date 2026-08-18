@@ -1,0 +1,24 @@
+// vim: set filetype=kdl :
+// Quake as a wk node. Run with:
+//
+//   wk run example/quake.wk
+//
+// The quake node is a wasm container (docker://plugins/quake/Dockerfile):
+// UNMODIFIED upstream quakegeneric compiled to wasm32-wasip1, drawing on a
+// wasi-gfx surface through the shared gfx-compat shim, with the id 1.06
+// shareware episode baked into the image as /id1/pak0.pak. Build it first:
+//
+//   cd plugins/quake && mise run build
+import "../workspace.wk"
+workspace "01KWQK0000000000000000WS00" {
+    node "quake" "01KWQK0000000000000000QK01" {
+        pos 80.0 80.0
+        size 660.0 520.0
+        args "-basedir" "/"
+    }
+    note "01KWQK0000000000000000NT02" {
+        text "Quake (id 1.06 shareware)\n\nEnter/Escape: menus\nArrows: move + turn\nCtrl: fire   Space: jump\nShift: run   `: console\nMouse: look (deltas from\npointer motion)\n\nSilent by design: quakegeneric\nhas no audio hook (snd_null.c)."
+        pos 780.0 80.0
+        size 320.0 240.0
+    }
+}
