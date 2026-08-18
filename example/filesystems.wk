@@ -1,69 +1,119 @@
 // vim: set filetype=kdl :
-// Nodes as filesystems — wk's FUSE (wk:fs), shown four ways. Run with:
+// Nodes as filesystems — wk's FUSE (wk:fs), the full tour. Run with:
 //
 //   wk run example/filesystems.wk
 //
-// Every wire into bash below is a live mount: the app on the other end
+// Every wire into an app below is a live mount: the node on the other end
 // ANSWERS the filesystem operations. In the bash terminal, try:
 //
-//   ls /hellofuse && cat /hellofuse/hello     # unmodified libfuse hello.c
-//   ls -R /zip && cat /zip/readme.md          # a zip browsed in place (miniz)
-//   echo hi > /peer/shared-notes.txt          # passfs re-exports ITS files —
-//   cat /peer/shared-notes.txt                # ...writable, straight through
-//   cat /hellofs/counter                      # hellofs synthesizes per open
+//   cat /hellofuse/greeting              # unmodified libfuse hello.c — and
+//                                        # the file's name/content came from
+//                                        # the node's args (fuse_opt_parse)
+//   ls -R /zip && cat /zip/readme.md     # a zip browsed in place (miniz)
+//   echo hi > /peer/shared-notes.txt     # passfs re-exports ITS files —
+//   cat /peer/shared-notes.txt           # ...writable, straight through
+//   ls /peer/zipview                     # the SAME zip through TWO daemons:
+//                                        # zipfs is mounted into passfs,
+//                                        # whose passthrough re-exports it
+//   cat /hellofs/counter                 # hellofs synthesizes per open
+//   echo yo > /hellofs/pad.txt           # ...then check the kilo node —
+//                                        # one provider, two consumers
+//   ls /web && cat /web/hello.txt        # a network filesystem: httpfs
+//                                        # mounts the python node's HTTP
+//                                        # server, dialed BY NAME over the
+//                                        # fabric (http://python:8000)
 //
-// The chain behind /peer is the fun one: a Volume is bind-mounted into the
-// passfs node, whose unmodified libfuse passthrough.c mirrors its own
-// filesystem — so bash sees the volume THROUGH another node's daemon, and
-// writes travel the whole way back.
+// The kilo node edits /hellofs/README.md — a full-screen editor opening,
+// editing, and saving THROUGH another node's daemon. python and httpfs are
+// networked nodes: if idle, press their play buttons (python first).
+//
+// Host-enforced read-only (the wire, not the daemon) is a token away:
+//   wk -f example/filesystems.wk token attenuate bash \
+//       'check if operation($k, $t, $a), $a != "write"'
+// makes every mount read-only for bash (/peer writes start failing);
+//   wk -f example/filesystems.wk token reset bash        # undo
+//
+// Also: open Files on the bash node and click into /zip or /peer — provider
+// mounts browse live ("served by ..." badges), and selecting a bind wire
+// shows its mount path, editable in place.
 //
 // Build the providers first (each is `mise run build` in its plugin dir):
-// hellofuse, passfs, zipfs, and hellofs (cargo component build). bash is the
-// docker:// dep from workspace.wk. Also try httpfs — a network filesystem
-// over the fabric — by pointing its args at any HTTP file server node on
-// its network: `httpfs http://filesrv:8080`.
+// hellofuse, passfs, zipfs, httpfs, and hellofs (cargo component build).
+// bash/python are docker:// deps from workspace.wk; kilo ships prebuilt.
 import "../workspace.wk"
 workspace "01KWFSDEM0000000000000WS00" {
-    node "bash" "01KWFSDEM0000000000000SH01" {
-        pos 700.0 300.0
-        size 560.0 340.0
-    }
     node "hellofuse" "01KWFSDEM0000000000000HF02" {
         pos 80.0 80.0
         size 300.0 160.0
+        args "--name=greeting" "--contents=hello from argv\n"
     }
-    node "zipfs" "01KWFSDEM0000000000000ZF03" {
-        pos 80.0 300.0
+    node "hellofs" "01KWFSDEM0000000000000MF05" {
+        pos 80.0 740.0
         size 300.0 160.0
     }
     node "passfs" "01KWFSDEM0000000000000PF04" {
         pos 80.0 520.0
         size 300.0 160.0
     }
-    node "hellofs" "01KWFSDEM0000000000000MF05" {
-        pos 80.0 740.0
+    node "bash" "01KWFSDEM0000000000000SH01" {
+        pos 700.0 300.0
+        size 560.0 340.0
+    }
+    node "zipfs" "01KWFSDEM0000000000000ZF03" {
+        pos 80.0 300.0
         size 300.0 160.0
+    }
+    node "kilo" "01KWFSDEM0000000000000KE09" {
+        pos 700.0 700.0
+        size 560.0 340.0
+        args "/hellofs/README.md"
+    }
+    node "python" "01KWFSDEM0000000000000PY10" {
+        pos 1340.0 80.0
+        size 360.0 240.0
+        args "/app/server.py" "8000"
+    }
+    node "httpfs" "01KWFSDEM0000000000000HT12" {
+        pos 1340.0 380.0
+        size 300.0 160.0
+        args "http://python:8000"
     }
     bindmount "example/demo-archive.zip" "01KWFSDEM0000000000000BM06" {
         pos 420.0 740.0
         size 220.0 120.0
     }
-    volume "shared-notes.txt" "01KWFSDEM0000000000000VL07" {
+    bindmount "example/httpfs-www" "01KWFSDEM0000000000000BM11" {
+        pos 1720.0 80.0
+        size 220.0 120.0
+    }
+    volume "shared-notes.txt" "01KWFSDEM0000000000000V107" {
         pos 420.0 520.0
         size 220.0 120.0
     }
-    note "01KWFSDEM0000000000000NT08" {
-        text "Every wire into bash is a live mount:\nthe node on the other end answers\nopen/read/readdir like a FUSE daemon.\n\nhellofuse + passfs run libfuse's own\nexamples, compiled unmodified.\n\nThe zip is browsed in place — never\nunpacked. The volume reaches bash\nTHROUGH passfs's daemon, writable."
-        pos 700.0 60.0
-        size 340.0 210.0
+    network "01KWFSDEM0000000000000NW13" {
+        pos 1340.0 600.0
+        size 130.0 44.0
     }
-    // The archive feeds zipfs; the volume feeds passfs. Both nodes then
-    // serve what they were given, each through its own daemon.
+    note "01KWFSDEM0000000000000NT08" {
+        text "Every wire into an app is a live mount:\nthe node on the other end answers\nopen/read/readdir like a FUSE daemon.\n\nhellofuse + passfs run libfuse's own\nexamples unmodified; hellofuse's file\ncomes from its args (fuse_opt_parse).\n\nThe zip is browsed in place — and\nreachable twice: at /zip, and THROUGH\npassfs at /peer/zipview (two daemons).\n\nhellofs serves bash AND kilo at once:\nkilo edits /hellofs/README.md through\nthe daemon; bash watches it change.\n\nhttpfs mounts the python node's HTTP\nserver over the fabric, by name.\npython + httpfs are networked: press\ntheir play buttons if idle."
+        pos 700.0 40.0
+        size 400.0 240.0
+    }
+    // Feeds: the archive into zipfs, the volume into passfs, the server
+    // script into python. And zipfs into passfs — a provider mounted inside
+    // another provider, re-exported one level deeper.
     connection "01KWFSDEM0000000000000BM06" "01KWFSDEM0000000000000ZF03"
-    connection "01KWFSDEM0000000000000VL07" "01KWFSDEM0000000000000PF04"
-    // Provider mounts into bash, each at its own path.
+    connection "01KWFSDEM0000000000000V107" "01KWFSDEM0000000000000PF04"
+    connection "01KWFSDEM0000000000000BM11" "01KWFSDEM0000000000000PY10" "/app"
+    connection "01KWFSDEM0000000000000ZF03" "01KWFSDEM0000000000000PF04" "/zipview"
+    // Provider mounts into the consumers, each at its own path.
     connection "01KWFSDEM0000000000000HF02" "01KWFSDEM0000000000000SH01" "/hellofuse"
     connection "01KWFSDEM0000000000000ZF03" "01KWFSDEM0000000000000SH01" "/zip"
     connection "01KWFSDEM0000000000000PF04" "01KWFSDEM0000000000000SH01" "/peer"
     connection "01KWFSDEM0000000000000MF05" "01KWFSDEM0000000000000SH01" "/hellofs"
+    connection "01KWFSDEM0000000000000MF05" "01KWFSDEM0000000000000KE09" "/hellofs"
+    connection "01KWFSDEM0000000000000HT12" "01KWFSDEM0000000000000SH01" "/web"
+    // The http pair shares a fabric network; httpfs resolves "python" on it.
+    netlink "01KWFSDEM0000000000000PY10" "01KWFSDEM0000000000000NW13"
+    netlink "01KWFSDEM0000000000000HT12" "01KWFSDEM0000000000000NW13"
 }

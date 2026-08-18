@@ -1435,7 +1435,16 @@ mod tests {
         ));
         let doc = Document::load_resolved(example).expect("filesystems.wk resolves");
         let names: Vec<&str> = doc.dependencies.iter().map(|d| d.name.as_str()).collect();
-        for want in ["bash", "hellofuse", "passfs", "zipfs", "hellofs", "httpfs"] {
+        for want in [
+            "bash",
+            "hellofuse",
+            "passfs",
+            "zipfs",
+            "hellofs",
+            "httpfs",
+            "kilo",
+            "python",
+        ] {
             assert!(names.contains(&want), "{want} available via import");
         }
         let ws = doc
@@ -1443,14 +1452,50 @@ mod tests {
             .iter()
             .find(|w| !w.nodes.is_empty())
             .expect("demo workspace");
-        // Two feeds (zip→zipfs, volume→passfs) + four provider mounts.
-        assert_eq!(ws.connections.len(), 6);
+        // Four feeds (zip→zipfs, volume→passfs, www→python, zipfs→passfs —
+        // the last a provider chained inside another provider) + five
+        // provider mounts into bash + one into kilo.
+        assert_eq!(ws.connections.len(), 10);
         let paths: Vec<&str> = ws.mount_paths.values().map(|s| s.as_str()).collect();
-        for want in ["/hellofuse", "/zip", "/peer", "/hellofs"] {
+        for want in [
+            "/hellofuse",
+            "/zip",
+            "/peer",
+            "/hellofs",
+            "/web",
+            "/zipview",
+            "/app",
+        ] {
             assert!(paths.contains(&want), "{want} mount path present");
         }
+        // hellofs serves two consumers (bash and kilo).
+        let hellofs = ws
+            .nodes
+            .iter()
+            .find(|n| matches!(&n.kind, SnapKind::App { name, .. } if name == "hellofs"))
+            .expect("hellofs node")
+            .id;
+        assert_eq!(
+            ws.connections
+                .iter()
+                .filter(|&&(f, _)| f == hellofs)
+                .count(),
+            2,
+            "one provider, two consumers"
+        );
+        // The http pair shares a fabric network.
+        assert_eq!(ws.net_links.len(), 2);
+        // hellofuse's file comes from its args (fuse_opt_parse).
+        assert!(ws.nodes.iter().any(|n| matches!(
+            &n.kind,
+            SnapKind::App { name, args, .. }
+                if name == "hellofuse" && args.iter().any(|a| a.starts_with("--name="))
+        )));
         assert!(ws.nodes.iter().any(
             |n| matches!(&n.kind, SnapKind::BindMount { path } if path.ends_with("demo-archive.zip"))
+        ));
+        assert!(ws.nodes.iter().any(
+            |n| matches!(&n.kind, SnapKind::BindMount { path } if path.ends_with("httpfs-www"))
         ));
     }
 
