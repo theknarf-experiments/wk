@@ -3268,6 +3268,237 @@ mod tests {
         node.kill.store(true, Ordering::Relaxed);
     }
 
+    /// Seed a netsurf node's filesystem with the browser's runtime resources
+    /// — what the container image's `COPY res /usr/share/netsurf` provides —
+    /// and spawn it. NetSurf imports wasi:sockets (its curl fetcher), so it is
+    /// a networked node: it waits to be Run, which the caller does once any
+    /// server peer is listening. Returns the registered node.
+    fn spawn_netsurf(
+        host: &PluginHost,
+        id: NodeId,
+        surfaces: &SurfaceRegistry,
+        nodes: &NodeRegistry,
+    ) -> Option<SharedNode> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/netsurf");
+        let wasm = dir.join("netsurf.wasm");
+        let res = dir.join("res");
+        if !wasm.exists() || !res.exists() {
+            eprintln!("skipping: build plugins/netsurf first (./build.sh)");
+            return None;
+        }
+
+        host.spawn(
+            &wasm,
+            "netsurf",
+            id,
+            &[],
+            surfaces.clone(),
+            nodes.clone(),
+            Vec::new(),
+            None,
+        )
+        .expect("spawn");
+
+        // The node registers synchronously; seed the resources before the
+        // (much slower) background compile can let the guest run.
+        let node = nodes
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|n| n.id == id)
+            .cloned()
+            .expect("node registered");
+        for entry in std::fs::read_dir(&res).expect("read res/") {
+            let entry = entry.expect("res entry");
+            let name = entry.file_name().into_string().expect("utf8 name");
+            node.fs.lock().unwrap().put_file_at(
+                &format!("usr/share/netsurf/{name}"),
+                std::fs::read(entry.path()).expect("read resource"),
+            );
+        }
+
+        // First-ever wasmtime compile of a 6.5 MB browser takes minutes;
+        // cached runs break out in milliseconds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        loop {
+            if node.is_runnable() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "netsurf never compiled"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        Some(node)
+    }
+
+    /// Pump headless compositor frames (the server's per-frame role) until
+    /// `done` is satisfied by the surface's presented pixels.
+    fn pump_until(surface: &SharedSurface, what: &str, done: impl Fn(&VirtualSurface) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            {
+                let mut s = surface.lock().unwrap();
+                s.frame_ready = true;
+                s.wake();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            if done(&surface.lock().unwrap()) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "netsurf never {what}");
+        }
+    }
+
+    /// The real thing, part one: NetSurf 3.11 (framebuffer frontend, libnsfb's
+    /// new wk surface) boots as a wk node and paints its built-in
+    /// `about:welcome` page — resources from the node's own filesystem, zero
+    /// network. The test pumps frames headless exactly like the gfx-smoke and
+    /// doom tests and asserts the surface stops being a uniform colour.
+    #[test]
+    fn netsurf_paints_its_welcome_page() {
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let surfaces: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        let Some(node) = spawn_netsurf(&host, id, &surfaces, &nodes) else {
+            return;
+        };
+
+        // No URL argument: the browser opens its NETSURF_HOMEPAGE
+        // (about:welcome → resource:welcome.html from the seeded resources).
+        host.run_node(&node, &[]).expect("run netsurf");
+
+        // The surface appears once the guest's nsfb wk backend calls
+        // wkgfx_open.
+        let surface = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                if let Some(s) = surfaces.lock().unwrap().first().cloned() {
+                    break s;
+                }
+                assert!(
+                    !node.finished.load(Ordering::Relaxed),
+                    "netsurf exited before opening a surface"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "netsurf never opened a surface"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        // The welcome page (toolbar, search box, logo) is anything but a
+        // uniform field of pixels.
+        pump_until(&surface, "painted a non-uniform frame", |s| {
+            !s.pixels.is_empty() && s.pixels.chunks_exact(4).any(|px| px != &s.pixels[0..4])
+        });
+
+        node.kill.store(true, Ordering::Relaxed);
+    }
+
+    /// The real thing, part two: NetSurf fetches a page over the fabric. An
+    /// HTTP server listens as the named fabric peer "websrv" on the node's own
+    /// net (the httpfs test's pattern) serving a page with a solid bright-red
+    /// body; netsurf is launched pointed at `http://websrv:8080/`, resolves
+    /// the name over the fabric, drives its curl fetcher through the
+    /// userspace netstack, renders the page — and the test asserts a run of
+    /// pure-red pixels appears on the surface.
+    #[test]
+    fn netsurf_fetches_over_the_fabric() {
+        use std::io::{Read, Write};
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let surfaces: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        let Some(node) = spawn_netsurf(&host, id, &surfaces, &nodes) else {
+            return;
+        };
+
+        // The page: a solid #ff0000 background nothing in netsurf's own
+        // chrome uses, so its arrival on screen proves the fetch+render.
+        let page = "<html><head><title>fabric</title></head>\
+                    <body style=\"background-color: #ff0000\"></body></html>";
+        let kill_srv = Arc::new(AtomicBool::new(false));
+        wk_fabric::listen::listen(
+            host.hub(),
+            node.net_stack().expect("netsurf has a fabric stack"),
+            "websrv",
+            8080,
+            kill_srv.clone(),
+            Arc::new(move |mut s: std::os::unix::net::UnixStream| {
+                let page = page.to_string();
+                std::thread::spawn(move || {
+                    let mut req = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !req.ends_with(b"\r\n\r\n") {
+                        match s.read(&mut byte) {
+                            Ok(1) => req.push(byte[0]),
+                            _ => return,
+                        }
+                    }
+                    let path = String::from_utf8_lossy(&req)
+                        .split(' ')
+                        .nth(1)
+                        .unwrap_or("")
+                        .to_string();
+                    let reply = if path == "/" {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            page.len(),
+                            page
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\
+                         Connection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = s.write_all(reply.as_bytes());
+                });
+            }),
+        );
+
+        host.run_node(&node, &["http://websrv:8080/".to_string()])
+            .expect("run netsurf");
+
+        let surface = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                if let Some(s) = surfaces.lock().unwrap().first().cloned() {
+                    break s;
+                }
+                assert!(
+                    !node.finished.load(Ordering::Relaxed),
+                    "netsurf exited before opening a surface"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "netsurf never opened a surface"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        // A whole row's worth of pure red only exists once the fetched page's
+        // background has been rendered (the throbber/toolbar have no such
+        // run).
+        pump_until(&surface, "rendered the fetched red page", |s| {
+            let red = s
+                .pixels
+                .chunks_exact(4)
+                .filter(|px| px[0] == 0xff && px[1] == 0 && px[2] == 0)
+                .count();
+            red >= s.width as usize
+        });
+
+        node.kill.store(true, Ordering::Relaxed);
+        kill_srv.store(true, Ordering::Relaxed);
+    }
+
     /// Outbound wasi:http is denied unless the node's fabric stack has host
     /// access (i.e. it's wired to a Gateway) — the same gate as raw sockets.
     /// A stackless store (pure-http node / serve store) is always denied.

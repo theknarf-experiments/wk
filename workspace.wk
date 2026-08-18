@@ -98,6 +98,9 @@ dependencies {
     doom "docker://plugins/doom/Dockerfile" {
         description "DOOM (unmodified doomgeneric + Freedoom Phase 1) on a wasi-gfx surface"
     }
+    netsurf "docker://plugins/netsurf/Dockerfile" {
+        description "NetSurf 3.11 web browser (framebuffer frontend, HTTP over the fabric; no TLS/JS)"
+    }
 }
 workspace "01KXNW9K5HE8SA351748KG6GFA" {
 }

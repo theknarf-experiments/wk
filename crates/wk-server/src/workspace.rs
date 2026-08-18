@@ -1500,6 +1500,38 @@ mod tests {
     }
 
     #[test]
+    fn browser_example_wires_netsurf_to_a_web_server() {
+        // The browser showcase: NetSurf + a CPython webserver on a shared
+        // fabric network, the browser launched pointed at the server by name.
+        let example = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example/browser.wk"
+        ));
+        let doc = Document::load_resolved(example).expect("browser.wk resolves");
+        let names: Vec<&str> = doc.dependencies.iter().map(|d| d.name.as_str()).collect();
+        for want in ["netsurf", "python"] {
+            assert!(names.contains(&want), "{want} available via import");
+        }
+        let ws = doc
+            .workspaces
+            .iter()
+            .find(|w| !w.nodes.is_empty())
+            .expect("browser workspace");
+        // netsurf's launch args point at the python node's fabric name.
+        assert!(ws.nodes.iter().any(|n| matches!(
+            &n.kind,
+            SnapKind::App { name, args, .. }
+                if name == "netsurf" && args.iter().any(|a| a.starts_with("http://python:"))
+        )));
+        // Both peers join the same network; the www dir feeds the server.
+        assert_eq!(ws.net_links.len(), 2);
+        assert!(ws.nodes.iter().any(
+            |n| matches!(&n.kind, SnapKind::BindMount { path } if path.ends_with("browser-www"))
+        ));
+        assert_eq!(ws.connections.len(), 1);
+    }
+
+    #[test]
     fn imports_are_cycle_safe() {
         let dir = std::env::temp_dir().join("wk-import-cycle");
         let _ = std::fs::remove_dir_all(&dir);

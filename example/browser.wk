@@ -1,0 +1,44 @@
+// vim: set filetype=kdl :
+// A real web browser as a wk node. Run with:
+//
+//   wk run example/browser.wk
+//
+// The netsurf node is a wasm container (docker://plugins/netsurf/Dockerfile):
+// NetSurf 3.11's framebuffer frontend, its window a wasi-gfx surface through
+// libnsfb's wk backend, its HTTP a real libcurl on the userspace fabric.
+// The python node serves example/browser-www/ on the shared Network; netsurf
+// is launched pointed at it by name. Build both first:
+//
+//   cd plugins/netsurf && mise run build
+//   cd plugins/python  && mise run build
+//
+// Networked nodes stay idle until run: play the python node, then netsurf.
+import "../workspace.wk"
+workspace "01N3TSRF00000000000000WS00" {
+    node "netsurf" "01N3TSRF00000000000000NS01" {
+        pos 80.0 380.0
+        size 820.0 640.0
+        args "http://python:8088/"
+    }
+    node "python" "01N3TSRF00000000000000PY02" {
+        pos 520.0 80.0
+        size 380.0 240.0
+        args "/app/server.py" "8088"
+    }
+    bindmount "example/browser-www" "01N3TSRF00000000000000BM03" {
+        pos 990.0 120.0
+        size 150.0 44.0
+    }
+    network "01N3TSRF00000000000000NW04" {
+        pos 960.0 380.0
+        size 130.0 44.0
+    }
+    note "01N3TSRF00000000000000NT05" {
+        text "NetSurf — a real browser in a node.\n\nClick links, scroll with the wheel,\ntype in the URL bar (the toolbar's\ntext field), Enter to go.\n\nHTTP-only for now: the curl build\nhas no TLS backend, so https://\nsites won't load. about:welcome\nand the python node's pages will.\n\nStart the python node first, then\nnetsurf (networked nodes stay\nidle until run)."
+        pos 80.0 80.0
+        size 360.0 280.0
+    }
+    connection "01N3TSRF00000000000000BM03" "01N3TSRF00000000000000PY02" "/app"
+    netlink "01N3TSRF00000000000000NS01" "01N3TSRF00000000000000NW04"
+    netlink "01N3TSRF00000000000000PY02" "01N3TSRF00000000000000NW04"
+}

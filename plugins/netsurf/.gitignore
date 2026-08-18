@@ -1,6 +1,9 @@
-# build products — everything here is reproduced by build-deps.sh
+# build products — everything here is reproduced by build-deps.sh / build.sh
 sysroot/
 tarballs/
 src/
 logs/
 .toolbin/
+obj/
+res/
+netsurf.wasm
