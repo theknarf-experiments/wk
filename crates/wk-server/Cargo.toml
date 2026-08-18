@@ -45,3 +45,9 @@ coremidi = "0.8"
 [dev-dependencies]
 proptest = "1"
 wk-token-service = { path = "../wk-token-service" }
+# The HTTPS-over-the-fabric e2e: a rustls listener plays "a TLS server on the
+# fabric" for guest curl.wasm, with an rcgen self-signed CA as the trust
+# anchor. ring explicitly on both (it's already in the tree; the process
+# default is ambiguous with two providers linked).
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "log", "std", "tls12"] }

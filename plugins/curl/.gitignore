@@ -1,0 +1,4 @@
+# The pinned Mozilla CA bundle build.sh fetches (dated snapshot from
+# curl.se/ca/); source tree + curl.wasm are ignored from the repo root.
+cacert.pem
+cacert.pem.part

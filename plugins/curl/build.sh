@@ -24,8 +24,13 @@
 #     Defining HAVE_GETADDRINFO/HAVE_FREEADDRINFO picks curl's getaddrinfo
 #     resolver, which is the one wasi-libc implements.
 #
-# TLS is out: no wasm-capable TLS backend is wired up here, so this is a
-# plain-http build (`--without-ssl`). Requires wasi-sdk (WASI_SDK, default
+# TLS: wolfSSL, cross-compiled by plugins/wolfssl/build.sh into its sysroot
+# with the exact same sjlj/emulated flags — so `--with-wolfssl` just links.
+# curl does all socket I/O itself (BIO callbacks over the fabric); wolfSSL
+# only transforms buffers and reads the CA bundle from the vfs. Trust comes
+# from a pinned Mozilla bundle (cacert.pem, fetched below) that images COPY
+# to /etc/ssl/cacert.pem — the path baked in via --with-ca-bundle; --cacert
+# still overrides per-invocation. Requires wasi-sdk (WASI_SDK, default
 # ~/wasi-sdk). Source is fetched (and cached) under curl-<ver>/ on first run.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -33,6 +38,22 @@ cd "$(dirname "$0")"
 WASI_SDK="${WASI_SDK:-$HOME/wasi-sdk}"
 CURL_VER=8.11.1
 SRC="curl-$CURL_VER"
+WOLFSSL="$PWD/../wolfssl/sysroot"
+
+if [ ! -f "$WOLFSSL/lib/libwolfssl.a" ]; then
+    echo "curl: plugins/wolfssl/sysroot missing — build plugins/wolfssl first (./build.sh)" >&2
+    exit 1
+fi
+
+# The CA trust anchor set: Mozilla's bundle as curl.se extracts it, pinned by
+# date (https://curl.se/docs/caextract.html keeps every dated snapshot).
+# Ships in images as /etc/ssl/cacert.pem, which matches --with-ca-bundle.
+CACERT_PIN=2026-08-13
+if [ ! -f cacert.pem ]; then
+    echo "fetching Mozilla CA bundle ($CACERT_PIN)..."
+    curl -fsSL "https://curl.se/ca/cacert-$CACERT_PIN.pem" -o cacert.pem.part
+    mv cacert.pem.part cacert.pem
+fi
 
 # wasi-sdk's clang runs wasm-opt as an optional post-link step, but the wasm-opt
 # on PATH can't parse the new exnref EH we emit; run the build with a PATH that
@@ -57,14 +78,29 @@ export CFLAGS="--target=wasm32-wasip2 -O2 \
     -DHAVE_GETADDRINFO=1 -DHAVE_FREEADDRINFO=1"
 export LDFLAGS="-lwasi-emulated-signal -lwasi-emulated-process-clocks -lwasi-emulated-getpid"
 
+# configure's answers are only good for the toolchain+options that produced
+# them (bash's lesson); reconfigure from scratch when either changes — e.g.
+# the --without-ssl → --with-wolfssl move.
+CONFIGURE=(./configure --host=wasm32-wasi
+    --with-wolfssl="$WOLFSSL" --with-ca-bundle=/etc/ssl/cacert.pem
+    --without-libpsl --without-zlib --without-brotli
+    --without-zstd --without-libidn2 --without-nghttp2
+    --disable-shared --enable-static
+    --disable-threaded-resolver --disable-ntlm
+    --disable-unix-sockets --disable-socketpair
+    ac_cv_header_sys_un_h=no)
+# The stamp also covers wolfSSL's generated options.h: a wolfSSL reconfigure
+# changes what curl's feature probes find (ALPN, the BIO chain), and only a
+# fresh configure re-asks.
+STAMP="$("$CC" --version | head -1) ${CONFIGURE[*]} $(cksum "$WOLFSSL/include/wolfssl/options.h" 2>/dev/null | awk '{print $1}')"
+if [ -f Makefile ] && [ "$(cat .wk-configured 2>/dev/null)" != "$STAMP" ]; then
+    echo "toolchain or configure options changed; reconfiguring curl"
+    env PATH="$BUILD_PATH" make distclean >/dev/null 2>&1 || true
+    rm -f .wk-configured
+fi
 if [ ! -f Makefile ]; then
-    ./configure --host=wasm32-wasi \
-        --without-ssl --without-libpsl --without-zlib --without-brotli \
-        --without-zstd --without-libidn2 --without-nghttp2 \
-        --disable-shared --enable-static \
-        --disable-threaded-resolver --disable-ntlm \
-        --disable-unix-sockets --disable-socketpair \
-        ac_cv_header_sys_un_h=no
+    env PATH="$BUILD_PATH" "${CONFIGURE[@]}"
+    printf '%s' "$STAMP" > .wk-configured
 fi
 
 env PATH="$BUILD_PATH" make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"

@@ -7,3 +7,4 @@ logs/
 obj/
 res/
 netsurf.wasm
+cacert.pem

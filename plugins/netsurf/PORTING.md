@@ -100,7 +100,10 @@ them; Choices/Cookies live under $HOME=/root and their absence is handled),
    this is the only spot late enough for archives that must resolve
    libpng/libjpeg/curl setjmp+emulation references.
 7. **sysroot/lib/pkgconfig/libcurl.pc** (generated whole): points netsurf's
-   pkg-config probe at plugins/curl's existing wasip2 libcurl.a.
+   pkg-config probe at plugins/curl's existing wasip2 libcurl.a — and, since
+   curl grew its wolfSSL backend, appends `-L plugins/wolfssl/sysroot/lib
+   -lwolfssl` so the TLS archive libcurl references rides the same link line.
+   NETSURF_USE_OPENSSL stays NO: TLS lives entirely inside curl.
 8. **SHELL=/bin/bash on the make command line**: the LINKDEPS recipe uses
    `echo -n`; macOS /bin/sh writes a literal "-n" into link.d, which kills
    the *next* make run with "missing separator".
@@ -118,8 +121,12 @@ opens `about:welcome` → `resource:welcome.html` from the image: first paint
 needs zero network. Toolbar icons, pointers, throbber frames and the internal
 font are compiled into the binary by the build tools, not shipped as files.
 
-Known limitations: HTTP only (no TLS backend in libcurl.a — https:// fails
-cleanly), no JavaScript (duktape off), no gzip transfer encoding, no SVG.
+HTTPS: works — libcurl.a carries wolfSSL (plugins/wolfssl) as its TLS
+backend, and the image COPYs the pinned Mozilla CA bundle to
+/etc/ssl/cacert.pem, the path baked into curl via --with-ca-bundle.
+
+Known limitations: no JavaScript (duktape off), no gzip transfer encoding,
+no SVG.
 
 ### Tests / example
 
@@ -206,14 +213,17 @@ utf8proc/nsutils/nslog calls) compiles, links, and **runs under wasmtime**.
 ## libcurl.a (do NOT rebuild)
 
 Present and reusable: `plugins/curl/curl-8.11.1/lib/.libs/libcurl.a`
-(852 KB, wasm objects verified by magic). Built by plugins/curl/build.sh with:
+(wasm objects verified by magic). Built by plugins/curl/build.sh with:
 `--target=wasm32-wasip2 -O2` + the same sjlj/EH + `-D_WASI_EMULATED_*` flags +
 `-DHAVE_GETADDRINFO=1 -DHAVE_FREEADDRINFO=1`; configure
-`--host=wasm32-wasi --without-ssl --without-libpsl --without-zlib
+`--host=wasm32-wasi --with-wolfssl=plugins/wolfssl/sysroot
+--with-ca-bundle=/etc/ssl/cacert.pem --without-libpsl --without-zlib
 --without-brotli --without-zstd --without-libidn2 --without-nghttp2
 --disable-shared --enable-static --disable-threaded-resolver --disable-ntlm
 --disable-unix-sockets --disable-socketpair ac_cv_header_sys_un_h=no`.
-Plain HTTP only (no TLS backend), sockets/DNS via the wasip2 fabric.
+HTTP and HTTPS (TLS = wolfSSL, a separate static archive the consumer link
+must also carry: `-lwolfssl` from plugins/wolfssl/sysroot/lib), sockets/DNS
+via the wasip2 fabric.
 
 **Target-triple note for the eventual netsurf link:** libcurl.a is wasip2, this
 sysroot is wasip1. wasm object files mix fine (same wasm32 ABI; the final link

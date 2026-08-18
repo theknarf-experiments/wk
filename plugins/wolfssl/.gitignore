@@ -1,0 +1,6 @@
+# Fetched upstream source, the installed sysroot, and build droppings —
+# build.sh recreates all of it.
+wolfssl-*/
+wolfssl-*.tar.gz
+sysroot/
+wkrand.o
