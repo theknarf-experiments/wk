@@ -656,6 +656,133 @@ pub fn unmount_file(fs: &SharedFs, at: &str) {
     fs.lock().unwrap().remove_path(at);
 }
 
+/// Whether `path` lands on or inside a provider mount — i.e. listing or
+/// reading it means asking the serving node. Cheap (a local walk, no
+/// provider call): the check a UI uses to route a browse through its
+/// background fetcher instead of the render thread.
+pub fn path_crosses_provider(fs: &SharedFs, path: &str) -> bool {
+    let g = fs.lock().unwrap();
+    matches!(resolve_place(&g, ROOT, path, true), Resolved::Remote { .. })
+}
+
+/// How many of a forwarded listing's files get a per-entry `getattr` for
+/// their size (each is one more provider round trip; a huge listing
+/// shouldn't fan out). Entries past the cap show size 0.
+const FORWARDED_SIZES: usize = 64;
+
+/// [`Fs::list_dir`] that crosses provider mounts: a path reaching a provider
+/// is answered by the serving node — one forwarded readdir, plus a getattr
+/// per file (capped) for sizes. BLOCKS up to the provider-call timeout, so
+/// this is for background threads (the file inspector fetches through it
+/// off-thread and caches), never a render loop.
+pub fn list_dir_forwarded(fs: &SharedFs, path: &str) -> Option<Vec<DirEntry>> {
+    let target = {
+        let g = fs.lock().unwrap();
+        match resolve_place(&g, ROOT, path, true) {
+            Resolved::Remote { conn, path, .. } => Some((conn, path)),
+            Resolved::Local(_) => None,
+            Resolved::Missing => return None,
+        }
+    };
+    let Some((conn, rpath)) = target else {
+        return fs.lock().unwrap().list_dir(path);
+    };
+    let entries = match conn
+        .call(FsOp::Readdir {
+            path: rpath.clone(),
+        })
+        .ok()?
+    {
+        FsReplyData::Entries(list) => list,
+        _ => return None,
+    };
+    let mut out: Vec<DirEntry> = entries
+        .into_iter()
+        .map(|d| DirEntry {
+            is_dir: d.kind == FsEntryKind::Dir,
+            size: 0,
+            // Directories render plain; files keep the mount badge — they
+            // ARE served content, and the badge says so.
+            origin: if d.kind == FsEntryKind::Dir {
+                PathKind::Dir
+            } else {
+                PathKind::Mounted
+            },
+            name: d.name,
+        })
+        .collect();
+    for e in out.iter_mut().filter(|e| !e.is_dir).take(FORWARDED_SIZES) {
+        let p = if rpath.is_empty() {
+            e.name.clone()
+        } else {
+            format!("{rpath}/{}", e.name)
+        };
+        if let Ok(FsReplyData::Attr(st)) = conn.call(FsOp::Getattr { path: p }) {
+            e.size = st.size as usize;
+        }
+    }
+    out.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+    Some(out)
+}
+
+/// [`Fs::read_file`] (bounded preview) that crosses provider mounts: open,
+/// read up to `cap`, release. Blocks like [`list_dir_forwarded`] — for
+/// background threads only.
+pub fn read_file_forwarded(fs: &SharedFs, path: &str, cap: usize) -> Option<Vec<u8>> {
+    let target = {
+        let g = fs.lock().unwrap();
+        match resolve_place(&g, ROOT, path, true) {
+            Resolved::Remote { conn, path, .. } => Some((conn, path)),
+            Resolved::Local(_) => None,
+            Resolved::Missing => return None,
+        }
+    };
+    let Some((conn, rpath)) = target else {
+        return fs.lock().unwrap().read_file(path, cap);
+    };
+    let opened = match conn
+        .call(FsOp::Open {
+            path: rpath,
+            create: false,
+            truncate: false,
+            exclusive: false,
+        })
+        .ok()?
+    {
+        FsReplyData::Opened(o) => o,
+        _ => return None,
+    };
+    if opened.kind == FsEntryKind::Dir {
+        conn.cast(FsOp::Release {
+            handle: opened.handle,
+        });
+        return None;
+    }
+    let mut out = Vec::new();
+    while out.len() < cap {
+        let want = (cap - out.len()).min(FILE_READ_CHUNK) as u32;
+        match conn.call(FsOp::Read {
+            handle: opened.handle,
+            offset: out.len() as u64,
+            len: want,
+        }) {
+            Ok(FsReplyData::Data { bytes, eof }) => {
+                let done = bytes.is_empty() || eof;
+                out.extend_from_slice(&bytes);
+                if done {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    conn.cast(FsOp::Release {
+        handle: opened.handle,
+    });
+    out.truncate(cap);
+    Some(out)
+}
+
 /// Split a path into normal components (ignoring empty and `.`).
 fn components(path: &str) -> Vec<&str> {
     path.split('/')
@@ -2975,6 +3102,63 @@ mod tests {
                 .unwrap()
                 .unwrap_err(),
             ErrorCode::NotPermitted
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        t.join().unwrap();
+    }
+
+    /// The UI's background browse in one test: crossing detection routes a
+    /// path, forwarded listings and previews reach through the mount, and
+    /// local paths still answer locally.
+    #[test]
+    fn forwarded_listing_and_preview_cross_the_mount() {
+        use std::sync::atomic::Ordering;
+        let conn = ProviderConn::new();
+        let (t, stop) = spawn_memfs_provider(
+            conn.clone(),
+            &[("hello.txt", b"served"), ("sub/inner.txt", b"nested")],
+        );
+        let fs = new_fs();
+        fs.lock()
+            .unwrap()
+            .put_file_at("local.txt", b"local".to_vec());
+        mount_provider(&fs, "/mnt/p", conn.clone(), true);
+
+        assert!(!path_crosses_provider(&fs, ""));
+        assert!(!path_crosses_provider(&fs, "local.txt"));
+        assert!(path_crosses_provider(&fs, "/mnt/p"));
+        assert!(path_crosses_provider(&fs, "/mnt/p/sub/inner.txt"));
+
+        // The mount root lists remotely: dirs first, files sized via getattr.
+        let list = list_dir_forwarded(&fs, "/mnt/p").expect("lists the mount");
+        let shape: Vec<(&str, bool, usize)> = list
+            .iter()
+            .map(|e| (e.name.as_str(), e.is_dir, e.size))
+            .collect();
+        assert_eq!(shape, [("sub", true, 0), ("hello.txt", false, 6)]);
+        let nested = list_dir_forwarded(&fs, "/mnt/p/sub").expect("lists nested");
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0].name, "inner.txt");
+
+        // A local path goes straight to the local listing.
+        assert!(list_dir_forwarded(&fs, "")
+            .expect("local root lists")
+            .iter()
+            .any(|e| e.name == "local.txt"));
+
+        // Previews: through the mount (with the cap honored) and local.
+        assert_eq!(
+            read_file_forwarded(&fs, "/mnt/p/hello.txt", 64).as_deref(),
+            Some(&b"served"[..])
+        );
+        assert_eq!(
+            read_file_forwarded(&fs, "/mnt/p/hello.txt", 3).as_deref(),
+            Some(&b"ser"[..])
+        );
+        assert_eq!(
+            read_file_forwarded(&fs, "local.txt", 64).as_deref(),
+            Some(&b"local"[..])
         );
 
         stop.store(true, Ordering::Relaxed);

@@ -276,6 +276,9 @@ struct App {
     capture_tick: u64,
     /// When inspecting a node's virtual filesystem (a modal overlay).
     inspect: Option<Inspector>,
+    /// Background-fetched listings/previews for inspector paths that cross a
+    /// provider mount (the render thread never blocks on a guest).
+    browse: ProviderBrowse,
     /// When viewing a node's output log (a modal overlay). Mutually exclusive
     /// with `inspect` — one panel at a time.
     logs: Option<LogView>,
@@ -369,6 +372,7 @@ impl App {
             editing_mount: None,
             capture_tick: 0,
             inspect: None,
+            browse: ProviderBrowse::new(),
             logs: None,
             log_max_scroll: 0.0,
             clipboard: arboard::Clipboard::new().ok(),
@@ -3475,7 +3479,7 @@ impl App {
             if let Some(insp) = &self.inspect {
                 let entries = node_by_id
                     .get(&insp.node)
-                    .map(|n| n.fs.lock().unwrap().list_dir(&insp.dir).unwrap_or_default())
+                    .map(|n| inspect_listing(&self.browse, n, &insp.dir))
                     .unwrap_or_default();
                 let (panel, close, up, rows, _preview) = self.inspect_regions(fb, entries.len());
                 if contains(close, mp) || !contains(panel, mp) {
@@ -4687,7 +4691,7 @@ impl App {
             let node = node_by_id.get(&insp.node);
             let node_name = node.map(|n| n.name.clone()).unwrap_or_default();
             let entries = node
-                .map(|n| n.fs.lock().unwrap().list_dir(&insp.dir).unwrap_or_default())
+                .map(|n| inspect_listing(&self.browse, n, &insp.dir))
                 .unwrap_or_default();
             let (panel, close, up, rows, preview) = self.inspect_regions(fb, entries.len());
             let (_, _, _, _, row_h) = inspect_layout(fb);
@@ -4931,7 +4935,7 @@ impl App {
                 Some(fname) => {
                     let path = insp.child_path(fname);
                     let bytes = node
-                        .and_then(|n| n.fs.lock().unwrap().read_file(&path, INSPECT_PREVIEW_CAP))
+                        .and_then(|n| inspect_preview(&self.browse, n, &path, INSPECT_PREVIEW_CAP))
                         .unwrap_or_default();
                     let header = format!("{fname}  ({})", human_size(bytes.len()));
                     self.text_cache.draw(

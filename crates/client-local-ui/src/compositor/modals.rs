@@ -4,6 +4,7 @@
 //! and the layout maths.
 
 use super::*;
+use std::sync::Mutex;
 
 /// Rows of the inspector listing visible at once.
 pub(super) const INSPECT_ROWS: usize = 14;
@@ -42,6 +43,146 @@ impl Inspector {
             Some(0) | None => self.dir.clear(),
             Some(i) => self.dir.truncate(i),
         }
+    }
+}
+
+/// One cached background fetch: in flight, delivered, or known-absent.
+enum Fetch<T> {
+    Pending,
+    Ready(T, std::time::Instant),
+    Gone(std::time::Instant),
+}
+
+/// How long a delivered listing/preview stays fresh before a background
+/// refresh — a live provider's changes show up without reopening the panel,
+/// without hammering it every frame.
+const BROWSE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One shared cache map: fetches keyed by (node, path).
+type FetchMap<T> = Arc<Mutex<HashMap<(NodeId, String), Fetch<T>>>>;
+
+/// Listings and previews for inspector paths that cross a provider mount,
+/// fetched on background threads. A provider call can block for seconds (a
+/// dead provider costs its full timeout), so the render thread only ever
+/// reads this cache: a missing entry spawns a fetch and renders empty until
+/// the reply lands (usually the next frame — the conduit is an in-process
+/// wake). Stale entries are served while a refresh runs behind them.
+pub(super) struct ProviderBrowse {
+    listings: FetchMap<Vec<wk_server::vfs::DirEntry>>,
+    previews: FetchMap<Vec<u8>>,
+}
+
+impl ProviderBrowse {
+    pub(super) fn new() -> Self {
+        ProviderBrowse {
+            listings: Arc::new(Mutex::new(HashMap::new())),
+            previews: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// The cached value for `key`, spawning `load` on a thread when the
+    /// entry is missing or stale. Serves the stale value while refreshing.
+    fn fetch<T: Clone + Send + 'static>(
+        map: &FetchMap<T>,
+        key: (NodeId, String),
+        load: impl FnOnce() -> Option<T> + Send + 'static,
+    ) -> Option<T> {
+        let spawn = |key: (NodeId, String)| {
+            let map = map.clone();
+            std::thread::spawn(move || {
+                let got = match load() {
+                    Some(v) => Fetch::Ready(v, std::time::Instant::now()),
+                    None => Fetch::Gone(std::time::Instant::now()),
+                };
+                map.lock().unwrap().insert(key, got);
+            });
+        };
+        let mut g = map.lock().unwrap();
+        match g.get_mut(&key) {
+            Some(Fetch::Pending) => None,
+            Some(Fetch::Ready(v, t)) => {
+                let out = v.clone();
+                if t.elapsed() >= BROWSE_TTL {
+                    // Mark fresh so one refresh runs, not one per frame.
+                    *t = std::time::Instant::now();
+                    drop(g);
+                    spawn(key);
+                }
+                Some(out)
+            }
+            Some(Fetch::Gone(t)) => {
+                if t.elapsed() >= BROWSE_TTL {
+                    *t = std::time::Instant::now();
+                    drop(g);
+                    spawn(key);
+                }
+                None
+            }
+            None => {
+                g.insert(key.clone(), Fetch::Pending);
+                drop(g);
+                spawn(key);
+                None
+            }
+        }
+    }
+
+    /// The listing for `dir` of `node`'s filesystem, through the cache.
+    pub(super) fn listing(
+        &self,
+        node: NodeId,
+        fs: &wk_server::vfs::SharedFs,
+        dir: &str,
+    ) -> Option<Vec<wk_server::vfs::DirEntry>> {
+        let fs = fs.clone();
+        let path = dir.to_string();
+        Self::fetch(&self.listings, (node, path.clone()), move || {
+            wk_server::vfs::list_dir_forwarded(&fs, &path)
+        })
+    }
+
+    /// A bounded preview of `path` in `node`'s filesystem, through the cache.
+    pub(super) fn preview(
+        &self,
+        node: NodeId,
+        fs: &wk_server::vfs::SharedFs,
+        path: &str,
+        cap: usize,
+    ) -> Option<Vec<u8>> {
+        let fs = fs.clone();
+        let p = path.to_string();
+        Self::fetch(&self.previews, (node, p.clone()), move || {
+            wk_server::vfs::read_file_forwarded(&fs, &p, cap)
+        })
+    }
+}
+
+/// The inspector's listing for `dir`: local filesystems answer directly on
+/// the render thread as always; a path crossing a provider mount goes
+/// through the background cache.
+pub(super) fn inspect_listing(
+    browse: &ProviderBrowse,
+    node: &SharedNode,
+    dir: &str,
+) -> Vec<wk_server::vfs::DirEntry> {
+    if wk_server::vfs::path_crosses_provider(&node.fs, dir) {
+        browse.listing(node.id, &node.fs, dir).unwrap_or_default()
+    } else {
+        node.fs.lock().unwrap().list_dir(dir).unwrap_or_default()
+    }
+}
+
+/// The inspector's file preview, with the same local/provider split.
+pub(super) fn inspect_preview(
+    browse: &ProviderBrowse,
+    node: &SharedNode,
+    path: &str,
+    cap: usize,
+) -> Option<Vec<u8>> {
+    if wk_server::vfs::path_crosses_provider(&node.fs, path) {
+        browse.preview(node.id, &node.fs, path, cap)
+    } else {
+        node.fs.lock().unwrap().read_file(path, cap)
     }
 }
 
