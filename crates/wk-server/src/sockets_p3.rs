@@ -211,6 +211,21 @@ fn family_of(a: IpSocketAddress) -> IpAddressFamily {
     }
 }
 
+/// The 0.3 bindgen's address family as the fabric's [`IpFamily`] (the 0.3
+/// world generates its own `IpAddressFamily` type, distinct from 0.2's).
+fn ip_family(f: IpAddressFamily) -> wk_fabric::netstack::IpFamily {
+    match f {
+        IpAddressFamily::Ipv4 => wk_fabric::netstack::IpFamily::V4,
+        IpAddressFamily::Ipv6 => wk_fabric::netstack::IpFamily::V6,
+    }
+}
+
+/// Does `addr`'s family match the wasi family a socket was created with?
+/// (See `crate::sockets::family_matches` — same guarantee for the 0.3 impl.)
+fn family_matches(addr: smoltcp::wire::IpAddress, family: IpAddressFamily) -> bool {
+    wk_fabric::netstack::IpFamily::of(addr) == ip_family(family)
+}
+
 fn ip3(ip: std::net::IpAddr) -> IpAddress {
     match ip {
         std::net::IpAddr::V4(v4) => {
@@ -308,6 +323,46 @@ impl<T: NetView + 'static> StreamProducer<T> for AcceptProducer<T> {
             if pool.iter().all(|&(h, gen)| !g.is_current(h, gen)) {
                 return Poll::Ready(Ok(StreamResult::Dropped));
             }
+            // The endpoint a consumed listener was armed with — its
+            // connection's local address (every pool listener is armed with a
+            // concrete family-scoped address; see `listen`).
+            let relisten_ep = |g: &NodeStack, h: SocketHandle| -> smoltcp::wire::IpListenEndpoint {
+                match g.sockets.get::<tcp::Socket>(h).local_endpoint() {
+                    Some(ep) => smoltcp::wire::IpListenEndpoint {
+                        addr: Some(ep.addr),
+                        port: me.port,
+                    },
+                    None => g.listen_endpoints(ip_family(me.family), None, me.port)[0],
+                }
+            };
+            // Defensive guarantee: never surface a peer of another family than
+            // the listening socket's own (a guest libc may abort on the
+            // mismatch). Family-scoped listeners make such a connection
+            // impossible; if one ever appears, refuse it (RST) and re-arm.
+            for (h, gen) in pool.iter_mut() {
+                if !g.is_current(*h, *gen)
+                    || matches!(
+                        g.sockets.get::<tcp::Socket>(*h).state(),
+                        tcp::State::Listen | tcp::State::SynSent | tcp::State::SynReceived
+                    )
+                    || g.sockets
+                        .get::<tcp::Socket>(*h)
+                        .remote_endpoint()
+                        .is_none_or(|ep| family_matches(ep.addr, me.family))
+                {
+                    continue;
+                }
+                let ep = relisten_ep(&g, *h);
+                g.sockets.get_mut::<tcp::Socket>(*h).abort();
+                g.begin_close(*h, SockKind::Tcp);
+                let fresh = g.sockets.add(fabric_tcp_socket());
+                let fresh_gen = g.track(fresh);
+                if g.sockets.get_mut::<tcp::Socket>(fresh).listen(ep).is_ok() {
+                    (*h, *gen) = (fresh, fresh_gen);
+                } else {
+                    g.begin_close(fresh, SockKind::Tcp);
+                }
+            }
             // A peer has connected once a pool socket leaves the listening
             // handshake states (same predicate as 0.2's AcceptReady). Not
             // just `Established`: a fast peer may have already sent data and
@@ -336,14 +391,12 @@ impl<T: NetView + 'static> StreamProducer<T> for AcceptProducer<T> {
             let remote = sock
                 .remote_endpoint()
                 .map(|ep| from_smol3(ep.addr, ep.port));
-            // Replenish the consumed slot with a fresh listener.
+            // Replenish the consumed slot with a fresh listener on the same
+            // family-scoped endpoint the consumed listener covered.
+            let ep = relisten_ep(&g, conn_handle);
             let fresh = g.sockets.add(fabric_tcp_socket());
             let fresh_gen = g.track(fresh);
-            if g.sockets
-                .get_mut::<tcp::Socket>(fresh)
-                .listen(me.port)
-                .is_ok()
-            {
+            if g.sockets.get_mut::<tcp::Socket>(fresh).listen(ep).is_ok() {
                 pool[idx] = (fresh, fresh_gen);
             } else {
                 g.begin_close(fresh, SockKind::Tcp);
@@ -1000,7 +1053,7 @@ impl<T: NetView + Send + 'static> wasi::sockets::types::HostTcpSocketWithStore<T
         let getter = store.getter();
         let producer = {
             let mut view = store.get();
-            let (stack, handle, gen, family, bound, bound_port) = {
+            let (stack, handle, gen, family, bound, bound_port, local) = {
                 let s = tbl(view.table().get(&socket))?;
                 if s.listening || s.connecting || s.connected || s.closed {
                     return Err(ErrorCode::InvalidState.into());
@@ -1012,6 +1065,7 @@ impl<T: NetView + Send + 'static> wasi::sockets::types::HostTcpSocketWithStore<T
                     s.family,
                     s.bound,
                     s.bound_port,
+                    s.local,
                 )
             };
             // Implicit bind to an ephemeral port when not explicitly bound
@@ -1023,9 +1077,14 @@ impl<T: NetView + Send + 'static> wasi::sockets::types::HostTcpSocketWithStore<T
             };
             let pool_vec = {
                 let mut g = stack.lock().unwrap();
+                // Family-scoped endpoints (see `NodeStack::listen_endpoints`):
+                // a listener only matches its own family's local addresses, so
+                // a v6 SYN to a v4-bound port is refused rather than surfacing
+                // a v6 peer on a v4 socket — same as the 0.2 start-listen.
+                let eps = g.listen_endpoints(ip_family(family), local.map(|a| to_smol3(a).0), port);
                 if g.sockets
                     .get_mut::<tcp::Socket>(handle)
-                    .listen(port)
+                    .listen(eps[0])
                     .is_err()
                 {
                     return Err(ErrorCode::InvalidState.into());
@@ -1034,10 +1093,14 @@ impl<T: NetView + Send + 'static> wasi::sockets::types::HostTcpSocketWithStore<T
                 // can connect at once — see LISTEN_BACKLOG in crate::sockets.
                 let mut pool = Vec::with_capacity(LISTEN_BACKLOG);
                 pool.push((handle, gen));
-                for _ in 1..LISTEN_BACKLOG {
+                for i in 1..LISTEN_BACKLOG {
                     let h = g.sockets.add(fabric_tcp_socket());
                     let hg = g.track(h);
-                    if g.sockets.get_mut::<tcp::Socket>(h).listen(port).is_err() {
+                    if g.sockets
+                        .get_mut::<tcp::Socket>(h)
+                        .listen(eps[i % eps.len()])
+                        .is_err()
+                    {
                         g.begin_close(h, SockKind::Tcp);
                         continue;
                     }
@@ -1375,15 +1438,22 @@ impl<T: NetView + Send + 'static> wasi::sockets::types::HostUdpSocketWithStore<T
         store: &Accessor<T, Self>,
         socket: Resource<UdpSocket>,
     ) -> SocketsResult<(Vec<u8>, IpSocketAddress)> {
-        type RecvPlan = (SharedStack, SocketHandle, u64, Option<IpSocketAddress>);
-        let (stack, handle, gen, filter) = store.with(|mut a| -> SocketsResult<RecvPlan> {
-            let mut view = a.get();
-            let s = tbl(view.table().get(&socket))?;
-            if !s.bound {
-                return Err(ErrorCode::InvalidState.into());
-            }
-            Ok((s.stack.clone(), s.handle, s.gen, s.remote))
-        })?;
+        type RecvPlan = (
+            SharedStack,
+            SocketHandle,
+            u64,
+            Option<IpSocketAddress>,
+            IpAddressFamily,
+        );
+        let (stack, handle, gen, filter, family) =
+            store.with(|mut a| -> SocketsResult<RecvPlan> {
+                let mut view = a.get();
+                let s = tbl(view.table().get(&socket))?;
+                if !s.bound {
+                    return Err(ErrorCode::InvalidState.into());
+                }
+                Ok((s.stack.clone(), s.handle, s.gen, s.remote, s.family))
+            })?;
         loop {
             UdpReady {
                 stack: stack.clone(),
@@ -1400,6 +1470,12 @@ impl<T: NetView + Send + 'static> wasi::sockets::types::HostUdpSocketWithStore<T
             let Ok((data, meta)) = s.recv() else {
                 continue; // spurious wake
             };
+            // Never surface a peer of the other family (the guest's sockaddr
+            // conversion may abort on it): drop the datagram, as a kernel
+            // would never have delivered it to this socket at all.
+            if !family_matches(meta.endpoint.addr, family) {
+                continue;
+            }
             let src = from_smol3(meta.endpoint.addr, meta.endpoint.port);
             // A connected socket only yields its peer's datagrams.
             if let Some(peer) = filter {
@@ -1717,6 +1793,107 @@ mod tests {
             let (sr, cr) = tokio::join!(server, client);
             sr.expect("server run_concurrent").expect("server body");
             cr.expect("client run_concurrent").expect("client body");
+        });
+    }
+
+    /// A v6 dial to a port where the guest listens on a **v4** socket is
+    /// refused at the SYN — the listener pool is family-scoped — while the v4
+    /// dial to the same port establishes. Before family-scoped listening, the
+    /// port-only listeners matched both families and accept surfaced a v6
+    /// peer on the v4 socket: wasi-libc's accept() aborts converting that
+    /// mismatch to a sockaddr (the netsurf→python `http.server` trap).
+    #[test]
+    fn p3_v6_dial_to_a_v4_listener_is_refused() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let hub = NetHub::new();
+            let net = NodeId::nil();
+            let client_stack = hub.attach(net, Ipv4Address::new(10, 0, 0, 1), "client");
+            let server_stack = hub.attach(net, Ipv4Address::new(10, 0, 0, 2), "server");
+            let (server_ip, server_ip6) = {
+                let g = server_stack.lock().unwrap();
+                (g.ip, g.ip6)
+            };
+            let engine = engine();
+            let mut server_store = store_on(&engine, Some(NetCtx::new(server_stack, hub.clone())));
+
+            server_store
+                .run_concurrent(async move |acc| {
+                    use wasi::sockets::types::HostTcpSocket as H;
+                    use wasi::sockets::types::HostTcpSocketWithStore as S;
+                    let nacc: Nacc = acc.with_getter(|s| SockImpl(s));
+                    let sock =
+                        must(nacc.with(|mut a| H::create(&mut a.get(), IpAddressFamily::Ipv4)));
+                    // The python http.server case: a v4 wildcard bind.
+                    must(
+                        nacc.with(|mut a| H::bind(&mut a.get(), res(&sock), v4(0, 0, 0, 0, 8080))),
+                    );
+                    let _accepts = must(nacc.with(|a| S::listen(a, res(&sock))));
+
+                    // Dial the server's fabric ULA — the v6 route to the port.
+                    // The SYN must meet no listener and be answered with RST.
+                    let dial = |dst: smoltcp::wire::IpAddress, lport: u16| {
+                        let mut g = client_stack.lock().unwrap();
+                        let h = g.sockets.add(fabric_tcp_socket());
+                        let _gen = g.track(h);
+                        let NodeStack { iface, sockets, .. } = &mut *g;
+                        sockets
+                            .get_mut::<tcp::Socket>(h)
+                            .connect(iface.context(), (dst, 8080), lport)
+                            .unwrap();
+                        h
+                    };
+                    let h6 = dial(server_ip6.into(), 49500);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    loop {
+                        let state = client_stack
+                            .lock()
+                            .unwrap()
+                            .sockets
+                            .get::<tcp::Socket>(h6)
+                            .state();
+                        assert_ne!(
+                            state,
+                            tcp::State::Established,
+                            "a v6 dial must never land on a v4-bound listener"
+                        );
+                        if state == tcp::State::Closed {
+                            break;
+                        }
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the v6 dial was neither refused nor established"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    }
+
+                    // The v4 route to the same port still establishes.
+                    let h4 = dial(server_ip.into(), 49501);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    loop {
+                        let state = client_stack
+                            .lock()
+                            .unwrap()
+                            .sockets
+                            .get::<tcp::Socket>(h4)
+                            .state();
+                        if state == tcp::State::Established {
+                            break;
+                        }
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the v4 dial never established"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    }
+                    wasmtime::error::Ok(())
+                })
+                .await
+                .expect("run_concurrent")
+                .expect("test body");
         });
     }
 

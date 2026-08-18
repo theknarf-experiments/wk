@@ -22,7 +22,8 @@ use smoltcp::socket::tcp::{Socket as TcpSocket, State as TcpState};
 use smoltcp::socket::udp::Socket as UdpSocket;
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Packet, Ipv6Address, Ipv6Packet,
+    HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address, Ipv4Packet, Ipv6Address,
+    Ipv6Packet,
 };
 
 /// One raw IP packet on the fabric (Medium::Ip — no Ethernet header).
@@ -187,6 +188,24 @@ pub enum SockKind {
     Udp,
 }
 
+/// An IP family on the fabric — which of a node's two addresses (`10.0.0.x` /
+/// `fd00::x`) a socket lives on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IpFamily {
+    V4,
+    V6,
+}
+
+impl IpFamily {
+    /// The family of a concrete address.
+    pub fn of(addr: IpAddress) -> IpFamily {
+        match addr {
+            IpAddress::Ipv4(_) => IpFamily::V4,
+            IpAddress::Ipv6(_) => IpFamily::V6,
+        }
+    }
+}
+
 /// Ticks (~1ms each) to let a closing socket flush before forcing removal.
 const CLOSE_TICKS: u32 = 5000;
 
@@ -217,6 +236,52 @@ impl NodeStack {
     pub fn begin_close(&mut self, h: SocketHandle, kind: SockKind) {
         if self.live.remove(&h).is_some() {
             self.closing.push((h, kind, CLOSE_TICKS));
+        }
+    }
+
+    /// The local endpoints a TCP listener on `port` must cover for a socket of
+    /// `family` bound to `bound`.
+    ///
+    /// Family-scoped listening is what keeps a v6 SYN off a v4-bound listener:
+    /// smoltcp matches a listener with a concrete address only against packets
+    /// to that address (and RSTs anything unmatched), while a port-only
+    /// listener (`listen(port)`) matches EVERY local address — both families —
+    /// which would hand a v4-bound guest socket a v6 peer. A guest runtime may
+    /// rightly refuse to represent that (wasi-libc's accept() `abort()`s
+    /// converting the mismatched family to a sockaddr), and wasi 0.2 sockets
+    /// are never dual-stack ("WASI IPv6 sockets are always v6-only"). Refused
+    /// at SYN time, a dual-family client (curl's happy eyeballs) simply falls
+    /// back to the other address.
+    ///
+    /// A concrete `bound` address (of the right family) narrows the listener to
+    /// that address alone; unspecified (`0.0.0.0` / `::`, or no address) covers
+    /// the node's fabric address plus loopback in that family.
+    pub fn listen_endpoints(
+        &self,
+        family: IpFamily,
+        bound: Option<IpAddress>,
+        port: u16,
+    ) -> Vec<IpListenEndpoint> {
+        match bound {
+            Some(addr) if !addr.is_unspecified() && IpFamily::of(addr) == family => {
+                vec![IpListenEndpoint {
+                    addr: Some(addr),
+                    port,
+                }]
+            }
+            _ => {
+                let addrs: [IpAddress; 2] = match family {
+                    IpFamily::V4 => [self.ip.into(), Ipv4Address::new(127, 0, 0, 1).into()],
+                    IpFamily::V6 => [self.ip6.into(), Ipv6Address::LOCALHOST.into()],
+                };
+                addrs
+                    .into_iter()
+                    .map(|addr| IpListenEndpoint {
+                        addr: Some(addr),
+                        port,
+                    })
+                    .collect()
+            }
         }
     }
 
@@ -586,6 +651,89 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(&got, b"hello v6 net");
+    }
+
+    /// A v4-only listener (the family-scoped endpoints of `listen_endpoints`)
+    /// never sees a v6 connection: a peer dialing the node's fabric ULA on that
+    /// port is refused (RST → the dialing socket dies), while a v4 dial to the
+    /// same port establishes. This is what keeps a v6 peer address out of a
+    /// guest's v4 accept() — wasi-libc aborts on the family mismatch.
+    #[test]
+    fn v4_only_listeners_refuse_v6_dials() {
+        let hub = NetHub::new();
+        let net = NodeId::nil();
+        let server = hub.attach(net, Ipv4Address::new(10, 0, 0, 2), "server");
+        let client = hub.attach(net, Ipv4Address::new(10, 0, 0, 1), "client");
+        let (server_ip, server_ip6) = {
+            let g = server.lock().unwrap();
+            (g.ip, g.ip6)
+        };
+
+        // A v4-bound-to-0.0.0.0 guest socket: one listener per covered local
+        // address (fabric v4 + v4 loopback), none matching the ULA.
+        {
+            let mut g = server.lock().unwrap();
+            for ep in g.listen_endpoints(IpFamily::V4, None, 80) {
+                let h = g.sockets.add(tcp_socket());
+                g.sockets.get_mut::<tcp::Socket>(h).listen(ep).unwrap();
+            }
+        }
+
+        let dial = |dst: IpAddress, lport: u16| {
+            let mut g = client.lock().unwrap();
+            let h = g.sockets.add(tcp_socket());
+            let NodeStack { iface, sockets, .. } = &mut *g;
+            sockets
+                .get_mut::<tcp::Socket>(h)
+                .connect(iface.context(), (dst, 80), lport)
+                .unwrap();
+            h
+        };
+
+        // v6 dial: refused — the SYN to fd00::2 matches no listener, smoltcp
+        // answers RST, and the dialing socket falls out of the handshake.
+        let h6 = dial(server_ip6.into(), 49152);
+        let mut refused = false;
+        for _ in 0..500 {
+            hub.step();
+            let state = client
+                .lock()
+                .unwrap()
+                .sockets
+                .get::<tcp::Socket>(h6)
+                .state();
+            assert_ne!(
+                state,
+                TcpState::Established,
+                "a v6 dial must never land on a v4-only listener"
+            );
+            if state == TcpState::Closed {
+                refused = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(refused, "the v6 dial was refused (RST), not left hanging");
+
+        // v4 dial to the same port: establishes.
+        let h4 = dial(server_ip.into(), 49153);
+        let mut established = false;
+        for _ in 0..500 {
+            hub.step();
+            if client
+                .lock()
+                .unwrap()
+                .sockets
+                .get::<tcp::Socket>(h4)
+                .state()
+                == TcpState::Established
+            {
+                established = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(established, "the v4 dial reaches the v4 listener");
     }
 
     /// Several sockets can listen on one port at once, and concurrent peers each

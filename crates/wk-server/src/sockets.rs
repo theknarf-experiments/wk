@@ -292,6 +292,11 @@ pub struct Datagrams {
     handle: SocketHandle,
     gen: u64,
     remote: Option<IpSocketAddress>,
+    /// The owning socket's address family: received datagrams from the other
+    /// family are dropped (a smoltcp socket bound by port alone receives
+    /// both), so the guest never sees a remote address its family can't
+    /// represent — wasi 0.2 sockets are never dual-stack.
+    family: IpAddressFamily,
 }
 
 pub struct ResolveStream {
@@ -336,6 +341,22 @@ fn from_smol(ip: smoltcp::wire::IpAddress, port: u16) -> IpSocketAddress {
             })
         }
     }
+}
+
+/// A wasi address family as the fabric's [`IpFamily`].
+pub(crate) fn ip_family(f: IpAddressFamily) -> wk_fabric::netstack::IpFamily {
+    match f {
+        IpAddressFamily::Ipv4 => wk_fabric::netstack::IpFamily::V4,
+        IpAddressFamily::Ipv6 => wk_fabric::netstack::IpFamily::V6,
+    }
+}
+
+/// Does `addr`'s family match the wasi family a socket was created with?
+/// Accept must never surface a peer of the other family (a guest libc may
+/// abort on the mismatch — wasi-libc's accept() does), so this backs the
+/// defensive checks in the accept paths.
+pub(crate) fn family_matches(addr: smoltcp::wire::IpAddress, family: IpAddressFamily) -> bool {
+    wk_fabric::netstack::IpFamily::of(addr) == ip_family(family)
 }
 
 /// This node's own fabric address in the family of `remote` (v4 or v6).
@@ -1039,27 +1060,37 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
         let Some(stack) = self.stack() else {
             return Ok(Err(ErrorCode::AccessDenied));
         };
-        let (handle, port) = {
+        let (handle, port, family, local) = {
             let s = self.table().get(&this)?;
-            (s.handle, s.bound_port)
+            (s.handle, s.bound_port, s.family, s.local)
         };
         let backlog = {
             let mut g = stack.lock().unwrap();
+            // Family-scoped endpoints: a listener only matches its own
+            // family's local addresses, so e.g. a v6 SYN to a v4-bound port is
+            // refused (RST) instead of handing the guest a v6 peer its accept
+            // can't represent (see `NodeStack::listen_endpoints`).
+            let eps = g.listen_endpoints(ip_family(family), local.map(|a| to_smol(a).0), port);
             if g.sockets
                 .get_mut::<tcp::Socket>(handle)
-                .listen(port)
+                .listen(eps[0])
                 .is_err()
             {
                 return Ok(Err(ErrorCode::InvalidState));
             }
             // A pool of extra listeners on the same port, so several peers can
             // connect at once instead of all but one being refused. smoltcp hands
-            // each incoming SYN to any socket that is listening on the port.
+            // each incoming SYN to any socket that is listening on a matching
+            // endpoint. The pool round-robins over the covered endpoints.
             let mut backlog = Vec::with_capacity(LISTEN_BACKLOG - 1);
-            for _ in 1..LISTEN_BACKLOG {
+            for i in 1..LISTEN_BACKLOG {
                 let h = g.sockets.add(fabric_tcp_socket());
                 let gen = g.track(h);
-                if g.sockets.get_mut::<tcp::Socket>(h).listen(port).is_err() {
+                if g.sockets
+                    .get_mut::<tcp::Socket>(h)
+                    .listen(eps[i % eps.len()])
+                    .is_err()
+                {
                     g.begin_close(h, wk_fabric::netstack::SockKind::Tcp);
                     continue;
                 }
@@ -1107,10 +1138,55 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
         // listener back in its slot, so the pool keeps its size.
         let (conn_handle, conn_gen, conn_local, conn_remote) = {
             let mut g = stack.lock().unwrap();
+            let mut pool = pool;
+            // The endpoint a consumed listener was armed with — its
+            // connection's local address (every pool listener is armed with a
+            // concrete family-scoped address; see start-listen).
+            let relisten_ep = |g: &wk_fabric::netstack::NodeStack,
+                               h: SocketHandle|
+             -> smoltcp::wire::IpListenEndpoint {
+                match g.sockets.get::<tcp::Socket>(h).local_endpoint() {
+                    Some(ep) => smoltcp::wire::IpListenEndpoint {
+                        addr: Some(ep.addr),
+                        port,
+                    },
+                    None => g.listen_endpoints(ip_family(family), None, port)[0],
+                }
+            };
+            // Defensive guarantee: accept never surfaces a peer of another
+            // family than the socket's own — a guest libc may abort on the
+            // mismatch (wasi-libc's accept() does). Family-scoped listeners
+            // make such a connection impossible; if one ever appears anyway,
+            // refuse it (RST) and re-arm the slot instead.
+            for (h, gen) in pool.iter_mut() {
+                if !g.is_current(*h, *gen)
+                    || g.sockets.get::<tcp::Socket>(*h).state() != tcp::State::Established
+                    || g.sockets
+                        .get::<tcp::Socket>(*h)
+                        .remote_endpoint()
+                        .is_none_or(|ep| family_matches(ep.addr, family))
+                {
+                    continue;
+                }
+                let ep = relisten_ep(&g, *h);
+                g.sockets.get_mut::<tcp::Socket>(*h).abort();
+                g.begin_close(*h, wk_fabric::netstack::SockKind::Tcp);
+                let fresh = g.sockets.add(fabric_tcp_socket());
+                let fresh_gen = g.track(fresh);
+                if g.sockets.get_mut::<tcp::Socket>(fresh).listen(ep).is_ok() {
+                    (*h, *gen) = (fresh, fresh_gen);
+                } else {
+                    g.begin_close(fresh, wk_fabric::netstack::SockKind::Tcp);
+                }
+            }
             let Some(idx) = pool.iter().position(|&(h, gen)| {
                 g.is_current(h, gen)
                     && g.sockets.get::<tcp::Socket>(h).state() == tcp::State::Established
             }) else {
+                let sm = self.table().get_mut(&this)?;
+                sm.handle = pool[0].0;
+                sm.gen = pool[0].1;
+                sm.backlog = pool[1..].to_vec();
                 return Ok(Err(ErrorCode::WouldBlock));
             };
             let (conn_handle, conn_gen) = pool[idx];
@@ -1122,12 +1198,14 @@ impl wasi::sockets::tcp::HostTcpSocket for HostState {
             let sock = g.sockets.get::<tcp::Socket>(conn_handle);
             let local = sock.local_endpoint().map(|ep| from_smol(ep.addr, ep.port));
             let remote = sock.remote_endpoint().map(|ep| from_smol(ep.addr, ep.port));
-            // Replenish the consumed slot with a fresh listener.
+            // Replenish the consumed slot with a fresh listener on the same
+            // family-scoped endpoint the consumed listener covered.
+            let new_ep = relisten_ep(&g, conn_handle);
             let new_listen = g.sockets.add(fabric_tcp_socket());
             let new_gen = g.track(new_listen);
             if g.sockets
                 .get_mut::<tcp::Socket>(new_listen)
-                .listen(port)
+                .listen(new_ep)
                 .is_err()
             {
                 return Ok(Err(ErrorCode::Unknown));
@@ -1521,9 +1599,9 @@ impl wasi::sockets::udp::HostUdpSocket for HostState {
         let Some(stack) = self.stack() else {
             return Ok(Err(ErrorCode::AccessDenied));
         };
-        let (handle, gen, bound) = {
+        let (handle, gen, bound, family) = {
             let s = self.table().get(&this)?;
-            (s.handle, s.gen, s.bound)
+            (s.handle, s.gen, s.bound, s.family)
         };
         if !bound {
             return Ok(Err(ErrorCode::InvalidState));
@@ -1535,12 +1613,14 @@ impl wasi::sockets::udp::HostUdpSocket for HostState {
             handle,
             gen,
             remote,
+            family,
         })?;
         let outgoing = self.table().push(Datagrams {
             stack,
             handle,
             gen,
             remote,
+            family,
         })?;
         Ok(Ok((incoming, outgoing)))
     }
@@ -1648,9 +1728,9 @@ impl wasi::sockets::udp::HostIncomingDatagramStream for HostState {
         this: Resource<Datagrams>,
         max_results: u64,
     ) -> Result<std::result::Result<Vec<wasi::sockets::udp::IncomingDatagram>, ErrorCode>> {
-        let (stack, handle, gen, filter) = {
+        let (stack, handle, gen, filter, family) = {
             let d = self.table().get(&this)?;
-            (d.stack.clone(), d.handle, d.gen, d.remote)
+            (d.stack.clone(), d.handle, d.gen, d.remote, d.family)
         };
         let mut out = Vec::new();
         let mut g = stack.lock().unwrap();
@@ -1659,13 +1739,20 @@ impl wasi::sockets::udp::HostIncomingDatagramStream for HostState {
         }
         let s = g.sockets.get_mut::<udp::Socket>(handle);
         while (out.len() as u64) < max_results {
-            let (data, src) = match s.recv() {
+            let (data, meta_addr, src) = match s.recv() {
                 Ok((data, meta)) => (
                     data.to_vec(),
+                    meta.endpoint.addr,
                     from_smol(meta.endpoint.addr, meta.endpoint.port),
                 ),
                 Err(_) => break, // receive buffer exhausted
             };
+            // Never surface a peer of the other family (the guest's sockaddr
+            // conversion may abort on it): drop the datagram, as a kernel
+            // would never have delivered it to this socket at all.
+            if !family_matches(meta_addr, family) {
+                continue;
+            }
             // A stream bound to a specific peer only yields that peer's datagrams.
             if let Some(f) = filter {
                 if to_smol(f) != to_smol(src) {
