@@ -32,6 +32,30 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Host-side prerequisites (ICU's host build wants a native toolchain; JSC's
+# build wants cmake+ninja and ruby for offlineasm). Check up front with a
+# clear message — the stages below log to files and would fail silently.
+missing=""
+for tool in cmake ninja ruby curl git make cc c++; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+done
+if [ -n "$missing" ]; then
+    echo "build-jsc.sh: missing host tools:$missing" >&2
+    echo "install them first (e.g. apt install cmake ninja-build ruby build-essential)" >&2
+    exit 1
+fi
+
+# On any failure, surface the tail of whichever stage logs exist — every
+# heavy stage below redirects into *.log and would otherwise die silently.
+fail_with_logs() {
+    echo "build-jsc.sh: $1 failed — last lines of its logs:" >&2
+    shift
+    for log in "$@"; do
+        [ -f "$log" ] && { echo "── $log ──" >&2; tail -n 40 "$log" >&2; }
+    done
+    exit 1
+}
+
 WASI_SDK="${WASI_SDK:-$HOME/wasi-sdk}"
 WEBKIT_REV=caad865eb1a6e5ca4427f5ea1f066140b11953e7   # bun/scripts/build/deps/webkit.ts
 ICU_VER=76-1
@@ -44,10 +68,13 @@ if [ ! -d native/icu ]; then
 fi
 if [ ! -f native/icu-host/lib/libicuuc.dylib ] && [ ! -f native/icu-host/lib/libicuuc.so ]; then
     mkdir -p native/icu-host
+    echo "== ICU host tools (logs: native/icu-host/*.log)"
     ( cd native/icu-host && ../icu/source/runConfigureICU "$(uname | sed 's/Darwin/MacOSX/')" \
-        --disable-tests --disable-samples --disable-extras > configure.log 2>&1 && make -j8 > build.log 2>&1 )
+        --disable-tests --disable-samples --disable-extras > configure.log 2>&1 && make -j8 > build.log 2>&1 ) \
+        || fail_with_logs "ICU host build" native/icu-host/configure.log native/icu-host/build.log
 fi
 if [ ! -f native/icu-wasi/install/lib/libicuuc.a ]; then
+    echo "== ICU wasi cross build (logs: native/icu-wasi/*.log)"
     mkdir -p native/icu-wasi
     ( cd native/icu-wasi && \
       DEFS="-DU_HAVE_TZSET=0 -DU_HAVE_TIMEZONE=0 -DU_HAVE_TZNAME=0 -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_GETPID -D_WASI_EMULATED_MMAN" && \
@@ -57,7 +84,8 @@ if [ ! -f native/icu-wasi/install/lib/libicuuc.a ]; then
       ../icu/source/configure --host=wasm32-wasi --with-cross-build="$PWD/../icu-host" \
         --enable-static --disable-shared --disable-dyload --disable-tools --disable-tests \
         --disable-samples --disable-extras --with-data-packaging=static --prefix="$PWD/install" \
-        > configure.log 2>&1 && make -j8 > build.log 2>&1 && make install > install.log 2>&1 )
+        > configure.log 2>&1 && make -j8 > build.log 2>&1 && make install > install.log 2>&1 ) \
+        || fail_with_logs "ICU wasi cross build" native/icu-wasi/configure.log native/icu-wasi/build.log native/icu-wasi/install.log
 fi
 
 # ── WebKit (bun's fork at the repo pin) + the wasi patch ──────────────────
