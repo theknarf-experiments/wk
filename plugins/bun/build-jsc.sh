@@ -41,7 +41,9 @@ for tool in cmake ninja ruby curl git make cc c++; do
 done
 if [ -n "$missing" ]; then
     echo "build-jsc.sh: missing host tools:$missing" >&2
-    echo "install them first (e.g. apt install cmake ninja-build ruby build-essential)" >&2
+    echo "cmake+ninja are mise-pinned here (plugins/bun/mise.toml) — build via" >&2
+    echo "\`mise run build\` (or \`mise install\` first); ruby + a native toolchain" >&2
+    echo "come from the OS (e.g. apt install ruby build-essential)" >&2
     exit 1
 fi
 

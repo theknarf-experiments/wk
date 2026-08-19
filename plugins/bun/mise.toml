@@ -1,3 +1,13 @@
+# Host-side build tools for build-jsc.sh (cmake+ninja drive the WebKit
+# build; both are static binaries, so mise can own them). Fully-qualified
+# backends — bare shorthands don't resolve on every machine's registry.
+# Ruby (offlineasm) and a native C/C++ toolchain (ICU's host pass) stay
+# OS-installed: mise's ruby compiles from source and a host cc can't be
+# pinned — build-jsc.sh's preflight check reports them clearly.
+[tools]
+"aqua:Kitware/CMake" = "3.31.7"
+"aqua:ninja-build/ninja" = "1.12.1"
+
 # Build this plugin: `mise run build`
 [tasks.build]
 description = "Build bun's transpiler slice into a wasm component"
