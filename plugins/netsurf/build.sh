@@ -54,6 +54,39 @@ CURLDIR="$PWD/../curl/curl-8.11.1"
 WOLFSSL="$PWD/../wolfssl/sysroot"
 mkdir -p "$TARBALLS" "$SRCDIR" "$LOGDIR"
 
+# Host libpng normally comes from a package manager whose .pc files the system
+# pkg-config does not search by default (homebrew on macOS, linuxbrew on Linux;
+# Debian has no libpng-dev unless you install it). Add that prefix HERE, for
+# this plugin's host probes only.
+#
+# Deliberately not fixed by putting brew's pkg-config first on PATH instead:
+# brew's libraries are built against a newer glibc than a Debian system's, so a
+# brew pkg-config answering for everything makes unrelated native links resolve
+# to incompatible copies — `cargo test -p wk-server` starts failing on
+# libasound's __isoc23_* symbols, nowhere near netsurf.
+if BREW_PREFIX="$(brew --prefix 2>/dev/null)"; then
+    export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:+$PKG_CONFIG_PATH:}$BREW_PREFIX/lib/pkgconfig"
+fi
+
+# Host tools and libraries the netsurf chain generates code with or links into
+# build-machine tools. None can be mise-pinned, so check them together up front
+# — one `brew bundle` then fixes everything, instead of discovering gperf four
+# libraries deep into build-deps.sh (or dying on pkg-config's own message under
+# set -e).
+missing=""
+for tool in gperf flex bison m4 cmake pkg-config perl; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+done
+pkg-config --exists libpng 2>/dev/null || missing="$missing libpng(host)"
+if [ -n "$missing" ]; then
+    echo "netsurf: missing host tools:$missing" >&2
+    echo "  (they run on THIS machine: netsurf's convert_image tool links host" >&2
+    echo "   libpng, libhubbub gperfs its element table, libnslog flex/bisons" >&2
+    echo "   its filter grammar)" >&2
+    echo "  brew:          brew bundle --file=plugins/netsurf/Brewfile" >&2
+    echo "  Debian/Ubuntu: apt install libpng-dev pkg-config gperf flex bison m4 cmake" >&2
+    exit 1
+fi
 # Host-side libpng flags for netsurf's convert_image build tool — computed
 # BEFORE PKG_CONFIG_LIBDIR points every later pkg-config call at the wasm
 # sysroot (the tool runs on this machine and needs the real thing).
@@ -93,15 +126,17 @@ fetch() { # fetch <url> <tarball> <srcdir-it-extracts-to>
 # =============================================================================
 ./build-deps.sh
 
-if [ ! -f "$CURLDIR/lib/.libs/libcurl.a" ]; then
-    echo "netsurf: plugins/curl/curl-8.11.1/lib/.libs/libcurl.a missing —" >&2
-    echo "  build plugins/curl first (its build.sh); see PORTING.md" >&2
-    exit 1
-fi
+# libcurl (and through it wolfSSL) comes from sibling plugins. Drive them from
+# here rather than demanding a manual build order: both are idempotent, and
+# `mise run build-plugins` walks plugins/ alphabetically, so netsurf is reached
+# before wolfssl and would otherwise never find a TLS backend on a fresh clone.
 if [ ! -f "$WOLFSSL/lib/libwolfssl.a" ]; then
-    echo "netsurf: plugins/wolfssl/sysroot missing — libcurl.a now needs its" >&2
-    echo "  TLS backend at link time; build plugins/wolfssl first (./build.sh)" >&2
-    exit 1
+    echo "netsurf: building libcurl's TLS backend first (plugins/wolfssl)" >&2
+    WASI_SDK="$WASI_SDK" ../wolfssl/build.sh
+fi
+if [ ! -f "$CURLDIR/lib/.libs/libcurl.a" ]; then
+    echo "netsurf: building libcurl first (plugins/curl)" >&2
+    WASI_SDK="$WASI_SDK" ../curl/build.sh
 fi
 
 # =============================================================================

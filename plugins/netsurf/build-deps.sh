@@ -50,14 +50,22 @@ LOGDIR="${LOGDIR:-$PWD/logs}"
 TOOLBIN="$PWD/.toolbin"
 mkdir -p "$SYSROOT" "$TARBALLS" "$SRCDIR" "$LOGDIR" "$TOOLBIN"
 
-# Host tools the builds need that live outside /usr/bin (cmake, pkg-config are
-# homebrew here). Symlinked into .toolbin so BUILD_PATH can stay free of the
-# rest of homebrew — notably any wasm-opt.
-for t in cmake pkg-config; do
+# Host tools the builds need that live outside /usr/bin (a package manager put
+# them in homebrew/linuxbrew). Symlinked into .toolbin so BUILD_PATH can stay
+# free of the rest of that prefix — notably any wasm-opt.
+#
+# The code generators have to be here too, not just cmake/pkg-config: libhubbub
+# gperfs its element-type table and libnslog flex/bisons its filter grammar, and
+# macOS happens to ship gperf in /usr/bin while Debian does not — so on Linux
+# the omission surfaced as a bare "make: gperf: No such file or directory" from
+# inside a sub-build, with gperf sitting installed and unreachable.
+for t in cmake pkg-config gperf flex bison m4 perl; do
     p="$(command -v "$t" || true)"
     [ -n "$p" ] && ln -sf "$p" "$TOOLBIN/$t"
 done
 BUILD_PATH="$WASI_SDK/bin:$TOOLBIN:/usr/bin:/bin"
+# Same, minus wasi-sdk — for the stages that build NATIVE host tools.
+HOST_PATH="$TOOLBIN:/usr/bin:/bin"
 
 # --- target flags ------------------------------------------------------------
 TARGET=wasm32-wasip1
@@ -307,7 +315,10 @@ if [ ! -f "$SYSROOT/host-tools/bin/nsgenbind" ]; then
     # nsgenbind's grammars use %code/%define — bison >= 2.4 territory. Stock
     # macOS ships bison 2.3 (so does CommandLineTools), which stops at the
     # first %code. Homebrew keg `bison` would do; put it on PATH or set BISON.
-    BISON_BIN="${BISON:-bison}"
+    # Resolve to an absolute path: the make below runs on a restricted PATH,
+    # and a bare "bison" that `command -v` found on the ambient one would not
+    # be findable there.
+    BISON_BIN="${BISON:-$(command -v bison || echo bison)}"
     bison_ok=no
     if command -v flex >/dev/null && command -v "$BISON_BIN" >/dev/null; then
         bison_vsn="$("$BISON_BIN" --version | sed -n '1s/.* //p')"
@@ -318,7 +329,11 @@ if [ ! -f "$SYSROOT/host-tools/bin/nsgenbind" ]; then
     fi
     if [ "$bison_ok" = yes ]; then
         echo "building nsgenbind (native host tool)..."
-        run_logged nsgenbind env PATH="/usr/bin:/bin" \
+        # HOST_PATH, not BUILD_PATH: nsgenbind is a native binary, so wasi-sdk's
+        # bin (whose ar/clang are wasm-targeted) must stay off the PATH — but
+        # .toolbin does belong on it, or the flex/bison/m4 this stage just
+        # verified are invisible to make.
+        run_logged nsgenbind env PATH="$HOST_PATH" \
             make -C "$SRCDIR/nsgenbind-$NSGENBIND_VER" -j"$JOBS" install \
                 PREFIX="$SYSROOT/host-tools" \
                 NSSHARED="$SYSROOT/share/netsurf-buildsystem" \
@@ -326,7 +341,8 @@ if [ ! -f "$SYSROOT/host-tools/bin/nsgenbind" ]; then
     else
         echo "nsgenbind: SKIPPED — needs host bison >= 2.4 (found: ${bison_vsn:-none});"
         echo "  only required when building netsurf WITH duktape/JS bindings."
-        echo "  Remedy: brew install bison, then BISON=/opt/homebrew/opt/bison/bin/bison $0"
+        echo "  Remedy: brew bundle --file=plugins/netsurf/Brewfile (keg bison),"
+        echo "  then re-run; BISON=<path> overrides the picked binary."
     fi
 fi
 

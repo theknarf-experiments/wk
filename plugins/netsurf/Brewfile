@@ -1,0 +1,37 @@
+# Host-side build tools and libraries that mise can't pin (none are in its
+# registry) and that a stock macOS or a minimal Linux box doesn't have.
+# Install with:
+#
+#   brew bundle --file=plugins/netsurf/Brewfile
+#
+# On Debian/Ubuntu the equivalent is:
+#   apt install libpng-dev pkg-config flex bison cmake
+#
+# Everything here runs on or links into THIS machine, not the wasm target:
+#   libpng + pkg-config  netsurf's own convert_image build tool links real
+#                        libpng; build.sh reads its flags via pkg-config
+#                        BEFORE PKG_CONFIG_LIBDIR is repointed at the wasm
+#                        sysroot.
+#   flex + bison         libnslog's filter grammar is generated at build time
+#                        (the outputs are plain C, then cross-compiled), and
+#                        nsgenbind needs bison >= 2.4 — newer than the 2.3
+#                        stock macOS ships, which is why build-deps.sh carries
+#                        the compat/nslog-bison23.h fallback.
+#   gperf                libhubbub generates its element-type perfect hash
+#                        with it (macOS ships one; Debian does not).
+#   m4                   bison shells out to it and fails with a bare
+#                        "m4 subprocess failed"; Debian has no /usr/bin/m4.
+#   cmake                build-deps.sh cross-builds libpng for wasi with it.
+brew "libpng"
+# pkg-config: needed on macOS, which ships none. On LINUX, skip this one and use
+# the distro's — brew's pkgconf takes over `pkg-config` on PATH and then answers
+# for system libraries too, resolving them to brew builds made against a newer
+# glibc. That breaks native links far from here (wk-server's tests stop linking
+# against libasound). build.sh adds brew's .pc dir to PKG_CONFIG_PATH itself, so
+# the system pkg-config still finds the libpng above.
+brew "pkg-config"
+brew "flex"
+brew "bison"
+brew "gperf"
+brew "m4"
+brew "cmake"
