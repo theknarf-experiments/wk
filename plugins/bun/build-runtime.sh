@@ -152,10 +152,17 @@ if [ ! -f native/libmimalloc.a ]; then
         -Inative/mimalloc/include -c native/mimalloc/src/static.c -o native/mimalloc.o
     "$WASI_SDK/bin/llvm-ar" rcs native/libmimalloc.a native/mimalloc.o
 fi
+# Ask the driver where each archive is rather than assembling the path (same
+# as build.sh): wasi-sdk 34 splits the C++ runtime into
+# lib/wasm32-wasip2/{eh,noeh}/ while the wasi-emulated libs stay flat, so one
+# hardcoded directory finds some of them and not others.
 for lib in libc++.a libc++abi.a libsetjmp.a libwasi-emulated-getpid.a \
            libwasi-emulated-signal.a libwasi-emulated-mman.a \
            libwasi-emulated-process-clocks.a; do
-    [ -f "native/$lib" ] || cp "$WASI_SDK/share/wasi-sysroot/lib/wasm32-wasip2/$lib" native/
+    [ -f "native/$lib" ] && continue
+    src="$("$WASI_SDK/bin/clang++" --target=wasm32-wasip2 -print-file-name="$lib")"
+    [ -f "$src" ] || { echo "build-runtime: $lib not found in $WASI_SDK's sysroot" >&2; exit 1; }
+    cp "$src" native/
 done
 
 # ── 5. configure-time codegen ─────────────────────────────────────────────
@@ -172,10 +179,16 @@ export BUN_CODEGEN_DIR="$PWD/codegen"
 # -A dead_code/unused-*: wasi feature-stubs leave helpers dead on this
 # target only (same rationale as build.sh).
 echo "== cargo build -p bun_bin (wasm32-wasip2, release-dev)"
+# `cargo +TOOLCHAIN` bypasses rust-toolchain.toml, targets list included, and
+# rustup gives a freshly-synced channel host std only — ask for the cross
+# target (a no-op once present) or the build dies in compiler_builtins with
+# "can't find crate for `core`".
+BUN_NIGHTLY=nightly-2026-07-20
+rustup target add wasm32-wasip2 --toolchain "$BUN_NIGHTLY" >/dev/null
 ( cd bun && \
   CC_wasm32_wasip2="$WASI_SDK/bin/clang" AR_wasm32_wasip2="$WASI_SDK/bin/llvm-ar" \
   RUSTFLAGS="-A dead_code -A unused-variables -A unused-imports -A unused-mut -A unreachable-code" \
-  cargo +nightly-2026-07-20 build -p bun_bin --target wasm32-wasip2 --profile release-dev )
+  cargo "+$BUN_NIGHTLY" build -p bun_bin --target wasm32-wasip2 --profile release-dev )
 [ -f bun/target/wasm32-wasip2/release-dev/libbun_rust.a ] || { echo "build-runtime: libbun_rust.a missing after cargo build" >&2; exit 1; }
 
 # ── 7. vendored C libraries → $VLIB ───────────────────────────────────────
