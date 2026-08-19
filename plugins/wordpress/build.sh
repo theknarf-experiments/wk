@@ -12,10 +12,12 @@ cd "$(dirname "$0")"
 
 WK="${WK:-$(command -v wk || echo ../../target/debug/wk)}"
 
+# The php plugin supplies this image's base layer, and `mise run build-plugins`
+# walks plugins/ alphabetically — wordpress is reached after php, but a fresh
+# clone building only this plugin isn't, so drive it (idempotent).
 if [ ! -f ../php/php.wasm ]; then
-    echo "plugins/php/php.wasm is missing — build the php plugin first:" >&2
-    echo "  (cd ../php && mise run build)" >&2
-    exit 1
+    echo "building the php interpreter first (plugins/php)..." >&2
+    ( cd ../php && mise run build )
 fi
 
 echo "building the php base image..."

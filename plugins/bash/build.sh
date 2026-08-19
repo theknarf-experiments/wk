@@ -203,14 +203,25 @@ cp "$SRC/bash" bash.wasm
 
 # The coreutils binary plus its command names as real symlinks, staged for the
 # wk-shell image — the same one-binary-many-links layout coreutils installs.
-cp ../coreutils/coreutils.wasm coreutils.wasm 2>/dev/null || \
-    echo "note: build plugins/coreutils first for a shell that can run commands"
+# Build the siblings if they aren't there: Dockerfile COPYs them unconditionally,
+# and `mise run build-plugins` walks plugins/ alphabetically, so bash ALWAYS runs
+# before coreutils and grep. Skipping with a note meant every fresh clone got a
+# bash image that no `FROM bash` build could use ("COPY coreutils.wasm: No such
+# file or directory"), reported from whichever plugin consumed it.
+if [ ! -f ../coreutils/coreutils.wasm ]; then
+    echo "bash: building plugins/coreutils first (the image COPYs it)"
+    ( cd ../coreutils && mise run build )
+fi
+cp ../coreutils/coreutils.wasm coreutils.wasm
 # GNU grep, the first tool a base image is expected to have that coreutils does
 # not provide. A single binary; grep 3.x no longer switches personality on
 # argv[0] (egrep/fgrep are separate wrapper scripts upstream), so only `grep`
 # is linked — use `grep -E` / `grep -F` for extended/fixed patterns.
-cp ../grep/grep.wasm grep.wasm 2>/dev/null || \
-    echo "note: build plugins/grep first for a shell with grep"
+if [ ! -f ../grep/grep.wasm ]; then
+    echo "bash: building plugins/grep first (the image COPYs it)"
+    ( cd ../grep && mise run build )
+fi
+cp ../grep/grep.wasm grep.wasm
 rm -rf bin && mkdir -p bin
 for a in "[" b2sum base32 base64 basename basenc cat chcon chgrp chmod chown \
          cksum comm cp csplit cut date dd dir dircolors dirname du echo expand \

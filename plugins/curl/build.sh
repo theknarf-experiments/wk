@@ -40,9 +40,13 @@ CURL_VER=8.11.1
 SRC="curl-$CURL_VER"
 WOLFSSL="$PWD/../wolfssl/sysroot"
 
+# wolfSSL is a library-only plugin with no component of its own, so nothing
+# else in the build order produces it — drive it from here (idempotent; a
+# no-op once its sysroot is populated), the way bun's build.sh runs
+# build-jsc.sh. WASI_SDK is a plain shell var here, so pass it explicitly.
 if [ ! -f "$WOLFSSL/lib/libwolfssl.a" ]; then
-    echo "curl: plugins/wolfssl/sysroot missing — build plugins/wolfssl first (./build.sh)" >&2
-    exit 1
+    echo "curl: building its TLS backend first (plugins/wolfssl)" >&2
+    WASI_SDK="$WASI_SDK" ../wolfssl/build.sh
 fi
 
 # The CA trust anchor set: Mozilla's bundle as curl.se extracts it, pinned by
