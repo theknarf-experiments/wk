@@ -56,16 +56,17 @@ mkdir -p "$TARBALLS" "$SRCDIR" "$LOGDIR"
 
 # Host libpng normally comes from a package manager whose .pc files the system
 # pkg-config does not search by default (homebrew on macOS, linuxbrew on Linux;
-# Debian has no libpng-dev unless you install it). Add that prefix HERE, for
-# this plugin's host probes only.
+# Debian has no libpng-dev unless you install it).
 #
-# Deliberately not fixed by putting brew's pkg-config first on PATH instead:
-# brew's libraries are built against a newer glibc than a Debian system's, so a
-# brew pkg-config answering for everything makes unrelated native links resolve
-# to incompatible copies — `cargo test -p wk-server` starts failing on
-# libasound's __isoc23_* symbols, nowhere near netsurf.
+# HOST_PC is used ONLY for the two host probes below — never exported. PKG_CONFIG
+# _PATH is searched IN ADDITION to the PKG_CONFIG_LIBDIR the cross stages pin to
+# the wasm sysroot, so exporting it leaks this machine's .pc files into the
+# cross lookups and lands host libraries on a wasm link line
+# ("/usr/lib/.../libc.a: archive member is neither Wasm object file nor LLVM
+# bitcode", from wasm-ld, several stages later).
+HOST_PC="${PKG_CONFIG_PATH:-}"
 if BREW_PREFIX="$(brew --prefix 2>/dev/null)"; then
-    export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:+$PKG_CONFIG_PATH:}$BREW_PREFIX/lib/pkgconfig"
+    HOST_PC="${HOST_PC:+$HOST_PC:}$BREW_PREFIX/lib/pkgconfig"
 fi
 
 # Host tools and libraries the netsurf chain generates code with or links into
@@ -77,7 +78,8 @@ missing=""
 for tool in gperf flex bison m4 cmake pkg-config perl; do
     command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
 done
-pkg-config --exists libpng 2>/dev/null || missing="$missing libpng(host)"
+PKG_CONFIG_PATH="$HOST_PC" pkg-config --exists libpng 2>/dev/null \
+    || missing="$missing libpng(host)"
 if [ -n "$missing" ]; then
     echo "netsurf: missing host tools:$missing" >&2
     echo "  (they run on THIS machine: netsurf's convert_image tool links host" >&2
@@ -90,8 +92,8 @@ fi
 # Host-side libpng flags for netsurf's convert_image build tool — computed
 # BEFORE PKG_CONFIG_LIBDIR points every later pkg-config call at the wasm
 # sysroot (the tool runs on this machine and needs the real thing).
-HOST_LIBPNG_CFLAGS="$(pkg-config --cflags libpng)"
-HOST_LIBPNG_LDFLAGS="$(pkg-config --libs libpng)"
+HOST_LIBPNG_CFLAGS="$(PKG_CONFIG_PATH="$HOST_PC" pkg-config --cflags libpng)"
+HOST_LIBPNG_LDFLAGS="$(PKG_CONFIG_PATH="$HOST_PC" pkg-config --libs libpng)"
 
 # Same flag set as build-deps.sh, per-target-triple.
 WASI_EXTRA="-mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false \
