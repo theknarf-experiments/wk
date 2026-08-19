@@ -59,6 +59,8 @@ fail_with_logs() {
 }
 
 WASI_SDK="${WASI_SDK:-$HOME/wasi-sdk}"
+# getconf spelling works on both Linux and macOS (nproc is coreutils-only).
+JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 WEBKIT_REV=caad865eb1a6e5ca4427f5ea1f066140b11953e7   # bun/scripts/build/deps/webkit.ts
 ICU_VER=76-1
 mkdir -p native
@@ -68,23 +70,33 @@ if [ ! -d native/icu ]; then
     curl -fsSL "https://github.com/unicode-org/icu/releases/download/release-$ICU_VER/icu4c-${ICU_VER/-/_}-src.tgz" | tar xz -C native
     cp native/icu/source/config/mh-linux native/icu/source/config/mh-unknown
 fi
-# Linux-host trap: with elf.h present, ICU builds its host pkgdata/genccode
-# with direct ELF-object writing, and they then try to arch-match our wasm
-# probe objects ("genccode: match-arch file oma.obj is not an ELF object").
-# ac_cv_header_elf_h=no makes the host tools fall back to generating C
-# arrays for the data — the path a macOS host takes naturally, and the one
-# that cross-compiles. The marker invalidates host builds made without it.
-if [ "$(uname)" = Linux ] && [ -f native/icu-host/lib/libicuuc.so ] && [ ! -f native/icu-host/.wk-noelf ]; then
-    echo "== rebuilding ICU host tools without ELF object writing (wasm cross needs the C fallback)"
+# Linux-host trap: on a Linux host ICU builds its pkgdata/genccode with
+# direct ELF-object writing, and they then try to arch-match our wasm probe
+# objects ("genccode: match-arch file oma.obj is not an ELF object"). We want
+# the C-array fallback — the path a macOS host takes naturally, and the one
+# that cross-compiles.
+#
+# The knob is U_DISABLE_OBJ_CODE, and it has to be exactly that one: ICU
+# decouples the two halves of the feature in tools/toolutil/pkg_genc.h.
+# CAN_WRITE_OBJ_CODE (the call site in pkgdata.cpp) keys off
+# U_PLATFORM_IS_LINUX_BASED, while CAN_GENERATE_OBJECTS (the definition in
+# pkg_genc.cpp) keys off U_ELF. Hiding elf.h from configure clears only the
+# second, so pkgdata still calls writeObjectCode and the host build dies at
+# link. U_DISABLE_OBJ_CODE gates both.
+#
+# .wk-hostbuild is the completion sentinel: it marks a tree built by THIS
+# recipe and, since it lands only after make succeeds, a partial build gets
+# thrown away and retried rather than half-used.
+if [ ! -f native/icu-host/.wk-hostbuild ]; then
     rm -rf native/icu-host
-fi
-if [ ! -f native/icu-host/lib/libicuuc.dylib ] && [ ! -f native/icu-host/lib/libicuuc.so ]; then
     mkdir -p native/icu-host
     echo "== ICU host tools (logs: native/icu-host/*.log)"
-    ( cd native/icu-host && ac_cv_header_elf_h=no ../icu/source/runConfigureICU "$(uname | sed 's/Darwin/MacOSX/')" \
-        --disable-tests --disable-samples --disable-extras > configure.log 2>&1 && make -j8 > build.log 2>&1 ) \
+    ( cd native/icu-host && CPPFLAGS="${CPPFLAGS:-} -DU_DISABLE_OBJ_CODE" \
+        ../icu/source/runConfigureICU "$(uname | sed 's/Darwin/MacOSX/')" \
+        --disable-tests --disable-samples --disable-extras > configure.log 2>&1 \
+        && make -j"$JOBS" > build.log 2>&1 ) \
         || fail_with_logs "ICU host build" native/icu-host/configure.log native/icu-host/build.log
-    touch native/icu-host/.wk-noelf
+    touch native/icu-host/.wk-hostbuild
 fi
 if [ ! -f native/icu-wasi/install/lib/libicuuc.a ]; then
     echo "== ICU wasi cross build (logs: native/icu-wasi/*.log)"
@@ -97,7 +109,7 @@ if [ ! -f native/icu-wasi/install/lib/libicuuc.a ]; then
       ../icu/source/configure --host=wasm32-wasi --with-cross-build="$PWD/../icu-host" \
         --enable-static --disable-shared --disable-dyload --disable-tools --disable-tests \
         --disable-samples --disable-extras --with-data-packaging=static --prefix="$PWD/install" \
-        > configure.log 2>&1 && make -j8 > build.log 2>&1 && make install > install.log 2>&1 ) \
+        > configure.log 2>&1 && make -j"$JOBS" > build.log 2>&1 && make install > install.log 2>&1 ) \
         || fail_with_logs "ICU wasi cross build" native/icu-wasi/configure.log native/icu-wasi/build.log native/icu-wasi/install.log
 fi
 

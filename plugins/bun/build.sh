@@ -29,6 +29,8 @@ WASI_SDK="${WASI_SDK:-$HOME/wasi-sdk}"
 BUN_REV=b7a0431032129d74fa4a7e3704eaf57b92fa9136
 LOLHTML_COMMIT=725ce499aa9b71e38b7a2d0a9fbb6d7294a4079e  # oven-sh/lol-html `bun` branch (scripts/build/deps/lolhtml.ts)
 
+patch_stamp() { cat patches/wk-*.patch | cksum | awk '{print $1, $2}'; }
+
 if [ ! -d bun ]; then
     echo "fetching bun @ $BUN_REV..."
     git clone --depth 1 https://github.com/oven-sh/bun.git bun
@@ -36,6 +38,17 @@ if [ ! -d bun ]; then
     for p in patches/wk-*.patch; do
         ( cd bun && git apply "../$p" )
     done
+    patch_stamp > bun/.wk-patch-stamp
+elif [ "$(patch_stamp)" != "$(cat bun/.wk-patch-stamp 2>/dev/null)" ]; then
+    # Patches are applied at clone time only, so an existing tree silently keeps
+    # whatever was current when it was made — and cargo's complaint about the
+    # resulting half-applied workspace ("failed to load manifest for workspace
+    # member src/wk_cli") points nowhere near the cause. Re-applying over a tree
+    # that already has most hunks isn't safe to automate, so stop and say so.
+    echo "build.sh: patches/wk-*.patch changed since bun/ was checked out." >&2
+    echo "  Re-clone to pick them up:  rm -rf plugins/bun/bun && mise run build" >&2
+    echo "  (native/ is untouched by this — JSC and ICU do not get rebuilt.)" >&2
+    exit 1
 fi
 
 # vendor/lolhtml is a path dep cargo insists on resolving; normally fetched by
@@ -79,20 +92,39 @@ fi
 # cmake emits THIN archives whose member paths are relative to that directory.
 # libc++/libc++abi + the wasi-emulated libs are copied out of the wasi-sdk
 # sysroot by build-jsc.sh's stage step (never -L the sysroot itself: its
-# libc.a preempts rustc's and breaks the crt).
+# libc.a preempts rustc's and breaks the crt). ICU keeps its own -L: the cross
+# build installs libicu{i18n,uc,data}.a under native/icu-wasi/install/lib and
+# nothing stages them next to JSC's archives.
 if [ ! -f native/jsc-build/lib/libJavaScriptCore.a ]; then
     echo "== JSC + ICU for wasi not built yet — running ./build-jsc.sh" >&2
     echo "== (first run takes a long while: ICU host tools, ICU cross, then" >&2
     echo "==  all of JavaScriptCore; the script is stage-resumable)" >&2
     ./build-jsc.sh
 fi
+# Ask the driver where each archive is instead of assembling the path by hand:
+# wasi-sdk 34 splits the C++ runtime into lib/wasm32-wasip2/{eh,noeh}/ while the
+# wasi-emulated libs stay flat, so a single hardcoded directory finds some of
+# them and not others. -print-file-name also picks the SAME eh/noeh variant the
+# JSC link resolved, since build-jsc.sh drives this same clang with no
+# -fwasm-exceptions (its sjlj lowering rides on -mllvm flags).
 for lib in libc++.a libc++abi.a libsetjmp.a libwasi-emulated-getpid.a \
            libwasi-emulated-signal.a libwasi-emulated-mman.a \
            libwasi-emulated-process-clocks.a; do
-    [ -f "native/$lib" ] || cp "$WASI_SDK/share/wasi-sysroot/lib/wasm32-wasip2/$lib" native/
+    [ -f "native/$lib" ] && continue
+    src="$("$WASI_SDK/bin/clang++" --target=wasm32-wasip2 -print-file-name="$lib")"
+    [ -f "$src" ] || { echo "build.sh: $lib not found in $WASI_SDK's sysroot" >&2; exit 1; }
+    cp "$src" native/
 done
 
 N="$PWD/native"
+
+# bun compiles with its OWN pinned nightly, requested via `cargo +TOOLCHAIN`,
+# so the repo's rust-toolchain.toml — including its `targets` list — governs
+# none of it. rustup installs only the host std for a freshly-synced channel,
+# so ask for the cross target explicitly; it's a no-op once present.
+BUN_NIGHTLY=nightly-2026-07-20
+rustup target add wasm32-wasip2 --toolchain "$BUN_NIGHTLY" >/dev/null
+
 cd bun
 # wasm-component-ld emits a component directly; wasi_shims.rs (in wk_cli)
 # supplies the JSC-tier symbols and the SIMD-kernel scalar fallbacks;
@@ -104,6 +136,7 @@ cd bun
 # allow()s (the repo hook rejects those).
 RUSTFLAGS="-A dead_code -A unused-variables -A unused-imports -A unused-mut -A unreachable-code \
     -C link-arg=-L$N -C link-arg=-L$N/jsc-build/lib \
+    -C link-arg=-L$N/icu-wasi/install/lib \
     -C link-arg=-lmimalloc -C link-arg=-lJavaScriptCore -C link-arg=-lWTF \
     -C link-arg=-lbmalloc -C link-arg=-licui18n -C link-arg=-licuuc \
     -C link-arg=-licudata -C link-arg=-lc++ -C link-arg=-lc++abi \
@@ -111,7 +144,7 @@ RUSTFLAGS="-A dead_code -A unused-variables -A unused-imports -A unused-mut -A u
     -C link-arg=-lwasi-emulated-signal -C link-arg=-lwasi-emulated-mman \
     -C link-arg=-lwasi-emulated-process-clocks \
     -C link-arg=-z -C link-arg=stack-size=8388608" \
-    cargo +nightly-2026-07-20 build -p bun_wk_cli --target wasm32-wasip2 --profile release-dev
+    cargo "+$BUN_NIGHTLY" build -p bun_wk_cli --target wasm32-wasip2 --profile release-dev
 cd ..
 cp bun/target/wasm32-wasip2/release-dev/bun-transpile.wasm bun-transpile.wasm
 echo "built plugins/bun/bun-transpile.wasm (real Bun transpiler, wasm32-wasip2 component)"
