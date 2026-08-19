@@ -65,6 +65,7 @@ fetch_pinned() {
         return 0
     fi
     echo "fetching $url ..."
+    mkdir -p "$(dirname "$out")"   # adapter/ is gitignored — absent on a fresh clone
     curl -fSL --retry 3 -o "$out.part" "$url"
     sha_check "$out.part" "$sha"
     mv "$out.part" "$out"

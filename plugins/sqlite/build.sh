@@ -17,7 +17,20 @@ WASI_SDK="${WASI_SDK:-$HOME/wasi-sdk}"
 VER=3530300            # SQLite 3.53.3
 YEAR=2026
 DIR="sqlite-amalgamation-$VER"
+# WASIp1→component adapter, pinned to our wasmtime (46); fetched and cached if
+# a registry copy isn't present. A fresh clone has never built the crate that
+# vendors it, so the registry probe finds nothing and the empty path used to
+# reach wasm-tools as `--adapt ""` — an unwrap panic, not a diagnosis.
+WASMTIME_VER=46.0.1
 ADAPTER="${WASI_ADAPTER:-$(find "$HOME/.cargo/registry/src" -name 'wasi_snapshot_preview1.command.wasm' 2>/dev/null | head -1)}"
+if [ -z "$ADAPTER" ] || [ ! -f "$ADAPTER" ]; then
+    mkdir -p gen
+    ADAPTER="gen/wasi_snapshot_preview1.command.wasm"
+    if [ ! -f "$ADAPTER" ]; then
+        echo "fetching WASI command adapter $WASMTIME_VER..."
+        curl -fsSL "https://github.com/bytecodealliance/wasmtime/releases/download/v$WASMTIME_VER/wasi_snapshot_preview1.command.wasm" -o "$ADAPTER"
+    fi
+fi
 
 # wasi-sdk's clang runs an optional wasm-opt post-link step; run clang with a
 # PATH that omits wasm-opt (kept consistent with the other plugins). wasm-tools

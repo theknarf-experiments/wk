@@ -18,7 +18,20 @@ cd "$(dirname "$0")"
 WASI_SDK="${WASI_SDK:-$HOME/wasi-sdk}"
 LUA_VER=5.4.7
 LUA_DIR="lua-$LUA_VER"
+# WASIp1→component adapter, pinned to our wasmtime (46); fetched and cached if
+# a registry copy isn't present. A fresh clone has never built the crate that
+# vendors it, so the registry probe finds nothing and the empty path used to
+# reach wasm-tools as `--adapt ""` — an unwrap panic, not a diagnosis.
+WASMTIME_VER=46.0.1
 ADAPTER="${WASI_ADAPTER:-$(find "$HOME/.cargo/registry/src" -name 'wasi_snapshot_preview1.command.wasm' 2>/dev/null | head -1)}"
+if [ -z "$ADAPTER" ] || [ ! -f "$ADAPTER" ]; then
+    mkdir -p gen
+    ADAPTER="gen/wasi_snapshot_preview1.command.wasm"
+    if [ ! -f "$ADAPTER" ]; then
+        echo "fetching WASI command adapter $WASMTIME_VER..."
+        curl -fsSL "https://github.com/bytecodealliance/wasmtime/releases/download/v$WASMTIME_VER/wasi_snapshot_preview1.command.wasm" -o "$ADAPTER"
+    fi
+fi
 
 # wasi-sdk's clang runs wasm-opt as an optional post-link step, but the wasm-opt
 # on PATH can't parse the new exnref EH we emit ("bad node code"). Run clang with
