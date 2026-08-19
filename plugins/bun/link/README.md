@@ -6,27 +6,42 @@ Cross-compiles the FULL bun+JSC runtime to a wasm32-wasip2 component
 
 ## Build flow
 
+One command: `../build-runtime.sh` (or `mise run build-runtime`). It
+orchestrates, in order, with every intermediate under the gitignored
+`../native/runtime-build/` (`obj/`, `vlib/`, `bunobj/`, `lists/`, `logs/`):
+
 1. `../build-jsc.sh` — JavaScriptCore (cloop/no-JIT) + ICU for wasi. Slow.
 2. `../gen-codegen.ts` — the configure-time codegen (`generate-classes`,
    bindgenv2 option-structs, `runtime.out.js`) bun's own build would produce.
 3. `cargo +nightly-<pin> build -p bun_bin --target wasm32-wasip2 --profile
    release-dev` (with `BUN_CODEGEN_DIR` set) → `libbun_rust.a`.
-4. Vendored C libraries, cross-built for wasip2:
-   - BoringSSL — `build_boringssl.sh` + `build_bssl_ssl.sh`
+4. Vendored C libraries, cross-built for wasip2 (sources fetched to
+   `../native/` at pinned commits by build-runtime.sh):
+   - BoringSSL — `build_boringssl.sh` + `build_bssl_ssl.sh` (source lists
+     generated from boringssl's `gen/sources.json`)
    - uSockets + uWebSockets — `build_usockets.sh` (recompile after touching
      `packages/bun-usockets/**` headers, e.g. the `Bun__addrinfo_set`/
      `zig_mutex_t` wasi arms)
-   - zstd / brotli / c-ares / zlib-ng / libarchive / hdrhistogram /
-     libdeflate / sqlite3 / llhttp / libspng / libjpeg-turbo — `build-vendored.sh`
+   - zstd / brotli — `build-vendored.sh`
+   - c-ares / libarchive / zlib-ng / libdeflate / sqlite3 / llhttp / libspng /
+     libjpeg-turbo / hdrhistogram — `build_vendored_extra.sh`
      (+ hand-written `configs/*.h` for the ones whose configure can't run)
    - picohttpparser + the `wk:exec` guest bindings — `build_exec_picohttp.sh`
-5. The C shims in this dir (see below), each compiled to `/tmp/<name>.o`.
-6. `link_all.sh` — the final `clang++` link into `/tmp/bun-run.wasm`
-   (`wasm-component-ld` emits the component). Package it into an image with a
-   `FROM scratch` Dockerfile (`COPY bun-run.wasm /bin/bun.wasm`).
+   - ls-hpack — `build_lshpack.sh`
+5. The C shims in this dir (`build-shims.sh`) and the C++ bindings/codegen
+   objects (`build_cxx_objects.sh` — the fail-tolerant bindings sweep plus
+   the testing/Bake TUs its name filters would wrongly drop, the
+   `gen_*/mod_*` TUs, `libuwsockets.o`, `us_root_certs.o`, `bun_simdutf.o`,
+   and `imrc.o` with a COMPUTED `.size`).
+6. `link_all.sh` — the final `clang++` link into
+   `../native/runtime-build/bun-run.wasm` (`wasm-component-ld` emits the
+   component), copied up to `../bun-run.wasm`. Package it with
+   `../runtime.Dockerfile` (`wk images build plugins/bun/runtime.Dockerfile
+   --tag bun-run`).
 
-Paths in `link_all.sh` are absolute snapshots (scratchpad `/tmp` intermediates +
-this checkout); it documents the exact recipe rather than being hermetic.
+All scripts take an env contract (`WASI_SDK`, `BUN_PLUGIN`, `BUN_NATIVE`,
+`BUN`, `WORK`, `VLIB`, `OBJ`) and default it from their own location, so
+each can also run standalone.
 
 ## C shims (this dir)
 

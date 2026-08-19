@@ -28,10 +28,10 @@ if [ ! -f "$LS/lshpack.c" ]; then
 fi
 
 "$CC" --target=wasm32-wasip2 -O2 -DXXH_NAMESPACE=lshpack_ \
-    -I "$LS/deps/xxhash" -c "$LS/deps/xxhash/xxhash.c" -o /tmp/xxhash.o
+    -I "$LS/deps/xxhash" -c "$LS/deps/xxhash/xxhash.c" -o "$OBJ/xxhash.o"
 "$CC" --target=wasm32-wasip2 -O2 \
     -DXXH_HEADER_NAME='"xxhash.h"' -DXXH_NAMESPACE=lshpack_ -DLS_HPACK_USE_LARGE_TABLES=1 \
     -I "$LS" -I "$LS/deps/xxhash" -I "$LS/compat/queue" \
-    -c "$LS/lshpack.c" -o /tmp/lshpack.o
+    -c "$LS/lshpack.c" -o "$OBJ/lshpack.o"
 
-echo "built /tmp/{lshpack,xxhash}.o"
+echo "built $OBJ/{lshpack,xxhash}.o"

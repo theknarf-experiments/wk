@@ -1,3 +1,4 @@
+#define __LIBARCHIVE_CONFIG_H_INCLUDED 1
 /* Minimal libarchive config for wasm32-wasip2 (tar + gzip only). */
 #define HAVE_STDLIB_H 1
 #define HAVE_STRING_H 1
@@ -37,3 +38,6 @@
 #define VERSION "3.7.0"
 #define LIBARCHIVE_VERSION_STRING "3.7.0"
 #define HAVE_STRNCPY_S 0
+#define HAVE_CTYPE_H 1
+#define HAVE_SYS_TIME_H 1
+#define HAVE_GETTIMEOFDAY 1

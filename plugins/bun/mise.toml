@@ -13,3 +13,10 @@
 description = "Build bun's transpiler slice into a wasm component"
 dir = "{{config_root}}"
 run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build.sh"
+
+# The FULL runtime (real Bun on JSC, ~181 MB bun-run.wasm) — opt-in, it is
+# enormous: `mise run build-runtime`. Intermediates: native/runtime-build/.
+[tasks.build-runtime]
+description = "Build the full bun+JSC runtime (bun-run.wasm) hermetically"
+dir = "{{config_root}}"
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-runtime.sh"

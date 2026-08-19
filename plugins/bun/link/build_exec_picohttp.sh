@@ -22,12 +22,16 @@
 #     wires pipeline stages through these fds, and the wasi spawn arm uses
 #     `wk_pipe_of_fd` to tell a real pipeline pipe from the node's inherited stdin.
 #
-# Emits /tmp/{picohttpparser,exec_host,wkexec,pipe}.o for link_all.sh.
+# Emits $OBJ/{picohttpparser,exec_host,wkexec,pipe}.o for link_all.sh.
+# PATHS RE-ROOTED (2026-08): objects went to /tmp; now $OBJ. Flags identical.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 WASI_SDK="${WASI_SDK:-$HOME/wasi-sdk}"
 CC="$WASI_SDK/bin/clang"
+WORK="${WORK:-$(cd ../native && pwd)/runtime-build}"
+OBJ="${OBJ:-$WORK/obj}"
+mkdir -p "$OBJ"
 EXEC="$(cd ../../exec-compat && pwd)"
 BUN="$(cd ../bun && pwd)"            # the (gitignored) bun checkout
 PICO_COMMIT=066d2b1e9ab820703db0837a7255d92d30f0c9f5  # h2o/picohttpparser (bun's pin)
@@ -39,7 +43,7 @@ if [ ! -f "$PICO_DIR/picohttpparser.c" ]; then
     curl -fsSL "https://raw.githubusercontent.com/h2o/picohttpparser/$PICO_COMMIT/picohttpparser.c" -o "$PICO_DIR/picohttpparser.c"
     curl -fsSL "https://raw.githubusercontent.com/h2o/picohttpparser/$PICO_COMMIT/picohttpparser.h" -o "$PICO_DIR/picohttpparser.h"
 fi
-"$CC" --target=wasm32-wasip2 -O2 -I "$PICO_DIR" -c "$PICO_DIR/picohttpparser.c" -o /tmp/picohttpparser.o
+"$CC" --target=wasm32-wasip2 -O2 -I "$PICO_DIR" -c "$PICO_DIR/picohttpparser.c" -o "$OBJ/picohttpparser.o"
 
 # --- wk:exec bindings (wasip2) --------------------------------------------
 # gen/ is produced by plugins/exec-compat/build.sh (wit-bindgen c --world
@@ -48,13 +52,13 @@ fi
 if [ ! -f "$EXEC/gen/exec_host.c" ]; then
     ( cd "$EXEC" && wit-bindgen c --world exec-host wit --out-dir gen )
 fi
-"$CC" --target=wasm32-wasip2 -O2 -I "$EXEC" -I "$EXEC/gen" -c "$EXEC/gen/exec_host.c" -o /tmp/exec_host.o
-"$CC" --target=wasm32-wasip2 -O2 -I "$EXEC" -I "$EXEC/gen" -c "$EXEC/wkexec.c" -o /tmp/wkexec.o
+"$CC" --target=wasm32-wasip2 -O2 -I "$EXEC" -I "$EXEC/gen" -c "$EXEC/gen/exec_host.c" -o "$OBJ/exec_host.o"
+"$CC" --target=wasm32-wasip2 -O2 -I "$EXEC" -I "$EXEC/gen" -c "$EXEC/wkexec.c" -o "$OBJ/wkexec.o"
 
 # --- pipe-compat's pipe() (wasip2) ----------------------------------------
 # Reuses the same wk:exec bindings (exec_host.h) as wkexec.o; adds the
 # descriptor-table-backed pipe and wk_pipe_of_fd.
 PIPE="$(cd ../../pipe-compat && pwd)"
-"$CC" --target=wasm32-wasip2 -O2 -I "$PIPE" -I "$EXEC" -I "$EXEC/gen" -c "$PIPE/pipe.c" -o /tmp/pipe.o
+"$CC" --target=wasm32-wasip2 -O2 -I "$PIPE" -I "$EXEC" -I "$EXEC/gen" -c "$PIPE/pipe.c" -o "$OBJ/pipe.o"
 
-echo "built /tmp/{picohttpparser,exec_host,wkexec,pipe}.o (+ $EXEC/gen/exec_host_component_type.o)"
+echo "built $OBJ/{picohttpparser,exec_host,wkexec,pipe}.o (+ $EXEC/gen/exec_host_component_type.o)"

@@ -1,5 +1,8 @@
 bun/
 codegen/
+# native/ holds the fetched vendored sources + JSC/ICU builds AND the
+# runtime-build/ intermediates dir build-runtime.sh writes (obj/, vlib/,
+# bunobj/, lists/, logs/, bun-run.wasm staging).
 native/
 bun-transpile.wasm
 bun-run.wasm
