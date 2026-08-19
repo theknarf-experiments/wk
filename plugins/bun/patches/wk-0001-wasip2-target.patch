@@ -1381,6 +1381,143 @@ index 09e327f8..436acd53 100644
  
      /// Kernel errno enum. `E` and `SystemErrno` share the exact same
      /// discriminant space on each POSIX target; alias rather than duplicate.
+diff --git a/src/errno/wasi_errno.rs b/src/errno/wasi_errno.rs
+new file mode 100644
+index 00000000..fec084c4
+--- /dev/null
++++ b/src/errno/wasi_errno.rs
+@@ -0,0 +1,131 @@
++// WASI errno table. Values come from wasi-libc's `__errno_values.h`
++// (wasm32-wasip2 sysroot) — WASI inherited CloudABI's alphabetically-ordered
++// errno space, so NO value below matches Linux/Darwin/FreeBSD.
++//
++// `EWOULDBLOCK`/`EOPNOTSUPP` are #define-aliases of `EAGAIN`/`ENOTSUP` in the
++// header; Rust enums need unique discriminants, so they (and the errnos WASI
++// lacks entirely but shared code names, e.g. `ESHUTDOWN`) get synthetic
++// values past the real range — decoding never produces them, mirroring how
++// linux_errno.rs uniquifies `EWOULDBLOCK`.
++pub use crate::posix::E;
++pub use crate::posix::S;
++pub use crate::posix::mode_t as Mode;
++
++#[repr(u16)]
++#[derive(
++    Copy, Clone, Eq, PartialEq, Hash, Debug, strum::IntoStaticStr, strum::EnumString, enum_map::Enum,
++)]
++pub enum SystemErrno {
++    SUCCESS = 0,
++    E2BIG = 1,
++    EACCES = 2,
++    EADDRINUSE = 3,
++    EADDRNOTAVAIL = 4,
++    EAFNOSUPPORT = 5,
++    EAGAIN = 6,
++    EALREADY = 7,
++    EBADF = 8,
++    EBADMSG = 9,
++    EBUSY = 10,
++    ECANCELED = 11,
++    ECHILD = 12,
++    ECONNABORTED = 13,
++    ECONNREFUSED = 14,
++    ECONNRESET = 15,
++    EDEADLK = 16,
++    EDESTADDRREQ = 17,
++    EDOM = 18,
++    EDQUOT = 19,
++    EEXIST = 20,
++    EFAULT = 21,
++    EFBIG = 22,
++    EHOSTUNREACH = 23,
++    EIDRM = 24,
++    EILSEQ = 25,
++    EINPROGRESS = 26,
++    EINTR = 27,
++    EINVAL = 28,
++    EIO = 29,
++    EISCONN = 30,
++    EISDIR = 31,
++    ELOOP = 32,
++    EMFILE = 33,
++    EMLINK = 34,
++    EMSGSIZE = 35,
++    EMULTIHOP = 36,
++    ENAMETOOLONG = 37,
++    ENETDOWN = 38,
++    ENETRESET = 39,
++    ENETUNREACH = 40,
++    ENFILE = 41,
++    ENOBUFS = 42,
++    ENODEV = 43,
++    ENOENT = 44,
++    ENOEXEC = 45,
++    ENOLCK = 46,
++    ENOLINK = 47,
++    ENOMEM = 48,
++    ENOMSG = 49,
++    ENOPROTOOPT = 50,
++    ENOSPC = 51,
++    ENOSYS = 52,
++    ENOTCONN = 53,
++    ENOTDIR = 54,
++    ENOTEMPTY = 55,
++    ENOTRECOVERABLE = 56,
++    ENOTSOCK = 57,
++    ENOTSUP = 58,
++    ENOTTY = 59,
++    ENXIO = 60,
++    EOVERFLOW = 61,
++    EOWNERDEAD = 62,
++    EPERM = 63,
++    EPIPE = 64,
++    EPROTO = 65,
++    EPROTONOSUPPORT = 66,
++    EPROTOTYPE = 67,
++    ERANGE = 68,
++    EROFS = 69,
++    ESPIPE = 70,
++    ESRCH = 71,
++    ESTALE = 72,
++    ETIMEDOUT = 73,
++    ETXTBSY = 74,
++    EXDEV = 75,
++    ENOTCAPABLE = 76,
++    // Synthetic (not real WASI errnos; see header comment).
++    EWOULDBLOCK = 77,
++    EOPNOTSUPP = 78,
++    ESHUTDOWN = 79,
++    EHOSTDOWN = 80,
++    ESOCKTNOSUPPORT = 81,
++    ENODATA = 82,
++    EFTYPE = 83,
++}
++
++impl SystemErrno {
++    pub const MAX: u16 = 84;
++}
++
++#[allow(non_upper_case_globals)]
++pub mod uv_e {
++    // Native `SystemErrno::$e as i32`; libuv-synthetic fallback for the codes
++    // WASI lacks (the four every-POSIX synthetics plus the BSD/SysV strays).
++    macro_rules! __v {
++        (CHARSET,        $e:tt, $uv:tt) => { -::bun_libuv_sys::$uv };
++        (NONET,          $e:tt, $uv:tt) => { -::bun_libuv_sys::$uv };
++        (REMOTEIO,       $e:tt, $uv:tt) => { -::bun_libuv_sys::$uv };
++        (UNATCH,         $e:tt, $uv:tt) => { -::bun_libuv_sys::$uv };
++        (SHUTDOWN,       $e:tt, $uv:tt) => { -::bun_libuv_sys::$uv };
++        (HOSTDOWN,       $e:tt, $uv:tt) => { -::bun_libuv_sys::$uv };
++        (SOCKTNOSUPPORT, $e:tt, $uv:tt) => { -::bun_libuv_sys::$uv };
++        (NODATA,         $e:tt, $uv:tt) => { -::bun_libuv_sys::$uv };
++        (FTYPE,          $e:tt, $uv:tt) => { -::bun_libuv_sys::$uv };
++        ($i:tt,          $e:tt, $uv:tt) => { super::SystemErrno::$e as i32 };
++    }
++    crate::__uv_e_rows!(__v);
++}
++
++// wasi-libc follows the Darwin/FreeBSD convention: every failure returns the
++// all-ones sentinel with the real code in the thread-local errno slot.
++impl_get_errno_libc!(i32, u32, isize, usize, i64);
 diff --git a/src/event_loop/SpawnSyncEventLoop.rs b/src/event_loop/SpawnSyncEventLoop.rs
 index d91f9c8b..d855057b 100644
 --- a/src/event_loop/SpawnSyncEventLoop.rs
@@ -3984,6 +4121,22 @@ index 88a58421..a9d5702f 100644
  
 +
  } // namespace WebCore
+diff --git a/src/jsc/bindings/webcore/BunScriptWrappableWrapper.cpp b/src/jsc/bindings/webcore/BunScriptWrappableWrapper.cpp
+new file mode 100644
+index 00000000..1d1aa14e
+--- /dev/null
++++ b/src/jsc/bindings/webcore/BunScriptWrappableWrapper.cpp
+@@ -0,0 +1,10 @@
++// Out-of-line definition of the inline ScriptWrappable::wrapper(). WebCore inlines
++// it everywhere, so no TU emits the out-of-line body — but non-inlined references
++// (e.g. AbortSignal::markAborted) need the symbol. Defined here without including
++// ScriptWrappableInlines.h to avoid an inline redefinition.
++#include "root.h"
++#include "ScriptWrappable.h"
++#include <JavaScriptCore/WeakInlines.h>
++namespace WebCore {
++JSDOMObject* ScriptWrappable::wrapper() const { return m_wrapper.get(); }
++}
 diff --git a/src/jsc/bindings/webcore/EventContext.cpp b/src/jsc/bindings/webcore/EventContext.cpp
 index b618b830..448cd541 100644
 --- a/src/jsc/bindings/webcore/EventContext.cpp
@@ -8517,6 +8670,42 @@ index 89a62dcc..d18cc6b5 100644
    {
      // This function is manual inlining + modification of
      //      us_socket_remote_address
+diff --git a/src/watcher/WasiWatcher.rs b/src/watcher/WasiWatcher.rs
+new file mode 100644
+index 00000000..26430da0
+--- /dev/null
++++ b/src/watcher/WasiWatcher.rs
+@@ -0,0 +1,30 @@
++//! WASI backend: watchlist bookkeeping only, events never fire. WASI has no
++//! file change notification (and a wk guest's vfs none yet either), so
++//! `--watch` degrades to "runs once" instead of failing to start. Per-file
++//! OS registration is a per-backend concern (the linux/macos arms in
++//! `Watcher.rs` are cfg'd to their platforms); this backend has none.
++
++use crate::Watcher;
++
++pub(crate) type Platform = WasiWatcher;
++
++pub struct WasiWatcher;
++
++impl WasiWatcher {
++    pub(crate) fn new(_root: &[u8]) -> crate::Result<Self> {
++        Ok(WasiWatcher)
++    }
++
++    pub(crate) fn stop(&mut self) {}
++}
++
++/// Repeatedly called by the main watcher until the watcher is terminated.
++pub(crate) fn watch_loop_cycle(this: &mut Watcher) -> bun_sys::Result<()> {
++    // No event source: dispatch the (always empty) batch — keeping the shared
++    // trace/callback path live — then terminate the loop.
++    this.dispatch_file_updates(0, 0);
++    Err(bun_sys::Error::from_code_int(
++        bun_errno::SystemErrno::ENOSYS as i32,
++        bun_sys::Tag::TODO,
++    ))
++}
 diff --git a/src/watcher/Watcher.rs b/src/watcher/Watcher.rs
 index 796f0b07..4c94296a 100644
 --- a/src/watcher/Watcher.rs
@@ -8601,3 +8790,970 @@ index f3996922..dc0a70b7 100644
  }
  
  // ── Console ctrl-handler dwCtrlType values (`wincon.h`) ───────────────────
+diff --git a/src/wk_cli/Cargo.toml b/src/wk_cli/Cargo.toml
+new file mode 100644
+index 00000000..ca9afe9b
+--- /dev/null
++++ b/src/wk_cli/Cargo.toml
+@@ -0,0 +1,27 @@
++# wk's wasm32-wasip2 CLI over the JSC-free transpiler slice — the
++# `bun build --no-bundle`-shaped transform pipeline as a wasi command.
++# Not part of any upstream build; exists for the wk plugin port.
++[package]
++name = "bun_wk_cli"
++version.workspace = true
++edition.workspace = true
++
++[[bin]]
++name = "bun-transpile"
++path = "main.rs"
++
++[dependencies]
++libc.workspace = true
++bun_alloc.workspace = true
++bun_bundler.workspace = true
++bun_dotenv.workspace = true
++bun_errno.workspace = true
++bun_install_types.workspace = true
++bun_js_parser.workspace = true
++bun_ast.workspace = true
++bun_core.workspace = true
++bun_options_types.workspace = true
++bun_transpiler.workspace = true
++
++[lints]
++workspace = true
+diff --git a/src/wk_cli/jsc_api.rs b/src/wk_cli/jsc_api.rs
+new file mode 100644
+index 00000000..5ed1bbba
+--- /dev/null
++++ b/src/wk_cli/jsc_api.rs
+@@ -0,0 +1,139 @@
++//! Minimal bindings to JavaScriptCore's C API (the wasi cloop build from
++//! plugins/bun/build-jsc.sh) — enough to evaluate the transpiler's output
++//! and print. This is the interim execution path; bun's real `*_jsc` bridge
++//! (which speaks the C++ additions layer, not the C API) replaces it as the
++//! port advances.
++
++#![allow(non_snake_case)]
++
++use core::ffi::{c_char, c_uint, c_void};
++
++pub(crate) type JSContextRef = *const c_void;
++pub(crate) type JSGlobalContextRef = *mut c_void;
++pub(crate) type JSValueRef = *const c_void;
++pub(crate) type JSObjectRef = *mut c_void;
++pub(crate) type JSStringRef = *mut c_void;
++type JSObjectCallAsFunctionCallback = unsafe extern "C" fn(
++    ctx: JSContextRef,
++    function: JSObjectRef,
++    this_object: JSObjectRef,
++    argument_count: usize,
++    arguments: *const JSValueRef,
++    exception: *mut JSValueRef,
++) -> JSValueRef;
++
++unsafe extern "C" {
++    fn JSGlobalContextCreate(global_object_class: *mut c_void) -> JSGlobalContextRef;
++    fn JSContextGetGlobalObject(ctx: JSContextRef) -> JSObjectRef;
++    fn JSEvaluateScript(
++        ctx: JSContextRef,
++        script: JSStringRef,
++        this_object: JSObjectRef,
++        source_url: JSStringRef,
++        starting_line_number: i32,
++        exception: *mut JSValueRef,
++    ) -> JSValueRef;
++    fn JSStringCreateWithUTF8CString(string: *const c_char) -> JSStringRef;
++    fn JSStringRelease(string: JSStringRef);
++    fn JSStringGetMaximumUTF8CStringSize(string: JSStringRef) -> usize;
++    fn JSStringGetUTF8CString(string: JSStringRef, buffer: *mut c_char, buffer_size: usize) -> usize;
++    fn JSValueToStringCopy(ctx: JSContextRef, value: JSValueRef, exception: *mut JSValueRef) -> JSStringRef;
++    fn JSValueMakeUndefined(ctx: JSContextRef) -> JSValueRef;
++    fn JSObjectMakeFunctionWithCallback(
++        ctx: JSContextRef,
++        name: JSStringRef,
++        callback: JSObjectCallAsFunctionCallback,
++    ) -> JSObjectRef;
++    fn JSObjectSetProperty(
++        ctx: JSContextRef,
++        object: JSObjectRef,
++        property_name: JSStringRef,
++        value: JSValueRef,
++        attributes: c_uint,
++        exception: *mut JSValueRef,
++    );
++    fn JSObjectMake(ctx: JSContextRef, class: *mut c_void, data: *mut c_void) -> JSObjectRef;
++}
++
++fn js_string(s: &str) -> JSStringRef {
++    let c = std::ffi::CString::new(s).expect("no interior NULs in source");
++    // SAFETY: valid NUL-terminated pointer for the duration of the call.
++    unsafe { JSStringCreateWithUTF8CString(c.as_ptr()) }
++}
++
++fn to_rust_string(ctx: JSContextRef, value: JSValueRef) -> String {
++    // SAFETY: ctx/value are live; a failed copy yields null, mapped to "".
++    unsafe {
++        let js = JSValueToStringCopy(ctx, value, core::ptr::null_mut());
++        if js.is_null() {
++            return String::new();
++        }
++        let cap = JSStringGetMaximumUTF8CStringSize(js);
++        let mut buf = vec![0u8; cap.max(1)];
++        let written = JSStringGetUTF8CString(js, buf.as_mut_ptr().cast(), buf.len());
++        JSStringRelease(js);
++        buf.truncate(written.saturating_sub(1)); // drop the NUL
++        String::from_utf8_lossy(&buf).into_owned()
++    }
++}
++
++unsafe extern "C" fn print_callback(
++    ctx: JSContextRef,
++    _function: JSObjectRef,
++    _this: JSObjectRef,
++    argument_count: usize,
++    arguments: *const JSValueRef,
++    _exception: *mut JSValueRef,
++) -> JSValueRef {
++    use std::io::Write;
++    let mut out = std::io::stdout();
++    for i in 0..argument_count {
++        // SAFETY: JSC passes `argument_count` valid values.
++        let arg = unsafe { *arguments.add(i) };
++        if i > 0 {
++            let _ = out.write_all(b" ");
++        }
++        let _ = out.write_all(to_rust_string(ctx, arg).as_bytes());
++    }
++    let _ = out.write_all(b"\n");
++    let _ = out.flush();
++    // SAFETY: ctx is live.
++    unsafe { JSValueMakeUndefined(ctx) }
++}
++
++/// Evaluate `source` in a fresh global context with `print`/`console.log`
++/// wired to stdout. Returns the uncaught-exception text, if any.
++pub(crate) fn evaluate(source: &str, source_url: &str) -> Result<(), String> {
++    // SAFETY: straight-line C API use; every ref we create is either
++    // released or owned by the context, which lives for the process.
++    unsafe {
++        let ctx = JSGlobalContextCreate(core::ptr::null_mut());
++        let global = JSContextGetGlobalObject(ctx);
++
++        let print_name = js_string("print");
++        let print_fn = JSObjectMakeFunctionWithCallback(ctx, print_name, print_callback);
++        JSObjectSetProperty(ctx, global, print_name, print_fn.cast_const(), 0, core::ptr::null_mut());
++
++        let console = JSObjectMake(ctx, core::ptr::null_mut(), core::ptr::null_mut());
++        for method in ["log", "error", "warn", "info", "debug"] {
++            let name = js_string(method);
++            JSObjectSetProperty(ctx, console, name, print_fn.cast_const(), 0, core::ptr::null_mut());
++            JSStringRelease(name);
++        }
++        let console_name = js_string("console");
++        JSObjectSetProperty(ctx, global, console_name, console.cast_const(), 0, core::ptr::null_mut());
++        JSStringRelease(console_name);
++
++        let script = js_string(source);
++        let url = js_string(source_url);
++        let mut exception: JSValueRef = core::ptr::null();
++        let result = JSEvaluateScript(ctx, script, core::ptr::null_mut(), url, 1, &mut exception);
++        JSStringRelease(script);
++        JSStringRelease(url);
++
++        if result.is_null() && !exception.is_null() {
++            return Err(to_rust_string(ctx, exception));
++        }
++        Ok(())
++    }
++}
+diff --git a/src/wk_cli/main.rs b/src/wk_cli/main.rs
+new file mode 100644
+index 00000000..e9caf1c0
+--- /dev/null
++++ b/src/wk_cli/main.rs
+@@ -0,0 +1,82 @@
++#![allow(non_snake_case)]
++//! `bun-transpile` — real Bun transpiling TS/TSX/JSX to stdout inside a wk
++//! wasm node. Drives the same `Transpiler::transform` pipeline as
++//! `bun build --no-bundle`, minus the CLI/JSC tiers that can't exist on
++//! wasm yet. Mirrors `Cli::start`'s minimal init: one process-lifetime
++//! `Log` + `Arena`, then transform each entry point to stdout.
++
++mod jsc_api;
++mod wasi_shims;
++
++use bun_options_types::schema::api;
++
++fn main() {
++    let mut args: Vec<String> = std::env::args().collect();
++    // --run: transpile, then execute the result on JSC (the wasi cloop build)
++    // instead of printing it.
++    let run_mode = args.iter().any(|a| a == "--run");
++    args.retain(|a| a != "--run");
++    if args.len() < 2 {
++        bun_core::pretty_errorln!("usage: bun-transpile [--run] FILE.ts [FILE...]");
++        std::process::exit(2);
++    }
++
++    bun_core::output::stdio::init();
++
++    // Process-lifetime, same as the real CLI (`exec` diverges there; we exit).
++    let arena: &'static bun_alloc::Arena = Box::leak(Box::new(bun_alloc::Arena::new()));
++    let log: &'static mut bun_ast::Log = Box::leak(Box::new(bun_ast::Log::init()));
++    let log_ptr: *mut bun_ast::Log = log;
++
++    let mut opts = api::TransformOptions::default();
++    opts.entry_points = args[1..]
++        .iter()
++        .map(|a| a.as_bytes().to_vec().into_boxed_slice())
++        .collect();
++
++    let result = bun_transpiler::Transpiler::init(arena, log_ptr, opts.clone(), None).and_then(|t| {
++        let t = arena.alloc(t);
++        // Same order as BuildCommand::exec.
++        t.configure_defines()?;
++        t.configure_linker();
++        t.transform(log_ptr, opts)
++    });
++
++    if let Ok(result) = &result {
++        if run_mode {
++            for f in &result.output_files {
++                if let bun_bundler::options::OutputFileValue::Buffer { bytes } = &f.value {
++                    let source = String::from_utf8_lossy(bytes);
++                    if let Err(exception) = jsc_api::evaluate(&source, &args[1]) {
++                        bun_core::pretty_errorln!("uncaught: {}", exception);
++                        bun_core::Output::flush();
++                        std::process::exit(1);
++                    }
++                }
++            }
++        } else {
++            // Same as BuildCommand's no-outdir path: buffer-valued outputs go
++            // straight to stdout.
++            use std::io::Write;
++            let mut out = std::io::stdout();
++            for f in &result.output_files {
++                if let bun_bundler::options::OutputFileValue::Buffer { bytes } = &f.value {
++                    let _ = out.write_all(bytes);
++                }
++            }
++            let _ = out.flush();
++        }
++    }
++
++    if log.errors > 0 || result.is_err() {
++        let _ = log.print(std::ptr::from_mut::<bun_core::io::Writer>(
++            bun_core::Output::error_writer(),
++        ));
++        if let Err(err) = result {
++            bun_core::pretty_errorln!("<red>error<r>: {:?}", err);
++        }
++        bun_core::Output::flush();
++        std::process::exit(1);
++    }
++    bun_core::Output::flush();
++}
+diff --git a/src/wk_cli/wasi_shims.rs b/src/wk_cli/wasi_shims.rs
+new file mode 100644
+index 00000000..059ea47c
+--- /dev/null
++++ b/src/wk_cli/wasi_shims.rs
+@@ -0,0 +1,695 @@
++//! Native symbols the transpiler slice references but which live in tiers
++//! that don't exist on wasm yet, in three classes:
++//!
++//! * **WebKit/WTF number machinery** — runtime-reachable from the printer and
++//!   constant folder, so these are real (approximate) implementations, not
++//!   aborts. They come with the JSC port later.
++//! * **JSC/dispatch/package-manager hooks** — referenced but unreachable in a
++//!   transform-only run (`ALLOW_MACROS` is false on wasm, no VM exists);
++//!   no-ops or aborts.
++//! * **BoringSSL X.509 helpers** — cert pretty-printing paths that a
++//!   transpile can't reach; aborts.
++//!
++//! mimalloc / highway / simdutf are NOT stubbed — build.sh compiles the real
++//! libraries with wasi-sdk.
++
++use core::ffi::{c_int, c_void};
++
++// ── WTF number machinery (approximations; JSC port replaces these) ────────
++
++/// `WTF::numberToString` — ES `ToString(Number)`: shortest round-trip
++/// digits, exponent form outside [1e-6, 1e21). Rust's shortest-round-trip
++/// formatter provides the digits; the exponent styling is applied here.
++#[unsafe(no_mangle)]
++extern "C" fn WTF__dtoa(buf: &mut [u8; 124], number: f64) -> usize {
++    let s = if number.is_nan() {
++        "NaN".to_string()
++    } else if number.is_infinite() {
++        if number < 0.0 { "-Infinity" } else { "Infinity" }.to_string()
++    } else if number == 0.0 {
++        "0".to_string()
++    } else if number.abs() >= 1e21 || number.abs() < 1e-6 {
++        // "1.5e30" → "1.5e+30" (ES always signs the exponent).
++        let e = format!("{:e}", number);
++        match e.find('e') {
++            Some(i) if e.as_bytes().get(i + 1) != Some(&b'-') => {
++                format!("{}e+{}", &e[..i], &e[i + 1..])
++            }
++            _ => e,
++        }
++    } else {
++        format!("{}", number)
++    };
++    let n = s.len().min(buf.len());
++    buf[..n].copy_from_slice(&s.as_bytes()[..n]);
++    n
++}
++
++/// `WTF::parseDouble` — JS-semantics prefix parse of a Latin-1 decimal.
++/// Callers feed lexer-validated numeric text, so a longest-valid-prefix
++/// retry loop is enough.
++#[unsafe(no_mangle)]
++unsafe extern "C" fn WTF__parseDouble(bytes: *const u8, length: usize, counted: *mut usize) -> f64 {
++    let s = unsafe { core::slice::from_raw_parts(bytes, length) };
++    let mut end = s.len();
++    while end > 0 {
++        if let Ok(text) = core::str::from_utf8(&s[..end])
++            && let Ok(v) = text.parse::<f64>()
++        {
++            unsafe { *counted = end };
++            return v;
++        }
++        end -= 1;
++    }
++    unsafe { *counted = 0 };
++    f64::NAN
++}
++
++/// JSC's `operationMathPow` — ES `**`: like `powf` except `±1 ** ±Infinity`
++/// is NaN (IEEE says 1).
++#[unsafe(no_mangle)]
++extern "C" fn Bun__JSC__operationMathPow(x: f64, y: f64) -> f64 {
++    if y.is_infinite() && x.abs() == 1.0 {
++        return f64::NAN;
++    }
++    x.powf(y)
++}
++
++/// JSC's `jsToNumber(String)` — ES `ToNumber(string)` for constant folding:
++/// trimmed empty → 0, hex/octal/binary prefixes, `Infinity`, else decimal.
++#[unsafe(no_mangle)]
++unsafe extern "C" fn JSC__jsToNumber(ptr: *const u8, len: usize) -> f64 {
++    let s = unsafe { core::slice::from_raw_parts(ptr, len) };
++    let Ok(s) = core::str::from_utf8(s) else {
++        return f64::NAN;
++    };
++    let t = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
++    if t.is_empty() {
++        return 0.0;
++    }
++    let radix = |p: &str, r: u32| i64::from_str_radix(p, r).map(|v| v as f64).ok();
++    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
++        return radix(hex, 16).unwrap_or(f64::NAN);
++    }
++    if let Some(oct) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
++        return radix(oct, 8).unwrap_or(f64::NAN);
++    }
++    if let Some(bin) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
++        return radix(bin, 2).unwrap_or(f64::NAN);
++    }
++    match t {
++        "Infinity" | "+Infinity" => f64::INFINITY,
++        "-Infinity" => f64::NEG_INFINITY,
++        _ => t.parse::<f64>().unwrap_or(f64::NAN),
++    }
++}
++
++/// Same probe trick as `bun_parsers::native_test_shims` — the caller treats
++/// the result as the recursion floor.
++#[unsafe(no_mangle)]
++extern "C" fn Bun__StackCheck__getMaxStack() -> *mut c_void {
++    let probe: u8 = 0;
++    let approx_sp = (&raw const probe) as usize;
++    (approx_sp.saturating_sub(512 * 1024)) as *mut c_void
++}
++
++// ── Scalar fallbacks for the SIMD kernels the linker kept ─────────────────
++// Same shapes as `bun_parsers::native_test_shims` (which is `cfg(test)`-only).
++// A real highway/simdutf wasi build can replace these later.
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn highway_count_char(haystack: *const u8, len: usize, needle: u8) -> usize {
++    let h = unsafe { core::slice::from_raw_parts(haystack, len) };
++    h.iter().filter(|&&c| c == needle).count()
++}
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn highway_last_index_of_char(haystack: *const u8, len: usize, needle: u8) -> usize {
++    let h = unsafe { core::slice::from_raw_parts(haystack, len) };
++    h.iter().rposition(|&c| c == needle).unwrap_or(len)
++}
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn highway_index_of_any_char(
++    text: *const u8,
++    text_len: usize,
++    chars: *const u8,
++    chars_len: usize,
++) -> usize {
++    let (t, cs) = unsafe {
++        (
++            core::slice::from_raw_parts(text, text_len),
++            core::slice::from_raw_parts(chars, chars_len),
++        )
++    };
++    t.iter().position(|c| cs.contains(c)).unwrap_or(text_len)
++}
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn simdutf__validate_ascii(buf: *const u8, len: usize) -> bool {
++    unsafe { core::slice::from_raw_parts(buf, len) }.is_ascii()
++}
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn highway_memrmem(
++    haystack: *const u8,
++    haystack_len: usize,
++    needle: *const u8,
++    needle_len: usize,
++) -> usize {
++    let (h, n) = unsafe {
++        (
++            core::slice::from_raw_parts(haystack, haystack_len),
++            core::slice::from_raw_parts(needle, needle_len),
++        )
++    };
++    if n.is_empty() {
++        return h.len();
++    }
++    if h.len() < n.len() {
++        return usize::MAX;
++    }
++    (0..=h.len() - n.len())
++        .rev()
++        .find(|&i| h[i..i + n.len()] == *n)
++        .unwrap_or(usize::MAX)
++}
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn highway_memrmem16(
++    haystack: *const u16,
++    haystack_len: usize,
++    needle: *const u16,
++    needle_len: usize,
++) -> usize {
++    let (h, n) = unsafe {
++        (
++            core::slice::from_raw_parts(haystack, haystack_len),
++            core::slice::from_raw_parts(needle, needle_len),
++        )
++    };
++    if n.is_empty() {
++        return h.len();
++    }
++    if h.len() < n.len() {
++        return usize::MAX;
++    }
++    (0..=h.len() - n.len())
++        .rev()
++        .find(|&i| h[i..i + n.len()] == *n)
++        .unwrap_or(usize::MAX)
++}
++
++/// First `*`, CR, LF, or byte > 127 (the lexer's multiline-comment skip).
++#[unsafe(no_mangle)]
++unsafe extern "C" fn highway_index_of_interesting_character_in_multiline_comment(
++    text: *const u8,
++    text_len: usize,
++) -> usize {
++    let t = unsafe { core::slice::from_raw_parts(text, text_len) };
++    t.iter()
++        .position(|&c| c == b'*' || c == b'\r' || c == b'\n' || c > 127)
++        .unwrap_or(text_len)
++}
++
++/// First `#`, `@`, control (< 0x20), or byte > 127 (shebang/pragma scan).
++#[unsafe(no_mangle)]
++unsafe extern "C" fn highway_index_of_newline_or_non_ascii_or_hash_or_at(
++    haystack: *const u8,
++    haystack_len: usize,
++) -> usize {
++    let h = unsafe { core::slice::from_raw_parts(haystack, haystack_len) };
++    h.iter()
++        .position(|&c| c == b'#' || c == b'@' || c < 0x20 || c > 127)
++        .unwrap_or(haystack_len)
++}
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn highway_index_of_char(haystack: *const u8, len: usize, needle: u8) -> usize {
++    let h = unsafe { core::slice::from_raw_parts(haystack, len) };
++    h.iter().position(|&c| c == needle).unwrap_or(len)
++}
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn highway_index_of_not_char(haystack: *const u8, len: usize, value: u8) -> usize {
++    let h = unsafe { core::slice::from_raw_parts(haystack, len) };
++    h.iter().position(|&c| c != value).unwrap_or(len)
++}
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn highway_memmem(
++    haystack: *const u8,
++    haystack_len: usize,
++    needle: *const u8,
++    needle_len: usize,
++) -> *const u8 {
++    let (h, n) = unsafe {
++        (
++            core::slice::from_raw_parts(haystack, haystack_len),
++            core::slice::from_raw_parts(needle, needle_len),
++        )
++    };
++    if n.is_empty() {
++        return haystack;
++    }
++    if h.len() < n.len() {
++        return core::ptr::null();
++    }
++    match (0..=h.len() - n.len()).find(|&i| h[i..i + n.len()] == *n) {
++        Some(i) => unsafe { haystack.add(i) },
++        None => core::ptr::null(),
++    }
++}
++
++/// First `c <= ' '` or byte > 127 (import-path scan).
++#[unsafe(no_mangle)]
++unsafe extern "C" fn highway_index_of_space_or_newline_or_non_ascii(
++    text: *const u8,
++    text_len: usize,
++) -> usize {
++    let t = unsafe { core::slice::from_raw_parts(text, text_len) };
++    t.iter()
++        .position(|&c| c <= b' ' || c > 127)
++        .unwrap_or(text_len)
++}
++
++/// Any control (< 0x20), byte > 127, or `"` (JSON fast path).
++#[unsafe(no_mangle)]
++unsafe extern "C" fn highway_contains_newline_or_non_ascii_or_quote(
++    text: *const u8,
++    text_len: usize,
++) -> bool {
++    let t = unsafe { core::slice::from_raw_parts(text, text_len) };
++    t.iter().any(|&c| c > 127 || c < 0x20 || c == b'"')
++}
++
++/// First char the printer must escape inside a `quote_char` string:
++/// DEL/non-ascii (>= 127), control, backslash, the quote itself, and `$`
++/// inside template literals.
++#[unsafe(no_mangle)]
++unsafe extern "C" fn highway_index_of_needs_escape_for_javascript_string(
++    text: *const u8,
++    text_len: usize,
++    quote_char: u8,
++) -> usize {
++    let t = unsafe { core::slice::from_raw_parts(text, text_len) };
++    let is_backtick = quote_char == b'`';
++    t.iter()
++        .position(|&c| {
++            c >= 127 || c < 0x20 || c == b'\\' || c == quote_char || (is_backtick && c == b'$')
++        })
++        .unwrap_or(text_len)
++}
++
++/// Layout of `simdutf_sys::SIMDUTFResult` (`{ status: i32, count: usize }`).
++#[repr(C)]
++struct SimdutfResult {
++    status: i32,
++    count: usize,
++}
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn simdutf__validate_ascii_with_errors(
++    buf: *const u8,
++    len: usize,
++) -> SimdutfResult {
++    let s = unsafe { core::slice::from_raw_parts(buf, len) };
++    match s.iter().position(|&b| b >= 0x80) {
++        // simdutf reports non-ASCII as TOO_LARGE (= 5) at the first bad index.
++        Some(i) => SimdutfResult { status: 5, count: i },
++        None => SimdutfResult { status: 0, count: len },
++    }
++}
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn simdutf__validate_utf8(buf: *const u8, len: usize) -> bool {
++    core::str::from_utf8(unsafe { core::slice::from_raw_parts(buf, len) }).is_ok()
++}
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn simdutf__validate_utf8_with_errors(buf: *const u8, len: usize) -> SimdutfResult {
++    let s = unsafe { core::slice::from_raw_parts(buf, len) };
++    match core::str::from_utf8(s) {
++        Ok(_) => SimdutfResult {
++            status: 0,
++            count: len,
++        },
++        // TOO_SHORT (= 2) at the end of the valid prefix; callers branch on
++        // SUCCESS and read `count` as the first invalid index.
++        Err(e) => SimdutfResult {
++            status: 2,
++            count: e.valid_up_to(),
++        },
++    }
++}
++
++/// `simdutf::utf16_length_from_utf8` — UTF-16 code units for (lossy) UTF-8.
++#[unsafe(no_mangle)]
++unsafe extern "C" fn simdutf__utf16_length_from_utf8(input: *const u8, length: usize) -> usize {
++    let s = unsafe { core::slice::from_raw_parts(input, length) };
++    String::from_utf8_lossy(s)
++        .chars()
++        .map(char::len_utf16)
++        .sum()
++}
++
++/// Pairing-aware UTF-8 byte count for UTF-16LE; unpaired surrogates count 3
++/// bytes — which also matches the `_with_replacement` variant (U+FFFD is 3).
++fn utf8_len_from_utf16(units: &[u16]) -> usize {
++    let mut n = 0usize;
++    let mut i = 0usize;
++    while i < units.len() {
++        let u = units[i];
++        if u < 0x80 {
++            n += 1;
++        } else if u < 0x800 {
++            n += 2;
++        } else if (0xD800..0xDC00).contains(&u)
++            && i + 1 < units.len()
++            && (0xDC00..0xE000).contains(&units[i + 1])
++        {
++            n += 4;
++            i += 1;
++        } else {
++            n += 3;
++        }
++        i += 1;
++    }
++    n
++}
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn simdutf__utf8_length_from_utf16le(input: *const u16, length: usize) -> usize {
++    utf8_len_from_utf16(unsafe { core::slice::from_raw_parts(input, length) })
++}
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn simdutf__utf8_length_from_utf16le_with_replacement(
++    input: *const u16,
++    length: usize,
++) -> usize {
++    utf8_len_from_utf16(unsafe { core::slice::from_raw_parts(input, length) })
++}
++
++/// Strict UTF-8 → UTF-16LE. Success: `{ SUCCESS, units written }`; invalid
++/// input reports TOO_SHORT (= 2) at the end of the valid prefix — callers
++/// only branch on SUCCESS.
++#[unsafe(no_mangle)]
++unsafe extern "C" fn simdutf__convert_utf8_to_utf16le_with_errors(
++    buf: *const u8,
++    len: usize,
++    utf16_output: *mut u16,
++) -> SimdutfResult {
++    let s = unsafe { core::slice::from_raw_parts(buf, len) };
++    match core::str::from_utf8(s) {
++        Ok(text) => {
++            let mut written = 0usize;
++            for c in text.chars() {
++                let mut units = [0u16; 2];
++                for &u in c.encode_utf16(&mut units).iter() {
++                    // SAFETY: caller sized the buffer via utf16_length_from_utf8.
++                    unsafe { *utf16_output.add(written) = u };
++                    written += 1;
++                }
++            }
++            SimdutfResult {
++                status: 0,
++                count: written,
++            }
++        }
++        Err(e) => SimdutfResult {
++            status: 2,
++            count: e.valid_up_to(),
++        },
++    }
++}
++
++/// Strict UTF-16LE → UTF-8. Unpaired surrogate: `{ SURROGATE (= 6), index }`.
++#[unsafe(no_mangle)]
++unsafe extern "C" fn simdutf__convert_utf16le_to_utf8_with_errors(
++    buf: *const u16,
++    len: usize,
++    utf8_buffer: *mut u8,
++) -> SimdutfResult {
++    let units = unsafe { core::slice::from_raw_parts(buf, len) };
++    let mut written = 0usize;
++    let mut i = 0usize;
++    for c in char::decode_utf16(units.iter().copied()) {
++        match c {
++            Ok(c) => {
++                let mut bytes = [0u8; 4];
++                let n = c.encode_utf8(&mut bytes).len();
++                // SAFETY: caller sized the buffer via utf8_length_from_utf16le.
++                unsafe {
++                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), utf8_buffer.add(written), n)
++                };
++                written += n;
++                i += c.len_utf16();
++            }
++            Err(_) => {
++                return SimdutfResult {
++                    status: 6,
++                    count: i,
++                };
++            }
++        }
++    }
++    SimdutfResult {
++        status: 0,
++        count: written,
++    }
++}
++
++// ── base64 (simdutf's default = padded `+/`, url = unpadded `-_`) ─────────
++
++const B64_STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++const B64_URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn simdutf__base64_length_from_binary(length: usize, is_urlsafe: c_int) -> usize {
++    if is_urlsafe != 0 {
++        (length * 4).div_ceil(3)
++    } else {
++        length.div_ceil(3) * 4
++    }
++}
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn simdutf__base64_encode(
++    input: *const u8,
++    length: usize,
++    output: *mut u8,
++    is_urlsafe: c_int,
++) -> usize {
++    let src = unsafe { core::slice::from_raw_parts(input, length) };
++    let alphabet = if is_urlsafe != 0 { B64_URL } else { B64_STD };
++    let mut written = 0usize;
++    let mut push = |b: u8| {
++        // SAFETY: caller sized the buffer via base64_length_from_binary.
++        unsafe { *output.add(written) = b };
++        written += 1;
++    };
++    for chunk in src.chunks(3) {
++        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
++        let v = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
++        let syms = [(v >> 18) & 63, (v >> 12) & 63, (v >> 6) & 63, v & 63];
++        let keep = chunk.len() + 1;
++        for (j, &sym) in syms.iter().enumerate() {
++            if j < keep {
++                push(alphabet[sym as usize]);
++            } else if is_urlsafe == 0 {
++                push(b'=');
++            }
++        }
++    }
++    written
++}
++
++/// `simdutf::base64_to_binary_safe` — whitespace-tolerant strict decode.
++/// Invalid character: `{ INVALID_BASE64_CHARACTER (= 7), index }`.
++#[unsafe(no_mangle)]
++unsafe extern "C" fn simdutf__base64_decode_from_binary(
++    input: *const u8,
++    length: usize,
++    output: *mut u8,
++    outlen: usize,
++    is_urlsafe: c_int,
++) -> SimdutfResult {
++    let src = unsafe { core::slice::from_raw_parts(input, length) };
++    let alphabet = if is_urlsafe != 0 { B64_URL } else { B64_STD };
++    let mut rev = [255u8; 256];
++    for (i, &c) in alphabet.iter().enumerate() {
++        rev[c as usize] = i as u8;
++    }
++    let mut acc: u32 = 0;
++    let mut bits = 0u32;
++    let mut written = 0usize;
++    for (i, &c) in src.iter().enumerate() {
++        if c.is_ascii_whitespace() || c == b'=' {
++            continue;
++        }
++        let v = rev[c as usize];
++        if v == 255 {
++            return SimdutfResult {
++                status: 7,
++                count: i,
++            };
++        }
++        acc = (acc << 6) | u32::from(v);
++        bits += 6;
++        if bits >= 8 {
++            bits -= 8;
++            if written >= outlen {
++                // simdutf reports OUTPUT_BUFFER_TOO_SMALL; callers size
++                // exactly, so any code != SUCCESS suffices.
++                return SimdutfResult {
++                    status: 8,
++                    count: written,
++                };
++            }
++            // SAFETY: bounds-checked against outlen above.
++            unsafe { *output.add(written) = (acc >> bits) as u8 };
++            written += 1;
++        }
++    }
++    SimdutfResult {
++        status: 0,
++        count: written,
++    }
++}
++
++// ── JSC / dispatch / package-manager hooks ────────────────────────────────
++
++#[unsafe(no_mangle)]
++fn __bun_macro_context_init(
++    _transpiler: *mut c_void,
++) -> bun_js_parser::Macro::MacroContext {
++    // `ALLOW_MACROS` is false on wasm; a null-data context makes `get_remap`
++    // return None and `deinit` a no-op if either is ever reached.
++    bun_js_parser::Macro::MacroContext::default()
++}
++
++#[unsafe(no_mangle)]
++fn __bun_dispatch__TranspilerCacheImpl__Jsc__put(
++    _output_code: &[u8],
++    _sourcemap: &[u8],
++    _esm_record: &[u8],
++) {
++    unreachable!("TranspilerCacheImplKind::Jsc is never installed on wasm");
++}
++
++#[unsafe(no_mangle)]
++fn __bun_resolver_init_package_manager(
++    _log: core::ptr::NonNull<bun_ast::Log>,
++    _install: Option<core::ptr::NonNull<bun_options_types::schema::api::BunInstall>>,
++    _env: core::ptr::NonNull<bun_dotenv::Loader>,
++) -> Result<core::ptr::NonNull<dyn bun_install_types::AutoInstaller>, bun_errno::SystemErrno> {
++    // `bun install`-on-resolve needs the package manager tier; not on wasm.
++    Err(bun_errno::SystemErrno::ENOSYS)
++}
++
++#[unsafe(no_mangle)]
++extern "C" fn Bun__WTFStringImpl__destroy(_this: *const c_void) {
++    unreachable!("no WTF strings exist without the JSC tier");
++}
++
++#[unsafe(no_mangle)]
++extern "C" fn URL__getFileURLString(_input: *mut c_void) -> *mut c_void {
++    unreachable!("WebKit URL is part of the JSC tier");
++}
++
++#[unsafe(no_mangle)]
++extern "C" fn bun_restore_stdio() {}
++
++/// Native bun's C++ startup snapshots stdio state and fills the
++/// `bun_stdio_tty` flags; the tty half is all wasm needs (wk's terminal
++/// nodes DO report as ttys through wasi:cli).
++#[unsafe(no_mangle)]
++extern "C" fn bun_initialize_process() {
++    unsafe extern "C" {
++        fn isatty(fd: c_int) -> c_int;
++        safe static bun_stdio_tty: [core::sync::atomic::AtomicI32; 3];
++    }
++    for fd in 0..3 {
++        // SAFETY: isatty only queries the descriptor.
++        let tty = unsafe { isatty(fd) };
++        bun_stdio_tty[fd as usize].store(tty, core::sync::atomic::Ordering::Relaxed);
++    }
++}
++
++// ── libc gaps in rustc's bundled wasi-libc ────────────────────────────────
++// rustc links its own wasi-libc snapshot, which predates `dup` and doesn't
++// pull the emulation libs mimalloc's stats/snapshot paths want. (Do NOT fix
++// this by putting the wasi-sdk lib dir on the search path — its libc.a then
++// preempts rustc's and breaks `__wasi_init_tp` in rust's crt1.)
++
++/// wasi-libc's own `dup` is `fcntl(fd, F_DUPFD, 0)` over the descriptor
++/// table. rustc's bundled wasi-libc predates F_DUPFD (returns EINVAL), so
++/// callers that can reopen instead do (see bun_sys's dir iterator); this
++/// forwards for the day the bundled libc catches up.
++#[unsafe(no_mangle)]
++extern "C" fn dup(fd: c_int) -> c_int {
++    const F_DUPFD: c_int = 5; // <__header_fcntl.h>
++    unsafe { libc::fcntl(fd, F_DUPFD, 0) }
++}
++
++/// `clock(3)` for mimalloc's stats. wasi CLOCKS_PER_SEC is 1e9, so the
++/// monotonic clock in nanoseconds IS the right unit.
++#[unsafe(no_mangle)]
++extern "C" fn clock() -> i64 {
++    let mut ts = libc::timespec {
++        tv_sec: 0,
++        tv_nsec: 0,
++    };
++    // SAFETY: valid out-pointer; wasi-libc's monotonic clock always exists.
++    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
++    ts.tv_sec * 1_000_000_000 + i64::from(ts.tv_nsec)
++}
++
++/// `getpid` for mimalloc's heap-snapshot filename; same placeholder the
++/// `-lwasi-emulated-getpid` library would return.
++#[unsafe(no_mangle)]
++extern "C" fn getpid() -> c_int {
++    42
++}
++
++/// zlib `compress2` — referenced by the sourcemap gzip path, which the
++/// transform pipeline doesn't take. Real zlib arrives with the runtime port.
++#[unsafe(no_mangle)]
++extern "C" fn compress2(
++    _dest: *mut u8,
++    _dest_len: *mut usize,
++    _src: *const u8,
++    _src_len: usize,
++    _level: c_int,
++) -> c_int {
++    unreachable!("zlib not linked on wasm yet (sourcemap gzip)");
++}
++
++// ── BoringSSL X.509 pretty-printing (unreachable from a transpile) ────────
++
++macro_rules! ssl_abort_stubs {
++    ($($name:ident($($arg:ty),*) -> $ret:ty;)+) => {$(
++        #[unsafe(no_mangle)]
++        extern "C" fn $name($(_: $arg),*) -> $ret {
++            unreachable!("BoringSSL is not linked on wasm; no TLS/cert paths exist")
++        }
++    )+};
++}
++ssl_abort_stubs! {
++    ASN1_STRING_to_UTF8(*mut *mut u8, *const c_void) -> c_int;
++    GENERAL_NAME_free(*mut c_void) -> ();
++    OPENSSL_free(*mut c_void) -> ();
++    sk_num(*const c_void) -> usize;
++    sk_pop_free_ex(*mut c_void, *const c_void, *const c_void) -> ();
++    sk_value(*const c_void, usize) -> *mut c_void;
++    X509_get_ext(*const c_void, c_int) -> *mut c_void;
++    X509_get_ext_by_NID(*const c_void, c_int, c_int) -> c_int;
++    X509_get_subject_name(*const c_void) -> *mut c_void;
++    X509_NAME_ENTRY_get_data(*const c_void) -> *mut c_void;
++    X509_NAME_get_entry(*const c_void, c_int) -> *mut c_void;
++    X509_NAME_get_index_by_NID(*const c_void, c_int, c_int) -> c_int;
++    X509V3_EXT_d2i(*const c_void) -> *mut c_void;
++    X509V3_EXT_get(*const c_void) -> *mut c_void;
++    X509V3_EXT_get_nid(c_int) -> *mut c_void;
++}
