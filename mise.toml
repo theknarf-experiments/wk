@@ -18,11 +18,20 @@ cargo.binstall = true
 
 [env]
 # Homebrew's lib dir, where the host-side libraries a few plugin builds link
-# (libpng for netsurf's convert_image, …) live on a Mac. `brew` isn't on a
-# plain Linux box, and an exec() that fails takes the WHOLE config down with a
-# parse error before any task can run — so swallow it and fall back to a path
-# that simply doesn't exist.
-LIBRARY_PATH = "{{env.LIBRARY_PATH | default(value='')}}:{{exec(command='brew --prefix 2>/dev/null || echo /nonexistent')}}/lib"
+# live on a Mac. macOS ONLY, deliberately:
+#
+# linuxbrew installs to the same layout but builds against a NEWER glibc than
+# the distro, so putting its lib dir on a Linux linker search path shadows the
+# system copies with ones the system loader cannot resolve. Two ways that bit:
+# wk-server's tests stopped linking (libasound wanting __isoc23_* from glibc
+# 2.38 on a 2.36 box), and CPython's configure half-detected ncurses — finding
+# libncursesw to link but no header to compile against, so the _curses module
+# was enabled and then failed on "unknown type name WINDOW".
+#
+# A Linux box that genuinely needs a library the distro lacks should say so
+# where it is needed, scoped, the way plugins/netsurf/build.sh resolves its
+# host libpng.
+LIBRARY_PATH = "{{env.LIBRARY_PATH | default(value='')}}{% if os() == 'macos' %}:{{exec(command='brew --prefix')}}/lib{% endif %}"
 _.path = ["{{config_root}}"]
 
 [tasks.setup-hooks]
