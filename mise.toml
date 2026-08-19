@@ -17,7 +17,12 @@ cargo.binstall = true
 "github:WebAssembly/wasi-sdk" = "wasi-sdk-34-rc.2"  # clang + wasi-sysroot for C plugins
 
 [env]
-LIBRARY_PATH = "{{env.LIBRARY_PATH | default(value='')}}:{{exec(command='brew --prefix')}}/lib"
+# Homebrew's lib dir, where the host-side libraries a few plugin builds link
+# (libpng for netsurf's convert_image, …) live on a Mac. `brew` isn't on a
+# plain Linux box, and an exec() that fails takes the WHOLE config down with a
+# parse error before any task can run — so swallow it and fall back to a path
+# that simply doesn't exist.
+LIBRARY_PATH = "{{env.LIBRARY_PATH | default(value='')}}:{{exec(command='brew --prefix 2>/dev/null || echo /nonexistent')}}/lib"
 _.path = ["{{config_root}}"]
 
 [tasks.setup-hooks]
@@ -35,6 +40,11 @@ set -e
 for d in plugins/*/; do
   [ -f "$d/mise.toml" ] || continue
   echo "== $d"
+  # Trust is per-config-file, so on a fresh clone every plugin's mise.toml is
+  # untrusted and `mise run build` below refuses to run. Trusting them here is
+  # not a widening: they are this repo's own files, and running this task
+  # already means trusting the root config that ships them.
+  mise trust --quiet "$d/mise.toml"
   (cd "$d" && mise run build)
 done
 """

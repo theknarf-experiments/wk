@@ -1,5 +1,16 @@
+# CPython's Tools/wasm/wasi helper runs the freshly-built interpreter during
+# `make install` (ensurepip) and checks for wasmtime up front. It's a static
+# binary, so mise can own it instead of asking for a hand-rolled ~/.wasmtime
+# install. Pinned to the same 46 line wk's host links
+# (crates/wk-server/Cargo.toml) and the WASIp1 adapter the other plugins fetch.
+[tools]
+"aqua:bytecodealliance/wasmtime" = "46.0.1"
+
 # Build this plugin: `mise run build`
 [tasks.build]
 description = "Fetch upstream CPython (wasm32-wasi) and componentize it"
 dir = "{{config_root}}"
-run = "./build.sh"
+# wasi-sdk comes from the root mise.toml [tools]; point build.sh at its install
+# (resolved at task time, like the other C plugins) — the ~/wasi-sdk default
+# only ever existed on a machine that installed the sdk by hand.
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build.sh"

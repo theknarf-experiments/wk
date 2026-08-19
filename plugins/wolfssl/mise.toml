@@ -1,0 +1,9 @@
+# Build this plugin: `mise run build`
+# wolfSSL produces no component of its own — it's the TLS backend plugins/curl
+# links (and through libcurl, plugins/netsurf). Both drive this build when
+# their sysroot copy is missing, so the task here is for building it directly
+# and for `mise run build-plugins`, which only visits dirs that have a config.
+[tasks.build]
+description = "Cross-compile upstream wolfSSL into a static wasm32-wasip2 library"
+dir = "{{config_root}}"
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build.sh"

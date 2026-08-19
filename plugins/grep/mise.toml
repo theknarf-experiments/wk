@@ -1,6 +1,6 @@
 # Build this plugin: `mise run build`
 [tasks.build]
-description = "Build libfuse's unmodified hello example as a wk:fs provider"
+description = "Cross-compile upstream GNU grep into a wasm component"
 dir = "{{config_root}}"
 # wasi-sdk comes from the root mise.toml [tools]; point build.sh at its install
 # (resolved at task time, like the other C plugins) — the ~/wasi-sdk default
