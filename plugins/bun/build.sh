@@ -41,6 +41,9 @@ fi
 # vendor/lolhtml is a path dep cargo insists on resolving; normally fetched by
 # bun's own configure (scripts/build/deps/lolhtml.ts).
 if [ ! -d bun/vendor/lolhtml ]; then
+    # A fresh bun clone has no vendor/ dir (its entries are submodules a plain
+    # checkout never materializes) — only a previously-built tree has one.
+    mkdir -p bun/vendor
     curl -fsSL "https://github.com/oven-sh/lol-html/archive/$LOLHTML_COMMIT.tar.gz" | tar xz -C bun/vendor
     mv "bun/vendor/lol-html-$LOLHTML_COMMIT" bun/vendor/lolhtml
 fi
