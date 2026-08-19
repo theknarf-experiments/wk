@@ -68,12 +68,23 @@ if [ ! -d native/icu ]; then
     curl -fsSL "https://github.com/unicode-org/icu/releases/download/release-$ICU_VER/icu4c-${ICU_VER/-/_}-src.tgz" | tar xz -C native
     cp native/icu/source/config/mh-linux native/icu/source/config/mh-unknown
 fi
+# Linux-host trap: with elf.h present, ICU builds its host pkgdata/genccode
+# with direct ELF-object writing, and they then try to arch-match our wasm
+# probe objects ("genccode: match-arch file oma.obj is not an ELF object").
+# ac_cv_header_elf_h=no makes the host tools fall back to generating C
+# arrays for the data — the path a macOS host takes naturally, and the one
+# that cross-compiles. The marker invalidates host builds made without it.
+if [ "$(uname)" = Linux ] && [ -f native/icu-host/lib/libicuuc.so ] && [ ! -f native/icu-host/.wk-noelf ]; then
+    echo "== rebuilding ICU host tools without ELF object writing (wasm cross needs the C fallback)"
+    rm -rf native/icu-host
+fi
 if [ ! -f native/icu-host/lib/libicuuc.dylib ] && [ ! -f native/icu-host/lib/libicuuc.so ]; then
     mkdir -p native/icu-host
     echo "== ICU host tools (logs: native/icu-host/*.log)"
-    ( cd native/icu-host && ../icu/source/runConfigureICU "$(uname | sed 's/Darwin/MacOSX/')" \
+    ( cd native/icu-host && ac_cv_header_elf_h=no ../icu/source/runConfigureICU "$(uname | sed 's/Darwin/MacOSX/')" \
         --disable-tests --disable-samples --disable-extras > configure.log 2>&1 && make -j8 > build.log 2>&1 ) \
         || fail_with_logs "ICU host build" native/icu-host/configure.log native/icu-host/build.log
+    touch native/icu-host/.wk-noelf
 fi
 if [ ! -f native/icu-wasi/install/lib/libicuuc.a ]; then
     echo "== ICU wasi cross build (logs: native/icu-wasi/*.log)"
