@@ -1,0 +1,14 @@
+# Host-side build tools that mise can't pin (none are in its registry) and
+# that a stock macOS or a minimal Linux box doesn't have. Install with:
+#
+#   brew bundle --file=plugins/wolfssl/Brewfile
+#
+# On Debian/Ubuntu the equivalent is:
+#   apt install autoconf automake libtool build-essential
+#
+# wolfSSL's GitHub archive ships no generated ./configure, so build.sh runs
+# autogen.sh -> autoreconf once after extraction. That pulls in the full
+# autotools trio; libtool is what provides libtoolize/glibtoolize.
+brew "autoconf"
+brew "automake"
+brew "libtool"

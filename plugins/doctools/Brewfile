@@ -1,0 +1,12 @@
+# Host-side build tools that mise can't pin (none are in its registry) and
+# that a stock macOS or a minimal Linux box doesn't have. Install with:
+#
+#   brew bundle --file=plugins/doctools/Brewfile
+#
+# On Debian/Ubuntu the equivalent is:
+#   apt install texinfo
+#
+# TeX Live's native pass (build-tex.sh stage 2) is a full autotools build on
+# this machine, and its doc/ subdir regenerates tlbuild.info — makeinfo ships
+# in texinfo. build-aux/missing only *warns* about it, then make dies 127.
+brew "texinfo"

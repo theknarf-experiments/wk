@@ -89,6 +89,22 @@ case "$WASI_SDK" in
         ;;
 esac
 
+# TeX Live's native pass is a full autotools build on THIS machine, and its
+# doc/ subdir regenerates tlbuild.info — so texinfo is a hard requirement, not
+# the optional nicety build-aux/missing makes it sound like (it warns, then
+# make dies with error 127). None of these are in mise's registry.
+missing=""
+for tool in cc c++ make git curl patch perl makeinfo; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+done
+if [ -n "$missing" ]; then
+    echo "doctools: missing host tools:$missing" >&2
+    echo "  (makeinfo ships in texinfo)" >&2
+    echo "  brew:          brew bundle --file=plugins/doctools/Brewfile" >&2
+    echo "  Debian/Ubuntu: apt install build-essential git curl perl texinfo" >&2
+    exit 1
+fi
+
 # TeX Live source, pinned by commit (master has no useful tags on GitHub).
 TL_REPO="https://github.com/TeX-Live/texlive-source.git"
 TL_COMMIT="0e9787e9100b91502f39c5cbc7761738de07dc19"

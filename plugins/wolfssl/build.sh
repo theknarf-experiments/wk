@@ -65,9 +65,34 @@ WOLFSSL_VER=5.7.6
 SRC="wolfssl-$WOLFSSL_VER-stable"
 SYSROOT="$PWD/sysroot"
 
+# autogen.sh runs autoreconf, which is not in mise's registry — check up front
+# rather than let ./autogen.sh die on "autoreconf: not found".
+missing=""
+for tool in autoconf automake libtool make curl; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+done
+if [ -n "$missing" ]; then
+    echo "wolfssl/build.sh: missing host tools:$missing" >&2
+    echo "  (the GitHub archive ships no generated configure)" >&2
+    echo "  brew:          brew bundle --file=plugins/wolfssl/Brewfile" >&2
+    echo "  Debian/Ubuntu: apt install autoconf automake libtool build-essential" >&2
+    exit 1
+fi
+
 # No wasm-opt on the build PATH (curl's trick: the one on PATH can't parse the
 # exnref EH we emit and wasi-sdk's clang would run it as a post-link step).
-BUILD_PATH="$WASI_SDK/bin:/opt/homebrew/bin:/usr/bin:/bin"
+# Everything else on PATH has to survive — autoreconf shells out to autom4te,
+# autoheader, m4 and libtoolize, so a hardcoded list can't stand in for
+# wherever the autotools were installed.
+BUILD_PATH="$WASI_SDK/bin:$PATH"
+if WASM_OPT="$(command -v wasm-opt 2>/dev/null)"; then
+    WASM_OPT_DIR="$(cd "$(dirname "$WASM_OPT")" && pwd)"
+    BUILD_PATH="$(printf '%s' "$BUILD_PATH" | tr ':' '\n' \
+        | while IFS= read -r p; do
+              [ "$(cd "$p" 2>/dev/null && pwd)" = "$WASM_OPT_DIR" ] || printf '%s:' "$p"
+          done)"
+    BUILD_PATH="${BUILD_PATH%:}"
+fi
 
 if [ ! -d "$SRC" ]; then
     echo "fetching wolfSSL $WOLFSSL_VER..."
@@ -80,10 +105,12 @@ fi
 cd "$SRC"
 
 # The git archive has no ./configure; generate it once. macOS installs GNU
-# libtool's scripts under a g prefix.
+# libtool's scripts under a g prefix (glibtoolize) — Linux has the unprefixed
+# name, and forcing LIBTOOLIZE=glibtoolize there just makes autogen.sh fail.
 if [ ! -f configure ]; then
     echo "autoreconfing wolfSSL (git archive ships no configure)..."
-    env PATH="$BUILD_PATH" LIBTOOLIZE=glibtoolize ./autogen.sh
+    LIBTOOLIZE="$(command -v glibtoolize || command -v libtoolize)"
+    env PATH="$BUILD_PATH" LIBTOOLIZE="$LIBTOOLIZE" ./autogen.sh
 fi
 
 export CC="$WASI_SDK/bin/clang"

@@ -41,10 +41,36 @@ WLR_PATCHES=(
     0018-fix-random_bytes-failing-on-Windows.patch
 )
 
+# buildconf regenerates PHP's configure from scratch, so it needs the autotools
+# on this machine. None of them can be mise-pinned (they're not in the
+# registry), so check up front — buildconf's own failure is a wall of autoconf
+# text, and configure would then run against a stale script.
+missing=""
+for tool in autoconf bison re2c make patch curl; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+done
+if [ -n "$missing" ]; then
+    echo "php/build.sh: missing host tools:$missing" >&2
+    echo "  brew:          brew bundle --file=plugins/php/Brewfile" >&2
+    echo "  Debian/Ubuntu: apt install autoconf bison re2c build-essential" >&2
+    exit 1
+fi
+
 # wasi-sdk's clang runs an optional wasm-opt post-link step; the wasm-opt on PATH
 # can't parse the new exnref EH we emit, so run the build with a PATH that omits
-# it (kept consistent with the lua/sqlite plugins).
-BUILD_PATH="$WASI_SDK/bin:/usr/bin:/bin"
+# whichever entry provides it. Everything ELSE on PATH has to survive: buildconf
+# needs autoconf/bison/re2c, and a hardcoded /usr/bin:/bin can't see them when
+# they come from homebrew (macOS) or linuxbrew — which is why this used to end
+# with an appended /opt/homebrew/bin that only ever helped on a Mac.
+BUILD_PATH="$WASI_SDK/bin:$PATH"
+if WASM_OPT="$(command -v wasm-opt 2>/dev/null)"; then
+    WASM_OPT_DIR="$(cd "$(dirname "$WASM_OPT")" && pwd)"
+    BUILD_PATH="$(printf '%s' "$BUILD_PATH" | tr ':' '\n' \
+        | while IFS= read -r p; do
+              [ "$(cd "$p" 2>/dev/null && pwd)" = "$WASM_OPT_DIR" ] || printf '%s:' "$p"
+          done)"
+    BUILD_PATH="${BUILD_PATH%:}"
+fi
 
 if [ ! -d "$SRC" ]; then
     echo "fetching PHP $PHP_VER..."
@@ -108,7 +134,7 @@ cd "$SRC"
 # The patches touch configure.ac, so regenerate configure (release tarballs ship
 # a pre-generated one).
 if [ ! -f .buildconf-done ]; then
-    PATH="$BUILD_PATH:/opt/homebrew/bin" ./buildconf --force
+    PATH="$BUILD_PATH" ./buildconf --force
     touch .buildconf-done
 fi
 

@@ -1,0 +1,15 @@
+# Host-side build tools that mise can't pin (none are in its registry) and
+# that a stock macOS or a minimal Linux box doesn't have. Install with:
+#
+#   brew bundle --file=plugins/php/Brewfile
+#
+# On Debian/Ubuntu the equivalent is:
+#   apt install autoconf bison re2c build-essential
+#
+# PHP's ./buildconf --force regenerates configure from scratch (the release
+# tarball's generated files are stale once our patches land), which needs
+# autoconf >= 2.68; bison and re2c generate the Zend language parser and
+# lexer. All three run on THIS machine, not the wasm target.
+brew "autoconf"
+brew "bison"
+brew "re2c"
