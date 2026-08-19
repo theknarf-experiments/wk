@@ -1,3 +1,16 @@
 [toolchain]
-channel = "nightly"
+# Dated, not bare "nightly": the pre-commit hook gates on
+# `cargo clippy -D warnings`, so an undated channel means the gate changes
+# whenever rustc does. A fresh clone in Aug 2026 picked up
+# clippy::chunks_exact_to_as_chunks and failed on ~9 untouched call sites in
+# wk-server/client-local-ui — code that had never been edited. Bump this
+# deliberately (and fix what the new lints find) rather than by the calendar.
+# Note this is NOT bun's toolchain: plugins/bun/build.sh pins its own newer
+# nightly, because bun's source requires it.
+channel = "nightly-2026-04-10"
+# Every plugin cross-compiles to one of these, and rustup only ships the host
+# std by default — without them a fresh clone fails at "can't find crate for
+# `core`". wasip1 is what `cargo component build` targets, wasip2 what the
+# component-native plugins (python, bun) do.
+targets = ["wasm32-wasip1", "wasm32-wasip2"]
 
