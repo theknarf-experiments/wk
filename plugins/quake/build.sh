@@ -55,7 +55,12 @@ QSW_SHA256=d173e9f828b932a8160d4c65927281d0c28131cd922f0bf0d69e92a35185b499
 if [ ! -f pak0.pak ]; then
     echo "fetching Quake 1.06 shareware data..."
     curl -fsSL "$QSW_URL" -o quakesw.tar.gz
-    echo "$QSW_SHA256  quakesw.tar.gz" | shasum -a 256 -c -
+    # coreutils sha256sum on Linux, perl shasum on macOS — whichever exists
+    if command -v sha256sum >/dev/null 2>&1; then
+        echo "$QSW_SHA256  quakesw.tar.gz" | sha256sum -c -
+    else
+        echo "$QSW_SHA256  quakesw.tar.gz" | shasum -a 256 -c -
+    fi
     tar xzf quakesw.tar.gz id1/pak0.pak
     mv id1/pak0.pak pak0.pak
     rmdir id1

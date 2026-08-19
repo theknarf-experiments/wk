@@ -44,7 +44,12 @@ ADAPTER_SHA256="6a13fa0ed7af65de3468fd6172abcfe6bb74e0b7f3bd0ef06e72f51ee32bc2a2
 
 sha_check() {
     local file="$1" want="$2" got
-    got=$(shasum -a 256 "$file" | cut -d' ' -f1)
+    # coreutils sha256sum on Linux, perl shasum on macOS — whichever exists
+    if command -v sha256sum >/dev/null 2>&1; then
+        got=$(sha256sum "$file" | cut -d' ' -f1)
+    else
+        got=$(shasum -a 256 "$file" | cut -d' ' -f1)
+    fi
     if [ "$got" != "$want" ]; then
         echo "$file: sha256 mismatch" >&2
         echo "  want $want" >&2

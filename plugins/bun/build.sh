@@ -81,8 +81,10 @@ fi
 # sysroot by build-jsc.sh's stage step (never -L the sysroot itself: its
 # libc.a preempts rustc's and breaks the crt).
 if [ ! -f native/jsc-build/lib/libJavaScriptCore.a ]; then
-    echo "run ./build-jsc.sh first (JSC + ICU for wasi)" >&2
-    exit 1
+    echo "== JSC + ICU for wasi not built yet — running ./build-jsc.sh" >&2
+    echo "== (first run takes a long while: ICU host tools, ICU cross, then" >&2
+    echo "==  all of JavaScriptCore; the script is stage-resumable)" >&2
+    ./build-jsc.sh
 fi
 for lib in libc++.a libc++abi.a libsetjmp.a libwasi-emulated-getpid.a \
            libwasi-emulated-signal.a libwasi-emulated-mman.a \
