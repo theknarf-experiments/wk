@@ -1,0 +1,62 @@
+// vim: set filetype=kdl :
+// The node that reads its own passport — a live Biscuit-token inspector.
+// Run with:
+//
+//   wk run example/tokens.wk
+//
+// Every app node's effective capability token is published into its OWN
+// filesystem at /run/wk/token (hex-encoded Biscuit), refreshed on every
+// token change. The biscuit node reads that file and renders the decoded
+// datalog: the authority block's "use what you're wired to" rules, then one
+// block per attenuation, with `check if` lines highlighted — attenuations
+// are the story. Scroll with the wheel, Up/Down, PgUp/PgDn, Home/End.
+//
+// The live demo — watch the biscuit node while you type (it re-reads the
+// file about once a second; the border flashes when a new block lands):
+//
+//   wk -f example/tokens.wk token attenuate biscuit \
+//       'check if operation($k, $t, $a), $a != "write"'
+//   wk -f example/tokens.wk token reset biscuit      # undo
+//
+// The same move with teeth: bash has a volume mounted at /data, so
+//
+//   wk -f example/tokens.wk token attenuate bash \
+//       'check if operation($k, $t, $a), $a != "write"'
+// makes `echo hi > /data/notes.txt` in the bash terminal start failing
+// (host-enforced, the wire not the daemon), while `cat /data/notes.txt`
+// keeps working;
+//   wk -f example/tokens.wk token reset bash         # undo
+//
+// The inspector shows the biscuit node's OWN credential, so it is the
+// biscuit node you attenuate to change what it renders. Wires to/from the
+// biscuit node change what its token *grants* (and what the host lets it
+// do), so feel free to wire the volume into it too — then the bash
+// attenuation above has a twin you can watch land.
+//
+// Build the inspector first: `mise run build` in plugins/biscuit.
+// bash is a docker:// dep from workspace.wk (build it once with
+// `mise run build` in plugins/bash).
+import "../workspace.wk"
+workspace "01KTKDEM00000000000000WS00" {
+    node "biscuit" "01KTKDEM00000000000000BC01" {
+        pos 80.0 80.0
+        size 560.0 420.0
+    }
+    node "bash" "01KTKDEM00000000000000SH02" {
+        pos 700.0 80.0
+        size 560.0 340.0
+    }
+    volume "notes.txt" "01KTKDEM00000000000000V103" {
+        pos 700.0 480.0
+        size 220.0 120.0
+    }
+    note "01KTKDEM00000000000000NT04" {
+        text "The biscuit node renders its OWN\n/run/wk/token: block 0 is the minted\nauthority (wired => can_use), every\nattenuation appends a check block.\n\nWatch it live:\n  wk -f example/tokens.wk \\\n     token attenuate biscuit \\\n     'check if operation($k, $t, $a),\n      $a != \"write\"'\nThe border flashes as the block lands;\n`wk token reset biscuit` clears it.\n\nAttenuate bash the same way and\nwrites to /data go read-only —\nthe token is the policy."
+        pos 80.0 560.0
+        size 400.0 280.0
+    }
+    // The volume mounts into bash at /data: that wire is what bash's token
+    // authorizes (a `wired` fact meets `operation` facts), and what a
+    // read-only attenuation of bash visibly takes away.
+    connection "01KTKDEM00000000000000V103" "01KTKDEM00000000000000SH02" "/data"
+}

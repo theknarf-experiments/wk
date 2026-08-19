@@ -15,6 +15,9 @@ dependencies {
     paint "plugins/paint/target/wasm32-wasip1/debug/paint.wasm" {
         description "self-driving animated gradient canvas"
     }
+    biscuit "plugins/biscuit/target/wasm32-wasip1/debug/biscuit.wasm" {
+        description "live Biscuit-token inspector: renders this node's own /run/wk/token, updating as it is attenuated"
+    }
     file_demo "plugins/file-demo/target/wasm32-wasip1/debug/file_demo.wasm" {
         description "shows the file node wired into it"
     }

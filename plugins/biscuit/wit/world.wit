@@ -1,0 +1,14 @@
+package wk:biscuit;
+
+/// A live Biscuit-token inspector: the node reads its OWN effective capability
+/// token — the host publishes it (hex-encoded) into the node's filesystem at
+/// /run/wk/token, refreshed on every token change — and renders the decoded
+/// datalog on a wasi-gfx surface. Attenuate the node and watch the check
+/// block appear.
+world biscuit {
+    import wasi:surface/surface@0.0.2;
+    import wasi:graphics-context/graphics-context@0.0.1;
+    import wasi:frame-buffer/frame-buffer@0.0.1;
+
+    export run: func();
+}

@@ -4371,4 +4371,144 @@ mod tests {
             "notes.pdf does not look like a PDF"
         );
     }
+
+    /// The biscuit inspector (plugins/biscuit) end to end: a node reading its
+    /// OWN capability token. The test mints a REAL credential the way wk does
+    /// at startup — wk-token-service's node base token, whose authority block
+    /// carries the wiring rule — publishes it hex-encoded at the path the
+    /// server's `write_token_file` uses (`/run/wk/token` in the node's vfs),
+    /// and pumps frames headless like the gfx-smoke test until the guest
+    /// renders it. Then the live half: overwrite the file with a holder-side
+    /// attenuated token (an appended `check if` block, exactly what `wk token
+    /// attenuate` produces) and require the picture to change within the
+    /// guest's ~1s re-read interval — the new block landing on the canvas.
+    /// Skipped when the artifact isn't built.
+    #[test]
+    fn biscuit_inspector_renders_own_token_and_tracks_attenuation() {
+        let wasm = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../plugins/biscuit/target/wasm32-wasip1/debug/biscuit.wasm");
+        if !wasm.exists() {
+            eprintln!("skipping: build plugins/biscuit first (mise run build)");
+            return;
+        }
+
+        // The real minting authority: the same base token every wk app node
+        // holds (authority rule: use what you're wired to, in every mode).
+        let svc = wk_token_service::TokenService::new();
+        let base = svc.mint_node_base().expect("mint the node base token");
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let surfaces: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        host.spawn(
+            &wasm,
+            "biscuit",
+            id,
+            &[],
+            surfaces.clone(),
+            nodes.clone(),
+            Vec::new(),
+            None,
+        )
+        .expect("spawn");
+
+        // The node registers synchronously; publish the token before the
+        // (much slower) background compile lets the guest run — playing the
+        // server's `write_token_file` role, same path, same hex encoding.
+        let node = nodes
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|n| n.id == id)
+            .cloned()
+            .expect("node registered");
+        node.fs.lock().unwrap().put_file_at(
+            "run/wk/token",
+            crate::workspace::bytes_hex(&base).into_bytes(),
+        );
+
+        let surface = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                if let Some(s) = surfaces.lock().unwrap().first().cloned() {
+                    break s;
+                }
+                assert!(
+                    !node.finished.load(Ordering::Relaxed),
+                    "biscuit exited before opening a surface"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "biscuit never opened a surface"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        let pump_frame = || {
+            let mut s = surface.lock().unwrap();
+            s.frame_ready = true;
+            s.wake();
+        };
+
+        // The decoded datalog on the dark background: a non-uniform frame.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            let s = surface.lock().unwrap();
+            let non_uniform = s.pixels.chunks_exact(4).any(|px| px != &s.pixels[0..4]);
+            if non_uniform {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "biscuit never painted its token view"
+            );
+        }
+
+        // The view is static between token changes — snapshot it, then
+        // refresh the published file with an attenuated token: an appended
+        // check block, holder-side (no signing key), `wk token attenuate`'s
+        // exact move.
+        let before: Vec<u8> = surface.lock().unwrap().pixels.clone();
+        let attenuated = biscuit_auth::UnverifiedBiscuit::from(&base)
+            .expect("reparse the minted token")
+            .append(
+                biscuit_auth::builder::BlockBuilder::new()
+                    .code(r#"check if operation($k, $t, $a), $a != "write";"#)
+                    .expect("attenuation block"),
+            )
+            .expect("append")
+            .to_vec()
+            .expect("serialize");
+        node.fs.lock().unwrap().put_file_at(
+            "run/wk/token",
+            crate::workspace::bytes_hex(&attenuated).into_bytes(),
+        );
+
+        // The guest re-reads the file about once a second of pumped frames;
+        // the new block (and its update flash) must repaint the canvas.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            let s = surface.lock().unwrap();
+            if s.pixels != before {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "biscuit never re-rendered after the token was attenuated"
+            );
+        }
+
+        // Shut down: close the surface and trip the kill switch.
+        {
+            let mut s = surface.lock().unwrap();
+            s.closed = true;
+            s.wake();
+        }
+        node.kill.store(true, Ordering::Relaxed);
+    }
 }

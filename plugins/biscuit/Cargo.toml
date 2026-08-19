@@ -1,0 +1,34 @@
+[package]
+name = "biscuit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+# The same crate (and version) wk's token service mints with; the guest only
+# inspects, so `UnverifiedBiscuit` (no root public key needed) is the entry.
+# Default features stay on: 6.0.0 does not build with them off (its builder
+# module unconditionally imports datalog-macro items).
+biscuit-auth = "6.0"
+# Public-domain 8x8 bitmap font for the software text renderer.
+font8x8 = "0.3"
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.component]
+package = "wk:biscuit"
+
+[package.metadata.component.dependencies]
+
+[package.metadata.component.target.dependencies]
+"wasi:surface" = { path = "wit/deps/wasi-surface" }
+"wasi:graphics-context" = { path = "wit/deps/wasi-graphics-context" }
+"wasi:frame-buffer" = { path = "wit/deps/wasi-frame-buffer" }
+"wasi:io" = { path = "wit/deps/wasi-io" }
+
+# Upstream biscuit-auth 6.0.0 does not compile for plain wasm32 targets (its
+# Instant shim is browser-only); vendor/biscuit-auth is the same source with
+# the shim feature-gated. See vendor/biscuit-auth/Cargo.toml.
+[patch.crates-io]
+biscuit-auth = { path = "vendor/biscuit-auth" }
