@@ -135,6 +135,10 @@ const API_BG: [f32; 4] = [0.08, 0.16, 0.22, 1.0];
 const API_BORDER: [f32; 4] = [0.30, 0.75, 0.90, 1.0];
 const MIDI_BG: [f32; 4] = [0.10, 0.20, 0.13, 1.0];
 const MIDI_BORDER: [f32; 4] = [0.35, 0.75, 0.45, 1.0];
+/// HostService nodes: teal chrome (a host service published into a Network —
+/// the reverse of a HostPort).
+const HOSTSVC_BG: [f32; 4] = [0.07, 0.19, 0.18, 1.0];
+const HOSTSVC_BORDER: [f32; 4] = [0.25, 0.80, 0.70, 1.0];
 
 /// Note nodes: a warm yellow sticky, dark text, for annotations.
 const NOTE_BG: [f32; 4] = [0.93, 0.86, 0.42, 1.0];
@@ -474,8 +478,8 @@ impl App {
             one(Serve, In) // apps serve to a HostPort
         } else if v.net_nodes.contains(&id) {
             one(Net, In) // members join a Network
-        } else if v.uplinks.contains_key(&id) {
-            one(Net, Out) // an uplink dials into a Network
+        } else if v.uplinks.contains_key(&id) || v.host_services.contains_key(&id) {
+            one(Net, Out) // an uplink dials into (a host service publishes into) a Network
         } else if v.capture_feeds.contains_key(&id) {
             one(Capture, Out) // a Capture node grants apps
         } else if v.api_nodes.contains(&id) {
@@ -1030,6 +1034,11 @@ impl App {
             PaletteCmd::AddMidiIn,
         ));
         v.push(PaletteRow::new(
+            "Add Host Service",
+            d("publish a host TCP service into a Network (the reverse of a HostPort)"),
+            PaletteCmd::AddHostService,
+        ));
+        v.push(PaletteRow::new(
             "New Workspace  (Cmd+T)",
             None,
             PaletteCmd::NewWorkspace,
@@ -1101,6 +1110,8 @@ impl App {
             u.kind.label().to_lowercase()
         } else if self.view.midi_ins.contains_key(&id) {
             "midi in".into()
+        } else if let Some(svc) = self.view.host_services.get(&id) {
+            svc.name.clone()
         } else {
             "node".into()
         }
@@ -1359,6 +1370,14 @@ impl App {
                 let pos = self.view_center([FILE_W, FILE_H], self.view.midi_ins.len());
                 self.conn.send(Command::Create(Resource::Node {
                     kind: NodeKind::MidiIn,
+                    pos,
+                    ws,
+                }));
+            }
+            PaletteCmd::AddHostService => {
+                let pos = self.view_center([FILE_W, FILE_H], self.view.host_services.len());
+                self.conn.send(Command::Create(Resource::Node {
+                    kind: NodeKind::HostService,
                     pos,
                     ws,
                 }));
@@ -2318,6 +2337,21 @@ impl App {
                     "MIDI in".to_string(),
                     TEXT,
                     status,
+                    status_col,
+                ))
+            } else if let Some(svc) = self.view.host_services.get(&id) {
+                let wired = self.view.net_links.iter().any(|&(s, _)| s == id);
+                let status_col = if wired {
+                    [0.45, 0.85, 0.75, 1.0]
+                } else {
+                    [0.55, 0.7, 0.68, 1.0]
+                };
+                Some(Chrome(
+                    HOSTSVC_BORDER,
+                    HOSTSVC_BG,
+                    svc.name.clone(),
+                    TEXT,
+                    format!("→ {}", svc.target),
                     status_col,
                 ))
             } else {
@@ -4282,6 +4316,39 @@ impl App {
                         border: MIDI_BORDER,
                         bg: MIDI_BG,
                         title: "MIDI in",
+                        title_col: TEXT,
+                        status: &status,
+                        status_col,
+                        status_scale: 0.7,
+                    },
+                );
+                continue;
+            }
+
+            // A HostService node: a capability widget whose status shows the
+            // host target its fabric name bridges to.
+            if let Some(svc) = self.view.host_services.get(&id).cloned() {
+                let wired = self.view.net_links.iter().any(|&(s, _)| s == id);
+                let status = format!("→ {}", svc.target);
+                let status_col = if wired {
+                    [0.45, 0.85, 0.75, 1.0]
+                } else {
+                    [0.55, 0.7, 0.68, 1.0]
+                };
+                self.draw_widget(
+                    &mut quads,
+                    &mut gfx,
+                    white,
+                    zf,
+                    mp,
+                    clip,
+                    full,
+                    WidgetChrome {
+                        id,
+                        r,
+                        border: HOSTSVC_BORDER,
+                        bg: HOSTSVC_BG,
+                        title: &svc.name,
                         title_col: TEXT,
                         status: &status,
                         status_col,

@@ -7,10 +7,12 @@
 //! this to put the wk API on a node's network (`wk-api`'s `serve_client` on
 //! the other end of the pair).
 //!
-//! Only the followed node itself may connect: an accepted connection whose
-//! source address isn't the node's fabric address is dropped (on a shared
-//! Network the endpoint would otherwise act with the wired node's authority
-//! for whoever dials it — a confused deputy).
+//! [`listen`] follows one node, and only that node may connect: an accepted
+//! connection whose source address isn't the node's fabric address is dropped
+//! (on a shared Network the endpoint would otherwise act with the wired
+//! node's authority for whoever dials it — a confused deputy). [`listen_net`]
+//! instead joins a network itself and accepts any member — for endpoints that
+//! carry no caller authority, like a HostService bridging a host TCP service.
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -51,7 +53,39 @@ pub fn listen(
     kill: Arc<AtomicBool>,
     on_conn: Arc<dyn Fn(UnixStream) + Send + Sync>,
 ) {
-    let net = follow.lock().unwrap().net;
+    listen_impl(hub, Some(follow), None, name, port, kill, on_conn)
+}
+
+/// Listen on the fabric as a named peer of the network `net` itself, accepting
+/// connections from *any* member. The scope-wide accept is deliberate — this
+/// is for endpoints that carry no caller authority (a HostService bridging a
+/// plain TCP service), unlike the Api listener, whose per-node allow-list
+/// exists because its connections act with the wired node's token.
+pub fn listen_net(
+    hub: Arc<NetHub>,
+    net: wk_protocol::NodeId,
+    name: &str,
+    port: u16,
+    kill: Arc<AtomicBool>,
+    on_conn: Arc<dyn Fn(UnixStream) + Send + Sync>,
+) {
+    listen_impl(hub, None, Some(net), name, port, kill, on_conn)
+}
+
+fn listen_impl(
+    hub: Arc<NetHub>,
+    follow: Option<SharedStack>,
+    fixed_net: Option<wk_protocol::NodeId>,
+    name: &str,
+    port: u16,
+    kill: Arc<AtomicBool>,
+    on_conn: Arc<dyn Fn(UnixStream) + Send + Sync>,
+) {
+    let net = match (&follow, fixed_net) {
+        (Some(f), _) => f.lock().unwrap().net,
+        (None, Some(n)) => n,
+        (None, None) => unreachable!("listen_impl needs a follow stack or a net"),
+    };
     let bridge = hub.attach(net, hub.alloc_ip(3), name);
     // Bind before returning, like TcpListener::bind: if the sockets were
     // created inside the accept thread, a caller that resolves the name and
@@ -75,15 +109,19 @@ pub fn listen(
                 // arrive back-to-back, which is what a backlog is for).
                 let mut backlog = initial_backlog;
                 while !kill.load(Ordering::Relaxed) {
-                    // Follow the node's current network.
-                    let net = follow.lock().unwrap().net;
-                    if bridge.lock().unwrap().net != net {
-                        bridge.lock().unwrap().net = net;
+                    // Follow the node's current network (fixed-net listeners
+                    // stay where they were attached).
+                    if let Some(follow) = &follow {
+                        let net = follow.lock().unwrap().net;
+                        if bridge.lock().unwrap().net != net {
+                            bridge.lock().unwrap().net = net;
+                        }
                     }
-                    let (allowed4, allowed6) = {
-                        let f = follow.lock().unwrap();
+                    // `None` = any member of the net may connect.
+                    let allowed = follow.as_ref().map(|f| {
+                        let f = f.lock().unwrap();
                         (IpAddress::from(f.ip), IpAddress::from(f.ip6))
-                    };
+                    });
                     // Collect whatever moved past the handshake this round.
                     let mut accepted: Vec<smoltcp::iface::SocketHandle> = Vec::new();
                     let mut idle = true;
@@ -94,9 +132,12 @@ pub fn listen(
                             match s.state() {
                                 tcp::State::Listen | tcp::State::SynReceived => true,
                                 _ => {
-                                    let peer_ok = s.remote_endpoint().is_some_and(|ep| {
-                                        ep.addr == allowed4 || ep.addr == allowed6
-                                    });
+                                    let peer_ok = match allowed {
+                                        None => true,
+                                        Some((a4, a6)) => s
+                                            .remote_endpoint()
+                                            .is_some_and(|ep| ep.addr == a4 || ep.addr == a6),
+                                    };
                                     if peer_ok {
                                         accepted.push(h);
                                     } else {
@@ -363,6 +404,65 @@ mod tests {
             rx.recv_timeout(Duration::from_millis(200)).is_err(),
             "no connection surfaced for the stranger"
         );
+
+        kill.store(true, Ordering::Relaxed);
+    }
+
+    /// A net-scoped listener accepts any member of the net — both nodes'
+    /// connections surface as socketpair ends.
+    #[test]
+    fn net_listener_accepts_any_member() {
+        let hub = NetHub::new();
+        let net = NodeId::nil();
+        let a = hub.attach(net, Ipv4Address::new(10, 0, 0, 2), "a");
+        let b = hub.attach(net, Ipv4Address::new(10, 0, 0, 4), "b");
+
+        let kill = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<UnixStream>();
+        listen_net(
+            hub.clone(),
+            net,
+            "svc",
+            9000,
+            kill.clone(),
+            Arc::new(move |s| {
+                let _ = tx.send(s);
+            }),
+        );
+
+        let svc_ip = hub.resolve(net, "svc").expect("svc resolves on the net");
+        let dial = |from: &SharedStack, lp: u16| {
+            let mut g = from.lock().unwrap();
+            let h = g.sockets.add(tcp_socket());
+            let _gen = g.track(h);
+            let crate::netstack::NodeStack { iface, sockets, .. } = &mut *g;
+            sockets
+                .get_mut::<tcp::Socket>(h)
+                .connect(iface.context(), (IpAddress::from(svc_ip), 9000), lp)
+                .unwrap();
+            h
+        };
+
+        for (stack, lp) in [(&a, 51001u16), (&b, 51002)] {
+            let h = dial(stack, lp);
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut ok = false;
+            while std::time::Instant::now() < deadline {
+                {
+                    let mut g = stack.lock().unwrap();
+                    if g.sockets.get_mut::<tcp::Socket>(h).may_send() {
+                        ok = true;
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(ok, "member's connection establishes");
+            assert!(
+                rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+                "connection surfaced for the member"
+            );
+        }
 
         kill.store(true, Ordering::Relaxed);
     }

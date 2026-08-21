@@ -363,6 +363,9 @@ pub enum SnapKind {
     /// A hardware MIDI input node: the host opens the named device (empty = the
     /// first available) and routes its messages to the apps it's wired to.
     MidiIn { device: String },
+    /// A host TCP service published into the Network it's wired to, as fabric
+    /// peer `name`; connections bridge to the host `target` (`addr:port`).
+    HostService { name: String, target: String },
 }
 
 /// Hex-encode an uplink secret for persistence.
@@ -877,7 +880,7 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
     // `<kind> <id>`.
     let named = matches!(
         n.name().value(),
-        "node" | "volume" | "virtualfile" | "bindmount" | "hostfile" | "midiin"
+        "node" | "volume" | "virtualfile" | "bindmount" | "hostfile" | "midiin" | "hostservice"
     );
     let id = node_id(n.get(if named { 1 } else { 0 })?)?;
     let ch = n.children()?;
@@ -942,6 +945,12 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
                 .unwrap_or("")
                 .to_string(),
         },
+        // The fabric name leads (like an app's dependency name); the host
+        // target is a child so the line reads `hostservice "subduction" <id>`.
+        "hostservice" => SnapKind::HostService {
+            name: n.get(0)?.as_string()?.to_string(),
+            target: text("target")?,
+        },
         "network" => SnapKind::Net { gateway: false },
         "gateway" => SnapKind::Net { gateway: true },
         "iroh" => SnapKind::Iroh {
@@ -988,6 +997,7 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         SnapKind::Capture => "capture",
         SnapKind::Api => "api",
         SnapKind::MidiIn { .. } => "midiin",
+        SnapKind::HostService { .. } => "hostservice",
     };
     let mut node = KdlNode::new(name);
     // Named kinds lead with the name (or note text), then the id.
@@ -1000,6 +1010,9 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         }
         SnapKind::MidiIn { device } => {
             node.push(str_entry(device));
+        }
+        SnapKind::HostService { name, .. } => {
+            node.push(str_entry(name));
         }
         _ => {}
     }
@@ -1026,6 +1039,7 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
             ch.nodes_mut().push(p);
         }
         SnapKind::Note { text } => child_str("text", text),
+        SnapKind::HostService { target, .. } => child_str("target", target),
         // Only a persisted volume writes the flag; the default is ephemeral.
         SnapKind::Volume { persist: true, .. } => {
             let mut p = KdlNode::new("persist");
@@ -1911,6 +1925,8 @@ mod tests {
             value_str().prop_map(|text| SnapKind::Note { text }),
             Just(SnapKind::Capture),
             Just(SnapKind::Api),
+            (value_str(), value_str())
+                .prop_map(|(name, target)| SnapKind::HostService { name, target }),
         ]
     }
 

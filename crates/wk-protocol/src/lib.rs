@@ -152,6 +152,11 @@ pub enum NodeKind {
     /// and routes its messages to the app nodes it's wired to (a MIDI source,
     /// like the piano plugin).
     MidiIn,
+    /// A host TCP service published into a Network: the reverse of a HostPort.
+    /// Wired to a Network, it joins the fabric as a named peer; members dial
+    /// `name:port` and the connection is bridged to the host address it
+    /// targets (e.g. a server in a Docker container on host localhost).
+    HostService,
 }
 
 /// A resource to create.
@@ -219,6 +224,12 @@ pub struct NodePatch {
     /// Toggle a Volume node's persistence (bytes saved to a sidecar and
     /// restored on load) (requires `Update`).
     pub persist: Option<bool>,
+    /// Set a HostService's fabric name — what members of its Network dial
+    /// (requires `Update`).
+    pub service_name: Option<String>,
+    /// Point a HostService at a host `addr:port` (e.g. `127.0.0.1:8080`); the
+    /// fabric side listens on the same port (requires `Update`).
+    pub service_target: Option<String>,
 }
 
 /// A mutation a client asks the server to perform: create/update/delete on a

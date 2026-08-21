@@ -522,6 +522,7 @@ fn kind_label(kind: NodeKind) -> &'static str {
         NodeKind::Capture => "capture",
         NodeKind::Api => "api",
         NodeKind::MidiIn => "midiin",
+        NodeKind::HostService => "hostservice",
     }
 }
 
@@ -590,6 +591,18 @@ pub fn create(
             persist: Some(true),
             ..Default::default()
         },
+        // `<name>=<addr:port>` sets both; a bare `addr:port` just the target.
+        NodeKind::HostService => match value.map(|v| match v.split_once('=') {
+            Some((name, target)) => (Some(name.to_string()), target.to_string()),
+            None => (None, v.to_string()),
+        }) {
+            Some((name, target)) => NodePatch {
+                service_name: name,
+                service_target: Some(target),
+                ..Default::default()
+            },
+            None => NodePatch::default(),
+        },
         _ => NodePatch::default(),
     };
     // Only send a follow-up if there's actually something to configure.
@@ -610,6 +623,8 @@ fn is_empty_patch(p: &NodePatch) -> bool {
         && p.text.is_none()
         && p.pos.is_none()
         && p.size.is_none()
+        && p.service_name.is_none()
+        && p.service_target.is_none()
 }
 
 /// `wk mount <volume> <app> [path]`: set where a volume bind mounts inside an

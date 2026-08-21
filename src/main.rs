@@ -237,6 +237,9 @@ enum CreateKind {
     /// A hardware MIDI input node (value = device name; omit for the default)
     Midi,
     Note,
+    /// A host TCP service published into a Network (value = `<name>=<addr:port>`,
+    /// e.g. `subduction=127.0.0.1:8080`; a bare `addr:port` keeps the default name)
+    Hostservice,
 }
 
 impl CreateKind {
@@ -253,6 +256,7 @@ impl CreateKind {
             CreateKind::Api => NodeKind::Api,
             CreateKind::Midi => NodeKind::MidiIn,
             CreateKind::Note => NodeKind::Note,
+            CreateKind::Hostservice => NodeKind::HostService,
         }
     }
 }

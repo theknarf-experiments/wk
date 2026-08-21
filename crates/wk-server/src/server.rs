@@ -183,6 +183,9 @@ pub struct View {
     /// MidiIn nodes (canvas id -> the resolved/target device name), for the UI
     /// to label them.
     pub midi_ins: HashMap<NodeId, String>,
+    /// HostService nodes (canvas id -> fabric name + host target), for the UI
+    /// to label and edit them.
+    pub host_services: HashMap<NodeId, HostService>,
     pub net_nodes: HashSet<NodeId>,
     pub gateways: HashSet<NodeId>,
     pub uplinks: HashMap<NodeId, UplinkMeta>,
@@ -225,6 +228,52 @@ pub struct View {
     pub node_ws: HashMap<NodeId, NodeId>,
     /// The workspaces (tabs), in order.
     pub workspaces: Vec<NodeId>,
+}
+
+/// Bridge one accepted fabric connection to the host service at `target`:
+/// dial it, then splice bytes both ways until either side closes. Each
+/// direction gets its own thread (blocking `io::copy`), with a half-close
+/// (`shutdown(Write)`) propagating EOF so protocols that close one way first
+/// — an HTTP client done sending, a WebSocket FIN — behave as they would on a
+/// real network. A dead or refusing target just drops the fabric connection,
+/// which the guest sees as ECONNRESET.
+fn bridge_to_host(stream: std::os::unix::net::UnixStream, target: String) {
+    std::thread::Builder::new()
+        .name("wk-hostsvc-bridge".into())
+        .spawn(move || {
+            use std::net::{Shutdown, TcpStream};
+            let Ok(host) = TcpStream::connect_timeout(
+                &match target.parse() {
+                    Ok(addr) => addr,
+                    Err(_) => {
+                        // Not a literal addr:port — resolve it (allows
+                        // `localhost:8080` and LAN hostnames).
+                        use std::net::ToSocketAddrs;
+                        match target.to_socket_addrs().ok().and_then(|mut a| a.next()) {
+                            Some(addr) => addr,
+                            None => return,
+                        }
+                    }
+                },
+                std::time::Duration::from_secs(10),
+            ) else {
+                return;
+            };
+            let _ = host.set_nodelay(true);
+            let (Ok(mut host_rd), Ok(mut fab_rd)) = (host.try_clone(), stream.try_clone()) else {
+                return;
+            };
+            let mut host_wr = host;
+            let mut fab_wr = stream;
+            let up = std::thread::spawn(move || {
+                let _ = std::io::copy(&mut fab_rd, &mut host_wr);
+                let _ = host_wr.shutdown(Shutdown::Write);
+            });
+            let _ = std::io::copy(&mut host_rd, &mut fab_wr);
+            let _ = fab_wr.shutdown(Shutdown::Write);
+            let _ = up.join();
+        })
+        .expect("spawn hostsvc bridge thread");
 }
 
 /// Keep the entries of an id-keyed map whose key satisfies `keep`.
@@ -287,6 +336,7 @@ impl View {
             host_ports: keep_map(&self.host_ports, mine),
             notes: keep_map(&self.notes, mine),
             midi_ins: keep_map(&self.midi_ins, mine),
+            host_services: keep_map(&self.host_services, mine),
             net_nodes: keep_set(&self.net_nodes, mine),
             gateways: keep_set(&self.gateways, mine),
             uplinks: keep_map(&self.uplinks, mine),
@@ -443,6 +493,10 @@ pub enum Kind {
     /// A hardware MIDI input node: the host opens a physical MIDI device and
     /// routes its messages to the app nodes it's wired to (a MIDI source).
     MidiIn,
+    /// A host TCP service published into a Network as a named fabric peer —
+    /// the reverse of a HostPort (fabric-dialable host service, not
+    /// host-dialable fabric service).
+    HostService,
 }
 
 impl Kind {
@@ -489,6 +543,10 @@ pub struct Graph {
     /// MidiIn nodes' target device name (canvas id -> device; empty = default),
     /// persisted so the node reconnects to the same hardware on reload.
     pub midi_ins: HashMap<NodeId, String>,
+    /// HostService nodes: the fabric name members dial and the host
+    /// `addr:port` the connection bridges to. The fabric side listens on the
+    /// target's port.
+    pub host_services: HashMap<NodeId, HostService>,
 
     /// Volume binds as (volume id, app node id).
     pub connections: Vec<(NodeId, NodeId)>,
@@ -529,6 +587,27 @@ pub struct Graph {
     pub available: Vec<Dependency>,
 }
 
+/// A HostService node's configuration: a host TCP service published into a
+/// Network as a named fabric peer. `target` is the host `addr:port` bridged
+/// to; the fabric listener uses the target's port, so `name:port` inside the
+/// net mirrors the host service one-to-one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HostService {
+    /// The fabric name members of the Network dial.
+    pub name: String,
+    /// The host `addr:port` each accepted connection is bridged to.
+    pub target: String,
+}
+
+impl HostService {
+    /// The TCP port of `target` — also the fabric listen port. `None` when
+    /// the target does not parse, which the reconciler treats as "not ready"
+    /// rather than an error.
+    pub fn port(&self) -> Option<u16> {
+        self.target.rsplit_once(':')?.1.parse().ok()
+    }
+}
+
 /// Serves one accepted fabric API connection: `(stream, token)` — the
 /// connection's socketpair end and the wired node's capability token. The
 /// runtime installs this (it closes over `wk-api`'s `serve_client`, which
@@ -564,6 +643,11 @@ pub struct Server {
     /// token allows the wire; a token swap restarts the endpoint so new
     /// connections carry the new token. Reconciled by `sync_apis`.
     api_serves: HashMap<NodeId, (NodeId, Arc<AtomicBool>, u64)>,
+    /// Running HostService fabric listeners: service node id -> (kill switch,
+    /// fingerprint of the (net, name, target) it was started with). A subset
+    /// of `graph.net_links`; any config or wiring change restarts the
+    /// listener. Reconciled by `sync_host_services`.
+    host_service_serves: HashMap<NodeId, (Arc<AtomicBool>, u64)>,
     /// The installed API connection server (see [`ApiConnServer`]); `None`
     /// until the runtime injects it (headless embedding without wk-api simply
     /// starts no endpoints).
@@ -664,6 +748,7 @@ impl Server {
             routed: HashSet::new(),
             serves: HashMap::new(),
             api_serves: HashMap::new(),
+            host_service_serves: HashMap::new(),
             api_conn_server: None,
             pending_run: HashSet::new(),
             port_errors: HashMap::new(),
@@ -921,6 +1006,21 @@ impl Server {
         self.place(id, Kind::Api, ws, pos, [FILE_W, FILE_H]);
     }
 
+    /// Add a HostService node — a host TCP service published into whatever
+    /// Network it gets wired to. Defaults target the usual dev server port;
+    /// both fields are editable in place.
+    fn add_host_service(&mut self, pos: [f32; 2], ws: NodeId) {
+        let id = self.alloc_id();
+        self.place(id, Kind::HostService, ws, pos, [FILE_W, FILE_H]);
+        self.graph.host_services.insert(
+            id,
+            HostService {
+                name: "host".to_string(),
+                target: "127.0.0.1:8080".to_string(),
+            },
+        );
+    }
+
     /// Add a hardware MIDI input node, opening the first available device now.
     fn add_midi_in_node(&mut self, pos: [f32; 2], ws: NodeId) {
         let id = self.alloc_id();
@@ -1121,6 +1221,12 @@ impl Server {
             Some(Kind::Capture) => self.remove_capture_node(id),
             Some(Kind::Api) => self.remove_api_node(id),
             Some(Kind::MidiIn) => self.remove_midi_in_node(id),
+            // Its net wire lives in net_links with the service as the "member"
+            // side; forget() kills the listener and drops the config.
+            Some(Kind::HostService) => {
+                self.graph.net_links.retain(|&(svc, _)| svc != id);
+                self.forget(id);
+            }
             None => {}
         }
     }
@@ -1361,6 +1467,7 @@ impl Server {
             Some(Kind::Capture) => NodeClass::Capture,
             Some(Kind::Api) => NodeClass::Api,
             Some(Kind::MidiIn) => NodeClass::MidiSource,
+            Some(Kind::HostService) => NodeClass::HostSvc,
             Some(Kind::App) | Some(Kind::Note) | None => NodeClass::Other,
         }
     }
@@ -1648,6 +1755,68 @@ impl Server {
                 on_conn,
             );
             self.api_serves.insert(app, (api, kill, fp));
+        }
+    }
+
+    /// Reconcile HostService fabric listeners against the desired wiring: one
+    /// named listener on the wired Network per service node, each accepted
+    /// connection bridged to the node's host `addr:port`. Mirrors `sync_apis`
+    /// (desired-set diff, kill-switch teardown, fingerprint restart), but
+    /// scoped to a *network* rather than following one node — any member may
+    /// dial, because the endpoint carries no caller authority.
+    fn sync_host_services(&mut self) {
+        use std::hash::{Hash, Hasher};
+        let mut desired: HashMap<NodeId, (NodeId, u64, HostService)> = HashMap::new();
+        for &(svc, net) in &self.graph.net_links {
+            let Some(cfg) = self.graph.host_services.get(&svc) else {
+                continue; // not a HostService wire
+            };
+            if cfg.port().is_none() {
+                continue; // target doesn't parse yet — nothing to publish
+            }
+            let fp = {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                net.hash(&mut h);
+                cfg.name.hash(&mut h);
+                cfg.target.hash(&mut h);
+                h.finish()
+            };
+            desired.insert(svc, (net, fp, cfg.clone()));
+        }
+        let stale: Vec<NodeId> = self
+            .host_service_serves
+            .iter()
+            .filter(|(svc, (_, fp))| {
+                desired
+                    .get(svc)
+                    .map(|(_, dfp, _)| dfp != fp)
+                    .unwrap_or(true)
+            })
+            .map(|(&svc, _)| svc)
+            .collect();
+        for svc in stale {
+            if let Some((kill, _)) = self.host_service_serves.remove(&svc) {
+                kill.store(true, Ordering::Relaxed);
+            }
+        }
+        for (svc, (net, fp, cfg)) in desired {
+            if self.host_service_serves.contains_key(&svc) {
+                continue;
+            }
+            let port = cfg.port().expect("filtered above");
+            let target = cfg.target.clone();
+            let kill = Arc::new(AtomicBool::new(false));
+            let on_conn: Arc<dyn Fn(std::os::unix::net::UnixStream) + Send + Sync> =
+                Arc::new(move |stream| bridge_to_host(stream, target.clone()));
+            wk_fabric::listen::listen_net(
+                self.host.hub(),
+                net,
+                &cfg.name,
+                port,
+                kill.clone(),
+                on_conn,
+            );
+            self.host_service_serves.insert(svc, (kill, fp));
         }
     }
 
@@ -2197,6 +2366,10 @@ impl Server {
         self.graph.iroh_secrets.remove(&id);
         self.graph.veilid_ids.remove(&id);
         self.graph.note_text.remove(&id);
+        self.graph.host_services.remove(&id);
+        if let Some((kill, _)) = self.host_service_serves.remove(&id) {
+            kill.store(true, Ordering::Relaxed);
+        }
         self.auth_cache.retain(|&(n, _, _, _), _| n != id);
     }
 
@@ -2282,6 +2455,7 @@ impl Server {
         self.sync_exec();
         self.sync_serves();
         self.sync_apis();
+        self.sync_host_services();
     }
 
     /// Kill a node and drop everything referencing it (its wiring, geometry, and
@@ -2596,6 +2770,7 @@ impl Server {
                 NodeKind::Capture => self.add_capture_node(pos, ws),
                 NodeKind::Api => self.add_api_node(pos, ws),
                 NodeKind::MidiIn => self.add_midi_in_node(pos, ws),
+                NodeKind::HostService => self.add_host_service(pos, ws),
             },
             // Create is create only: a wire that already exists is left alone
             // (removal is Delete, so a create-only token can never disconnect).
@@ -2637,6 +2812,19 @@ impl Server {
                 }
                 if let Some(device) = patch.midi_device {
                     self.set_midi_device(id, device);
+                }
+                if let Some(name) = patch.service_name {
+                    if let Some(svc) = self.graph.host_services.get_mut(&id) {
+                        let name = name.trim();
+                        if !name.is_empty() {
+                            svc.name = name.to_string();
+                        }
+                    }
+                }
+                if let Some(target) = patch.service_target {
+                    if let Some(svc) = self.graph.host_services.get_mut(&id) {
+                        svc.target = target.trim().to_string();
+                    }
                 }
                 if let Some(persist) = patch.persist {
                     if let Some(FileNode::Volume(v)) = self.graph.file_nodes.get_mut(&id) {
@@ -2811,6 +2999,13 @@ impl Server {
             Kind::MidiIn => SnapKind::MidiIn {
                 device: self.graph.midi_ins.get(&id).cloned().unwrap_or_default(),
             },
+            Kind::HostService => {
+                let svc = self.graph.host_services.get(&id)?;
+                SnapKind::HostService {
+                    name: svc.name.clone(),
+                    target: svc.target.clone(),
+                }
+            }
         };
         Some(NodeSnap {
             id,
@@ -3044,6 +3239,16 @@ impl Server {
                 // Reconnect to the saved device (or the first available).
                 self.open_midi_device(s.id, device);
             }
+            SnapKind::HostService { name, target } => {
+                self.place(s.id, Kind::HostService, ws, s.pos, s.size);
+                self.graph.host_services.insert(
+                    s.id,
+                    HostService {
+                        name: name.clone(),
+                        target: target.clone(),
+                    },
+                );
+            }
         }
         if let Some(p3) = s.pos3d {
             self.graph.pos3d.insert(s.id, p3);
@@ -3216,6 +3421,7 @@ impl Server {
             host_ports: self.graph.host_ports.clone(),
             notes: self.graph.note_text.clone(),
             midi_ins: self.graph.midi_ins.clone(),
+            host_services: self.graph.host_services.clone(),
             net_nodes,
             gateways,
             uplinks,
@@ -3281,6 +3487,7 @@ impl Server {
                 Some(Kind::Capture) => "capture",
                 Some(Kind::Api) => "api",
                 Some(Kind::MidiIn) => "midiin",
+                Some(Kind::HostService) => "hostservice",
                 None => "unknown",
             }
         };
@@ -3354,6 +3561,64 @@ impl Server {
             wires,
             available: v.available.iter().map(|d| d.name.clone()).collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod hostsvc_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// `bridge_to_host` splices an accepted fabric connection (its socketpair
+    /// end) to a real host TCP server, both directions, with EOF propagating.
+    #[test]
+    fn bridge_reaches_host_service_and_shuttles_bytes() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 64];
+            let n = s.read(&mut buf).unwrap();
+            s.write_all(b"echo:").unwrap();
+            s.write_all(&buf[..n]).unwrap();
+        });
+
+        let (fabric_end, ours) = std::os::unix::net::UnixStream::pair().unwrap();
+        bridge_to_host(fabric_end, target);
+
+        let mut ours = ours;
+        ours.write_all(b"hello").unwrap();
+        ours.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 64];
+        while got.len() < b"echo:hello".len() {
+            let n = ours.read(&mut buf).expect("bytes come back");
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(&got, b"echo:hello");
+        server.join().unwrap();
+    }
+
+    /// A dead target drops the fabric connection instead of hanging it.
+    #[test]
+    fn bridge_to_dead_target_drops_the_connection() {
+        // Bind-then-drop to get a port with nothing listening.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let (fabric_end, ours) = std::os::unix::net::UnixStream::pair().unwrap();
+        bridge_to_host(fabric_end, format!("127.0.0.1:{port}"));
+        let mut ours = ours;
+        ours.set_read_timeout(Some(std::time::Duration::from_secs(15)))
+            .unwrap();
+        let mut buf = [0u8; 8];
+        // EOF (Ok(0)) — the bridge closed its end after the failed dial.
+        assert_eq!(ours.read(&mut buf).unwrap(), 0);
     }
 }
 
@@ -4379,6 +4644,8 @@ mod model_tests {
                     host_path: None,
                     midi_device: None,
                     persist: None,
+                    service_name: None,
+                    service_target: None,
                 },
             }),
             Op::Undo => s.apply(Command::Undo),
