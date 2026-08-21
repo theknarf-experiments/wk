@@ -17,6 +17,11 @@ pub struct MemTree {
     /// Paths written or removed locally since the last sync flush — the set
     /// the sync client turns into Automerge changes.
     pub dirty: HashSet<String>,
+    /// Renames since the last flush, in order (order matters: a→b then b→c
+    /// must replay as two steps). Kept apart from `dirty` so a rename stays a
+    /// rename — a directory-doc re-key that the file doc's history survives —
+    /// instead of decaying into delete + create.
+    pub renames: Vec<(String, String)>,
 }
 
 const MAX_FILE: usize = 64 * 1024 * 1024;
@@ -29,7 +34,26 @@ impl MemTree {
             handles: HashMap::new(),
             next_handle: 1,
             dirty: HashSet::new(),
+            renames: Vec::new(),
         }
+    }
+
+    /// Move one file's local state from `src` to `dest`: bytes, dirty
+    /// membership, open handles (a descriptor held across a rename keeps
+    /// addressing the same file), and the rename log the flush replays.
+    fn move_file(&mut self, src: String, dest: String) {
+        if let Some(bytes) = self.files.remove(&src) {
+            self.files.insert(dest.clone(), bytes);
+        }
+        if self.dirty.remove(&src) {
+            self.dirty.insert(dest.clone());
+        }
+        for path in self.handles.values_mut() {
+            if *path == src {
+                *path = dest.clone();
+            }
+        }
+        self.renames.push((src, dest));
     }
 
     fn is_dir(&self, path: &str) -> bool {
@@ -195,15 +219,45 @@ impl MemTree {
                 self.dirs.remove(&path);
                 Ok(ReplyData::Done)
             }
-            Op::Rename(a) => match self.files.remove(&a.src) {
-                Some(b) => {
-                    self.dirty.insert(a.src);
-                    self.dirty.insert(a.dest.clone());
-                    self.files.insert(a.dest, b);
+            Op::Rename(a) => {
+                if self.files.contains_key(&a.src) {
+                    self.move_file(a.src, a.dest);
                     Ok(ReplyData::Done)
+                } else if self.is_dir(&a.src) {
+                    // A directory rename is a prefix re-key of every file
+                    // under it (file docs carry only their own basename, so
+                    // none of them changes — just the directory-doc keys).
+                    let prefix = format!("{}/", a.src);
+                    let moved: Vec<String> = self
+                        .files
+                        .keys()
+                        .filter(|p| p.starts_with(&prefix))
+                        .cloned()
+                        .collect();
+                    for old in moved {
+                        let new = format!("{}/{}", a.dest, &old[prefix.len()..]);
+                        self.move_file(old, new);
+                    }
+                    let dirs: Vec<String> = self
+                        .dirs
+                        .iter()
+                        .filter(|d| **d == a.src || d.starts_with(&prefix))
+                        .cloned()
+                        .collect();
+                    for old in dirs {
+                        self.dirs.remove(&old);
+                        let new = if old == a.src {
+                            a.dest.clone()
+                        } else {
+                            format!("{}/{}", a.dest, &old[prefix.len()..])
+                        };
+                        self.dirs.insert(new);
+                    }
+                    Ok(ReplyData::Done)
+                } else {
+                    Err(Error::NoEntry)
                 }
-                None => Err(Error::NoEntry),
-            },
+            }
         }
     }
 }

@@ -18,7 +18,11 @@
 //   echo hi > /repo/note.txt               # becomes an automerge doc + a
 //                                          # directory-doc change, pushed —
 //                                          # the browser app sees it live
-//   rm /repo/note.txt                      # so does a delete
+//   mv /repo/note.txt /repo/kept.txt       # a re-key: the file's doc (and
+//                                          # its whole history) follows the
+//                                          # new name — watch the log say
+//                                          # "still automerge:..."
+//   rm /repo/kept.txt                      # so does a delete
 //
 // Edits made elsewhere (the flow-page app, pushwork) appear here within a
 // second: the node subscribes, and re-materializes docs the server pushes.
@@ -47,7 +51,7 @@ workspace "01KWAMFSEX000000000000WS00" {
         size 150.0 44.0
     }
     note "01KWAMFSEX000000000000NT05" {
-        text "automergefs — the flow-page\ntemplate manifest as a live\nfilesystem.\n\nThe subduction server runs in\nDocker on the host; HostService\npublishes host:8080 into the\nNetwork as `subduction`.\n\nIn bash:\n  ls /repo\n  echo hi > /repo/note.txt\n  rm /repo/note.txt\n\nWrites sync back as automerge\nchanges; remote edits appear\nwithin a second."
+        text "automergefs — the flow-page\ntemplate manifest as a live\nfilesystem.\n\nThe subduction server runs in\nDocker on the host; HostService\npublishes host:8080 into the\nNetwork as `subduction`.\n\nIn bash:\n  ls /repo\n  echo hi > /repo/note.txt\n  mv /repo/note.txt /repo/k.txt\n  rm /repo/k.txt\n\nWrites sync back as automerge\nchanges; a rename keeps the\nfile's doc and history; remote\nedits appear within a second."
         pos 740.0 80.0
         size 320.0 300.0
     }

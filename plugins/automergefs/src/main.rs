@@ -215,7 +215,10 @@ fn run(server: &str, service_name: &str, root: SedimentreeId, doc_url: &str) -> 
     // ── Initial sync: the directory doc, then every file doc it names. ──
     let mut dir_doc = fetch(root)?;
     let mut tree = fs::MemTree::empty();
-    let mut file_ids: HashMap<String, SedimentreeId> = HashMap::new();
+    // Path → (sedimentree id, the `automerge:` url the directory doc holds).
+    // The url is kept verbatim rather than re-derived: a rename re-keys it,
+    // and re-encoding would bake in the assumption every doc id is 16 bytes.
+    let mut file_ids: HashMap<String, (SedimentreeId, String)> = HashMap::new();
     let mut docs: HashMap<SedimentreeId, Automerge> = HashMap::new();
     for (path, url) in repo::dir_leaves(&dir_doc) {
         match repo::parse_doc_id(&url).and_then(&fetch) {
@@ -223,14 +226,14 @@ fn run(server: &str, service_name: &str, root: SedimentreeId, doc_url: &str) -> 
                 let id = repo::parse_doc_id(&url).expect("parsed once already");
                 tree.files.insert(path.clone(), repo::file_content(&doc));
                 docs.insert(id, doc);
-                file_ids.insert(path, id);
+                file_ids.insert(path, (id, url));
             }
             Err(e) => eprintln!("[automergefs] {path}: {e}"),
         }
     }
     let mut counts: HashMap<SedimentreeId, usize> = file_ids
         .values()
-        .copied()
+        .map(|(id, _)| *id)
         .chain([root])
         .map(|id| (id, blob_count(id)))
         .collect();
@@ -252,9 +255,29 @@ fn run(server: &str, service_name: &str, root: SedimentreeId, doc_url: &str) -> 
                 exec.pump();
 
                 // Local edits → automerge changes, debounced a touch so a
-                // write burst (an editor saving) flushes once.
-                if !tree.dirty.is_empty() && last_flush.elapsed() >= Duration::from_millis(400) {
+                // write burst (an editor saving) flushes once. Renames
+                // replay first, in order: a rename is a directory-doc re-key
+                // (the file doc and its history stay put), and any content
+                // edit in `dirty` already carries the post-rename path.
+                if (!tree.dirty.is_empty() || !tree.renames.is_empty())
+                    && last_flush.elapsed() >= Duration::from_millis(400)
+                {
                     last_flush = Instant::now();
+                    let renames: Vec<(String, String)> = tree.renames.drain(..).collect();
+                    for (src, dest) in renames {
+                        let outcome = flush_rename(
+                            &src,
+                            &dest,
+                            &mut dir_doc,
+                            &mut docs,
+                            &mut file_ids,
+                            root,
+                            &push_change,
+                        );
+                        if let Err(e) = outcome {
+                            eprintln!("[automergefs] rename {src} -> {dest}: {e}");
+                        }
+                    }
                     let dirty: Vec<String> = tree.dirty.drain().collect();
                     for path in dirty {
                         let outcome = flush_path(
@@ -272,7 +295,7 @@ fn run(server: &str, service_name: &str, root: SedimentreeId, doc_url: &str) -> 
                         }
                     }
                     counts.insert(root, blob_count(root));
-                    for id in file_ids.values() {
+                    for (id, _) in file_ids.values() {
                         counts.insert(*id, blob_count(*id));
                     }
                 }
@@ -286,16 +309,16 @@ fn run(server: &str, service_name: &str, root: SedimentreeId, doc_url: &str) -> 
                         counts.insert(root, root_now);
                         if let Ok(fresh) = load(root, Duration::from_millis(100)) {
                             dir_doc = fresh;
-                            let current: HashMap<String, SedimentreeId> =
+                            let current: HashMap<String, (SedimentreeId, String)> =
                                 repo::dir_leaves(&dir_doc)
                                     .into_iter()
                                     .filter_map(|(p, u)| {
-                                        repo::parse_doc_id(&u).ok().map(|id| (p, id))
+                                        repo::parse_doc_id(&u).ok().map(|id| (p, (id, u)))
                                     })
                                     .collect();
                             tree.files
                                 .retain(|p, _| current.contains_key(p) || tree.dirty.contains(p));
-                            for (path, id) in &current {
+                            for (path, (id, _)) in &current {
                                 if !file_ids.contains_key(path) {
                                     if let Ok(doc) = fetch(*id) {
                                         tree.files.insert(path.clone(), repo::file_content(&doc));
@@ -307,7 +330,7 @@ fn run(server: &str, service_name: &str, root: SedimentreeId, doc_url: &str) -> 
                             file_ids = current;
                         }
                     }
-                    for (path, id) in &file_ids {
+                    for (path, (id, _)) in &file_ids {
                         if tree.dirty.contains(path) {
                             continue;
                         }
@@ -330,24 +353,63 @@ fn run(server: &str, service_name: &str, root: SedimentreeId, doc_url: &str) -> 
     Ok(())
 }
 
+/// Replay one recorded rename: re-key the directory doc (same url, new
+/// path — the file doc and its whole history follow untouched) and update
+/// the file doc's name metadata, the same two changes flow-page's rename
+/// makes. A rename of a not-yet-flushed new file has no directory entry to
+/// move; the path stays in `dirty` and flushes as a create under its final
+/// name.
+fn flush_rename(
+    src: &str,
+    dest: &str,
+    dir_doc: &mut Automerge,
+    docs: &mut HashMap<SedimentreeId, Automerge>,
+    file_ids: &mut HashMap<String, (SedimentreeId, String)>,
+    root: SedimentreeId,
+    push_change: &impl Fn(&mut Automerge, SedimentreeId) -> Result<(), String>,
+) -> Result<(), String> {
+    let Some((id, url)) = file_ids.remove(src) else {
+        return Ok(()); // never synced under src — the dirty flush creates it
+    };
+    // Renaming over an existing file orphans the overwritten doc, exactly
+    // like a delete of it would.
+    if let Some((old_id, _)) = file_ids.remove(dest) {
+        docs.remove(&old_id);
+    }
+    repo::rename_dir_entry(dir_doc, src, dest, &url)?;
+    push_change(dir_doc, root)?;
+    // Name metadata only moves when the basename does (a directory rename
+    // keeps every child's own name).
+    let basename = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+    if basename(src) != basename(dest) {
+        if let Some(doc) = docs.get_mut(&id) {
+            repo::set_file_meta(doc, dest)?;
+            push_change(doc, id)?;
+        }
+    }
+    file_ids.insert(dest.to_string(), (id, url.clone()));
+    println!("[automergefs] renamed {src} -> {dest} (still {url})");
+    Ok(())
+}
+
 /// Turn one dirty path into pushed changes: modify its file doc, create a
 /// new doc (and directory entry) for a new file, or drop the entry for a
-/// deleted one. Renames arrive as delete + create — the new path gets a new
-/// doc (history does not follow the rename; pushwork tolerates this).
+/// deleted one. (Renames never land here — they replay from the rename log
+/// first, so the association between old and new path is kept.)
 #[allow(clippy::too_many_arguments)]
 fn flush_path(
     path: &str,
     tree: &mut fs::MemTree,
     dir_doc: &mut Automerge,
     docs: &mut HashMap<SedimentreeId, Automerge>,
-    file_ids: &mut HashMap<String, SedimentreeId>,
+    file_ids: &mut HashMap<String, (SedimentreeId, String)>,
     root: SedimentreeId,
     push_change: &impl Fn(&mut Automerge, SedimentreeId) -> Result<(), String>,
     push_new: &impl Fn(&Automerge, SedimentreeId) -> Result<(), String>,
 ) -> Result<(), String> {
-    match (tree.files.get(path), file_ids.get(path).copied()) {
+    match (tree.files.get(path), file_ids.get(path).cloned()) {
         // Modified: update the file doc's content, push the change.
-        (Some(content), Some(id)) => {
+        (Some(content), Some((id, _))) => {
             let doc = docs
                 .get_mut(&id)
                 .ok_or_else(|| "no cached doc".to_string())?;
@@ -360,7 +422,7 @@ fn flush_path(
             let doc = repo::make_file_doc(path, content)?;
             push_new(&doc, id)?;
             docs.insert(id, doc);
-            file_ids.insert(path.to_string(), id);
+            file_ids.insert(path.to_string(), (id, url.clone()));
             repo::set_dir_entry(dir_doc, path, Some(&url))?;
             push_change(dir_doc, root)?;
             println!("[automergefs] created {path} as {url}");
@@ -368,7 +430,7 @@ fn flush_path(
         }
         // Deleted: drop the directory entry (the file doc stays server-side,
         // like flow-page's best-effort delete).
-        (None, Some(id)) => {
+        (None, Some((id, _))) => {
             repo::set_dir_entry(dir_doc, path, None)?;
             push_change(dir_doc, root)?;
             file_ids.remove(path);

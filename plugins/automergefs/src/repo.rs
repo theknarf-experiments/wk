@@ -121,9 +121,9 @@ pub fn set_content(doc: &mut Automerge, bytes: &[u8]) -> Result<(), String> {
     .map_err(|e| format!("set_content: {}", e.error))
 }
 
-/// A brand-new pushwork file doc for `rel` (mirrors flow-page's
-/// `makeFileEntry`: `@patchwork` meta + name/extension/mimeType + content).
-pub fn make_file_doc(rel: &str, content: &[u8]) -> Result<Automerge, String> {
+/// The name/extension/mimeType triple a path implies (flow-page's
+/// `makeFileEntry` metadata).
+fn file_meta(rel: &str) -> (&str, &str, &'static str) {
     let name = rel.rsplit('/').next().unwrap_or(rel);
     let extension = match name.rfind('.') {
         Some(dot) if dot > 0 => &name[dot + 1..],
@@ -139,6 +139,13 @@ pub fn make_file_doc(rel: &str, content: &[u8]) -> Result<Automerge, String> {
         "jpg" | "jpeg" => "image/jpeg",
         _ => "text/plain",
     };
+    (name, extension, mime)
+}
+
+/// A brand-new pushwork file doc for `rel` (mirrors flow-page's
+/// `makeFileEntry`: `@patchwork` meta + name/extension/mimeType + content).
+pub fn make_file_doc(rel: &str, content: &[u8]) -> Result<Automerge, String> {
+    let (name, extension, mime) = file_meta(rel);
     let mut doc = Automerge::new();
     doc.transact::<_, _, automerge::AutomergeError>(|tx| {
         let meta = tx.put_object(automerge::ROOT, "@patchwork", ObjType::Map)?;
@@ -151,6 +158,38 @@ pub fn make_file_doc(rel: &str, content: &[u8]) -> Result<Automerge, String> {
     .map_err(|e| format!("make_file_doc: {}", e.error))?;
     set_content(&mut doc, content)?;
     Ok(doc)
+}
+
+/// Re-point a file doc's name metadata at a new path — flow-page's `move()`
+/// does the same on rename. The content (and its history) is untouched.
+pub fn set_file_meta(doc: &mut Automerge, rel: &str) -> Result<(), String> {
+    let (name, extension, mime) = file_meta(rel);
+    doc.transact::<_, _, automerge::AutomergeError>(|tx| {
+        tx.put(automerge::ROOT, "name", name)?;
+        tx.put(automerge::ROOT, "extension", extension)?;
+        tx.put(automerge::ROOT, "mimeType", mime)?;
+        Ok(())
+    })
+    .map(|_| ())
+    .map_err(|e| format!("set_file_meta: {}", e.error))
+}
+
+/// Re-key a directory entry — the whole of a rename, as one change: the new
+/// path points at the same file doc, the old path goes. Atomic in one
+/// transaction so no reader ever sees the file under both names or neither.
+pub fn rename_dir_entry(
+    dir: &mut Automerge,
+    src: &str,
+    dest: &str,
+    url: &str,
+) -> Result<(), String> {
+    dir.transact::<_, _, automerge::AutomergeError>(|tx| {
+        tx.put(automerge::ROOT, dest, url)?;
+        tx.delete(automerge::ROOT, src)?;
+        Ok(())
+    })
+    .map(|_| ())
+    .map_err(|e| format!("rename_dir_entry: {}", e.error))
 }
 
 /// Point `path` at `url` in the directory doc (or, with `None`, drop it).
