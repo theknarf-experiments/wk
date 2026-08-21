@@ -1,0 +1,16 @@
+package wk:automergefs;
+
+/// A node that IS a synced filesystem: an Automerge repo in pushwork's vfs
+/// shape (a directory doc of path → file-doc urls), kept live over a
+/// subduction websocket, served to the nodes it's wired into via
+/// `wk:fs/provider`. The subduction server stays wherever it is (a Docker
+/// container on the host, reached through a HostService node); this guest is
+/// the sync client.
+///
+/// A command component (`wasi:cli/run` is its main), because it needs
+/// wasi:sockets — which the wasip1 adapter world cargo-component targets does
+/// not have. Serving and syncing share the one guest thread, so the serve
+/// loop uses `poll-request` (bounded wait), never the blocking `next-request`.
+world automergefs {
+    import wk:fs/provider;
+}

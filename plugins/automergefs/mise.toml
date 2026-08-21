@@ -1,0 +1,10 @@
+# Build this plugin: `mise run build`
+[tasks.build]
+description = "Build this plugin into a wasm component"
+dir = "{{config_root}}"
+# wasip2 directly (not cargo component / wasip1 + adapter): the sync client
+# needs wasi:sockets, which the wasip1 adapter world does not have.
+run = """
+cargo build --release --target wasm32-wasip2
+cp target/wasm32-wasip2/release/automergefs.wasm automergefs.wasm
+"""

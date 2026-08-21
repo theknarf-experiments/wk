@@ -1,0 +1,33 @@
+[package]
+name = "automergefs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wit-bindgen = { version = "0.46", default-features = false, features = ["macros", "realloc"] }
+automerge = "0.11"
+tungstenite = "0.30"
+futures = "0.3"
+future_form = "0.3"
+bs58 = { version = "0.5", features = ["check"] }
+getrandom = "0.2"
+
+[profile.release]
+# Component size matters (it ships in the repo like httpfs.wasm); automerge's
+# columnar codecs inline heavily at -O3 for no runtime win here.
+opt-level = "s"
+lto = true
+
+# The subduction client: protocol core + crypto + the sedimentree doc model,
+# pinned to the rev the flow-page server image builds from (flake main).
+[dependencies.subduction_core]
+git = "https://github.com/inkandswitch/subduction"
+rev = "2401102882b97d6b13c559fbbcfc2257e3a46dd3"
+
+[dependencies.subduction_crypto]
+git = "https://github.com/inkandswitch/subduction"
+rev = "2401102882b97d6b13c559fbbcfc2257e3a46dd3"
+
+[dependencies.sedimentree_core]
+git = "https://github.com/inkandswitch/subduction"
+rev = "2401102882b97d6b13c559fbbcfc2257e3a46dd3"

@@ -68,6 +68,26 @@ impl wit::Host for HostState {
         }
     }
 
+    fn poll_request(&mut self, max_wait_ms: u32) -> Result<wit::Polled> {
+        let Some(serve) = &self.fs_serve else {
+            return Ok(wit::Polled::Shutdown);
+        };
+        // One bounded wait on the conduit, capped so a huge argument can't
+        // park the guest beyond the kill flag's reach for long.
+        let wait = Duration::from_millis(u64::from(max_wait_ms.min(1000)));
+        if serve.kill.load(Ordering::Relaxed) {
+            return Ok(wit::Polled::Shutdown);
+        }
+        match serve.conn.next_request(wait) {
+            Some((id, op)) => Ok(wit::Polled::Request(wit::Request {
+                id,
+                op: op_to_wit(op),
+            })),
+            None if serve.kill.load(Ordering::Relaxed) => Ok(wit::Polled::Shutdown),
+            None => Ok(wit::Polled::Empty),
+        }
+    }
+
     fn reply(
         &mut self,
         id: u64,

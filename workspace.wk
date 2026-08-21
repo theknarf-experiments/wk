@@ -36,6 +36,9 @@ dependencies {
     httpfs "plugins/httpfs/httpfs.wasm" {
         description "network filesystem over the fabric: mounts an HTTP file server by name (httpfs http://filesrv:8080)"
     }
+    automergefs "plugins/automergefs/automergefs.wasm" {
+        description "a node that IS a synced automerge repo (subduction client): automergefs ws://subduction:8080 automerge:<doc> [service-name]"
+    }
     piano "plugins/piano/target/wasm32-wasip1/debug/piano.wasm" {
         description "on-screen keyboard emitting MIDI"
     }

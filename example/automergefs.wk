@@ -1,0 +1,57 @@
+// vim: set filetype=kdl :
+// A node that IS a synced Automerge repo — the subduction client as a
+// filesystem (wk:fs), with the sync server staying in Docker. Run with:
+//
+//   (in flow-page:)  docker compose up -d       # subduction on :8080
+//   (here:)          wk run example/automergefs.wk
+//
+// automergefs speaks subduction's websocket protocol (handshake, sedimentree
+// sync, live subscriptions) from inside the node, over the fabric: the
+// HostService node publishes the Docker container's port INTO the network as
+// the name `subduction`, the reverse of a HostPort. Nothing was ported — the
+// server is Ink & Switch's release, and this is its real client protocol.
+//
+// The wire into bash is a live mount. Try:
+//
+//   ls /repo && cat /repo/templates.json   # flow-page's template manifest,
+//                                          # synced from the server
+//   echo hi > /repo/note.txt               # becomes an automerge doc + a
+//                                          # directory-doc change, pushed —
+//                                          # the browser app sees it live
+//   rm /repo/note.txt                      # so does a delete
+//
+// Edits made elsewhere (the flow-page app, pushwork) appear here within a
+// second: the node subscribes, and re-materializes docs the server pushes.
+//
+// The third arg is the server's --service-name (the handshake audience is
+// hashed from it, flow-page pins localhost:8080); the doc url is any
+// pushwork-shaped directory doc — swap in your own project's url.
+import "../workspace.wk"
+workspace "01KWAMFSEX000000000000WS00" {
+    node "automergefs" "01KWAMFSEX000000000000AF01" {
+        pos 80.0 80.0
+        size 380.0 240.0
+        args "ws://subduction:8080" "automerge:3dDUirk6VY6EXDvZiZQEkkPAQNa2" "localhost:8080"
+    }
+    node "bash" "01KWAMFSEX000000000000SH02" {
+        pos 80.0 380.0
+        size 560.0 340.0
+    }
+    network "01KWAMFSEX000000000000NW03" {
+        pos 560.0 120.0
+        size 130.0 44.0
+    }
+    hostservice "subduction" "01KWAMFSEX000000000000HS04" {
+        target "127.0.0.1:8080"
+        pos 560.0 220.0
+        size 150.0 44.0
+    }
+    note "01KWAMFSEX000000000000NT05" {
+        text "automergefs — the flow-page\ntemplate manifest as a live\nfilesystem.\n\nThe subduction server runs in\nDocker on the host; HostService\npublishes host:8080 into the\nNetwork as `subduction`.\n\nIn bash:\n  ls /repo\n  echo hi > /repo/note.txt\n  rm /repo/note.txt\n\nWrites sync back as automerge\nchanges; remote edits appear\nwithin a second."
+        pos 740.0 80.0
+        size 320.0 300.0
+    }
+    netlink "01KWAMFSEX000000000000AF01" "01KWAMFSEX000000000000NW03"
+    netlink "01KWAMFSEX000000000000HS04" "01KWAMFSEX000000000000NW03"
+    connection "01KWAMFSEX000000000000AF01" "01KWAMFSEX000000000000SH02" "/repo"
+}
