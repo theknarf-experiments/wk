@@ -13,6 +13,7 @@ pub mod auth;
 pub mod capture;
 pub mod exec;
 pub mod execpipe;
+pub mod fetch;
 pub mod fsprov;
 pub mod http;
 pub mod images;

@@ -384,20 +384,9 @@ fn is_url(src: &str) -> bool {
     src.starts_with("http://") || src.starts_with("https://")
 }
 
-/// Fetch a URL at build time via the host's `curl` (as the OCI adapter fetch
-/// does) — reuses the host's TLS/proxy config without a client dependency.
+/// Fetch a URL for `ADD`, in-process (see [`crate::fetch`]).
 fn fetch_url(url: &str) -> Result<Vec<u8>, String> {
-    let out = std::process::Command::new("curl")
-        .args(["-fsSL", url])
-        .output()
-        .map_err(|e| format!("ADD {url}: running curl: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "ADD {url}: curl failed ({})",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(out.stdout)
+    crate::fetch::get(url).map_err(|e| format!("ADD {e}"))
 }
 
 /// Append an archive's entries into the layer, re-rooted under `dest` (the

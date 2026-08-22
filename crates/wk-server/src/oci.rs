@@ -247,21 +247,23 @@ fn cached_adapter() -> Result<Vec<u8>, String> {
         "https://github.com/bytecodealliance/wasmtime/releases/download/v{WASMTIME_VER}/wasi_snapshot_preview1.command.wasm"
     );
     println!("fetching WASI command adapter {WASMTIME_VER} ...");
-    let out = std::process::Command::new("curl")
-        .args(["-fsSL", &url])
-        .output()
-        .map_err(|e| format!("curl for the WASI adapter: {e}"))?;
-    if !out.status.success() || out.stdout.is_empty() {
+    let bytes = crate::fetch::get(&url).map_err(|e| {
+        format!(
+            "fetching the WASI adapter failed ({e}); place it at {} to work offline",
+            path.display()
+        )
+    })?;
+    if bytes.is_empty() {
         return Err(format!(
-            "failed to fetch the WASI adapter from {url}; place it at {}",
+            "the WASI adapter at {url} came back empty; place it at {}",
             path.display()
         ));
     }
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(&path, &out.stdout).map_err(|e| e.to_string())?;
-    Ok(out.stdout)
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    Ok(bytes)
 }
 
 /// Make pulled wasm loadable: a component passes through; a core WASIp1 module

@@ -3610,12 +3610,12 @@ mod hostsvc_tests {
         });
 
         let (fabric_end, ours) = std::os::unix::net::UnixStream::pair().unwrap();
-        bridge_to_host(fabric_end, target);
-
         let mut ours = ours;
-        ours.write_all(b"hello").unwrap();
+        // Set before the bridge runs — see the sibling test.
         ours.set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
+        bridge_to_host(fabric_end, target);
+        ours.write_all(b"hello").unwrap();
         let mut got = Vec::new();
         let mut buf = [0u8; 64];
         while got.len() < b"echo:hello".len() {
@@ -3638,10 +3638,12 @@ mod hostsvc_tests {
             l.local_addr().unwrap().port()
         };
         let (fabric_end, ours) = std::os::unix::net::UnixStream::pair().unwrap();
-        bridge_to_host(fabric_end, format!("127.0.0.1:{port}"));
         let mut ours = ours;
+        // Before the bridge runs: once its failed dial drops the far end,
+        // macOS rejects setsockopt on the now-peerless socket with EINVAL.
         ours.set_read_timeout(Some(std::time::Duration::from_secs(15)))
             .unwrap();
+        bridge_to_host(fabric_end, format!("127.0.0.1:{port}"));
         let mut buf = [0u8; 8];
         // EOF (Ok(0)) — the bridge closed its end after the failed dial.
         assert_eq!(ours.read(&mut buf).unwrap(), 0);

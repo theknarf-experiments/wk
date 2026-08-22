@@ -11011,6 +11011,7 @@ dependencies = [
  "pollster",
  "proptest",
  "rcgen",
+ "reqwest",
  "rustls 0.23.41",
  "serde",
  "serde_json",
