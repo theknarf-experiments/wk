@@ -67,6 +67,16 @@ pub struct NodeInfo {
     /// An uplink node's live peer-connection count. `None` for other kinds.
     #[serde(default)]
     pub peers: Option<usize>,
+    /// The node's address on its virtual network, e.g. `10.0.0.7` — what a
+    /// peer dials when a name won't do (names are per-hub, so they do not
+    /// resolve across an uplink). `None` until the node has a fabric stack:
+    /// only a compiled component importing `wasi:sockets` gets one.
+    #[serde(default)]
+    pub ip: Option<String>,
+    /// The same node's fabric IPv6 address (`fd00::7`), derived from `ip`'s
+    /// host octet so the two stay in lock-step.
+    #[serde(default)]
+    pub ip6: Option<String>,
 }
 
 /// One wire between two nodes.
@@ -213,6 +223,8 @@ mod tests {
                 token: None,
                 ticket: None,
                 peers: None,
+                ip: None,
+                ip6: None,
             }],
             wires: vec![WireInfo {
                 kind: "file".into(),

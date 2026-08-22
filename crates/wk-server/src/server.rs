@@ -3472,6 +3472,17 @@ impl Server {
     pub fn ipc_snapshot(&mut self) -> wk_protocol::ipc::Snapshot {
         use wk_protocol::ipc::{NodeInfo, Snapshot, WireInfo};
         let v = self.view();
+        // Every node's fabric addresses, collected once: locking each stack
+        // from inside the per-node closure below would re-lock per field.
+        let fabric_addrs: HashMap<NodeId, (String, String)> = v
+            .nodes
+            .iter()
+            .filter_map(|n| {
+                let stack = n.net_stack()?;
+                let g = stack.lock().unwrap();
+                Some((n.id, (g.ip.to_string(), g.ip6.to_string())))
+            })
+            .collect();
         let kind_str = |id: NodeId| -> &'static str {
             match self.kind_of(id) {
                 Some(Kind::App) => "app",
@@ -3541,6 +3552,12 @@ impl Server {
                     // only ever printed to the server's stderr at startup.
                     ticket: v.uplinks.get(&id).map(|u| u.ticket.clone()),
                     peers: v.uplinks.get(&id).map(|u| u.peers),
+                    // Addressing a node across an uplink means using its
+                    // fabric IP (names don't cross a trunk), and until now
+                    // nothing reported it — you had to derive it from the
+                    // node id by hand.
+                    ip: fabric_addrs.get(&id).map(|(v4, _)| v4.clone()),
+                    ip6: fabric_addrs.get(&id).map(|(_, v6)| v6.clone()),
                 }
             })
             .collect();

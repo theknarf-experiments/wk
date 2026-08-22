@@ -292,6 +292,12 @@ struct NodeReport<'a> {
     /// An uplink's live peer count.
     #[serde(skip_serializing_if = "Option::is_none")]
     peers: Option<usize>,
+    /// The node's address on its virtual network — what a peer dials when a
+    /// name won't do (names don't resolve across an uplink).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ip: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ip6: Option<&'a str>,
     pos: [f32; 2],
     size: [f32; 2],
     workspace: String,
@@ -357,6 +363,8 @@ fn node_report<'a>(snap: &'a Snapshot, node: &'a wk_protocol::ipc::NodeInfo) -> 
         args: &node.args,
         ticket: node.ticket.as_deref(),
         peers: node.peers,
+        ip: node.ip.as_deref(),
+        ip6: node.ip6.as_deref(),
         pos: node.pos,
         size: node.size,
         workspace: short(node.ws),
@@ -839,6 +847,8 @@ mod tests {
             token: None,
             ticket: None,
             peers: None,
+            ip: None,
+            ip6: None,
         }
     }
 
@@ -894,6 +904,27 @@ mod tests {
         let plain = serde_json::to_string(&node_report(&s, &s.nodes[1])).unwrap();
         assert!(!plain.contains("ticket"), "{plain}");
         assert!(!plain.contains("peers"), "{plain}");
+    }
+
+    /// A node's fabric address reaches `wk inspect`. It is the only way to
+    /// address a node across an uplink — names are per-hub and don't resolve
+    /// over a trunk — and deriving it from the node id by hand was previously
+    /// the only option. A node with no fabric stack omits the fields rather
+    /// than reporting a null address.
+    #[test]
+    fn inspect_reports_a_nodes_fabric_address() {
+        let mut netserve = node(0xE5, "netserve");
+        netserve.ip = Some("10.0.0.129".into());
+        netserve.ip6 = Some("fd00::81".into());
+        let s = snap(vec![netserve.clone(), node(0xF6, "note")]);
+
+        let json = serde_json::to_string(&node_report(&s, &s.nodes[0])).unwrap();
+        assert!(json.contains("10.0.0.129"), "{json}");
+        assert!(json.contains("fd00::81"), "{json}");
+
+        let plain = serde_json::to_string(&node_report(&s, &s.nodes[1])).unwrap();
+        assert!(!plain.contains("\"ip\""), "{plain}");
+        assert!(!plain.contains("\"ip6\""), "{plain}");
     }
 
     #[test]
