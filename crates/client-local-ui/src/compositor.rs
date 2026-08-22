@@ -179,6 +179,8 @@ struct WidgetChrome<'a> {
     status_col: [f32; 4],
     /// Text scale of the status line relative to the title.
     status_scale: f32,
+    /// Draw the copy-ticket button (uplink nodes — see [`ticket_btn`]).
+    copy_ticket: bool,
 }
 
 /// A node popped out into its own OS window. Purely client-local view state:
@@ -316,6 +318,9 @@ struct App {
     /// System clipboard, for pasting into the args/ticket field and the
     /// command palette. `None` if the platform has no clipboard.
     clipboard: Option<arboard::Clipboard>,
+    /// The uplink whose ticket was just copied, and when — the widget shows a
+    /// short confirmation, because a clipboard write is otherwise invisible.
+    ticket_copied: Option<(NodeId, std::time::Instant)>,
     drag: Option<Drag>,
     /// The connection wire currently selected (click to select, Delete to remove).
     wire_sel: Option<Wire>,
@@ -419,6 +424,7 @@ impl App {
             logs: None,
             log_max_scroll: 0.0,
             clipboard: arboard::Clipboard::new().ok(),
+            ticket_copied: None,
             drag: None,
             wire_sel: None,
             del_wire: false,
@@ -642,6 +648,30 @@ impl App {
     fn clipboard_text(&mut self) -> Option<String> {
         let text = self.clipboard.as_mut()?.get_text().ok()?;
         Some(text.trim().to_string())
+    }
+
+    /// Put uplink `id`'s own ticket on the clipboard, and flag the widget to
+    /// confirm it. A failed/absent clipboard leaves no confirmation, which is
+    /// the honest signal that nothing was copied.
+    fn copy_ticket(&mut self, id: NodeId) {
+        let Some(ticket) = self.view.uplinks.get(&id).map(|u| u.ticket.clone()) else {
+            return;
+        };
+        let ok = self
+            .clipboard
+            .as_mut()
+            .is_some_and(|c| c.set_text(ticket).is_ok());
+        if ok {
+            self.ticket_copied = Some((id, std::time::Instant::now()));
+        }
+    }
+
+    /// How long the "ticket copied" confirmation stays on an uplink widget.
+    const COPIED_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Whether uplink `id` should currently show its copy confirmation.
+    fn just_copied(&self, id: NodeId) -> bool {
+        matches!(self.ticket_copied, Some((cid, at)) if cid == id && at.elapsed() < Self::COPIED_FOR)
     }
 
     /// (Re)run an idle or exited node's guest. Commits any in-progress args edit
@@ -1561,6 +1591,25 @@ impl App {
             TEXT,
             clip,
         );
+        if w.copy_ticket {
+            let tb = ticket_btn(w.r, zf);
+            if contains(tb, mp) {
+                quads.push(Quad::solid(white, tb, CLOSE_HOT, clip));
+            }
+            self.text_cache.draw(
+                quads,
+                &mut gfx.renderer,
+                &gfx.fonts,
+                &gfx.device,
+                &gfx.queue,
+                "c",
+                tb[0] + (tb[2] - tb[0]) * 0.28,
+                tb[1] + (tb[3] - tb[1]) * 0.05,
+                zf * 0.8,
+                TEXT,
+                clip,
+            );
+        }
         self.draw_typed_ports(quads, gfx.renderer.circle, w.id, zf, mp, full);
     }
 
@@ -3771,6 +3820,11 @@ impl App {
                                     ..Default::default()
                                 },
                             });
+                        } else if is_uplink && contains(ticket_btn(r, zf), mp) {
+                            // Copy this uplink's own ticket. It is ~200 opaque
+                            // characters, so the clipboard is the only sane
+                            // way to move it to the other side.
+                            self.copy_ticket(id);
                         } else if is_uplink && mp[1] > (r[1] + r[3]) * 0.5 {
                             // Click the status line to type/paste the remote
                             // ticket; Enter dials it.
@@ -4060,6 +4114,7 @@ impl App {
                         status: &status,
                         status_col,
                         status_scale: 0.85,
+                        copy_ticket: false,
                     },
                 );
                 continue;
@@ -4108,6 +4163,7 @@ impl App {
                         status: &port_label,
                         status_col: TEXT,
                         status_scale: 0.85,
+                        copy_ticket: false,
                     },
                 );
                 // Port −/+ buttons (also: scroll over the node to change fast).
@@ -4169,6 +4225,7 @@ impl App {
                         status: &status,
                         status_col: [0.72, 0.62, 0.9, 1.0],
                         status_scale: 0.7,
+                        copy_ticket: false,
                     },
                 );
                 continue;
@@ -4194,12 +4251,14 @@ impl App {
                         .rev()
                         .collect();
                     (format!("{tail}_"), TEXT)
+                } else if self.just_copied(id) {
+                    ("ticket copied".into(), [0.4, 0.85, 0.5, 1.0])
                 } else if meta.peers > 0 {
                     (format!("● {} peer(s)", meta.peers), [0.4, 0.85, 0.5, 1.0])
                 } else if self.view.node_args.get(&id).is_some_and(|a| !a.is_empty()) {
                     ("dialing…".into(), [0.72, 0.62, 0.9, 1.0])
                 } else {
-                    ("click to add peer".into(), [0.55, 0.7, 0.72, 1.0])
+                    ("c = copy ticket".into(), [0.55, 0.7, 0.72, 1.0])
                 };
                 self.draw_widget(
                     &mut quads,
@@ -4219,6 +4278,7 @@ impl App {
                         status: &status,
                         status_col,
                         status_scale: 0.7,
+                        copy_ticket: true,
                     },
                 );
                 continue;
@@ -4254,6 +4314,7 @@ impl App {
                         status,
                         status_col,
                         status_scale: 0.7,
+                        copy_ticket: false,
                     },
                 );
                 continue;
@@ -4286,6 +4347,7 @@ impl App {
                         status,
                         status_col,
                         status_scale: 0.7,
+                        copy_ticket: false,
                     },
                 );
                 continue;
@@ -4320,6 +4382,7 @@ impl App {
                         status: &status,
                         status_col,
                         status_scale: 0.7,
+                        copy_ticket: false,
                     },
                 );
                 continue;
@@ -4353,6 +4416,7 @@ impl App {
                         status: &status,
                         status_col,
                         status_scale: 0.7,
+                        copy_ticket: false,
                     },
                 );
                 continue;

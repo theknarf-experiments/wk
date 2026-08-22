@@ -43,6 +43,16 @@ pub(super) fn close_btn(r: [f32; 4], z: f32) -> [f32; 4] {
     let y0 = r[1] + 4.0 * z;
     [x1 - s, y0, x1, y0 + s]
 }
+/// The copy-ticket button, just left of the close button. Puts an uplink's own
+/// dialable ticket on the clipboard — it is far too long to read off the
+/// widget, and the remote side can't connect without it. Shown on uplink
+/// nodes, which have no detach/files/logs buttons to collide with.
+pub(super) fn ticket_btn(r: [f32; 4], z: f32) -> [f32; 4] {
+    let cb = close_btn(r, z);
+    let w = cb[2] - cb[0];
+    let gap = 4.0 * z;
+    [cb[0] - w - gap, cb[1], cb[0] - gap, cb[3]]
+}
 /// The detach button, just left of the close button. Pops the node out into its
 /// own OS window (and, when already detached, reattaches it). Shown on app nodes.
 pub(super) fn detach_btn(r: [f32; 4], z: f32) -> [f32; 4] {

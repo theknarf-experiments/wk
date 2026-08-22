@@ -286,10 +286,23 @@ struct NodeReport<'a> {
     terminal: bool,
     attached: bool,
     args: &'a [String],
+    /// An uplink's own dialable ticket — paste it into the remote side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ticket: Option<&'a str>,
+    /// An uplink's live peer count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peers: Option<usize>,
     pos: [f32; 2],
     size: [f32; 2],
     workspace: String,
     connections: Vec<Connection>,
+}
+
+/// The first `n` characters of `s`, for long opaque strings (uplink tickets)
+/// that would otherwise wrap a table. Char-wise, so it can't split a UTF-8
+/// sequence.
+fn ellipsis(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
 }
 
 /// Status label for an inspected node, matching `wk ps`'s vocabulary.
@@ -342,6 +355,8 @@ fn node_report<'a>(snap: &'a Snapshot, node: &'a wk_protocol::ipc::NodeInfo) -> 
         terminal: node.terminal,
         attached: node.attached,
         args: &node.args,
+        ticket: node.ticket.as_deref(),
+        peers: node.peers,
         pos: node.pos,
         size: node.size,
         workspace: short(node.ws),
@@ -760,6 +775,14 @@ pub fn ps(workspace: &Path) -> Result<(), String> {
             "compiling".to_string()
         } else if n.attached {
             "attached".to_string()
+        } else if let Some(peers) = n.peers {
+            // An uplink is never "runnable", so its connection state is the
+            // only status worth showing (same vocabulary as the UI widget).
+            match peers {
+                0 if n.args.is_empty() => "no peer".to_string(),
+                0 => "dialing".to_string(),
+                p => format!("{p} peer(s)"),
+            }
         } else if !n.runnable {
             "-".to_string()
         } else if n.running {
@@ -769,10 +792,16 @@ pub fn ps(workspace: &Path) -> Result<(), String> {
         };
         let name = if n.name.is_empty() { "-" } else { &n.name };
         // The trailing column carries the error message when there is one (a
-        // HostPort has no args of its own), else the launch args.
-        let detail = match &n.error {
-            Some(e) => e.clone(),
-            None => n.args.join(" "),
+        // HostPort has no args of its own), else the launch args. An uplink's
+        // args are a ~200-char ticket, which would wrap the whole table — it
+        // is elided here and printed in full by `wk inspect`.
+        let detail = match (&n.error, n.peers.is_some()) {
+            (Some(e), _) => e.clone(),
+            (None, true) => match n.args.join(" ") {
+                t if t.is_empty() => String::new(),
+                t => format!("dials {}…", ellipsis(&t, 16)),
+            },
+            (None, false) => n.args.join(" "),
         };
         println!(
             "{:<12}  {:<11}  {:<16}  {:<9}  {}",
@@ -808,6 +837,8 @@ mod tests {
             compiling: false,
             error: None,
             token: None,
+            ticket: None,
+            peers: None,
         }
     }
 
@@ -837,6 +868,32 @@ mod tests {
         let tail: String = piano.id.to_string().chars().rev().take(4).collect();
         let tail: String = tail.chars().rev().collect();
         assert_eq!(resolve(&s, &tail).unwrap().id, piano.id);
+    }
+
+    /// An uplink's ticket reaches `wk inspect`'s JSON in full — it is the one
+    /// string the remote side cannot connect without, and scraping it out of
+    /// the server's stderr used to be the only way to get it. Non-uplink
+    /// nodes omit the field entirely rather than carrying a null.
+    #[test]
+    fn inspect_reports_an_uplink_ticket_and_peers() {
+        let mut up = node(0xC3, "");
+        up.kind = "iroh".into();
+        up.runnable = false;
+        up.ticket = Some("endpointabc123".into());
+        up.peers = Some(2);
+        let s = snap(vec![up.clone(), node(0xD4, "vim")]);
+
+        let json = serde_json::to_string(&node_report(&s, &s.nodes[0])).unwrap();
+        assert!(
+            json.contains("endpointabc123"),
+            "full ticket in output: {json}"
+        );
+        assert!(json.contains("\"peers\":2"), "{json}");
+
+        // A plain app node carries neither field.
+        let plain = serde_json::to_string(&node_report(&s, &s.nodes[1])).unwrap();
+        assert!(!plain.contains("ticket"), "{plain}");
+        assert!(!plain.contains("peers"), "{plain}");
     }
 
     #[test]

@@ -3532,6 +3532,11 @@ impl Server {
                             .or_else(|| self.node_auth.as_ref().map(|(_, base)| base.clone()))
                             .map(|t| crate::workspace::bytes_hex(&t))
                     }),
+                    // An uplink's ticket is the whole point of the node: the
+                    // remote side can't dial without it, and it is otherwise
+                    // only ever printed to the server's stderr at startup.
+                    ticket: v.uplinks.get(&id).map(|u| u.ticket.clone()),
+                    peers: v.uplinks.get(&id).map(|u| u.peers),
                 }
             })
             .collect();

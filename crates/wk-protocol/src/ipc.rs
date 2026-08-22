@@ -59,6 +59,14 @@ pub struct NodeInfo {
     /// `None` for non-app nodes (or a server without node auth configured).
     #[serde(default)]
     pub token: Option<String>,
+    /// An uplink node's own dialable ticket — the string the *remote* side
+    /// pastes to reach this fabric. `None` for every other kind. (The ticket
+    /// it dials, if any, is its `args`.)
+    #[serde(default)]
+    pub ticket: Option<String>,
+    /// An uplink node's live peer-connection count. `None` for other kinds.
+    #[serde(default)]
+    pub peers: Option<usize>,
 }
 
 /// One wire between two nodes.
@@ -203,6 +211,8 @@ mod tests {
                 attached: false,
                 error: None,
                 token: None,
+                ticket: None,
+                peers: None,
             }],
             wires: vec![WireInfo {
                 kind: "file".into(),
