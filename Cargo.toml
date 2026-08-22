@@ -13,6 +13,11 @@ edition = "2021"
 # The wk binary is just the CLI: it parses args, runs the workspace
 # subcommands, builds the server, and hands it to a client. The contract, the
 # backend, and the local UI client each live in their own crate.
+[features]
+# See `wk-server`'s feature of the same name: builds a runtime that needs no
+# executable pages, at the cost of interpreting guest code.
+pulley = ["wk-server/pulley"]
+
 [dependencies]
 biscuit-auth = "6.0"
 wk-api = { path = "crates/wk-api" }

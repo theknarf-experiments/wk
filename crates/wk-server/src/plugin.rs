@@ -1251,9 +1251,42 @@ pub struct PluginHost {
     hub: Arc<wk_fabric::netstack::NetHub>,
 }
 
+/// Point `config` at the Pulley interpreter when built with the `pulley`
+/// feature; otherwise leave it on the host's native backend.
+///
+/// Pulley is a portable bytecode: compiling to it produces *data*, so the
+/// runtime never needs executable pages. That is the whole point — a platform
+/// can forbid mapping memory executable (iOS does) and guests still run. The
+/// bill is speed, and it varies with how compute-bound a guest is: guests
+/// paced by frames or I/O are close to native, while tight compute (crypto, an
+/// interpreter's own loop) lands roughly 10-20x slower.
+///
+/// The whole test suite doubles as the Pulley suite — `cargo test --features
+/// pulley` runs every plugin test through this backend.
+fn set_compile_target(config: &mut Config) -> Result<()> {
+    #[cfg(feature = "pulley")]
+    {
+        // Pulley's ISA is pointer-width and endianness specific, and the
+        // bytecode is produced for whatever the *host* will interpret it on.
+        let target = match (
+            cfg!(target_pointer_width = "64"),
+            cfg!(target_endian = "big"),
+        ) {
+            (true, false) => "pulley64",
+            (true, true) => "pulley64be",
+            (false, false) => "pulley32",
+            (false, true) => "pulley32be",
+        };
+        config.target(target)?;
+    }
+    let _ = config;
+    Ok(())
+}
+
 impl PluginHost {
     pub fn new() -> Result<Self> {
         let mut config = Config::new();
+        set_compile_target(&mut config)?;
         config.wasm_component_model(true);
         // The WebAssembly exception-handling proposal (new `exnref` model), so
         // guests that use setjmp/longjmp run: wasi-sdk lowers setjmp to wasm EH,
@@ -1268,10 +1301,11 @@ impl PluginHost {
         // Lets the server stop a runaway node: increment_epoch() each frame
         // trips the per-store deadline callback, which traps on `kill`.
         config.epoch_interruption(true);
-        // Persist compiled machine code to an on-disk cache so a plugin is only
-        // Cranelift-compiled once ever — subsequent launches load the cached
-        // artifact (a debug sqlite drops from ~3s to milliseconds). Best-effort:
-        // if the cache can't be set up, we just compile every launch as before.
+        // Persist compiled code to an on-disk cache so a plugin is only
+        // compiled once ever — subsequent launches load the cached artifact (a
+        // debug sqlite drops from ~3s to milliseconds). The cache key covers
+        // the compiler settings, so native and Pulley artifacts never mix.
+        // Best-effort: if the cache can't be set up, we compile every launch.
         match wasmtime::Cache::from_file(None) {
             Ok(cache) => {
                 config.cache(Some(cache));

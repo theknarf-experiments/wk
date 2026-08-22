@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "The wk backend: the authoritative Server plus the wasm runtime, virtual filesystem, userspace network, audio, MIDI, HTTP, and workspace persistence."
 
+[features]
+# Compile guests to Pulley bytecode and interpret them, rather than emitting
+# native machine code. Required wherever the platform forbids JIT (iOS).
+pulley = ["wasmtime/pulley"]
+
 [dependencies]
 wk-protocol = { path = "../wk-protocol" }
 biscuit-auth = "6.0"
