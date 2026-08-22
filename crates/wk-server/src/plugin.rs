@@ -2323,6 +2323,137 @@ mod tests {
         node.kill.store(true, Ordering::Relaxed);
     }
 
+    /// Live-coding's whole promise: a host file bind-mounted into the shader
+    /// node is re-read every frame, so editing it on disk swaps the running
+    /// program. Both shaders here are *static* (a constant colour), so a
+    /// change in the rendered pixels can only mean a recompile — an animated
+    /// shader would change pixels frame to frame on its own and prove
+    /// nothing. A mount that never took would render the colour-bar fallback,
+    /// which is not uniform, so the first wait would time out rather than
+    /// pass by accident.
+    #[test]
+    fn shader_hot_reloads_a_bind_mounted_file_edited_on_disk() {
+        let wasm = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../plugins/shader/target/wasm32-wasip1/debug/shader.wasm");
+        if !wasm.exists() {
+            eprintln!("skipping: build plugins/shader first (cargo component build)");
+            return;
+        }
+        // `u` stays referenced (times zero) so the uniform binding can't be
+        // optimised out of the pipeline layout; the colour is still constant.
+        let src = |rgb: &str| {
+            format!("fn main_image(uv: vec2<f32>) -> vec3<f32> {{\n    return {rgb} + vec3<f32>(0.0) * u.time;\n}}\n")
+        };
+        let dir = std::env::temp_dir().join(format!("wk-shader-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("live.wgsl");
+        std::fs::write(&path, src("vec3<f32>(1.0, 0.0, 0.0)")).expect("seed the shader file");
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let surfaces: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        host.spawn(
+            &wasm,
+            "shader",
+            id,
+            &[],
+            surfaces.clone(),
+            nodes.clone(),
+            Vec::new(),
+            None,
+        )
+        .expect("spawn");
+
+        // Bind the file in exactly as a BindMount wire does. The guest
+        // rescans `/` for a `.wgsl` every frame, so mounting after start is
+        // fine — this is the same "wired in later" path zipfs relies on.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let node = loop {
+            if let Some(n) = nodes.lock().unwrap().iter().find(|n| n.id == id).cloned() {
+                break n;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shader node never registered"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        crate::vfs::mount_host(&node.fs, "/live.wgsl", path.clone(), true);
+
+        let surface = loop {
+            if let Some(s) = surfaces.lock().unwrap().first().cloned() {
+                break s;
+            }
+            assert!(
+                !node.finished.load(Ordering::Relaxed),
+                "shader exited before opening a surface"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shader never opened a surface"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+
+        // Headless frame pacing, as the compositor would drive it.
+        let pump_frame = || {
+            let mut s = surface.lock().unwrap();
+            s.frame_ready = true;
+            s.wake();
+        };
+        // The single colour the whole surface is painted, once it is painted
+        // uniformly at all (`None` while it is blank or mid-paint).
+        let uniform_pixel = || -> Option<[u8; 4]> {
+            let s = surface.lock().unwrap();
+            let px = s.pixels.chunks_exact(4).next()?;
+            if px == [0, 0, 0, 0] || s.pixels.chunks_exact(4).any(|p| p != px) {
+                return None;
+            }
+            Some([px[0], px[1], px[2], px[3]])
+        };
+        let wait_for = |want: &dyn Fn(Option<[u8; 4]>) -> bool, what: &str| -> Option<[u8; 4]> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+            loop {
+                pump_frame();
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                let px = uniform_pixel();
+                if want(px) {
+                    return px;
+                }
+                assert!(
+                    !node.finished.load(Ordering::Relaxed),
+                    "shader exited while waiting for {what}"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for {what}"
+                );
+            }
+        };
+
+        let first =
+            wait_for(&|px| px.is_some(), "the mounted shader to render").expect("a uniform frame");
+
+        // The edit under test: same file, new contents, as a save from vim
+        // (or any host editor) would leave it.
+        std::fs::write(&path, src("vec3<f32>(0.0, 1.0, 0.0)")).expect("edit the shader file");
+        let second = wait_for(
+            &|px| matches!(px, Some(p) if p != first),
+            "the edit to be picked up",
+        )
+        .expect("a uniform frame");
+        assert_ne!(first, second, "the shader reloaded after the file changed");
+
+        {
+            let mut s = surface.lock().unwrap();
+            s.closed = true;
+            s.wake();
+        }
+        node.kill.store(true, Ordering::Relaxed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// wk's FUSE, end to end with real wasm: the hellofs plugin (a `wk:fs`
     /// provider) is spawned as a node, its served tree is mounted into a
     /// consumer filesystem, and reads/writes cross the mount into the running
