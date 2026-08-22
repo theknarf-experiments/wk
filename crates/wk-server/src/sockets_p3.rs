@@ -31,9 +31,9 @@ use wasmtime::component::{
 use wasmtime::StoreContextMut;
 
 use crate::sockets::{
-    fabric_tcp_socket, local_ip_for, on_fabric, resolve_name, udp_packet_buffer, ConnReady,
-    HostConn, NetCtx, SharedPipe, UdpReady, Want, WantReady, HOST_BUF_CAP, LISTEN_BACKLOG, TCP_BUF,
-    UDP_BUF,
+    fabric_tcp_socket, host_sockaddr, local_ip_for, on_fabric, resolve_name, smol_addr,
+    udp_packet_buffer, ConnReady, HostConn, HostUdp, NetCtx, SharedHostUdp, SharedPipe, UdpReady,
+    Want, WantReady, HOST_BUF_CAP, LISTEN_BACKLOG, TCP_BUF, UDP_BUF,
 };
 use wk_fabric::netstack::{NodeStack, SharedStack, SockKind};
 
@@ -155,6 +155,10 @@ pub struct UdpSocket {
     /// Default peer set by `connect` (POSIX "connected"): `send` is limited
     /// to it and `receive` filters to datagrams from it.
     remote: Option<IpSocketAddress>,
+    /// The gateway bridge, opened on the first off-fabric send — the same
+    /// [`HostUdp`] the 0.2 sockets use, so both generations reach the host
+    /// network the same way.
+    host: SharedHostUdp,
 }
 
 /// Adapt a `ResourceTable` error into a trap (the guest misused a handle).
@@ -1254,6 +1258,7 @@ impl<T: NetView + Send> wasi::sockets::types::HostUdpSocket for SockImpl<&mut T>
             bound: false,
             bound_port: 0,
             local: None,
+            host: Default::default(),
             remote: None,
         }))
     }
@@ -1385,34 +1390,75 @@ impl<T: NetView + Send + 'static> wasi::sockets::types::HostUdpSocketWithStore<T
             SocketHandle,
             u64,
             (smoltcp::wire::IpAddress, u16),
+            IpAddressFamily,
+            SharedHostUdp,
         );
-        let (stack, handle, gen, dest) = store.with(|mut a| -> SocketsResult<SendPlan> {
-            let mut view = a.get();
-            let bound = tbl(view.table().get(&socket))?.bound;
-            if !bound {
-                // WASI requires send to perform an implicit bind.
-                view.udp_bind(&socket, 0)?;
-            }
-            let s = tbl(view.table().get(&socket))?;
-            let dest = match (s.remote, remote_address) {
-                // A connected socket only sends to its peer.
-                (Some(peer), Some(given)) if to_smol3(given) != to_smol3(peer) => {
-                    return Err(ErrorCode::InvalidArgument.into())
+        let (stack, handle, gen, dest, family, host_cell) =
+            store.with(|mut a| -> SocketsResult<SendPlan> {
+                let mut view = a.get();
+                let bound = tbl(view.table().get(&socket))?.bound;
+                if !bound {
+                    // WASI requires send to perform an implicit bind.
+                    view.udp_bind(&socket, 0)?;
                 }
-                (Some(peer), _) => peer,
-                (None, Some(given)) => given,
-                (None, None) => return Err(ErrorCode::InvalidArgument.into()),
-            };
-            let (ip, port) = to_smol3(dest);
-            if port == 0 || ip.is_unspecified() {
-                return Err(ErrorCode::InvalidArgument.into());
+                let s = tbl(view.table().get(&socket))?;
+                let dest = match (s.remote, remote_address) {
+                    // A connected socket only sends to its peer.
+                    (Some(peer), Some(given)) if to_smol3(given) != to_smol3(peer) => {
+                        return Err(ErrorCode::InvalidArgument.into())
+                    }
+                    (Some(peer), _) => peer,
+                    (None, Some(given)) => given,
+                    (None, None) => return Err(ErrorCode::InvalidArgument.into()),
+                };
+                let (ip, port) = to_smol3(dest);
+                if port == 0 || ip.is_unspecified() {
+                    return Err(ErrorCode::InvalidArgument.into());
+                }
+                Ok((
+                    s.stack.clone(),
+                    s.handle,
+                    s.gen,
+                    (ip, port),
+                    s.family,
+                    s.host.clone(),
+                ))
+            })?;
+
+        // Off-fabric: bridge to the real host network, but only for a node
+        // wired to a Gateway — the same rule connect() applies for TCP, and
+        // the same bridge the 0.2 path uses.
+        if !on_fabric(dest.0) {
+            if !stack.lock().unwrap().host_access {
+                return Err(ErrorCode::AccessDenied.into());
             }
-            Ok((s.stack.clone(), s.handle, s.gen, (ip, port)))
-        })?;
+            let bridge = {
+                let mut cell = host_cell.lock().unwrap();
+                if cell.is_none() {
+                    *cell = HostUdp::open(matches!(family, IpAddressFamily::Ipv4))
+                        .map(std::sync::Arc::new);
+                }
+                cell.clone()
+            };
+            let Some(bridge) = bridge else {
+                // The host socket could not be created (no host networking,
+                // or FDs exhausted).
+                return Err(ErrorCode::OutOfMemory.into());
+            };
+            // A host socket is effectively always writable, so unlike the
+            // fabric path there is no buffer-space wait here.
+            return if bridge.send_to(&data, host_sockaddr(dest.0, dest.1)) {
+                Ok(())
+            } else {
+                Err(ErrorCode::RemoteUnreachable.into())
+            };
+        }
+
         loop {
             // Wait for buffer space; the hub tick wakes the parked waker.
             UdpReady {
-                // 0.3 has no UDP gateway bridge yet (see sockets.rs HostUdp).
+                // Send readiness is about the fabric socket's buffer; the
+                // gateway path returned above.
                 host: None,
                 stack: stack.clone(),
                 handle,
@@ -1446,26 +1492,54 @@ impl<T: NetView + Send + 'static> wasi::sockets::types::HostUdpSocketWithStore<T
             u64,
             Option<IpSocketAddress>,
             IpAddressFamily,
+            SharedHostUdp,
         );
-        let (stack, handle, gen, filter, family) =
+        let (stack, handle, gen, filter, family, host_cell) =
             store.with(|mut a| -> SocketsResult<RecvPlan> {
                 let mut view = a.get();
                 let s = tbl(view.table().get(&socket))?;
                 if !s.bound {
                     return Err(ErrorCode::InvalidState.into());
                 }
-                Ok((s.stack.clone(), s.handle, s.gen, s.remote, s.family))
+                Ok((
+                    s.stack.clone(),
+                    s.handle,
+                    s.gen,
+                    s.remote,
+                    s.family,
+                    s.host.clone(),
+                ))
             })?;
         loop {
             UdpReady {
-                // 0.3 has no UDP gateway bridge yet (see sockets.rs HostUdp).
-                host: None,
+                host: Some(host_cell.clone()),
                 stack: stack.clone(),
                 handle,
                 gen,
                 send: false,
             }
             .await;
+
+            // Anything that came back over the gateway, before the fabric
+            // socket — the same order the 0.2 path uses.
+            let from_host = host_cell
+                .lock()
+                .unwrap()
+                .clone()
+                .and_then(|b| b.next_datagram());
+            if let Some((data, src)) = from_host {
+                let (sip, sport) = smol_addr(src);
+                if !family_matches(sip, family) {
+                    continue;
+                }
+                let src = from_smol3(sip, sport);
+                if let Some(peer) = filter {
+                    if to_smol3(peer) != to_smol3(src) {
+                        continue;
+                    }
+                }
+                return Ok((data, src));
+            }
             let mut g = stack.lock().unwrap();
             if !g.is_current(handle, gen) {
                 return Err(ErrorCode::InvalidState.into());
@@ -1742,6 +1816,87 @@ mod tests {
             sr.expect("server run_concurrent").expect("server body");
             cr.expect("client run_concurrent").expect("client body");
         });
+    }
+
+    /// wasi 0.3 reaches a real host UDP service through a Gateway — the same
+    /// bridge the 0.2 sockets use, so both generations behave alike.
+    ///
+    /// As in the 0.2 test, the target must be a non-loopback address:
+    /// `on_fabric` claims 127/8 for the guest's own loopback, so a localhost
+    /// echo server would never take the host path and the test would pass
+    /// while proving nothing. Skips when the machine has no routable address.
+    #[test]
+    fn p3_udp_reaches_a_host_service_through_a_gateway() {
+        let Some(std::net::IpAddr::V4(local_ip)) = std::net::UdpSocket::bind("0.0.0.0:0")
+            .ok()
+            .and_then(|s| s.connect("8.8.8.8:53").ok().map(|_| s))
+            .and_then(|s| s.local_addr().ok())
+            .map(|a| a.ip())
+            .filter(|ip| !ip.is_loopback())
+        else {
+            eprintln!("skipping: no non-loopback local address to serve on");
+            return;
+        };
+        let o = local_ip.octets();
+
+        // A host UDP echo server, reachable at the machine's own address.
+        let server = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind host echo");
+        let host_port = server.local_addr().expect("local addr").port();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopper = stop.clone();
+        std::thread::spawn(move || {
+            server
+                .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+                .expect("read timeout");
+            let mut buf = [0u8; 2048];
+            while !stopper.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok((n, src)) = server.recv_from(&mut buf) {
+                    let mut reply = b"p3:".to_vec();
+                    reply.extend_from_slice(&buf[..n]);
+                    let _ = server.send_to(&reply, src);
+                }
+            }
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .enable_io()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let hub = NetHub::new();
+            let net = NodeId::nil();
+            let stack = hub.attach(net, Ipv4Address::new(10, 0, 0, 1), "client");
+            // What wiring the node to a Gateway node grants.
+            stack.lock().unwrap().host_access = true;
+            let engine = engine();
+            let mut store = store_on(&engine, Some(NetCtx::new(stack, hub.clone())));
+
+            let body = store.run_concurrent(async move |acc| {
+                use wasi::sockets::types::HostUdpSocket as H;
+                use wasi::sockets::types::HostUdpSocketWithStore as S;
+                let nacc: Nacc = acc.with_getter(|s| SockImpl(s));
+                let sock = must(nacc.with(|mut a| H::create(&mut a.get(), IpAddressFamily::Ipv4)));
+                must(nacc.with(|mut a| H::bind(&mut a.get(), res(&sock), v4(10, 0, 0, 1, 4244))));
+                let dest = v4(o[0], o[1], o[2], o[3], host_port);
+                must(S::send(&nacc, res(&sock), b"hello".to_vec(), Some(dest)).await);
+                let (data, from) = must(S::receive(&nacc, res(&sock)).await);
+                assert_eq!(data, b"p3:hello");
+                // The reply came from the host service, not the fabric.
+                assert!(matches!(
+                    from,
+                    IpSocketAddress::Ipv4(p) if p.address == (o[0], o[1], o[2], o[3])
+                ));
+                wasmtime::error::Ok(())
+            });
+
+            tokio::time::timeout(std::time::Duration::from_secs(30), body)
+                .await
+                .expect("host udp round-trip timed out")
+                .expect("run_concurrent")
+                .expect("body");
+        });
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// UDP round-trip between two nodes on the same net, including the

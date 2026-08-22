@@ -238,15 +238,14 @@ impl Drop for HostUdp {
 }
 
 impl HostUdp {
-    /// Bind a host UDP socket of `family` and start reading into `rx`.
-    /// `None` if the bind fails (no host networking, sandbox, FD exhaustion).
-    fn open(family: IpAddressFamily) -> Option<HostUdp> {
+    /// Bind a host UDP socket and start reading into `rx`. `None` if the bind
+    /// fails (no host networking, sandbox, FD exhaustion). Takes a plain
+    /// `ipv4` flag rather than a family, because wasi 0.2 and 0.3 each have
+    /// their own `IpAddressFamily` type and both generations share this.
+    pub(crate) fn open(ipv4: bool) -> Option<HostUdp> {
         use std::sync::atomic::AtomicBool;
         use std::sync::{Arc, Mutex};
-        let bind = match family {
-            IpAddressFamily::Ipv4 => "0.0.0.0:0",
-            IpAddressFamily::Ipv6 => "[::]:0",
-        };
+        let bind = if ipv4 { "0.0.0.0:0" } else { "[::]:0" };
         let sock = Arc::new(std::net::UdpSocket::bind(bind).ok()?);
         sock.set_read_timeout(Some(std::time::Duration::from_millis(10)))
             .ok()?;
@@ -278,18 +277,36 @@ impl HostUdp {
     }
 
     /// Send one datagram to a real host address.
-    fn send_to(&self, data: &[u8], addr: std::net::SocketAddr) -> bool {
+    pub(crate) fn send_to(&self, data: &[u8], addr: std::net::SocketAddr) -> bool {
         self.sock.send_to(data, addr).is_ok()
     }
 
     /// Whether any host datagram is waiting (drives poll readiness).
-    fn has_datagrams(&self) -> bool {
+    pub(crate) fn has_datagrams(&self) -> bool {
         !self.rx.lock().unwrap().is_empty()
     }
 
     /// Take the next received datagram, if any.
-    fn next_datagram(&self) -> Option<(Vec<u8>, std::net::SocketAddr)> {
+    pub(crate) fn next_datagram(&self) -> Option<(Vec<u8>, std::net::SocketAddr)> {
         self.rx.lock().unwrap().pop_front()
+    }
+}
+
+/// A fabric/smoltcp address as the host's sockaddr, for handing to a real
+/// socket. Shared by both wasi generations' gateway paths.
+pub(crate) fn host_sockaddr(ip: smoltcp::wire::IpAddress, port: u16) -> std::net::SocketAddr {
+    match ip {
+        smoltcp::wire::IpAddress::Ipv4(v4) => std::net::SocketAddr::from((v4.octets(), port)),
+        smoltcp::wire::IpAddress::Ipv6(v6) => std::net::SocketAddr::from((v6.octets(), port)),
+    }
+}
+
+/// The inverse of [`host_sockaddr`]: a host sockaddr as a smoltcp address +
+/// port, which each generation then renders in its own wasi address type.
+pub(crate) fn smol_addr(addr: std::net::SocketAddr) -> (smoltcp::wire::IpAddress, u16) {
+    match addr {
+        std::net::SocketAddr::V4(a) => (smoltcp::wire::IpAddress::Ipv4(*a.ip()), a.port()),
+        std::net::SocketAddr::V6(a) => (smoltcp::wire::IpAddress::Ipv6(*a.ip()), a.port()),
     }
 }
 
@@ -1871,14 +1888,8 @@ impl wasi::sockets::udp::HostIncomingDatagramStream for HostState {
                 let Some((data, src)) = bridge.next_datagram() else {
                     break;
                 };
-                let remote_address = match src {
-                    std::net::SocketAddr::V4(a) => {
-                        from_smol(smoltcp::wire::IpAddress::Ipv4(*a.ip()), a.port())
-                    }
-                    std::net::SocketAddr::V6(a) => {
-                        from_smol(smoltcp::wire::IpAddress::Ipv6(*a.ip()), a.port())
-                    }
-                };
+                let (sip, sport) = smol_addr(src);
+                let remote_address = from_smol(sip, sport);
                 // Same contract as the fabric path: a stream bound to one peer
                 // only yields that peer's datagrams.
                 if let Some(f) = filter {
@@ -2015,7 +2026,8 @@ impl wasi::sockets::udp::HostOutgoingDatagramStream for HostState {
             let bridge = {
                 let mut cell = host_cell.lock().unwrap();
                 if cell.is_none() {
-                    *cell = HostUdp::open(family).map(std::sync::Arc::new);
+                    *cell = HostUdp::open(matches!(family, IpAddressFamily::Ipv4))
+                        .map(std::sync::Arc::new);
                 }
                 cell.clone()
             };
@@ -2025,15 +2037,7 @@ impl wasi::sockets::udp::HostOutgoingDatagramStream for HostState {
                 }
                 break;
             };
-            let addr = match ip {
-                smoltcp::wire::IpAddress::Ipv4(v4) => {
-                    std::net::SocketAddr::from((v4.octets(), port))
-                }
-                smoltcp::wire::IpAddress::Ipv6(v6) => {
-                    std::net::SocketAddr::from((v6.octets(), port))
-                }
-            };
-            if !bridge.send_to(&dg.data, addr) {
+            if !bridge.send_to(&dg.data, host_sockaddr(ip, port)) {
                 break;
             }
             sent += 1;
