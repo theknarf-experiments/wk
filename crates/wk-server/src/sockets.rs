@@ -205,6 +205,98 @@ impl HostConn {
     }
 }
 
+/// How many host datagrams queue for a gatewayed UDP socket before further
+/// arrivals are dropped. Datagram loss is already part of UDP's contract, so a
+/// guest that stops reading loses packets rather than growing host RAM.
+pub(crate) const HOST_UDP_QUEUE: usize = 256;
+
+/// The host-side half of a **gatewayed UDP socket**: one real [`std::net::UdpSocket`]
+/// shared by every off-fabric destination the guest sends to, plus the
+/// datagrams received back. This is UDP's answer to [`HostConn`] — but where a
+/// TCP bridge is per-connection, one of these serves all peers, which is what
+/// a UDP socket is.
+///
+/// Created lazily on the first off-fabric send, so a fabric-only UDP socket
+/// never costs a host FD, and only for a node wired to a Gateway.
+pub(crate) struct HostUdp {
+    sock: std::sync::Arc<std::net::UdpSocket>,
+    /// Received datagrams (payload, source), oldest first.
+    rx: UdpRxQueue,
+    abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The queue a [`HostUdp`]'s reader thread fills and the guest drains.
+type UdpRxQueue =
+    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(Vec<u8>, std::net::SocketAddr)>>>;
+
+impl Drop for HostUdp {
+    fn drop(&mut self) {
+        // The guest dropped the socket: the reader thread sees `abort`, exits,
+        // and the last Arc drop closes the host FD.
+        self.abort.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl HostUdp {
+    /// Bind a host UDP socket of `family` and start reading into `rx`.
+    /// `None` if the bind fails (no host networking, sandbox, FD exhaustion).
+    fn open(family: IpAddressFamily) -> Option<HostUdp> {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+        let bind = match family {
+            IpAddressFamily::Ipv4 => "0.0.0.0:0",
+            IpAddressFamily::Ipv6 => "[::]:0",
+        };
+        let sock = Arc::new(std::net::UdpSocket::bind(bind).ok()?);
+        sock.set_read_timeout(Some(std::time::Duration::from_millis(10)))
+            .ok()?;
+        let rx = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let abort = Arc::new(AtomicBool::new(false));
+        let (s, q, ab) = (sock.clone(), rx.clone(), abort.clone());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            while !ab.load(std::sync::atomic::Ordering::Relaxed) {
+                match s.recv_from(&mut buf) {
+                    Ok((n, src)) => {
+                        let mut q = q.lock().unwrap();
+                        // Tail-drop when the guest isn't draining: a full
+                        // socket buffer loses datagrams on any OS too.
+                        if q.len() < HOST_UDP_QUEUE {
+                            q.push_back((buf[..n].to_vec(), src));
+                        }
+                    }
+                    // A timeout is the idle case; any other error ends the
+                    // bridge (the socket is unusable).
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        Some(HostUdp { sock, rx, abort })
+    }
+
+    /// Send one datagram to a real host address.
+    fn send_to(&self, data: &[u8], addr: std::net::SocketAddr) -> bool {
+        self.sock.send_to(data, addr).is_ok()
+    }
+
+    /// Whether any host datagram is waiting (drives poll readiness).
+    fn has_datagrams(&self) -> bool {
+        !self.rx.lock().unwrap().is_empty()
+    }
+
+    /// Take the next received datagram, if any.
+    fn next_datagram(&self) -> Option<(Vec<u8>, std::net::SocketAddr)> {
+        self.rx.lock().unwrap().pop_front()
+    }
+}
+
+/// A UDP socket's lazily-opened host bridge, shared between the socket and the
+/// datagram streams it hands out (the stream sends, the socket owns).
+pub(crate) type SharedHostUdp = std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<HostUdp>>>>;
+
 /// Pump bytes between a real host socket and the guest pipes until either side
 /// closes or the guest drops the socket (`abort`). A short read timeout lets one
 /// thread service both directions; buffering is bounded by [`HOST_BUF_CAP`].
@@ -282,6 +374,10 @@ pub struct UdpSock {
     /// Default peer set by the most recent `stream` call (POSIX "connected").
     remote: Option<IpSocketAddress>,
     bound: bool,
+    /// The host bridge, opened on the first off-fabric send (see [`HostUdp`]).
+    /// Shared with this socket's datagram streams, which is where sends and
+    /// receives actually happen.
+    host: SharedHostUdp,
 }
 
 /// An incoming or outgoing datagram stream over a node's UDP socket. For an
@@ -297,6 +393,8 @@ pub struct Datagrams {
     /// both), so the guest never sees a remote address its family can't
     /// represent — wasi 0.2 sockets are never dual-stack.
     family: IpAddressFamily,
+    /// The owning socket's host bridge (see [`UdpSock::host`]).
+    host: SharedHostUdp,
 }
 
 pub struct ResolveStream {
@@ -570,10 +668,27 @@ pub(crate) struct UdpReady {
     pub(crate) handle: SocketHandle,
     pub(crate) gen: u64,
     pub(crate) send: bool,
+    /// The socket's gateway bridge, so a datagram from the host network makes
+    /// the stream readable too (the hub's per-tick wake re-polls this).
+    pub(crate) host: Option<SharedHostUdp>,
 }
 impl Future for UdpReady {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
+        // A queued host datagram is readable regardless of the fabric socket's
+        // state — and of whether the handle is still current.
+        if !self.send {
+            if let Some(cell) = &self.host {
+                if cell
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|b| b.has_datagrams())
+                {
+                    return Poll::Ready(());
+                }
+            }
+        }
         let mut g = self.stack.lock().unwrap();
         if !g.is_current(self.handle, self.gen) {
             return Poll::Ready(());
@@ -598,6 +713,7 @@ struct UdpStreamPollable {
     handle: SocketHandle,
     gen: u64,
     send: bool,
+    host: Option<SharedHostUdp>,
 }
 #[async_trait]
 impl Pollable for UdpStreamPollable {
@@ -607,6 +723,7 @@ impl Pollable for UdpStreamPollable {
             handle: self.handle,
             gen: self.gen,
             send: self.send,
+            host: self.host.clone(),
         }
         .await
     }
@@ -1526,6 +1643,7 @@ impl wasi::sockets::udp_create_socket::Host for HostState {
             local: None,
             remote: None,
             bound: false,
+            host: Default::default(),
         })?))
     }
 }
@@ -1599,9 +1717,9 @@ impl wasi::sockets::udp::HostUdpSocket for HostState {
         let Some(stack) = self.stack() else {
             return Ok(Err(ErrorCode::AccessDenied));
         };
-        let (handle, gen, bound, family) = {
+        let (handle, gen, bound, family, host) = {
             let s = self.table().get(&this)?;
-            (s.handle, s.gen, s.bound, s.family)
+            (s.handle, s.gen, s.bound, s.family, s.host.clone())
         };
         if !bound {
             return Ok(Err(ErrorCode::InvalidState));
@@ -1614,6 +1732,7 @@ impl wasi::sockets::udp::HostUdpSocket for HostState {
             gen,
             remote,
             family,
+            host: host.clone(),
         })?;
         let outgoing = self.table().push(Datagrams {
             stack,
@@ -1621,6 +1740,7 @@ impl wasi::sockets::udp::HostUdpSocket for HostState {
             gen,
             remote,
             family,
+            host,
         })?;
         Ok(Ok((incoming, outgoing)))
     }
@@ -1704,6 +1824,9 @@ impl wasi::sockets::udp::HostUdpSocket for HostState {
             handle,
             gen,
             send: true,
+            // Send readiness never depends on the host bridge (a host socket
+            // is always writable), so this poll doesn't need it.
+            host: None,
         })?;
         subscribe(self.table(), p)
     }
@@ -1728,11 +1851,48 @@ impl wasi::sockets::udp::HostIncomingDatagramStream for HostState {
         this: Resource<Datagrams>,
         max_results: u64,
     ) -> Result<std::result::Result<Vec<wasi::sockets::udp::IncomingDatagram>, ErrorCode>> {
-        let (stack, handle, gen, filter, family) = {
+        let (stack, handle, gen, filter, family, host_cell) = {
             let d = self.table().get(&this)?;
-            (d.stack.clone(), d.handle, d.gen, d.remote, d.family)
+            (
+                d.stack.clone(),
+                d.handle,
+                d.gen,
+                d.remote,
+                d.family,
+                d.host.clone(),
+            )
         };
         let mut out = Vec::new();
+
+        // Datagrams that came back over the gateway, if this socket has a host
+        // bridge. Taken first so a busy fabric can't starve them.
+        if let Some(bridge) = host_cell.lock().unwrap().clone() {
+            while (out.len() as u64) < max_results {
+                let Some((data, src)) = bridge.next_datagram() else {
+                    break;
+                };
+                let remote_address = match src {
+                    std::net::SocketAddr::V4(a) => {
+                        from_smol(smoltcp::wire::IpAddress::Ipv4(*a.ip()), a.port())
+                    }
+                    std::net::SocketAddr::V6(a) => {
+                        from_smol(smoltcp::wire::IpAddress::Ipv6(*a.ip()), a.port())
+                    }
+                };
+                // Same contract as the fabric path: a stream bound to one peer
+                // only yields that peer's datagrams.
+                if let Some(f) = filter {
+                    if to_smol(f) != to_smol(remote_address) {
+                        continue;
+                    }
+                }
+                out.push(wasi::sockets::udp::IncomingDatagram {
+                    data,
+                    remote_address,
+                });
+            }
+        }
+
         let mut g = stack.lock().unwrap();
         if !g.is_current(handle, gen) {
             return Ok(Ok(out));
@@ -1767,15 +1927,16 @@ impl wasi::sockets::udp::HostIncomingDatagramStream for HostState {
         Ok(Ok(out))
     }
     fn subscribe(&mut self, this: Resource<Datagrams>) -> Result<Resource<DynPollable>> {
-        let (stack, handle, gen) = {
+        let (stack, handle, gen, host) = {
             let d = self.table().get(&this)?;
-            (d.stack.clone(), d.handle, d.gen)
+            (d.stack.clone(), d.handle, d.gen, d.host.clone())
         };
         let p = self.table().push(UdpStreamPollable {
             stack,
             handle,
             gen,
             send: false,
+            host: Some(host),
         })?;
         subscribe(self.table(), p)
     }
@@ -1806,15 +1967,22 @@ impl wasi::sockets::udp::HostOutgoingDatagramStream for HostState {
         this: Resource<Datagrams>,
         datagrams: Vec<wasi::sockets::udp::OutgoingDatagram>,
     ) -> Result<std::result::Result<u64, ErrorCode>> {
-        let (stack, handle, gen, default_remote) = {
+        let (stack, handle, gen, default_remote, family, host_cell) = {
             let d = self.table().get(&this)?;
-            (d.stack.clone(), d.handle, d.gen, d.remote)
+            (
+                d.stack.clone(),
+                d.handle,
+                d.gen,
+                d.remote,
+                d.family,
+                d.host.clone(),
+            )
         };
         let mut g = stack.lock().unwrap();
         if !g.is_current(handle, gen) {
             return Ok(Ok(0));
         }
-        let s = g.sockets.get_mut::<udp::Socket>(handle);
+        let host_access = g.host_access;
         let mut sent = 0u64;
         for dg in datagrams {
             // Per-datagram destination, or the stream's default peer.
@@ -1828,8 +1996,45 @@ impl wasi::sockets::udp::HostOutgoingDatagramStream for HostState {
                 }
             };
             let (ip, port) = to_smol(dest);
-            if s.send_slice(&dg.data, (ip, port)).is_err() {
-                break; // send buffer full: stop, report what we queued
+            if on_fabric(ip) {
+                let s = g.sockets.get_mut::<udp::Socket>(handle);
+                if s.send_slice(&dg.data, (ip, port)).is_err() {
+                    break; // send buffer full: stop, report what we queued
+                }
+                sent += 1;
+                continue;
+            }
+            // Off-fabric: bridge to the real host network, but only for a node
+            // wired to a Gateway — the same rule TCP's connect applies.
+            if !host_access {
+                if sent == 0 {
+                    return Ok(Err(ErrorCode::AccessDenied));
+                }
+                break;
+            }
+            let bridge = {
+                let mut cell = host_cell.lock().unwrap();
+                if cell.is_none() {
+                    *cell = HostUdp::open(family).map(std::sync::Arc::new);
+                }
+                cell.clone()
+            };
+            let Some(bridge) = bridge else {
+                if sent == 0 {
+                    return Ok(Err(ErrorCode::Unknown));
+                }
+                break;
+            };
+            let addr = match ip {
+                smoltcp::wire::IpAddress::Ipv4(v4) => {
+                    std::net::SocketAddr::from((v4.octets(), port))
+                }
+                smoltcp::wire::IpAddress::Ipv6(v6) => {
+                    std::net::SocketAddr::from((v6.octets(), port))
+                }
+            };
+            if !bridge.send_to(&dg.data, addr) {
+                break;
             }
             sent += 1;
         }
@@ -1845,6 +2050,7 @@ impl wasi::sockets::udp::HostOutgoingDatagramStream for HostState {
             handle,
             gen,
             send: true,
+            host: None,
         })?;
         subscribe(self.table(), p)
     }

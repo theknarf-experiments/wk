@@ -13,16 +13,23 @@
 //! node's authority for whoever dials it — a confused deputy). [`listen_net`]
 //! instead joins a network itself and accepts any member — for endpoints that
 //! carry no caller authority, like a HostService bridging a host TCP service.
+//!
+//! `listen_net` also carries the **UDP** half of a HostService, because both
+//! protocols must share one bridge NIC: two NICs answering to the same fabric
+//! name would give it two addresses, and `NetHub::resolve` returns whichever
+//! it finds first — so a guest could resolve the name and reach only half the
+//! service. See [`udp_host_pump`].
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use smoltcp::socket::tcp;
-use smoltcp::wire::IpAddress;
+use smoltcp::socket::{tcp, udp};
+use smoltcp::wire::{IpAddress, IpEndpoint};
 
 use crate::netstack::{NetHub, SharedStack, SockKind};
 
@@ -32,6 +39,16 @@ const SOCK_BUF: usize = 64 * 1024;
 /// How many sockets sit in Listen at once — the accept backlog. More than one
 /// so the port is never momentarily unattended (see the accept loop).
 const BACKLOG: usize = 4;
+
+/// Drop a fabric peer's host-side UDP socket after this long without traffic —
+/// the same NAT timeout [`crate::portfwd`] uses in the opposite direction.
+const UDP_IDLE: Duration = Duration::from_secs(120);
+
+fn udp_socket() -> udp::Socket<'static> {
+    // Payloads are bounded by the fabric MTU (1280); 16 packets per direction.
+    let buf = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 16 * 1280]);
+    udp::Socket::new(buf(), buf())
+}
 
 fn tcp_socket() -> tcp::Socket<'static> {
     tcp::Socket::new(
@@ -53,7 +70,7 @@ pub fn listen(
     kill: Arc<AtomicBool>,
     on_conn: Arc<dyn Fn(UnixStream) + Send + Sync>,
 ) {
-    listen_impl(hub, Some(follow), None, name, port, kill, on_conn)
+    listen_impl(hub, Some(follow), None, name, port, kill, on_conn, None)
 }
 
 /// Listen on the fabric as a named peer of the network `net` itself, accepting
@@ -61,6 +78,9 @@ pub fn listen(
 /// is for endpoints that carry no caller authority (a HostService bridging a
 /// plain TCP service), unlike the Api listener, whose per-node allow-list
 /// exists because its connections act with the wired node's token.
+///
+/// `udp_target` additionally NATs fabric UDP datagrams on the same port to
+/// that host `addr:port` (see [`udp_host_pump`]); `None` serves TCP only.
 pub fn listen_net(
     hub: Arc<NetHub>,
     net: wk_protocol::NodeId,
@@ -68,10 +88,12 @@ pub fn listen_net(
     port: u16,
     kill: Arc<AtomicBool>,
     on_conn: Arc<dyn Fn(UnixStream) + Send + Sync>,
+    udp_target: Option<String>,
 ) {
-    listen_impl(hub, None, Some(net), name, port, kill, on_conn)
+    listen_impl(hub, None, Some(net), name, port, kill, on_conn, udp_target)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn listen_impl(
     hub: Arc<NetHub>,
     follow: Option<SharedStack>,
@@ -80,6 +102,7 @@ fn listen_impl(
     port: u16,
     kill: Arc<AtomicBool>,
     on_conn: Arc<dyn Fn(UnixStream) + Send + Sync>,
+    udp_target: Option<String>,
 ) {
     let net = match (&follow, fixed_net) {
         (Some(f), _) => f.lock().unwrap().net,
@@ -93,6 +116,26 @@ fn listen_impl(
     // dropped SYN can fail the connection outright rather than retrying.
     let initial_backlog: Vec<smoltcp::iface::SocketHandle> =
         (0..BACKLOG).map(|_| add_listener(&bridge, port)).collect();
+    // Bind the UDP side synchronously too, and for the same reason as the
+    // backlog above: a datagram that arrives before the bind is simply lost,
+    // and UDP has no retransmit to paper over it. Binding inside the pump
+    // thread made the first datagrams after a publish disappear whenever
+    // thread startup lost the race.
+    let udp_bits = udp_target.map(|t| {
+        let handle = {
+            let mut g = bridge.lock().unwrap();
+            let h = g.sockets.add(udp_socket());
+            let _gen = g.track(h);
+            match g.sockets.get_mut::<udp::Socket>(h).bind(port) {
+                Ok(()) => Some(h),
+                Err(_) => {
+                    g.begin_close(h, SockKind::Udp);
+                    None
+                }
+            }
+        };
+        (t, bridge.clone(), kill.clone(), handle)
+    });
 
     let accept_thread = std::thread::Builder::new()
         .name(format!("wk-fabric-listen-{name}"))
@@ -182,14 +225,129 @@ fn listen_impl(
         })
         .expect("spawn fabric listen thread");
 
-    // Detach the bridge NIC once the accept loop is done with it.
+    // The UDP half, on the *same* bridge NIC (see the module docs).
+    let udp_thread = udp_bits.and_then(|(target, bridge, kill, handle)| {
+        let handle = handle?;
+        Some(
+            std::thread::Builder::new()
+                .name(format!("wk-fabric-listen-udp-{name}"))
+                .spawn(move || udp_host_pump(bridge, handle, target, kill))
+                .expect("spawn fabric listen udp thread"),
+        )
+    });
+
+    // Detach the bridge NIC once both protocol loops are done with it.
     std::thread::Builder::new()
         .name("wk-fabric-listen-detach".into())
         .spawn(move || {
             let _ = accept_thread.join();
+            if let Some(t) = udp_thread {
+                let _ = t.join();
+            }
             hub.detach(&bridge);
         })
         .expect("spawn fabric listen supervisor");
+}
+
+/// Resolve a host `addr:port` target — a literal, or a name the host resolver
+/// knows (`localhost:8080`, a LAN host).
+fn resolve_target(target: &str) -> Option<SocketAddr> {
+    target
+        .parse()
+        .ok()
+        .or_else(|| target.to_socket_addrs().ok()?.next())
+}
+
+/// NAT fabric UDP datagrams out to a host service: the mirror of
+/// [`crate::portfwd`]'s `udp_pump`. `fabric_handle` is the already-bound
+/// fabric socket (bound by the caller, before publishing — see there for why),
+/// which receives from every peer on the net; each distinct peer endpoint gets
+/// its own host [`UdpSocket`], so replies from the service return only to the
+/// peer that asked. Idle peers expire after [`UDP_IDLE`].
+///
+/// UDP has no accept: a peer "arrives" simply by being a source address we
+/// have not seen, which is why this demultiplexes rather than mirroring the
+/// TCP backlog above.
+fn udp_host_pump(
+    bridge: SharedStack,
+    fabric_handle: smoltcp::iface::SocketHandle,
+    target: String,
+    kill: Arc<AtomicBool>,
+) {
+    struct Session {
+        sock: UdpSocket,
+        last: Instant,
+    }
+    let mut sessions: HashMap<IpEndpoint, Session> = HashMap::new();
+    let mut buf = [0u8; 2048];
+
+    while !kill.load(Ordering::Relaxed) {
+        let mut idle = true;
+
+        // Fabric -> host: drain everything the bridge received this round.
+        loop {
+            let got = {
+                let mut g = bridge.lock().unwrap();
+                match g.sockets.get_mut::<udp::Socket>(fabric_handle).recv() {
+                    Ok((data, meta)) => Some((data.to_vec(), meta.endpoint)),
+                    Err(_) => None,
+                }
+            };
+            let Some((data, peer)) = got else { break };
+            idle = false;
+            // A peer we haven't seen gets its own host socket, bound to an
+            // ephemeral port the OS picks.
+            let sess = match sessions.entry(peer) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    let Some(dst) = resolve_target(&target) else {
+                        continue; // unresolvable right now — drop, like any NAT
+                    };
+                    let bind_addr = if dst.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+                    let Ok(sock) = UdpSocket::bind(bind_addr) else {
+                        continue;
+                    };
+                    if sock.set_nonblocking(true).is_err() || sock.connect(dst).is_err() {
+                        continue;
+                    }
+                    v.insert(Session {
+                        sock,
+                        last: Instant::now(),
+                    })
+                }
+            };
+            sess.last = Instant::now();
+            // `connect`ed, so send() targets the service and the kernel drops
+            // replies from anyone else.
+            let _ = sess.sock.send(&data);
+        }
+
+        // Host -> fabric: each peer's replies go back to that peer alone.
+        for (peer, sess) in sessions.iter_mut() {
+            while let Ok(n) = sess.sock.recv(&mut buf) {
+                idle = false;
+                sess.last = Instant::now();
+                let mut g = bridge.lock().unwrap();
+                // Oversized-for-the-fabric datagrams drop, as on any path with
+                // a smaller MTU.
+                let _ = g
+                    .sockets
+                    .get_mut::<udp::Socket>(fabric_handle)
+                    .send_slice(&buf[..n], *peer);
+            }
+        }
+
+        // Expire idle peers so a long-lived service doesn't leak host sockets.
+        let now = Instant::now();
+        sessions.retain(|_, s| now.duration_since(s.last) <= UDP_IDLE);
+
+        if idle {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    let mut g = bridge.lock().unwrap();
+    g.begin_close(fabric_handle, SockKind::Udp);
 }
 
 /// Add a fresh listening socket on `port` to the bridge stack.
@@ -428,6 +586,7 @@ mod tests {
             Arc::new(move |s| {
                 let _ = tx.send(s);
             }),
+            None,
         );
 
         let svc_ip = hub.resolve(net, "svc").expect("svc resolves on the net");
@@ -465,5 +624,115 @@ mod tests {
         }
 
         kill.store(true, Ordering::Relaxed);
+    }
+
+    /// The UDP half of a HostService: two fabric nodes reach a real host UDP
+    /// server through one bridge, and each gets its *own* reply — the NAT
+    /// keeps peers apart rather than broadcasting the answer to both.
+    #[test]
+    fn net_listener_nats_udp_out_to_a_host_service() {
+        // A host UDP echo server that answers with "<payload>!".
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let host_port = server.local_addr().unwrap().port();
+        let done = Arc::new(AtomicBool::new(false));
+        let stop = done.clone();
+        std::thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .unwrap();
+            let mut buf = [0u8; 256];
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok((n, src)) = server.recv_from(&mut buf) {
+                    let mut reply = buf[..n].to_vec();
+                    reply.push(b'!');
+                    let _ = server.send_to(&reply, src);
+                }
+            }
+        });
+
+        let hub = NetHub::new();
+        let net = NodeId::nil();
+        let a = hub.attach(net, Ipv4Address::new(10, 0, 0, 2), "a");
+        let b = hub.attach(net, Ipv4Address::new(10, 0, 0, 4), "b");
+
+        let kill = Arc::new(AtomicBool::new(false));
+        listen_net(
+            hub.clone(),
+            net,
+            "svc",
+            9100,
+            kill.clone(),
+            Arc::new(|_| {}),
+            Some(format!("127.0.0.1:{host_port}")),
+        );
+        let svc_ip = hub.resolve(net, "svc").expect("svc resolves on the net");
+
+        // One fabric UDP socket per node, each sending a distinct payload.
+        let open = |stack: &SharedStack, lport: u16| {
+            let mut g = stack.lock().unwrap();
+            let h = g.sockets.add(udp_socket());
+            let _gen = g.track(h);
+            g.sockets.get_mut::<udp::Socket>(h).bind(lport).unwrap();
+            h
+        };
+        let ha = open(&a, 41000);
+        let hb = open(&b, 41001);
+        let dst = (IpAddress::from(svc_ip), 9100u16);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut got_a = Vec::new();
+        let mut got_b = Vec::new();
+        let mut next_send = std::time::Instant::now();
+        while std::time::Instant::now() < deadline {
+            // Resend periodically: this is UDP, so a lost datagram is a normal
+            // outcome, not a failure — a test that sent once would just hang.
+            if std::time::Instant::now() >= next_send {
+                next_send = std::time::Instant::now() + Duration::from_millis(200);
+                if got_a.is_empty() {
+                    a.lock()
+                        .unwrap()
+                        .sockets
+                        .get_mut::<udp::Socket>(ha)
+                        .send_slice(b"from-a", dst)
+                        .unwrap();
+                }
+                if got_b.is_empty() {
+                    b.lock()
+                        .unwrap()
+                        .sockets
+                        .get_mut::<udp::Socket>(hb)
+                        .send_slice(b"from-b", dst)
+                        .unwrap();
+                }
+            }
+            for (stack, h, out) in [(&a, ha, &mut got_a), (&b, hb, &mut got_b)] {
+                let mut g = stack.lock().unwrap();
+                while let Ok((data, _)) = g.sockets.get_mut::<udp::Socket>(h).recv() {
+                    out.extend_from_slice(data);
+                }
+            }
+            if !got_a.is_empty() && !got_b.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        // Resends can land a duplicate reply, so assert on the shape rather
+        // than an exact buffer: each node got *its own* echo, and never the
+        // other's — the latter is what proves the NAT keeps peers apart.
+        let contains = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
+        assert!(
+            got_a.starts_with(b"from-a!"),
+            "node a got its own reply, saw {got_a:?}"
+        );
+        assert!(
+            got_b.starts_with(b"from-b!"),
+            "node b got its own reply, saw {got_b:?}"
+        );
+        assert!(!contains(&got_a, b"from-b"), "a never sees b's traffic");
+        assert!(!contains(&got_b, b"from-a"), "b never sees a's traffic");
+
+        kill.store(true, Ordering::Relaxed);
+        done.store(true, Ordering::Relaxed);
     }
 }

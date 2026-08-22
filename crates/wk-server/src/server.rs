@@ -1815,6 +1815,10 @@ impl Server {
                 port,
                 kill.clone(),
                 on_conn,
+                // The same target serves both protocols, so a published
+                // service that speaks UDP (DNS, QUIC, a game server) works
+                // like the TCP one rather than silently blackholing.
+                Some(cfg.target.clone()),
             );
             self.host_service_serves.insert(svc, (kill, fp));
         }

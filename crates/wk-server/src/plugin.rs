@@ -2454,6 +2454,128 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A gatewayed guest reaches a **real host UDP service** — the datagram
+    /// counterpart of the TCP gateway, which until now silently went nowhere
+    /// (UDP had no `HostConn` equivalent, so off-fabric sends fell into the
+    /// fabric and vanished).
+    ///
+    /// The target must be a non-loopback address: `on_fabric` claims 127/8 for
+    /// the guest's own loopback, so a localhost echo server would never take
+    /// the host path and the test would pass without proving anything. The
+    /// machine's own LAN address is discovered without sending a packet (a
+    /// UDP `connect` only picks a route); with no route there is nothing to
+    /// prove and the test skips.
+    #[test]
+    fn gatewayed_guest_reaches_a_host_udp_service() {
+        let wasm = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/udpecho/udpecho.wasm");
+        if !wasm.exists() {
+            eprintln!("skipping: build plugins/udpecho first (./build.sh)");
+            return;
+        }
+        let Some(local_ip) = std::net::UdpSocket::bind("0.0.0.0:0")
+            .ok()
+            .and_then(|s| s.connect("8.8.8.8:53").ok().map(|_| s))
+            .and_then(|s| s.local_addr().ok())
+            .map(|a| a.ip())
+            .filter(|ip| !ip.is_loopback())
+        else {
+            eprintln!("skipping: no non-loopback local address to serve on");
+            return;
+        };
+
+        // A host UDP echo server, reachable at the machine's own address.
+        let server = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind host echo");
+        let host_port = server.local_addr().expect("local addr").port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopper = stop.clone();
+        std::thread::spawn(move || {
+            server
+                .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+                .expect("read timeout");
+            let mut buf = [0u8; 2048];
+            while !stopper.load(Ordering::Relaxed) {
+                if let Ok((n, src)) = server.recv_from(&mut buf) {
+                    let mut reply = b"echo:".to_vec();
+                    reply.extend_from_slice(&buf[..n]);
+                    let _ = server.send_to(&reply, src);
+                }
+            }
+        });
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        host.spawn(
+            &wasm,
+            "udpecho",
+            id,
+            &[],
+            Arc::new(Mutex::new(Vec::new())),
+            nodes.clone(),
+            Vec::new(),
+            None,
+        )
+        .expect("spawn");
+
+        let node = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                if let Some(n) = nodes.lock().unwrap().iter().find(|n| n.id == id).cloned() {
+                    if n.is_runnable() {
+                        break n;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "udpecho never compiled"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        // What wiring the node to a Gateway node grants.
+        node.net_stack()
+            .expect("udpecho has a fabric stack")
+            .lock()
+            .unwrap()
+            .host_access = true;
+
+        host.run_node(
+            &node,
+            &[
+                "client".to_string(),
+                local_ip.to_string(),
+                host_port.to_string(),
+                "hello-gateway".to_string(),
+            ],
+        )
+        .expect("run udpecho");
+
+        let want = "echo:hello-gateway";
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let (bytes, _) = node.term_io.log_read(0);
+            let out = String::from_utf8_lossy(&bytes).to_string();
+            if out.contains(want) {
+                break;
+            }
+            if node.finished.load(Ordering::Relaxed) {
+                let (bytes, _) = node.term_io.log_read(0);
+                let out = String::from_utf8_lossy(&bytes).to_string();
+                assert!(out.contains(want), "udpecho exited without the echo: {out}");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no echo from the host UDP service"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        node.kill.store(true, Ordering::Relaxed);
+    }
+
     /// wk's FUSE, end to end with real wasm: the hellofs plugin (a `wk:fs`
     /// provider) is spawned as a node, its served tree is mounted into a
     /// consumer filesystem, and reads/writes cross the mount into the running

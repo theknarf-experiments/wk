@@ -1412,6 +1412,8 @@ impl<T: NetView + Send + 'static> wasi::sockets::types::HostUdpSocketWithStore<T
         loop {
             // Wait for buffer space; the hub tick wakes the parked waker.
             UdpReady {
+                // 0.3 has no UDP gateway bridge yet (see sockets.rs HostUdp).
+                host: None,
                 stack: stack.clone(),
                 handle,
                 gen,
@@ -1456,6 +1458,8 @@ impl<T: NetView + Send + 'static> wasi::sockets::types::HostUdpSocketWithStore<T
             })?;
         loop {
             UdpReady {
+                // 0.3 has no UDP gateway bridge yet (see sockets.rs HostUdp).
+                host: None,
                 stack: stack.clone(),
                 handle,
                 gen,
