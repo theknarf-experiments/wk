@@ -57,3 +57,27 @@ for d in plugins/*/; do
   (cd "$d" && mise run build)
 done
 """
+
+[tasks.test-pulley]
+description = "Run the suite on the Pulley interpreter (the no-JIT backend an iOS build needs)"
+run = "cargo nextest run --workspace --features pulley"
+
+[tasks.test-small-memory]
+description = "Run the suite with phone-sized guest memory reservations"
+run = "WK_MEMORY_RESERVATION_MIB=${WK_MEMORY_RESERVATION_MIB:-64} cargo nextest run --workspace"
+
+[tasks.test-ios-shape]
+description = "Run the suite the way an iOS build behaves: interpreted, with small reservations"
+run = "WK_MEMORY_RESERVATION_MIB=${WK_MEMORY_RESERVATION_MIB:-64} cargo nextest run --workspace --features pulley"
+
+[tasks.mem-report]
+description = "Measure a running server's address-space footprint at several reservation sizes (macOS)"
+run = "./scripts/mem-report.sh"
+
+[tasks.ios-check]
+description = "Report what is still missing before wk can be built and run for iOS"
+run = "./scripts/ios-check.sh"
+
+[tasks.ios-build]
+description = "Build wk-server for iOS (simulator; `--device` for hardware). Run `mise run ios-check` first"
+run = "./scripts/ios-build.sh"

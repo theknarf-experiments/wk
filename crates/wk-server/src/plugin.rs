@@ -1283,10 +1283,56 @@ fn set_compile_target(config: &mut Config) -> Result<()> {
     Ok(())
 }
 
+/// Per-memory virtual reservation for a constrained host, in MiB.
+///
+/// wasmtime's default reserves 4GiB of address space per linear memory (plus a
+/// 32MiB guard) so bounds checks fold into the guard region. A desktop shrugs
+/// that off — the pages are never touched — but it is charged against a
+/// process's address space, and wk runs a memory per node: three nodes already
+/// reserve 12GiB. Somewhere small enough for a phone, large enough that the
+/// guests that matter (DOOM, CPython, NetSurf) don't spend their lives being
+/// relocated.
+const SMALL_MEMORY_MIB: u64 = 64;
+
+/// Bound how much address space each guest reserves.
+///
+/// `WK_MEMORY_RESERVATION_MIB` overrides on any build (`0` disables the
+/// reservation entirely, so a memory is allocated at its real size and moved
+/// when it grows); otherwise a `pulley` build — the shape that targets a
+/// phone — takes [`SMALL_MEMORY_MIB`] and everything else keeps wasmtime's
+/// defaults, which are the right trade on a desktop.
+///
+/// Guests are unaffected in behaviour either way: a reservation smaller than a
+/// guest's initial memory is simply ignored, and growth past it relocates
+/// rather than failing.
+fn set_memory_limits(config: &mut Config) {
+    let mib = match std::env::var("WK_MEMORY_RESERVATION_MIB")
+        .ok()
+        .map(|v| v.trim().parse::<u64>())
+    {
+        Some(Ok(mib)) => Some(mib),
+        Some(Err(_)) => {
+            eprintln!("wk: ignoring non-numeric WK_MEMORY_RESERVATION_MIB");
+            None
+        }
+        None => cfg!(feature = "pulley").then_some(SMALL_MEMORY_MIB),
+    };
+    let Some(mib) = mib else { return };
+    config.memory_reservation(mib * (1 << 20));
+    // Room to grow into before a memory has to be relocated, and a guard small
+    // enough to not reintroduce the reservation through the back door.
+    config.memory_reservation_for_growth(mib.min(16) * (1 << 20));
+    config.memory_guard_size(64 * 1024);
+    // Growth must be allowed to relocate, since there is no longer a large
+    // reservation to grow into.
+    config.memory_may_move(true);
+}
+
 impl PluginHost {
     pub fn new() -> Result<Self> {
         let mut config = Config::new();
         set_compile_target(&mut config)?;
+        set_memory_limits(&mut config);
         config.wasm_component_model(true);
         // The WebAssembly exception-handling proposal (new `exnref` model), so
         // guests that use setjmp/longjmp run: wasi-sdk lowers setjmp to wasm EH,
