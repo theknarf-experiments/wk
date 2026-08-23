@@ -220,6 +220,14 @@ struct EntityGpu {
     bound: ([f32; 3], f32),
 }
 
+/// Whether a node's flat 2D panel is drawn in the 3D world. Hidden only when
+/// the document asks for it (`panel3d #false`) *and* the node has a `wk:scene`
+/// body to stand in its place — a node whose guest died (or whose objects a
+/// token muted) would otherwise vanish from the world with nothing to click.
+fn shows_panel3d(hidden: &HashSet<NodeId>, bodied: &HashSet<NodeId>, id: NodeId) -> bool {
+    !hidden.contains(&id) || !bodied.contains(&id)
+}
+
 struct App {
     /// This client's connection to the independently-running server: send
     /// [`Command`]s, read [`View`] snapshots.
@@ -1097,6 +1105,23 @@ impl App {
                 }),
                 PaletteCmd::ToggleFly,
             ));
+            // The focused node — clicking a wk:scene object focuses its node,
+            // the same gesture that focuses a panel — can drop its flat panel
+            // and stand as the 3D object alone. Offered only for a node that
+            // has such an object, since it is what would be left.
+            if let Some(id) = self.kbd_focus.filter(|id| self.scene_nodes().contains(id)) {
+                let hidden = self.view.hidden_panel3d.contains(&id);
+                let who = self.node_label(id);
+                v.push(PaletteRow::new(
+                    if hidden { "Show Panel" } else { "Hide Panel" },
+                    d(&if hidden {
+                        format!("{who} — draw its 2D card again, beside its 3D object")
+                    } else {
+                        format!("{who} — leave only its 3D object, remembered in the file")
+                    }),
+                    PaletteCmd::TogglePanel3d(id),
+                ));
+            }
         }
         v.push(PaletteRow::new(
             if self.mode_3d { "2D View" } else { "3D View" },
@@ -1145,6 +1170,16 @@ impl App {
         } else {
             "node".into()
         }
+    }
+
+    /// Nodes that own at least one live `wk:scene` entity — the ones with a 3D
+    /// body of their own, and so the only ones whose flat panel can be hidden.
+    fn scene_nodes(&self) -> HashSet<NodeId> {
+        self.view
+            .scene_entities
+            .iter()
+            .map(|e| e.lock().unwrap().node_id)
+            .collect()
     }
 
     /// Palette entries matching the current query (case-insensitive substring
@@ -1420,6 +1455,16 @@ impl App {
                 self.pan_target = self.cam.pan;
             }
             PaletteCmd::ToggleFly => self.fly3d = !self.fly3d,
+            PaletteCmd::TogglePanel3d(id) => {
+                let show = self.view.hidden_panel3d.contains(&id);
+                self.conn.send(Command::Update {
+                    id,
+                    patch: NodePatch {
+                        panel3d: Some(show),
+                        ..Default::default()
+                    },
+                });
+            }
             PaletteCmd::View3d => {
                 if self.mode_3d {
                     self.mode_3d = false;
@@ -2080,6 +2125,7 @@ impl App {
         }
 
         let ids = self.view.node_ids.clone();
+        let bodied = self.scene_nodes();
         let mut panels: Vec<Panel> = Vec::new();
         // Each node's world pose (origin + yaw), the parent frame for any
         // wk:scene entities it owns.
@@ -2122,6 +2168,12 @@ impl App {
                 )
             };
             poses.insert(id, (center, normal[0].atan2(normal[2])));
+            // A stripped node renders as its wk:scene objects alone — the pose
+            // above still places them, and pressing one focuses the node
+            // exactly as its panel would have.
+            if !shows_panel3d(&self.view.hidden_panel3d, &bodied, id) {
+                continue;
+            }
             let cw = size[0] / PX_PER_M;
             let max_w = cw * 0.92;
 
@@ -6147,6 +6199,27 @@ mod inspect_tests {
         assert_ne!(a[0][1], a[2][1]);
         // The single output centres vertically.
         assert!((a[1][1] - 150.0).abs() < 0.01);
+    }
+
+    /// Hiding a node's 3D panel takes effect only for a node that has a
+    /// `wk:scene` body to stand in its place.
+    #[test]
+    fn a_panel_hides_only_when_something_else_can_be_seen() {
+        let (totem, plain) = (NodeId::new(), NodeId::new());
+        let hidden: HashSet<NodeId> = [totem, plain].into_iter().collect();
+        let bodied: HashSet<NodeId> = [totem].into_iter().collect();
+        assert!(
+            !shows_panel3d(&hidden, &bodied, totem),
+            "asked to hide, and has an object to show instead"
+        );
+        assert!(
+            shows_panel3d(&hidden, &bodied, plain),
+            "asked to hide, but hiding would leave nothing at all"
+        );
+        // A node that never asked keeps its panel either way.
+        let none = HashSet::new();
+        assert!(shows_panel3d(&none, &bodied, totem));
+        assert!(shows_panel3d(&none, &none, plain));
     }
 
     /// A registry stub for an app node (no wasm), enough for name lookups.

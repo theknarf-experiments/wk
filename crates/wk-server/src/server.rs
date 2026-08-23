@@ -172,6 +172,9 @@ pub struct View {
     /// Free 3D poses (`[x, y, z, yaw]`) for nodes placed off the layout
     /// cylinder in the 3D world.
     pub pos3d: HashMap<NodeId, [f32; 4]>,
+    /// Nodes asking for no flat panel in the 3D world — they are drawn as
+    /// their `wk:scene` objects alone.
+    pub hidden_panel3d: HashSet<NodeId>,
     /// Every live wk:scene entity (plugin-owned 3D objects), across all nodes.
     pub scene_entities: Vec<crate::scene::SharedEntity>,
     /// The document's 3D world scene as an absolute glTF/GLB path, if set.
@@ -325,6 +328,7 @@ impl View {
             win_pos: keep_map(&self.win_pos, mine),
             win_size: keep_map(&self.win_size, mine),
             pos3d: keep_map(&self.pos3d, mine),
+            hidden_panel3d: keep_set(&self.hidden_panel3d, mine),
             scene_entities: self
                 .scene_entities
                 .iter()
@@ -534,6 +538,11 @@ pub struct Graph {
     /// Free 3D poses (`[x, y, z, yaw]`, world units) for nodes placed off the
     /// default layout cylinder. Side table: only posed nodes have entries.
     pub pos3d: HashMap<NodeId, [f32; 4]>,
+    /// Nodes whose flat 2D panel is suppressed in the 3D world, leaving their
+    /// `wk:scene` objects as their whole body. Side table: only hidden nodes
+    /// have entries — the panel is the default, and the only way most nodes
+    /// are visible at all.
+    pub hidden_panel3d: HashSet<NodeId>,
     /// Canvas file nodes (in-memory or disk-backed) wired into apps.
     pub file_nodes: HashMap<NodeId, FileNode>,
     /// HostPort nodes (canvas id -> localhost port).
@@ -2363,6 +2372,7 @@ impl Server {
     fn forget(&mut self, id: NodeId) {
         self.graph.nodes.remove(&id);
         self.graph.pos3d.remove(&id);
+        self.graph.hidden_panel3d.remove(&id);
         self.graph.node_args.remove(&id);
         self.graph.file_nodes.remove(&id);
         self.graph.host_ports.remove(&id);
@@ -2441,6 +2451,16 @@ impl Server {
     fn set_node_pos3d(&mut self, id: NodeId, pose: [f32; 4]) {
         if self.graph.nodes.contains_key(&id) {
             self.graph.pos3d.insert(id, pose);
+        }
+    }
+    /// Show or hide a node's flat 2D panel in the 3D world.
+    fn set_node_panel3d(&mut self, id: NodeId, show: bool) {
+        if self.graph.nodes.contains_key(&id) {
+            if show {
+                self.graph.hidden_panel3d.remove(&id);
+            } else {
+                self.graph.hidden_panel3d.insert(id);
+            }
         }
     }
 
@@ -2794,6 +2814,9 @@ impl Server {
                 if let Some(pose) = patch.pos3d {
                     self.set_node_pos3d(id, pose);
                 }
+                if let Some(show) = patch.panel3d {
+                    self.set_node_panel3d(id, show);
+                }
                 if let Some(size) = patch.size {
                     self.set_node_size(id, size);
                 }
@@ -3016,6 +3039,7 @@ impl Server {
             pos,
             size,
             pos3d: self.graph.pos3d.get(&id).copied(),
+            panel3d: !self.graph.hidden_panel3d.contains(&id),
             kind,
         })
     }
@@ -3257,6 +3281,9 @@ impl Server {
         if let Some(p3) = s.pos3d {
             self.graph.pos3d.insert(s.id, p3);
         }
+        if !s.panel3d {
+            self.graph.hidden_panel3d.insert(s.id);
+        }
     }
 
     /// Whether two nodes are already joined by any connection.
@@ -3400,6 +3427,7 @@ impl Server {
             win_pos,
             win_size,
             pos3d: self.graph.pos3d.clone(),
+            hidden_panel3d: self.graph.hidden_panel3d.clone(),
             // A node's wk:scene objects render only while its token allows
             // "show" — the deny side is a live per-viewer mute: the guest keeps
             // its entity (and keeps updating it); it just isn't in the view.
@@ -4269,6 +4297,67 @@ mod model_tests {
 
     /// Turning off a volume's persistence removes its sidecar on the next save,
     /// so stale bytes don't linger.
+    /// Hiding a node's 3D panel is cosmetic arrangement, and it outlives the
+    /// session: the flag reaches the view, the file, and the reloaded server.
+    #[test]
+    fn hiding_a_3d_panel_persists_across_a_reload() {
+        let path = std::env::temp_dir().join("wk-panel3d-test.wk");
+        let _ = std::fs::remove_file(&path);
+
+        let mut s = Server::new(&Document::empty(), path.clone()).expect("server");
+        let ws = s.graph.workspaces[0];
+        s.apply(Command::Create(Resource::Node {
+            kind: NodeKind::Volume,
+            pos: [0.0, 0.0],
+            ws,
+        }));
+        let id = *s.graph.file_nodes.keys().next().expect("a node");
+
+        let hide = Command::Update {
+            id,
+            patch: NodePatch {
+                panel3d: Some(false),
+                ..Default::default()
+            },
+        };
+        // Showing or hiding a panel is layout, not reconfiguration — a
+        // client with only `Arrange` may do it.
+        assert_eq!(
+            hide.required(),
+            (
+                wk_protocol::ResourceKind::Node,
+                wk_protocol::Action::Arrange
+            )
+        );
+        s.apply(hide);
+        assert!(s.graph.hidden_panel3d.contains(&id));
+        assert!(s.view().hidden_panel3d.contains(&id));
+
+        s.save();
+        let text = std::fs::read_to_string(&path).expect("saved");
+        assert!(text.contains("panel3d #false"), "not in the file: {text}");
+        let doc = Document::load(&path).expect("re-parses");
+        let reloaded = Server::new(&doc, path.clone()).expect("server");
+        assert!(
+            reloaded.graph.hidden_panel3d.contains(&id),
+            "the reloaded node lost its hidden panel"
+        );
+
+        // Showing it again clears the flag, and the file stops mentioning it.
+        let mut s = reloaded;
+        s.apply(Command::Update {
+            id,
+            patch: NodePatch {
+                panel3d: Some(true),
+                ..Default::default()
+            },
+        });
+        assert!(!s.graph.hidden_panel3d.contains(&id));
+        s.save();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("panel3d"));
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn unpersisting_a_volume_prunes_its_sidecar() {
         let path = std::env::temp_dir().join("wk-vol-prune-test.wk");
@@ -4377,6 +4466,7 @@ mod model_tests {
                         pos: [10.0, 10.0],
                         size: [360.0, 260.0],
                         pos3d: None,
+                        panel3d: true,
                         kind: SnapKind::App {
                             name: "ghost".into(),
                             options: vec![1.0, 2.0],
@@ -4389,6 +4479,7 @@ mod model_tests {
                         pos: [20.0, 20.0],
                         size: [130.0, 44.0],
                         pos3d: None,
+                        panel3d: true,
                         kind: SnapKind::Volume {
                             name: "file1".into(),
                             persist: false,
@@ -4663,6 +4754,7 @@ mod model_tests {
                 id: NodeId::from_u128(*n),
                 patch: NodePatch {
                     pos3d: None,
+                    panel3d: Some(false),
                     pos: Some([1.0, 2.0]),
                     size: Some([3.0, 4.0]),
                     args: Some("ghost".into()),
@@ -4699,6 +4791,9 @@ mod model_tests {
         }
         for id in s.graph.host_ports.keys() {
             prop_assert!(base.contains(id), "orphan host_ports entry");
+        }
+        for id in &s.graph.hidden_panel3d {
+            prop_assert!(base.contains(id), "orphan hidden_panel3d entry");
         }
         prop_assert!(
             !s.graph.workspaces.is_empty(),

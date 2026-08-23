@@ -29,6 +29,9 @@ pub(super) enum PaletteCmd {
     View3d,
     /// Toggle the 3D camera between grounded walking and free flight.
     ToggleFly,
+    /// Show or hide this node's flat 2D panel in the 3D world, leaving a
+    /// `wk:scene` node as its 3D object alone.
+    TogglePanel3d(NodeId),
     Quit,
     /// Close the UI but keep the server (and every node) running.
     Headless,

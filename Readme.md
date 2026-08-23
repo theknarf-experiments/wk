@@ -229,6 +229,15 @@ per-tab views.
   as) a panel: it hands wk a GLB blob and a live transform, and polls
   hover/press/release ray events. `plugins/totem` is the reference — a
   spinning crystal you can click (and Cmd+drag to carry).
+- **Panels off** — such a node can drop its flat card and *be* its 3D object.
+  Click the object to focus it (the HUD reads `keyboard → totem`), then
+  Cmd+K → **Hide Panel**; **Show Panel** brings the card back. The object
+  stays clickable and Cmd+draggable either way, so a stripped node is still
+  how you focus, carry and un-hide it. The choice is remembered in the file as
+  `panel3d #false`. Wiring a hidden node needs its ports, so do that from the
+  2D canvas — or show the panel again. A node with no live object keeps its
+  panel regardless, so a crashed guest can never leave an invisible node
+  behind.
 
 ## Setup
 

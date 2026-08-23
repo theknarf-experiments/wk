@@ -306,6 +306,10 @@ pub struct NodeSnap {
     /// Optional free 3D pose in the world: `[x, y, z, yaw]` (world units,
     /// radians). Absent = the node sits on the default layout cylinder.
     pub pos3d: Option<[f32; 4]>,
+    /// Whether the node's flat 2D panel is drawn in the 3D world. `false`
+    /// (written as `panel3d #false`) leaves a `wk:scene` node as its 3D object
+    /// alone. Default `true` — the panel is how most nodes are visible at all.
+    pub panel3d: bool,
     pub kind: SnapKind,
 }
 
@@ -973,11 +977,18 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
             p.get(3).and_then(num).unwrap_or(0.0),
         ])
     });
+    // Absent means shown: hiding the panel is the exception a file records.
+    let panel3d = ch
+        .get("panel3d")
+        .and_then(|p| p.get(0))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     Some(NodeSnap {
         id,
         pos: [pos.get(0).and_then(num)?, pos.get(1).and_then(num)?],
         size: [size.get(0).and_then(num)?, size.get(1).and_then(num)?],
         pos3d,
+        panel3d,
         kind,
     })
 }
@@ -1055,6 +1066,12 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         for v in p3 {
             n.push(KdlEntry::new(v as f64));
         }
+        ch.nodes_mut().push(n);
+    }
+    // Only a hidden panel writes the flag; the default is shown.
+    if !s.panel3d {
+        let mut n = KdlNode::new("panel3d");
+        n.push(KdlEntry::new(false));
         ch.nodes_mut().push(n);
     }
     if let SnapKind::App {
@@ -1349,6 +1366,32 @@ mod tests {
     }
 
     #[test]
+    fn a_hidden_3d_panel_round_trips_and_defaults_to_shown() {
+        let ws = NodeId::from_u128(11);
+        let id = NodeId::from_u128(12);
+        let doc = Document::from_kdl(&format!(
+            "workspace \"{ws}\" {{\n  \
+             node \"totem\" \"{id}\" {{ pos 1 2; size 30 40; panel3d #false }}\n}}"
+        ))
+        .expect("parses");
+        assert!(!doc.workspaces[0].nodes[0].panel3d);
+
+        // The flag survives a trip back out to the file...
+        let text = doc.to_kdl();
+        assert!(text.contains("panel3d #false"), "not written: {text}");
+        let back = Document::from_kdl(&text).expect("round-trips");
+        assert!(!back.workspaces[0].nodes[0].panel3d);
+
+        // ...and a node that never asked keeps its panel, writing no flag.
+        let plain = Document::from_kdl(&format!(
+            "workspace \"{ws}\" {{\n  node \"totem\" \"{id}\" {{ pos 0 0; size 10 10 }}\n}}"
+        ))
+        .expect("parses");
+        assert!(plain.workspaces[0].nodes[0].panel3d);
+        assert!(!plain.to_kdl().contains("panel3d"));
+    }
+
+    #[test]
     fn import_merges_for_running_and_save_preserves_the_composition() {
         let dir = std::env::temp_dir().join("wk-import-test");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1633,6 +1676,7 @@ mod tests {
                             pos: [40.0, 56.0],
                             size: [360.0, 260.0],
                             pos3d: None,
+                            panel3d: true,
                             kind: SnapKind::App {
                                 name: "synth".into(),
                                 options: vec![8.0, 0.6, 0.0, 1.0],
@@ -1645,6 +1689,7 @@ mod tests {
                             pos: [200.0, 120.0],
                             size: [130.0, 44.0],
                             pos3d: None,
+                            panel3d: true,
                             kind: SnapKind::Volume {
                                 name: "chan".into(),
                                 persist: true,
@@ -1655,6 +1700,7 @@ mod tests {
                             pos: [200.0, 200.0],
                             size: [130.0, 44.0],
                             pos3d: None,
+                            panel3d: true,
                             kind: SnapKind::BindMount {
                                 path: "notes.txt".into(),
                             },
@@ -1664,6 +1710,7 @@ mod tests {
                             pos: [600.0, 100.0],
                             size: [130.0, 44.0],
                             pos3d: None,
+                            panel3d: true,
                             kind: SnapKind::Port { port: 8080 },
                         },
                         NodeSnap {
@@ -1671,6 +1718,7 @@ mod tests {
                             pos: [700.0, 100.0],
                             size: [130.0, 44.0],
                             pos3d: None,
+                            panel3d: true,
                             kind: SnapKind::Net { gateway: false },
                         },
                         NodeSnap {
@@ -1678,6 +1726,7 @@ mod tests {
                             pos: [700.0, 200.0],
                             size: [130.0, 44.0],
                             pos3d: None,
+                            panel3d: true,
                             kind: SnapKind::Net { gateway: true },
                         },
                         NodeSnap {
@@ -1685,6 +1734,7 @@ mod tests {
                             pos: [800.0, 100.0],
                             size: [130.0, 44.0],
                             pos3d: None,
+                            panel3d: true,
                             kind: SnapKind::Iroh {
                                 secret: Some(secret_hex(&[7u8; 32])),
                                 peer: Some("endpointabc123".into()),
@@ -1695,6 +1745,7 @@ mod tests {
                             pos: [900.0, 100.0],
                             size: [130.0, 44.0],
                             pos3d: None,
+                            panel3d: true,
                             kind: SnapKind::Veilid {
                                 secret: Some("VLD0:pubkey:secretkey".into()),
                                 peer: Some("VLD0:remoterecordkey".into()),
@@ -1937,13 +1988,15 @@ mod tests {
             coord(),
             coord(),
             coord(),
+            any::<bool>(),
             snap_kind(),
         )
-            .prop_map(|(id, px, py, sx, sy, kind)| NodeSnap {
+            .prop_map(|(id, px, py, sx, sy, panel3d, kind)| NodeSnap {
                 id,
                 pos: [px, py],
                 size: [sx, sy],
                 pos3d: None,
+                panel3d,
                 kind,
             })
     }

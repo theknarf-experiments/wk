@@ -205,6 +205,10 @@ pub struct NodePatch {
     /// (requires only `Arrange`). Nodes without one sit on the default layout
     /// cylinder derived from their canvas position.
     pub pos3d: Option<[f32; 4]>,
+    /// Show (`true`) or hide (`false`) the node's flat 2D panel in the 3D
+    /// world (requires only `Arrange`). A node that draws itself through
+    /// `wk:scene` can drop the panel and be its 3D object alone.
+    pub panel3d: Option<bool>,
     /// Resize (requires only `Arrange`).
     pub size: Option<[f32; 2]>,
     /// Set launch args from a whitespace-separated string (requires `Update`).
