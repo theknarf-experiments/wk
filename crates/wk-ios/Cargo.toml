@@ -1,0 +1,18 @@
+[package]
+name = "wk-ios"
+version = "0.1.0"
+edition = "2021"
+description = "Booting wk on iOS: a C entry point for an app shell, and a smoke binary that proves the runtime works on the device."
+
+[features]
+# Forwarded to wk-server; an iOS build always wants it (no JIT there).
+pulley = ["wk-server/pulley"]
+
+[dependencies]
+wk-server = { path = "../wk-server" }
+wk-protocol = { path = "../wk-protocol" }
+wk-fabric = { path = "../wk-fabric" }
+
+[lib]
+# staticlib for the Xcode app to link; rlib so the smoke binary can use it.
+crate-type = ["staticlib", "rlib"]

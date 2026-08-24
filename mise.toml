@@ -78,6 +78,10 @@ run = "./scripts/mem-report.sh"
 description = "Report what is still missing before wk can be built and run for iOS"
 run = "./scripts/ios-check.sh"
 
+[tasks.ios-smoke]
+description = "Boot wk's runtime in the iOS simulator and report engine/fabric/guest checks"
+run = "./scripts/ios-smoke.sh"
+
 [tasks.ios-build]
 description = "Build wk-server for iOS (simulator; `--device` for hardware). Run `mise run ios-check` first"
 run = "./scripts/ios-build.sh"

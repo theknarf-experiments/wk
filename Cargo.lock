@@ -10987,6 +10987,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wk-ios"
+version = "0.1.0"
+dependencies = [
+ "wk-fabric",
+ "wk-protocol",
+ "wk-server",
+]
+
+[[package]]
 name = "wk-protocol"
 version = "0.1.0"
 dependencies = [
