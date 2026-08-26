@@ -1,0 +1,48 @@
+# torrent-file-editor 1.0.3 as a wk node: `mise run build`.
+#
+# This plugin is a LEAF of plugins/qt. It does not build Qt itself -- it builds
+# the two extra Qt repos this app needs (qt5compat, qtsvg) into its OWN
+# ./sysroot and links the app against plugins/qt/sysroot. So the prerequisites
+# are plugins/qt's `build-qpa` task (which itself depends on `build-qtbase` and
+# `build-host`, both measured in hours) and they are NOT expressed as a mise
+# `depends` here: that would make a repo-wide `mise run build-plugins` sweep
+# silently start an hours-long Qt build. build.sh's preflight names the missing
+# piece instead.
+#
+# The two Qt module builds are ~10 minutes together; the app itself is under a
+# minute. Run detached and tail ./logs rather than under a foreground timeout.
+
+[tasks.build]
+description = "Build plugins/qt-torrentfileeditor103/torrent-file-editor.wasm (needs plugins/qt built)"
+dir = "{{config_root}}"
+# wasi-sdk comes from the root mise.toml [tools]; resolve it at task time
+# (`mise where` cannot be used in an [env] template -- it would recurse).
+# Self-skips rather than failing when plugins/qt has not been built, so a
+# repo-wide `mise run build-plugins` sweep is not blocked by a Qt tree nobody
+# asked for.
+run = """
+set -e
+if [ ! -f ../qt/sysroot/lib/libqwk.a ]; then
+  echo "qt-torrentfileeditor103: needs the Qt port first."
+  echo "    cd ../qt && ./build-host.sh && ./build-qtbase.sh && ./build-qpa.sh"
+  echo "    (hours: see plugins/qt/PORTING.md). Skipping."
+  exit 0
+fi
+WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build.sh
+"""
+
+[tasks.test]
+description = "Run the node headless on wk's real runtime and check it renders a loaded .torrent"
+dir = "{{config_root}}/harness"
+# A standalone cargo project (plugins/ is excluded from the wk workspace). It
+# drives PluginHost exactly as the wk-server tests drive gfx-smoke and
+# qt-smoke: pumps one frame per iteration, reads back the presented pixels,
+# checks the app parsed the .torrent it was handed, and clicks a real button
+# with a real wasi:surface pointer event. Writes both frames to --dump.
+#
+# Debug profile, deliberately: Cargo.toml optimizes DEPENDENCIES to opt-level 3
+# (wasmtime AOT-compiles the 22 MB component at node start, which is minutes at
+# opt-level 0) while leaving the harness itself unoptimized, exactly as the
+# root Cargo.toml does. A --release build would recompile the whole dependency
+# tree for no benefit.
+run = "cargo run -- --dump {{config_root}}/logs"

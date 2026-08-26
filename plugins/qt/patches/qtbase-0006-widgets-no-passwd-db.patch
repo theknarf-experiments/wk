@@ -1,0 +1,69 @@
+Subject: widgets: QFileDialog's tilde expansion without a passwd database
+
+WHAT / WHY
+
+  src/widgets/dialogs/qfiledialog.cpp
+      Three hunks, all one cause: the wasi sysroot has no <pwd.h>.
+
+      (a) The `#if defined(Q_OS_UNIX)` include block pulls in <pwd.h>
+          unconditionally -- a hard "fatal error: 'pwd.h' file not found", and
+          the ONLY thing that stopped QtWidgets compiling.
+      (b) homeDirFromPasswdEntry() (getpwnam_r/getpwnam) is compiled out, so
+          the file does not carry a static function nothing can call.
+      (c) qt_tildeExpansion() takes the Q_OS_VXWORKS/Q_OS_INTEGRITY branch,
+          which resolves "~" and "~/a/b" via QDir::homePath() and treats
+          "~otheruser" as our own home rather than looking it up.
+
+      (c) is the only behavioural change and it is the right one: a wasip2
+      component has no user database to enumerate, so the only home directory
+      that exists is its own.
+
+UPSTREAM
+  yes. Hunk (a) is a plain missing guard, and (b)/(c) reuse the escape hatch
+  upstream already maintains for VxWorks and Integrity -- two other platforms
+  with no passwd database. Nothing wk-specific.
+
+---
+diff --git a/src/widgets/dialogs/qfiledialog.cpp b/src/widgets/dialogs/qfiledialog.cpp
+index ac2f288..13ebc96 100644
+--- a/src/widgets/dialogs/qfiledialog.cpp
++++ b/src/widgets/dialogs/qfiledialog.cpp
+@@ -39,7 +39,9 @@
+ #include <qstylepainter.h>
+ #include "ui_qfiledialog.h"
+ #if defined(Q_OS_UNIX)
+-#include <pwd.h>
++#if !defined(Q_OS_WASI)
++#include <pwd.h>    // no user database, and no pwd.h, in the wasi sysroot
++#endif
+ #include <unistd.h> // for pathconf() on OS X
+ #elif defined(Q_OS_WIN)
+ #  include <QtCore/qt_windows.h>
+@@ -1122,6 +1124,7 @@ void QFileDialog::selectUrl(const QUrl &url)
+ }
+ 
+ #ifdef Q_OS_UNIX
++#ifndef Q_OS_WASI
+ static QString homeDirFromPasswdEntry(const QString &path, const QByteArray &userName)
+ {
+ #if defined(_POSIX_THREAD_SAFE_FUNCTIONS) && !defined(Q_OS_OPENBSD) && !defined(Q_OS_WASM)
+@@ -1147,6 +1150,7 @@ static QString homeDirFromPasswdEntry(const QString &path, const QByteArray &use
+     return QFile::decodeName(pw->pw_dir);
+ #endif // defined(_POSIX_THREAD_SAFE_FUNCTIONS) && !defined(Q_OS_OPENBSD) && !defined(Q_OS_WASM)
+ }
++#endif // !Q_OS_WASI
+ 
+ Q_AUTOTEST_EXPORT QString qt_tildeExpansion(const QString &path)
+ {
+@@ -1161,7 +1165,10 @@ Q_AUTOTEST_EXPORT QString qt_tildeExpansion(const QString &path)
+     if (sepIndex == 1) // '~/' or '~/a/b/c'
+         return QDir::homePath() + sv.sliced(1);
+ 
+-#if defined(Q_OS_VXWORKS) || defined(Q_OS_INTEGRITY)
++// Q_OS_WASI joins these two for the same reason: there is no passwd database
++// to look "~otheruser" up in (and no <pwd.h> in the wasi sysroot), so the only
++// home directory that exists is our own.
++#if defined(Q_OS_VXWORKS) || defined(Q_OS_INTEGRITY) || defined(Q_OS_WASI)
+     if (sepIndex == -1)
+         return QDir::homePath();
+     return QDir::homePath() + sv.sliced(sepIndex);

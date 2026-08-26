@@ -171,3 +171,62 @@ plugins/doctools/adapter/
 plugins/doctools/bin/
 plugins/doctools/tex/
 plugins/doctools/texmf/
+
+# qt (upstream Qt 6 fetched + cross-built by build.sh: the tarballs, the
+# extracted trees, the native host-tools build, and the wasip2 install prefix
+# are all derived — only the build scripts, the toolchain file, the wk QPA
+# plugin, patches/ and mise.toml are tracked)
+plugins/qt/tarballs/
+plugins/qt/src/
+plugins/qt/host/
+plugins/qt/build-host/
+plugins/qt/build-target/
+plugins/qt/sysroot/
+plugins/qt/logs/
+plugins/qt/*.wasm
+# A copy of somebody else's font, staged by build-smoke.sh from whatever the
+# machine has (DejaVu, Arial, Liberation). Qt 6 ships no fonts and a wk node
+# has no host font dir, so the smoke app compiles one in as a Qt resource --
+# but the file itself is not ours to commit.
+plugins/qt/smoke/fonts/
+
+# qt-torrentfileeditor103 (torrent-file-editor 1.0.3 as a wk node: upstream and
+# the two extra Qt repos it needs are FETCHED by build.sh, never vendored;
+# ./sysroot is this port's own Qt-module install prefix on top of
+# plugins/qt/sysroot. Only build.sh, mise.toml, patches/, harness/ and
+# PORTING.md are tracked)
+plugins/qt-torrentfileeditor103/tarballs/
+plugins/qt-torrentfileeditor103/src/
+plugins/qt-torrentfileeditor103/build/
+plugins/qt-torrentfileeditor103/sysroot/
+plugins/qt-torrentfileeditor103/gen/
+plugins/qt-torrentfileeditor103/logs/
+plugins/qt-torrentfileeditor103/*.wasm
+plugins/qt-torrentfileeditor103/harness/target/
+# A copy of somebody else's font, staged by build.sh from whatever the machine
+# has. Qt 6 ships no fonts and a wk node has no host font dir, so the app
+# compiles one in as a Qt resource -- but the file itself is not ours to commit.
+plugins/qt-torrentfileeditor103/fonts/
+
+# qt-slate (Slate, the Qt Quick pixel-art editor, pinned to commit e5cf5b6).
+# Upstream Slate + its gif-h submodule + qtdeclarative are FETCHED by build.sh,
+# never vendored; the native host Qt (built only so that `qsb` exists), the
+# wasip2 qtdeclarative install prefix, the wit-bindgen output and the node
+# component are all derived. Only build*.sh, node/, patches/, harness/,
+# Dockerfile, mise.toml and README.md are tracked.
+plugins/qt-slatepixelarteditore5cf5b6c66f21d4e5a6f7c42f497b1d29115b432/tarballs/
+plugins/qt-slatepixelarteditore5cf5b6c66f21d4e5a6f7c42f497b1d29115b432/src/
+plugins/qt-slatepixelarteditore5cf5b6c66f21d4e5a6f7c42f497b1d29115b432/host/
+plugins/qt-slatepixelarteditore5cf5b6c66f21d4e5a6f7c42f497b1d29115b432/build-host/
+plugins/qt-slatepixelarteditore5cf5b6c66f21d4e5a6f7c42f497b1d29115b432/build-target/
+plugins/qt-slatepixelarteditore5cf5b6c66f21d4e5a6f7c42f497b1d29115b432/sysroot/
+plugins/qt-slatepixelarteditore5cf5b6c66f21d4e5a6f7c42f497b1d29115b432/gen/
+plugins/qt-slatepixelarteditore5cf5b6c66f21d4e5a6f7c42f497b1d29115b432/logs/
+plugins/qt-slatepixelarteditore5cf5b6c66f21d4e5a6f7c42f497b1d29115b432/*.wasm
+plugins/qt-slatepixelarteditore5cf5b6c66f21d4e5a6f7c42f497b1d29115b432/harness/target/
+plugins/qt-slatepixelarteditore5cf5b6c66f21d4e5a6f7c42f497b1d29115b432/harness/Cargo.lock
+# A copy of somebody else's font, staged by build.sh from whatever the machine
+# has. Qt 6 ships no fonts and a wk node has no host font dir, so the component
+# compiles one in under :/wkfonts as the platform's default family -- but the
+# file itself is not ours to commit.
+plugins/qt-slatepixelarteditore5cf5b6c66f21d4e5a6f7c42f497b1d29115b432/node/fonts/

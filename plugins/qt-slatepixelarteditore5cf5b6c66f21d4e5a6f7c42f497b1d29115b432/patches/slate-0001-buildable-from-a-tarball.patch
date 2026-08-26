@@ -1,0 +1,127 @@
+WHAT
+    Four changes to Slate's CMake so it configures against a Qt that has no
+    qttools, no QtTest, and from a source tarball rather than a git checkout.
+
+WHY
+    Each is a hard configure error, not a warning:
+
+    1. lib/CMakeLists.txt ends with
+           else()
+               message(FATAL_ERROR "Can not find .git repo")
+           endif()
+       so Slate cannot be built from a release tarball at all. This port
+       fetches the pinned tarball on purpose -- the house rule is that build.sh
+       fetches upstream and git never carries it. BUILD_VERSION is now an input
+       the packager can supply (node/CMakeLists.txt passes the short commit),
+       and it still comes from git when there is a git. It only ever reaches
+       the About box.
+
+    2. qt_add_translations() is called unconditionally, but the command only
+       exists when Qt6LinguistTools was found -- and the find_package for it at
+       the top of the file is deliberately not REQUIRED. On a Qt built without
+       qttools (there is no wasm qttools here, and lrelease would be a host
+       tool anyway) CMake dies with "Unknown CMake command". Guarded on the
+       lrelease target, which is what the command actually needs.
+
+    3. set_property(DIRECTORY tests ...) runs even when ENABLE_TESTING is OFF,
+       and CMake errors out on a directory it was never given. The cross qtbase
+       has FEATURE_testlib=OFF (QTestLib wants threads and a process launcher),
+       so ENABLE_TESTING must be OFF here.
+
+    4. -Weverything on clang. wasi-sdk 34's clang reports itself as Clang 23 and
+       -Weverything emits tens of thousands of diagnostics for a Qt/QML
+       codebase -- including -Wc++98-compat on a C++17 project -- which buries
+       the real ones. Narrowed to -Wall -Wextra.
+
+    1-3 are portable improvements that would help anyone packaging Slate;
+    4 is a local preference and should not be sent upstream as-is.
+
+UPSTREAM
+    Worth offering: 1 (build from tarball), 2 and 3 (configure without
+    qttools/QtTest). Not offered: 4.
+
+CLASSIFICATION
+    as-is -- no behaviour of the running program changes. The About box shows
+    the pinned short commit instead of a live `git rev-parse`.
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -16,7 +16,7 @@
+ 
+ target_compile_options(projectWarning INTERFACE
+     $<$<CXX_COMPILER_ID:GNU>:$<BUILD_INTERFACE:-Wall;-Wextra;-Wpedantic>>
+-    $<$<CXX_COMPILER_ID:Clang>:$<BUILD_INTERFACE:-Weverything;-Wpedantic>>
++    $<$<CXX_COMPILER_ID:Clang>:$<BUILD_INTERFACE:-Wall;-Wextra>>
+     $<$<CXX_COMPILER_ID:MSVC>:/W0>
+ )
+ 
+@@ -33,12 +33,14 @@
+ add_subdirectory(lib)
+ add_subdirectory(app)
+ 
+-qt_add_translations(app
+-    TS_FILES
+-        ${ts_files}
+-    SOURCES
+-        app/qml/qml.qrc
+-)
++if(TARGET Qt6::lrelease)
++    qt_add_translations(app
++        TS_FILES
++            ${ts_files}
++        SOURCES
++            app/qml/qml.qrc
++    )
++endif()
+ 
+ if(ENABLE_TESTING)
+     enable_testing()
+@@ -46,5 +48,7 @@
+     add_subdirectory(tests)
+ endif()
+ 
+-set_property(DIRECTORY tests PROPERTY QT_EXCLUDE_FROM_TRANSLATION ON)
++if(ENABLE_TESTING)
++    set_property(DIRECTORY tests PROPERTY QT_EXCLUDE_FROM_TRANSLATION ON)
++endif()
+ 
+--- a/lib/CMakeLists.txt
++++ b/lib/CMakeLists.txt
+@@ -254,8 +254,13 @@
+     CXX_STANDARD_REQUIRED TRUE
+ )
+ 
+-# Generate vcs-repo-state.h
+-if(EXISTS ${CMAKE_SOURCE_DIR}/.git)
++# Generate vcs-repo-state.h.
++# Upstream FATAL_ERRORs when there is no .git, which makes the project
++# unbuildable from a release tarball -- and this port builds from the pinned
++# source tarball on purpose (the house rule is that build.sh fetches upstream
++# and git never carries it). BUILD_VERSION can be supplied by the packager
++# instead; it only ever reaches the About box.
++if(NOT BUILD_VERSION AND EXISTS ${CMAKE_SOURCE_DIR}/.git)
+     find_package(Git)
+     if(GIT_FOUND)
+         EXECUTE_PROCESS(
+@@ -264,15 +269,13 @@
+             OUTPUT_VARIABLE BUILD_VERSION
+             OUTPUT_STRIP_TRAILING_WHITESPACE
+             )
+-
+-        configure_file(
+-            ${CMAKE_CURRENT_SOURCE_DIR}/vcs-repo-state.h.in
+-            ${CMAKE_CURRENT_BINARY_DIR}/vcs-repo-state.h
+-            )
+-    else()
+-        message(FATAL_ERROR "Can not find Git")
+     endif()
+-else()
+-    message(FATAL_ERROR "Can not find .git repo")
+ endif()
++if(NOT BUILD_VERSION)
++    set(BUILD_VERSION "unknown")
++endif()
++configure_file(
++    ${CMAKE_CURRENT_SOURCE_DIR}/vcs-repo-state.h.in
++    ${CMAKE_CURRENT_BINARY_DIR}/vcs-repo-state.h
++    )
+ 

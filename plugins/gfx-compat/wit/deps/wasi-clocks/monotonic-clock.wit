@@ -1,0 +1,46 @@
+package wasi:clocks@0.2.3;
+
+/// WASI Monotonic Clock is a clock API intended to let users measure elapsed
+/// time.
+///
+/// Vendored here for one reason only: `wkgfx_wait_frame_timeout()` needs a
+/// deadline pollable to hand to `wasi:io/poll`'s multi-pollable `poll`, and
+/// `subscribe-duration` is where deadline pollables come from. Guests already
+/// import this interface transitively through wasi-libc (a component built
+/// against this world resolves to whatever version the host offers — verified:
+/// the `wasi:io/poll@0.2.3` declared in deps/wasi-io unifies with libc's
+/// `@0.2.12` at link time), so declaring it costs no new host capability.
+@since(version = 0.2.0)
+interface monotonic-clock {
+    @since(version = 0.2.0)
+    use wasi:io/poll@0.2.3.{pollable};
+
+    /// An instant in time, in nanoseconds. An instant is relative to an
+    /// unspecified initial value, and can only be compared to instances from
+    /// the same monotonic-clock.
+    @since(version = 0.2.0)
+    type instant = u64;
+
+    /// A duration of time, in nanoseconds.
+    @since(version = 0.2.0)
+    type duration = u64;
+
+    /// Read the current value of the clock.
+    @since(version = 0.2.0)
+    now: func() -> instant;
+
+    /// Query the resolution of the clock. Returns the duration of time
+    /// corresponding to a clock tick.
+    @since(version = 0.2.0)
+    resolution: func() -> duration;
+
+    /// Create a `pollable` which will resolve once the specified instant
+    /// has occurred.
+    @since(version = 0.2.0)
+    subscribe-instant: func(when: instant) -> pollable;
+
+    /// Create a `pollable` that will resolve after the specified duration has
+    /// elapsed from the time this function is invoked.
+    @since(version = 0.2.0)
+    subscribe-duration: func(when: duration) -> pollable;
+}

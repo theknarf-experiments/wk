@@ -82,6 +82,43 @@ void wkgfx_wait_frame(void) {
     (void)wasi_surface_surface_method_surface_get_frame(surf(), &fe);
 }
 
+int wkgfx_wait_frame_timeout(int64_t timeout_ns) {
+    wasi_io_poll_borrow_pollable_t frame = {G.frame_pollable.__handle};
+
+    if (timeout_ns < 0) {
+        wkgfx_wait_frame();
+        return 1;
+    }
+
+    /* A duration pollable is one-shot: subscribe fresh each call, and drop it
+     * again before returning or the handle table leaks one entry per wait. */
+    wasi_io_poll_own_pollable_t deadline =
+        wasi_clocks_monotonic_clock_subscribe_duration((uint64_t)timeout_ns);
+    wasi_io_poll_borrow_pollable_t in[2] = {
+        frame,
+        {deadline.__handle},
+    };
+    wasi_io_poll_list_borrow_pollable_t list = {.ptr = in, .len = 2};
+    wkgfx_list_u32_t ready = {0};
+    wasi_io_poll_poll(&list, &ready);
+
+    /* Index 0 is the frame. `poll` may report both as ready; the frame wins,
+     * because consuming it is what unblocks the host's next present. */
+    int got_frame = 0;
+    for (size_t i = 0; i < ready.len; i++) {
+        if (ready.ptr[i] == 0)
+            got_frame = 1;
+    }
+    wkgfx_list_u32_free(&ready);
+    wasi_io_poll_pollable_drop_own(deadline);
+
+    if (got_frame) {
+        wasi_surface_surface_frame_event_t fe;
+        (void)wasi_surface_surface_method_surface_get_frame(surf(), &fe);
+    }
+    return got_frame;
+}
+
 /* Ensure the staging buffer matches the live surface size. */
 static void stage_fit(uint32_t sw, uint32_t sh) {
     if (G.stage && G.stage_w == sw && G.stage_h == sh)

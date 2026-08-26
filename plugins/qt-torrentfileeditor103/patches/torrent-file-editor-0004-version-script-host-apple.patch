@@ -1,0 +1,38 @@
+WHAT: cmake/Version.cmake only configures the macOS bundle Info.plist when the
+      template it needs actually exists.
+WHY:  Version.cmake runs as `cmake -P`, i.e. SCRIPT mode, where there is no
+      toolchain file and no target platform -- APPLE, UNIX and WIN32 all
+      describe the HOST. Cross-compiling to wasm FROM macOS therefore takes the
+      Apple branch, while the project (CMAKE_SYSTEM_NAME=WASI) took the
+      non-Apple one and never ran the configure_file that puts
+      MacOSXBundleInfo.plist.in in the build dir. The build then dies on its
+      very first step:
+        FAILED: appversion config.h
+        CMake Error: File .../build/app/MacOSXBundleInfo.plist.in does not exist
+      which reads like a missing source file rather than a host/target
+      confusion. Upstream already knows about this class of bug in the same
+      place: the add_custom_command passes `-DWIN32=${WIN32}` precisely so the
+      script sees the TARGET's WIN32 and not the host's. This does the same for
+      the one Apple-only branch, without adding another command-line variable.
+UPSTREAM: as-is. It is a real cross-compilation bug in upstream, it affects any
+      non-Apple target built on a Mac, and the fix is strictly more correct
+      than the current guard even natively (the branch cannot work without that
+      file). Reporting it upstream costs nothing.
+--- a/cmake/Version.cmake	2026-06-05 13:11:57
++++ b/cmake/Version.cmake	2026-08-26 02:22:09
+@@ -133,7 +133,14 @@
+   configure_file(${CMAKE_CURRENT_LIST_DIR}/../appcast.json.in appcast.json)
+ endif()
+ file(WRITE appversion ${APP_VERSION})
+-if (APPLE)
++# EXISTS, not just APPLE: this file runs as `cmake -P`, i.e. in SCRIPT mode,
++# where APPLE describes the HOST -- there is no toolchain and no target
++# platform. Cross-compiling from macOS therefore takes the Apple branch while
++# the project itself took the non-Apple one and never configured
++# MacOSXBundleInfo.plist.in into the build dir, so configure_file() fails and
++# the whole build stops at "Generate config.h". Upstream already works around
++# the same mismatch for WIN32 by passing -DWIN32=${WIN32} on the command line.
++if (APPLE AND EXISTS "${CMAKE_BINARY_DIR}/MacOSXBundleInfo.plist.in")
+   configure_file("${CMAKE_BINARY_DIR}/MacOSXBundleInfo.plist.in" "${CMAKE_BINARY_DIR}/Torrent File Editor.app/Contents/Info.plist")
+   file(WRITE "${CMAKE_BINARY_DIR}/CPackProperties.cmake"
+     "set(CPACK_PACKAGE_VERSION \"${APP_VERSION}\")\n"

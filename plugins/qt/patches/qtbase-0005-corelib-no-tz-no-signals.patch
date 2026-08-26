@@ -1,0 +1,140 @@
+Subject: corelib: no timezone tables, no signals, no flock on wasi
+
+WHAT / WHY
+
+  src/corelib/global/qtenvironmentvariables.cpp
+      qTzSet() calls tzset() and qTzName() reads tzname[]. wasi-libc keeps
+      tzset, tzname[], daylight and timezone behind
+      __wasilibc_unmodified_upstream with the comment "WASI has no timezone
+      tables", so both are COMPILE errors ("use of undeclared identifier").
+      qTzSet() becomes a no-op -- a component's clock is UTC and there is no TZ
+      database to re-read -- and qTzName() reports the empty string, which is
+      what callers already treat as "unknown zone, use the offset".
+
+      Note this file is compiled unconditionally; FEATURE_timezone=OFF does not
+      reach it.
+
+  src/corelib/io/qlockfile_unix.cpp
+      QLockFilePrivate::isProcessRunning() calls ::kill(pid, 0) to decide
+      whether a lock file is stale. wasi-libc declares kill() only under
+      __wasilibc_unmodified_upstream ("WASI has no signals") and defines no
+      symbol for it, so it fails at compile time.
+
+      Returns false (== "not running", so the lock is stale and gets broken).
+      That is the only answer that lets a node restart after a crash instead of
+      deadlocking on its own leftover lock, and a wasip2 component genuinely
+      cannot observe another process.
+
+      The cost is real and worth writing down: if two wk nodes ever share one
+      writable volume, each will consider the other's lock stale. QLockFile is
+      NOT a cross-node mutex on this platform.
+
+      A SECOND hunk in the same file `#undef`s LOCK_EX and LOCK_NB, reusing the
+      idiom upstream already has three lines above for Q_OS_RTEMS. wasi-libc's
+      <sys/file.h> declares flock() and defines LOCK_SH/LOCK_EX/LOCK_NB/LOCK_UN
+      while no wasi-sdk library defines the symbol, so setNativeLocks()'s
+      `#elif defined(LOCK_EX) && defined(LOCK_NB)` branch compiles happily and
+      the failure lands at APPLICATION link time as "undefined symbol: flock",
+      long after anyone is still thinking about QLockFile. Undefining the
+      macros selects the existing `#else Q_UNUSED(fd)` no-op branch.
+
+UPSTREAM
+  yes for the qtenvironmentvariables.cpp hunks -- a libc that has no TZ tables
+  is an ordinary porting case and the guards sit next to the existing
+  Q_OS_WIN/_UCRT ones.
+
+  not-as-is for qlockfile_unix.cpp. The guard is fine but the SEMANTICS are a
+  policy choice (always-stale) that upstream would want to argue about, and it
+  silently weakens QLockFile. If wk ever needs a real cross-node lock this hunk
+  is the first thing to revisit.
+
+---
+diff --git a/src/corelib/global/qtenvironmentvariables.cpp b/src/corelib/global/qtenvironmentvariables.cpp
+index 7bc717e..7151390 100644
+--- a/src/corelib/global/qtenvironmentvariables.cpp
++++ b/src/corelib/global/qtenvironmentvariables.cpp
+@@ -345,6 +345,12 @@ void qTzSet()
+     const auto locker = qt_scoped_lock(environmentMutex);
+ #if defined(Q_OS_WIN)
+     _tzset();
++#elif defined(Q_OS_WASI)
++    // wasi-libc keeps tzset(), tzname[], daylight and timezone behind
++    // __wasilibc_unmodified_upstream with the comment "WASI has no timezone
++    // tables", so this is a compile error rather than a link error. A wasip2
++    // component's clock is UTC and there is no TZ database to re-read, so
++    // there is genuinely nothing to do here.
+ #else
+     tzset();
+ #endif // Q_OS_WIN
+@@ -417,6 +423,13 @@ QString qTzName(int dstIndex)
+         const auto locker = qt_scoped_lock(environmentMutex);
+         ok = _get_tzname(&s, name, 512, dstIndex) != 0;
+     }
++#elif defined(Q_OS_WASI)
++    // No tzname[] on wasi-libc -- see qTzSet() above. Reporting "no name" is
++    // the honest answer for a component whose only zone is UTC; callers treat
++    // an empty QString as "unknown zone" and fall back to the offset.
++    Q_UNUSED(dstIndex);
++    Q_UNUSED(name);
++    ok = false;
+ #else
+     {
+         const auto locker = qt_scoped_lock(environmentMutex);
+diff --git a/src/corelib/io/qlockfile_unix.cpp b/src/corelib/io/qlockfile_unix.cpp
+index 5704f65..aa1ce78 100644
+--- a/src/corelib/io/qlockfile_unix.cpp
++++ b/src/corelib/io/qlockfile_unix.cpp
+@@ -30,6 +30,19 @@
+ #  undef LOCK_NB
+ #endif
+ 
++#if defined(Q_OS_WASI)
++// Same treatment as RTEMS above, but the failure mode is nastier: wasi-libc's
++// <sys/file.h> DECLARES flock() and defines LOCK_SH/LOCK_EX/LOCK_NB/LOCK_UN,
++// while no wasi-sdk library defines the symbol (verified with llvm-nm over
++// libc.a, librt.a and every libwasi-emulated-*). So the guard below is
++// satisfied, QtCore compiles clean, and the failure lands much later as
++// "undefined symbol: flock" when an APPLICATION links -- long after anyone is
++// still looking at QLockFile. Undefining the macros routes setNativeLocks()
++// to its existing no-op branch.
++#  undef LOCK_EX
++#  undef LOCK_NB
++#endif
++
+ #include <sys/types.h> // kill
+ #include <signal.h>    // kill
+ #include <unistd.h>    // gethostname
+@@ -185,6 +198,25 @@ bool QLockFilePrivate::removeStaleLock()
+ 
+ bool QLockFilePrivate::isProcessRunning(qint64 pid, const QString &appname)
+ {
++#ifdef Q_OS_WASI
++    // wasi-libc declares kill() only under __wasilibc_unmodified_upstream
++    // ("WASI has no signals"), and there is no symbol for it in libc.a either,
++    // so this is a compile error before it would have been a link error.
++    //
++    // There is also no meaningful answer to give. A wasip2 component is alone
++    // in its world: it cannot enumerate, signal or even name another process.
++    // Reporting "not running" means a lock file left behind by an earlier run
++    // is treated as stale and broken, which is the behaviour that lets a node
++    // restart after a crash instead of deadlocking on its own leftovers.
++    //
++    // The cost, stated plainly: if two wk nodes ever share one writable volume,
++    // each will consider the other's lock stale. QLockFile is therefore NOT a
++    // cross-node mutex on this platform. Guarding a shared volume needs
++    // something built on wk's own capabilities, not on POSIX signals.
++    Q_UNUSED(pid);
++    Q_UNUSED(appname);
++    return false;
++#else
+     if (::kill(pid_t(pid), 0) == -1 && errno == ESRCH)
+         return false; // PID doesn't exist anymore
+ 
+@@ -198,6 +230,7 @@ bool QLockFilePrivate::isProcessRunning(qint64 pid, const QString &appname)
+     }
+ 
+     return true;
++#endif // Q_OS_WASI
+ }
+ 
+ QString QLockFilePrivate::processNameByPid(qint64 pid)

@@ -1,0 +1,32 @@
+Subject: corelib: include what you use, for headers wasi-libc does not pull in
+
+WHAT / WHY
+
+  src/corelib/global/qsimd.cpp
+      qDetectCpuFeatures() calls getenv("QT_NO_CPU_FEATURE") with a comment
+      saying "Intentionally NOT qgetenv (this code runs too early)", but the
+      file includes only <stdio.h>, <string.h> and <assert.h>. glibc's and
+      Apple's <stdio.h> drag in enough to declare getenv anyway; wasi-libc's
+      does not, so the call is a hard "use of undeclared identifier 'getenv'"
+      (helpfully mis-suggested by clang as 'qgetenv', which then compounds into
+      "calling 'qgetenv' with incomplete return type 'QByteArray'").
+      Adding <stdlib.h> is the whole fix.
+
+UPSTREAM
+  yes. A plain include-what-you-use defect that happens to be invisible on the
+  platforms Qt currently builds on. Nothing wasi-specific in the hunk, so it is
+  applied unconditionally rather than under Q_OS_WASI.
+
+---
+diff --git a/src/corelib/global/qsimd.cpp b/src/corelib/global/qsimd.cpp
+index e60c828..aee4049 100644
+--- a/src/corelib/global/qsimd.cpp
++++ b/src/corelib/global/qsimd.cpp
+@@ -10,6 +10,7 @@
+ #include "qalgorithms.h"
+ 
+ #include <stdio.h>
++#include <stdlib.h>     // getenv() -- see qDetectCpuFeatures() below
+ #include <string.h>
+ 
+ #if defined(QT_NO_DEBUG) && !defined(NDEBUG)

@@ -1,0 +1,56 @@
+WHAT
+    Teach masm's WTF::systemPageSize() about wasi.
+
+WHY
+    src/3rdparty/masm/wtf/PageBlock.cpp defines systemPageSize() twice, once
+    under OS(UNIX) and once under OS(WINDOWS), and on wasm neither is taken:
+    masm's own Platform.h decides OS(UNIX) from a fixed list of system names
+    plus `defined(unix)`, and wasi-sdk defines none of them. The build then
+    fails in the one place that calls it:
+
+        PageBlock.cpp:71:22: error: use of undeclared identifier 'systemPageSize'
+           71 |         s_pageSize = systemPageSize();
+
+    The UNIX implementation is `sysconf(_SC_PAGESIZE)`, which wasi-libc
+    provides and which answers 65536 -- the wasm linear-memory page, a power of
+    two as pageSize()'s ASSERT requires. So the fix is to widen that one
+    function's guard, and only that one: Platform.h's OS(UNIX) block also turns
+    on WTF_USE_PTHREADS, HAVE_MMAP and <langinfo.h>, none of which we want.
+
+    This is a wasm-only change. Off wasm the preprocessor sees the file
+    unchanged.
+
+UPSTREAM
+    Not offered upstream: masm is a vendored fork of an old JavaScriptCore and
+    Qt does not take wasi patches for it today. Would be a one-line addition to
+    the OS(UNIX) list in Platform.h if it ever were.
+
+CLASSIFICATION
+    as-is -- the value is the true page size, not a stand-in.
+--- a/src/3rdparty/masm/wtf/PageBlock.cpp
++++ b/src/3rdparty/masm/wtf/PageBlock.cpp
+@@ -26,7 +26,7 @@
+ #include "config.h"
+ #include "PageBlock.h"
+ 
+-#if OS(UNIX)
++#if OS(UNIX) || defined(__wasi__)
+ #include <unistd.h>
+ #endif
+ 
+@@ -40,7 +40,14 @@
+ static size_t s_pageSize;
+ static size_t s_pageMask;
+ 
+-#if OS(UNIX)
++// wasi-libc is a Unix-like libc, but masm's Platform.h does not know the name:
++// its OS(UNIX) test is a fixed list of systems plus `defined(unix)`, and
++// wasi-sdk defines none of those. Adding WASI to OS(UNIX) wholesale is wrong --
++// that same block turns on WTF_USE_PTHREADS, HAVE_MMAP and <langinfo.h> -- so
++// only this one function is widened. sysconf(_SC_PAGESIZE) IS in wasi-libc and
++// answers 65536, the wasm linear-memory page, which is what pageSize() wants
++// and is a power of two as pageSize()'s ASSERT requires.
++#if OS(UNIX) || defined(__wasi__)
+ 
+ inline size_t systemPageSize()
+ {

@@ -1,0 +1,52 @@
+# Build this plugin: `mise run build`
+#
+# Three stages, because each needs the one before it:
+#   build-hosttools   a native Qt 6.8.4 WITH QtGui into ./host, purely so that
+#                     `qsb` exists. plugins/qt/host is Gui-less and without qsb
+#                     qtdeclarative builds NO Qt Quick at all. ~10 minutes.
+#   build-qtdeclarative
+#                     QtQml + QtQuick + Quick Controls cross-compiled to
+#                     wasm32-wasip2 into ./sysroot. ~20 minutes.
+#   build             Slate itself -> ./slate.wasm. Minutes.
+#
+# It also needs plugins/qt to have been built already (the cross qtbase and
+# libqwk.a, the wk QPA plugin); build.sh checks and says so.
+#
+# Long: run detached and tail ./logs rather than waiting on a foreground
+# timeout.
+
+[tasks.build-hosttools]
+description = "Native Qt 6.8.4 with QtGui + qsb into ./host (Qt Quick cannot cross-build without it)"
+dir = "{{config_root}}"
+# Nothing here compiles wasm, but every script in this plugin shares one SDK
+# guard so a mismatched WASI_SDK fails loudly instead of half-building.
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-hosttools.sh"
+
+[tasks.build-qtdeclarative]
+description = "Cross-build qtdeclarative 6.8.4 (QtQml/QtQuick/Controls) for wasm32-wasip2 into ./sysroot"
+dir = "{{config_root}}"
+depends = ["build-hosttools"]
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-qtdeclarative.sh"
+
+[tasks.build]
+description = "Build Slate (Qt Quick pixel-art editor) as a wk node -> ./slate.wasm"
+dir = "{{config_root}}"
+# build.sh runs the two stages above itself when their outputs are missing, so
+# there is no `depends` here: a rebuild of just the app must not re-enter the
+# Qt builds' idempotency checks on every invocation.
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build.sh"
+
+[tasks.test]
+description = "Run slate.wasm as a headless wk node and prove it paints (writes a PPM)"
+dir = "{{config_root}}"
+run = """
+set -e
+# The harness is its own cargo workspace, so it resolves dependencies on its
+# own -- and wk-server depends on wasi-gfx-runtime by git with no rev, which
+# means a fresh resolve picks a DIFFERENT commit than the repo uses and fails
+# with "no matching package named `wasi-graphics-context-wasmtime`". Seeding
+# the lock from the repo's pins it to what wk itself builds against.
+[ -f harness/Cargo.lock ] || cp ../../Cargo.lock harness/Cargo.lock
+cargo build --release --manifest-path harness/Cargo.toml
+./harness/target/release/slate-harness ./slate.wasm /tmp/slate.ppm
+"""

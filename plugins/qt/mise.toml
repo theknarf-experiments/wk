@@ -1,0 +1,66 @@
+# Build this plugin: `mise run build`  (host tools, then the cross qtbase)
+#
+# Two halves, because the second cannot start until the first has finished:
+#   build-host   native Qt 6.8.4 tools (moc/rcc/uic/qmake/syncqt + the QML
+#                tools) into ./host -- Qt refuses to cross-compile without a
+#                QT_HOST_PATH of the exact same version.
+#   build-qtbase qtbase cross-compiled to wasm32-wasip2 into ./sysroot.
+# Both are long (hours, not minutes). Run them detached and tail ./logs rather
+# than waiting on a foreground timeout.
+
+[tasks.build-host]
+description = "Build native Qt 6.8.4 host tools (moc/rcc/uic/qmlcachegen) into ./host"
+dir = "{{config_root}}"
+# Nothing here compiles wasm, but every script in this plugin shares one SDK
+# guard so a mismatched WASI_SDK fails loudly instead of half-building.
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-host.sh"
+
+[tasks.build-qtbase]
+description = "Cross-build qtbase 6.8.4 for wasm32-wasip2 into ./sysroot"
+dir = "{{config_root}}"
+depends = ["build-host"]
+# wasi-sdk comes from the root mise.toml [tools]; point the script at its
+# install (resolved at task time -- `mise where` can't be used in an [env]
+# template, it would recurse). Falls back to the script's own default when run
+# outside mise.
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-qtbase.sh"
+
+# The repo-wide `mise run build-plugins` invokes every plugin's `build` task,
+# so this one must not blow up the whole sweep while the port is still
+# scaffolding. It self-skips until patches/ has something in it -- the qtbase
+# cross build cannot even configure before then (see build-qtbase.sh's
+# preflight and PORTING.md "Current state"). The moment the first patch lands
+# this becomes a real, and very long, build.
+[tasks.build-qpa]
+description = "Build the wk QPA platform plugin (plugins/qt/qpa) into ./sysroot/lib/libqwk.a"
+dir = "{{config_root}}"
+depends = ["build-qtbase"]
+# Minutes, not hours: this compiles eleven of OUR files against the installed
+# cross Qt. It is out of tree on purpose -- see build-qpa.sh's header.
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-qpa.sh"
+
+[tasks.build-smoke]
+description = "Build plugins/qt/qt-smoke.wasm -- a Qt Widgets app as a wk node"
+dir = "{{config_root}}"
+depends = ["build-qpa"]
+# Staged font included; see build-smoke.sh. Verified by the wk-server test
+# `qt_widgets_app_paints_through_the_wk_qpa`, which pumps frames headless and
+# checks the composited surface is a real widget frame.
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-smoke.sh"
+
+[tasks.build]
+description = "Build the Qt port: host tools + cross qtbase (self-skips while patches/ is empty)"
+dir = "{{config_root}}"
+run = """
+set -e
+if ! ls patches/qtbase-*.patch >/dev/null 2>&1; then
+  echo "qt: scaffolding only -- no patches/qtbase-*.patch yet, so there is nothing to build."
+  echo "    qtbase cannot configure for WASI without them; see PORTING.md 'Current state'."
+  echo "    To work on the port: ./build-host.sh then ./build-qtbase.sh."
+  exit 0
+fi
+SDK=$(mise where github:WebAssembly/wasi-sdk)
+WASI_SDK="$SDK" ./build-host.sh
+WASI_SDK="$SDK" ./build-qtbase.sh
+echo "qt: host tools in ./host, cross qtbase in ./sysroot -- see PORTING.md"
+"""

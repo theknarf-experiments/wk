@@ -1,0 +1,225 @@
+WHAT
+    Give masm's OSAllocator a wasi implementation, backed by
+    aligned_alloc(pageSize()) rather than by wasi-libc's emulated mmap.
+
+WHY -- part 1, the link error
+    masm's Platform.h decides OS(UNIX) from a fixed list of system names plus
+    `defined(unix)`, and wasi-sdk defines none of them, so the whole of
+    OSAllocatorPosix.cpp compiles to nothing. src/qml/CMakeLists.txt:721 DOES
+    add the file (`CONDITION UNIX AND NOT INTEGRITY`, which qtbase's WASI patch
+    satisfies); it is the in-file guard that drops it. QtQml then does not link:
+
+        wasm-ld: error: libQt6Qml.a(qv4mm.cpp.obj): undefined symbol:
+            WTF::OSAllocator::commit(void*, unsigned long, bool, bool)
+        wasm-ld: error: libQt6Qml.a(YarrInterpreter.cpp.obj): undefined symbol:
+            WTF::OSAllocator::reserveAndCommit(...)
+        wasm-ld: error: libQt6Qml.a(qv4executableallocator.cpp.obj): undefined
+            symbol: WTF::OSAllocator::releaseDecommitted(void*, unsigned long)
+
+    -- the JS heap, the regexp interpreter's stack, and the executable
+    allocator.
+
+WHY -- part 2, why widening the guard is NOT enough
+    Simply letting the POSIX file compile does link, and then crashes. Every
+    OS(LINUX)/OS(QNX)/OS(DARWIN) branch in it is false for us and
+    HAVE(MADV_FREE)/HAVE(MADV_FREE_REUSE) are set only for DARWIN and QNX
+    (Platform.h:673-701), so the generic paths use only mmap and munmap, both
+    of which wasi-libc's libwasi-emulated-mman provides. But wasi-libc
+    implements mmap as malloc and munmap as free, and malloc is 8-byte
+    aligned where mmap is PAGE aligned. Measured under wasmtime:
+
+        sysconf(_SC_PAGESIZE) = 65536
+        mmap(65536) = 0x11498   page-aligned=0
+        mmap(65536) = 0x214b8   page-aligned=0
+
+    qtdeclarative relies on that alignment. src/qml/jsruntime/qv4persistent.cpp
+    puts one WTF::PageAllocation behind every page of PersistentValues and
+    recovers a page's header from any Value inside it by MASKING:
+
+        Page *getPage(const Value *val) {
+           return reinterpret_cast<Page *>(reinterpret_cast<quintptr>(val)
+                   & ~((quintptr)(WTF::pageSize() - 1)));
+        }
+
+    With an unaligned page that mask lands on an unrelated address and every
+    header field read through it is garbage. allocatePage() asserts exactly
+    this -- Q_ASSERT(!((quintptr)p & (WTF::pageSize() - 1))) -- so a debug
+    build would say so; a release build silently corrupts the GC's bookkeeping.
+    Observed, in Slate, after QML had loaded and bindings were evaluating:
+
+        0: QV4::markPersistentValues(QV4::GCStateMachine*, ...)
+        2: QV4::GCStateMachine::transition()
+        3: QV4::MemoryManager::runGC()
+        ...
+        memory fault at wasm address 0xffff00fc in linear memory of size
+        0x2d80000: wasm trap: out of bounds memory access
+
+    aligned_alloc(65536, ...) does give real 64 KiB alignment on wasi-libc's
+    dlmalloc (verified under wasmtime: 0x20000, 0x40000, 0x60000), and free()
+    takes exactly that pointer, which is all releaseDecommitted has to do.
+    The rest follows from wasm having no virtual memory: reserveUncommitted IS
+    reserveAndCommit and commit()/decommit() are no-ops -- the same shape the
+    generic POSIX path already takes. The memset is not optional: qv4mm.cpp
+    assumes a fresh reservation is zeroed (MemorySegment::free() zeroes before
+    decommit precisely because of that), mmap would have zeroed, malloc does
+    not.
+
+    canAllocateExecutableMemory() returns a constant instead of probing.
+    wasm code is not data; there is no way to make linear memory executable.
+    But wasi-libc's mprotect() is a stub that returns 0, so upstream's probe
+    -- mmap RW, then mprotect PROT_EXEC -- would report SUCCESS.
+
+UPSTREAM
+    Not offered: masm is a vendored fork of an old JavaScriptCore. The
+    alignment lesson is more general, and is worth remembering for any wasi
+    port: wasi-libc's mmap is malloc, so ANY code that masks a pointer back to
+    a page boundary is broken on it.
+
+CLASSIFICATION
+    as-is for the allocator: same contract, different primitive.
+    The canAllocateExecutableMemory() hunk deliberately replaces a runtime
+    probe with a constant, because the probe cannot answer truthfully here.
+--- a/src/3rdparty/masm/wtf/OSAllocatorPosix.cpp
++++ b/src/3rdparty/masm/wtf/OSAllocatorPosix.cpp
+@@ -26,8 +26,134 @@
+ #include "config.h"
+ #include "OSAllocator.h"
+ 
+-#if OS(UNIX)
++#if defined(__wasi__)
++
++// wasi gets its own implementation rather than a widened OS(UNIX) guard, and
++// the reason is alignment.
++//
++// The file below compiles to nothing on wasi in the first place, because
++// masm's Platform.h decides OS(UNIX) from a fixed list of system names plus
++// `defined(unix)` and wasi-sdk defines none of them. QtQml then does not link:
++//
++//     wasm-ld: error: libQt6Qml.a(qv4mm.cpp.obj): undefined symbol:
++//         WTF::OSAllocator::commit(void*, unsigned long, bool, bool)
++//     wasm-ld: error: libQt6Qml.a(YarrInterpreter.cpp.obj): undefined symbol:
++//         WTF::OSAllocator::reserveAndCommit(...)
++//     wasm-ld: error: libQt6Qml.a(qv4executableallocator.cpp.obj): undefined
++//         symbol: WTF::OSAllocator::releaseDecommitted(void*, unsigned long)
++//
++// i.e. the JS heap, the regexp interpreter and the executable allocator. The
++// obvious fix is to let the POSIX file compile: every OS(LINUX)/OS(QNX)/
++// OS(DARWIN) branch in it is false for us and HAVE(MADV_FREE)/
++// HAVE(MADV_FREE_REUSE) are set only for DARWIN and QNX (Platform.h:673-701),
++// so the generic paths use nothing but mmap and munmap, both of which
++// wasi-libc's libwasi-emulated-mman provides.
++//
++// THAT IS NOT ENOUGH, and the way it fails is worth writing down. wasi-libc
++// implements mmap as malloc and munmap as free. malloc is 8-byte aligned;
++// mmap on a real OS is PAGE aligned, and callers rely on it. In particular
++// qtdeclarative's src/qml/jsruntime/qv4persistent.cpp allocates one
++// WTF::PageAllocation per page of PersistentValues and then recovers the page
++// header from any Value inside it by MASKING:
++//
++//     Page *getPage(const Value *val) {
++//        return reinterpret_cast<Page *>(
++//            reinterpret_cast<quintptr>(val) & ~((quintptr)(WTF::pageSize() - 1)));
++//     }
++//
++// With an unaligned page that mask lands on an unrelated address, every
++// header field read from it is garbage, and the GC walks off into nowhere.
++// Observed, from a Qt Quick app that had already loaded its QML and started
++// evaluating bindings:
++//
++//     0: QV4::markPersistentValues(QV4::GCStateMachine*, ...)
++//     3: QV4::MemoryManager::runGC()
++//     ...
++//     memory fault at wasm address 0xffff00fc in linear memory of size
++//     0x2d80000: wasm trap: out of bounds memory access
++//
++// Note allocatePage() asserts exactly this -- Q_ASSERT(!((quintptr)p &
++// (WTF::pageSize() - 1))) -- so a debug build would have said so. A release
++// build silently corrupts.
++//
++// So on wasi the reservation comes from aligned_alloc(pageSize(), ...), which
++// wasi-libc's dlmalloc honours for 64 KiB (verified under wasmtime: it returns
++// 0x20000, 0x40000, 0x60000). free() then takes exactly that pointer, which is
++// all releaseDecommitted needs to do.
++//
++// The rest follows from wasm not having virtual memory at all: there is no
++// such thing as reserved-but-uncommitted address space, so reserveUncommitted
++// IS reserveAndCommit and commit()/decommit() are no-ops -- the same shape the
++// generic POSIX path takes. qv4mm.cpp requires a fresh reservation to be
++// zeroed (its MemorySegment::free() zeroes before decommit precisely because
++// it assumes that), so we memset; malloc does not zero and mmap would have.
++
++#include <cstdlib>
++#include <cstring>
++
++#include <wtf/Assertions.h>
++#include <wtf/PageBlock.h>
++#include <wtf/UnusedParam.h>
++
++namespace WTF {
++
++void* OSAllocator::reserveUncommitted(size_t bytes, Usage usage, bool writable, bool executable)
++{
++    return reserveAndCommit(bytes, usage, writable, executable);
++}
++
++void* OSAllocator::reserveAndCommit(size_t bytes, Usage usage, bool writable, bool executable, bool includesGuardPages)
++{
++    UNUSED_PARAM(usage);
++    UNUSED_PARAM(writable);
++    UNUSED_PARAM(executable);
++    // Guard pages would need PROT_NONE, which linear memory cannot express.
++    // Only the executable allocator asks for them, and there is no executable
++    // memory here (see canAllocateExecutableMemory below).
++    UNUSED_PARAM(includesGuardPages);
++
++    const size_t alignment = pageSize();
++    const size_t size = (bytes + alignment - 1) & ~(alignment - 1);
++    void* result = std::aligned_alloc(alignment, size);
++    if (!result)
++        CRASH();
++    std::memset(result, 0, size);
++    return result;
++}
++
++void OSAllocator::commit(void* address, size_t bytes, bool writable, bool executable)
++{
++    UNUSED_PARAM(address);
++    UNUSED_PARAM(bytes);
++    UNUSED_PARAM(writable);
++    UNUSED_PARAM(executable);
++}
+ 
++void OSAllocator::decommit(void* address, size_t bytes)
++{
++    UNUSED_PARAM(address);
++    UNUSED_PARAM(bytes);
++}
++
++void OSAllocator::releaseDecommitted(void* address, size_t bytes)
++{
++    UNUSED_PARAM(bytes);
++    std::free(address);
++}
++
++bool OSAllocator::canAllocateExecutableMemory()
++{
++    // No, and it is important to say so rather than probe for it: wasm code is
++    // not data, there is no way to make linear memory executable, and
++    // wasi-libc's mprotect() is a stub that returns 0 -- so the POSIX probe
++    // below (mmap RW, then mprotect PROT_EXEC) would report SUCCESS.
++    return false;
++}
++
++} // namespace WTF
++
++#elif OS(UNIX)
++
+ #include <cstdlib>
+ 
+ #include "PageAllocation.h"
+@@ -332,4 +458,4 @@
+ 
+ } // namespace WTF
+ 
+-#endif // OS(UNIX)
++#endif // __wasi__ / OS(UNIX)

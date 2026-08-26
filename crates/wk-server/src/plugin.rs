@@ -1766,7 +1766,13 @@ impl PluginHost {
         ctx_builder
             .env("TERM", "xterm-256color")
             .env("COLUMNS", cols.to_string())
-            .env("LINES", rows.to_string());
+            .env("LINES", rows.to_string())
+            // A guest cannot see what it is running on, and GUI toolkits need
+            // to: winit reports the macOS Command key as `meta`, and a toolkit
+            // that follows Mac convention has to swap Ctrl/Meta for Cmd+C to
+            // mean Copy. A browser gets this from `navigator`; wk's guests get
+            // it from here (plugins/qt/qpa/qwkkeytranslator.cpp reads it).
+            .env("WK_HOST_OS", std::env::consts::OS);
         // Outbound http follows the node's fabric stack's host access (gateway).
         let http_stack = net.as_ref().map(|n| n.stack.clone());
         let state = HostState {
@@ -2118,6 +2124,43 @@ mod tests {
             );
         }
 
+        // Type a character. `key` and `text` are independent halves of a key
+        // event and only the first has been exercised so far (the arrow keys
+        // above): `text` is what a text field inserts, and it reached no guest
+        // at all while the compositor hardcoded it to `None`. The guest echoes
+        // the scalar it decoded into the top-left pixel, so this asserts the
+        // whole path — VirtualSurface queue, wasi:surface record, wkgfx's
+        // UTF-8 decode, C code — and not merely that the field is populated.
+        {
+            let mut s = surface.lock().unwrap();
+            let ev = KeyEvent {
+                key: Some(Key::KeyK),
+                text: Some("k".into()),
+                alt_key: false,
+                ctrl_key: false,
+                meta_key: false,
+                shift_key: false,
+                repeat: false,
+            };
+            s.key_down.push_back(ev.clone());
+            s.key_up.push_back(ev);
+            s.wake();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            let s = surface.lock().unwrap();
+            if s.pixels.len() >= 4 && s.pixels[0..3] == [b'k', 0, 0] {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the typed character never reached the guest (top-left pixel is {:?}, want [107, 0, 0])",
+                &s.pixels[0..3.min(s.pixels.len())]
+            );
+        }
+
         // Close the surface: the guest traps on its next get-frame and exits.
         {
             let mut s = surface.lock().unwrap();
@@ -2128,6 +2171,302 @@ mod tests {
         if let Some(n) = node {
             n.kill.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// A REAL Qt Widgets application (Qt 6.8.4 cross-built for wasm32-wasip2)
+    /// paints onto a wk surface through the `wk` QPA plugin.
+    ///
+    /// This exercises considerably more than gfx-smoke: QApplication startup,
+    /// static QPA plugin resolution, the widget layout engine, the raster
+    /// paint engine, FreeType+HarfBuzz text out of a compiled-in Qt resource,
+    /// the fbconvenience compositor blitting N top-levels into ONE surface,
+    /// and an event dispatcher whose only blocking call is the wk frame
+    /// pollable. Frames are pumped headless exactly like the gfx-smoke test.
+    /// Skipped when the artifact isn't built.
+    #[test]
+    fn qt_widgets_app_paints_through_the_wk_qpa() {
+        let wasm = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/qt/qt-smoke.wasm");
+        if !wasm.exists() {
+            eprintln!("skipping: build plugins/qt first (./build-smoke.sh)");
+            return;
+        }
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let surfaces: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        host.spawn(
+            &wasm,
+            "qt-smoke",
+            id,
+            &[],
+            surfaces.clone(),
+            nodes.clone(),
+            Vec::new(),
+            // WK_SMOKE_SELFTEST makes the guest click its own button and print
+            // the result, so the test can check widget behaviour and not only
+            // pixels.
+            Some(crate::images::ContainerSetup {
+                layers: Vec::new(),
+                env: vec![("WK_SMOKE_SELFTEST".into(), "1".into())],
+            }),
+        )
+        .expect("spawn");
+
+        let node = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+            loop {
+                if let Some(n) = nodes.lock().unwrap().iter().find(|n| n.id == id).cloned() {
+                    break n;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "qt-smoke node never appeared"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        // Compiling a 21 MB component takes a while; wkgfx_open() only runs
+        // after that, and after QApplication has built its font database.
+        let surface = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            loop {
+                if let Some(s) = surfaces.lock().unwrap().first().cloned() {
+                    break s;
+                }
+                assert!(
+                    !node.finished.load(Ordering::Relaxed),
+                    "qt-smoke exited before opening a surface; node log:\n{}",
+                    String::from_utf8_lossy(&node.term_io.log_read(0).0)
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "qt-smoke never opened a surface; node log:\n{}",
+                    String::from_utf8_lossy(&node.term_io.log_read(0).0)
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+
+        let pump_frame = || {
+            let mut s = surface.lock().unwrap();
+            s.frame_ready = true;
+            s.wake();
+        };
+
+        // A Qt window is not a gradient: the bar is a frame that is neither
+        // uniform nor uniformly black. Fusion's window background is a light
+        // grey, so a painted frame has both dark (text, button border) and
+        // light (background) pixels.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        let (dark, light) = loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            {
+                let s = surface.lock().unwrap();
+                let mut dark = 0usize;
+                let mut light = 0usize;
+                for px in s.pixels.chunks_exact(4) {
+                    let lum = px[0] as u32 + px[1] as u32 + px[2] as u32;
+                    if lum < 200 {
+                        dark += 1;
+                    } else if lum > 500 {
+                        light += 1;
+                    }
+                }
+                if dark > 100 && light > 10_000 {
+                    break (dark, light);
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "qt-smoke never painted a widget frame; node log:\n{}",
+                String::from_utf8_lossy(&node.term_io.log_read(0).0)
+            );
+        };
+        eprintln!("qt-smoke frame: {dark} dark px, {light} light px");
+
+        // A pixel histogram proves "not blank"; it does not prove "a window".
+        // WK_QT_SMOKE_DUMP=/tmp/f.ppm writes the composited surface out so a
+        // human can look at it — which is the only way to catch a QPA plugin
+        // that paints something plausible but wrong.
+        if let Ok(path) = std::env::var("WK_QT_SMOKE_DUMP") {
+            let s = surface.lock().unwrap();
+            let mut ppm = format!("P6\n{} {}\n255\n", s.width, s.height).into_bytes();
+            ppm.extend(s.pixels.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
+            std::fs::write(&path, ppm).expect("write frame dump");
+            eprintln!("qt-smoke frame dumped to {path}");
+            eprintln!(
+                "--- qt-smoke node log ---\n{}",
+                String::from_utf8_lossy(&node.term_io.log_read(0).0)
+            );
+        }
+
+        // The guest's own assertion: it clicked its QPushButton directly and
+        // the QLabel followed. Pixels prove the paint path; this proves the
+        // widget machinery underneath it. It also prints the button's rect in
+        // surface coordinates, which is what the input check below aims at.
+        let log_now = || String::from_utf8_lossy(&node.term_io.log_read(0).0).to_string();
+        // The LAST BUTTON line, not the first: the guest republishes the rect
+        // on a repeating timer and the early readings predate the forced
+        // resize to the full surface.
+        let button_rect = |log: &str| -> Option<(i64, i64, i64, i64)> {
+            let line = log.lines().rfind(|l| l.starts_with("BUTTON "))?;
+            let n: Vec<i64> = line[7..]
+                .split_whitespace()
+                .filter_map(|t| t.parse().ok())
+                .collect();
+            (n.len() == 4).then(|| (n[0], n[1], n[2], n[3]))
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            let log = log_now();
+            assert!(
+                !log.contains("SELFTEST FAIL"),
+                "qt-smoke's self-test failed; node log:\n{log}"
+            );
+            if log.contains("SELFTEST PASS") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "qt-smoke never reported its self-test; node log:\n{log}"
+            );
+        }
+
+        // Typing, which is what `text` on a key event is for. The guest has
+        // focused its QLineEdit and echoes every change to it, so this drives
+        // the whole chain — VirtualSurface queue, wkgfx's UTF-8 decode,
+        // QWkKeyTranslator's layout branch, QWidgetLineControl — and asserts
+        // on the string a user would see. It runs before the pointer click
+        // below because clicking the QPushButton takes the focus away.
+        let typed = |s: &mut VirtualSurface, key: Key, text: &str, ctrl: bool, meta: bool| {
+            let ev = KeyEvent {
+                key: Some(key),
+                text: Some(text.into()),
+                alt_key: false,
+                ctrl_key: ctrl,
+                meta_key: meta,
+                shift_key: false,
+                repeat: false,
+            };
+            s.key_down.push_back(ev.clone());
+            s.key_up.push_back(ev);
+            s.wake();
+        };
+        typed(&mut surface.lock().unwrap(), Key::KeyA, "a", false, false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            if log_now().contains("EDIT 'a'") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a typed 'a' never reached the QLineEdit; node log:\n{}",
+                log_now()
+            );
+        }
+        eprintln!("qt-smoke: a real key event typed into the QLineEdit");
+
+        // ...and the other half of typing: a command chord must NOT type its
+        // letter. Both are sent because which one is dangerous depends on the
+        // host: whichever of ctrl/meta the QPA maps to Qt::MetaModifier slips
+        // past QInputControl's exact-ControlModifier guard (QTBUG-35734), and
+        // the swap that decides which is which follows WK_HOST_OS.
+        typed(&mut surface.lock().unwrap(), Key::KeyS, "s", false, true);
+        typed(&mut surface.lock().unwrap(), Key::KeyG, "g", true, false);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < until {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            let log = log_now();
+            assert!(
+                !log.contains("EDIT 'as'") && !log.contains("EDIT 'ag'"),
+                "a command chord typed its letter into the QLineEdit; node log:\n{log}"
+            );
+        }
+
+        // The host told the guest what it is running on, which is the only way
+        // a sandboxed toolkit can know whether Cmd or Ctrl is the shortcut key.
+        assert!(
+            log_now().contains(&format!("host_os={}", std::env::consts::OS)),
+            "qt-smoke did not see WK_HOST_OS; node log:\n{}",
+            log_now()
+        );
+
+        // Now the real thing: a genuine wasi:surface pointer press and release
+        // aimed at the button. Reaching the QPushButton means the whole input
+        // path works — the host queue, wkgfx_poll_event, QWkInput, and
+        // QGuiApplication's null-window hit-testing through
+        // QFbScreen::topLevelAt. Re-aim from the newest published rect on each
+        // attempt, since the layout settles a few frames in.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let aimed_at = 'click: loop {
+            let rect = loop {
+                pump_frame();
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                if let Some(r) = button_rect(&log_now()) {
+                    break r;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "qt-smoke never published a button rect -- its repeating QTimer never fired, \
+                     so the dispatcher is not servicing timers; node log:\n{}",
+                    log_now()
+                );
+            };
+            let (bx, by) = (rect.0 + rect.2 / 2, rect.1 + rect.3 / 2);
+            {
+                let mut s = surface.lock().unwrap();
+                s.pointer_move.push_back(PointerEvent {
+                    x: bx as f64,
+                    y: by as f64,
+                    button: None,
+                });
+                s.pointer_down.push_back(PointerEvent {
+                    x: bx as f64,
+                    y: by as f64,
+                    button: Some(PointerButton::Left),
+                });
+                s.pointer_up.push_back(PointerEvent {
+                    x: bx as f64,
+                    y: by as f64,
+                    button: Some(PointerButton::Left),
+                });
+                s.wake();
+            }
+            let attempt = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                pump_frame();
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                if log_now().contains("clicked 2") {
+                    break 'click (bx, by);
+                }
+                if std::time::Instant::now() > attempt {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "a real pointer click at ({bx}, {by}) never reached the QPushButton; \
+                     node log:\n{}",
+                    log_now()
+                );
+            }
+        };
+        eprintln!("qt-smoke: real pointer click at {aimed_at:?} reached the QPushButton");
+
+        {
+            let mut s = surface.lock().unwrap();
+            s.closed = true;
+            s.wake();
+        }
+        node.kill.store(true, Ordering::Relaxed);
     }
 
     /// The real thing: UNMODIFIED doomgeneric (plugins/doom) boots Freedoom
@@ -2239,7 +2578,11 @@ mod tests {
             let enter = |sur: &mut VirtualSurface, down: bool| {
                 let ev = KeyEvent {
                     key: Some(Key::Enter),
-                    text: None,
+                    // winit's text for Enter is "\r" and the compositor
+                    // forwards it, so send what a real keystroke sends —
+                    // doom's `ch` fallback ignores control characters, which
+                    // is exactly the property worth exercising here.
+                    text: Some("\r".into()),
                     alt_key: false,
                     ctrl_key: false,
                     meta_key: false,
@@ -4549,7 +4892,10 @@ mod tests {
             let mut s = surface.lock().unwrap();
             let minus = KeyEvent {
                 key: Some(Key::Minus),
-                text: None,
+                // What the compositor sends: winit resolves the character and
+                // the host forwards it, so a harness event that omits it is
+                // testing a shape no real keystroke has.
+                text: Some("-".into()),
                 alt_key: false,
                 ctrl_key: false,
                 meta_key: false,

@@ -41,11 +41,24 @@ typedef enum {
 } wkgfx_event_type;
 
 /* One merged input event. Only the fields for the event's type are
- * meaningful; the rest are zeroed/-1. */
+ * meaningful; the rest are zeroed/-1.
+ *
+ * `key` and `ch` answer different questions and a guest usually wants both:
+ * `key` is WHICH physical key (layout-independent — WASD stays WASD on AZERTY),
+ * `ch` is WHAT it types (layout- and shift-aware). Prefer `ch` for text and
+ * `key` for controls; see plugins/qt/qpa/qwkkeytranslator.cpp for a full
+ * treatment.
+ *
+ * `ch` is the FIRST scalar of the event's text and the rest is dropped, which
+ * costs nothing today (the host sends one character) but loses the tail of the
+ * one string winit documents as longer: on Windows an uncombinable dead key
+ * produces the accent followed by the letter, so "´e" arrives as U+00B4
+ * alone. Widening this to a small buffer is an ABI change and has not been
+ * needed yet. */
 typedef struct {
     wkgfx_event_type type;
     int32_t key;        /* KEY_*: raw wasi:surface key enum value (WKGFX_K_*), -1 if none */
-    uint32_t ch;        /* KEY_*: unicode scalar from the event's text, 0 if none */
+    uint32_t ch;        /* KEY_*: first unicode scalar of the event's text, 0 if none */
     uint8_t repeat, alt, ctrl, meta, shift; /* KEY_* modifiers/auto-repeat */
     double x, y;        /* POINTER / SCROLL: pointer position, surface-local */
     int32_t button;     /* POINTER_DOWN/UP: 0 left, 1 middle, 2 right, 3 back, 4 forward; -1 none */
@@ -66,6 +79,18 @@ uint32_t wkgfx_height(void);
 
 /* Block until the host signals the next frame (consumes get-frame). */
 void wkgfx_wait_frame(void);
+
+/* Block until the host's next frame OR until `timeout_ns` nanoseconds have
+ * elapsed, whichever comes first. `timeout_ns < 0` means "no timeout" and is
+ * exactly wkgfx_wait_frame(); `timeout_ns == 0` polls without blocking.
+ * Returns 1 if a frame arrived and was consumed, 0 on timeout.
+ *
+ * For guests that own a real event loop and must also wake on their OWN
+ * deadlines — a Qt QTimer, an animation tick — rather than only when the host
+ * decides to paint. Built on wasi:io/poll's multi-pollable `poll` plus a
+ * wasi:clocks deadline pollable, which is also where socket pollables will go
+ * when a guest needs to select() over the network too. */
+int wkgfx_wait_frame_timeout(int64_t timeout_ns);
 
 /* Present a whole RGBA frame of `w` x `h` pixels. If (w, h) equals the live
  * surface size this is a direct blit; otherwise the frame is scaled to the

@@ -1,0 +1,382 @@
+Subject: give Qt a real WASI platform, mkspec and Platform module
+
+WHAT
+  cmake/QtPlatformSupport.cmake         defines WASI (deliberately NOT via
+                                        qt_set01 -- see below) AND sets UNIX.
+  cmake/QtMkspecHelpers.cmake           maps WASI -> the new mkspec.
+  cmake/QtBuildRepoHelpers.cmake        adds WASI to the no-pkg-config list.
+  mkspecs/common/wasi/qplatformdefs.h   NEW. mkspecs/common/wasm/'s file with
+                                        everything wasi-libc lacks removed.
+  mkspecs/common/wasi/wasi.conf         NEW.
+  mkspecs/wasi-clang-wasip2/{qmake.conf,qplatformdefs.h}  NEW.
+
+WHY
+  * CMake's own Platform/WASI.cmake is a comment and WASI-Initialize.cmake is a
+    bare `set(WASI 1)` -- unlike Emscripten-Initialize.cmake, NEITHER sets
+    UNIX. Qt gates its entire POSIX layer on `CONDITION UNIX`
+    (src/corelib/CMakeLists.txt:702,720,736,844,854,893,1021,1051,1110,1193,
+    1210 -- qcore_unix.cpp, qfilesystemengine_unix.cpp, qeventdispatcher_unix.
+    cpp, qtimerinfo_unix.cpp, qlocale_unix.cpp). Without UNIX those sources are
+    never added to the Core target, syncqt therefore never copies
+    qcore_unix_p.h into the build include tree, and the build dies with
+    "private/qcore_unix_p.h file not found" in a dozen files that have nothing
+    obviously to do with it (qlogging.cpp, qrandom.cpp, qsysinfo.cpp,
+    qfsfileengine.cpp, qtemporaryfile.cpp, qtranslator.cpp, ...).
+
+    UNIX cannot be set from a toolchain file because CMake clears it
+    afterwards. It also CANNOT be set the way Qt does it for Integrity, in
+    cmake/platforms/Platform/WASI.cmake -- that was tried first and it silently
+    does nothing. cmGlobalGenerator::EnableLanguage resolves
+    `include(Platform/${CMAKE_SYSTEM_NAME})` against CMake's OWN Modules
+    directory in preference to CMAKE_MODULE_PATH, which is precisely what the
+    comment above the PREPEND in QtAutoDetectHelpers.cmake means by
+    "CMake-provided platform modules take precedence". Integrity works only
+    because CMake ships no Platform/Integrity.cmake; CMake 4.4.2 DOES ship
+    Modules/Platform/WASI.cmake, so a Qt-side sibling is shadowed and never
+    runs. Verified by probe: with ONLY qtbase/cmake/platforms on
+    CMAKE_MODULE_PATH, a message() added to that file never prints and UNIX
+    stays empty.
+
+    Hence `set(UNIX 1)` lives in QtPlatformSupport.cmake, which is include()d
+    from the macro qt_internal_setup_platform_support_variables() at top-level
+    directory scope before add_subdirectory(src) -- so it reaches every module
+    exactly the way WASM and ANDROID do.
+
+  * WASI itself is set with a plain quoted `if(CMAKE_SYSTEM_NAME STREQUAL
+    "WASI")` and NOT with qt_set01, even though every other platform on that
+    page uses qt_set01. This is a genuine trap, and it cost a whole build
+    cycle. qt_set01 is `function(qt_set01 result) if(${ARGN}) ...`, and
+    `if(${ARGN})` RE-EXPANDS its arguments unquoted; if() then dereferences any
+    bare word that names a defined variable. CMake's own
+    Platform/WASI-Initialize.cmake has ALREADY done `set(WASI 1)`, so
+    `CMAKE_SYSTEM_NAME STREQUAL WASI` degrades to `"WASI" STREQUAL "1"` and
+    qt_set01 sets WASI to *0* on the one platform where it should be 1. Every
+    other line gets away with it only because nothing defines a variable named
+    `Linux`, `QNX` or `Android`. Reproduced in isolation with `cmake -P`:
+    qt_set01 yields 0 where a directly quoted if() yields TRUE.
+  * QtMkspecHelpers.cmake has no WASI arm, so QT_DEFAULT_MKSPEC stays empty and
+    its `if(NOT QT_QMAKE_TARGET_MKSPEC OR NOT EXISTS ...)` FATAL_ERRORs before
+    a single feature is evaluated. The directory is ALSO a real include path
+    (QtPlatformTargetHelpers.cmake's qt_internal_get_platform_definition_
+    include_dir), which is how Qt's `#include "qplatformdefs.h"` resolves --
+    so it has to be a genuine header, not a stub.
+  * mkspecs/common/wasm/qplatformdefs.h cannot be reused: it includes <grp.h>,
+    <pwd.h>, <sys/ipc.h>, <sys/wait.h> and <net/if.h>, none of which exist in
+    the wasi sysroot, and it defines QT_OPEN_LARGEFILE to O_LARGEFILE, which is
+    an undeclared identifier on wasi-libc.
+  * pkg-config would answer from the HOST's .pc files. WASM is already on that
+    exclusion list for the same reason.
+
+  Note WASI is deliberately a SEPARATE variable from WASM, not an alias. Qt's
+  `AND NOT WASM` guards all mean "not emscripten" (embind, emscripten::val,
+  EM_ASM, -s FETCH=1) and none of them are about wasm as a machine. Setting
+  WASM=1 would pull in ~4,000 lines of embind code wasi-sdk cannot compile,
+  inject emcc-only link flags onto the global Platform target, and EXCLUDE the
+  minimal/offscreen QPA plugins that we want.
+
+UPSTREAM
+  not-as-is. The idea is right but upstream would want a whole Qt platform
+  port -- CI, a QPA, docs, a supported-platform entry -- not four files. The
+  qt_set01(WASI) and the pkg-config line are individually fine; the mkspec is
+  the part that needs a real port around it. The qt_set01 collision, by
+  contrast, is a plain latent bug in qt_set01 itself and IS worth reporting
+  upstream: any platform whose CMake name matches an already-defined variable
+  will be misdetected the same way. The `set(UNIX 1)` is arguably a bug report
+  against CMake rather than against Qt:
+  Platform/WASI-Initialize.cmake should set UNIX the way its Emscripten
+  counterpart does, and if it ever did, this hunk could be dropped.
+
+---
+diff --git a/cmake/QtPlatformSupport.cmake b/cmake/QtPlatformSupport.cmake
+index 9f8498e..bb2001f 100644
+--- a/cmake/QtPlatformSupport.cmake
++++ b/cmake/QtPlatformSupport.cmake
+@@ -20,6 +20,52 @@ qt_set01(FREEBSD CMAKE_SYSTEM_NAME STREQUAL "FreeBSD") # FIXME: How to identify
+ qt_set01(NETBSD CMAKE_SYSTEM_NAME STREQUAL "NetBSD") # FIXME: How to identify this?
+ qt_set01(WASM CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
+ qt_set01(WASM64 QT_QMAKE_TARGET_MKSPEC STREQUAL "wasm-emscripten-64")
++# WASI is wasm, but it is NOT Emscripten: no DOM, no embind, a POSIX libc
++# instead of a JS shim. It must therefore stay distinct from WASM above --
++# every `AND NOT WASM` guard in Qt is about emscripten-isms, not about wasm.
++#
++# NOT written as `qt_set01(WASI CMAKE_SYSTEM_NAME STREQUAL "WASI")`, even
++# though that is the form every line above uses. qt_set01 does `if(${ARGN})`,
++# which RE-EXPANDS its arguments unquoted, and if() dereferences a bare word
++# that names a defined variable. CMake's own Platform/WASI-Initialize.cmake has
++# already done `set(WASI 1)`, so the condition degrades to
++# `"WASI" STREQUAL "1"` and qt_set01 confidently sets WASI to 0. Every other
++# platform in this file gets away with it only because no variable is named
++# `Linux`, `QNX`, `Android`... Verified in isolation with `cmake -P`:
++# qt_set01 yields 0 where a directly quoted if() yields TRUE.
++if(CMAKE_SYSTEM_NAME STREQUAL "WASI")
++    set(WASI 1)
++else()
++    set(WASI 0)
++endif()
++if(WASI)
++    # wasi-libc IS a POSIX libc, and Qt gates its entire POSIX layer on
++    # `CONDITION UNIX` -- qcore_unix.cpp, qfilesystemengine_unix.cpp,
++    # qfsfileengine_unix.cpp, qlockfile_unix.cpp, qtimerinfo_unix.cpp,
++    # qeventdispatcher_unix.cpp, qlocale_unix.cpp, qstandardpaths_unix.cpp.
++    # Without UNIX, QtCore compiles with no platform layer at all: the sources
++    # are never added, syncqt never copies qcore_unix_p.h, and the build dies
++    # on "private/qcore_unix_p.h file not found" in a dozen unrelated files.
++    #
++    # This must be done HERE and not in cmake/platforms/Platform/WASI.cmake the
++    # way Integrity does it. That idiom only works for a platform CMake does
++    # not already know: cmGlobalGenerator::EnableLanguage resolves
++    # `include(Platform/${CMAKE_SYSTEM_NAME})` against CMake's OWN Modules
++    # directory in preference to CMAKE_MODULE_PATH -- which is exactly what
++    # QtAutoDetectHelpers.cmake means by "CMake-provided platform modules take
++    # precedence". CMake ships Modules/Platform/WASI.cmake (a bare comment) and
++    # Modules/Platform/WASI-Initialize.cmake (`set(WASI 1)`, and notably NOT
++    # `set(UNIX 1)` the way Emscripten-Initialize.cmake does), so a Qt-side
++    # Platform/WASI.cmake is silently shadowed and never runs. Verified by
++    # probe: with ONLY qtbase/cmake/platforms on CMAKE_MODULE_PATH, a
++    # message() added to that file does not print and UNIX stays empty.
++    #
++    # QtPlatformSupport is include()d from the macro
++    # qt_internal_setup_platform_support_variables(), which runs at top-level
++    # directory scope before add_subdirectory(src), so this reaches every
++    # module the same way WASM and ANDROID do.
++    set(UNIX 1)
++endif()
+ qt_set01(SOLARIS CMAKE_SYSTEM_NAME STREQUAL "SunOS")
+ qt_set01(HURD CMAKE_SYSTEM_NAME STREQUAL "GNU")
+ 
+diff --git a/cmake/QtMkspecHelpers.cmake b/cmake/QtMkspecHelpers.cmake
+index a961296..ed3f852 100644
+--- a/cmake/QtMkspecHelpers.cmake
++++ b/cmake/QtMkspecHelpers.cmake
+@@ -60,6 +60,8 @@ macro(qt_internal_setup_platform_definitions_and_mkspec)
+         set(QT_DEFAULT_MKSPEC macx-ios-clang)
+     elseif(APPLE)
+         set(QT_DEFAULT_MKSPEC macx-clang)
++    elseif(WASI)
++        set(QT_DEFAULT_MKSPEC wasi-clang-wasip2)
+     elseif(WASM)
+         if(WASM64)
+             set(QT_DEFAULT_MKSPEC wasm-emscripten-64)
+diff --git a/cmake/QtBuildRepoHelpers.cmake b/cmake/QtBuildRepoHelpers.cmake
+index 57fc3da..0b56a59 100644
+--- a/cmake/QtBuildRepoHelpers.cmake
++++ b/cmake/QtBuildRepoHelpers.cmake
+@@ -1011,7 +1011,9 @@ function(qt_build_internals_disable_pkg_config_if_needed)
+     set(pkg_config_enabled ON)
+     qt_build_internals_find_pkg_config_executable()
+ 
+-    if(APPLE OR WIN32 OR QNX OR ANDROID OR WASM OR (NOT PKG_CONFIG_EXECUTABLE))
++    # WASI joins this list for the same reason WASM is on it: there is no
++    # target pkg-config, so any .pc file found would describe the HOST.
++    if(APPLE OR WIN32 OR QNX OR ANDROID OR WASM OR WASI OR (NOT PKG_CONFIG_EXECUTABLE))
+         set(pkg_config_enabled OFF)
+     endif()
+ 
+diff --git a/mkspecs/common/wasi/qplatformdefs.h b/mkspecs/common/wasi/qplatformdefs.h
+new file mode 100644
+index 0000000..b192711
+--- /dev/null
++++ b/mkspecs/common/wasi/qplatformdefs.h
+@@ -0,0 +1,123 @@
++// Copyright (C) 2024 The Qt Company Ltd.
++// SPDX-License-Identifier: LicenseRef-Qt-Commercial OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
++
++#ifndef Q_WASI_PLATFORMDEFS_H
++#define Q_WASI_PLATFORMDEFS_H
++
++// Derived from mkspecs/common/wasm/qplatformdefs.h, with everything wasi-libc
++// does not have removed. The deletions, and why each one had to go:
++//
++//   <grp.h>, <pwd.h>   absent from the wasi sysroot entirely. There are no
++//                      users or groups in a wasm sandbox.
++//   <sys/ipc.h>        absent; no SysV IPC (FEATURE_sysv_shm/sem are OFF).
++//   <sys/wait.h>       absent; no fork/exec/wait (FEATURE_process is OFF).
++//   <net/if.h>         absent; wasip2 has no interface enumeration, so we
++//                      define QT_NO_IPV6IFNAME below rather than include it.
++//   <dlfcn.h>          present, but its dlopen is a stub over a static error
++//                      string. FEATURE_dlopen is OFF; not including it keeps
++//                      anything from being tempted.
++//
++// Everything else is byte-for-byte the wasm file, taking the
++// non-QT_LARGEFILE_SUPPORT arm of every macro pair: wasi-libc's off_t is
++// already 64-bit and none of the *64 symbols (stat64, lseek64, fopen64,
++// readdir64) exist.
++
++// Get Qt defines/settings
++
++#include "qglobal.h"
++
++// Set any POSIX/XOPEN defines at the top of this file to turn on specific APIs
++
++#include <unistd.h>
++
++// We are hot - unistd.h should have turned on the specific APIs we requested
++
++#include <features.h>
++#include <pthread.h>
++#include <dirent.h>
++#include <fcntl.h>
++#include <signal.h>
++
++#include <sys/types.h>
++#include <sys/ioctl.h>
++#include <sys/time.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++
++// wasip2 has no net/if.h and no if_nametoindex/if_indextoname. QHostAddress's
++// scope-id handling checks this macro and falls back to a plain string.
++#ifndef QT_NO_IPV6IFNAME
++#  define QT_NO_IPV6IFNAME
++#endif
++
++#ifndef _GNU_SOURCE
++#  define _GNU_SOURCE
++#endif
++
++// wasi-libc has no *64 variants; off_t is 64-bit natively.
++#define QT_STATBUF              struct stat
++#define QT_STATBUF4TSTAT        struct stat
++#define QT_STAT                 ::stat
++#define QT_FSTAT                ::fstat
++#define QT_LSTAT                ::lstat
++#define QT_OPEN                 ::open
++#define QT_TRUNCATE             ::truncate
++#define QT_FTRUNCATE            ::ftruncate
++#define QT_LSEEK                ::lseek
++
++#define QT_FOPEN                ::fopen
++#define QT_FSEEK                ::fseek
++#define QT_FTELL                ::ftell
++#define QT_FGETPOS              ::fgetpos
++#define QT_FSETPOS              ::fsetpos
++#define QT_MMAP                 ::mmap
++#define QT_FPOS_T               fpos_t
++#define QT_OFF_T                long
++
++#define QT_STAT_REG             S_IFREG
++#define QT_STAT_DIR             S_IFDIR
++#define QT_STAT_MASK            S_IFMT
++#define QT_STAT_LNK             S_IFLNK
++#define QT_SOCKET_CONNECT       ::connect
++#define QT_SOCKET_BIND          ::bind
++#define QT_FILENO               fileno
++#define QT_CLOSE                ::close
++#define QT_READ                 ::read
++#define QT_WRITE                ::write
++#define QT_ACCESS               ::access
++#define QT_GETCWD               ::getcwd
++#define QT_CHDIR                ::chdir
++#define QT_MKDIR                ::mkdir
++#define QT_RMDIR                ::rmdir
++// O_LARGEFILE is undeclared on wasi-libc ("use of undeclared identifier"); the
++// flag is meaningless here because off_t is already 64-bit.
++#define QT_OPEN_LARGEFILE       0
++#define QT_OPEN_RDONLY          O_RDONLY
++#define QT_OPEN_WRONLY          O_WRONLY
++#define QT_OPEN_RDWR            O_RDWR
++#define QT_OPEN_CREAT           O_CREAT
++#define QT_OPEN_TRUNC           O_TRUNC
++#define QT_OPEN_APPEND          O_APPEND
++#define QT_OPEN_EXCL            O_EXCL
++
++// Directory iteration
++#define QT_DIR                  DIR
++
++#define QT_OPENDIR              ::opendir
++#define QT_CLOSEDIR             ::closedir
++
++#define QT_DIRENT               struct dirent
++#define QT_READDIR              ::readdir
++
++#define QT_SIGNAL_RETTYPE       void
++#define QT_SIGNAL_ARGS          int
++#define QT_SIGNAL_IGNORE        SIG_IGN
++
++#define QT_SOCKLEN_T            socklen_t
++
++#if defined(_XOPEN_SOURCE) && (_XOPEN_SOURCE >= 500)
++#define QT_SNPRINTF             ::snprintf
++#define QT_VSNPRINTF            ::vsnprintf
++#endif
++
++#endif // Q_WASI_PLATFORMDEFS_H
+diff --git a/mkspecs/common/wasi/wasi.conf b/mkspecs/common/wasi/wasi.conf
+new file mode 100644
+index 0000000..1c8064d
+--- /dev/null
++++ b/mkspecs/common/wasi/wasi.conf
+@@ -0,0 +1,46 @@
++#
++# qmake configuration for building with wasi-sdk clang, targeting wasm32-wasip2.
++#
++# The CMake build only needs this directory to EXIST and to carry a resolvable
++# qplatformdefs.h (QtMkspecHelpers.cmake FATAL_ERRORs on an unknown mkspec, and
++# QtPlatformTargetHelpers.cmake puts mkspecs/<spec> on the include path so that
++# Qt's `#include "qplatformdefs.h"` resolves). qmake itself is not used to build
++# this port. The file is kept honest anyway so `qmake -query` output is not a
++# lie, and so a future qmake-based consumer has something to start from.
++#
++# Deliberately NOT copied from ../wasm/wasm.conf: that file carries the whole
++# EMCC_COMMON_LFLAGS / -s ASYNCIFY / ASYNCIFY_IMPORTS block, which is emcc-only.
++#
++
++MAKEFILE_GENERATOR      = UNIX
++QMAKE_PLATFORM          = wasi wasm unix
++CONFIG                 += static no_plugin_manifest
++
++include(../gcc-base.conf)
++include(../clang.conf)
++
++QMAKE_CC                = $$(WASI_SDK)/bin/clang --target=wasm32-wasip2
++QMAKE_CXX               = $$(WASI_SDK)/bin/clang++ --target=wasm32-wasip2
++QMAKE_LINK              = $$QMAKE_CXX
++QMAKE_LINK_C            = $$QMAKE_CC
++QMAKE_AR                = $$(WASI_SDK)/bin/llvm-ar cqs
++QMAKE_RANLIB            = $$(WASI_SDK)/bin/llvm-ranlib
++QMAKE_NM                = $$(WASI_SDK)/bin/llvm-nm -P
++QMAKE_STRIP             =
++
++# wasm has no shared objects and no dlopen: everything is a static archive
++# linked into the final component.
++QMAKE_PREFIX_STATICLIB  = lib
++QMAKE_EXTENSION_STATICLIB = a
++QMAKE_PREFIX_SHLIB      =
++QMAKE_EXTENSION_SHLIB   =
++
++# See plugins/qt/wasip2.cmake for why this exact triple of flags: wasmtime
++# rejects wasi-sdk's default LEGACY exception encoding, and Qt's bundled
++# libpng/libjpeg need real setjmp.
++QMAKE_CFLAGS           += -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID
++QMAKE_CXXFLAGS         += $$QMAKE_CFLAGS
++QMAKE_CXXFLAGS         += -fwasm-exceptions -mllvm -wasm-use-legacy-eh=false
++QMAKE_LFLAGS           += -lunwind -lsetjmp -lwasi-emulated-signal -lwasi-emulated-mman -lwasi-emulated-process-clocks -lwasi-emulated-getpid
++
++load(qt_config)
+diff --git a/mkspecs/wasi-clang-wasip2/qmake.conf b/mkspecs/wasi-clang-wasip2/qmake.conf
+new file mode 100644
+index 0000000..8bc4784
+--- /dev/null
++++ b/mkspecs/wasi-clang-wasip2/qmake.conf
+@@ -0,0 +1,6 @@
++# qmake configuration for building with wasi-sdk clang for wasm32-wasip2.
++#
++# Mirrors mkspecs/wasm-emscripten/qmake.conf: a one-line include of the shared
++# common/ config. See ../common/wasi/wasi.conf.
++
++include(../common/wasi/wasi.conf)
+diff --git a/mkspecs/wasi-clang-wasip2/qplatformdefs.h b/mkspecs/wasi-clang-wasip2/qplatformdefs.h
+new file mode 100644
+index 0000000..dbd849b
+--- /dev/null
++++ b/mkspecs/wasi-clang-wasip2/qplatformdefs.h
+@@ -0,0 +1,9 @@
++// Copyright (C) 2024 The Qt Company Ltd.
++// SPDX-License-Identifier: LicenseRef-Qt-Commercial OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
++
++#ifndef QPLATFORMDEFS_H
++#define QPLATFORMDEFS_H
++
++#include "../common/wasi/qplatformdefs.h"
++
++#endif // QPLATFORMDEFS_H

@@ -10,6 +10,12 @@
  * and flashes on pointer-down — enough observable behavior for the host e2e
  * test to verify that events queued on the VirtualSurface reach C code.
  *
+ * It also echoes the last TYPED character back through the top-left pixel
+ * (see `typed` below). A key event carries two independent things — which key
+ * (`ev.key`) and what it types (`ev.ch`, decoded from the event's text) — and
+ * the second one silently reached no guest at all until the host started
+ * filling it in; the arrow-key square exercises only the first.
+ *
  * The frame is rendered at a fixed 320x240 and pushed with wkgfx_present():
  * if the host resizes the surface, the shim's nearest-neighbor letterboxing
  * path takes over — the DOOM model, smoke-tested.
@@ -31,6 +37,7 @@ int main(void) {
     int32_t sx = W / 2, sy = H / 2; /* square center */
     int32_t half = 12;              /* square half-size */
     uint32_t t = 0;
+    uint32_t typed = 0; /* last character typed, 0 until the host sends one */
 
     for (;;) {
         wkgfx_wait_frame();
@@ -47,6 +54,8 @@ int main(void) {
                     flash = 1;
                 break;
             case WKGFX_KEY_DOWN:
+                if (ev.ch != 0)
+                    typed = ev.ch;
                 switch (ev.key) {
                 case WKGFX_K_ARROW_UP:
                     sy -= 8;
@@ -96,6 +105,17 @@ int main(void) {
                 p[3] = 255;
             }
         }
+        /* The typed character, in the one pixel a printf cannot reach: this is
+         * a surface, not a terminal, so pixels are the only channel back to
+         * the host test. Low byte in red, high byte in green — the gradient
+         * paints (0, 0, t) here, so any non-zero red is ours. */
+        if (typed != 0) {
+            frame[0] = (uint8_t)(typed & 0xff);
+            frame[1] = (uint8_t)((typed >> 8) & 0xff);
+            frame[2] = 0;
+            frame[3] = 255;
+        }
+
         wkgfx_present(frame, W, H);
         t += 3;
     }

@@ -7,4 +7,9 @@ world wkgfx {
     import wasi:surface/surface@0.0.2;
     import wasi:graphics-context/graphics-context@0.0.1;
     import wasi:frame-buffer/frame-buffer@0.0.1;
+    /// Only for wkgfx_wait_frame_timeout(): a deadline pollable to combine
+    /// with the frame pollable in wasi:io/poll's multi-pollable `poll`. A
+    /// guest that owns a real event loop (Qt) must wake on its own timer
+    /// deadlines, not only on host frames.
+    import wasi:clocks/monotonic-clock@0.2.3;
 }

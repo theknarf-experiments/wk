@@ -1,0 +1,57 @@
+Subject: corelib: qresource must not call mremap, which wasi-libc only declares
+
+WHAT / WHY
+
+  src/corelib/io/qresource.cpp
+      wasi-libc's <sys/mman.h> declares mremap() and defines MREMAP_MAYMOVE,
+      MREMAP_FIXED and MREMAP_DONTUNMAP, but NO wasi-sdk library defines the
+      symbol (verified with llvm-nm over libc.a, librt.a and every
+      libwasi-emulated-*). Qt's own guard is
+      `#if defined(MREMAP_MAYMOVE) && defined(MREMAP_DONTUNMAP)`, which those
+      macros satisfy -- so QtCore compiles clean and the failure lands at
+      APPLICATION link time as "undefined symbol: mremap", from
+      qresource.cpp.obj, in a build that has nothing to do with resources.
+
+      `#undef`ing the two macros for Q_OS_WASI selects the fall-through in
+      QResourceFileEnginePrivate::mapUncompressed_sys(), which leaves ptr null
+      and returns false. The caller (load()) then decompresses into heap memory
+      via resource.uncompressedData(). A zero-copy optimisation is lost; there
+      is no behavioural change.
+
+  This is the same class of bug as the flock() hunk in 0005 and the eventfd()
+  hunk in 0003, and it is the one that makes wasi-libc genuinely nasty to port
+  to: THE HEADERS ARE NOT A CONTRACT. __has_include and `#ifdef SOME_FLAG`
+  both lie, and every one of these three passed configure, passed the whole
+  qtbase build, and only surfaced when a real application was linked. Anything
+  added to this port later should be link-tested against a real executable,
+  not just compiled.
+
+UPSTREAM
+  yes. A guard on a function the platform does not provide, with an existing
+  fallback path already in the file.
+
+---
+diff --git a/src/corelib/io/qresource.cpp b/src/corelib/io/qresource.cpp
+index 82e275e..f3e86d0 100644
+--- a/src/corelib/io/qresource.cpp
++++ b/src/corelib/io/qresource.cpp
+@@ -42,6 +42,19 @@
+ #  elif defined(Q_OS_DARWIN)
+ #    include <mach/mach.h>
+ #    include <mach/vm_map.h>
++#  elif defined(Q_OS_WASI)
++// wasi-libc's <sys/mman.h> declares mremap() and defines MREMAP_MAYMOVE,
++// MREMAP_FIXED and MREMAP_DONTUNMAP, but NO wasi-sdk library defines the
++// symbol. Left alone, `#if defined(MREMAP_MAYMOVE) && defined(MREMAP_DONTUNMAP)`
++// in mapUncompressed_sys() below is satisfied, QtCore compiles, and an
++// APPLICATION link later fails with "undefined symbol: mremap".
++//
++// Undefining them selects the fall-through in mapUncompressed_sys(), which
++// leaves ptr null, returns false, and makes the caller decompress into heap
++// memory via resource.uncompressedData() instead. That is a
++// zero-copy-optimisation lost, not a behaviour change.
++#    undef MREMAP_MAYMOVE
++#    undef MREMAP_DONTUNMAP
+ #  endif
+ #endif
+ #ifdef Q_OS_WIN

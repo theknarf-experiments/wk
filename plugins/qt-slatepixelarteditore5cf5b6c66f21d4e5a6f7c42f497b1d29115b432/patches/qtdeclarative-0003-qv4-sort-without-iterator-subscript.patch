@@ -1,0 +1,96 @@
+WHAT
+    Sort QML sequence types through a materialised copy instead of handing
+    QSequentialIterable's tagged iterators to std::sort.
+
+WHY
+    wasi-sdk 34 ships libc++ from LLVM 23, whose std::sort indexes the range:
+
+        __algorithm/sift_down.h:49: __comp(__first[__child], __first[__child + 1])
+
+    and QTaggedIterator (qtbase's qiterable.h) implements ++, --, +=, -=, +, -
+    and iterator difference but NO operator[]. Older libc++ wrote
+    `*(__first + n)`, which is why this has always compiled elsewhere. The
+    build fails with five copies of
+
+        error: type 'QTaggedIterator<QTaggedIterator<QSequentialIterator, void>,
+        std::random_access_iterator_tag>' does not provide a subscript operator
+
+    The one-line fix belongs in qtbase -- add operator[] to QTaggedIterator
+    returning `*(*this + j)` -- but this plugin must not patch the shared
+    qtbase tree that plugins/qt owns, and any other libc++ is free to make the
+    same (permitted) choice.
+
+    Sorting a copy needs nothing but forward iteration and QVariantRef's
+    assignment operator, which every QSequentialIterable has, so upstream's
+    random-access and bidirectional branches collapse into one. The behaviour
+    is the same: std::sort is not stable either way, and the comparator already
+    takes (const QVariant &, const QVariant &). The cost is one QVariant per
+    element of a JS array being sorted by a JS callback -- noise next to a call
+    into the JS engine per comparison.
+
+UPSTREAM
+    The real fix is qtbase's; worth filing there as "QTaggedIterator is not a
+    valid random access iterator for libc++ >= 20".
+
+CLASSIFICATION
+    as-is -- same result, different algorithm plumbing.
+--- a/src/qml/jsruntime/qv4sequenceobject.cpp
++++ b/src/qml/jsruntime/qv4sequenceobject.cpp
+@@ -14,6 +14,8 @@
+ #include <private/qqmltype_p_p.h>
+ #include <private/qqmlvaluetypewrapper_p.h>
+ 
++#include <QtCore/qvarlengtharray.h>
++
+ #include <algorithm>
+ 
+ QT_BEGIN_NAMESPACE
+@@ -50,17 +52,39 @@
+     /* non-const */ Heap::Sequence *p = sequence->d();
+ 
+     QSequentialIterable iterable(p->metaSequence(), p->listType(), p->storagePointer());
+-    if (iterable.canRandomAccessIterate()) {
+-        std::sort(QSequentialIterable::RandomAccessIterator(iterable.mutableBegin()),
+-                  QSequentialIterable::RandomAccessIterator(iterable.mutableEnd()),
+-                  compare);
+-    } else if (iterable.canReverseIterate()) {
+-        std::sort(QSequentialIterable::BidirectionalIterator(iterable.mutableBegin()),
+-                  QSequentialIterable::BidirectionalIterator(iterable.mutableEnd()),
+-                  compare);
+-    } else {
++
++    // Upstream hands QSequentialIterable's tagged iterators straight to
++    // std::sort. That does not compile against wasi-sdk 34's libc++ (LLVM 23):
++    // its __sift_down() indexes the range as `__first[__child]`, and
++    // QTaggedIterator (qtbase/src/corelib/kernel/qiterable.h) implements
++    // ++/--/+=/-=/+/- but NO operator[]. Older libc++ wrote `*(__first + n)`,
++    // which is why this has always built elsewhere. The clean fix belongs in
++    // qtbase -- one operator[] on QTaggedIterator returning `*(*this + j)` --
++    // but this port must not patch the shared qtbase tree, and the same
++    // incompatibility would come back on any other libc++ that makes the same
++    // (permitted) choice.
++    //
++    // So sort a materialised copy instead. It needs nothing but forward
++    // iteration and QVariantRef's assignment operator, which every
++    // QSequentialIterable has, so the random-access and bidirectional branches
++    // collapse into one. Cost: one QVariant per element, for a JS array being
++    // sorted by a JS callback -- next to the cost of calling into the JS
++    // engine per comparison, this is noise.
++    if (!iterable.canForwardIterate()) {
+         qWarning() << "Container has no suitable iterator for sorting";
++        return;
+     }
++
++    QVarLengthArray<QVariant, 32> values;
++    const auto end = iterable.mutableEnd();
++    for (auto it = iterable.mutableBegin(); it != end; ++it)
++        values.append(*it);
++
++    std::sort(values.begin(), values.end(), compare);
++
++    qsizetype i = 0;
++    for (auto it = iterable.mutableBegin(); i < values.size(); ++it, ++i)
++        *it = values.at(i);
+ }
+ 
+ // helper function to generate valid warnings if errors occur during sequence operations.

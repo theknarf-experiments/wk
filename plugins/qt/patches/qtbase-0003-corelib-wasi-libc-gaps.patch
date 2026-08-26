@@ -1,0 +1,317 @@
+Subject: plug the wasi-libc gaps in QtCore's generic UNIX backends
+
+WHAT / WHY -- one hunk per missing wasi-libc facility. Each names the symbol
+or header that is absent and what breaks without the guard.
+
+  src/corelib/kernel/qcore_unix_p.h
+      <sys/wait.h> does not exist in the wasi sysroot (wasip2 has no
+      fork/exec, so nothing can be waited on). This header is included by
+      nearly every UNIX TU in QtCore, so the missing file stops the build on
+      file one. Its only user, qt_safe_waitpid(), lives under
+      QT_CONFIG(processenvironment), which this port has OFF.
+
+  src/corelib/kernel/qcore_unix.cpp
+      qt_ignore_sigpipe() uses `struct sigaction` and ::sigaction unguarded.
+      wasi-libc has NEITHER even with -D_WASI_EMULATED_SIGNAL -- the struct is
+      an incomplete type and the function is undeclared;
+      libwasi-emulated-signal.a defines only signal, raise, psignal,
+      strsignal, bsd_signal and __sysv_signal. Made a no-op: there is no
+      process to send SIGPIPE to.
+
+  src/corelib/kernel/qeventdispatcher_unix.cpp
+      The nastiest of the four, because it compiles and fails at LINK. The
+      wasi sysroot SHIPS <sys/eventfd.h>, declaring eventfd/eventfd_read/
+      eventfd_write and defining EFD_CLOEXEC, but NO wasi-sdk library defines
+      any of the three (verified with llvm-nm over libc.a, librt.a,
+      libpthread.a and every libwasi-emulated-*). So `__has_include` says yes,
+      UsingEventfd becomes true, and the link dies on three undefined symbols.
+      Excluding WASI from the __has_include test also leaves EFD_CLOEXEC
+      undefined, which is what removes the three `#ifdef EFD_CLOEXEC` blocks
+      further down; QThreadPipe then falls back to qt_safe_pipe().
+
+      ...and a second, independent hunk in the same file makes that fallback
+      failing NON-FATAL. pipe() is present in wasi-libc but is routed through
+      its descriptor-table vtable, and a wasip2 host that does not implement it
+      returns ENOTSUP -- stock `wasmtime run` does exactly this. Upstream then
+      qFatal()s in QEventDispatcherUNIXPrivate's constructor, so QApplication
+      cannot be constructed AT ALL and the whole of QtWidgets is unreachable.
+      VERIFIED: before this hunk the smoke app died with "QThreadPipe: Unable
+      to create pipe: Not supported" / "Cannot continue without a thread pipe";
+      after it, the same binary runs to completion.
+
+      The thread pipe exists solely so another thread or a signal handler can
+      wake a blocked event loop. This port is QT_FEATURE_thread=OFF on a
+      runtime with neither threads nor signals, so nothing can call wakeUp()
+      from outside the thread already inside processEvents(). fds stays
+      {-1,-1}: prepare() hands poll() a negative fd, which POSIX requires it to
+      ignore, and wakeUp()/check() keep the wakeUps flag working so a wakeup
+      posted before processEvents() is still observed.
+
+  src/corelib/kernel/qcoreapplication.cpp
+      The setuid sanity check calls geteuid() and getuid(). wasi-libc declares
+      NEITHER -- unistd.h keeps the whole block behind
+      __wasilibc_unmodified_upstream -- so this is a compile error, not a link
+      error. Nothing to check either: a component has no uid, cannot be setuid,
+      and its authority comes from the capabilities the host handed it.
+
+  src/corelib/io/qfilesystemengine_unix.cpp
+      Three things. (a) <grp.h> and <pwd.h> do not exist; guarded. (b) The two
+      existing `!defined(Q_OS_WASM)` guards around getpwuid/getgrgid gain
+      Q_OS_WASI -- there is no user or group database. (c) moveFileToTrash
+      takes the same ENOSYS stub Android takes, because the freedesktop trash
+      implementation calls ::getuid() twice, to name $topdir/.Trash-$uid and to
+      verify directory ownership.
+
+  src/corelib/io/qstandardpaths_unix.cpp
+      Two geteuid() call sites in the XDG_RUNTIME_DIR logic. Rather than
+      restructure both blocks, a file-local `geteuid()` returning 0 is defined
+      under Q_OS_WASI. Returning 0 is not a placeholder: wasi's stat fills
+      st_uid with 0, so the ownership check in checkXdgRuntimeDir() compares
+      equal against a directory this component just created. Returning
+      anything else would make QStandardPaths::RuntimeLocation always come
+      back empty.
+
+UPSTREAM
+  yes for the six guard hunks -- they are the same shape as the Q_OS_WASM,
+  Q_OS_INTEGRITY and Q_OS_VXWORKS guards already sitting next to them, and
+  three of them (sys/wait.h, sigaction, eventfd) are arguably about any
+  POSIX-incomplete libc, not about wasi specifically.
+
+  not-as-is for the thread-pipe hunk: upstream's real answer is a dedicated
+  event dispatcher rather than a POSIX one limping without its wakeup channel,
+  and that is what the wk QPA will bring (a QAbstractEventDispatcherV2 blocking
+  in wkgfx_wait_frame()). This hunk is what makes Widgets testable in the
+  meantime, and it should be revisited then.
+
+  not-as-is for the qstandardpaths_unix.cpp geteuid shim. A file-local
+  redefinition of a POSIX function is not something upstream would take; the
+  upstream shape is a QT_CONFIG feature or a q_geteuid() in qcore_unix_p.h.
+  Carried as-is here because it is two lines and touches one file.
+
+---
+diff --git a/src/corelib/kernel/qcore_unix_p.h b/src/corelib/kernel/qcore_unix_p.h
+index bf955db..7b1a6e2 100644
+--- a/src/corelib/kernel/qcore_unix_p.h
++++ b/src/corelib/kernel/qcore_unix_p.h
+@@ -40,7 +40,14 @@
+ #endif
+ 
+ #include <chrono>
+-#include <sys/wait.h>
++#ifndef Q_OS_WASI
++// wasi-libc has no <sys/wait.h> at all: wasip2 has no fork/exec, so nothing
++// can be waited on. This header is included by nearly every UNIX TU in QtCore,
++// so the missing file would otherwise stop the build on file one.
++// The only user, qt_safe_waitpid(), is itself already inside
++// QT_CONFIG(processenvironment) territory, which is OFF for this port.
++#  include <sys/wait.h>
++#endif
+ #include <errno.h>
+ #include <fcntl.h>
+ 
+diff --git a/src/corelib/kernel/qcore_unix.cpp b/src/corelib/kernel/qcore_unix.cpp
+index 6861251..2dbe671 100644
+--- a/src/corelib/kernel/qcore_unix.cpp
++++ b/src/corelib/kernel/qcore_unix.cpp
+@@ -22,6 +22,13 @@ QT_BEGIN_NAMESPACE
+ 
+ void qt_ignore_sigpipe() noexcept // noexcept: sigaction(2) is not a Posix Cancellation Point
+ {
++#ifdef Q_OS_WASI
++    // wasi-libc has neither `struct sigaction` (incomplete type) nor
++    // ::sigaction, even with -D_WASI_EMULATED_SIGNAL --
++    // libwasi-emulated-signal.a defines only signal/raise/psignal/strsignal.
++    // There is nothing to ignore either: wasip2 has no process to send SIGPIPE
++    // to, and a write to a closed stream returns an error instead.
++#else
+     // Set to ignore SIGPIPE once only.
+     Q_CONSTINIT static QBasicAtomicInt atom = Q_BASIC_ATOMIC_INITIALIZER(0);
+     if (!atom.loadRelaxed()) {
+@@ -33,6 +40,7 @@ void qt_ignore_sigpipe() noexcept // noexcept: sigaction(2) is not a Posix Cance
+         ::sigaction(SIGPIPE, &noaction, nullptr);
+         atom.storeRelaxed(1);
+     }
++#endif
+ }
+ 
+ QByteArray qt_readlink(const char *path)
+diff --git a/src/corelib/kernel/qeventdispatcher_unix.cpp b/src/corelib/kernel/qeventdispatcher_unix.cpp
+index fe54750..5894b22 100644
+--- a/src/corelib/kernel/qeventdispatcher_unix.cpp
++++ b/src/corelib/kernel/qeventdispatcher_unix.cpp
+@@ -20,7 +20,14 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
+-#if __has_include(<sys/eventfd.h>)
++// NOT just __has_include on wasi: the wasi sysroot SHIPS <sys/eventfd.h>,
++// declaring eventfd/eventfd_read/eventfd_write and defining EFD_CLOEXEC, but
++// NO wasi-sdk library defines any of the three (verified with llvm-nm over
++// libc.a, librt.a, libpthread.a and every libwasi-emulated-*). Taking the
++// eventfd path here therefore compiles cleanly and fails at link with three
++// undefined symbols. Forcing UsingEventfd=false makes QThreadPipe fall back to
++// qt_safe_pipe(), and pipe() does exist on wasip2.
++#if __has_include(<sys/eventfd.h>) && !defined(Q_OS_WASI)
+ #  include <sys/eventfd.h>
+ static constexpr bool UsingEventfd = true;
+ #else
+@@ -135,8 +142,29 @@ bool QThreadPipe::init()
+     if (!UsingEventfd)
+         ret = qt_safe_pipe(fds, O_NONBLOCK);
+     if (ret == -1) {
++#  ifdef Q_OS_WASI
++        // Not fatal here. The thread pipe exists ONLY so that another thread
++        // (or a signal handler) can wake a blocked event loop, and this port
++        // is built with QT_FEATURE_thread=OFF on a runtime that has neither
++        // threads nor signals -- nothing can ever call wakeUp() from outside
++        // the one thread that is already inside processEvents().
++        //
++        // pipe() genuinely fails here on a bare wasip2 host: wasi-libc routes
++        // it through its descriptor-table vtable and a host that does not
++        // implement it returns ENOTSUP ("QThreadPipe: Unable to create pipe:
++        // Not supported"). Upstream then qFatal()s in
++        // QEventDispatcherUNIXPrivate's constructor, so QApplication cannot be
++        // constructed AT ALL -- the whole of QtWidgets is unreachable because
++        // of a wakeup channel it never uses.
++        //
++        // fds stays {-1, -1}; prepare() hands poll() a negative fd, which
++        // POSIX requires it to ignore (revents is set to 0), and wakeUp() and
++        // check() below skip their I/O.
++        fds[0] = fds[1] = -1;
++#  else
+         perror("QThreadPipe: Unable to create pipe");
+         return false;
++#  endif
+     }
+ #endif
+ 
+@@ -150,6 +178,15 @@ pollfd QThreadPipe::prepare() const
+ 
+ void QThreadPipe::wakeUp()
+ {
++#ifdef Q_OS_WASI
++    // No pipe (see init()). Still record the wakeup flag so that a
++    // wakeUp()-before-processEvents() is not lost; there is simply no fd to
++    // poke, because there is no other thread that could be blocked on it.
++    if (fds[1] < 0) {
++        wakeUps.fetchAndOrAcquire(1);
++        return;
++    }
++#endif
+     if ((wakeUps.fetchAndOrAcquire(1) & 1) == 0) {
+ #  ifdef EFD_CLOEXEC
+         eventfd_write(fds[0], 1);
+@@ -164,6 +201,14 @@ int QThreadPipe::check(const pollfd &pfd)
+ {
+     Q_ASSERT(pfd.fd == fds[0]);
+ 
++#ifdef Q_OS_WASI
++    // No pipe (see init()); poll() left revents at 0 for the negative fd, so
++    // there is nothing to drain. Report the pending wakeup, if any, so
++    // processEvents() still returns true for a wakeUp() that arrived earlier.
++    if (fds[0] < 0)
++        return wakeUps.testAndSetRelease(1, 0) ? 1 : 0;
++#endif
++
+     char c[16];
+     const int readyread = pfd.revents & POLLIN;
+ 
+diff --git a/src/corelib/kernel/qcoreapplication.cpp b/src/corelib/kernel/qcoreapplication.cpp
+index 8440235..86b0b68 100644
+--- a/src/corelib/kernel/qcoreapplication.cpp
++++ b/src/corelib/kernel/qcoreapplication.cpp
+@@ -465,7 +465,12 @@ QCoreApplicationPrivate::QCoreApplicationPrivate(int &aargc, char **aargv)
+ #ifndef QT_NO_QOBJECT
+     QCoreApplicationPrivate::is_app_closing = false;
+ 
+-#  if defined(Q_OS_UNIX)
++#  if defined(Q_OS_UNIX) && !defined(Q_OS_WASI)
++    // Skipped on WASI: wasi-libc declares neither geteuid nor getuid (unistd.h
++    // keeps both behind __wasilibc_unmodified_upstream), so this is a compile
++    // error rather than a link error. There is also nothing to check -- a wasm
++    // component has no uid, cannot be setuid, and its authority comes from the
++    // capabilities the host handed it, not from a filesystem bit.
+     if (Q_UNLIKELY(!setuidAllowed && (geteuid() != getuid())))
+         qFatal("FATAL: The application binary appears to be running setuid, this is a security hole.");
+ #  endif // Q_OS_UNIX
+diff --git a/src/corelib/io/qfilesystemengine_unix.cpp b/src/corelib/io/qfilesystemengine_unix.cpp
+index 36160f9..ae03e1f 100644
+--- a/src/corelib/io/qfilesystemengine_unix.cpp
++++ b/src/corelib/io/qfilesystemengine_unix.cpp
+@@ -19,8 +19,13 @@
+ # include <QtCore/private/qtemporaryfile_p.h>
+ #endif // QT_BOOTSTRAPPED
+ 
+-#include <grp.h>
+-#include <pwd.h>
++#ifndef Q_OS_WASI
++// Neither header exists in the wasi sysroot: a wasm sandbox has no user or
++// group database. Every call site below is already guarded with
++// !defined(Q_OS_WASM); those guards gain Q_OS_WASI too.
++#  include <grp.h>
++#  include <pwd.h>
++#endif
+ #include <stdlib.h> // for realpath()
+ #include <unistd.h>
+ #include <stdio.h>
+@@ -762,7 +767,7 @@ QString QFileSystemEngine::resolveUserName(uint userId)
+     QVarLengthArray<char, 1024> buf(size_max);
+ #endif
+ 
+-#if !defined(Q_OS_INTEGRITY) && !defined(Q_OS_WASM)
++#if !defined(Q_OS_INTEGRITY) && !defined(Q_OS_WASM) && !defined(Q_OS_WASI)
+     struct passwd *pw = nullptr;
+ #if QT_CONFIG(thread) && defined(_POSIX_THREAD_SAFE_FUNCTIONS) && !defined(Q_OS_OPENBSD) && !defined(Q_OS_VXWORKS)
+     struct passwd entry;
+@@ -788,7 +793,7 @@ QString QFileSystemEngine::resolveGroupName(uint groupId)
+     QVarLengthArray<char, 1024> buf(size_max);
+ #endif
+ 
+-#if !defined(Q_OS_INTEGRITY) && !defined(Q_OS_WASM)
++#if !defined(Q_OS_INTEGRITY) && !defined(Q_OS_WASM) && !defined(Q_OS_WASI)
+     struct group *gr = nullptr;
+ #if QT_CONFIG(thread) && defined(_POSIX_THREAD_SAFE_FUNCTIONS) && !defined(Q_OS_OPENBSD) && !defined(Q_OS_VXWORKS) && (!defined(Q_OS_ANDROID) || defined(Q_OS_ANDROID) && (__ANDROID_API__ >= 24))
+     size_max = sysconf(_SC_GETGR_R_SIZE_MAX);
+@@ -1199,8 +1204,15 @@ bool QFileSystemEngine::createLink(const QFileSystemEntry &source, const QFileSy
+ 
+ #ifdef Q_OS_DARWIN
+ // see qfilesystemengine_mac.mm
+-#elif defined(QT_BOOTSTRAPPED) || !defined(AT_FDCWD) || defined(Q_OS_ANDROID) || defined(Q_OS_VXWORKS)
++#elif defined(QT_BOOTSTRAPPED) || !defined(AT_FDCWD) || defined(Q_OS_ANDROID) || defined(Q_OS_VXWORKS) \
++    || defined(Q_OS_WASI)
+ // bootstrapped tools don't need this, and we don't want QStorageInfo
++//
++// Q_OS_WASI takes the ENOSYS stub for the same reason Android does: the
++// freedesktop trash spec is built on things a wasm sandbox does not have. The
++// implementation below calls ::getuid() twice (lines ~1329 and ~1380) to name
++// $topdir/.Trash-$uid and to check directory ownership, and wasi-libc has no
++// getuid/geteuid at all -- there are no users in a component's world.
+ //static
+ bool QFileSystemEngine::moveFileToTrash(const QFileSystemEntry &, QFileSystemEntry &,
+                                         QSystemError &error)
+diff --git a/src/corelib/io/qstandardpaths_unix.cpp b/src/corelib/io/qstandardpaths_unix.cpp
+index 46fb671..5e5b330 100644
+--- a/src/corelib/io/qstandardpaths_unix.cpp
++++ b/src/corelib/io/qstandardpaths_unix.cpp
+@@ -25,6 +25,21 @@ QT_BEGIN_NAMESPACE
+ 
+ using namespace Qt::StringLiterals;
+ 
++#ifdef Q_OS_WASI
++// wasi-libc has no geteuid: unistd.h keeps the whole getuid/geteuid/getgid
++// block behind __wasilibc_unmodified_upstream, so the two call sites below
++// ("XDG_RUNTIME_DIR ownership check" and "runtime-<username>" fallback) are
++// COMPILE errors, not link errors.
++//
++// A wasm component has exactly one, anonymous principal, and every file it can
++// see through its preopens is by definition its own. Reporting 0 makes the
++// ownership check in checkXdgRuntimeDir() compare equal against a directory
++// this component just created (wasi's stat fills st_uid with 0), which is the
++// behaviour we want -- the alternative is XDG_RUNTIME_DIR being rejected every
++// time and QStandardPaths::RuntimeLocation always coming back empty.
++static inline uid_t geteuid() noexcept { return 0; }
++#endif
++
+ static void appendOrganizationAndApp(QString &path)
+ {
+ #ifndef QT_BOOTSTRAPPED

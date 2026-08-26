@@ -1,0 +1,53 @@
+WHAT: two more things in the WK_TFE_SELFTEST narration -- the Name field's
+      rect (LENAME), and which widget currently holds focus (focus= on the
+      STATE line).
+WHY:  the harness can now TYPE into a real QLineEdit and prove the characters
+      landed. Both additions exist because the obvious version of that test
+      cannot tell its failures apart:
+        * a QLineEdit only accepts text when it has focus, and focus is taken
+          by clicking it -- which needs its rect, at a position only the
+          laid-out app knows (same reason 0003 publishes BTNABOUT, and the
+          same reason it is on the repeating timer: the wk QPA forces the
+          first top-level to the full surface, so any rect read earlier is
+          the pre-resize one);
+        * without focus=, text that arrives while nothing is focused is
+          indistinguishable from text that never arrived. One is a missed
+          click, the other is a broken host input path, and the whole point
+          of the test is to tell those two apart.
+      name= was already read straight off leName->text(), so the assertion
+      itself needed nothing new: it reads the string the user would see in
+      the field, not a proxy for it.
+UPSTREAM: no, same as 0003 -- ours, for testing, #ifdef __wasi__.
+--- a/main.cpp
++++ b/main.cpp
+@@ -349,14 +349,28 @@
+                         ++tops;
+                     }
+                 }
+-                std::printf("STATE title='%s' name='%s' hash='%s' size='%s' files=%d tops=%d\n",
++                // focus= is what makes the typing check honest. Text that
++                // arrives while nothing is focused goes nowhere and looks
++                // exactly like text that never arrived, so a harness that
++                // only watched name= could not tell "the key event was
++                // dropped" from "I clicked the wrong pixel".
++                QWidget *fw = QApplication::focusWidget();
++                std::printf("STATE title='%s' name='%s' hash='%s' size='%s' files=%d tops=%d focus='%s'\n",
+                             qPrintable(w.windowTitle()), qPrintable(text("leName")),
+                             qPrintable(text("leHash")), qPrintable(text("leTorrentTotalSize")),
+-                            files, tops);
++                            files, tops, fw ? qPrintable(fw->objectName()) : "");
+                 if (QWidget *b = w.findChild<QWidget *>(QStringLiteral("btnAbout"))) {
+                     const QRect r(b->mapToGlobal(QPoint(0, 0)), b->size());
+                     std::printf("BTNABOUT %d %d %d %d\n", r.x(), r.y(), r.width(), r.height());
+                 }
++                // The Name field's rect, for the same reason BTNABOUT is
++                // published: it is a real widget at a position only the
++                // laid-out app knows, and the harness has to put a genuine
++                // pointer event inside it before it can type into it.
++                if (QWidget *e = w.findChild<QWidget *>(QStringLiteral("leName"))) {
++                    const QRect r(e->mapToGlobal(QPoint(0, 0)), e->size());
++                    std::printf("LENAME %d %d %d %d\n", r.x(), r.y(), r.width(), r.height());
++                }
+                 std::fflush(stdout);
+             });
+             report->start(250);

@@ -1,0 +1,43 @@
+// vim: set filetype=kdl :
+// torrent-file-editor as a wk node — a REAL Qt 6 Widgets application. Run it
+// from the repo root with:
+//
+//   wk run plugins/qt-torrentfileeditor103/example.wk
+//
+// Build it first (and note it needs plugins/qt, which is hours):
+//
+//   cd plugins/qt-torrentfileeditor103 && mise run build
+//
+// This file carries its OWN `dependencies` block rather than importing
+// ../../workspace.wk, so it is self-contained: nothing outside this plugin
+// directory has to change to try the node. Move the entry into workspace.wk
+// when the port stops being an experiment — that is where every other node
+// type is registered, and it is what lets you add one from the canvas UI.
+//
+// No .torrent is baked into the image. One arrives over the bindmount wire
+// below — a FILE bindmount lands at /<name>, so this one is /demo.torrent —
+// and `args` points the app at it exactly the way a desktop shortcut would:
+// main.cpp opens a single filename argument if the file exists. Swap the
+// bindmount for any .torrent on your disk and change `args` to match.
+dependencies {
+    torrent_editor "docker://plugins/qt-torrentfileeditor103/Dockerfile" {
+        description "torrent-file-editor 1.0.3 — a real Qt 6 Widgets app (wire a .torrent in)"
+    }
+}
+workspace "01KWTFEDEM000000000000WS00" {
+    node "torrent_editor" "01KWTFEDEM000000000000TE01" {
+        pos 80.0 80.0
+        size 1000.0 720.0
+        args "/demo.torrent"
+    }
+    bindmount "plugins/qt-torrentfileeditor103/test/demo.torrent" "01KWTFEDEM000000000000BM02" {
+        pos 80.0 840.0
+        size 240.0 120.0
+    }
+    note "01KWTFEDEM000000000000NT03" {
+        text "torrent-file-editor 1.0.3\nQt 6.8.4 Widgets on wasm32-wasip2\n\nThe tabs are real: Simple shows the\ntorrent's fields, Files its file list,\nBencode the raw tree with editable\ncells.\n\nKNOWN GAPS\n* no IME and no clipboard bridge:\n  typing works, composing and\n  pasting do not\n* creating a torrent from a folder\n  hashes on a QThread, and this build\n  has FEATURE_thread=OFF — that one\n  progress dialog sits at 0%\n* no window decorations: the main\n  window fills the surface, dialogs\n  float above it"
+        pos 1120.0 80.0
+        size 360.0 380.0
+    }
+    connection "01KWTFEDEM000000000000BM02" "01KWTFEDEM000000000000TE01"
+}

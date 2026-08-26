@@ -1,0 +1,18 @@
+# A standalone crate ON PURPOSE.
+#
+# `[workspace]` with no members makes this its own workspace root, so it is not
+# a member of the repo's root workspace (which is `members = ["crates/*"]`,
+# `exclude = ["plugins"]` anyway). That means running this harness changes
+# nothing about the main build and adds nothing to the repo's Cargo.lock — it
+# just links wk-server by path, the same runtime `wk` itself runs.
+[workspace]
+
+[package]
+name = "slate-harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+wk-server = { path = "../../../crates/wk-server" }
+wk-protocol = { path = "../../../crates/wk-protocol" }

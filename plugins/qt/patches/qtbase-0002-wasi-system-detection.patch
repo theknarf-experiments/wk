@@ -1,0 +1,87 @@
+Subject: detect __wasi__ as an OS, and __wasm32__ as a processor
+
+WHAT
+  src/corelib/global/qsystemdetection.h     adds a Q_OS_WASI arm.
+  src/corelib/global/qprocessordetection.h  widens the Web Assembly arm from
+                                            __EMSCRIPTEN__ to __wasm32__ /
+                                            __wasm64__, and confines
+                                            Q_PROCESSOR_WORDSIZE 8 to the
+                                            targets that actually have it.
+
+WHY
+  * wasi-sdk 34-rc.2 predefines only __wasi__, __wasip2__, __wasm, __wasm32,
+    __wasm32__ and __wasm__ -- no __EMSCRIPTEN__, no __linux__, no __unix__
+    (verified with `clang --target=wasm32-wasip2 -dM -E -x c /dev/null`).
+    qsystemdetection.h therefore falls all the way through to
+    `#error "Qt has not been ported to this OS"` and not one translation unit
+    compiles. Q_OS_UNIX is granted automatically by the existing fallthrough
+    at the bottom of the file.
+
+    Q_OS_WASM is deliberately NOT also defined. It would make
+    qcoreapplication.cpp and qthread_p.h include qeventdispatcher_wasm_p.h,
+    which is emscripten::val code that CMake is not building for us and that
+    wasi-sdk cannot compile.
+
+  * qprocessordetection.h's Web Assembly arm keys on __EMSCRIPTEN__ alone, so
+    a wasi target gets neither Q_PROCESSOR_WASM nor Q_BYTE_ORDER. Qt's
+    architecture config test then reports "Architecture:unknown" and
+    QT_BUILD_ABI becomes "unknown-little_endian-ilp32", which is a lie any
+    module that string-matches the ABI can act on.
+
+    The existing arm also does `#define Q_PROCESSOR_WORDSIZE 8` unconditionally
+    -- correct for emscripten (which models a 64-bit word even on wasm32) and
+    for wasm64, wrong for wasm32-wasip2, where pointers and long are 4 bytes.
+    Widening the arm without confining that line would have introduced a real
+    bug, so it is now guarded.
+
+UPSTREAM
+  yes, both hunks. Small, mechanical, no policy in them: an OS macro for a
+  compiler-defined target macro, and a processor arm keyed on the architecture
+  rather than on one particular SDK. The WORDSIZE guard is arguably a latent
+  upstream defect in its own right.
+
+---
+diff --git a/src/corelib/global/qsystemdetection.h b/src/corelib/global/qsystemdetection.h
+index 0cbcef2..ac60c78 100644
+--- a/src/corelib/global/qsystemdetection.h
++++ b/src/corelib/global/qsystemdetection.h
+@@ -96,6 +96,13 @@
+ #  define Q_OS_HPUX
+ #elif defined(__EMSCRIPTEN__)
+ #  define Q_OS_WASM
++#elif defined(__wasi__)
++// WASI is wasm with a POSIX-ish libc, NOT Emscripten. Deliberately NOT
++// Q_OS_WASM: that macro pulls in the embind event dispatcher
++// (qcoreapplication.cpp, qthread_p.h include qeventdispatcher_wasm_p.h under
++// it) and the rest of the emscripten::val code, none of which wasi-sdk can
++// compile. Q_OS_UNIX is granted automatically by the fallthrough below.
++#  define Q_OS_WASI
+ #elif defined(__linux__) || defined(__linux)
+ #  define Q_OS_LINUX
+ #elif defined(__FreeBSD__) || defined(__DragonFly__) || defined(__FreeBSD_kernel__)
+diff --git a/src/corelib/global/qprocessordetection.h b/src/corelib/global/qprocessordetection.h
+index f7298bb..821a369 100644
+--- a/src/corelib/global/qprocessordetection.h
++++ b/src/corelib/global/qprocessordetection.h
+@@ -335,10 +335,19 @@
+ #  define Q_BYTE_ORDER Q_BIG_ENDIAN
+ 
+ // -- Web Assembly --
+-#elif defined(__EMSCRIPTEN__)
++// __wasm32__/__wasm64__ so that a non-Emscripten wasm target (wasi-sdk defines
++// __wasi__ and __wasm32__, never __EMSCRIPTEN__) still gets a processor and a
++// byte order; without this Qt's architecture config test reports
++// "Architecture:unknown" and QT_BUILD_ABI becomes "unknown-little_endian-ilp32".
++#elif defined(__EMSCRIPTEN__) || defined(__wasm32__) || defined(__wasm64__)
+ #  define Q_PROCESSOR_WASM
+ #  define Q_BYTE_ORDER Q_LITTLE_ENDIAN
+-#  define Q_PROCESSOR_WORDSIZE 8
++// WORDSIZE 8 is correct for emscripten (which models a 64-bit word even on
++// wasm32) and for real wasm64, but NOT for a plain 32-bit wasi target, where
++// pointers and long are 4 bytes.
++#  if defined(__EMSCRIPTEN__) || defined(__wasm64__)
++#    define Q_PROCESSOR_WORDSIZE 8
++#  endif
+ #ifdef QT_COMPILER_SUPPORTS_SSE2
+ #  define Q_PROCESSOR_X86 6   // enables SIMD support
+ # define Q_PROCESSOR_X86_64 // wasm64

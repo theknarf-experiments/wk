@@ -1,0 +1,138 @@
+WHAT: make the app a wk node -- default to the `wk` QPA platform, statically
+      import the three plugins wasm cannot dlopen, link libqwk.a and the
+      component-type object, and compile a font in as a Qt resource.
+WHY:  four things a wasm32-wasip2 Qt node needs that a desktop build gets for
+      free:
+        * QT_QPA_PLATFORM. plugins/qt's qtbase was configured
+          QT_QPA_DEFAULT_PLATFORM=offscreen (it predates the wk QPA plugin), so
+          an unmodified app renders to nowhere and never opens a surface. Set
+          only when the environment does not already say, so
+          QT_QPA_PLATFORM=offscreen stays available for bisecting failures.
+        * Q_IMPORT_PLUGIN. No dlopen on wasm. Without QWkIntegrationPlugin,
+          QApplication aborts with "no Qt platform plugin could be initialized"
+          and an EMPTY plugin list -- it reads like a broken Qt, but it is an
+          unreferenced symbol. QSvgPlugin/QSvgIconPlugin are what let
+          aboutdlg.ui's <pixmap>:/icons/app.svg and the window icon decode;
+          upstream links Qt6::Svg but, being a shared-Qt build, never names the
+          plugins.
+        * the component-type object must arrive as a LINK OPTION. It holds only
+          a `component-type` custom section that wasm-component-ld reads to
+          build the import list; nothing references it, so as an archive member
+          it is dropped and the binary ends up with no wasi:surface import.
+        * fonts. Qt 6 ships none and a wk node has no host font dir; with none
+          the app runs, QFontDatabase is empty, and every string renders as
+          nothing at all.
+      All four are guarded (`#ifdef __wasi__`, `if(WK_...)`) so a desktop build
+      of this tree is byte-for-byte unaffected.
+UPSTREAM: as-is in spirit -- this is the standard static-Qt deployment shape,
+      the same thing upstream already does for its MXE static Windows build
+      (main.cpp's existing Q_IMPORT_PLUGIN block). It is wk-specific only in
+      naming OUR platform plugin.
+--- a/CMakeLists.txt	2026-08-26 02:23:33
++++ b/CMakeLists.txt	2026-08-26 02:23:20
+@@ -353,6 +353,19 @@
+   resources.qrc
+ )
+ 
++# --- wk node: fonts ---------------------------------------------------------
++# Qt 6 ships no fonts and a wk node has no host font directory to fall back on:
++# with none, the app runs, QFontDatabase is empty and every string renders as
++# nothing at all. build.sh stages one TTF and generates this .qrc beside it
++# (which font exists depends on the machine), and the wk QPA plugin's font
++# database falls back to :/fonts after looking in QT_QPA_FONTDIR and the usual
++# VFS directories. A node that bind-mounts a real font directory can still set
++# QT_QPA_FONTDIR and never touch this copy.
++set(WK_FONTS_QRC "" CACHE FILEPATH "generated .qrc holding one staged TTF under :/fonts")
++if(WK_FONTS_QRC)
++  list(APPEND RESOURCES "${WK_FONTS_QRC}")
++endif()
++
+ # The lupdate/fix_* maintainer targets are gone with LinguistTools: every one
+ # of them names the Qt6::lupdate imported target, which does not exist without
+ # find_package(Qt6LinguistTools), so merely DECLARING them is a configure
+@@ -436,6 +449,43 @@
+ 
+ if(APPLE)
+   target_link_libraries(${EXE_NAME} ${SPARKLE_LIBRARY} "-framework AppKit")
++endif()
++
++# --- wk node: the platform plugin and the component's imports ---------------
++# There is no dlopen on wasm, so every Qt plugin is an ARCHIVE linked into the
++# binary and named once with Q_IMPORT_PLUGIN (see main.cpp).
++#
++#   WK_QPA_LIB            plugins/qt/sysroot/lib/libqwk.a -- the wk QPA plugin.
++#                         It also carries the gfx-compat shim objects
++#                         (wkgfx.c + the wit-bindgen output), so the app needs
++#                         no other wasi-gfx code.
++#   WK_SVG_PLUGINS        the qsvg imageformat + iconengine plugins. Without
++#                         them Qt6::Svg is linked but no QImageReader knows
++#                         what an .svg is, and aboutdlg.ui's <pixmap>
++#                         :/icons/app.svg (and the window icon) come out null.
++#   WK_GFX_COMPONENT_TYPE gen/wkgfx_component_type.o, passed as a LINK OPTION
++#                         and never as a library. It carries only a
++#                         `component-type` custom section that
++#                         wasm-component-ld reads to build the component's
++#                         import list; nothing references it, so as an archive
++#                         member the linker drops it and the result is a
++#                         component with NO wasi:surface import at all.
++set(WK_QPA_LIB "" CACHE FILEPATH "libqwk.a, the wk QPA plugin (plugins/qt/build-qpa.sh)")
++set(WK_SVG_PLUGINS "" CACHE STRING "static qsvg plugin archives")
++set(WK_GFX_COMPONENT_TYPE "" CACHE FILEPATH "gfx-compat gen/wkgfx_component_type.o")
++if(WK_QPA_LIB)
++  # FbSupportPrivate is not optional and not obvious: the wk QPA plugin IS
++  # fbconvenience -- QWkScreen derives from QFbScreen, QWkWindow from
++  # QFbWindow, QWkBackingStore from QFbBackingStore, and that is where the
++  # guest-side compositing of N top-level windows into one surface lives.
++  # Without it the link fails with a page of "undefined symbol: QFbScreen::..."
++  # from inside libqwk.a. It is an INTERNAL_MODULE, so it is its own package
++  # rather than a component of Qt6Gui.
++  find_package(Qt6 6.8 REQUIRED COMPONENTS FbSupportPrivate)
++  target_link_libraries(${EXE_NAME} ${WK_SVG_PLUGINS} "${WK_QPA_LIB}" Qt6::FbSupportPrivate)
++endif()
++if(WK_GFX_COMPONENT_TYPE)
++  target_link_options(${EXE_NAME} PRIVATE "${WK_GFX_COMPONENT_TYPE}")
+ endif()
+ 
+ 
+--- a/main.cpp	2026-06-05 13:11:57
++++ b/main.cpp	2026-08-26 02:23:33
+@@ -11,6 +11,20 @@
+ #include <QFile>
+ #include <QVariant>
+ 
++// --- wk node ---------------------------------------------------------------
++// wasm has no dlopen, so Qt cannot discover a plugin at runtime: every plugin
++// is linked in as an archive and named here. Without the QWkIntegrationPlugin
++// line QApplication aborts with "no Qt platform plugin could be initialized"
++// and an EMPTY available-plugins list, which reads like a broken Qt build but
++// is a missing symbol reference. The two Svg plugins are what make
++// aboutdlg.ui's :/icons/app.svg (and the window icon) decode at all.
++#ifdef __wasi__
++#include <QtPlugin>
++Q_IMPORT_PLUGIN(QWkIntegrationPlugin)
++Q_IMPORT_PLUGIN(QSvgPlugin)
++Q_IMPORT_PLUGIN(QSvgIconPlugin)
++#endif
++
+ // Allow run Qt5 static version https://github.com/tonytheodore/mxe/commit/497669fa44356db0cd8335e2554b7bac12eb88c2
+ #if QT_VERSION >= QT_VERSION_CHECK(5, 0, 0) && defined Q_OS_WIN && defined BUILD_STATIC
+ #include <QtPlugin>
+@@ -193,6 +207,18 @@
+ 
+ int main(int argc, char *argv[])
+ {
++#ifdef __wasi__
++    // plugins/qt/sysroot's qtbase was configured with
++    // QT_QPA_DEFAULT_PLATFORM=offscreen -- it predates the wk plugin -- so
++    // without this the app comes up on a platform that renders to nowhere and
++    // never opens a wk surface. An explicit QT_QPA_PLATFORM in the node's
++    // environment still wins, which is what makes `QT_QPA_PLATFORM=offscreen`
++    // usable for separating "Qt is broken" from "the wk QPA is broken".
++    if (!qEnvironmentVariableIsSet("QT_QPA_PLATFORM")) {
++        qputenv("QT_QPA_PLATFORM", "wk");
++    }
++#endif
++
+     if (argc == 2) {
+         if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) {
+             openWinConsole();

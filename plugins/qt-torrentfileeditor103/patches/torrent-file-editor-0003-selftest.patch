@@ -1,0 +1,107 @@
+WHAT: WK_TFE_SELFTEST=1 makes the app narrate itself on stdout -- platform,
+      style, font count, screen size, then a repeating STATE line (window
+      title, torrent name, info hash, total size, file-list row count, number
+      of visible top-levels) and a BTNABOUT line with the About button's rect
+      in surface coordinates.
+WHY:  TEST SCAFFOLDING, and the only kind that catches the failures that
+      matter here. A headless harness can read pixels, but a pixel histogram
+      proves "not blank" -- it cannot tell a rendered torrent from a rendered
+      empty form. These lines come out of BencodeModel, so they prove the
+      .torrent arriving over a wk BindMount was actually PARSED. The published
+      rect is what lets the harness aim a genuine wasi:surface pointer event
+      at a real button and watch a second top-level window appear, which is
+      the whole input path plus multi-window compositing.
+      Rect published on a repeating timer, not once: the wk QPA forces the
+      first top-level to the full surface, so any rect read at singleShot(0)
+      predates that resize and aiming at it misses. The repeat doubles as the
+      only evidence that QTimer deadlines survive being folded into the frame
+      wait.
+UPSTREAM: no. This is ours, for testing, and it is #ifdef __wasi__ so it does
+      not exist in a desktop build. Upstream would rightly want this as a
+      QTest, which cannot run here (FEATURE_testlib=OFF, and a wasip2
+      component has no test harness).
+--- a/main.cpp	2026-08-26 02:17:57
++++ b/main.cpp	2026-08-26 02:19:49
+@@ -23,6 +23,17 @@
+ Q_IMPORT_PLUGIN(QWkIntegrationPlugin)
+ Q_IMPORT_PLUGIN(QSvgPlugin)
+ Q_IMPORT_PLUGIN(QSvgIconPlugin)
++
++// for the WK_TFE_SELFTEST narration further down
++#include <QAbstractItemModel>
++#include <QAbstractItemView>
++#include <QApplication>
++#include <QFontDatabase>
++#include <QLineEdit>
++#include <QScreen>
++#include <QStyle>
++#include <QTimer>
++#include <cstdio>
+ #endif
+ 
+ // Allow run Qt5 static version https://github.com/tonytheodore/mxe/commit/497669fa44356db0cd8335e2554b7bac12eb88c2
+@@ -293,6 +304,64 @@
+                 w.open(filename);
+             }
+         }
++
++#ifdef __wasi__
++        // --- wk selftest -----------------------------------------------
++        // WK_TFE_SELFTEST=1 makes the app narrate itself on stdout so a
++        // headless harness can check more than a pixel histogram. A frame
++        // that is "not blank" proves almost nothing; these lines prove that
++        // the .torrent actually PARSED (name, info hash, total size and the
++        // file list all come out of BencodeModel), and they publish the
++        // About button's rect in surface coordinates so the harness can aim
++        // a real wasi:surface pointer event at it and watch a second
++        // top-level window appear.
++        //
++        // Repeating rather than one-shot, deliberately: the first top-level
++        // is forced to the full surface by the wk QPA, so an early reading of
++        // any widget rect is the pre-resize one; and a timer that keeps
++        // firing is itself the only evidence that QTimer deadlines survive
++        // being folded into the frame wait.
++        if (qEnvironmentVariableIntValue("WK_TFE_SELFTEST") == 1) {
++            std::printf("platform=%s style=%s families=%lld\n",
++                        qPrintable(QApplication::platformName()),
++                        qPrintable(QApplication::style()->objectName()),
++                        (long long)QFontDatabase::families().size());
++            if (QScreen *s = QApplication::primaryScreen()) {
++                std::printf("screen=%dx%d\n", s->geometry().width(), s->geometry().height());
++            }
++            std::fflush(stdout);
++
++            QTimer *report = new QTimer(&w);
++            QObject::connect(report, &QTimer::timeout, [&w]() {
++                auto text = [&w](const char *name) -> QString {
++                    QLineEdit *e = w.findChild<QLineEdit *>(QString::fromLatin1(name));
++                    return e ? e->text() : QString();
++                };
++                int files = 0;
++                if (QAbstractItemView *v = w.findChild<QAbstractItemView *>(QStringLiteral("viewFiles"))) {
++                    if (v->model()) {
++                        files = v->model()->rowCount();
++                    }
++                }
++                int tops = 0;
++                for (QWidget *tl : QApplication::topLevelWidgets()) {
++                    if (tl->isVisible()) {
++                        ++tops;
++                    }
++                }
++                std::printf("STATE title='%s' name='%s' hash='%s' size='%s' files=%d tops=%d\n",
++                            qPrintable(w.windowTitle()), qPrintable(text("leName")),
++                            qPrintable(text("leHash")), qPrintable(text("leTorrentTotalSize")),
++                            files, tops);
++                if (QWidget *b = w.findChild<QWidget *>(QStringLiteral("btnAbout"))) {
++                    const QRect r(b->mapToGlobal(QPoint(0, 0)), b->size());
++                    std::printf("BTNABOUT %d %d %d %d\n", r.x(), r.y(), r.width(), r.height());
++                }
++                std::fflush(stdout);
++            });
++            report->start(250);
++        }
++#endif
+ 
+         returnCode = a.exec();
+     }
