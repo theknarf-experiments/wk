@@ -299,3 +299,12 @@ plugins/qt-drumstickvpiano2111/harness/target/
 # has. Qt 6 ships no fonts and a wk node has no host font dir, so the app
 # compiles one in as a Qt resource -- but the file itself is not ours to commit.
 plugins/qt-drumstickvpiano2111/fonts/
+
+# resolv-compat (libresolv for wasip2: DNS records over BSD sockets). The
+# static lib and its staged header are derived; only resolv.c/resolv.h,
+# build.sh and mise.toml are tracked.
+plugins/resolv-compat/obj/
+plugins/resolv-compat/sysroot/
+
+# dnsstub (hermetic authoritative DNS server node for tests) build artifact
+plugins/dnsstub/dnsstub.wasm

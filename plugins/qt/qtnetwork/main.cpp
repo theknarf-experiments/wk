@@ -45,6 +45,7 @@
 #include <QtCore/QTimer>
 #include <QtGui/QGuiApplication>
 #include <QtNetwork/QHostInfo>
+#include <QtNetwork/QDnsLookup>
 #include <QtNetwork/QNetworkAccessManager>
 #include <QtNetwork/QNetworkReply>
 #include <QtNetwork/QNetworkRequest>
@@ -102,6 +103,55 @@ int main(int argc, char **argv)
     });
     watchdog.start(120'000);
 
+    // --- stage 5 (declared first so stage 4 can call it) ------------------
+    // QDnsLookup: the RECORD types getaddrinfo cannot express. Stage 1 already
+    // resolved a name to an address, and that path never touches this one --
+    // QHostInfo goes through getaddrinfo and so through wk's fabric name
+    // service, whereas QDnsLookup builds a DNS query, puts it on the wire, and
+    // parses the response. On this port that means Qt's own
+    // qdnslookup_unix.cpp over plugins/resolv-compat, and it is only reachable
+    // at all because QDnsLookup is no longer gated on QT_FEATURE_thread (see
+    // plugins/qt/patches/qtbase-0010-dnslookup-without-threads.patch).
+    //
+    // The peer is plugins/dnsstub, which is authoritative for wk.test and
+    // nothing else, so every field asserted here is one this repo wrote --
+    // no internet, no records somebody else controls.
+    const QString dnsHost = argc > 3 ? QString::fromLocal8Bit(argv[3]) : QStringLiteral("dnsstub");
+    auto dnsStage = [&app, dnsHost]() {
+        auto *mx = new QDnsLookup(QDnsLookup::MX, QStringLiteral("wk.test"), &app);
+        QObject::connect(mx, &QDnsLookup::finished, [&app, mx]() {
+            mx->deleteLater();
+            if (mx->error() != QDnsLookup::NoError) {
+                say("DNSREC FAIL %d %s", int(mx->error()), qPrintable(mx->errorString()));
+                app.exit(1);
+                return;
+            }
+            const auto records = mx->mailExchangeRecords();
+            if (records.isEmpty()) {
+                say("DNSREC FAIL no MX records");
+                app.exit(1);
+                return;
+            }
+            // Both fields matter: the exchange proves dn_expand walked the
+            // name, the preference proves the RDATA offset was right.
+            say("DNSREC MX %s pref=%u", qPrintable(records.first().exchange()),
+                unsigned(records.first().preference()));
+            app.quit();
+        });
+        say("DNSREC LOOKUP MX wk.test via %s", qPrintable(dnsHost));
+        // Resolve the stub's own address through the fabric first: QDnsLookup
+        // wants a nameserver ADDRESS, and the node is known by name.
+        const QHostInfo ns = QHostInfo::fromName(dnsHost);
+        if (ns.error() != QHostInfo::NoError || ns.addresses().isEmpty()) {
+            say("DNSREC FAIL cannot resolve nameserver %s", qPrintable(dnsHost));
+            app.exit(1);
+            return;
+        }
+        say("DNSREC NAMESERVER %s", qPrintable(ns.addresses().first().toString()));
+        mx->setNameserver(ns.addresses().first());
+        mx->lookup();
+    };
+
     // --- stage 4 (declared first so stage 3 can call it) ------------------
     // Does https:// silently DOWNGRADE to cleartext when there is no TLS
     // backend? That is the failure mode worth checking, because it would be
@@ -113,11 +163,11 @@ int main(int argc, char **argv)
     // *plaintext* peer on purpose: if the request were downgraded it would
     // succeed, and this stage would fail.
     auto *nam = new QNetworkAccessManager(&app);
-    auto tlsStage = [&app, nam, host, port]() {
+    auto tlsStage = [&app, nam, host, port, dnsStage]() {
         const QUrl url(QStringLiteral("https://%1:%2/").arg(host).arg(port));
         say("TLS GET %s", qPrintable(url.toString()));
         QNetworkReply *reply = nam->get(QNetworkRequest(url));
-        QObject::connect(reply, &QNetworkReply::finished, [&app, reply]() {
+        QObject::connect(reply, &QNetworkReply::finished, [&app, reply, dnsStage]() {
             reply->deleteLater();
             if (reply->error() == QNetworkReply::NoError) {
                 say("TLS FAIL https succeeded with no TLS backend -- downgrade?");
@@ -126,7 +176,7 @@ int main(int argc, char **argv)
             }
             say("TLS REJECTED %d %s", int(reply->error()),
                 qPrintable(reply->errorString()));
-            app.quit();
+            dnsStage();
         });
     };
 

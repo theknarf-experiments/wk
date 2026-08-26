@@ -179,9 +179,43 @@ set(WK_WASI_EMULATION_DEFINES "-D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_
 # stay overridable/appendable by the caller. Corollary, and it bites: changing
 # them later has no effect on an existing build dir — delete build-target/ (or
 # run build-qtbase.sh with WK_QT_RECONFIGURE=1) to pick up an edit.
-set(CMAKE_C_FLAGS_INIT   "${WK_WASI_EMULATION_DEFINES} ${WK_WASI_EH_FLAGS}")
-set(CMAKE_CXX_FLAGS_INIT "${WK_WASI_EMULATION_DEFINES} ${WK_WASI_EH_FLAGS}")
-set(CMAKE_ASM_FLAGS_INIT "${WK_WASI_EMULATION_DEFINES} ${WK_WASI_EH_FLAGS}")
+# -I for anything this port supplies that is NOT in the wasi sysroot, passed as
+# -DWK_EXTRA_INCLUDE_DIRS="a;b". It has to be a compiler FLAG rather than a
+# find-root entry, because the checks that need it do not look there:
+# CMake's check_<lang>_source_compiles() honours CMAKE_REQUIRED_LIBRARIES but
+# gets no include directories from a find_path(), and several of Qt's
+# FindWrap*.cmake modules probe with exactly that shape — find_library() for
+# the library, then a compile test that plain `#include`s the header. Qt's
+# FindWrapResolv.cmake is the case in hand: it locates libresolv.a fine and
+# then fails to compile `#include <resolv.h>`, so WrapResolv_FOUND comes back
+# false and QDnsLookup silently degrades to the dummy backend.
+set(WK_EXTRA_INCLUDE_DIRS "" CACHE STRING
+    "Extra include directories for headers this port supplies outside the wasi sysroot")
+
+# ../resolv-compat is wired in HERE, by default, rather than by each build
+# script, because it is not only qtbase that needs it: turning FEATURE_libresolv
+# on makes WrapResolv a recorded third-party dependency of the Qt6Network
+# PACKAGE, so every downstream app that does find_package(Qt6 COMPONENTS Network)
+# re-resolves it at its own configure time and fails with
+#   Qt6Network could not be found because dependency WrapResolv could not be found
+# if it cannot. Defaulting it from the toolchain file — which every consumer
+# already uses — means no app port has to know DNS exists.
+get_filename_component(_wk_resolv "${CMAKE_CURRENT_LIST_DIR}/../resolv-compat/sysroot" ABSOLUTE)
+if(EXISTS "${_wk_resolv}/lib/libresolv.a")
+    list(APPEND CMAKE_FIND_ROOT_PATH "${_wk_resolv}")
+    if(NOT WK_EXTRA_INCLUDE_DIRS)
+        set(WK_EXTRA_INCLUDE_DIRS "${_wk_resolv}/include")
+    endif()
+endif()
+unset(_wk_resolv)
+set(WK_EXTRA_INCLUDE_FLAGS "")
+foreach(_dir IN LISTS WK_EXTRA_INCLUDE_DIRS)
+    string(APPEND WK_EXTRA_INCLUDE_FLAGS " -I${_dir}")
+endforeach()
+
+set(CMAKE_C_FLAGS_INIT   "${WK_WASI_EMULATION_DEFINES} ${WK_WASI_EH_FLAGS}${WK_EXTRA_INCLUDE_FLAGS}")
+set(CMAKE_CXX_FLAGS_INIT "${WK_WASI_EMULATION_DEFINES} ${WK_WASI_EH_FLAGS}${WK_EXTRA_INCLUDE_FLAGS}")
+set(CMAKE_ASM_FLAGS_INIT "${WK_WASI_EMULATION_DEFINES} ${WK_WASI_EH_FLAGS}${WK_EXTRA_INCLUDE_FLAGS}")
 
 # Link-time companions:
 #   -lunwind   MANDATORY with -fwasm-exceptions and easy to miss: without it
@@ -240,6 +274,27 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+
+# ...and without this, none of the above finds ANYTHING.
+#
+# The find-root paths are not searched directly: CMake combines each root with
+# the platform's relative search prefixes, so find_library looks in
+# <root>/<prefix>/lib and find_path in <root>/<prefix>/include. Those prefixes
+# come from CMAKE_SYSTEM_PREFIX_PATH, which every real platform module seeds
+# (Platform/UnixPaths.cmake puts "/" and "/usr" in it) — but CMake's
+# Platform/WASI.cmake is a one-line stub that seeds NOTHING. With an empty
+# list there are no combinations to try, so find_library(), find_path() and
+# find_package() all fail no matter what is on CMAKE_FIND_ROOT_PATH, and they
+# fail SILENTLY: the caller just gets NOTFOUND and, for an optional dependency,
+# a feature quietly switching itself off. That is exactly how QDnsLookup first
+# came back with Qt's do-nothing dummy backend while libresolv.a sat in a
+# directory that was on the find root.
+#
+# "/" is the whole fix: <root>//lib and <root>//include are the layouts a
+# sysroot actually has. This is the same class of gap as UNIX not being set
+# (see the platform notes in PORTING.md) — CMake knows the WASI *toolchain*
+# but has no WASI *platform* to speak of, so this file has to be it.
+list(APPEND CMAKE_SYSTEM_PREFIX_PATH "/")
 
 # pkg-config must never run: it would answer from the host's .pc files.
 # Qt has its own guard for this (QtBuildRepoHelpers.cmake skips pkg-config on

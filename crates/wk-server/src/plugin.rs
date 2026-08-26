@@ -3066,9 +3066,15 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/qt/qt-qtnetwork.wasm");
         let srv_wasm =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/netserve/netserve.wasm");
-        if !qt_wasm.exists() || !srv_wasm.exists() {
+        // The DNS peer. Authoritative for wk.test and nothing else, so the
+        // records asserted below are ones this repo wrote -- QDnsLookup gets
+        // tested without reaching the internet.
+        let dns_wasm =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/dnsstub/dnsstub.wasm");
+        if !qt_wasm.exists() || !srv_wasm.exists() || !dns_wasm.exists() {
             eprintln!(
-                "skipping: build plugins/qt (./build-qtnetwork.sh) and plugins/netserve first"
+                "skipping: build plugins/qt (./build-qtnetwork.sh), plugins/netserve \
+                 and plugins/dnsstub first"
             );
             return;
         }
@@ -3117,8 +3123,9 @@ mod tests {
         let client = spawn(&qt_wasm, "qt-qtnetwork");
 
         // One shared Network, like a netlink in a .wk workspace.
+        let dns = spawn(&dns_wasm, "dnsstub");
         let shared_net = NodeId::new();
-        for n in [&server, &client] {
+        for n in [&server, &client, &dns] {
             n.net_stack().expect("fabric stack").lock().unwrap().net = shared_net;
         }
 
@@ -3150,20 +3157,39 @@ mod tests {
             }
         }
 
-        host.run_node(&client, &["netserve".to_string(), "8080".to_string()])
-            .expect("run qt-qtnetwork");
+        // Port 53: QDnsLookup gives no way to say otherwise -- setNameserver()
+        // takes an address and the port is Qt's own default.
+        host.run_node(&dns, &["53".to_string()])
+            .expect("run dnsstub");
+
+        host.run_node(
+            &client,
+            &[
+                "netserve".to_string(),
+                "8080".to_string(),
+                "dnsstub".to_string(),
+            ],
+        )
+        .expect("run qt-qtnetwork");
 
         let log_now = || String::from_utf8_lossy(&client.term_io.log_read(0).0).to_string();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
         let log = loop {
             let log = log_now();
-            for stage in ["DNS FAIL", "TCP FAIL", "HTTP FAIL", "TLS FAIL", "NET FAIL"] {
+            for stage in [
+                "DNS FAIL",
+                "TCP FAIL",
+                "HTTP FAIL",
+                "TLS FAIL",
+                "DNSREC FAIL",
+                "NET FAIL",
+            ] {
                 assert!(
                     !log.contains(stage),
                     "qt-qtnetwork reported {stage}; node log:\n{log}"
                 );
             }
-            if log.contains("TLS REJECTED") {
+            if log.contains("DNSREC MX") {
                 break log;
             }
             assert!(
@@ -3202,11 +3228,26 @@ mod tests {
              than deleting the assert; node log:\n{log}"
         );
         assert!(at("HTTP STATUS 200") < at("TLS REJECTED"), "log:\n{log}");
+        // QDnsLookup: the record types getaddrinfo cannot express, and a path
+        // that shares nothing with stage 1 -- QHostInfo goes through the
+        // fabric's ip-name-lookup, whereas this builds a DNS query, sends it
+        // over UDP to plugins/dnsstub and parses the answer. It reaches
+        // libQt6Network at all only because QDnsLookup is no longer gated on
+        // QT_FEATURE_thread, and it can only ANSWER because plugins/resolv-compat
+        // supplies the res_n*/dn_expand that wasi-libc lacks.
+        assert!(at("TLS REJECTED") < at("DNSREC MX"), "log:\n{log}");
+        // Both fields, because they fail differently: a wrong `exchange` means
+        // dn_expand mis-walked the name, a wrong `pref` means the MX RDATA was
+        // read at the wrong offset. dnsstub serves exactly these.
+        assert!(
+            log.contains("DNSREC MX mail.wk.test pref=10"),
+            "QDnsLookup did not decode dnsstub's MX record; node log:\n{log}"
+        );
         eprintln!(
             "qt-qtnetwork: {}",
             log.lines()
                 .filter(|l| {
-                    ["NET ", "TLS ", "DNS ", "TCP ", "HTTP "]
+                    ["NET ", "TLS ", "DNS ", "DNSREC ", "TCP ", "HTTP "]
                         .iter()
                         .any(|p| l.starts_with(p))
                 })

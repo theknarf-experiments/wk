@@ -1,0 +1,125 @@
+Subject: network: QDnsLookup without threads, over a wasi libresolv
+
+WHAT / WHY
+
+  QDnsLookup is the only API for the DNS record types getaddrinfo cannot
+  express -- MX, SRV, TXT, NS, PTR, CNAME, SOA. On this port it was doubly
+  unreachable, and both reasons had to go.
+
+  src/network/configure.cmake
+      `qt_feature("dnslookup" ... CONDITION QT_FEATURE_thread AND NOT
+      INTEGRITY)`. FEATURE_thread is OFF here and is not coming back (wasip2
+      components have no threads), so the whole feature compiled out. The
+      thread condition is dropped; NOT INTEGRITY stays.
+
+  src/network/kernel/qdnslookup.cpp
+      The reason for that condition: QDnsLookupThreadPool derives from
+      QThreadPool, and qthreadpool.cpp lives inside
+      `qt_internal_extend_target(Core CONDITION QT_FEATURE_thread)` -- with
+      threads off the class does not exist at all, so the file cannot even
+      link. Both things the pool did are done inline instead:
+
+        * DELIVERY. The pool version connects finished() with
+          BlockingQueuedConnection, which on one thread is a deadlock that Qt
+          asserts on. DirectConnection is not an approximation of it: it is
+          what BlockingQueuedConnection degenerates to when sender and
+          receiver share a thread, i.e. run() returns only after the slot has
+          run, which is the ordering the threaded build guarantees.
+        * OWNERSHIP. QRunnable autoDelete means the pool deletes the runnable.
+          abort() only clears QDnsLookupPrivate's pointer without deleting,
+          and ~QDnsLookup() is empty, so deleting it after run() is both
+          required and safe; a late abort is already handled by the `d->runnable
+          == sender()` check in the finished lambda, which drops the result.
+
+      The invocation is QUEUED, not direct, so lookup() keeps its asynchronous
+      contract -- finished() must not be emitted before lookup() returns, or a
+      caller that connects afterwards (which the class documentation's own
+      example does) would miss it. The query itself then blocks the event loop
+      for its duration; that is unavoidable without a thread and is bounded by
+      the resolver timeout.
+
+  The other half is not a patch: wasi-libc ships <arpa/nameser.h> but no
+  resolver, so upstream would fall back to qdnslookup_dummy.cpp, which errors
+  on every lookup. plugins/resolv-compat supplies res_ninit/res_nmkquery/
+  res_nsend/dn_expand (plus the legacy global _res that qhostinfo_unix.cpp
+  wants) over ordinary sockets, which is all Qt borrows -- qdnslookup_unix.cpp
+  parses every record type itself. With FEATURE_libresolv=ON that upstream
+  file builds unmodified.
+
+UPSTREAMABLE? The configure.cmake half, plausibly: nothing about
+qdnslookup.cpp's logic needs a thread, and Qt already supports
+-no-feature-thread. The single-threaded delivery path would need to be
+written the way Qt writes them (a QT_CONFIG(thread) arm, as here) and to
+survive their CI on a platform nobody currently builds that way.
+
+--- a/src/network/configure.cmake
++++ b/src/network/configure.cmake
+@@ -314,7 +314,7 @@
+     SECTION "Networking"
+     LABEL "QDnsLookup"
+     PURPOSE "Provides API for DNS lookups."
+-    CONDITION QT_FEATURE_thread AND NOT INTEGRITY
++    CONDITION NOT INTEGRITY
+ )
+ qt_feature("gssapi" PUBLIC
+     SECTION "Networking"
+--- a/src/network/kernel/qdnslookup.cpp
++++ b/src/network/kernel/qdnslookup.cpp
+@@ -26,6 +26,7 @@
+ 
+ static Q_LOGGING_CATEGORY(lcDnsLookup, "qt.network.dnslookup", QtCriticalMsg)
+ 
++#if QT_CONFIG(thread)
+ namespace {
+ struct QDnsLookupThreadPool : QThreadPool
+ {
+@@ -38,6 +39,7 @@
+ }
+ 
+ Q_APPLICATION_STATIC(QDnsLookupThreadPool, theDnsLookupThreadPool);
++#endif // QT_CONFIG(thread)
+ 
+ static bool qt_qdnsmailexchangerecord_less_than(const QDnsMailExchangeRecord &r1, const QDnsMailExchangeRecord &r2)
+ {
+@@ -799,9 +801,41 @@
+     };
+ 
+     d->runnable = new QDnsLookupRunnable(d);
++#if QT_CONFIG(thread)
+     connect(d->runnable, &QDnsLookupRunnable::finished, this, l,
+             Qt::BlockingQueuedConnection);
+     theDnsLookupThreadPool->start(d->runnable);
++#else
++    // Without threads there is no pool to hand this to, and the two things the
++    // pool did have to be done here instead: deliver the result, and own the
++    // runnable.
++    //
++    // DirectConnection, not BlockingQueued: a blocking-queued connection whose
++    // sender and receiver are the same thread is a deadlock, and Qt asserts on
++    // it. Direct delivery is not an approximation of the threaded behaviour --
++    // it is what BlockingQueuedConnection degenerates to once there is only one
++    // thread, i.e. run() returns only after `l` has run, which is exactly the
++    // ordering the pool version guarantees.
++    connect(d->runnable, &QDnsLookupRunnable::finished, this, l, Qt::DirectConnection);
++    // Queued, so lookup() keeps its asynchronous contract: finished() must not
++    // be emitted before lookup() returns, or a caller that connects after
++    // calling lookup() -- legal, and what the docs' own example does -- would
++    // miss it. The query itself still blocks the event loop for its duration;
++    // that is unavoidable without a thread, and it is bounded by the resolver
++    // timeout (res_ninit's retrans*retry, 10s by default).
++    //
++    // The runnable is the context object, so this is cancelled if it dies. It
++    // cannot die behind our back: abort() only clears QDnsLookupPrivate's
++    // pointer without deleting (in the threaded build the pool owns the
++    // deletion), ~QDnsLookup() is empty, and the runnable is unparented -- so
++    // deleting it here is both required and safe. An abort that lands first is
++    // handled by `l`'s own `d->runnable == sender()` check, which drops the
++    // late result.
++    QMetaObject::invokeMethod(d->runnable, [r = d->runnable] {
++        r->run();
++        delete r;
++    }, Qt::QueuedConnection);
++#endif
+ }
+ 
+ /*!

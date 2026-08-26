@@ -68,6 +68,16 @@ QTBASE_SRC="$SRCDIR/qtbase-everywhere-src-$QT_VER"
 BUILD="$PWD/build-target/qtbase"
 SYSROOT="$PWD/sysroot"
 HOST_PREFIX="${QT_HOST_PATH:-$PWD/host}"
+
+# ../resolv-compat's sysroot, built on demand: Qt's FindWrapResolv probe needs
+# both libresolv.a and resolv.h to exist before configure runs, and a missing
+# one shows up as FEATURE_libresolv=ON being "an invalid feature" rather than
+# as anything mentioning DNS.
+RESOLV_SYSROOT="$PWD/../resolv-compat/sysroot"
+if [ ! -f "$RESOLV_SYSROOT/lib/libresolv.a" ]; then
+    echo "=== building ../resolv-compat (libresolv.a for QDnsLookup)"
+    (cd "$PWD/../resolv-compat" && WASI_SDK="$WASI_SDK" ./build.sh)
+fi
 LOGDIR="${LOGDIR:-$PWD/logs}"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
 mkdir -p "$SRCDIR" "$TARBALLS" "$LOGDIR" "$(dirname "$BUILD")"
@@ -177,6 +187,16 @@ CFG=(
     -DQT_QMAKE_TARGET_MKSPEC="$MKSPEC"
     -DQT_HOST_PATH="$HOST_PREFIX"
     -DCMAKE_INSTALL_PREFIX="$SYSROOT"
+    # ../resolv-compat's libresolv.a + resolv.h, for QDnsLookup (see
+    # FEATURE_libresolv below). wasip2.cmake sets FIND_ROOT_PATH_MODE_LIBRARY /
+    # _INCLUDE to ONLY, so a path has to be on CMAKE_FIND_ROOT_PATH to be
+    # searched at all -- appending here rather than replacing keeps the
+    # wasi-sysroot entry the toolchain file put there.
+    -DCMAKE_FIND_ROOT_PATH="$WASI_SDK/share/wasi-sysroot;$RESOLV_SYSROOT"
+    # ...and the header separately, as a -I: Qt's FindWrapResolv probes with a
+    # compile test that gets no include dirs from the find root. See
+    # WK_EXTRA_INCLUDE_DIRS in wasip2.cmake.
+    -DWK_EXTRA_INCLUDE_DIRS="$RESOLV_SYSROOT/include"
     -DCMAKE_BUILD_TYPE=Release
     -DBUILD_SHARED_LIBS=OFF
     -DQT_BUILD_EXAMPLES=OFF
@@ -284,15 +304,37 @@ CFG=(
     -DFEATURE_getifaddrs=OFF
     -DFEATURE_ipv6ifname=OFF
     -DFEATURE_linux_netlink=OFF
-    # No <resolv.h>, so no res_ninit/res_setservers. QHostInfo falls back to
-    # plain getaddrinfo(), which is exactly what we want: wk's fabric answers
-    # node names through wasi:sockets ip-name-lookup (plugins/fetch/fetch.c is
-    # the reference). dnslookup is CONDITION QT_FEATURE_thread and so would go
-    # off by itself; pinned because QDnsLookup would otherwise need a
-    # resolver we do not have the moment threads come back.
-    -DFEATURE_libresolv=OFF
+    # QDnsLookup, over ../resolv-compat. wasi-libc ships <arpa/nameser.h> --
+    # every DNS constant and the BIND HEADER struct -- but no resolver, so
+    # there is no <resolv.h> and upstream falls back to qdnslookup_dummy.cpp,
+    # which errors on every lookup. ../resolv-compat supplies res_ninit,
+    # res_nmkquery, res_nsend and dn_expand over ordinary sockets, which is all
+    # Qt borrows: qdnslookup_unix.cpp parses every record type itself. Its
+    # sysroot is on CMAKE_FIND_ROOT_PATH above, so Qt's own FindWrapResolv
+    # probe (find_library(resolv) + a compile test) finds it.
+    #
+    # Passed ON explicitly, but do NOT trust it to fail loudly: Qt does not
+    # error when a forced feature's CONDITION is false, it prints
+    #   Resetting 'FEATURE_libresolv' from 'ON' to 'OFF' because it doesn't
+    #   meet its condition 'WrapResolv_FOUND'
+    # in the middle of thousands of configure lines and carries on, silently
+    # linking qdnslookup_dummy.cpp — which builds, links, and then errors on
+    # every lookup at runtime. If QDnsLookup ever starts returning
+    # ResolverError, grep the configure log for that line first.
+    #
+    # This is separate from QHostInfo, which needs none of it -- plain
+    # getaddrinfo() already reaches wk's fabric name service, and that is the
+    # only thing that resolves sibling NODE names (plugins/fetch/fetch.c is the
+    # reference). QDnsLookup is for the record types getaddrinfo cannot express:
+    # MX, SRV, TXT, NS, PTR, CNAME, SOA.
+    -DFEATURE_libresolv=ON
+    # res_setservers() is glibc-specific and the shim does not provide it; Qt
+    # has a documented fallback that writes _res.nsaddr_list directly, which it
+    # does provide.
     -DFEATURE_res_setservers=OFF
-    -DFEATURE_dnslookup=OFF
+    # No longer CONDITION QT_FEATURE_thread -- see
+    # patches/qtbase-0010-dnslookup-without-threads.patch.
+    -DFEATURE_dnslookup=ON
     # AF_UNIX: <sys/un.h> exists in the sysroot but wasi:sockets has no unix
     # domain at all, so QLocalSocket would compile and fail at runtime.
     -DFEATURE_localserver=OFF

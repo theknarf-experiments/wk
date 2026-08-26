@@ -216,7 +216,7 @@ test fail before restoring it; see *Negative controls actually run*.
 | M5 typing | **done** — the host fills `text`; a real `QLineEdit` takes a letter |
 | M5 socket notifiers | **done** — `QSocketNotifier` over the fabric, `qt-net.wasm` |
 | M5 clipboard | **done** — `wk:clipboard`, a wired + token-gated capability |
-| M5 QtNetwork | **done for TCP+HTTP** — `QTcpSocket` and `QNetworkAccessManager` reach another wk node; **no TLS**, `QUdpSocket` unproven. See [QtNetwork](#qtnetwork) |
+| M5 QtNetwork | **done for TCP+HTTP+DNS** — `QTcpSocket`, `QNetworkAccessManager` and `QDnsLookup` reach another wk node; **no TLS**, `QUdpSocket` unproven. See [QtNetwork](#qtnetwork) |
 | M6 a compute-heavy Widgets app | **done** — `plugins/qt-qalculate` (Qalculate! 5.12.0 + GMP/MPFR/libxml2) |
 | M6 a MIDI app on the fabric | **done** — `plugins/qt-drumstickvpiano2111` (Drumstick VPiano; MIDI reaches a *second* node) |
 | M6 KDE Frameworks 6 | **yes** — `plugins/qt-kcalc`, 14 of 15 frameworks (**KCrash not ported**); opens a KXmlGuiWindow, computes through KNumber/GMP/MPFR, and paints the result (pixel-asserted) |
@@ -841,7 +841,7 @@ loop delivered all four rather than that four independent things happened.
 | `QUdpSocket` | links, **unproven**, ancillary data gone |
 | `QNetworkInterface` | compiled out entirely |
 | `QLocalSocket` / `QLocalServer` | off — wasi:sockets has no AF_UNIX |
-| `QDnsLookup` | off — needs threads and a resolver |
+| `QDnsLookup` | **works** — `patches/qtbase-0010` + `plugins/resolv-compat` |
 | `QNetworkProxy`, cookies' `qIsEffectiveTLD()` | off |
 
 #### Names resolve, and that was free
@@ -854,6 +854,84 @@ takes its plain-`getaddrinfo` path rather than the `res_ninit` one, which is
 exactly what we want. With `FEATURE_thread=OFF`, `qhostinfo.cpp`'s `QThreadPool`
 branch compiles out and the lookup runs inline — but the *result* still comes
 back as a posted event, so even stage one needs a working event loop.
+
+#### `QDnsLookup` without threads, and a libresolv that did not exist
+
+Two independent blockers, and it is worth separating them because only one is
+about threads.
+
+**The feature was thread-gated.** `qt_feature("dnslookup" ... CONDITION
+QT_FEATURE_thread ...)`, because `QDnsLookupThreadPool` derives from
+`QThreadPool` and `qthreadpool.cpp` is itself inside
+`CONDITION QT_FEATURE_thread` — with threads off the base class does not exist,
+so the file cannot link. `patches/qtbase-0010` drops the condition and runs the
+runnable inline: **DirectConnection** for delivery (BlockingQueued on one
+thread is a deadlock Qt asserts on, and Direct is what it degenerates to), and
+a **queued** invocation so `lookup()` stays asynchronous. Same shape as the
+`QNetworkAccessManager` fix above — correct single-threaded semantics, not an
+approximation.
+
+**There was no resolver.** wasi-libc ships `<arpa/nameser.h>` — every DNS
+constant, type code, rcode enum, and the BIND `HEADER` struct — but nothing
+that speaks to a nameserver, so no `<resolv.h>`. Upstream therefore selects
+`qdnslookup_dummy.cpp`, whose entire body sets `ResolverError`. **This fails
+silently**: it builds, links, and errors only at runtime.
+
+`plugins/resolv-compat` is the answer, and the shape is the point: Qt only
+borrows the *transport* from libresolv (`res_nmkquery`, `res_nsend`) plus
+`dn_expand`; `qdnslookup_unix.cpp` parses every record type itself. Supplying
+those four functions over ordinary BSD sockets — which already reach the fabric
+— makes that upstream file build **unmodified**. `qhostinfo_unix.cpp`
+additionally wants the BIND-era global `_res`/`res_init()` for
+`QHostInfo::localDomainName()`, so the shim provides those too.
+
+Nothing in it is wasm-specific, which is deliberate: `./build.sh --native`
+builds it for the host, and its DNS logic was exercised against a real resolver
+(A/MX/TXT/NS, compression pointers, the TCP-on-truncation retry) before ever
+being pointed at the fabric.
+
+**Two traps this cost, both worth knowing before adding any other native
+dependency to this port.**
+
+*CMake finds nothing under a WASI find-root.* `find_library`/`find_path`/
+`find_package` combine each `CMAKE_FIND_ROOT_PATH` entry with the platform's
+relative prefixes from `CMAKE_SYSTEM_PREFIX_PATH` — and CMake's
+`Platform/WASI.cmake` is a stub that seeds none, so there are no combinations
+to try and every find fails no matter what is on the root path. `wasip2.cmake`
+now appends `"/"`. Same class of gap as `UNIX` not being set.
+
+*A forced feature does not fail loudly.* `-DFEATURE_libresolv=ON` with an unmet
+condition does not error; Qt prints `Resetting 'FEATURE_libresolv' from 'ON' to
+'OFF' because it doesn't meet its condition` in the middle of thousands of
+configure lines and carries on with the dummy backend. If `QDnsLookup` ever
+starts returning `ResolverError`, grep the configure log for that line first.
+
+*And a consequence:* turning the feature on makes **WrapResolv a recorded
+third-party dependency of the Qt6Network package**, so every downstream app
+doing `find_package(Qt6 COMPONENTS Network)` re-resolves it at its own
+configure time. `wasip2.cmake` therefore wires `resolv-compat` in by default
+rather than each build script doing it — otherwise an app port fails with
+`Qt6Network could not be found because dependency WrapResolv could not be
+found`, which names nothing about DNS.
+
+**One-time upgrade step for existing build trees.** An app port configured
+*before* this change has `CMAKE_CXX_FLAGS` cached without the `resolv-compat`
+`-I`, and `*_FLAGS_INIT` only seeds a cache on its FIRST configure — so it
+re-runs, fails to find WrapResolv, and reports
+`Qt6Network could not be found because dependency WrapResolv could not be found`
+with nothing pointing at the cause. Delete that port's build directory (or its
+`CMakeCache.txt`) once; a fresh clone never sees this. The already-built
+`.wasm` files are unaffected — the qtbase rebuild that came with this change
+altered no ABI, and all of them still pass their tests — so this is a
+configure-time upgrade step, not a reason to relink everything.
+
+**Tested hermetically.** `plugins/dnsstub` is a ~180-line authoritative server
+for `wk.test` and nothing else, wired onto the same Network, so every asserted
+field is one this repo wrote — no internet, no third-party records. The test
+asserts `DNSREC MX mail.wk.test pref=10`: the exchange proves `dn_expand`
+walked the name, the preference proves the MX RDATA was read at the right
+offset. Changing the stub's preference to 20 fails the test, which is how that
+was confirmed to be load-bearing rather than decorative.
 
 #### `QNetworkAccessManager` without threads
 
