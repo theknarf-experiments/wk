@@ -1,0 +1,254 @@
+WHAT: WK_VPIANO_SELFTEST=1 makes the app narrate itself on stdout -- platform,
+      style, font-family count, screen size, then a repeating STATE line (how
+      many top-levels are visible, which MIDI backends the static-plugin scan
+      found) and a KEYBD line with the piano widget's rect in surface
+      coordinates -- plus a SENT/RECV line for every MIDI note that leaves or
+      arrives. Also lets WK_VPIANO_MIDI_THRU override the persisted MIDI-thru
+      setting.
+WHY:  TEST SCAFFOLDING, and the only kind that catches what matters here. A
+      headless harness can read pixels, but a pixel histogram proves "not
+      blank" -- it cannot tell a piano that is wired to a synth from one that
+      is wired to nothing, which is the entire claim of this port.
+        * SENT is emitted where the app hands a note to its MIDI output, so a
+          harness can click a real key with a real wasi:surface pointer event
+          and then require the SAME note number and velocity to appear in the
+          terminal of a DIFFERENT node -- the fluidsynth synth on the other end
+          of a canvas wire. Tying the two logs together by value is what makes
+          it a test of the fabric rather than of two coincidences.
+        * RECV is the return path: MIDI injected into this node's inbox has to
+          come out of drumstick's parser as a decoded note and light the key up.
+        * STATE names the backends. If BackendManager had found nothing,
+          VPiano::initialize() would already have qFatal'd -- so the line
+          existing is half the claim, and naming them stops a WRONG backend
+          from passing.
+        * KEYBD is published on a repeating timer, not once: the wk QPA forces
+          the first top-level to the full surface a few frames in, so a rect
+          read at singleShot(0) is the pre-resize geometry and aiming at it
+          misses. The repeat doubles as the only evidence that QTimer deadlines
+          survive being folded into the frame wait -- the exact mechanism the
+          MIDI input pump depends on.
+        * WK_VPIANO_MIDI_THRU exists because thru is normally a checkbox in a
+          dialog persisted to QSettings, and a node started from a .wk file has
+          neither a person at the dialog nor somewhere to persist. It is what
+          makes a USB keyboard play THROUGH the app to a synth while lighting
+          its keys.
+      The reporter deliberately reads QPluginLoader::staticInstances() rather
+      than constructing a second BackendManager: that constructor calls
+      refresh(), which rewrites the public name and excluded-connection list of
+      the very singletons being reported.
+UPSTREAM: no. Ours, for testing, and every line of it is behind `#ifdef
+      __wasi__` / `#if defined(WK_BACKEND)`, so it does not exist in a desktop
+      build. Upstream would rightly want this as a QTest, which cannot run here
+      (FEATURE_testlib=OFF, and a wasip2 component has no test harness).
+diff --git a/utils/vpiano/vpiano.cpp b/utils/vpiano/vpiano.cpp
+index 22a82cc..e1c3d56 100644
+--- a/utils/vpiano/vpiano.cpp
++++ b/utils/vpiano/vpiano.cpp
+@@ -35,6 +35,18 @@
+ #include "vpianoabout.h"
+ #include "vpianosettings.h"
+ 
++#ifdef __wasi__
++#include <cstdio>
++// WK_VPIANO_SELFTEST=1 makes the app narrate every MIDI message it sends and
++// receives on stdout, which is a wk node's terminal. See vpianomain.cpp for
++// the rest of the narration and for why any of it exists.
++static bool wkSelftest()
++{
++    static const bool on = qEnvironmentVariableIntValue("WK_VPIANO_SELFTEST") == 1;
++    return on;
++}
++#endif
++
+ using namespace drumstick::rt;
+ using namespace drumstick::widgets;
+ 
+@@ -195,7 +207,23 @@ void VPiano::initialize()
+         }
+         if (m_midiIn != nullptr) {
+             m_midiIn->setMIDIThruDevice(m_midiOut);
+-            m_midiIn->enableMIDIThru(VPianoSettings::instance()->midiThru());
++            bool thru = VPianoSettings::instance()->midiThru();
++#ifdef __wasi__
++            // MIDI-thru is normally a checkbox in the Connections dialog and
++            // is persisted in QSettings. A wk node is often started from a
++            // .wk workspace file with no settings to persist into and nobody
++            // sitting in front of the dialog, so the workspace's `env` block
++            // can say it instead: WK_VPIANO_MIDI_THRU=1 makes a hardware
++            // keyboard wired INTO this node play THROUGH it to whatever it is
++            // wired out to, while still lighting up its keys.
++            bool ok = false;
++            const int envThru = qEnvironmentVariableIntValue("WK_VPIANO_MIDI_THRU", &ok);
++            if (ok) {
++                thru = envThru != 0;
++            }
++#endif
++            m_midiIn->enableMIDIThru(thru);
++            VPianoSettings::instance()->setMidiThru(thru);
+         }
+     }
+ }
+@@ -212,20 +240,48 @@ void VPiano::closeEvent(QCloseEvent *event)
+     event->accept();
+ }
+ 
++// The two-argument overloads are the widget's: PianoKeybd::noteOn/noteOff fire
++// them when a key is played (mouse, touch or computer keyboard), and they are
++// the ONLY path out of this app. The three-argument overloads are the
++// backend's, fed by MIDIInput's signals.
++//
++// The SENT/RECV narration below is what makes the wk harness a test of the
++// wiring rather than of the window: a pointer click lands here, `SENT` names
++// the note that left, and the same note has to turn up in the terminal of the
++// synth node on the other end of the canvas wire.
++
+ void VPiano::slotNoteOn(const int midiNote, const int vel)
+ {
+     int chan = VPianoSettings::instance()->outChannel();
+     m_midiOut->sendNoteOn(chan, midiNote, vel);
++#ifdef __wasi__
++    if (wkSelftest()) {
++        std::printf("SENT noteon ch=%d note=%d vel=%d\n", chan, midiNote, vel);
++        std::fflush(stdout);
++    }
++#endif
+ }
+ 
+ void VPiano::slotNoteOff(const int midiNote, const int vel)
+ {
+     int chan = VPianoSettings::instance()->outChannel();
+     m_midiOut->sendNoteOff(chan, midiNote, vel);
++#ifdef __wasi__
++    if (wkSelftest()) {
++        std::printf("SENT noteoff ch=%d note=%d vel=%d\n", chan, midiNote, vel);
++        std::fflush(stdout);
++    }
++#endif
+ }
+ 
+ void VPiano::slotNoteOn(const int chan, const int note, const int vel)
+ {
++#ifdef __wasi__
++    if (wkSelftest()) {
++        std::printf("RECV noteon ch=%d note=%d vel=%d\n", chan, note, vel);
++        std::fflush(stdout);
++    }
++#endif
+     if (VPianoSettings::instance()->inChannel() == chan) {
+         if (vel > 0) {
+             ui.pianokeybd->showNoteOn(note, vel);
+@@ -238,6 +294,12 @@ void VPiano::slotNoteOn(const int chan, const int note, const int vel)
+ void VPiano::slotNoteOff(const int chan, const int note, const int vel)
+ {
+     Q_UNUSED(vel)
++#ifdef __wasi__
++    if (wkSelftest()) {
++        std::printf("RECV noteoff ch=%d note=%d vel=%d\n", chan, note, vel);
++        std::fflush(stdout);
++    }
++#endif
+     if (VPianoSettings::instance()->inChannel() == chan) {
+         ui.pianokeybd->showNoteOff(note);
+     }
+diff --git a/utils/vpiano/vpianomain.cpp b/utils/vpiano/vpianomain.cpp
+index 4efba88..19550e3 100644
+--- a/utils/vpiano/vpianomain.cpp
++++ b/utils/vpiano/vpianomain.cpp
+@@ -80,6 +80,14 @@ Q_IMPORT_PLUGIN(OSSOutput)
+ Q_IMPORT_PLUGIN(WkMIDIInput)
+ Q_IMPORT_PLUGIN(WkMIDIOutput)
+ Q_IMPORT_PLUGIN(QWkIntegrationPlugin)
++
++// ...and for the WK_VPIANO_SELFTEST narration at the bottom of main().
++#include <QFontDatabase>
++#include <QPluginLoader>
++#include <QScreen>
++#include <QStyle>
++#include <QTimer>
++#include <cstdio>
+ #endif
+ 
+ int main(int argc, char *argv[])
+@@ -166,6 +174,82 @@ int main(int argc, char *argv[])
+             QSettings::setDefaultFormat(QSettings::NativeFormat);
+         }
+         w.show();
++
++#if defined(WK_BACKEND)
++        // --- wk selftest ----------------------------------------------
++        // WK_VPIANO_SELFTEST=1 makes the app narrate itself on stdout (a wk
++        // node's terminal) so a headless harness can assert on more than a
++        // pixel histogram. A frame that is "not blank" would be equally
++        // consistent with a piano that is wired to nothing.
++        //
++        // What each line is for:
++        //   platform/style/families/screen  Qt came up on the wk QPA at all,
++        //                                   and the font database is not
++        //                                   empty (with no font every string
++        //                                   renders as nothing).
++        //   STATE ... in='wk' out='wk'      BackendManager actually found the
++        //                                   two static plugins. If it had
++        //                                   not, VPiano::initialize() would
++        //                                   already have qFatal'd -- so this
++        //                                   line existing at all is half the
++        //                                   claim, and it names the backends
++        //                                   so a WRONG one cannot pass.
++        //   KEYBD x y w h                   the PianoKeybd's rect in SURFACE
++        //                                   coordinates, so the harness can
++        //                                   aim a genuine wasi:surface
++        //                                   pointer event at a real key.
++        //
++        // Repeating rather than one-shot, deliberately: the wk QPA forces the
++        // first top-level to the full surface a few frames in, so a rect read
++        // at singleShot(0) is the pre-resize geometry and aiming at it misses.
++        // The repeat doubles as the only evidence that QTimer deadlines
++        // survive being folded into the frame wait -- which is exactly the
++        // mechanism the wk MIDI input pump depends on.
++        if (qEnvironmentVariableIntValue("WK_VPIANO_SELFTEST") == 1) {
++            std::printf("platform=%s style=%s families=%lld\n",
++                        qPrintable(QApplication::platformName()),
++                        qPrintable(QApplication::style()->objectName()),
++                        (long long) QFontDatabase::families().size());
++            if (QScreen *s = QApplication::primaryScreen()) {
++                std::printf("screen=%dx%d\n", s->geometry().width(), s->geometry().height());
++            }
++            std::fflush(stdout);
++
++            QTimer *report = new QTimer(&w);
++            QObject::connect(report, &QTimer::timeout, [&w]() {
++                int tops = 0;
++                for (QWidget *tl : QApplication::topLevelWidgets()) {
++                    if (tl->isVisible()) {
++                        ++tops;
++                    }
++                }
++                // The static plugin instances directly, NOT a second
++                // BackendManager: constructing one calls refresh(), which
++                // rewrites the public name and the excluded-connection list
++                // on these very same singletons and overwrites
++                // BackendManagerPrivate::m_instance. A reporter must not have
++                // side effects on the thing it reports.
++                QString in, out;
++                const QObjectList statics = QPluginLoader::staticInstances();
++                for (QObject *obj : statics) {
++                    if (auto *i = qobject_cast<drumstick::rt::MIDIInput *>(obj)) {
++                        in = i->backendName();
++                    } else if (auto *o = qobject_cast<drumstick::rt::MIDIOutput *>(obj)) {
++                        out = o->backendName();
++                    }
++                }
++                std::printf("STATE tops=%d in='%s' out='%s'\n", tops,
++                            qPrintable(in), qPrintable(out));
++                if (QWidget *k = w.findChild<QWidget *>(QStringLiteral("pianokeybd"))) {
++                    const QRect r(k->mapToGlobal(QPoint(0, 0)), k->size());
++                    std::printf("KEYBD %d %d %d %d\n", r.x(), r.y(), r.width(), r.height());
++                }
++                std::fflush(stdout);
++            });
++            report->start(250);
++        }
++#endif
++
+         return app.exec();
+     } catch (...) {
+         qWarning() << QCoreApplication::translate("main", "Fatal error from a MIDI backend.");

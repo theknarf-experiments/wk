@@ -1,0 +1,185 @@
+WHAT: make drumstick-vpiano a wk node -- default to the `wk` QPA platform,
+      statically import the three plugins wasm cannot dlopen, link libqwk.a,
+      Qt6::FbSupportPrivate and BOTH component-type objects, compile a font in
+      as a Qt resource, and stop the NET_BACKEND arm from firing on a sysroot
+      that merely happens to contain QtNetwork.
+WHY:  five things a wasm32-wasip2 Qt node needs that a desktop build gets free:
+        * QT_QPA_PLATFORM. plugins/qt's qtbase was configured
+          QT_QPA_DEFAULT_PLATFORM=offscreen (it predates the wk QPA plugin), so
+          an unmodified app renders to nowhere and never opens a surface. Set
+          only when the environment does not already say, so
+          QT_QPA_PLATFORM=offscreen stays available for bisecting failures.
+        * Q_IMPORT_PLUGIN. No dlopen on wasm. Without QWkIntegrationPlugin,
+          QApplication aborts with "no Qt platform plugin could be initialized"
+          and an EMPTY plugin list -- it reads like a broken Qt, but it is an
+          unreferenced symbol. Upstream's own #if defined(XXX_BACKEND) block
+          already does exactly this for its five other static backends, so the
+          WK_BACKEND arm is that pattern with our two names in it; the QPA line
+          is the one addition, because the wk platform plugin is out of tree on
+          purpose and Qt's deployment glue therefore never writes it.
+        * the component-type objects must arrive as LINK OPTIONS. Each holds
+          only a `component-type` custom section that wasm-component-ld reads
+          to build the import list; nothing references them, so as archive
+          members they are dropped and the binary ends up with no wasi:surface
+          and no wk:midi import -- and wk then gives the node neither a surface
+          nor MIDI ports. TWO of them in one link is what this port had to
+          establish, and they merge into one world.
+        * fonts. Qt 6 ships none and a wk node has no host font dir; with none
+          the app runs, QFontDatabase is empty, and every string renders as
+          nothing at all -- including every note name on every key.
+        * NET_BACKEND. Upstream asks whether Qt6Network EXISTS, but
+          drumstick-rt-net-in/out are only DECLARED when USE_NETWORK was on. A
+          sysroot with a cross-built libQt6Network.a and USE_NETWORK=OFF -- 
+          which is exactly plugins/qt/sysroot -- therefore links two targets
+          that were never created. Keying off HAVE_NETWORK is the same test
+          library/rt-backends/CMakeLists.txt already uses.
+      Everything is guarded (`#if defined(WK_BACKEND)`, `if(WK_...)`,
+      `MATCHES "WASI"`), so a desktop build of this tree is unaffected.
+UPSTREAM: the NET_BACKEND hunk is as-is -- it is a real bug in their tree and
+      not wk-specific. The rest is as-is in spirit: it is the standard static-Qt
+      deployment shape, which upstream already performs for its own static
+      builds; it is wk-specific only in naming OUR platform plugin and OUR
+      backends.
+diff --git a/utils/vpiano/CMakeLists.txt b/utils/vpiano/CMakeLists.txt
+index 6f6fef3..7e0d796 100644
+--- a/utils/vpiano/CMakeLists.txt
++++ b/utils/vpiano/CMakeLists.txt
+@@ -31,7 +31,19 @@ if(APPLE)
+     set(EXTRA_LIBS ${CORELIBS})
+ endif()
+ 
++# --- wk node: fonts ---------------------------------------------------------
++# Qt 6 ships no fonts and a wk node has no host font directory to fall back on:
++# with none, the app runs, QFontDatabase is empty, and every string renders as
++# nothing at all -- including the note names on the keys, which is most of what
++# this app draws. build.sh stages one TTF and generates this .qrc beside it
++# (which font exists depends on the machine); the wk QPA's font database falls
++# back to :/fonts after looking at QT_QPA_FONTDIR and the usual VFS
++# directories, so a node that bind-mounts a real font directory can still
++# override it and never touch this copy. AUTORCC compiles it in.
++set(WK_FONTS_QRC "" CACHE FILEPATH "generated .qrc holding one staged TTF under :/fonts")
++
+ set(vpiano_SRCS
++    ${WK_FONTS_QRC}
+     connections.cpp
+     connections.h
+     connections.ui
+@@ -154,8 +166,16 @@ if(STATIC_DRUMSTICK)
+             winmm)
+     endif()
+ 
+-    find_package(Qt${QT_VERSION_MAJOR}Network)
+-    if(Qt${QT_VERSION_MAJOR}Network_FOUND)
++    # HAVE_NETWORK, not a fresh find_package. Upstream asks Qt6Network whether
++    # it EXISTS, but drumstick-rt-net-in/out are only built when USE_NETWORK
++    # was on (library/rt-backends/CMakeLists.txt gates them on HAVE_NETWORK) --
++    # so on a tree where QtNetwork happens to be installed but the backend was
++    # switched off, this links two targets that were never declared. That is
++    # not hypothetical here: plugins/qt/sysroot has grown a cross-built
++    # libQt6Network.a, and this build needs USE_NETWORK=OFF because the net
++    # backend is QUdpSocket-based and would want socket notifiers on a
++    # multicast socket.
++    if(HAVE_NETWORK)
+         target_compile_definitions(drumstick-vpiano PUBLIC NET_BACKEND)
+         target_link_libraries(drumstick-vpiano PRIVATE
+             drumstick-rt-net-in
+@@ -166,7 +186,60 @@ if(STATIC_DRUMSTICK)
+         target_compile_definitions(drumstick-vpiano PUBLIC FLUIDSYNTH_BACKEND)
+         target_link_libraries(drumstick-vpiano PRIVATE drumstick-rt-fluidsynth)
+     endif()
++
++    # The wk backends: this node's one MIDI inbox and outbox. See
++    # library/rt-backends/wk-in and wk-out; WK_BACKEND is what turns on the
++    # matching Q_IMPORT_PLUGIN pair in vpianomain.cpp.
++    # STREQUAL, for the reason spelled out in
++    # library/rt-backends/CMakeLists.txt: `if(${CMAKE_SYSTEM_NAME} MATCHES
++    # "WASI")` is silently FALSE, because Platform/WASI.cmake defines a
++    # variable named WASI and MATCHES dereferences its unquoted operand.
++    if(CMAKE_SYSTEM_NAME STREQUAL "WASI")
++        target_compile_definitions(drumstick-vpiano PUBLIC WK_BACKEND)
++        target_link_libraries(drumstick-vpiano PRIVATE
++            drumstick-rt-wk-in
++            drumstick-rt-wk-out)
++    endif()
++endif()
++
++# --- wk node: the platform plugin and the component's imports ---------------
++# There is no dlopen on wasm, so every Qt plugin is an ARCHIVE linked into the
++# binary and named once with Q_IMPORT_PLUGIN (see vpianomain.cpp).
++#
++#   WK_QPA_LIB               plugins/qt/sysroot/lib/libqwk.a -- the wk QPA
++#                            plugin. It also carries the gfx-compat shim
++#                            objects (wkgfx.c plus its wit-bindgen output) and,
++#                            on a recent enough build, the clipboard bridge, so
++#                            the app needs no wasi-gfx code of its own.
++#   WK_COMPONENT_TYPE_OBJS   the *_component_type.o objects, in a ;-list:
++#                            wkgfx (always), wkmidi (always), wkclipboard (only
++#                            when this libqwk.a references it -- build.sh
++#                            probes the archive rather than guessing).
++#
++# Those objects arrive as LINK OPTIONS and never as libraries. Each carries
++# only a `component-type` custom section that wasm-component-ld reads to build
++# the component's import list; nothing references them, so as archive members
++# the linker drops them and the result is a component with no wasi:surface and
++# no wk:midi import at all -- which wk then refuses to give either a surface or
++# MIDI ports. SEVERAL of them in one link is the thing this port needed to
++# establish, and they MERGE: the component ends up importing wasi:surface and
++# wk:midi/midi together.
++set(WK_QPA_LIB "" CACHE FILEPATH "libqwk.a, the wk QPA plugin (plugins/qt/build-qpa.sh)")
++set(WK_COMPONENT_TYPE_OBJS "" CACHE STRING "wit-bindgen *_component_type.o objects to link")
++if(WK_QPA_LIB)
++    # FbSupportPrivate is not optional and not obvious: the wk QPA plugin IS
++    # fbconvenience -- QWkScreen derives from QFbScreen, QWkWindow from
++    # QFbWindow, QWkBackingStore from QFbBackingStore -- and that is where the
++    # guest-side compositing of N top-level windows into one surface lives.
++    # Without it the link fails with a page of "undefined symbol:
++    # QFbScreen::..." from inside libqwk.a. It is an INTERNAL_MODULE, so it is
++    # its own package rather than a component of Qt6Gui.
++    find_package(Qt6 6.8 REQUIRED COMPONENTS FbSupportPrivate)
++    target_link_libraries(drumstick-vpiano PRIVATE "${WK_QPA_LIB}" Qt6::FbSupportPrivate)
+ endif()
++foreach(obj IN LISTS WK_COMPONENT_TYPE_OBJS)
++    target_link_options(drumstick-vpiano PRIVATE "${obj}")
++endforeach()
+ 
+ install(TARGETS drumstick-vpiano
+         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+diff --git a/utils/vpiano/vpianomain.cpp b/utils/vpiano/vpianomain.cpp
+index c4194e7..4efba88 100644
+--- a/utils/vpiano/vpianomain.cpp
++++ b/utils/vpiano/vpianomain.cpp
+@@ -68,8 +68,34 @@ Q_IMPORT_PLUGIN(OSSInput)
+ Q_IMPORT_PLUGIN(OSSOutput)
+ #endif
+ 
++#if defined(WK_BACKEND)
++// This node's MIDI inbox and outbox (library/rt-backends/wk-in, wk-out), and
++// the platform plugin it draws through. The QPA one is not part of upstream's
++// pattern above because Qt's own deployment glue writes it for you -- but the
++// wk QPA is deliberately OUT OF TREE (plugins/qt/qpa), so nothing generates
++// it and it has to be named here. Without the line QApplication aborts with
++// "no Qt platform plugin could be initialized" and an EMPTY plugin list, which
++// reads like a broken Qt and is actually an unreferenced symbol.
++#include <QtPlugin>
++Q_IMPORT_PLUGIN(WkMIDIInput)
++Q_IMPORT_PLUGIN(WkMIDIOutput)
++Q_IMPORT_PLUGIN(QWkIntegrationPlugin)
++#endif
++
+ int main(int argc, char *argv[])
+ {
++#if defined(WK_BACKEND)
++    // plugins/qt's qtbase was configured QT_QPA_DEFAULT_PLATFORM=offscreen --
++    // it predates the wk QPA plugin -- so without this the app comes up on a
++    // platform that renders to nowhere and never opens a wk surface. An
++    // explicit QT_QPA_PLATFORM in the node's environment still wins, which is
++    // what makes `QT_QPA_PLATFORM=offscreen` usable for separating "Qt is
++    // broken" from "the wk QPA is broken".
++    if (!qEnvironmentVariableIsSet("QT_QPA_PLATFORM")) {
++        qputenv("QT_QPA_PLATFORM", "wk");
++    }
++#endif
++
+     QApplication app(argc, argv);
+     QCoreApplication::setOrganizationName("drumstick.sourceforge.net");
+     QCoreApplication::setOrganizationDomain("drumstick.sourceforge.net");

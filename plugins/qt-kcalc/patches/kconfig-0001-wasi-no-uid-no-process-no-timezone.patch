@@ -1,0 +1,186 @@
+WHAT: give KConfig a WASI path in four places -- getuid(), two QProcess
+      helper launches, QDateTime timezone round-tripping -- and skip the
+      kconf_update / kreadconfig standalone executables.
+WHY:  KConfig is where the whole KDE settings story lives, so every one of
+      these had to be answered rather than dodged:
+        * kconfiginibackendreader_p.h:239 "no member named getuid in the global
+          namespace; did you mean getpid?". wasi-libc has no getuid because a
+          WASI component has no user identity -- there is exactly one principal
+          inside a wk node and everything in its vfs belongs to it. Upstream is
+          asking "does this file belong to me, or am I writing into someone
+          else s?", and here the answer is unconditionally "mine", so the WASI
+          branch takes the owned-by-user consequence: preserve the existing
+          file s permissions.
+        * kconfig.cpp:29 `#include <QProcess>` (FEATURE_process=OFF). Two uses,
+          both "shell out to a helper binary": kconf_update --check to migrate
+          stale config files, and kdialog --msgbox to tell the user their
+          config is read-only. reparseConfiguration() still runs in the first
+          case, and upstream already treats a missing kdialog as "warn
+          nowhere", so the second is a path a stock desktop takes too. A wk
+          node config starts empty in its own vfs, so there is nothing for
+          kconf_update to migrate anyway.
+        * kconfiggroup.cpp:360 and :1009 -- QTimeZone(QByteArray) and
+          QDateTime::timeZone(), gone with FEATURE_timezone=OFF. Consequence:
+          a QDateTime entry round-trips WITHOUT its zone, i.e. as local time.
+          Config files written by this build and read by a desktop KDE would
+          lose the zone field. Worth knowing, harmless for a self-contained
+          node with no zone database in the first place.
+        * src/CMakeLists.txt -- kconf_update, kreadconfig and kwriteconfig are
+          standalone executables that only make sense on the machine whose
+          config is being migrated or inspected. Cross-built to wasm they are
+          components nobody can invoke, and kconf_update.cpp:16 fails on
+          QProcess regardless.
+UPSTREAM: the QProcess and QTimeZone hunks are as-is (both are real Qt feature
+      switches with sensible fallbacks already in the file). The getuid hunk is
+      not-as-is -- upstream would want a HAVE_GETUID configure check next to
+      the existing Q_OS_WIN one.
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index ab5ddc8..38bee2f 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -6,8 +6,16 @@ if(KCONFIG_USE_QML)
+     add_subdirectory(qml)
+ endif()
+ add_subdirectory(kconfig_compiler)
+-add_subdirectory(kconf_update)
+-add_subdirectory(kreadconfig)
++# kconf_update, kreadconfig and kwriteconfig are standalone EXECUTABLES that
++# only make sense on the machine whose config is being migrated or inspected.
++# Cross-built for wasm32-wasip2 they would be three more components nobody can
++# invoke -- a wk node runs one program. kconf_update.cpp:16 also fails outright
++# on `#include <QProcess>` (FEATURE_process=OFF). Skipping the directories is
++# the honest version of "these are not part of this port".
++if(NOT CMAKE_SYSTEM_NAME STREQUAL "WASI")
++    add_subdirectory(kconf_update)
++    add_subdirectory(kreadconfig)
++endif()
+ 
+ ecm_qt_install_logging_categories(
+     EXPORT KCONFIG
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index aebaa47..439f2f3 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -50,10 +50,19 @@ ecm_generate_export_header(KF6ConfigCore
+     EXCLUDE_DEPRECATED_BEFORE_AND_AT ${EXCLUDE_DEPRECATED_BEFORE_AND_AT}
+ )
+ 
+-target_compile_definitions(KF6ConfigCore
+-    PRIVATE
+-        KCONF_UPDATE_INSTALL_LOCATION="${KDE_INSTALL_FULL_LIBEXECDIR_KF}/$<TARGET_FILE_NAME:KF6::kconf_update>"
+-)
++# The generator expression needs the KF6::kconf_update TARGET to exist, and
++# src/CMakeLists.txt does not add that directory on WASI (see the comment
++# there). The macro is only read by the QProcess call in KConfig::checkUpdate,
++# which is itself #if QT_CONFIG(process) -- so on this platform it names a
++# binary that can neither be built nor run, and the honest value is nothing.
++if(CMAKE_SYSTEM_NAME STREQUAL "WASI")
++    target_compile_definitions(KF6ConfigCore PRIVATE KCONF_UPDATE_INSTALL_LOCATION="")
++else()
++    target_compile_definitions(KF6ConfigCore
++        PRIVATE
++            KCONF_UPDATE_INSTALL_LOCATION="${KDE_INSTALL_FULL_LIBEXECDIR_KF}/$<TARGET_FILE_NAME:KF6::kconf_update>"
++    )
++endif()
+ 
+ target_include_directories(KF6ConfigCore
+     INTERFACE "$<INSTALL_INTERFACE:${KDE_INSTALL_INCLUDEDIR_KF}/KConfig;${KDE_INSTALL_INCLUDEDIR_KF}/KConfigCore>"
+diff --git a/src/core/kconfig.cpp b/src/core/kconfig.cpp
+index 3d4902a..2e05c4f 100644
+--- a/src/core/kconfig.cpp
++++ b/src/core/kconfig.cpp
+@@ -26,7 +26,9 @@
+ #include <QFile>
+ #include <QLocale>
+ #include <QMutexLocker>
++#if QT_CONFIG(process)
+ #include <QProcess>
++#endif
+ #include <QSet>
+ #include <QThreadStorage>
+ #include <QTimeZone>
+@@ -557,7 +559,17 @@ void KConfig::checkUpdate(const QString &id, const QString &updateFile)
+     const QString cfg_id = updateFile + QLatin1Char(':') + id;
+     const QStringList ids = cg.readEntry("update_info", QStringList());
+     if (!ids.contains(cfg_id)) {
++#if QT_CONFIG(process)
+         QProcess::execute(QStringLiteral(KCONF_UPDATE_INSTALL_LOCATION), QStringList{QStringLiteral("--check"), updateFile});
++#else
++        // FEATURE_process=OFF: no fork/exec across a WASI component boundary,
++        // so kconf_update -- a separate BINARY that migrates old config files
++        // in place -- cannot be run. reparseConfiguration() still happens, so
++        // an already-current config is read normally; only the migration of a
++        // stale one is skipped. A wk node's config lives in its own vfs and
++        // starts empty, so there is nothing there to migrate.
++        qCDebug(KCONFIG_CORE_LOG) << "kconf_update cannot be run on this platform (no QProcess); skipping" << updateFile;
++#endif
+         reparseConfiguration();
+     }
+ }
+@@ -991,10 +1003,17 @@ bool KConfig::isConfigWritable(bool warnUser)
+ 
+         // Note: We don't ask the user if we should not ask this question again because we can't save the answer.
+         errorMsg += QCoreApplication::translate("KConfig", "Please contact your system administrator.");
++#if QT_CONFIG(process)
+         QString cmdToExec = QStandardPaths::findExecutable(QStringLiteral("kdialog"));
+         if (!cmdToExec.isEmpty()) {
+             QProcess::execute(cmdToExec, QStringList{QStringLiteral("--title"), QCoreApplication::applicationName(), QStringLiteral("--msgbox"), errorMsg});
+         }
++#else
++        // Same reason: shelling out to `kdialog` is not available. Upstream
++        // already treats a missing kdialog as "warn nowhere", so this is the
++        // path a desktop without kdialog installed takes too.
++        qCWarning(KCONFIG_CORE_LOG) << errorMsg;
++#endif
+     }
+ 
+     d->configState = allWritable ? ReadWrite : ReadOnly; // update the read/write status
+diff --git a/src/core/kconfiggroup.cpp b/src/core/kconfiggroup.cpp
+index 3c330c7..1e588fa 100644
+--- a/src/core/kconfiggroup.cpp
++++ b/src/core/kconfiggroup.cpp
+@@ -355,10 +355,12 @@ QVariant KConfigGroup::convertToQVariant(const char *pKey, const QByteArray &val
+         const QTime time(list.at(3), list.at(4), seconds, milliseconds);
+ 
+         QDateTime dt(date, time);
++#if QT_CONFIG(timezone)
+         if (list.count() == 7) { // Then the timezone, which was added later
+             const auto id = value.mid(value.lastIndexOf(',') + 1);
+             dt.setTimeZone(QTimeZone(id));
+         }
++#endif
+         if (!dt.isValid()) {
+             qCWarning(KCONFIG_CORE_LOG) << errString(pKey, value, aDefault);
+             return aDefault;
+@@ -1005,9 +1007,11 @@ void KConfigGroup::writeEntry(const char *key, const QVariant &value, WriteConfi
+             time.minute(),
+             time.second() + time.msec() / 1000.0,
+         };
++#if QT_CONFIG(timezone)
+         if (rDateTime.timeRepresentation().timeSpec() != Qt::LocalTime) {
+             list.append(rDateTime.timeZone().id());
+         }
++#endif
+ 
+         writeEntry(key, list, flags);
+         return;
+diff --git a/src/core/kconfiginibackendreader_p.h b/src/core/kconfiginibackendreader_p.h
+index cf70b83..ac626cd 100644
+--- a/src/core/kconfiginibackendreader_p.h
++++ b/src/core/kconfiginibackendreader_p.h
+@@ -235,6 +235,15 @@ public:
+ #ifdef Q_OS_WIN
+             // TODO: getuid does not exist on windows, use GetSecurityInfo and GetTokenInformation instead
+             createNew = false;
++#elif defined(Q_OS_WASI)
++            // wasi-libc has no getuid() ("no member named 'getuid' in the
++            // global namespace; did you mean 'getpid'?"), because a WASI
++            // component has no user identity at all -- there is exactly one
++            // principal inside a wk node and everything in its vfs belongs to
++            // it. So the "is this file mine?" test is unconditionally yes, and
++            // the behaviour that follows from yes is: preserve the existing
++            // file's permissions.
++            fileMode = fi.permissions();
+ #else
+             if (fi.ownerId() == ::getuid()) {
+                 // Preserve file mode if file exists and is owned by user.

@@ -1,0 +1,209 @@
+WHAT: make Qt6::PrintSupport optional in KXmlGui (guarding the one file that
+      uses it), and skip the KSandbox packaging-format lookup on WASI.
+WHY:  two blockers, and the first is the reason KXmlGui was the highest-risk
+      framework in this port.
+      1. CMakeLists.txt:46 `find_package(Qt6 ... REQUIRED Widgets Xml Network
+         PrintSupport)`. Unlike Svg -- a separate repo that a port-local
+         sysroot overlay can supply, which is how qt-torrentfileeditor103 gets
+         Core5Compat -- PrintSupport lives INSIDE qtbase. So the overlay rule
+         does not save you: a port cannot add it without rebuilding the shared
+         qtbase that every other Qt node in wk depends on. wk qtbase is
+         FEATURE_printsupport=OFF because a wk node paints into one RGBA8
+         surface and has no printer, no CUPS and no PDF spooler behind it.
+         Exactly ONE file uses it: kshortcutseditor.cpp printShortcuts(), the
+         "print this shortcut list" button, whose entire body already sits
+         inside an `#ifndef _WIN32_WCE` because "one can t print on wince".
+         The guard is widened to include HAVE_PRINTSUPPORT and the function
+         becomes a no-op on this platform. Everything else in KShortcutsEditor
+         -- editing, conflict detection, shortcut schemes -- is untouched.
+         NOTE that Qt6::Network stays REQUIRED and resolves: plugins/qt built
+         QtNetwork over wk smoltcp fabric, so that half of the original
+         blocker has already been removed elsewhere.
+      2. systeminformation_p.h:18 `#include <pwd.h>`, reached from
+         kbugreport.cpp. wasi-libc has no account database, so getpwuid/getuid
+         do not exist. It pre-fills the "From" field of the bug-report dialog;
+         the WASI branch returns the same "Unknown User" placeholder the
+         Windows branch already falls back to. Qt defines Q_OS_UNIX on this
+         platform, which is what steers the header into its POSIX arm.
+      3. kabstractaboutdialog_p.cpp:22 `#include <KSandbox>`. KCoreAddons does
+         not build KSandbox on WASI (see kcoreaddons-0001) because ksandbox.h:7
+         includes <QProcess>. KSandbox asks "am I inside a Flatpak or a Snap?";
+         a wk node IS a sandbox, and a stricter one than either, but it is
+         neither of those two -- so "no" is the correct answer and the
+         packaging-format line is simply absent from the About dialog.
+         Upstream has the same latent breakage on iOS, where KCoreAddons
+         already excludes KSandbox for the same QProcess reason.
+UPSTREAM: as-is for both. PrintSupport being optional is a plain portability
+      improvement (Qt for embedded configurations routinely lack it), and the
+      KSandbox include is an unguarded use of a KCoreAddons class that
+      KCoreAddons own CMakeLists declines to build on two platforms.
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9a3827e..0f5c5d9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -43,7 +43,19 @@ add_feature_info(DESIGNERPLUGIN ${BUILD_DESIGNERPLUGIN} "Build plugin for Qt Des
+ 
+ # Dependencies
+ set(REQUIRED_QT_VERSION 6.8.0)
+-find_package(Qt6 ${REQUIRED_QT_VERSION} CONFIG REQUIRED Widgets Xml Network PrintSupport)
++# PrintSupport is OPTIONAL here, and it has to be: unlike Svg (a separate
++# repo, layerable into a port-local prefix) PrintSupport lives INSIDE qtbase,
++# so a Qt port that did not build it cannot gain it without rebuilding the
++# shared qtbase every other Qt node in wk depends on. wk's qtbase is
++# FEATURE_printsupport=OFF -- a wk node paints into one RGBA8 surface and has
++# no printer, no CUPS and no PDF spooler to reach.
++# Network IS present (plugins/qt built QtNetwork over wk's smoltcp fabric), so
++# it stays REQUIRED.
++# Exactly one file uses PrintSupport: kshortcutseditor.cpp's
++# printShortcuts(), the "print this shortcut list" button. See the guard there.
++find_package(Qt6 ${REQUIRED_QT_VERSION} CONFIG REQUIRED Widgets Xml Network)
++find_package(Qt6 ${REQUIRED_QT_VERSION} CONFIG QUIET OPTIONAL_COMPONENTS PrintSupport)
++set(HAVE_PRINTSUPPORT ${Qt6PrintSupport_FOUND})
+ if(Qt6Core_VERSION VERSION_GREATER_EQUAL "6.9.0")
+     find_package(Qt6 ${REQUIRED_QT_VERSION} CONFIG REQUIRED CorePrivate)
+ endif()
+diff --git a/KF6XmlGuiConfig.cmake.in b/KF6XmlGuiConfig.cmake.in
+index 887c0c9..06c3f52 100644
+--- a/KF6XmlGuiConfig.cmake.in
++++ b/KF6XmlGuiConfig.cmake.in
+@@ -13,7 +13,15 @@ find_dependency(KF6GuiAddons "@KF_DEP_VERSION@")
+ 
+ if (NOT @BUILD_SHARED_LIBS@) 
+     find_dependency(Qt6Network "@REQUIRED_QT_VERSION@")
+-    find_dependency(Qt6PrintSupport "@REQUIRED_QT_VERSION@")
++    # Only when this build actually had it -- see the PrintSupport note in
++    # CMakeLists.txt. A static KF6XmlGui records its private link dependencies
++    # here, and an unconditional find_dependency() makes every DOWNSTREAM
++    # find_package(KF6 COMPONENTS XmlGui) fail with "KF6XmlGui could not be
++    # found because dependency Qt6PrintSupport could not be found" -- naming
++    # the framework, not the missing Qt module.
++    if (@HAVE_PRINTSUPPORT@)
++        find_dependency(Qt6PrintSupport "@REQUIRED_QT_VERSION@")
++    endif()
+ 
+     if (@KF6GlobalAccel_FOUND@)
+         find_dependency(KF6GlobalAccel "@KF_DEP_VERSION@")
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 6ca25e1..657533c 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -101,7 +101,6 @@ PUBLIC
+     KF6::GuiAddons      #KKeySequenceWidget
+ PRIVATE
+     Qt6::Network        #QNetworkAccessManager in kaboutapplicationpersonmodel_p
+-    Qt6::PrintSupport   #QPrinter in kshortcutseditor
+     Qt6::CorePrivate    #QSystemLocale in initializeLanguages
+     KF6::CoreAddons     #KAboutData
+     KF6::WidgetsAddons  #KToggleAction
+@@ -110,6 +109,9 @@ PRIVATE
+     KF6::IconThemes         #KIconLoader and KIconThemes in KToolBar
+     KF6::IconWidgets        #KIconDialog
+ )
++if (HAVE_PRINTSUPPORT)
++  target_link_libraries(KF6XmlGui PRIVATE Qt6::PrintSupport) #QPrinter in kshortcutseditor
++endif()
+ if (HAVE_QTDBUS)
+   target_link_libraries(KF6XmlGui PUBLIC Qt6::DBus) #QDBus connect to signal in KToolBar
+ endif()
+diff --git a/src/config-xmlgui.h.cmake b/src/config-xmlgui.h.cmake
+index 1e16424..6a6f564 100644
+--- a/src/config-xmlgui.h.cmake
++++ b/src/config-xmlgui.h.cmake
+@@ -1,2 +1,5 @@
+ /* KF6GlobalAccel available */
+ #cmakedefine01 HAVE_GLOBALACCEL
++
++/* Qt6::PrintSupport available (it lives inside qtbase and may be off) */
++#cmakedefine01 HAVE_PRINTSUPPORT
+diff --git a/src/kabstractaboutdialog_p.cpp b/src/kabstractaboutdialog_p.cpp
+index fc59845..7560e98 100644
+--- a/src/kabstractaboutdialog_p.cpp
++++ b/src/kabstractaboutdialog_p.cpp
+@@ -19,7 +19,15 @@
+ // KF
+ #include <KAdjustingScrollArea>
+ #include <KLocalizedString>
++// KSandbox answers "am I inside a Flatpak or a Snap?". KCoreAddons does not
++// build it on WASI (or on iOS) because ksandbox.h:7 includes <QProcess> and
++// FEATURE_process=OFF -- so the header is not installed and this include
++// fails. A wk node IS a sandbox, a stricter one than either, but it is
++// neither of the two this asks about, so "no" is the correct answer and the
++// packaging line is simply absent from the About dialog.
++#ifndef Q_OS_WASI
+ #include <KSandbox>
++#endif
+ #include <KSeparator>
+ #include <KTitleWidget>
+ // Qt
+@@ -132,12 +140,14 @@ QWidget *KAbstractAboutDialogPrivate::createComponentWidget(const QList<KAboutCo
+                                          KAboutLicense::LGPL_V3));
+ 
+     QString packageText;
++#ifndef Q_OS_WASI
+     if (KSandbox::isFlatpak()) {
+         packageText = i18nc("Linux packaging format", "Flatpak");
+     }
+     if (KSandbox::isSnap()) {
+         packageText = i18nc("Linux packaging format", "Snap");
+     }
++#endif
+     if (qEnvironmentVariableIsSet("APPIMAGE")) {
+         packageText = i18nc("Linux packaging format", "AppImage");
+     }
+diff --git a/src/kshortcutseditor.cpp b/src/kshortcutseditor.cpp
+index 82e7f77..d468eae 100644
+--- a/src/kshortcutseditor.cpp
++++ b/src/kshortcutseditor.cpp
+@@ -24,8 +24,10 @@
+ #include <QHeaderView>
+ #include <QList>
+ #include <QObject>
++#if HAVE_PRINTSUPPORT
+ #include <QPrintDialog>
+ #include <QPrinter>
++#endif
+ #include <QTextCursor>
+ #include <QTextDocument>
+ #include <QTextTable>
+@@ -506,8 +508,15 @@ more important things):
+ */
+ void KShortcutsEditorPrivate::printShortcuts() const
+ {
+-// One can't print on wince
+-#ifndef _WIN32_WCE
++// One can't print on wince -- nor on a platform whose Qt has no PrintSupport
++// module at all. wk's qtbase is FEATURE_printsupport=OFF: a wk node paints
++// into one RGBA8 surface and has no printer, no CUPS and no PDF spooler
++// behind it. The whole body below builds a QTextDocument and hands it to a
++// QPrintDialog, so with no PrintSupport there is nothing to salvage --
++// printShortcuts() becomes a no-op, exactly as it already is on WinCE.
++// (Everything else in KShortcutsEditor -- editing, conflict detection,
++// shortcut schemes -- is unaffected; this is one button in one dialog.)
++#if !defined(_WIN32_WCE) && HAVE_PRINTSUPPORT
+     QTreeWidgetItem *root = ui.list->invisibleRootItem();
+     QTextDocument doc;
+ 
+diff --git a/src/systeminformation_p.h b/src/systeminformation_p.h
+index 5197861..32ebfa2 100644
+--- a/src/systeminformation_p.h
++++ b/src/systeminformation_p.h
+@@ -14,7 +14,18 @@ namespace SystemInformation
+ QString userName();
+ }
+ 
+-#if !defined(Q_OS_WIN)
++#if defined(Q_OS_WASI)
++// wasi-libc has no <pwd.h>: a WASI component has no account database and no
++// user identity to look up in one. This is used to pre-fill the "From" field
++// of KBugReport, so the honest value is a placeholder -- the same shape as the
++// Windows branch's "Unknown User" fallback below. (Qt defines Q_OS_UNIX on
++// this platform, which is what steers the file into the POSIX branch.)
++inline QString SystemInformation::userName()
++{
++    return QStringLiteral("Unknown User");
++}
++
++#elif !defined(Q_OS_WIN)
+ #include <pwd.h>
+ #include <sys/utsname.h>
+ #include <unistd.h>

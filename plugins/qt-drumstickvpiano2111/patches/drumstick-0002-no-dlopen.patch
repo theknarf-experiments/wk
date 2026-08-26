@@ -1,0 +1,110 @@
+WHAT: guard everything in BackendManager that loads a plugin from disk with
+      `#if QT_CONFIG(library)` -- the unload loop, the loader-dedup helper,
+      QCoreApplication::libraryPaths(), and the whole dynamic-discovery loop in
+      refresh(). Static plugins are untouched.
+WHY:  drumstick does not build against a Qt configured without library/plugin
+      loading, and that is not an exotic configuration -- it is what every
+      platform with no dlopen gets, wasm included. In such a Qt, QPluginLoader
+      keeps only its static half: `staticInstances()` is there, but
+      `instance()`, `fileName()`, `unload()`, the QString constructor,
+      QLibrary and QCoreApplication::libraryPaths() are all compiled out.
+      Six hard errors in one file, and the last one is the confusing kind:
+      because the lambda body fails to compile, its return type deduces to
+      void and the failure is reported inside libc++'s __invoke rather than at
+      drumstick's own `loader->fileName()`.
+      Nothing is lost that this build could have had. A plugin loaded at
+      runtime from a shared object is precisely what a component cannot do; the
+      static path immediately below the guarded loop is the one that runs, and
+      it is how the wk backends (and every other STATIC_DRUMSTICK backend) are
+      found.
+UPSTREAM: as-is. This fixes a real portability bug in their tree -- a Qt built
+      with -no-feature-library is a supported Qt on any platform, and the guard
+      is the idiom Qt itself uses. It is not wk-specific in any way: no
+      Q_OS_WASI, no wk anything. Their own static Windows and macOS builds
+      would benefit from it the moment someone turns the feature off.
+diff --git a/library/rt/backendmanager.cpp b/library/rt/backendmanager.cpp
+index df5fa1e..0bcb4ea 100644
+--- a/library/rt/backendmanager.cpp
++++ b/library/rt/backendmanager.cpp
+@@ -23,6 +23,14 @@
+ #include <QtGlobal>
+ #include <drumstick/backendmanager.h>
+ 
++// Qt can be configured WITHOUT library/plugin loading (QT_FEATURE_library
++// off), which is not exotic -- it is what every platform with no dlopen gets,
++// wasm included. In that build QPluginLoader keeps only its STATIC half:
++// staticInstances() is there, but instance(), fileName(), unload(), the
++// QString constructor, QLibrary and QCoreApplication::libraryPaths() are all
++// gone. Everything below that touches them is guarded; static plugins, which
++// are the only kind such a build can have, keep working untouched.
++
+ /**
+  * @file backendmanager.cpp
+  * Implementation of a class managing realtime MIDI input/output backends
+@@ -76,12 +84,14 @@ namespace drumstick { namespace rt {
+         {
+             // qDebug() << Q_FUNC_INFO << "loaders:" << m_loaders.count()
+             //          << "inputs:" << m_inputsList.count() << "outputs:" << m_outputsList.count();
++#if QT_CONFIG(library)
+             while (!m_loaders.empty()) {
+                 QPluginLoader* pluginLoader = m_loaders.takeFirst();
+                 //qDebug() << "unloading:" << pluginLoader->fileName();
+                 pluginLoader->unload();
+                 delete pluginLoader;
+             }
++#endif
+             m_inputsList.clear();
+             m_outputsList.clear();
+             m_loaders.clear();
+@@ -98,12 +108,21 @@ namespace drumstick { namespace rt {
+ 
+         bool isLoaderNeeded(const QString &fileName)
+         {
++#if QT_CONFIG(library)
+             auto it = std::find_if(m_loaders.constBegin(),
+                                    m_loaders.constEnd(),
+                                    [=](QPluginLoader *loader) {
+                                        return loader->fileName() == fileName;
+                                    });
+             return it == m_loaders.constEnd();
++#else
++            // Unreachable: its only caller is the dynamic-discovery loop in
++            // refresh(), which is compiled out too. Answering "no loader
++            // needed" is the safe direction anyway -- a loader that cannot be
++            // created must never be reported as wanted.
++            Q_UNUSED(fileName)
++            return false;
++#endif
+         }
+     };
+ 
+@@ -171,9 +190,11 @@ namespace drumstick { namespace rt {
+ #else
+         d->appendDir( QLibraryInfo::path(QLibraryInfo::PluginsPath) + QDir::separator() + QSTR_DRUMSTICK, result );
+ #endif
++#if QT_CONFIG(library)
+         foreach(const QString& path, QCoreApplication::libraryPaths()) {
+             d->appendDir( path + QDir::separator() + QSTR_DRUMSTICK, result );
+         }
++#endif
+         return result;
+     }
+ 
+@@ -218,6 +239,7 @@ namespace drumstick { namespace rt {
+         //qDebug() << Q_FUNC_INFO << "names:" << names << "paths:" << paths;
+ 
+         // Dynamic backends
++#if QT_CONFIG(library)
+         foreach(const QString& dir, paths) {
+             QDir pluginsDir(dir);
+             foreach (QString fileName, pluginsDir.entryList(QDir::Files)) {
+@@ -251,6 +273,9 @@ namespace drumstick { namespace rt {
+                 }
+             }
+         }
++#else
++        Q_UNUSED(paths)
++#endif
+ 
+         // Static backends
+         foreach(QObject* obj, QPluginLoader::staticInstances()) {

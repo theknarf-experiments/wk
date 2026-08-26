@@ -1,0 +1,28 @@
+WHAT: put knumber `add_subdirectory(tests)` behind if(BUILD_TESTING).
+WHY:  knumber/CMakeLists.txt adds its tests unconditionally -- unlike kcalc own
+      autotests/ and appiumtests/, which the top-level CMakeLists correctly
+      guards -- and knumber/tests/CMakeLists.txt:8 does
+      find_package(Qt6Test REQUIRED). wk qtbase is FEATURE_testlib=OFF, so
+      merely ADDING the directory is a hard configure failure even with
+      -DBUILD_TESTING=OFF passed. Nothing in the knumber library itself needs
+      Qt6::Test.
+UPSTREAM: as-is. This is a plain inconsistency in their tree: every other test
+      directory in this project is already guarded.
+diff --git a/knumber/CMakeLists.txt b/knumber/CMakeLists.txt
+index d63406d..31a3d31 100644
+--- a/knumber/CMakeLists.txt
++++ b/knumber/CMakeLists.txt
+@@ -54,4 +54,12 @@ target_include_directories(knumber PUBLIC ${CMAKE_BINARY_DIR} ${GMP_INCLUDE_DIR}
+ 
+ target_link_libraries(knumber PUBLIC Qt6::Core PRIVATE ${GMP_LIBRARIES} ${MPFR_LIBRARIES} ${MPC_LIBRARIES})
+ 
+-add_subdirectory( tests ) 
++# knumber's tests are added UNCONDITIONALLY -- not inside the `if(BUILD_TESTING)`
++# that guards kcalc's own autotests/ and appiumtests/ -- and
++# knumber/tests/CMakeLists.txt:8 does find_package(Qt6Test REQUIRED). wk's
++# qtbase is FEATURE_testlib=OFF (plugins/qt/build-qtbase.sh), so merely
++# ADDING the directory is a hard configure failure even with
++# -DBUILD_TESTING=OFF. Nothing in the knumber LIBRARY needs Qt6::Test.
++if(BUILD_TESTING)
++    add_subdirectory( tests )
++endif()

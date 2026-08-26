@@ -1,0 +1,188 @@
+WHAT: give KCoreAddons a WASI branch in the four places it reaches for a POSIX
+      facility wasi-libc does not have -- statfs/statvfs, socketpair,
+      struct rlimit, and QProcess.
+WHY:  four separate compile failures, none of them related except in cause:
+        * io/kfilesystemtype.cpp:243 "use of undeclared identifier
+          determineFileSystemTypeImpl". Misleading: the function is not
+          missing, it was never DEFINED. The non-Windows half of this file is a
+          chain of #if Q_OS_BSD4 / #elif Q_OS_LINUX / #elif Q_OS_AIX... with NO
+          trailing #else -- the #else near the bottom belongs to the
+          #ifndef Q_OS_WIN at the top -- so an unrecognised UNIX silently
+          defines nothing and only the call site complains.
+        * util/ksignalhandler.cpp:39 "no member named socketpair in the global
+          namespace". wasi-libc hides socketpair behind
+          __wasilibc_unmodified_upstream. The whole class is the self-pipe
+          trick, and wasip2 has no asynchronous signals to feed it anyway
+          (-D_WASI_EMULATED_SIGNAL is stubs), so it degrades exactly as it
+          already does on Windows: constructing one works and it never emits.
+        * caching/ksdcmapping_p.h:194 "variable has incomplete type struct
+          rlimit" / "use of undeclared identifier RLIMIT_MEMLOCK". wasi-libc
+          ships a sys/resource.h with rusage and getrusage but no rlimit at
+          all. The block is a best-effort mlock() budget used to prove the
+          mapping is readable; skipping it loses a diagnostic, not the cache.
+        * src/lib/CMakeLists.txt: kprocess.h:14 and ksandbox.h:7 both
+          #include <QProcess>, and wk qtbase is FEATURE_process=OFF -- there is
+          no fork or exec across a WASI component boundary, and qprocess.h is
+          not installed. WASI joins iOS in the exclusion that already exists
+          for exactly this reason.
+UPSTREAM: the kfilesystemtype hunk is as-is (their missing #else is a real
+      portability bug -- any non-listed UNIX hits it). The other three are
+      not-as-is: correct here, but upstream would want a configure check
+      rather than a Q_OS_WASI test.
+diff --git a/src/lib/CMakeLists.txt b/src/lib/CMakeLists.txt
+index 00df4a8..61c90c0 100644
+--- a/src/lib/CMakeLists.txt
++++ b/src/lib/CMakeLists.txt
+@@ -186,7 +186,18 @@ elseif(HAVE_QTDBUS)
+     target_sources(KF6CoreAddons PRIVATE util/ksystemclockskewnotifierengine_dbus.cpp)
+ endif()
+ 
+-if(NOT IOS)
++# WASI joins iOS here. Both kprocess.h:14 and ksandbox.h:7 do `#include
++# <QProcess>`, and wk's qtbase is FEATURE_process=OFF -- there is no fork and
++# no exec behind a WASI component's boundary, so qprocess.h is not even
++# installed and these two fail at the #include. KProcess is a QProcess
++# subclass, so there is nothing to salvage; KSandbox answers "are we in a
++# Flatpak/Snap?", which for a wk node is a question with a different (and
++# better) answer than either. A node that wants to run another program uses
++# wk:exec, not QProcess -- see plugins/exec-compat.
++# Consequence to know about: KXmlGui's kabstractaboutdialog_p.cpp calls
++# KSandbox::isFlatpak()/isSnap(), so it needs the matching patch. Nothing in
++# KCalc's graph uses KProcess at all.
++if(NOT IOS AND NOT CMAKE_SYSTEM_NAME STREQUAL "WASI")
+     target_sources(KF6CoreAddons PRIVATE
+         io/kprocess.cpp
+         util/ksandbox.cpp
+diff --git a/src/lib/caching/ksdcmapping_p.h b/src/lib/caching/ksdcmapping_p.h
+index b72d36e..04030ce 100644
+--- a/src/lib/caching/ksdcmapping_p.h
++++ b/src/lib/caching/ksdcmapping_p.h
+@@ -17,7 +17,14 @@
+ #include <QtGlobal>
+ #include <qplatformdefs.h>
+ 
++#ifndef Q_OS_WASI
++// wasi-libc ships a sys/resource.h that defines struct rusage and getrusage
++// but NOT struct rlimit, rlim_t or any RLIMIT_* constant -- the upstream block
++// that would define them is inside `#ifdef __wasilibc_unmodified_upstream`.
++// Including it is harmless; relying on rlimit below is not. See the mlock
++// block further down.
+ #include <sys/resource.h>
++#endif
+ 
+ #if defined(_POSIX_MAPPED_FILES) && ((_POSIX_MAPPED_FILES == 0) || (_POSIX_MAPPED_FILES >= 200112L))
+ #define KSDC_MAPPED_FILES_SUPPORTED 1
+@@ -190,6 +197,7 @@ private:
+             // with a larger size. If that's the case we need to at least match
+             // the size to be able to access every entry, so fixup the mapping.
+             if (mapAddress != MAP_FAILED) {
++#ifndef Q_OS_WASI
+                 // Successful mmap doesn't actually mean that whole range is readable so ensure it is
+                 struct rlimit memlock;
+                 if (getrlimit(RLIMIT_MEMLOCK, &memlock) == 0 && memlock.rlim_cur >= 2) {
+@@ -207,6 +215,7 @@ private:
+                 } else {
+                     qCWarning(KCOREADDONS_DEBUG) << "Failed to get RLIMIT_MEMLOCK!";
+                 }
++#endif
+ 
+                 SharedMemory *mapped = reinterpret_cast<SharedMemory *>(mapAddress);
+ 
+diff --git a/src/lib/io/kfilesystemtype.cpp b/src/lib/io/kfilesystemtype.cpp
+index 49ab7d8..0e9b901 100644
+--- a/src/lib/io/kfilesystemtype.cpp
++++ b/src/lib/io/kfilesystemtype.cpp
+@@ -208,6 +208,23 @@ static KFileSystemType::Type determineFileSystemTypeImpl(const QByteArray &path)
+     }
+ }
+ 
++#elif defined(Q_OS_WASI)
++// A wk node's filesystem is wk's own VFS -- layered, sometimes a guest-served
++// wk:fs provider, sometimes a host bind mount -- and none of statfs(2),
++// statvfs(2) or /proc/mounts exists to ask. Unknown is the honest answer, and
++// it is the same answer the (Q_OS_WIN-side) fallback at the bottom of this
++// file already gives. This branch is needed because the non-Windows side of
++// the #ifndef Q_OS_WIN has NO trailing #else: the `#else` further down belongs
++// to `#ifndef Q_OS_WIN` at the top, so an unrecognised UNIX simply never
++// defines determineFileSystemTypeImpl and the link/compile fails at its one
++// call site.
++
++KFileSystemType::Type determineFileSystemTypeImpl(const QByteArray &path)
++{
++    Q_UNUSED(path);
++    return KFileSystemType::Unknown;
++}
++
+ #elif defined(Q_OS_AIX) || defined(Q_OS_HPUX) || defined(Q_OS_QNX) || defined(Q_OS_SCO) || defined(Q_OS_UNIXWARE) || defined(Q_OS_RELIANT)                     \
+     || defined(Q_OS_NETBSD)
+ #include <sys/statvfs.h>
+diff --git a/src/lib/util/ksignalhandler.cpp b/src/lib/util/ksignalhandler.cpp
+index 05a2d4c..cec3d39 100644
+--- a/src/lib/util/ksignalhandler.cpp
++++ b/src/lib/util/ksignalhandler.cpp
+@@ -6,10 +6,20 @@
+ 
+ #include "ksignalhandler.h"
+ #include "kcoreaddons_debug.h"
++
++// Q_OS_WASI joins Q_OS_WIN in every guard below. KSignalHandler's whole
++// mechanism is the self-pipe trick: socketpair(2) a pair of fds, write the
++// signal number from the async-signal handler, read it back on the event loop
++// through a QSocketNotifier. wasi-libc has no socketpair at all (it is behind
++// __wasilibc_unmodified_upstream and does not compile), and wasip2 has no
++// asynchronous POSIX signals to deliver into it in the first place --
++// -D_WASI_EMULATED_SIGNAL supplies signal(2) as a stub that never fires.
++// So this degrades exactly the way it already does on Windows: constructing a
++// KSignalHandler and calling watchSignal() succeeds and simply never emits.
+ #include <QSocketNotifier>
+ #include <QTimer>
+ 
+-#ifndef Q_OS_WIN
++#if !defined(Q_OS_WIN) && !defined(Q_OS_WASI)
+ #include <cerrno>
+ #include <fcntl.h>
+ #include <signal.h>
+@@ -35,7 +45,7 @@ KSignalHandler::KSignalHandler()
+     : d(new KSignalHandlerPrivate)
+ {
+     d->q = this;
+-#ifndef Q_OS_WIN
++#if !defined(Q_OS_WIN) && !defined(Q_OS_WASI)
+     if (::socketpair(AF_UNIX, SOCK_STREAM, 0, KSignalHandlerPrivate::signalFd)) {
+         qCWarning(KCOREADDONS_DEBUG) << "Couldn't create a socketpair";
+         return;
+@@ -54,7 +64,7 @@ KSignalHandler::KSignalHandler()
+ 
+ KSignalHandler::~KSignalHandler()
+ {
+-#ifndef Q_OS_WIN
++#if !defined(Q_OS_WIN) && !defined(Q_OS_WASI)
+     for (int sig : std::as_const(d->m_signalsRegistered)) {
+         signal(sig, nullptr);
+     }
+@@ -66,14 +76,14 @@ KSignalHandler::~KSignalHandler()
+ void KSignalHandler::watchSignal(int signalToTrack)
+ {
+     d->m_signalsRegistered.insert(signalToTrack);
+-#ifndef Q_OS_WIN
++#if !defined(Q_OS_WIN) && !defined(Q_OS_WASI)
+     signal(signalToTrack, KSignalHandlerPrivate::signalHandler);
+ #endif
+ }
+ 
+ void KSignalHandlerPrivate::signalHandler(int signal)
+ {
+-#ifndef Q_OS_WIN
++#if !defined(Q_OS_WIN) && !defined(Q_OS_WASI)
+     const int ret = ::write(signalFd[0], &signal, sizeof(signal));
+     if (ret != sizeof(signal)) {
+         qCWarning(KCOREADDONS_DEBUG) << "signalHandler couldn't write for signal" << strsignal(signal) << " Got error:" << strerror(errno);
+@@ -85,7 +95,7 @@ void KSignalHandlerPrivate::signalHandler(int signal)
+ 
+ void KSignalHandlerPrivate::handleSignal()
+ {
+-#ifndef Q_OS_WIN
++#if !defined(Q_OS_WIN) && !defined(Q_OS_WASI)
+     m_handler->setEnabled(false);
+     int signal;
+     const int ret = ::read(KSignalHandlerPrivate::signalFd[1], &signal, sizeof(signal));

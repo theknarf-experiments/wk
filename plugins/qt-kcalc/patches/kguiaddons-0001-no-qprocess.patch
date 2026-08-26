@@ -1,0 +1,54 @@
+WHAT: guard KUrlHandler khelpcenter launch on QT_CONFIG(process).
+WHY:  kurlhandler_p.cpp:15 is `#include <QProcess>` and wk qtbase is
+      FEATURE_process=OFF -- a WASI component has no fork and no exec, so
+      qprocess.h is not installed and the file fails at the include. The only
+      use is QProcess::startDetached("khelpcenter", url) at line 31.
+      A wk node does not launch sibling binaries: a program a node runs comes
+      from its own vfs through wk:exec (plugins/exec-compat), and a help viewer
+      would be a separate NODE wired to this one. With the guard, openHelp()
+      falls through to QDesktopServices::openUrl(docUrl) -- exactly the path a
+      desktop without khelpcenter installed already takes, so this is upstream
+      behaviour rather than a new one.
+UPSTREAM: as-is. QT_CONFIG(process) is a real Qt feature switch and this file
+      already has a working fallback for the case.
+diff --git a/src/util/kurlhandler_p.cpp b/src/util/kurlhandler_p.cpp
+index c2b579c..f3fdd76 100644
+--- a/src/util/kurlhandler_p.cpp
++++ b/src/util/kurlhandler_p.cpp
+@@ -12,14 +12,28 @@
+ #include <QDebug>
+ #include <QDesktopServices>
+ #include <QLocale>
++#if QT_CONFIG(process)
+ #include <QProcess>
++#endif
+ #include <QStandardPaths>
+ #include <QUrl>
+ 
++// QT_CONFIG(process) is 0 in wk's qtbase: a WASI component has no fork and no
++// exec, so <QProcess> is not installed and this file failed at line 15 with
++// "'QProcess' file not found". Launching a separate khelpcenter BINARY is not
++// a thing a wk node does anyway -- a node that wants to run another program
++// uses wk:exec (plugins/exec-compat), and a help viewer would be a separate
++// node wired to this one, not a child process. openHelp() falls through to
++// QDesktopServices::openUrl() below, which is the same path a desktop without
++// khelpcenter installed already takes.
+ static const char s_khelpcenter_exec[] = "khelpcenter";
+ 
+ static bool openWithKHelpCenter(const QUrl &url)
+ {
++#if !QT_CONFIG(process)
++    Q_UNUSED(url);
++    return false;
++#else
+     const QString helpcenter = QStandardPaths::findExecutable(QString::fromLatin1(s_khelpcenter_exec));
+     if (!helpcenter.isEmpty()) {
+         QUrl u(url);
+@@ -33,6 +47,7 @@ static bool openWithKHelpCenter(const QUrl &url)
+     }
+ 
+     return false;
++#endif
+ }
+ 
+ KUrlHandler::KUrlHandler(QObject *parent)

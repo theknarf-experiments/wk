@@ -1,0 +1,186 @@
+WHAT: guard every dynamic-plugin-loading path in KPluginMetaData and
+      KPluginFactory on QT_CONFIG(library), leaving the static-plugin path
+      untouched.
+WHY:  wk qtbase is FEATURE_library=OFF, because wasm has no dlopen. With it
+      off, qpluginloader.h keeps ONLY the static half of QPluginLoader --
+      staticInstances() and staticPlugins() -- and QLibrary and
+      QCoreApplication::libraryPaths() do not exist at all, so
+      kpluginmetadata.cpp and kpluginfactory.cpp fail with a page of "no member
+      named load/instance/metaData/setFileName/errorString in QPluginLoader".
+      These two files are in KCoreAddons unconditional source list, so this is
+      not optional -- it is the root of the whole framework graph.
+
+      SAY THIS OUT LOUD, because it is the one place in this port where
+      capability is genuinely REMOVED rather than rerouted: after this patch,
+      KPluginMetaData built from a file path comes back invalid, findPlugins()
+      over a directory finds nothing, and KPluginFactory::loadFactory() on a
+      non-static plugin returns INVALID_PLUGIN with the reason spelled out.
+      That is not a stub concealing a failure -- it is the truth on wasm, and
+      the failure is loud where upstream would have failed at dlopen anyway.
+      Everything a wk node actually loads -- the wk QPA plugin, the qsvg
+      image-format and icon-engine plugins -- arrives via Q_IMPORT_PLUGIN and
+      goes through QPluginLoader::staticPlugins(), which still exists and is
+      what KStaticPluginHelpers already uses on the other side of each guard.
+      The alternative was flipping FEATURE_library=ON in plugins/qt (dlopen,
+      dlsym and dlerror DO exist as linkable stubs in wasi-sdk), which would
+      have made QLibrary compile and then fail at runtime for every caller.
+      Failing at compile time in fifteen places beats failing at runtime in an
+      unknown number.
+UPSTREAM: not-as-is. Upstream supports QT_CONFIG(library)=0 nowhere, and would
+      want either a proper static-only backend or these files excluded from the
+      build entirely rather than a shotgun of #ifs.
+diff --git a/src/lib/plugin/kpluginfactory.cpp b/src/lib/plugin/kpluginfactory.cpp
+index 171826c..435cff5 100644
+--- a/src/lib/plugin/kpluginfactory.cpp
++++ b/src/lib/plugin/kpluginfactory.cpp
+@@ -36,6 +36,19 @@ KPluginFactory::Result<KPluginFactory> KPluginFactory::loadFactory(const KPlugin
+             qCWarning(KCOREADDONS_DEBUG) << result.errorText;
+             return result;
+         }
++#if !QT_CONFIG(library)
++        // wk's qtbase is FEATURE_library=OFF: wasm has no dlopen, so a plugin
++        // that is not a STATIC plugin cannot be loaded, ever. Fail with the
++        // ordinary error rather than pretending. Plugins that reach a wk node
++        // do so through Q_IMPORT_PLUGIN and take the isStaticPlugin() branch
++        // above.
++        result.errorString = tr("Could not load plugin from %1: %2")
++                                 .arg(data.fileName(), tr("this build of Qt has no support for loading libraries at runtime"));
++        result.errorText = QStringLiteral("Could not load plugin from %1: no QLibrary support (wasm has no dlopen)").arg(data.fileName());
++        result.errorReason = INVALID_PLUGIN;
++        qCWarning(KCOREADDONS_DEBUG) << result.errorText;
++        return result;
++#else
+         QPluginLoader loader(data.fileName());
+         obj = loader.instance();
+         if (!obj) {
+@@ -45,6 +58,7 @@ KPluginFactory::Result<KPluginFactory> KPluginFactory::loadFactory(const KPlugin
+             qCWarning(KCOREADDONS_DEBUG) << result.errorText;
+             return result;
+         }
++#endif
+     }
+ 
+     KPluginFactory *factory = qobject_cast<KPluginFactory *>(obj);
+diff --git a/src/lib/plugin/kpluginmetadata.cpp b/src/lib/plugin/kpluginmetadata.cpp
+index 83ebf24..2752096 100644
+--- a/src/lib/plugin/kpluginmetadata.cpp
++++ b/src/lib/plugin/kpluginmetadata.cpp
+@@ -21,6 +21,19 @@
+ #include <QLocale>
+ #include <QMimeDatabase>
+ #include <QPluginLoader>
++// --- QT_CONFIG(library) ------------------------------------------------------
++// wk's qtbase is built with FEATURE_library=OFF because wasm has no dlopen.
++// With it off, <QtCore/qpluginloader.h> keeps only the STATIC half of
++// QPluginLoader -- staticInstances() and staticPlugins() -- and QLibrary and
++// QCoreApplication::libraryPaths() do not exist at all. Every guard below
++// removes a code path that can only ever mean "open a .so at runtime", and
++// leaves the static-plugin path -- which is how EVERY Qt/KF plugin reaches a
++// wk node, via Q_IMPORT_PLUGIN -- completely untouched. KStaticPluginHelpers
++// on the other side of each guard is doing the real work here.
++// This is a REDUCTION IN CAPABILITY, not a stub: KPluginMetaData built from a
++// file path comes back invalid, and KPluginFactory::loadFactory() on a
++// non-static plugin fails with a proper error, which is the truth on wasm.
++
+ #include <QStandardPaths>
+ 
+ #include "kaboutdata.h"
+@@ -55,6 +68,12 @@ public:
+ 
+     static void forEachPlugin(const QString &directory, std::function<void(const QFileInfo &)> callback)
+     {
++#if !QT_CONFIG(library)
++        // No dlopen: there is no such thing as a plugin FILE to iterate over.
++        // findPlugins() falls through to KStaticPluginHelpers below.
++        Q_UNUSED(directory);
++        Q_UNUSED(callback);
++#else
+         QStringList dirsToCheck;
+ #ifdef Q_OS_ANDROID
+         dirsToCheck << QCoreApplication::libraryPaths();
+@@ -92,6 +111,7 @@ public:
+                 }
+             }
+         }
++#endif // QT_CONFIG(library)
+     }
+ 
+     struct StaticPluginLoadResult {
+@@ -112,6 +132,7 @@ public:
+         data.d = d;
+         return data;
+     }
++#if QT_CONFIG(library)
+     static void pluginLoaderForPath(QPluginLoader &loader, const QString &path)
+     {
+         if (path.startsWith(QLatin1Char('/'))) { // Absolute path, use as it is
+@@ -124,8 +145,18 @@ public:
+         }
+     }
+ 
++#endif // QT_CONFIG(library)
++
+     static KPluginMetaDataPrivate *ofPath(const QString &path, KPluginMetaData::KPluginMetaDataOptions options)
+     {
++#if !QT_CONFIG(library)
++        // The metadata of a plugin that would have to be dlopen'd to read it.
++        // Keep the requested name so the "Could not find plugin %1" diagnostic
++        // downstream still names the right thing.
++        auto ret = new KPluginMetaDataPrivate(QJsonObject(), QString(), options);
++        ret->m_requestedFileName = path;
++        return ret;
++#else
+         QPluginLoader loader;
+         pluginLoaderForPath(loader, path);
+ 
+@@ -139,6 +170,7 @@ public:
+                                               options);
+         ret->m_requestedFileName = path;
+         return ret;
++#endif
+     }
+ };
+ 
+@@ -183,6 +215,7 @@ KPluginMetaData::KPluginMetaData(const QString &pluginFile, KPluginMetaDataOptio
+     }
+ }
+ 
++#if QT_CONFIG(library)
+ KPluginMetaData::KPluginMetaData(const QPluginLoader &loader, KPluginMetaDataOptions options)
+     : d(new KPluginMetaDataPrivate(loader.metaData().value(QLatin1String("MetaData")).toObject(), loader.fileName(), options))
+ {
+@@ -190,6 +223,16 @@ KPluginMetaData::KPluginMetaData(const QPluginLoader &loader, KPluginMetaDataOpt
+         d->m_pluginId = QFileInfo(loader.fileName()).completeBaseName();
+     }
+ }
++#else
++// QPluginLoader without QT_CONFIG(library) has no fileName() and no
++// metaData(); a plugin it could describe cannot exist. The overload stays so
++// that callers still COMPILE, and yields an invalid KPluginMetaData.
++KPluginMetaData::KPluginMetaData(const QPluginLoader &loader, KPluginMetaDataOptions options)
++    : d(new KPluginMetaDataPrivate(QJsonObject(), QString(), options))
++{
++    Q_UNUSED(loader);
++}
++#endif
+ 
+ KPluginMetaData::KPluginMetaData(const QJsonObject &metaData, const QString &fileName)
+     : d(new KPluginMetaDataPrivate(metaData, fileName))
+@@ -205,14 +248,16 @@ KPluginMetaData::KPluginMetaData(const QJsonObject &metaData, const QString &fil
+ 
+ KPluginMetaData KPluginMetaData::findPluginById(const QString &directory, const QString &pluginId, KPluginMetaDataOptions options)
+ {
+-    QPluginLoader loader;
+     const QString fileName = directory + QLatin1Char('/') + pluginId;
++#if QT_CONFIG(library)
++    QPluginLoader loader;
+     KPluginMetaDataPrivate::pluginLoaderForPath(loader, fileName);
+     if (loader.load()) {
+         if (KPluginMetaData metaData(loader, options); metaData.isValid()) {
+             return metaData;
+         }
+     }
++#endif
+ 
+     if (const auto staticOptional = KStaticPluginHelpers::findById(directory, pluginId)) {
+         KPluginMetaData data = KPluginMetaDataPrivate::ofStaticPlugin(directory, pluginId, options, staticOptional.value());

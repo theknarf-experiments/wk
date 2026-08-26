@@ -1,0 +1,50 @@
+WHAT: demote KNotifications unconditional find_package(Qt6 DBus REQUIRED)
+      and find_package(Canberra REQUIRED) to optional.
+WHY:  CMake binds AND tighter than OR, so the guard
+      `if (NOT APPLE AND NOT ANDROID AND NOT WIN32 AND NOT HAIKU OR (WIN32 AND
+      NOT WITH_SNORETOAST))` is all-true on WASI and the block fires. This is
+      the ONE place in KCalc entire framework graph where DBus is not behind
+      the USE_DBUS switch -- and it is a CMake bug rather than a code
+      dependency: src/CMakeLists.txt already gates every DBus source on
+      `if (HAVE_DBUS)` (:23-29, :62-65, :84) and every audio source on
+      `if (TARGET Canberra::Canberra)` (:56-58, :98-99). With USE_DBUS=OFF and
+      no Canberra target, ZERO sources need either package.
+      This two-line change is what removes DBus from this port graph
+      entirely, and it is the single highest-leverage patch in the series.
+      WHAT IS LOST: notification SOUNDS. Canberra is libcanberra, an
+      ALSA/PulseAudio event-sound player, and there is no wasm build of it. wk
+      does have audio (plugins/audio-compat), so a real backend is possible
+      later -- it just will not be libcanberra. Visual notifications are
+      unaffected; on a platform with no notification server KNotification falls
+      back to its own handling, which is what a wk node wants anyway.
+UPSTREAM: as-is. The AND/OR precedence here is almost certainly not what the
+      author meant, and the sources being correctly gated proves the packages
+      were never meant to be REQUIRED.
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9135340..8fc8f9b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -76,9 +76,21 @@ endif()
+ 
+ find_package(KF6Config ${KF_DEP_VERSION} REQUIRED)
+ 
++# CMake binds AND tighter than OR, so on WASI the first conjunction is
++# all-true and this block fires -- demanding Qt6 DBus and Canberra
++# unconditionally, in the ONE framework in KCalc's graph where DBus is not
++# behind the USE_DBUS switch. It is a CMake bug, not a code dependency:
++# src/CMakeLists.txt gates every DBus source on `if (HAVE_DBUS)` (:23-29,
++# :62-65, :84) and every audio source on `if (TARGET Canberra::Canberra)`
++# (:56-58, :98-99), so with USE_DBUS=OFF and no Canberra target ZERO sources
++# need either. Making both non-REQUIRED removes DBus from this port's graph
++# entirely -- which is the single largest thing this patch series buys.
++# What is lost: notification SOUNDS (Canberra is libcanberra, an ALSA/
++# PulseAudio event-sound player). wk has audio via plugins/audio-compat, so a
++# real backend is possible later; it just is not libcanberra.
+ if (NOT APPLE AND NOT ANDROID AND NOT WIN32 AND NOT HAIKU OR (WIN32 AND NOT WITH_SNORETOAST))
+-    find_package(Qt6 ${REQUIRED_QT_VERSION} CONFIG REQUIRED DBus)
+-    find_package(Canberra REQUIRED)
++    find_package(Qt6 ${REQUIRED_QT_VERSION} CONFIG QUIET COMPONENTS DBus)
++    find_package(Canberra)
+     set_package_properties(Canberra PROPERTIES
+         PURPOSE "Needed to build audio notification support")
+     if (TARGET Canberra::Canberra)

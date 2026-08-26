@@ -1,0 +1,31 @@
+# A STANDALONE cargo project, on purpose.
+#
+# The wk workspace excludes plugins/ (`exclude = ["plugins"]` in the root
+# Cargo.toml), so this builds and locks on its own and adding it costs the
+# workspace nothing. It exists because the only honest way to test a wk node is
+# to run it on wk's real runtime — the same PluginHost the daemon uses — and
+# the alternative (another #[test] in crates/wk-server/src/plugin.rs) would
+# mean editing a shared file that other ports are editing at the same time.
+#
+# Cargo.lock is COMMITTED, and it is a copy of the workspace's. wk-server
+# depends on wasi-graphics-context-wasmtime by bare git URL with no tag or rev,
+# and that crate no longer exists at the repository's HEAD — so a fresh resolve
+# fails with "no matching package named `wasi-graphics-context-wasmtime`". The
+# workspace lock pins the revision that has it. Refresh this file from
+# ../../../Cargo.lock whenever wk-server's dependencies move.
+[package]
+name = "vpiano-harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+wk-server = { path = "../../../crates/wk-server" }
+wk-protocol = { path = "../../../crates/wk-protocol" }
+
+# wasmtime AOT-compiles the 21 MB component when the node starts; at
+# opt-level 0 that takes minutes. Same reasoning as the root Cargo.toml.
+[profile.dev.package."*"]
+opt-level = 3

@@ -1,0 +1,108 @@
+WHAT: exclude KCharSelect, KCharSelectData, KDateTimeEdit and KMimeTypeEditor
+      (and the 3.1 MB kcharselect-data resource) from the WASI build.
+WHY:  each one needs a Qt feature wk qtbase does not have, and each was a hard
+      compile failure, not a warning:
+        * kcharselectdata_p.h:13 "fatal error: QFuture file not found". Not a
+          missing include path -- FEATURE_thread=OFF means <QFuture> is NOT
+          INSTALLED. KCharSelectData builds a Unicode index in a QRunnable on
+          a QThreadPool (kcharselectdata.cpp:34 `class RunIndexCreation :
+          public QFutureInterface<Index>, public QRunnable`) and
+          waitForFinished()es it on demand. With no threads that is a rewrite,
+          not a guard. WORTH KNOWING: this is precisely why KCharSelect-the-app
+          is NOT the cheap first KDE port a CMake-only reading suggests -- its
+          central widget is the one thing in KWidgetsAddons that cannot exist
+          here.
+        * kdatetimeedit.cpp: QTimeZone::availableTimeZoneIds(),
+          QTimeZone(QByteArray), QDateTime::timeZone(). FEATURE_timezone=OFF,
+          and a wk node has no zone database to switch it on with.
+        * kmimetypeeditor.cpp:12 "fatal error: QProcess file not found". The
+          class exists to launch `keditfiletype`. FEATURE_process=OFF; there is
+          no fork/exec across a WASI component boundary.
+      The HEADERS are removed from the target sources as well as the .cpp
+      files, otherwise AUTOMOC still parses kcharselectdata_p.h and
+      mocs_compilation.cpp fails on the same missing <QFuture> even though the
+      translation unit is gone.
+      SAY IT PLAINLY: this REMOVES four public classes from KWidgetsAddons on
+      this platform. Their headers are still installed, so a downstream user
+      fails at link rather than at #include. Nothing in KCalc graph touches
+      any of them (checked by grep across every framework in the graph).
+UPSTREAM: not-as-is. Upstream would want these behind proper feature options
+      (KWIDGETSADDONS_WITH_CHARSELECT etc.), not a platform test.
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 1d041a5..c7b09ce 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -202,6 +202,49 @@ target_sources(KF6WidgetsAddons PRIVATE
+     icons.qrc
+ )
+ 
++# --- WASI: four widgets this platform cannot carry --------------------------
++# Each is excluded for a NAMED missing Qt feature, not for convenience, and
++# none of them is reachable from anything else in KCalc's framework graph
++# (verified by grep across kconfigwidgets, kxmlgui, kbookmarks, kiconthemes,
++# kitemviews, kcolorscheme, knotifications and kcalc itself).
++#
++#   kcharselect + kcharselectdata   QFuture / QFutureInterface / QRunnable on a
++#       QThreadPool. wk qtbase is FEATURE_thread=OFF, so <QFuture> is not even
++#       INSTALLED ("'QFuture' file not found"). KCharSelectData builds its
++#       3 MB Unicode index on a worker thread and waitForFinished()es it on
++#       demand; with no threads that is not a guard to relax, it is a rewrite.
++#       This is why KCharSelect-the-app is NOT a cheaper first KDE port than
++#       KCalc, contrary to what a CMake-only reading suggests.
++#   kdatetimeedit                   QTimeZone::availableTimeZoneIds(),
++#       QTimeZone(QByteArray) and QDateTime::timeZone(). FEATURE_timezone=OFF,
++#       and a wk node has no zone database to turn it on with.
++#   kmimetypeeditor                 #include <QProcess> at line 12 -- it exists
++#       to launch `keditfiletype`. FEATURE_process=OFF; there is no fork/exec
++#       across a WASI component boundary.
++#
++# The headers stay installed, so a downstream user of these classes fails at
++# LINK time rather than at #include. That is a known sharp edge; it is
++# recorded in PORTING.md rather than hidden.
++if(CMAKE_SYSTEM_NAME STREQUAL "WASI")
++    get_target_property(_kwa_wasi_srcs KF6WidgetsAddons SOURCES)
++    list(REMOVE_ITEM _kwa_wasi_srcs
++        kcharselect.cpp
++        kcharselectdata.cpp
++        kdatetimeedit.cpp
++        kmimetypeeditor.cpp
++        # The headers go too, or AUTOMOC still runs over them: moc parses
++        # kcharselectdata_p.h, hits its `#include <QFuture>` at line 13, and
++        # the generated mocs_compilation.cpp fails to compile even though not
++        # one of these translation units is being built any more.
++        kcharselect.h
++        kcharselect_p.h
++        kcharselectdata_p.h
++        kdatetimeedit.h
++        kmimetypeeditor.h
++    )
++    set_target_properties(KF6WidgetsAddons PROPERTIES SOURCES "${_kwa_wasi_srcs}")
++endif()
++
+ set(kwidgetsaddons_UI_SRCS)
+ qt_wrap_ui(kwidgetsaddons_UI_SRCS
+    kdatetimeedit.ui
+@@ -331,12 +374,17 @@ install(FILES
+   DESTINATION ${KDE_INSTALL_INCLUDEDIR_KF}/KWidgetsAddons COMPONENT Devel
+ )
+ 
+-qt6_add_resources(KF6WidgetsAddons "kcharselect-data"
+-    PREFIX "/kf6/kcharselect/"
+-    FILES kcharselect-data
+-    OUTPUT_TARGETS _rcc_target
+-)
+-install(TARGETS ${_rcc_target} EXPORT KF6WidgetsAddonsTargets ${KF_INSTALL_TARGETS_DEFAULT_ARGS})
++# 3.1 MB of Unicode tables, and the only thing that reads them is
++# KCharSelectData, which is excluded above. Compiling it in would put 3 MB of
++# dead weight into every KF6 wasm component that links KWidgetsAddons.
++if(NOT CMAKE_SYSTEM_NAME STREQUAL "WASI")
++    qt6_add_resources(KF6WidgetsAddons "kcharselect-data"
++        PREFIX "/kf6/kcharselect/"
++        FILES kcharselect-data
++        OUTPUT_TARGETS _rcc_target
++    )
++    install(TARGETS ${_rcc_target} EXPORT KF6WidgetsAddonsTargets ${KF_INSTALL_TARGETS_DEFAULT_ARGS})
++endif()
+ 
+ if(BUILD_DESIGNERPLUGIN)
+     add_subdirectory(designer)

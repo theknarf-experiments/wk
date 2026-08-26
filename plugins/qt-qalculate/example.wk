@@ -1,0 +1,40 @@
+// vim: set filetype=kdl :
+// Qalculate! as a wk node — a REAL Qt 6 Widgets application on a REAL
+// libqalculate (GMP + MPFR + libxml2, all cross-compiled to wasm32-wasip2).
+// Run it from the repo root with:
+//
+//   wk run plugins/qt-qalculate/example.wk
+//
+// Build it first (and note it needs plugins/qt, which is hours):
+//
+//   cd plugins/qt-qalculate && mise run build
+//
+// This file carries its OWN `dependencies` block rather than importing
+// ../../workspace.wk, so it is self-contained: nothing outside this plugin
+// directory has to change to try the node. Move the entry into workspace.wk
+// when the port stops being an experiment — that is where every other node
+// type is registered, and it is what lets you add one from the canvas UI.
+//
+// NOTHING IS WIRED IN, and nothing needs to be. The unit, function, element
+// and constant database is compiled into the component as C string literals
+// (--enable-compiled-definitions), so the calculator is complete with an empty
+// filesystem and no network. The `args` line is the expression to evaluate at
+// startup, exactly as `qalculate-qt "5 m + 2 ft to cm"` would on a desktop;
+// delete it for an empty history.
+dependencies {
+    qalculate "docker://plugins/qt-qalculate/Dockerfile" {
+        description "Qalculate! 5.12.0 — a real Qt 6 calculator, units and all"
+    }
+}
+workspace "01KWQACDEM000000000000WS00" {
+    node "qalculate" "01KWQACDEM000000000000QA01" {
+        pos 80.0 80.0
+        size 1000.0 760.0
+        args "5 m + 2 ft to cm"
+    }
+    note "01KWQACDEM000000000000NT02" {
+        text "Qalculate! 5.12.0\nQt 6.8.4 Widgets + libqalculate 5.12.0\non wasm32-wasip2\n\nType an expression and press Return.\nIt is the real thing: units, intervals,\nsymbolic solve(), arbitrary precision\nthrough GMP/MPFR.\n\nKNOWN GAPS\n* no IME: ASCII typing works, but the\n  Unicode operators (x, /, sqrt, pi) have\n  to come from the on-screen keypad\n* no calculation TIMEOUT. With no\n  threads the caller cannot watch the\n  clock, so a runaway expression blocks\n  the node instead of returning \"timed\n  out\" — and the Cancel dialog never\n  appears\n* exchange rates are compiled in and\n  already stale: currency conversion\n  gives out-of-date numbers, quietly\n* Plot opens and does nothing (there is\n  no gnuplot to exec, and no exec)\n* no window decorations: the main\n  window fills the surface, dialogs\n  float above it"
+        pos 1120.0 80.0
+        size 380.0 460.0
+    }
+}

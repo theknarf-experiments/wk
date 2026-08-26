@@ -1,0 +1,40 @@
+WHAT: guard <pwd.h> and getHomeDir()'s getpwuid() fallback with #ifndef __wasi__.
+WHY:  wasi-libc ships no <pwd.h> at all, so the unconditional include at
+      util.cc:48 is a hard `fatal error: 'pwd.h' file not found` and the
+      library does not compile. Its ONE use is getHomeDir()'s fallback for
+      when $HOME is unset -- a wk node has no passwd database, no uid and no
+      way to answer that question, and its environment always carries HOME
+      (the container setup sets it), so the fallback returns "/" instead.
+UPSTREAM: as-is. Upstream already brackets this whole region with `#ifdef
+      _WIN32`; wasi is a third platform with no pwd database, and the diff is
+      the same shape as the Windows arm they already carry.
+--- a/libqalculate/util.cc
++++ b/libqalculate/util.cc
+@@ -45,7 +45,11 @@
+ #	endif
+ #	include <utime.h>
+ #	include <unistd.h>
+-#	include <pwd.h>
++/* wasi-libc ships no <pwd.h>: a wk node has no passwd database and no
++ * uid to look up. getHomeDir()'s only use of it is guarded below. */
++#	ifndef __wasi__
++#		include <pwd.h>
++#	endif
+ #endif
+ 
+ using std::string;
+@@ -539,7 +543,14 @@ string utf8_encode(const std::wstring &wstr) {
+ string getHomeDir() {
+ 	const char *homedir;
+ 	if ((homedir = getenv("HOME")) == NULL) {
++#ifdef __wasi__
++		/* No passwd database to fall back on. A wk node's environment
++		 * always carries HOME, so this arm is unreachable in practice;
++		 * "/" keeps buildPath() producing an absolute path if it is not. */
++		homedir = "/";
++#else
+ 		homedir = getpwuid(getuid())->pw_dir;
++#endif
+ 	}
+ 	return homedir;
+ }

@@ -1,0 +1,64 @@
+WHAT: guard KFormatPrivate two QTimeZone uses on QT_CONFIG(timezone).
+WHY:  wk qtbase is FEATURE_timezone=OFF, so QDateTime has no timeZone()
+      accessor and QTimeZone keeps only its stub half -- no systemTimeZone(),
+      no displayName(), and no TimeType/NameType enumerators. The failure is
+      loud but reads oddly ("ShortData is a private member of QTimeZone"),
+      because the compiler finds a same-shaped private member instead.
+      A wk node has no /etc/localtime and no host zone database, so there is
+      nothing behind the feature to turn on either. The degradation is exactly
+      one thing: a formatted time is never annotated with a timezone
+      abbreviation. Durations, byte sizes, relative dates and distances --
+      the rest of KFormat, and all KCalc would ever touch -- are unaffected.
+UPSTREAM: as-is. QT_CONFIG(timezone) is a Qt feature that can legitimately be
+      off (Qt for MCUs, bootstrap builds); guarding for it is a real
+      portability fix, not a wk-ism.
+diff --git a/src/lib/util/kformatprivate.cpp b/src/lib/util/kformatprivate.cpp
+index 61e745f..0fa0c76 100644
+--- a/src/lib/util/kformatprivate.cpp
++++ b/src/lib/util/kformatprivate.cpp
+@@ -650,12 +650,25 @@ QString KFormatPrivate::formatRelativeDateTime(const QDateTime &dateTime, QLocal
+     return formattedDate.replace(0, 1, formattedDate.at(0).toUpper());
+ }
+ 
++// QT_CONFIG(timezone) is 0 in wk's qtbase. Without it QDateTime has no
++// timeZone() accessor and QTimeZone keeps only its stub half -- no
++// systemTimeZone(), no displayName(), no TimeType enumerators -- so the whole
++// "which zone is this, and does it differ from the system's" question cannot
++// be asked. A wk node has no /etc/localtime and no host zone database to
++// answer it with either, so the honest degradation is: never annotate a time
++// with a zone abbreviation. Everything else KFormat does -- durations, byte
++// sizes, relative dates, distances -- is untouched.
+ [[nodiscard]] static bool needsTimeZone(const QDateTime &dt)
+ {
++#if QT_CONFIG(timezone)
+     if (dt.timeSpec() == Qt::LocalTime) {
+         return false;
+     }
+     return dt.timeZone().offsetFromUtc(dt) != QTimeZone::systemTimeZone().offsetFromUtc(dt);
++#else
++    Q_UNUSED(dt);
++    return false;
++#endif
+ }
+ 
+ QString KFormatPrivate::formatTime(const QDateTime &dateTime, QLocale::FormatType format, KFormat::TimeFormatOptions options) const
+@@ -666,6 +679,11 @@ QString KFormatPrivate::formatTime(const QDateTime &dateTime, QLocale::FormatTyp
+         return output;
+     }
+ 
++#if !QT_CONFIG(timezone)
++    // See needsTimeZone() above: with no timezone feature there is no
++    // displayName() to ask, so the unannotated time is the whole answer.
++    return output;
++#else
+     QString tzAbbr;
+     const auto tz = dateTime.timeZone();
+     if (tz.hasDaylightTime()) {
+@@ -678,6 +696,7 @@ QString KFormatPrivate::formatTime(const QDateTime &dateTime, QLocale::FormatTyp
+     }
+     /*: %1 is a formatted time (from QLocale.toString), %2 is a localized timezone abbreviation (from QTimeZone::displayName(QTimeZone::ShortName)). */
+     return tr("%1 %2").arg(output, tzAbbr);
++#endif
+ }
+ 
+ QString KFormatPrivate::formatDistance(double distance, KFormat::DistanceFormatOptions options) const

@@ -1,0 +1,232 @@
+WHAT: make KCalc a wk node -- default to the `wk` QPA platform, statically
+      import the four plugins wasm cannot dlopen, link libqwk.a and the two
+      component-type objects, compile a font in as a Qt resource -- and DROP
+      KF6::Crash.
+WHY:  four things a wasm32-wasip2 Qt/KF node needs that a desktop build gets
+      for free, plus one framework that cannot come along.
+        * QT_QPA_PLATFORM. plugins/qt qtbase was configured
+          QT_QPA_DEFAULT_PLATFORM=offscreen (it predates the wk QPA plugin), so
+          an unmodified app renders to nowhere and never opens a surface. Set
+          only when the environment does not already say, so
+          QT_QPA_PLATFORM=offscreen stays available for bisecting failures.
+        * Q_IMPORT_PLUGIN. No dlopen on wasm. Without QWkIntegrationPlugin,
+          QApplication aborts with "no Qt platform plugin could be
+          initialized" and an EMPTY plugin list -- it reads like a broken Qt,
+          but it is an unreferenced symbol. QSvgPlugin/QSvgIconPlugin are what
+          let SVG icons decode at all (KIconThemes REQUIRES Qt6::Svg and icon
+          themes are SVG). KIconEnginePlugin is KIconThemes own icon engine,
+          made STATIC by patches/kiconthemes-0001 -- it is what makes
+          QIcon::fromTheme() give KDE theme semantics rather than Qt simpler
+          lookup.
+        * the component-type objects must arrive as LINK OPTIONS. They hold
+          only a `component-type` custom section that wasm-component-ld reads
+          to build the import list; nothing references them, so as archive
+          members they are dropped and the binary ends up with no wasi:surface
+          import.
+        * fonts. Qt 6 ships none and a wk node has no host font dir; with none
+          the app runs, QFontDatabase is empty, and every string renders as
+          nothing at all.
+
+      *** KF6::Crash IS REMOVED, AND THAT IS THE LOUDEST THING IN THIS PORT ***
+      KCrash implementation is sigaction()/sigemptyset()/SA_RESTART signal
+      handlers that, on a crash, fork() a child, setgroups()/setgid()/setuid()
+      it, exec() drkonqi, waitpid() for it, and alarm() a watchdog. Every one
+      of those symbols is absent from wasi-libc -- 15 distinct undefined
+      identifiers in kcrash.cpp alone (fork, waitpid, kill, alarm, setuid,
+      setgid, getuid, getgid, setgroups, sigaction, sigemptyset, sigaddset,
+      SA_RESTART, SIG_UNBLOCK, RLIMIT_NOFILE) plus <QUnhandledException> in
+      exception.cpp (FEATURE_thread=OFF). wasip2 has no asynchronous signals
+      and no fork/exec at all.
+      Building a KCrash that COMPILED would have meant gutting kcrash.cpp
+      until KCrash::initialize() did nothing -- a stub wearing a framework
+      name, which is a worse lie than an honest absence. So KCalc here has NO
+      crash handler. When a wk node traps, wasmtime reports it to the host and
+      the node dies; that is wk crash story, and drkonqi was never going to
+      be part of it. This is the ONE framework of the fifteen that did not
+      make it; see PORTING.md.
+
+      All the wk-node changes are guarded (`#ifdef __wasi__`, `if(WK_...)`) so
+      a desktop build of this tree is unaffected -- except for the KCrash
+      removal, which is unconditional because CMake cannot easily make a
+      find_package COMPONENT conditional on the target platform.
+UPSTREAM: the wk-node half is as-is in spirit -- it is the standard static-Qt
+      deployment shape. The KCrash removal is `no`: it is ours, it is
+      wk-specific, and upstream would rightly want KCrash itself to grow a
+      no-op platform backend instead.
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 33a945a..322bd26 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -39,9 +39,25 @@ find_package (Qt6 ${QT_MIN_VERSION} CONFIG REQUIRED COMPONENTS
+     Widgets
+ )
+ 
++# KF6::Crash is NOT in this list, and that is the single loudest omission in
++# this port. Read plugins/qt-kcalc/PORTING.md before "fixing" it.
++#
++# KCrash's implementation is sigaction()/sigemptyset()/SA_RESTART signal
++# handlers that, on a crash, fork() a child, setgid()/setuid() it, exec()
++# drkonqi, waitpid() for it and alarm() a watchdog. Every one of those symbols
++# is absent from wasi-libc, because wasip2 has no asynchronous signals and no
++# fork/exec at all -- 15 distinct undefined identifiers in kcrash.cpp alone,
++# plus <QUnhandledException> in exception.cpp (FEATURE_thread=OFF). This is not
++# a header guard away; it is the one framework in KCalc's graph with no
++# meaningful wasm implementation.
++#
++# Building a KCrash that COMPILED would mean gutting kcrash.cpp until
++# KCrash::initialize() did nothing -- a stub pretending to be a framework,
++# which is worse than an honest absence. So KCalc runs with no crash handler
++# on this platform. When a wk node traps, wasmtime reports it to the host and
++# the node dies; that is wk's crash story, not drkonqi's.
+ find_package(KF6 ${KF_MIN_VERSION} REQUIRED COMPONENTS
+     CoreAddons
+-    Crash
+     ColorScheme
+     Config
+     ConfigWidgets
+@@ -105,6 +121,19 @@ target_sources(kcalc PRIVATE
+    kcalc_numeralsystem_view.h
+    kcalc.qrc )
+ 
++# --- wk node: fonts ---------------------------------------------------------
++# Qt 6 ships no fonts and a wk node has no host font directory to fall back on:
++# with none, the app runs, QFontDatabase is empty and every string renders as
++# nothing at all. build.sh stages one TTF and generates this .qrc beside it
++# (which font exists depends on the machine), and the wk QPA plugin's font
++# database falls back to :/fonts after looking in QT_QPA_FONTDIR and the usual
++# VFS directories. A node that bind-mounts a real font directory can still set
++# QT_QPA_FONTDIR and never touch this copy.
++set(WK_FONTS_QRC "" CACHE FILEPATH "generated .qrc holding one staged TTF under :/fonts")
++if(WK_FONTS_QRC)
++  target_sources(kcalc PRIVATE "${WK_FONTS_QRC}")
++endif()
++
+ if(CMAKE_BUILD_TYPE MATCHES "Release")
+    add_definitions(-DQT_NO_DEBUG_OUTPUT)
+ endif()
+@@ -142,10 +171,55 @@ target_link_libraries(kcalc
+     KF6::IconThemes
+     KF6::Notifications
+     KF6::XmlGui
+-    KF6::Crash
+     knumber
+ )
+ 
++# --- wk node: the platform plugin, the icon engine, the component's imports --
++# There is no dlopen on wasm, so every Qt/KF plugin is an ARCHIVE linked into
++# the binary and named once with Q_IMPORT_PLUGIN (see kcalc.cpp's main).
++#
++#   WK_QPA_LIB              plugins/qt/sysroot/lib/libqwk.a -- the wk QPA
++#                           plugin. It also carries the gfx-compat shim
++#                           objects, so the app needs no other wasi-gfx code.
++#   WK_SVG_PLUGINS          the qsvg imageformat + iconengine plugins from this
++#                           port's own qtsvg build. KIconThemes REQUIRES
++#                           Qt6::Svg and Breeze's icons are SVG, so without
++#                           these no QImageReader knows what an .svg is and
++#                           every themed icon comes out null.
++#   WK_ICON_ENGINE_PLUGIN   KIconThemes' KIconEnginePlugin, built STATIC by
++#                           patches/kiconthemes-0001. This is what makes
++#                           QIcon::fromTheme() return a KIconEngine rather than
++#                           Qt's own -- i.e. it is KDE icon-theme semantics.
++#   WK_GFX_COMPONENT_TYPE   gen/wkgfx_component_type.o, passed as a LINK OPTION
++#   WK_CLIP_COMPONENT_TYPE  gen/wkclipboard_component_type.o, likewise.
++#                           These carry only a `component-type` custom section
++#                           that wasm-component-ld reads to build the
++#                           component's import list; nothing references them,
++#                           so as archive members the linker drops them and the
++#                           result is a component with NO wasi:surface import
++#                           at all.
++set(WK_QPA_LIB "" CACHE FILEPATH "libqwk.a, the wk QPA plugin (plugins/qt/build-qpa.sh)")
++set(WK_SVG_PLUGINS "" CACHE STRING "static qsvg plugin archives")
++set(WK_ICON_ENGINE_PLUGIN "" CACHE FILEPATH "static libKIconEnginePlugin.a")
++set(WK_GFX_COMPONENT_TYPE "" CACHE FILEPATH "gfx-compat gen/wkgfx_component_type.o")
++set(WK_CLIP_COMPONENT_TYPE "" CACHE FILEPATH "clipboard-compat gen/wkclipboard_component_type.o")
++if(WK_QPA_LIB)
++  # FbSupportPrivate is not optional and not obvious: the wk QPA plugin IS
++  # fbconvenience -- QWkScreen derives from QFbScreen, QWkWindow from
++  # QFbWindow, QWkBackingStore from QFbBackingStore, and that is where the
++  # guest-side compositing of N top-level windows into one surface lives.
++  # Without it the link fails with a page of "undefined symbol: QFbScreen::..."
++  # from inside libqwk.a. It is an INTERNAL_MODULE, so it is its own package
++  # rather than a component of Qt6Gui.
++  find_package(Qt6 6.8 REQUIRED COMPONENTS FbSupportPrivate)
++  target_link_libraries(kcalc ${WK_SVG_PLUGINS} "${WK_ICON_ENGINE_PLUGIN}" "${WK_QPA_LIB}" Qt6::FbSupportPrivate)
++endif()
++foreach(_wk_ct "${WK_GFX_COMPONENT_TYPE}" "${WK_CLIP_COMPONENT_TYPE}")
++  if(_wk_ct)
++    target_link_options(kcalc PRIVATE "${_wk_ct}")
++  endif()
++endforeach()
++
+ set_target_properties(kcalc PROPERTIES MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/MacOSXBundleInfo.plist.in)
+ 
+ install(TARGETS kcalc  ${KDE_INSTALL_TARGETS_DEFAULT_ARGS} )
+diff --git a/kcalc.cpp b/kcalc.cpp
+index b17274f..e0ff333 100644
+--- a/kcalc.cpp
++++ b/kcalc.cpp
+@@ -27,7 +27,9 @@
+ #include <KActionCollection>
+ #include <KColorMimeData>
+ #include <KConfigDialog>
+-#include <KCrash>
++// KCrash is deliberately absent: its entire implementation is POSIX signal
++// handlers plus fork/exec of drkonqi, and wasip2 has neither. See the long
++// comment in CMakeLists.txt. This is a decision, not an oversight.
+ #include <KIconTheme>
+ #include <KStandardAction>
+ #include <KToggleAction>
+@@ -2922,8 +2924,42 @@ void KCalculator::resizeEvent(QResizeEvent *event)
+ // Name: main
+ // Desc: entry point of the application
+ //------------------------------------------------------------------------------
++#ifdef __wasi__
++// --- wk node ---------------------------------------------------------------
++// wasm has no dlopen, so Qt cannot discover a plugin at runtime: every plugin
++// is linked in as an archive and named here. Without the QWkIntegrationPlugin
++// line QApplication aborts with "no Qt platform plugin could be initialized"
++// and an EMPTY available-plugins list, which reads like a broken Qt build but
++// is a missing symbol reference.
++//   QSvgPlugin/QSvgIconPlugin  KIconThemes requires Qt6::Svg and icon themes
++//                              are SVG; without these every themed icon is
++//                              null.
++//   KIconEnginePlugin          KIconThemes' own QIconEnginePlugin, made STATIC
++//                              by patches/kiconthemes-0001. It is what makes
++//                              QIcon::fromTheme() go through KIconEngine --
++//                              theme inheritance, scaled dirs, KIconEffect --
++//                              rather than Qt's simpler lookup.
++#include <QtPlugin>
++Q_IMPORT_PLUGIN(QWkIntegrationPlugin)
++Q_IMPORT_PLUGIN(QSvgPlugin)
++Q_IMPORT_PLUGIN(QSvgIconPlugin)
++Q_IMPORT_PLUGIN(KIconEnginePlugin)
++#endif
++
+ int main(int argc, char *argv[])
+ {
++#ifdef __wasi__
++    // plugins/qt/sysroot's qtbase was configured with
++    // QT_QPA_DEFAULT_PLATFORM=offscreen -- it predates the wk plugin -- so
++    // without this the app comes up on a platform that renders to nowhere and
++    // never opens a wk surface. An explicit QT_QPA_PLATFORM in the node's
++    // environment still wins, which is what makes `QT_QPA_PLATFORM=offscreen`
++    // usable for separating "Qt is broken" from "the wk QPA is broken".
++    if (!qEnvironmentVariableIsSet("QT_QPA_PLATFORM")) {
++        qputenv("QT_QPA_PLATFORM", "wk");
++    }
++#endif
++
+     /**
+      * trigger initialization of proper icon theme
+      */
+@@ -2990,7 +3026,9 @@ int main(int argc, char *argv[])
+     aboutData.addAuthor(i18n("Niklas Freund"), QString(), QStringLiteral("nalquas.dev@gmail.com"));
+ 
+     KAboutData::setApplicationData(aboutData);
+-    KCrash::initialize();
++    // KCrash::initialize() would go here on a platform that has signals and
++    // fork. On wasm a trap is reported to the host by wasmtime and the node
++    // dies; there is nothing for a handler to catch and nothing to launch.
+ 
+     QApplication::setWindowIcon(QIcon::fromTheme(QStringLiteral("accessories-calculator"), QApplication::windowIcon()));
+ 

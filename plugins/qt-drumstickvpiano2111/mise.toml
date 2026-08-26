@@ -1,0 +1,53 @@
+# drumstick-vpiano 2.11.1 as a wk node: `mise run build`.
+#
+# This plugin is a LEAF of plugins/qt. It does not build Qt itself, and unlike
+# plugins/qt-torrentfileeditor103 it does not build any extra Qt module either
+# -- drumstick needs nothing beyond the Core/Gui/Widgets already in
+# plugins/qt/sysroot. So the only prerequisite is plugins/qt's `build-qpa` task
+# (which itself depends on `build-qtbase` and `build-host`, both measured in
+# hours), and it is NOT expressed as a mise `depends` here: that would make a
+# repo-wide `mise run build-plugins` sweep silently start an hours-long Qt
+# build. build.sh's preflight names the missing piece instead, and the task
+# below self-skips.
+#
+# The build itself is a few minutes -- drumstick is small and the slow part is
+# the 21 MB Qt link.
+
+[tasks.build]
+description = "Build plugins/qt-drumstickvpiano2111/drumstick-vpiano.wasm (needs plugins/qt built)"
+dir = "{{config_root}}"
+# wasi-sdk comes from the root mise.toml [tools]; resolve it at task time
+# (`mise where` cannot be used in an [env] template -- it would recurse).
+# Self-skips rather than failing when plugins/qt has not been built, so a
+# repo-wide `mise run build-plugins` sweep is not blocked by a Qt tree nobody
+# asked for.
+run = """
+set -e
+if [ ! -f ../qt/sysroot/lib/libqwk.a ]; then
+  echo "qt-drumstickvpiano2111: needs the Qt port first."
+  echo "    cd ../qt && ./build-host.sh && ./build-qtbase.sh && ./build-qpa.sh"
+  echo "    (hours: see plugins/qt/PORTING.md). Skipping."
+  exit 0
+fi
+WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build.sh
+"""
+
+[tasks.test]
+description = "Run the node headless on wk's real runtime: click a key, hear it at a SECOND node"
+dir = "{{config_root}}/harness"
+# A standalone cargo project (plugins/ is excluded from the wk workspace). It
+# drives PluginHost the way the wk-server tests drive gfx-smoke and fluidsynth:
+# spawns BOTH the piano and the real plugins/fluidsynth synth, wires them with
+# the same router call a canvas "midi" connection makes, clicks a real piano
+# key with a real wasi:surface pointer event, and requires the SAME note number
+# to appear in the synth node's terminal. Then injects MIDI the other way and
+# checks the key lights up. Writes three frames to --dump.
+#
+# Needs plugins/fluidsynth built (cd ../../fluidsynth && ./build.sh) -- the
+# whole point is that the MIDI crosses a node boundary.
+#
+# Debug profile, deliberately: Cargo.toml optimizes DEPENDENCIES to opt-level 3
+# (wasmtime AOT-compiles the 21 MB component at node start, which is minutes at
+# opt-level 0) while leaving the harness itself unoptimized, exactly as the
+# root Cargo.toml does.
+run = "cargo run -- --dump {{config_root}}/logs"

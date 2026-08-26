@@ -1,0 +1,72 @@
+WHAT: guard the seven setAccessibleName()/setAccessibleDescription() calls in
+      KContextualHelpButton, KMessageWidget and KPasswordDialog on
+      QT_CONFIG(accessibility).
+WHY:  QT_FEATURE_accessibility is -1 in wk qtbase (qtgui-config.h), and
+      qwidget.h declares those two setters INSIDE `#if QT_CONFIG(accessibility)`
+      -- so the failure reads as "no member named setAccessibleName in
+      KContextualHelpButton", which points at the subclass rather than at the
+      feature. There is no AT-SPI bus, no UIAutomation and no VoiceOver behind
+      a wk node surface for the strings to reach. Every one of them exists
+      solely to be spoken by a screen reader, so nothing a sighted user can
+      observe changes. If wk ever grows an accessibility bridge, these guards
+      are the first thing to delete.
+UPSTREAM: as-is. QT_CONFIG(accessibility) is a legitimate Qt configuration and
+      guarding for it is a plain portability fix.
+diff --git a/src/kcontextualhelpbutton.cpp b/src/kcontextualhelpbutton.cpp
+index c462437..db74e66 100644
+--- a/src/kcontextualhelpbutton.cpp
++++ b/src/kcontextualhelpbutton.cpp
+@@ -65,7 +65,9 @@ KContextualHelpButtonPrivate::KContextualHelpButtonPrivate(KContextualHelpButton
+     // interface. Usually we start button labels with a verb, however the help text contained within this button will automatically be read by the screen
+     // reader without requiring additional user input. In this sense the label here is more of an announcement that the text read afterwards is help relevant
+     // to the current context.
++#if QT_CONFIG(accessibility)
+     q_ptr->setAccessibleName(QObject::tr("Contextual Help", "@action:button accessible name"));
++#endif
+     q_ptr->setAttribute(Qt::WidgetAttribute::WA_CustomWhatsThis); // Makes sure clicking this button in whatsThisMode triggers it instead of doing nothing.
+ 
+     auto popup = new QWidgetAction{q_ptr};
+@@ -94,7 +96,9 @@ void KContextualHelpButtonPrivate::setContextualHelpText(const QString &contextu
+         return;
+     }
+     q_ptr->setToolTip(contextualHelpText);
++#if QT_CONFIG(accessibility)
+     q_ptr->setAccessibleDescription(QTextDocumentFragment::fromHtml(contextualHelpText).toPlainText()); // Makes sure html tags aren't read out.
++#endif
+     m_popupLabel->setText(contextualHelpText);
+     Q_EMIT q_ptr->contextualHelpTextChanged(contextualHelpText);
+ }
+diff --git a/src/kmessagewidget.cpp b/src/kmessagewidget.cpp
+index 7a098ba..af5b933 100644
+--- a/src/kmessagewidget.cpp
++++ b/src/kmessagewidget.cpp
+@@ -282,6 +282,7 @@ void KMessageWidget::setMessageType(KMessageWidget::MessageType type)
+     d->messageType = type;
+     d->setPalette();
+ 
++#if QT_CONFIG(accessibility)
+     // The accessible names are announced like a title before the actual message of the box is read out.
+     switch (type) {
+     case KMessageWidget::Positive:
+@@ -296,6 +297,7 @@ void KMessageWidget::setMessageType(KMessageWidget::MessageType type)
+     case KMessageWidget::Error:
+         setAccessibleName(KMessageWidget::tr("Error", "accessible name of error-colored (e.g. red) message box"));
+     }
++#endif
+ }
+ 
+ QSize KMessageWidget::sizeHint() const
+diff --git a/src/kpassworddialog.cpp b/src/kpassworddialog.cpp
+index 702a511..77552d6 100644
+--- a/src/kpassworddialog.cpp
++++ b/src/kpassworddialog.cpp
+@@ -78,7 +78,9 @@ void KPasswordDialogPrivate::init()
+     ui.userEditContextHelpButton->setIcon(QIcon::fromTheme(QStringLiteral("help-contextual")));
+     ui.userEditContextHelpButton->setText(QString());
+     const QString description = QApplication::translate("KPasswordDialog", "Show Contextual Help");
++#if QT_CONFIG(accessibility)
+     ui.userEditContextHelpButton->setAccessibleName(description);
++#endif
+     ui.userEditContextHelpButton->setToolTip(description);
+     QObject::connect(ui.userEditContextHelpButton, &QPushButton::released, q, [this] {
+         QEvent ev(QEvent::WhatsThis);

@@ -1,0 +1,45 @@
+WHAT: a second component-type object on the link line, WK_CLIP_COMPONENT_TYPE,
+      for the wk:clipboard world.
+WHY:  the wk QPA plugin grew a QWkClipboard (plugins/qt/qpa/qwkclipboard.cpp),
+      so libqwk.a now contains the wk:clipboard C shim and QWkIntegration::
+      clipboard() references it. That makes the shim reachable from every app
+      linking libqwk.a, whether or not the app itself copies anything -- and
+      the wit-bindgen output deliberately references a symbol that only lives
+      in wkclipboard_component_type.o:
+
+        undefined symbol: __component_type_object_force_link_wkclipboard
+
+      so this is a hard link error, not a silently import-less component. Same
+      shape and same reasoning as WK_GFX_COMPONENT_TYPE right above it: an
+      OBJECT on the link line, never a library, because nothing references the
+      section it carries and an archive member would be dropped.
+UPSTREAM: no -- wk-specific, part of the same wk-node block patch 0002 adds.
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -473,6 +473,15 @@
+ set(WK_QPA_LIB "" CACHE FILEPATH "libqwk.a, the wk QPA plugin (plugins/qt/build-qpa.sh)")
+ set(WK_SVG_PLUGINS "" CACHE STRING "static qsvg plugin archives")
+ set(WK_GFX_COMPONENT_TYPE "" CACHE FILEPATH "gfx-compat gen/wkgfx_component_type.o")
++#   WK_CLIP_COMPONENT_TYPE gen/wkclipboard_component_type.o, the same thing for
++#                         the wk:clipboard world. It is NOT optional even
++#                         though this app never calls the clipboard shim
++#                         directly: libqwk.a contains QWkClipboard, which the
++#                         QPA plugin's clipboard() returns, so the shim is
++#                         always pulled out of the archive. Omitting the object
++#                         is an undefined-symbol error at link, not a silently
++#                         broken component.
++set(WK_CLIP_COMPONENT_TYPE "" CACHE FILEPATH "clipboard-compat gen/wkclipboard_component_type.o")
+ if(WK_QPA_LIB)
+   # FbSupportPrivate is not optional and not obvious: the wk QPA plugin IS
+   # fbconvenience -- QWkScreen derives from QFbScreen, QWkWindow from
+@@ -487,6 +496,9 @@
+ if(WK_GFX_COMPONENT_TYPE)
+   target_link_options(${EXE_NAME} PRIVATE "${WK_GFX_COMPONENT_TYPE}")
+ endif()
++if(WK_CLIP_COMPONENT_TYPE)
++  target_link_options(${EXE_NAME} PRIVATE "${WK_CLIP_COMPONENT_TYPE}")
++endif()
+ 
+ 
+ if(UNIX AND NOT APPLE)

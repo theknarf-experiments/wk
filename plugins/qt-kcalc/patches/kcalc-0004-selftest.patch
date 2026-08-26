@@ -1,0 +1,102 @@
+WHAT: with WK_KCALC_SELFTEST=1, narrate the result display (and the number of
+      visible top-level widgets) to stderr on every change.
+WHY:  so a headless harness can assert on something other than pixels.
+      "It links" is worth very little for this port, and a pixel histogram
+      proves only "something was painted" -- it cannot distinguish 42 from 43
+      without OCR. The claim worth making is that a real key event reached
+      KCalculator, went through KCalc own expression parser, was evaluated by
+      KNumber -- i.e. by GMP, MPFR and MPC, three autotools cross-builds that
+      nothing else in this port exercises -- and came back as the right number.
+      That is a STRING, so the app prints the string.
+      BOTH displays are narrated, because they are different widgets answering
+      different questions and only one of them is where typing lands:
+        input    KCalcInputDisplay, a QLineEdit -- the expression being typed
+        display  KCalcDisplay -- the RESULT, empty until the expression parses
+      A harness watching only `display` sees nothing at all while keys arrive
+      perfectly, which reads exactly like keys not arriving. (It did, on the
+      first run of the harness.)
+      `tops` is the count of visible top-level widgets: 1 is the KXmlGuiWindow,
+      more means a dialog is open. It is the cheapest way for a harness to tell
+      a modal settings dialog from the main window.
+      Guarded on __wasi__ AND on the environment variable, so a desktop build
+      of this tree is byte-for-byte unaffected and a wk node without the
+      variable prints nothing.
+UPSTREAM: no. This is ours, for testing, and not upstream business.
+diff --git a/kcalc.cpp b/kcalc.cpp
+index e0ff333..b3b0223 100644
+--- a/kcalc.cpp
++++ b/kcalc.cpp
+@@ -57,6 +57,62 @@ const int maxprecision = 1000;
+ // Name: KCalculator
+ // Desc: constructor
+ //------------------------------------------------------------------------------
++// --- wk selftest -----------------------------------------------------------
++// With WK_KCALC_SELFTEST=1 in the node's environment, narrate what the
++// calculator is SHOWING to stderr, which a wk node's log carries.
++//
++// WHY NARRATION AND NOT PIXELS. A harness can prove "something was painted"
++// from a histogram, and that is worth very little here: the interesting claim
++// is that a keystroke reached KCalculator through Qt's shortcut machinery,
++// went through KCalc's own expression parser, was evaluated by KNumber -- i.e.
++// by GMP, MPFR and MPC, three autotools cross-builds nothing else in this port
++// exercises -- and came back as a number. No arrangement of pixels
++// distinguishes 42 from 43 without OCR. So the app says what it is showing and
++// the harness asserts on the string.
++//
++// BOTH displays, because they are different widgets answering different
++// questions and only one of them is where typing lands:
++//   input   KCalcInputDisplay, a QLineEdit -- the expression being typed;
++//   display KCalcDisplay -- the RESULT, which stays empty until `=`.
++// A harness watching only `display` sees nothing at all while keys arrive
++// perfectly, which reads exactly like keys not arriving.
++// tops is the count of visible top-level widgets: 1 is the KXmlGuiWindow,
++// more means a dialog is open.
++//
++// Guarded on __wasi__ AND on the environment variable, so a desktop build of
++// this tree is byte-for-byte unaffected.
++#ifdef __wasi__
++#include <cstdio>
++static void wkSelftestInstall(QWidget *win, QLineEdit *input, KCalcDisplay *display)
++{
++    if (!qEnvironmentVariableIsSet("WK_KCALC_SELFTEST")) {
++        return;
++    }
++    auto say = [input, display]() {
++        int tops = 0;
++        const auto widgets = QApplication::topLevelWidgets();
++        for (const QWidget *w : widgets) {
++            if (w->isVisible()) {
++                ++tops;
++            }
++        }
++        std::fprintf(stderr,
++                     "STATE input='%s' display='%s' tops=%d\n",
++                     qUtf8Printable(input->text()),
++                     qUtf8Printable(display->text()),
++                     tops);
++        std::fflush(stderr);
++    };
++    QObject::connect(input, &QLineEdit::textChanged, win, [say](const QString &) {
++        say();
++    });
++    QObject::connect(display, &KCalcDisplay::changedText, win, [say](const QString &) {
++        say();
++    });
++    say();
++}
++#endif
++
+ KCalculator::KCalculator(QWidget *parent)
+     : KXmlGuiWindow(parent)
+     , m_memoryNum(0.0)
+@@ -151,6 +207,10 @@ KCalculator::KCalculator(QWidget *parent)
+     m_isStillInLaunch = false;
+ 
+     calc_display->setFocus();
++
++#ifdef __wasi__
++    wkSelftestInstall(this, input_display, calc_display);
++#endif
+ }
+ 
+ //------------------------------------------------------------------------------

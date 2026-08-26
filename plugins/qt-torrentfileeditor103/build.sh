@@ -79,6 +79,7 @@ QTPLUGIN="$PWD/../qt"                 # the shared Qt port: qtbase + the wk QPA
 QTBASE_SYSROOT="$QTPLUGIN/sysroot"
 HOST_PREFIX="${QT_HOST_PATH:-$QTPLUGIN/host}"
 GFXCOMPAT="$PWD/../gfx-compat"
+CLIPCOMPAT="$PWD/../clipboard-compat"
 
 SRCDIR="$PWD/src"
 TARBALLS="$PWD/tarballs"
@@ -309,6 +310,11 @@ EOF
     # bindings themselves are already objects inside libqwk.a.
     echo "=== wit-bindgen (wkgfx world)"
     wit-bindgen c --world wkgfx "$GFXCOMPAT/wit" --out-dir "$GEN" >/dev/null
+    # ...and wk:clipboard, for the same reason: libqwk.a carries QWkClipboard
+    # and the clipboard shim, so this app links their component-type object
+    # whether or not it ever copies anything. See patches/*-0006-wk-clipboard.
+    echo "=== wit-bindgen (wkclipboard world)"
+    wit-bindgen c --world wkclipboard "$CLIPCOMPAT/wit" --out-dir "$GEN" >/dev/null
 
     fetch_app
     apply_patches "$TFE_SRC" torrent-file-editor
@@ -338,6 +344,7 @@ EOF
             -DWK_QPA_LIB="$QTBASE_SYSROOT/lib/libqwk.a" \
             -DWK_SVG_PLUGINS="$SYSROOT/plugins/imageformats/libqsvg.a;$SYSROOT/plugins/iconengines/libqsvgicon.a" \
             -DWK_GFX_COMPONENT_TYPE="$GEN/wkgfx_component_type.o" \
+            -DWK_CLIP_COMPONENT_TYPE="$GEN/wkclipboard_component_type.o" \
             -DWK_FONTS_QRC="$FONTDIR/wkfonts.qrc" \
             2>&1 | tee "$LOG"
     else

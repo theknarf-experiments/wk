@@ -1,0 +1,35 @@
+WHAT: guard KMessageBox FrameworkIntegrationPlugin lookup on
+      QT_CONFIG(library).
+WHY:  FEATURE_library=OFF (wasm has no dlopen) leaves QPluginLoader with only
+      its static half, so `lib.instance()` does not compile. The fallback this
+      would have skipped is already right there: both interfaces drop through
+      to the Q_GLOBAL_STATIC defaults immediately below, which is exactly what
+      happens on a stock desktop that has no frameworkintegration installed.
+      Nothing is lost that a wk node could have had -- Plasma integration is
+      not part of this graph.
+UPSTREAM: as-is. Same shape as the guard KCoreAddons needed.
+diff --git a/src/kmessagebox_p.cpp b/src/kmessagebox_p.cpp
+index c012434..b0e005b 100644
+--- a/src/kmessagebox_p.cpp
++++ b/src/kmessagebox_p.cpp
+@@ -98,12 +98,20 @@ static void loadKMessageBoxPlugin()
+     if (!triedLoadingPlugin) {
+         triedLoadingPlugin = true;
+ 
++#if QT_CONFIG(library)
++        // wk's qtbase is FEATURE_library=OFF (wasm has no dlopen), so this
++        // half of QPluginLoader does not exist. FrameworkIntegrationPlugin is
++        // Plasma's integration point and is not part of KCalc's graph anyway;
++        // both interfaces fall through to the Q_GLOBAL_STATIC defaults right
++        // below, which is exactly what happens on a stock desktop without
++        // frameworkintegration installed.
+         QPluginLoader lib(QStringLiteral("kf6/FrameworkIntegrationPlugin"));
+         QObject *rootObj = lib.instance();
+         if (rootObj) {
+             s_dontAskAgainInterface = rootObj->property(KMESSAGEBOXDONTASKAGAIN_PROPERTY).value<KMessageBoxDontAskAgainInterface *>();
+             s_notifyInterface = rootObj->property(KMESSAGEBOXNOTIFY_PROPERTY).value<KMessageBoxNotifyInterface *>();
+         }
++#endif
+     }
+     if (!s_dontAskAgainInterface) {
+         s_dontAskAgainInterface = s_defaultDontAskAgainInterface;

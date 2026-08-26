@@ -1,0 +1,26 @@
+# A STANDALONE cargo project, on purpose.
+#
+# The wk workspace excludes plugins/ (`exclude = ["plugins"]` in the root
+# Cargo.toml), so this builds and locks on its own and adding it costs the
+# workspace nothing. It exists because the only honest way to test a wk node is
+# to run it on wk's real runtime — the same PluginHost the daemon uses — and
+# the alternative (another #[test] in crates/wk-server/src/plugin.rs) would
+# mean editing a shared file that several other Qt ports are being written
+# against at the same time. Same shape as
+# plugins/qt-torrentfileeditor103/harness.
+[package]
+name = "kcalc-harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+wk-server = { path = "../../../crates/wk-server" }
+wk-protocol = { path = "../../../crates/wk-protocol" }
+
+# wasmtime AOT-compiles the 25 MB component when the node starts; at
+# opt-level 0 that takes minutes. Same reasoning as the root Cargo.toml.
+[profile.dev.package."*"]
+opt-level = 3

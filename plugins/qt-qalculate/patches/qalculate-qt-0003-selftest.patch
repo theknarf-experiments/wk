@@ -1,0 +1,133 @@
+WHAT: WK_QALC_SELFTEST=1 makes the app narrate itself on stdout -- platform,
+      style, font-family count, screen size, then a repeating STATE line (the
+      expression editor's text, the most recent history result, the number of
+      visible top-levels, whether a popup is up, the focused widget's class)
+      and an EXPREDIT line with the expression editor's rect in surface
+      coordinates. STATE also carries `hist` -- the size of
+      settings->expression_history, which only grows when an expression is
+      COMMITTED with Return -- and `last`, its most recent entry.
+WHY:  TEST SCAFFOLDING, and the only kind that catches what matters here. A
+      headless harness can read pixels, but for a CALCULATOR a luminance
+      histogram cannot tell a rendered empty keypad from a rendered ANSWER.
+      The `result` field comes out of HistoryView, i.e. out of libqalculate
+      through the whole parse -> evaluate -> print -> display path, so it is
+      the only way to assert that the node actually COMPUTED -- which is the
+      claim patches/libqalculate-0002 exists to make true, and which would
+      otherwise read as the literal string "aborted" in a frame that still
+      looks perfectly healthy.
+      EXPREDIT is what lets the harness aim a genuine wasi:surface pointer
+      event at the expression editor and then type into it with genuine key
+      events. Published on a repeating timer, not once: the wk QPA forces the
+      first top-level to the full surface a few frames in, so a rect read at
+      singleShot(0) predates that resize and aiming at it misses. The repeat
+      doubles as the only evidence that QTimer deadlines survive being folded
+      into the frame wait.
+      `hist`/`last` exist because qalculate AUTO-CALCULATES as you type: the
+      answer to a half-typed expression appears in the history view without
+      anyone pressing anything, so `result` alone cannot distinguish "the live
+      preview updated" from "Return committed the calculation". The expression
+      history is the app's own record of the latter.
+      `popup` is reported because ExpressionEdit's completion list is a real
+      popup window and Enter ACCEPTS a completion instead of calculating when
+      one is showing (expressionedit.cpp:2052) -- a harness that did not know
+      that would misread the result.
+UPSTREAM: no. This is ours, for testing, and it is #ifdef __wasi__ so a
+      desktop build of this tree does not contain it. Upstream would rightly
+      want a QTest, which cannot run here (FEATURE_testlib=OFF, and a wasip2
+      component has no test harness).
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -50,6 +50,15 @@
+ Q_IMPORT_PLUGIN(QWkIntegrationPlugin)
+ Q_IMPORT_PLUGIN(QSvgPlugin)
+ Q_IMPORT_PLUGIN(QSvgIconPlugin)
++
++// for the WK_QALC_SELFTEST narration further down
++#include <QFontDatabase>
++#include <QScreen>
++#include <QStyle>
++#include <QTimer>
++#include <cstdio>
++#include "expressionedit.h"
++#include "historyview.h"
+ #endif
+ 
+ #ifdef _WIN32
+@@ -351,6 +360,77 @@ int main(int argc, char **argv) {
+ 
+ 	if(!settings->use_custom_app_font) win->loadInitialHistory();
+ 
++#ifdef __wasi__
++	// --- wk selftest -------------------------------------------------------
++	// WK_QALC_SELFTEST=1 makes the app narrate itself on stdout so a headless
++	// harness can check more than a pixel histogram. "The frame is not blank"
++	// proves almost nothing for a calculator: a rendered empty keypad and a
++	// rendered ANSWER look identical to a luminance count. These lines come
++	// out of HistoryView, i.e. out of libqalculate through the printing path,
++	// so they are the only way to assert that the node actually COMPUTED
++	// something -- which is the claim the libqalculate thread patch exists to
++	// make true, and whose failure mode is the literal string "aborted" in a
++	// frame that still looks perfectly healthy.
++	//
++	// EXPREDIT publishes the expression editor's rect in surface coordinates
++	// so the harness can aim a genuine wasi:surface pointer event at it and
++	// then type with genuine key events. Repeating rather than one-shot,
++	// deliberately: the wk QPA forces the first top-level to the full surface
++	// a few frames in, so any rect read at singleShot(0) is the pre-resize one
++	// and aiming at it misses. The repeat doubles as the only evidence that
++	// QTimer deadlines survive being folded into the frame wait.
++	if(qEnvironmentVariableIntValue("WK_QALC_SELFTEST") == 1) {
++		std::printf("QALC platform=%s style=%s families=%lld\n",
++			qPrintable(QApplication::platformName()),
++			qPrintable(QApplication::style()->objectName()),
++			(long long) QFontDatabase::families().size());
++		if(QScreen *sc = QApplication::primaryScreen()) {
++			std::printf("QALC screen=%dx%d\n", sc->geometry().width(), sc->geometry().height());
++		}
++		std::fflush(stdout);
++
++		QTimer *report = new QTimer(win);
++		QObject::connect(report, &QTimer::timeout, [win]() {
++			ExpressionEdit *ee = win->findChild<ExpressionEdit*>();
++			HistoryView *hv = win->findChild<HistoryView*>();
++			// The last non-empty line of the history view IS the most recent
++			// result: HistoryView renders each entry as the expression
++			// followed by its answer.
++			QString result;
++			if(hv) {
++				const QStringList lines = hv->toPlainText().split('\n');
++				for(int i = lines.size() - 1; i >= 0; i--) {
++					if(!lines.at(i).trimmed().isEmpty()) {result = lines.at(i).trimmed(); break;}
++				}
++			}
++			int tops = 0;
++			for(QWidget *tl : QApplication::topLevelWidgets()) {
++				if(tl->isVisible()) tops++;
++			}
++			// `hist` is settings->expression_history, which ExpressionEdit
++			// ::addToHistory() only ever touches when an expression is
++			// COMMITTED -- it is the difference between "qalculate
++			// auto-calculated what you were typing" (which it does, live, on
++			// every keystroke) and "you pressed Return". Its front element is
++			// the most recently committed expression.
++			std::printf("STATE expr='%s' result='%s' hist=%d last='%s' tops=%d popup=%d focus='%s'\n",
++				ee ? qPrintable(ee->toPlainText()) : "",
++				qPrintable(result),
++				(int) settings->expression_history.size(),
++				settings->expression_history.empty() ? "" : settings->expression_history.front().c_str(),
++				tops,
++				QApplication::activePopupWidget() ? 1 : 0,
++				QApplication::focusWidget() ? QApplication::focusWidget()->metaObject()->className() : "");
++			if(ee) {
++				const QRect r(ee->mapToGlobal(QPoint(0, 0)), ee->size());
++				std::printf("EXPREDIT %d %d %d %d\n", r.x(), r.y(), r.width(), r.height());
++			}
++			std::fflush(stdout);
++		});
++		report->start(250);
++	}
++#endif
++
+ 	return app.exec();
+ 
+ }

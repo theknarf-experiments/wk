@@ -1,0 +1,959 @@
+WHAT: add a Drumstick RT backend pair, `wk-in` and `wk-out`, over the wk
+      runtime's `wk:midi/midi` port, plus the `wk-common` glue that both halves
+      share; build them on CMAKE_SYSTEM_NAME=WASI; and give BackendManager a
+      Q_OS_WASI arm so "wk" is the default backend name.
+WHY:  this is the port. Everything else here is build plumbing; this patch is
+      the reason the node can exchange MIDI with another node at all.
+
+      Drumstick reaches MIDI hardware through plugins that implement MIDIInput
+      and MIDIOutput. On this platform every backend upstream ships is gated
+      off -- ALSA is Linux, mac/win are the wrong OS, OSS wants `UNIX` (which
+      CMake's Platform/WASI.cmake does not set), FluidSynth/Sonivox/PulseAudio
+      are absent, and the Network one is QUdpSocket over multicast -- so
+      drumstick builds ZERO backends and BackendManager finds nothing. These
+      two are what a wk node actually has: one inbox and one outbox, wired to
+      other nodes by drawing a "midi" connection on the canvas.
+
+      THE INTERESTING PART IS THE INPUT PUMP, and it is the constraint that
+      shaped the whole port. Every other Drumstick input backend either blocks
+      a QThread on a device (alsa-in) or hangs a QSocketNotifier off a
+      descriptor (net-in, oss-in). Neither exists here: this Qt is built
+      FEATURE_thread=OFF, and `wk:midi/midi` has no descriptor and no pollable
+      -- `input.receive()` is a non-blocking pop off a host-side queue. So
+      wk-in polls, on a 1 ms Qt::PreciseTimer, which is not the "paper over it
+      with a QTimer" anti-pattern plugins/qt/PORTING.md forbids: that rule is
+      about a descriptor that HAS a pollable and wants a notifier. Polling is
+      the only mechanism this interface offers, it is what every existing wk
+      MIDI guest does (plugins/fluidsynth, arp, synth), and the timer only
+      shortens a poll QWkEventDispatcher was making anyway -- it already folds
+      m_timers.timerWait() into the frame wait. WK_MIDI_POLL_MS overrides it.
+
+      The bytes go straight into drumstick's own rt-backends/common/
+      midiparser.cpp, which is COMPILED IN exactly as net-in and oss-in compile
+      it in. That parser emits all ten MIDIInput signals and implements
+      MIDI-thru, so these backends contain no MIDI parsing whatsoever.
+
+      wk-common exists because wk-in and wk-out are two plugins over ONE pair
+      of wk:midi resources, which the shim holds in file statics: compiling the
+      shim into both archives would both duplicate its symbols at link time and
+      give each plugin its own half-opened resource.
+
+      The BackendManager hunk is the difference between working and qFatal.
+      Q_OS_WASI is granted Q_OS_UNIX by fallthrough (plugins/qt/patches/
+      qtbase-0002-wasi-system-detection.patch), so without a wk arm placed
+      BEFORE it the defaults are {"FluidSynth","OSS"} -- neither of which is in
+      this binary -- and VPiano::initialize() dies at "Unable to find a
+      suitable output backend."
+UPSTREAM: not-as-is, and that is the right answer rather than a hedge: a
+      backend for one specific runtime belongs upstream only if that runtime
+      is something upstream wants to carry. The SHAPE, though, is entirely
+      theirs -- these files are net-in/net-out with Qt::Network swapped out,
+      down to the QT_STATICPLUGIN arm and the moc -I. Nothing in drumstick had
+      to change to accept them except the two dispatch points above.
+diff --git a/library/rt-backends/CMakeLists.txt b/library/rt-backends/CMakeLists.txt
+index c0853fa..fb49045 100644
+--- a/library/rt-backends/CMakeLists.txt
++++ b/library/rt-backends/CMakeLists.txt
+@@ -56,3 +56,28 @@ endif()
+ if(HAVE_FLUIDSYNTH)
+     add_subdirectory(fluidsynth)
+ endif()
++
++# --- wk ---------------------------------------------------------------------
++# MIDI in and out over the wk runtime's `wk:midi/midi` port -- a wk node's one
++# MIDI inbox and outbox, wired to other nodes by drawing a "midi" connection on
++# the canvas. wk-common holds the shim both halves share.
++#
++# On this platform every gate above is false: CMake's Platform/WASI.cmake sets
++# only WASI, so UNIX is empty and the OSS arm is skipped; CMAKE_SYSTEM_NAME is
++# neither Darwin nor Windows; and ALSA/PulseAudio/Sonivox/FluidSynth/Network
++# are all off for a wasm32-wasip2 build. So drumstick would otherwise build
++# ZERO backends and BackendManager would find nothing at all.
++# STREQUAL, and NOT the `if(${CMAKE_SYSTEM_NAME} MATCHES ...)` form the Darwin
++# and Windows arms above use. That is a trap, not a style preference:
++# `${CMAKE_SYSTEM_NAME}` expands to the bare word WASI, CMake treats an
++# unquoted MATCHES operand as a VARIABLE NAME when one exists, and
++# Platform/WASI.cmake defines `set(WASI 1)` -- so the test silently becomes
++# `if(1 MATCHES "WASI")`, which is false. The backends are then skipped with no
++# warning at all, the app still links, and the first sign of trouble is
++# qFatal("Unable to find a suitable input backend") at runtime. Darwin and
++# Windows are safe only because no variable of those names happens to exist.
++if(CMAKE_SYSTEM_NAME STREQUAL "WASI")
++    add_subdirectory(wk-common)
++    add_subdirectory(wk-in)
++    add_subdirectory(wk-out)
++endif()
+diff --git a/library/rt-backends/wk-common/CMakeLists.txt b/library/rt-backends/wk-common/CMakeLists.txt
+new file mode 100644
+index 0000000..e924b16
+--- /dev/null
++++ b/library/rt-backends/wk-common/CMakeLists.txt
+@@ -0,0 +1,43 @@
++# The wk:midi shim, compiled ONCE for both wk backends.
++#
++# wk-in and wk-out are two Drumstick plugins over ONE node port pair, and the
++# shim (plugins/qt-drumstickvpiano2111/shim/wkmidiio.c plus the wit-bindgen
++# output beside it) keeps the wk:midi input and output resources in the same
++# file-static struct. Compiling those sources into both plugin archives would
++# therefore be wrong twice over: the linker would see wkmidi_send defined in
++# two objects that are both pulled in, and even if it did not, the two copies
++# would each hold their own half-opened resource.
++#
++# Hence a third target. It is deliberately NOT installed or exported: it is
++# wk's, not drumstick's, and the wk build never runs `cmake --install` on this
++# tree -- the app is linked from the same build directory.
++#
++#   WK_MIDI_SHIM_SRCS      shim/wkmidiio.c + gen/wkmidi.c (build.sh regenerates
++#                          the latter from ../midi-compat/wit every build)
++#   WK_MIDI_SHIM_INCLUDES  the directories holding wkmidiio.h and the generated
++#                          wkmidi.h
++#
++# Note what is NOT here: gen/wkmidi_component_type.o. That object carries only
++# a `component-type` custom section and nothing references it, so as an archive
++# member the linker drops it and the component ends up with no wk:midi import
++# at all. It has to reach the final link as a LINK OPTION -- utils/vpiano does
++# that, via WK_MIDI_COMPONENT_TYPE.
++# Drumstick's project() declares `LANGUAGES CXX`, so a target made only of .c
++# files leaves CMake with nothing to link with: "CMake can not determine linker
++# language for target". Enabling C here rather than editing the top-level
++# project() keeps the change inside the wk subtree. Compiling these two files
++# as C++ instead would be the wrong fix -- the generated bindings use C
++# compound literals.
++enable_language(C)
++
++set(WK_MIDI_SHIM_SRCS "" CACHE STRING "C sources of the wk:midi shim + its wit-bindgen output")
++set(WK_MIDI_SHIM_INCLUDES "" CACHE STRING "include dirs for wkmidiio.h and the generated wkmidi.h")
++
++if(NOT WK_MIDI_SHIM_SRCS)
++    message(FATAL_ERROR "wk backends need -DWK_MIDI_SHIM_SRCS=... (see plugins/qt-drumstickvpiano2111/build.sh)")
++endif()
++
++add_library(drumstick-rt-wk-shim STATIC ${WK_MIDI_SHIM_SRCS})
++
++# PUBLIC: wk-in and wk-out include wkmidiio.h themselves.
++target_include_directories(drumstick-rt-wk-shim PUBLIC ${WK_MIDI_SHIM_INCLUDES})
+diff --git a/library/rt-backends/wk-common/wkconnection.h b/library/rt-backends/wk-common/wkconnection.h
+new file mode 100644
+index 0000000..1e79890
+--- /dev/null
++++ b/library/rt-backends/wk-common/wkconnection.h
+@@ -0,0 +1,48 @@
++/*
++    Drumstick RT backend for the wk runtime's wk:midi port (shared bit)
++    Copyright (C) 2026 the wk project
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 3 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program. If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#ifndef WKCONNECTION_H
++#define WKCONNECTION_H
++
++#include <drumstick/rtmidioutput.h> // for MIDIConnection
++
++namespace drumstick {
++namespace rt {
++
++/**
++ * The single MIDI port a wk node has, reported identically by the input and
++ * the output backend so that a Connections dialog reads as one device rather
++ * than two coincidences.
++ *
++ * Inline, in a header both plugins include, rather than a static on either
++ * class: wk-in and wk-out are separate static archives and neither should
++ * have to be linked to get the other's name.
++ *
++ * The name is deliberately self-explanatory. The dialog will list exactly ONE
++ * port, which looks like a broken driver until the name says what it is --
++ * the port is not a device, it is this node's edge on the wk canvas, and
++ * where its bytes go is decided by the wires drawn there.
++ */
++inline MIDIConnection wkConnection()
++{
++    return MIDIConnection(QStringLiteral("wk fabric"), QStringLiteral("wk"));
++}
++
++}} // namespace drumstick::rt
++
++#endif // WKCONNECTION_H
+diff --git a/library/rt-backends/wk-in/CMakeLists.txt b/library/rt-backends/wk-in/CMakeLists.txt
+new file mode 100644
+index 0000000..2b9b176
+--- /dev/null
++++ b/library/rt-backends/wk-in/CMakeLists.txt
+@@ -0,0 +1,42 @@
++# The wk:midi input backend. net-in/CMakeLists.txt with Qt::Network swapped for
++# the wk:midi shim; see wk-out/CMakeLists.txt for why QT_STATICPLUGIN is the
++# line that matters.
++#
++# ../common/midiparser.{h,cpp} is COMPILED IN here, the same way net-in and
++# oss-in compile it in, rather than reimplemented: it is drumstick's own MIDI
++# byte-stream state machine, it emits all ten MIDIInput signals, and it
++# implements MIDI-thru. This backend therefore contains no MIDI parsing of its
++# own at all. It is moc'd as well as compiled because MIDIParser is a QObject.
++
++set(CMAKE_INCLUDE_CURRENT_DIR ON)
++
++set(drumstick-rt-wk-in_QTOBJ_SRCS
++    ../common/midiparser.h
++    wkmidiinput.h
++)
++
++set(drumstick-rt-wk-in_SRCS
++    ../common/midiparser.cpp
++    wkmidiinput.cpp
++)
++
++qt_wrap_cpp(drumstick-rt-wk-in_MOC_SRCS ${drumstick-rt-wk-in_QTOBJ_SRCS}
++    OPTIONS -I ${Drumstick_SOURCE_DIR}/library/include)
++
++add_library(drumstick-rt-wk-in STATIC
++    ${drumstick-rt-wk-in_MOC_SRCS}
++    ${drumstick-rt-wk-in_SRCS})
++
++target_compile_definitions(drumstick-rt-wk-in PRIVATE QT_STATICPLUGIN)
++
++target_include_directories(drumstick-rt-wk-in PRIVATE
++    ${Drumstick_SOURCE_DIR}/library/include
++    ../common
++    ../wk-common)
++
++target_link_libraries(drumstick-rt-wk-in PRIVATE
++    Qt${QT_VERSION_MAJOR}::Core
++    Drumstick::RT
++    drumstick-rt-wk-shim)
++
++# No install(): see wk-out/CMakeLists.txt.
+diff --git a/library/rt-backends/wk-in/wkmidiinput.cpp b/library/rt-backends/wk-in/wkmidiinput.cpp
+new file mode 100644
+index 0000000..b4cc0bd
+--- /dev/null
++++ b/library/rt-backends/wk-in/wkmidiinput.cpp
+@@ -0,0 +1,199 @@
++/*
++    Drumstick RT backend for the wk runtime's wk:midi port (input half)
++    Copyright (C) 2026 the wk project
++
++    Modelled on drumstick's own rt-backends/dummy-in and net-in, which are
++    Copyright (C) 2009-2026 Pedro Lopez-Cabanillas <plcl@users.sf.net>.
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 3 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program. If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#include "wkmidiinput.h"
++#include "wkconnection.h"
++#include "midiparser.h"
++
++#include <QByteArray>
++#include <QTimerEvent>
++#include <QtGlobal>
++
++extern "C" {
++#include "wkmidiio.h"
++}
++
++namespace drumstick {
++namespace rt {
++
++// How often the pump runs, in milliseconds. 1 ms is the default because it is
++// below the threshold where a played note feels late (human timing is ±10 ms)
++// and because the poll it shortens is one the event dispatcher was making
++// anyway. Raise it from the node's environment on a machine where the extra
++// wakeups matter -- the cost is latency, not correctness, and 0 disables the
++// pump entirely, which is useful for proving that a test is really watching
++// the input path.
++static int pollIntervalMs()
++{
++    bool ok = false;
++    const int ms = qEnvironmentVariableIntValue("WK_MIDI_POLL_MS", &ok);
++    return ok ? qBound(0, ms, 1000) : 1;
++}
++
++WkMIDIInput::WkMIDIInput(QObject *parent)
++    : MIDIInput(parent)
++    , m_publicName(QStringLiteral("MIDI In"))
++    , m_parser(new MIDIParser(this, this))
++    , m_thru(false)
++    , m_timerId(0)
++{
++}
++
++WkMIDIInput::~WkMIDIInput()
++{
++    close();
++}
++
++void WkMIDIInput::initialize(QSettings *settings)
++{
++    Q_UNUSED(settings)
++    // Nothing to configure: what feeds this node's inbox is a "midi" wire on
++    // the wk canvas, not a setting inside the guest.
++}
++
++QString WkMIDIInput::backendName()
++{
++    return QStringLiteral("wk");
++}
++
++QString WkMIDIInput::publicName()
++{
++    return m_publicName;
++}
++
++void WkMIDIInput::setPublicName(QString name)
++{
++    m_publicName = name;
++}
++
++QList<MIDIConnection> WkMIDIInput::connections(bool advanced)
++{
++    Q_UNUSED(advanced)
++    // The same single port the output half reports, and named identically, so
++    // the Connections dialog reads as one device rather than two coincidences.
++    return QList<MIDIConnection>{wkConnection()};
++}
++
++void WkMIDIInput::setExcludedConnections(QStringList conns)
++{
++    Q_UNUSED(conns)
++}
++
++void WkMIDIInput::open(const MIDIConnection &conn)
++{
++    Q_UNUSED(conn)
++    wkmidi_open_in();
++    m_currentConnection = wkConnection();
++    if (m_timerId == 0) {
++        const int ms = pollIntervalMs();
++        if (ms > 0) {
++            // PreciseTimer: a CoarseTimer is allowed to drift by 5% of its
++            // interval, which at 1 ms Qt rounds into "whenever", and the
++            // whole point of the interval is that it is short.
++            m_timerId = startTimer(ms, Qt::PreciseTimer);
++        }
++    }
++}
++
++void WkMIDIInput::close()
++{
++    if (m_timerId != 0) {
++        killTimer(m_timerId);
++        m_timerId = 0;
++    }
++    // As in wk-out: the wk:midi resource itself is the node's and outlives
++    // this object. Stopping the pump is the whole of "closed".
++    m_currentConnection = MIDIConnection();
++}
++
++MIDIConnection WkMIDIInput::currentConnection()
++{
++    return m_currentConnection;
++}
++
++void WkMIDIInput::setMIDIThruDevice(MIDIOutput *device)
++{
++    // Thru is implemented by the parser, not here: it forwards each decoded
++    // message to this device before emitting the corresponding signal, so
++    // enabling it costs this class nothing (see
++    // rt-backends/common/midiparser.cpp, which checks isEnabledMIDIThru()).
++    m_parser->setMIDIThruDevice(device);
++}
++
++void WkMIDIInput::enableMIDIThru(bool enable)
++{
++    m_thru = enable;
++}
++
++bool WkMIDIInput::isEnabledMIDIThru()
++{
++    return m_thru;
++}
++
++void WkMIDIInput::timerEvent(QTimerEvent *event)
++{
++    if (event->timerId() != m_timerId) {
++        MIDIInput::timerEvent(event);
++        return;
++    }
++
++    // Drain the WHOLE queue each tick, not one message. The host bounds the
++    // inbox at 1024 messages and silently drops beyond it
++    // (crates/wk-server/src/midi.rs), and the most visible symptom of a drop
++    // is a stuck note -- a note-off that never arrived. A burst (a chord, a
++    // sysex dump, a sequencer starting) must therefore never be spread across
++    // ticks. The bound is the queue emptying, so this terminates.
++    uint8_t msg[WKMIDI_MAX_MSG];
++    int n;
++    while ((n = wkmidi_recv(msg, sizeof msg)) > 0) {
++        // MIDIParser::parse(QByteArray) runs the same state machine as the
++        // byte-at-a-time overload, so a message split across wk:midi sends
++        // (which the interface permits) still decodes correctly.
++        m_parser->parse(QByteArray(reinterpret_cast<const char *>(msg), n));
++    }
++}
++
++// --- the Q_PROPERTY answers vpiano reads -----------------------------------
++
++QStringList WkMIDIInput::getDiagnostics()
++{
++    return QStringList();
++}
++
++QString WkMIDIInput::getLibVersion()
++{
++    return QT_STRINGIFY(VERSION);
++}
++
++bool WkMIDIInput::getStatus()
++{
++    // A node's inbox always exists; nothing here can fail to open. vpiano
++    // prints the diagnostics list when this is false, so returning true and
++    // an empty list is the consistent pair.
++    return true;
++}
++
++bool WkMIDIInput::getConfigurable()
++{
++    return false;
++}
++
++}} // namespace drumstick::rt
+diff --git a/library/rt-backends/wk-in/wkmidiinput.h b/library/rt-backends/wk-in/wkmidiinput.h
+new file mode 100644
+index 0000000..e0688b4
+--- /dev/null
++++ b/library/rt-backends/wk-in/wkmidiinput.h
+@@ -0,0 +1,114 @@
++/*
++    Drumstick RT backend for the wk runtime's wk:midi port (input half)
++    Copyright (C) 2026 the wk project
++
++    Modelled on drumstick's own rt-backends/dummy-in and net-in, which are
++    Copyright (C) 2009-2026 Pedro Lopez-Cabanillas <plcl@users.sf.net>.
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 3 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program. If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#ifndef WKMIDIINPUT_H
++#define WKMIDIINPUT_H
++
++#include <QObject>
++#include <drumstick/rtmidiinput.h>
++
++namespace drumstick {
++namespace rt {
++
++class MIDIParser;
++
++/**
++ * @brief MIDI input over wk's `wk:midi/midi` input resource.
++ *
++ * WHY THERE IS NO THREAD, AND NO SOCKET NOTIFIER.
++ *
++ * Every other Drumstick input backend either blocks a thread on a device
++ * (alsa-in runs a QThread over snd_seq_event_input) or hangs a QSocketNotifier
++ * off a descriptor (net-in, oss-in). Neither is available here:
++ *
++ *   * this Qt is built FEATURE_thread=OFF, so a QThread would link and never
++ *     run -- there is exactly one thread and it is the one painting;
++ *   * `wk:midi/midi` has no descriptor and no pollable. Its input resource is
++ *     `receive: func() -> option<list<u8>>`, a non-blocking pop off a queue
++ *     the host owns (crates/wk-server/src/midi.rs). There is nothing to give
++ *     the QPA's one wasi:io/poll call to wait on.
++ *
++ * So this backend polls, on a Qt::PreciseTimer. That is NOT the "wrap the
++ * missing capability in a QTimer" anti-pattern the wk Qt port forbids
++ * elsewhere -- that rule is about a descriptor that HAS a pollable and wants
++ * a socket notifier. Polling is the only mechanism this interface offers, and
++ * it is what every existing wk MIDI guest already does (plugins/fluidsynth,
++ * plugins/arp, plugins/synth). The interval is settable from the environment
++ * (WK_MIDI_POLL_MS, default 1) and costs one extra deadline on a poll the
++ * dispatcher was going to make anyway: QWkEventDispatcher already folds
++ * m_timers.timerWait() into the frame wait, so a running timer only shortens
++ * a block that already existed.
++ *
++ * The bytes themselves are handed straight to drumstick's own MIDIParser,
++ * which emits all ten MIDIInput signals and implements MIDI-thru. This class
++ * parses nothing.
++ */
++class WkMIDIInput : public MIDIInput
++{
++    Q_OBJECT
++    Q_PLUGIN_METADATA(IID "net.sourceforge.drumstick.rt.MIDIInput/2.0")
++    Q_INTERFACES(drumstick::rt::MIDIInput)
++    Q_PROPERTY(QStringList diagnostics READ getDiagnostics)
++    Q_PROPERTY(QString libversion READ getLibVersion)
++    Q_PROPERTY(bool status READ getStatus)
++    Q_PROPERTY(bool isconfigurable READ getConfigurable)
++
++public:
++    explicit WkMIDIInput(QObject *parent = nullptr);
++    virtual ~WkMIDIInput();
++
++    // MIDIInput interface
++public:
++    void initialize(QSettings *settings) override;
++    QString backendName() override;
++    QString publicName() override;
++    void setPublicName(QString name) override;
++    QList<MIDIConnection> connections(bool advanced) override;
++    void setExcludedConnections(QStringList conns) override;
++    void open(const MIDIConnection &conn) override;
++    void close() override;
++    MIDIConnection currentConnection() override;
++
++    void setMIDIThruDevice(MIDIOutput *device) override;
++    void enableMIDIThru(bool enable) override;
++    bool isEnabledMIDIThru() override;
++
++protected:
++    /** The pump. Drains the node's inbox into the parser; see the class
++     *  comment for why this is a timer and not a notifier. */
++    void timerEvent(QTimerEvent *event) override;
++
++private:
++    QStringList getDiagnostics();
++    QString getLibVersion();
++    bool getStatus();
++    bool getConfigurable();
++
++    QString m_publicName;
++    MIDIConnection m_currentConnection;
++    MIDIParser *m_parser;
++    bool m_thru;
++    int m_timerId;
++};
++
++}} // namespace drumstick::rt
++
++#endif // WKMIDIINPUT_H
+diff --git a/library/rt-backends/wk-out/CMakeLists.txt b/library/rt-backends/wk-out/CMakeLists.txt
+new file mode 100644
+index 0000000..c21d791
+--- /dev/null
++++ b/library/rt-backends/wk-out/CMakeLists.txt
+@@ -0,0 +1,46 @@
++# The wk:midi output backend. A copy of net-out/CMakeLists.txt with Qt::Network
++# swapped for the wk:midi shim -- nothing else about the shape is ours.
++#
++# The load-bearing line is QT_STATICPLUGIN. There is no dlopen on wasm, so this
++# plugin can only ever be linked in and named with Q_IMPORT_PLUGIN
++# (utils/vpiano/vpianomain.cpp); QT_STATICPLUGIN is what makes moc emit the
++# static registration function that Q_IMPORT_PLUGIN references and
++# QPluginLoader::staticInstances() -- which is how BackendManager::refresh()
++# finds it -- returns. Without it the app links, BackendManager finds nothing,
++# and VPiano::initialize() reaches qFatal("Unable to find a suitable output
++# backend").
++
++set(CMAKE_INCLUDE_CURRENT_DIR ON)
++
++set(drumstick-rt-wk-out_QTOBJ_SRCS
++    wkmidioutput.h
++)
++
++set(drumstick-rt-wk-out_SRCS
++    wkmidioutput.cpp
++)
++
++# The -I is not decoration: moc has to find drumstick/rtmidioutput.h to resolve
++# Q_INTERFACES(drumstick::rt::MIDIOutput), exactly as every sibling backend
++# passes it.
++qt_wrap_cpp(drumstick-rt-wk-out_MOC_SRCS ${drumstick-rt-wk-out_QTOBJ_SRCS}
++    OPTIONS -I ${Drumstick_SOURCE_DIR}/library/include)
++
++add_library(drumstick-rt-wk-out STATIC
++    ${drumstick-rt-wk-out_MOC_SRCS}
++    ${drumstick-rt-wk-out_SRCS})
++
++target_compile_definitions(drumstick-rt-wk-out PRIVATE QT_STATICPLUGIN)
++
++target_include_directories(drumstick-rt-wk-out PRIVATE
++    ${Drumstick_SOURCE_DIR}/library/include
++    ../wk-common)
++
++target_link_libraries(drumstick-rt-wk-out PRIVATE
++    Qt${QT_VERSION_MAJOR}::Core
++    Drumstick::RT
++    drumstick-rt-wk-shim)
++
++# No install(): these two plugins are wk's, they are STATIC and they are linked
++# straight out of this build tree. Adding them to drumstick-rt-targets would
++# also drag drumstick-rt-wk-shim into an export set it does not belong in.
+diff --git a/library/rt-backends/wk-out/wkmidioutput.cpp b/library/rt-backends/wk-out/wkmidioutput.cpp
+new file mode 100644
+index 0000000..a2cbf66
+--- /dev/null
++++ b/library/rt-backends/wk-out/wkmidioutput.cpp
+@@ -0,0 +1,207 @@
++/*
++    Drumstick RT backend for the wk runtime's wk:midi port (output half)
++    Copyright (C) 2026 the wk project
++
++    Modelled on drumstick's own rt-backends/dummy-out and net-out, which are
++    Copyright (C) 2009-2026 Pedro Lopez-Cabanillas <plcl@users.sf.net>.
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 3 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program. If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#include "wkmidioutput.h"
++#include "wkconnection.h"
++
++extern "C" {
++#include "wkmidiio.h"
++}
++
++namespace drumstick {
++namespace rt {
++
++WkMIDIOutput::WkMIDIOutput(QObject *parent)
++    : MIDIOutput(parent)
++    , m_publicName(QStringLiteral("MIDI Out"))
++{
++}
++
++void WkMIDIOutput::initialize(QSettings *settings)
++{
++    Q_UNUSED(settings)
++    // Nothing to configure: which nodes receive these bytes is a property of
++    // the wk canvas (a "midi" wire), not of any setting inside the guest.
++}
++
++QString WkMIDIOutput::backendName()
++{
++    return QStringLiteral("wk");
++}
++
++QString WkMIDIOutput::publicName()
++{
++    return m_publicName;
++}
++
++void WkMIDIOutput::setPublicName(QString name)
++{
++    m_publicName = name;
++}
++
++QList<MIDIConnection> WkMIDIOutput::connections(bool advanced)
++{
++    Q_UNUSED(advanced)
++    return QList<MIDIConnection>{wkConnection()};
++}
++
++void WkMIDIOutput::setExcludedConnections(QStringList conns)
++{
++    // The exclusion list exists so a backend does not offer the application
++    // its own ports back (an ALSA app would otherwise see itself). There is
++    // one port here and it is not ours to loop back -- the host router
++    // decides where it goes -- so there is nothing to exclude.
++    Q_UNUSED(conns)
++}
++
++void WkMIDIOutput::open(const MIDIConnection &conn)
++{
++    Q_UNUSED(conn)
++    // The connection argument is ignored on purpose: connections() offers
++    // exactly one, and wkmidi_open_out() is idempotent-by-returning--1, so
++    // reopening after a Connections-dialog round trip costs nothing.
++    wkmidi_open_out();
++    m_currentConnection = wkConnection();
++}
++
++void WkMIDIOutput::close()
++{
++    // The wk:midi output resource lives for the guest's lifetime (see
++    // shim/wkmidiio.h); "closed" here means only that this backend will
++    // report no current connection. Dropping the resource would buy nothing
++    // -- a node has one outbox and it is the node's, not this object's.
++    m_currentConnection = MIDIConnection();
++}
++
++MIDIConnection WkMIDIOutput::currentConnection()
++{
++    return m_currentConnection;
++}
++
++// --- the encoders ----------------------------------------------------------
++//
++// MIDI 1.0 wire format, one message per call, status byte always present.
++// wk:midi delivers messages, not a byte stream, so running status would be
++// meaningless here and every message is self-contained.
++
++void WkMIDIOutput::sendNoteOff(int chan, int note, int vel)
++{
++    const uint8_t m[3] = { uint8_t(MIDI_STATUS_NOTEOFF | (chan & MIDI_CHANNEL_MASK)),
++                           uint8_t(note & 0x7f), uint8_t(vel & 0x7f) };
++    wkmidi_send(m, sizeof m);
++}
++
++void WkMIDIOutput::sendNoteOn(int chan, int note, int vel)
++{
++    const uint8_t m[3] = { uint8_t(MIDI_STATUS_NOTEON | (chan & MIDI_CHANNEL_MASK)),
++                           uint8_t(note & 0x7f), uint8_t(vel & 0x7f) };
++    wkmidi_send(m, sizeof m);
++}
++
++void WkMIDIOutput::sendKeyPressure(int chan, int note, int value)
++{
++    const uint8_t m[3] = { uint8_t(MIDI_STATUS_KEYPRESURE | (chan & MIDI_CHANNEL_MASK)),
++                           uint8_t(note & 0x7f), uint8_t(value & 0x7f) };
++    wkmidi_send(m, sizeof m);
++}
++
++void WkMIDIOutput::sendController(int chan, int control, int value)
++{
++    const uint8_t m[3] = { uint8_t(MIDI_STATUS_CONTROLCHANGE | (chan & MIDI_CHANNEL_MASK)),
++                           uint8_t(control & 0x7f), uint8_t(value & 0x7f) };
++    wkmidi_send(m, sizeof m);
++}
++
++void WkMIDIOutput::sendProgram(int chan, int program)
++{
++    const uint8_t m[2] = { uint8_t(MIDI_STATUS_PROGRAMCHANGE | (chan & MIDI_CHANNEL_MASK)),
++                           uint8_t(program & 0x7f) };
++    wkmidi_send(m, sizeof m);
++}
++
++void WkMIDIOutput::sendChannelPressure(int chan, int value)
++{
++    const uint8_t m[2] = { uint8_t(MIDI_STATUS_CHANNELPRESSURE | (chan & MIDI_CHANNEL_MASK)),
++                           uint8_t(value & 0x7f) };
++    wkmidi_send(m, sizeof m);
++}
++
++void WkMIDIOutput::sendPitchBend(int chan, int value)
++{
++    // Drumstick's `value` is SIGNED, -8192..8191, and the wire wants an
++    // unsigned 14-bit number centred on 0x2000, LSB first. Getting this wrong
++    // is silent -- every bend just lands an octave off -- so it is written the
++    // way net-out and oss-out write it, and it is the exact inverse of what
++    // rt-backends/common/midiparser.cpp does on the way back in
++    // (`v = m1 + m2 * 0x80 - 0x2000`).
++    const int centred = 8192 + value;
++    const uint8_t m[3] = { uint8_t(MIDI_STATUS_PITCHBEND | (chan & MIDI_CHANNEL_MASK)),
++                           uint8_t(MIDI_LSB(centred)), uint8_t(MIDI_MSB(centred)) };
++    wkmidi_send(m, sizeof m);
++}
++
++void WkMIDIOutput::sendSysex(const QByteArray &data)
++{
++    // Verbatim: drumstick's callers pass the complete F0..F7 message, and the
++    // host queues it as one message rather than a stream, so there is nothing
++    // to frame.
++    if (data.isEmpty())
++        return;
++    wkmidi_send(reinterpret_cast<const uint8_t *>(data.constData()), size_t(data.size()));
++}
++
++void WkMIDIOutput::sendSystemMsg(const int status)
++{
++    const uint8_t m[1] = { uint8_t(status & 0xff) };
++    wkmidi_send(m, sizeof m);
++}
++
++// --- the Q_PROPERTY answers vpiano reads -----------------------------------
++
++QStringList WkMIDIOutput::getDiagnostics()
++{
++    return QStringList();
++}
++
++QString WkMIDIOutput::getLibVersion()
++{
++    return QT_STRINGIFY(VERSION);
++}
++
++bool WkMIDIOutput::getStatus()
++{
++    // Always true: there is no device to fail to open. A wk node's outbox
++    // exists whether or not anything is wired to it, and sending into an
++    // unwired node is a no-op in the host router, not an error.
++    return true;
++}
++
++bool WkMIDIOutput::getConfigurable()
++{
++    // False, and this is the honest answer rather than a stub: the only thing
++    // there would be to configure is where the MIDI goes, and that lives on
++    // the wk canvas. Drumstick's configureOutputDriver() checks this property
++    // AND the existence of a configure(QWidget*) slot, so returning false and
++    // declaring no such slot are consistent.
++    return false;
++}
++
++}} // namespace drumstick::rt
+diff --git a/library/rt-backends/wk-out/wkmidioutput.h b/library/rt-backends/wk-out/wkmidioutput.h
+new file mode 100644
+index 0000000..0c1115c
+--- /dev/null
++++ b/library/rt-backends/wk-out/wkmidioutput.h
+@@ -0,0 +1,96 @@
++/*
++    Drumstick RT backend for the wk runtime's wk:midi port (output half)
++    Copyright (C) 2026 the wk project
++
++    Modelled on drumstick's own rt-backends/dummy-out and net-out, which are
++    Copyright (C) 2009-2026 Pedro Lopez-Cabanillas <plcl@users.sf.net>.
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 3 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program. If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#ifndef WKMIDIOUTPUT_H
++#define WKMIDIOUTPUT_H
++
++#include <QObject>
++#include <drumstick/rtmidioutput.h>
++
++namespace drumstick {
++namespace rt {
++
++/**
++ * @brief MIDI output over wk's `wk:midi/midi` output resource.
++ *
++ * A wk node has exactly ONE MIDI outbox, and where its bytes go is decided
++ * on the wk canvas, not here: the host router (crates/wk-server/src/midi.rs)
++ * forwards whatever this node sends to the inbox of every node a "midi" wire
++ * connects it to. So the whole Drumstick connection model -- enumerate ports,
++ * pick one, open it -- collapses to a single fixed connection, and this class
++ * is a state machine with one state plus a byte assembler.
++ *
++ * Assembling raw bytes is the entire job. Drumstick's MIDIOutput interface is
++ * nine typed slots; wk:midi carries MIDI 1.0 wire bytes. Each slot below is
++ * the one-line encoding from the spec -- no running status (every message
++ * carries its status byte, because the host queues messages, not a stream),
++ * and no timestamps (a message's arrival IS its time; wk:midi has no clock).
++ */
++class WkMIDIOutput : public MIDIOutput
++{
++    Q_OBJECT
++    Q_PLUGIN_METADATA(IID "net.sourceforge.drumstick.rt.MIDIOutput/2.0")
++    Q_INTERFACES(drumstick::rt::MIDIOutput)
++    Q_PROPERTY(QStringList diagnostics READ getDiagnostics)
++    Q_PROPERTY(QString libversion READ getLibVersion)
++    Q_PROPERTY(bool status READ getStatus)
++    Q_PROPERTY(bool isconfigurable READ getConfigurable)
++
++public:
++    explicit WkMIDIOutput(QObject *parent = nullptr);
++    virtual ~WkMIDIOutput() = default;
++
++    // MIDIOutput interface
++public:
++    void initialize(QSettings *settings) override;
++    QString backendName() override;
++    QString publicName() override;
++    void setPublicName(QString name) override;
++    QList<MIDIConnection> connections(bool advanced) override;
++    void setExcludedConnections(QStringList conns) override;
++    void open(const MIDIConnection &conn) override;
++    void close() override;
++    MIDIConnection currentConnection() override;
++
++public Q_SLOTS:
++    void sendNoteOff(int chan, int note, int vel) override;
++    void sendNoteOn(int chan, int note, int vel) override;
++    void sendKeyPressure(int chan, int note, int value) override;
++    void sendController(int chan, int control, int value) override;
++    void sendProgram(int chan, int program) override;
++    void sendChannelPressure(int chan, int value) override;
++    void sendPitchBend(int chan, int value) override;
++    void sendSysex(const QByteArray &data) override;
++    void sendSystemMsg(const int status) override;
++
++private:
++    QStringList getDiagnostics();
++    QString getLibVersion();
++    bool getStatus();
++    bool getConfigurable();
++
++    QString m_publicName;
++    MIDIConnection m_currentConnection;
++};
++
++}} // namespace drumstick::rt
++
++#endif // WKMIDIOUTPUT_H
+diff --git a/library/rt/backendmanager.cpp b/library/rt/backendmanager.cpp
+index 0bcb4ea..7f8c37d 100644
+--- a/library/rt/backendmanager.cpp
++++ b/library/rt/backendmanager.cpp
+@@ -62,6 +62,18 @@ namespace drumstick { namespace rt {
+         QList<MIDIOutput *> m_outputsList;
+         static BackendManager *m_instance;
+ 
++        // The wk arm MUST come first. Q_OS_WASI is granted Q_OS_UNIX by
++        // fallthrough in qsystemdetection.h (see plugins/qt/patches/
++        // qtbase-0002-wasi-system-detection.patch), so the Q_OS_UNIX arm below
++        // would otherwise win and name FluidSynth and OSS -- two backends this
++        // build cannot contain -- leaving findOutput() with nothing and
++        // VPiano::initialize() at qFatal("Unable to find a suitable output
++        // backend"). The one backend a wk node has is called "wk"
++        // (library/rt-backends/wk-in, wk-out).
++#if defined(Q_OS_WASI)
++        QString m_inputBackend{QLatin1String("wk")};
++        QStringList m_outputBackends{QLatin1String("wk")};
++#else
+         QString m_inputBackend{QLatin1String("Network")};
+ #if defined(Q_OS_LINUX)
+         QStringList m_outputBackends{QLatin1String("SonivoxEAS"),QLatin1String("FluidSynth"),QLatin1String("ALSA")};
+@@ -74,6 +86,7 @@ namespace drumstick { namespace rt {
+ #else
+         QStringList m_outputBackends{m_inputBackend};
+ #endif
++#endif // Q_OS_WASI
+ 
+         ~BackendManagerPrivate()
+         {

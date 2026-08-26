@@ -1,0 +1,72 @@
+WHAT: guard KCalc own four setAccessibleName()/setAccessibleDescription()
+      calls on QT_CONFIG(accessibility).
+WHY:  QT_FEATURE_accessibility is -1 in wk qtbase, and qwidget.h declares
+      those setters INSIDE `#if QT_CONFIG(accessibility)` -- so the compiler
+      reports "use of undeclared identifier setAccessibleName" (in
+      kcalc_display.cpp, where the calls are unqualified) and "no member named
+      setAccessibleName in KSqueezedTextLabel" (in
+      kcalc_numeralsystem_view.cpp). Neither message mentions accessibility.
+      There is no AT-SPI bus, no UIAutomation and no VoiceOver behind a wk node
+      surface. Every one of these calls exists so a screen reader can announce
+      the result display; nothing a sighted user can observe changes.
+      These four are the ONLY changes this port needs to KCalc application
+      logic. Everything else in patches/kcalc-* is build-system plumbing or
+      test scaffolding.
+UPSTREAM: as-is. QT_CONFIG(accessibility) is a legitimate Qt configuration
+      (Qt for embedded systems routinely disables it) and this is a plain
+      portability guard.
+diff --git a/kcalc_display.cpp b/kcalc_display.cpp
+index 8f9a7df..1e6b510 100644
+--- a/kcalc_display.cpp
++++ b/kcalc_display.cpp
+@@ -43,7 +43,16 @@ KCalcDisplay::KCalcDisplay(QWidget *parent)
+     , m_displayAmount(0)
+     , m_selectionTimer(new QTimer(this))
+ {
++// QT_CONFIG(accessibility) is 0 in wk's qtbase: there is no AT-SPI bus, no
++// UIAutomation and no VoiceOver behind a wk node's surface, so QWidget does not
++// even declare setAccessibleName()/setAccessibleDescription() -- which is why
++// the error reads "use of undeclared identifier" rather than naming a feature.
++// These calls exist solely so a screen reader can announce the result; nothing
++// a sighted user can observe changes. Delete these guards the day wk grows an
++// accessibility bridge.
++#if QT_CONFIG(accessibility)
+     setAccessibleDescription(i18nc("@label accessibility description of the calculation result display", "Result Display"));
++#endif
+     setFocusPolicy(Qt::StrongFocus);
+ 
+     setSizePolicy(QSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed));
+@@ -339,7 +348,9 @@ void KCalcDisplay::setUnformattedText(const QString &string)
+ {
+     m_text = string;
+     update();
++#if QT_CONFIG(accessibility)
+     setAccessibleName(m_text);
++#endif
+ }
+ 
+ void KCalcDisplay::setText(const QString &string)
+@@ -349,7 +360,9 @@ void KCalcDisplay::setText(const QString &string)
+     // m_text = formatNumber(m_text);
+ 
+     update();
++#if QT_CONFIG(accessibility)
+     setAccessibleName(m_text); // "Labels should be represented by only QAccessibleInterface and return their text as name"
++#endif
+     Q_EMIT changedText(m_text);
+ }
+ 
+diff --git a/kcalc_numeralsystem_view.cpp b/kcalc_numeralsystem_view.cpp
+index 8346824..fb5933a 100644
+--- a/kcalc_numeralsystem_view.cpp
++++ b/kcalc_numeralsystem_view.cpp
+@@ -56,7 +56,9 @@ void KCalcNumeralSystemLabel::updateLabel()
+ {
+     QString num_str = QString::number(number_, number_base_).toUpper();
+     m_textLabel->setText(KCalcNumberFormatter::formatNumber(num_str, number_base_));
++#if QT_CONFIG(accessibility)
+     m_textLabel->setAccessibleName(m_textLabel->fullText());
++#endif
+ 
+     m_numeralSystemLabel->setText(QStringLiteral("<sub><b>%1</b></sub>").arg(number_base_));
+ }

@@ -24,10 +24,11 @@ project(wk-slate LANGUAGES C CXX)
 
 set(SLATE_SRC "" CACHE PATH "the extracted upstream Slate tree")
 set(WK_GFX_COMPAT "" CACHE PATH "plugins/gfx-compat, the wasi-gfx C shim")
+set(WK_GEN_DIR "" CACHE PATH "this port's gen/, where ../build.sh writes the bindings")
 set(WK_QPA_LIB "" CACHE FILEPATH "plugins/qt/sysroot/lib/libqwk.a")
 set(WK_FONT "" CACHE FILEPATH "a .ttf staged into node/fonts/ by ../build.sh")
 
-foreach(v SLATE_SRC WK_GFX_COMPAT WK_QPA_LIB WK_FONT)
+foreach(v SLATE_SRC WK_GFX_COMPAT WK_GEN_DIR WK_QPA_LIB WK_FONT)
     if(NOT ${v})
         message(FATAL_ERROR "wk-slate: -D${v}=... is required (see ../build.sh)")
     endif()
@@ -82,3 +83,10 @@ target_link_libraries(app PRIVATE "${WK_QPA_LIB}" Qt6::FbSupportPrivate)
 # Q_IMPORT_PLUGIN(SlatePlugin).
 target_link_libraries(app PRIVATE slateplugin)
 target_link_options(app PRIVATE "${WK_GFX_COMPAT}/gen/wkgfx_component_type.o")
+# The clipboard world's component-type object. Needed even though Slate never
+# calls wkclip_*: libqwk.a contains QWkClipboard and the shim it uses, so the
+# shim is always pulled out of the archive, and the wit-bindgen output
+# references a symbol that lives ONLY in this object. Omit it and the link
+# fails with "undefined symbol:
+# __component_type_object_force_link_wkclipboard".
+target_link_options(app PRIVATE "${WK_GEN_DIR}/wkclipboard_component_type.o")

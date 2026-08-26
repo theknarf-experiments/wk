@@ -1,0 +1,271 @@
+WHAT: on __wasi__, give libqalculate's Thread an in-memory message FIFO and run
+      each thread body INLINE from sleep_ms(), instead of pthreads.
+WHY:  this is the patch the port exists on. wasm32-wasip2 has no threads --
+      wasi-libc defines pthread_create as a stub returning ENOTSUP -- so
+      upstream's Thread::start() fails and EVERY caller takes its
+      `mstruct->setAborted()` error path. Measured on the unpatched library
+      under wasmtime 47:
+
+          CALCULATOR->calculate(&m, "6*7", 2000, eo)
+            -> rc=0 aborted=1 elapsed=0 ms result="aborted"
+
+      i.e. the Qt GUI would render the word "aborted" for every expression a
+      user types, and it would look like a Qt or QPA bug rather than a
+      libqalculate one. (pthread_cancel is a second, smaller failure: wasi-sdk
+      declares it only under __wasi_cooperative_threads__ with the comment
+      "WASI has no cancellation support", so Thread::cancel() does not even
+      compile. This patch removes that call site along with the rest.)
+
+      THE SHAPE. Every run() body in libqalculate and in the Qt front end --
+      CalculateThread, ViewThread, CommandThread -- is
+
+          while(true) { if(!read(&a)) break; ... }
+
+      a message loop that already stops cleanly when its queue runs dry. So
+      draining the queue and returning IS the loop's own exit condition, and
+      no body needed touching. write() appends bytes to a std::vector (byte-
+      exact with the fwrite() it replaces, because the readers read fixed
+      scalar widths back), start() only marks the thread live, and the body
+      runs on the caller's stack the next time anything calls sleep_ms().
+
+      sleep_ms() is the hook because every waiter in BOTH projects already
+      spins on it right after writing its messages -- Calculator::calculate(),
+      Calculator::convertTimeOut(), Calculator::abort(), terminateThreads(),
+      and, on the Qt side, QalculateWindow::setResult() and ::executeCommand().
+      That is why this port needs no patch to qalculate-qt's threading at all.
+
+      WHAT IS LOST, honestly: the msecs timeout. Upstream enforces it by
+      watching the clock from the calling thread while the worker runs; with
+      one stack there is nobody to watch, so a runaway expression blocks the
+      node rather than returning "timed out". The progress dialog and its
+      Cancel button are unreachable for the same reason -- which at least
+      means nobody is shown a frozen dialog. The cooperative
+      startControl(msecs) ceiling still applies everywhere the caller sets one
+      (printing, the CLI-style entry points); it is the GUI's
+      calculate(..., 0, ...) path that has none.
+UPSTREAM: not-as-is. Upstream would want this as a proper single-threaded
+      backend selected by configure (they already carry a _WIN32 arm of the
+      same class), not as a third #ifdef inside the POSIX one; and they would
+      want the timeout preserved, which needs cooperation from the evaluator
+      rather than from the caller.
+--- a/libqalculate/util.cc
++++ b/libqalculate/util.cc
+@@ -68,6 +68,24 @@ bool eqstr::operator()(const char *s1, const char *s2) const {
+ #endif
+ 
+ void sleep_ms(int milliseconds) {
++#ifdef __wasi__
++	/* THE HOOK. Every waiter in libqalculate AND in the Qt front end spins on
++	 * sleep_ms() immediately after handing a Thread its messages:
++	 *
++	 *   Calculator::calculate()   for(i = 0; b_busy && ...) sleep_ms(1);
++	 *   Calculator::convertTimeOut()               likewise
++	 *   Calculator::abort() / terminateThreads()   likewise
++	 *   QalculateWindow::setResult()   for(...) sleep_ms(1); then
++	 *                                  while(b_busy) {processEvents(); sleep_ms(10);}
++	 *   QalculateWindow::executeCommand()          same shape
++	 *
++	 * so pumping here runs the thread body at exactly the point the caller
++	 * expects the other thread to be making progress, with no call-site
++	 * patches at all. The body then clears b_busy before sleep_ms() returns
++	 * and the spin exits on its first iteration. Falls through to the real
++	 * sleep below so that any OTHER use of sleep_ms keeps its meaning. */
++	Thread::wasiPumpAll();
++#endif
+ #ifdef _WIN32
+ 	Sleep(milliseconds);
+ #elif _POSIX_C_SOURCE >= 199309L
+@@ -1139,6 +1157,105 @@ bool Thread::cancel() {
+ 	return true;
+ }
+ 
++#elif defined(__wasi__)
++
++/* wasm32-wasip2 has NO threads. wasi-libc defines pthread_create as a stub
++ * returning ENOTSUP, so upstream's Thread::start() fails, every caller takes
++ * its `mstruct->setAborted()` error path, and the Qt GUI displays "aborted"
++ * for EVERY expression. Measured before this patch:
++ *
++ *   CALCULATOR->calculate(&m, "6*7", 2000, eo) -> rc=0 aborted=1 in 0 ms
++ *
++ * The fix keeps the whole Thread interface and changes only where the body
++ * runs: messages go into an in-memory FIFO instead of a pipe, start() is a
++ * no-op that just marks the thread live, and the body runs INLINE on the
++ * caller's stack the next time anyone calls sleep_ms() (see the note there).
++ *
++ * This works because every run() body in both projects -- CalculateThread,
++ * ViewThread, CommandThread -- is literally
++ *
++ *     while(true) { if(!read(&a)) break; ...; }
++ *
++ * i.e. it already stops cleanly when the message queue runs dry. Draining the
++ * queue and returning IS the loop's own termination condition, so no body had
++ * to be touched.
++ *
++ * What is genuinely lost, and it is not nothing: the msecs TIMEOUT. Upstream
++ * enforces it by letting the caller watch the clock while the thread works
++ * and calling abort() if it overruns. With one stack there is nobody to
++ * watch, so a runaway expression blocks the node instead of raising the
++ * "timed out" result. libqalculate's cooperative startControl(msecs) still
++ * applies wherever the caller sets it (printing, the CLI-style entry points);
++ * it is the GUI's calculate(..., 0, ...) path that has no ceiling. The Cancel
++ * button in the progress dialog is unreachable for the same reason -- and so
++ * is the dialog, which is why nobody sees a frozen one.
++ */
++
++static std::vector<Thread*> *wasi_pending = NULL;
++static bool wasi_pumping = false;
++
++Thread::Thread() : running(false), m_pos(0) {}
++
++Thread::~Thread() {
++	cancel();
++}
++
++void Thread::wasiSchedule() {
++	if(!wasi_pending) wasi_pending = new std::vector<Thread*>;
++	for(size_t i = 0; i < wasi_pending->size(); i++) {
++		if((*wasi_pending)[i] == this) return;
++	}
++	wasi_pending->push_back(this);
++}
++
++void Thread::wasiPumpAll() {
++	/* Not reentrant on purpose: a run() body that itself calls sleep_ms()
++	 * (Calculator::abort() does) must not re-enter its own run(). The outer
++	 * loop below still picks up anything queued while it was running. */
++	if(wasi_pumping || !wasi_pending) return;
++	wasi_pumping = true;
++	while(!wasi_pending->empty()) {
++		Thread *thread = wasi_pending->front();
++		wasi_pending->erase(wasi_pending->begin());
++		if(!thread->running) continue;
++		thread->run();
++		/* compact: run() stopped because the FIFO ran dry, so anything left
++		 * is a prefix nobody will ever complete. */
++		if(thread->m_pos > 0) {
++			thread->m_buf.erase(thread->m_buf.begin(), thread->m_buf.begin() + thread->m_pos);
++			thread->m_pos = 0;
++		}
++	}
++	wasi_pumping = false;
++}
++
++void Thread::enableAsynchronousCancel() {
++	/* Nothing to cancel asynchronously, and wasi-libc's pthread_setcanceltype
++	 * is a stub. */
++}
++
++bool Thread::start() {
++	/* No thread is created. `running` is what every caller polls to decide
++	 * whether the worker is alive, and it has to stay true across calls:
++	 * QalculateWindow::executeCommand() reads `if(!commandThread->running)
++	 * command_aborted = true;` after its wait. */
++	running = true;
++	return true;
++}
++
++bool Thread::cancel() {
++	running = false;
++	m_buf.clear();
++	m_pos = 0;
++	if(wasi_pending) {
++		for(size_t i = 0; i < wasi_pending->size();) {
++			if((*wasi_pending)[i] == this) wasi_pending->erase(wasi_pending->begin() + i);
++			else i++;
++		}
++	}
++	return true;
++}
++
+ #else
+ 
+ Thread::Thread() : running(false), m_pipe_r(NULL), m_pipe_w(NULL) {
+--- a/libqalculate/util.h
++++ b/libqalculate/util.h
+@@ -26,6 +26,14 @@
+ #	include <unistd.h>
+ #endif
+ 
++#ifdef __wasi__
++/* wasm32-wasip2 has no threads: wasi-libc's pthread_create is a stub that
++ * returns ENOTSUP. Thread below keeps its message-passing interface but
++ * carries the messages in memory and runs the body inline. */
++#	include <vector>
++#	include <cstring>
++#endif
++
+ #ifdef _WIN32
+ 	#define srand48 srand
+ #endif
+@@ -124,6 +132,15 @@ public:
+ #ifdef _WIN32
+ 		int ret = PostThreadMessage(m_threadID, WM_USER, (WPARAM) data, 0);
+ 		return (ret != 0);
++#elif defined(__wasi__)
++		/* Byte-exact with the fwrite() below, deliberately: every caller
++		 * writes a fixed sequence of scalars that run() reads back in the
++		 * same order and the same widths, so the FIFO must be bytes and
++		 * not a variant. */
++		const char *p = (const char*) &data;
++		m_buf.insert(m_buf.end(), p, p + sizeof(T));
++		wasiSchedule();
++		return true;
+ #else
+ 		int ret = fwrite(&data, sizeof(T), 1, m_pipe_w);
+ 		if(ret != 1) return false;
+@@ -132,6 +149,12 @@ public:
+ #endif
+ 	}
+ 
++#ifdef __wasi__
++	/** Run, inline on the calling stack, every Thread that has unread
++	 * messages. sleep_ms() calls this -- see the long note in util.cc. */
++	static void wasiPumpAll();
++#endif
++
+ 	// FIXME: this is technically wrong -- needs memory barriers (std::atomic?)
+ 	volatile bool running;
+ 
+@@ -143,6 +166,10 @@ protected:
+ 		MSG msg;
+ 		int ret = GetMessage(&msg, NULL, WM_USER, WM_USER);
+ 		return (T) msg.wParam;
++#elif defined(__wasi__)
++		T x = T();
++		read(&x);
++		return x;
+ #else
+ 		T x;
+ 		fread(&x, sizeof(T), 1, m_pipe_r);
+@@ -156,6 +183,15 @@ protected:
+ 		if(ret == 0 || ret == -1) return false;
+ 		*data = (T) msg.wParam;
+ 		return true;
++#elif defined(__wasi__)
++		/* An empty FIFO cannot block here -- there is no other thread to
++		 * fill it -- so it reports end-of-messages, which is exactly what
++		 * every run() body already treats as "stop and return". */
++		if(m_buf.size() - m_pos < sizeof(T)) return false;
++		memcpy((void*) data, &m_buf[m_pos], sizeof(T));
++		m_pos += sizeof(T);
++		if(m_pos == m_buf.size()) {m_buf.clear(); m_pos = 0;}
++		return true;
+ #else
+ 		int ret = fread(data, sizeof(T), 1, m_pipe_r);
+ 		return ret == 1;
+@@ -168,6 +204,14 @@ private:
+ 
+ 	HANDLE m_thread, m_threadReadyEvent;
+ 	DWORD m_threadID;
++#elif defined(__wasi__)
++	/* No pthread_t, no pipe: wasi-libc's pipe() is ENOSYS on wasip2 and the
++	 * upstream constructor would leave m_pipe_r/m_pipe_w NULL for ~Thread()
++	 * to fclose(). */
++	void wasiSchedule();
++
++	std::vector<char> m_buf;
++	size_t m_pos;
+ #else
+ 	static void doCleanup(void *data);
+ 	static void *doRun(void *data);

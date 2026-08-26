@@ -83,6 +83,7 @@ QPA_LIB="$QTBASE_SYSROOT/lib/libqwk.a"
 QUICK_SYSROOT="$PWD/sysroot"
 HOST_PREFIX="${QT_HOST_PATH:-$PWD/host}"
 GFXCOMPAT="$PWD/../gfx-compat"
+CLIPCOMPAT="$PWD/../clipboard-compat"
 SRCDIR="$PWD/src"
 TARBALLS="$PWD/tarballs"
 SLATE_SRC="$SRCDIR/slate-$SLATE_COMMIT"
@@ -189,6 +190,12 @@ echo "=== font: $FONT -> node/fonts/$(basename "$FONT")"
 # the same output directory.
 echo "=== wit-bindgen (wkgfx world)"
 wit-bindgen c --world wkgfx "$GFXCOMPAT/wit" --out-dir "$GENDIR" >/dev/null
+# ...and wk:clipboard, whose component-type object is needed for the same
+# reason even though Slate never calls the shim itself: libqwk.a carries
+# QWkClipboard, so the shim is always pulled out of the archive and its
+# __component_type_object_force_link_wkclipboard must resolve.
+echo "=== wit-bindgen (wkclipboard world)"
+wit-bindgen c --world wkclipboard "$CLIPCOMPAT/wit" --out-dir "$GENDIR" >/dev/null
 
 # --- configure + build ------------------------------------------------------
 LOG="$LOGDIR/target-slate.log"
@@ -204,6 +211,7 @@ env PATH="$BUILD_PATH" cmake -G Ninja -S "$PWD/node" -B "$BUILD" \
     -DCMAKE_BUILD_TYPE=Release \
     -DSLATE_SRC="$SLATE_SRC" \
     -DWK_GFX_COMPAT="$GFXCOMPAT" \
+    -DWK_GEN_DIR="$GENDIR" \
     -DWK_QPA_LIB="$QPA_LIB" \
     -DWK_FONT="$STAGED" \
     2>&1 | tee "$LOG"

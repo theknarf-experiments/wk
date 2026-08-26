@@ -1,0 +1,37 @@
+WHAT: move KCrash unconditional find_package(Qt6Test REQUIRED) inside
+      if(BUILD_TESTING).
+WHY:  the call sits at TOP-LEVEL scope (CMakeLists.txt:37), not inside the
+      `if(BUILD_TESTING)` block twenty lines below -- so even a
+      -DBUILD_TESTING=OFF build demands it. wk qtbase is FEATURE_testlib=OFF
+      (plugins/qt/build-qtbase.sh), so this is a hard configure failure for a
+      package the LIBRARY never uses: Qt6::Test appears in zero link lines
+      under src/. It serves the autotests alone.
+      SEPARATE, AND IMPORTANT: this patch makes KCrash BUILD. It does not make
+      crash handling work, and it cannot -- KCrash handler re-execs the
+      process and forks drkonqi, and there is no fork on WASI. The app
+      therefore does NOT call KCrash::initialize(); see the comment in KCalc
+      main.cpp patch, which says so out loud rather than leaving it looking
+      like an oversight.
+UPSTREAM: as-is. This is a plain bug in their tree -- any Qt build without
+      testlib hits it, wasm or not.
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cce6e90..d0d9cf9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -34,7 +34,15 @@ if(WITH_X11)
+     find_package(X11 REQUIRED)
+     set(HAVE_X11 TRUE)
+ endif()
+-find_package(Qt6Test ${REQUIRED_QT_VERSION} CONFIG REQUIRED)
++# Qt6Test is required at TOP-LEVEL scope here, not inside the
++# `if(BUILD_TESTING)` further down at line 70 -- so a -DBUILD_TESTING=OFF
++# build still demands it. wk's qtbase is FEATURE_testlib=OFF (see
++# plugins/qt/build-qtbase.sh), so this is a hard configure failure for a
++# package nothing in the LIBRARY uses: grep KF6Crash's src/ and Qt6::Test
++# appears in exactly zero link lines. It serves the autotests alone.
++if(BUILD_TESTING)
++    find_package(Qt6Test ${REQUIRED_QT_VERSION} CONFIG REQUIRED)
++endif()
+ include(ECMGenerateExportHeader)
+ include(ECMSetupVersion)
+ include(ECMGenerateHeaders)

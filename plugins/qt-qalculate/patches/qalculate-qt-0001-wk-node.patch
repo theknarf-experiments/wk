@@ -1,0 +1,65 @@
+WHAT: make the app a wk node -- default to the `wk` QPA platform and statically
+      import the three plugins wasm cannot dlopen.
+WHY:  two things a wasm32-wasip2 Qt node needs that a desktop build gets free:
+        * QT_QPA_PLATFORM. plugins/qt's qtbase was configured
+          QT_QPA_DEFAULT_PLATFORM=offscreen (it predates the wk QPA plugin), so
+          an unmodified app renders to nowhere and never opens a surface. Set
+          only when the environment does not already say, so
+          QT_QPA_PLATFORM=offscreen stays available for bisecting failures.
+        * Q_IMPORT_PLUGIN. No dlopen on wasm. Without QWkIntegrationPlugin,
+          QApplication aborts with "no Qt platform plugin could be initialized"
+          and an EMPTY plugin list -- it reads like a broken Qt, but it is an
+          unreferenced symbol. QSvgPlugin/QSvgIconPlugin matter more here than
+          in the other Qt ports: qalculateqtsettings.h:31 defines
+          LOAD_APP_ICON(x) as QIcon(":/icons/apps/scalable/" x ".svg") and
+          icons.qrc is 53 SVGs, so without them the app has no icons at all.
+      The component-type link objects and the font resource are handled by the
+      port's own CMakeLists (upstream has none), not here.
+      Both hunks are guarded by #ifdef __wasi__, so a desktop build of this
+      tree is byte-for-byte unaffected.
+UPSTREAM: as-is in spirit -- this is the standard static-Qt deployment shape.
+      It is wk-specific only in naming OUR platform plugin.
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -34,6 +34,22 @@
+ #include "qalculatewindow.h"
+ #include "qalculateqtsettings.h"
+ 
++// --- wk node ---------------------------------------------------------------
++// wasm has no dlopen, so Qt cannot discover a plugin at runtime: every plugin
++// is linked in as an archive and named here. Without the QWkIntegrationPlugin
++// line QApplication aborts with "no Qt platform plugin could be initialized"
++// and an EMPTY available-plugins list, which reads like a broken Qt build but
++// is a missing symbol reference. The two Svg plugins are load-bearing for this
++// app in particular: icons.qrc is 53 SVGs and qalculateqtsettings.h's
++// LOAD_APP_ICON/LOAD_COLORED_ICON only ever name ".svg", so without them every
++// toolbar button, menu action and the window icon are null QIcons.
++#ifdef __wasi__
++#include <QtPlugin>
++Q_IMPORT_PLUGIN(QWkIntegrationPlugin)
++Q_IMPORT_PLUGIN(QSvgPlugin)
++Q_IMPORT_PLUGIN(QSvgIconPlugin)
++#endif
++
+ #ifdef _WIN32
+ #	include <windows.h>
+ #endif
+@@ -46,6 +62,18 @@ QTranslator translator, translator_qt, translator_qtbase;
+ 
+ int main(int argc, char **argv) {
+ 
++#ifdef __wasi__
++	// plugins/qt/sysroot's qtbase was configured with
++	// QT_QPA_DEFAULT_PLATFORM=offscreen -- it predates the wk plugin -- so
++	// without this the app comes up on a platform that renders to nowhere and
++	// never opens a wk surface. An explicit QT_QPA_PLATFORM in the node's
++	// environment still wins, which is what makes `QT_QPA_PLATFORM=offscreen`
++	// usable for separating "Qt is broken" from "the wk QPA is broken".
++	if(!qEnvironmentVariableIsSet("QT_QPA_PLATFORM")) {
++		qputenv("QT_QPA_PLATFORM", "wk");
++	}
++#endif
++
+ #ifdef _WIN32
+ 	if(!qEnvironmentVariableIsSet("QT_QPA_PLATFORM")) {
+ 		qputenv("QT_QPA_PLATFORM", "windows:altgr");

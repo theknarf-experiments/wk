@@ -1,0 +1,168 @@
+WHAT: drop `find_package(Qt6LinguistTools REQUIRED)` from library/widgets and
+      utils/vpiano, the qt_add_translation() calls that need lrelease, the
+      lupdate maintainer targets, and the top-level `update-translations`
+      aggregate that gathers them.
+WHY:  lrelease and lupdate live in qttools -- a repo plugins/qt does not build
+      for the host (its ./host is qtbase plus qtdeclarative; verified: no
+      lrelease, no lupdate in host/bin or host/libexec) -- and there is no
+      cross-built one to borrow, because they are host tools by definition.
+      Three separate things break without the package, which is why this is
+      five hunks and not one:
+        * find_package fails outright (REQUIRED), twice;
+        * qt_add_translation() invokes the Qt6::lrelease imported target, which
+          does not exist;
+        * the update-*-translations custom targets name Qt6::lupdate, and the
+          top-level add_dependencies() on them resolves eagerly -- so merely
+          DECLARING them is a configure error, not a build one.
+UPSTREAM: not-as-is. Upstream would want this behind an option
+      (ENABLE_TRANSLATIONS, defaulting ON) rather than commented out. The
+      degradation is bounded and honest: the UI is English only. vpianomain.cpp
+      already skips installing translators for the C and English locales, and a
+      wk node has no locale to speak of. Building qttools for the host would
+      remove the need for this patch entirely.
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 58dc4d8..9feaaaf 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -298,23 +298,16 @@ if(BUILD_TESTING)
+ endif()
+ 
+ # translations
+-add_custom_target( update-translations COMMENT "Updating translations" )
+-
+-if (BUILD_WIDGETS)
+-    add_dependencies( update-translations update-widget-translations )
+-endif()
+-
+-if (BUILD_UTILS)
+-    if (BUILD_RT AND BUILD_WIDGETS)
+-        add_dependencies( update-translations update-vpiano-translations )
+-    endif()
+-    if(BUILD_ALSA AND ALSA_FOUND)
+-        add_dependencies( update-translations update-drumgrid-translations )
+-        if(BUILD_FILE)
+-            add_dependencies( update-translations update-guiplayer-translations )
+-        endif()
+-    endif()
+-endif()
++#
++# The whole aggregate target is gone with LinguistTools (see the two
++# CMakeLists it used to gather from). Every dependency below names an
++# update-*-translations target that only exists inside a
++# find_package(Qt6LinguistTools) block, so add_dependencies() on them is a
++# hard configure error the moment the package is not found -- CMake resolves
++# custom-target dependencies eagerly, unlike library ones.
++#
++#   add_custom_target( update-translations COMMENT "Updating translations" )
++#   ... add_dependencies( update-translations update-widget-translations ) ...
+ 
+ # pkg-config support
+ if ( IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}" )
+diff --git a/library/widgets/CMakeLists.txt b/library/widgets/CMakeLists.txt
+index 1753b9d..d1fbf94 100644
+--- a/library/widgets/CMakeLists.txt
++++ b/library/widgets/CMakeLists.txt
+@@ -19,7 +19,11 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
+ set(CMAKE_INCLUDE_CURRENT_DIR ON)
+ 
+ find_package(Qt${QT_VERSION_MAJOR}Widgets REQUIRED)
+-find_package(Qt${QT_VERSION_MAJOR}LinguistTools REQUIRED)
++# NO Qt6LinguistTools. lrelease and lupdate live in qttools, a repo the wk Qt
++# port does not build for the host (plugins/qt/host is qtbase + qtdeclarative),
++# and there is nothing to cross-build instead -- they are host tools by
++# definition. The .ts -> .qm compilation and the lupdate maintainer target go
++# with it; see the bottom of this file.
+ 
+ set(drumstick-widgets_HEADERS
+     ../include/drumstick/pianokeybd.h
+@@ -151,28 +155,20 @@ set(TS_FILES
+     translations/drumstick-widgets_zh_CN.ts
+ )
+ 
+-if (QT_VERSION VERSION_LESS 5.15.0)
+-    qt5_add_translation(QM_FILES ${TS_FILES})
+-else()
+-    qt_add_translation(QM_FILES ${TS_FILES})
+-endif()
+-
+-add_custom_target( update-widget-translations
+-    COMMAND Qt${QT_VERSION_MAJOR}::lupdate ${CMAKE_CURRENT_SOURCE_DIR}
+-        -I ${PROJECT_SOURCE_DIR}/library/include
+-        -I ${CMAKE_CURRENT_SOURCE_DIR}
+-        -I ${CMAKE_CURRENT_BINARY_DIR}
+-        -ts ${TS_FILES}
+-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+-    COMMENT "Updating widget translations"
+-)
+-
+-add_custom_target( drumstick-widgets-translations ALL DEPENDS ${QM_FILES} )
+-
+-if (UNIX)
+-    install( FILES ${QM_FILES}
+-             DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/drumstick )
+-endif ()
++# qt_add_translation() invokes Qt6::lrelease and update-widget-translations
++# names Qt6::lupdate; both are imported targets that only exist under
++# find_package(Qt6LinguistTools), so with the package gone these are configure
++# errors rather than build ones. ${QM_FILES} stays empty and the ALL target
++# that depended on it is dropped with them.
++#
++# What degrades, and it is the whole of it: the library's strings are English
++# only. vpianomain.cpp already skips loading translators for the C and English
++# locales, and a wk node has no locale to speak of.
++#
++#   qt_add_translation(QM_FILES ${TS_FILES})
++#   add_custom_target( update-widget-translations COMMAND Qt6::lupdate ... )
++#   add_custom_target( drumstick-widgets-translations ALL DEPENDS ${QM_FILES} )
++#   install( FILES ${QM_FILES} DESTINATION ... )
+ 
+ if(STATIC_DRUMSTICK)
+     set_target_properties(drumstick-widgets PROPERTIES
+diff --git a/utils/vpiano/CMakeLists.txt b/utils/vpiano/CMakeLists.txt
+index 82ed6b1..6f6fef3 100644
+--- a/utils/vpiano/CMakeLists.txt
++++ b/utils/vpiano/CMakeLists.txt
+@@ -21,7 +21,9 @@ set(CMAKE_AUTOMOC ON)
+ set(CMAKE_AUTORCC ON)
+ set(CMAKE_AUTOUIC ON)
+ 
+-find_package(Qt${QT_VERSION_MAJOR} COMPONENTS Gui Widgets LinguistTools REQUIRED)
++# LinguistTools dropped -- see library/widgets/CMakeLists.txt for why (lrelease
++# and lupdate are host tools from qttools, which the wk Qt port does not build).
++find_package(Qt${QT_VERSION_MAJOR} COMPONENTS Gui Widgets REQUIRED)
+ 
+ set(EXTRA_LIBS)
+ if(APPLE)
+@@ -102,24 +104,14 @@ set(TS_FILES
+     drumstick-vpiano_it.ts
+ )
+ 
+-if (QT_VERSION VERSION_LESS 5.15.0)
+-    qt5_add_translation(QM_FILES ${TS_FILES})
+-else()
+-    qt_add_translation(QM_FILES ${TS_FILES})
+-endif()
+-
+-add_custom_target( update-vpiano-translations
+-    COMMAND Qt${QT_VERSION_MAJOR}::lupdate ${CMAKE_CURRENT_SOURCE_DIR} -ts ${TS_FILES}
+-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+-    COMMENT "Updating vpiano translations"
+-)
+-
+-add_custom_target( drumstick-vpiano-translations ALL DEPENDS ${QM_FILES} )
+-
+-if (UNIX)
+-    install( FILES ${QM_FILES}
+-             DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/drumstick )
+-endif ()
++# The .qm compilation and the lupdate target go with LinguistTools; see
++# library/widgets/CMakeLists.txt. The app is English only, which is what
++# vpianomain.cpp already does for the C and English locales anyway.
++#
++#   qt_add_translation(QM_FILES ${TS_FILES})
++#   add_custom_target( update-vpiano-translations COMMAND Qt6::lupdate ... )
++#   add_custom_target( drumstick-vpiano-translations ALL DEPENDS ${QM_FILES} )
++#   install( FILES ${QM_FILES} DESTINATION ... )
+ 
+ if(STATIC_DRUMSTICK)
+     if (FALSE)

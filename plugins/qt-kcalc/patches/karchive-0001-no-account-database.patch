@@ -1,0 +1,62 @@
+WHAT: stop KArchive from including <grp.h>/<pwd.h> and calling
+      getpwuid/getgrgid on WASI.
+WHY:  karchive.cpp:30 "fatal error: grp.h file not found". Qt DOES define
+      Q_OS_UNIX on this platform (qsystemdetection.h:155), which is what steers
+      the file into the UNIX branch, but wasi-libc ships neither header: a WASI
+      component has no user or group database and no identity to look up in
+      one. <limits.h> and <unistd.h> in the same block are real and stay.
+      The two functions feed the owner/group name fields of archive ENTRIES
+      (tar uname/gname). With no account database the honest value is the empty
+      string -- which is precisely what upstream own generic `#else` branch
+      already returns for any platform that is neither UNIX nor Windows. So an
+      archive written by a wk node is readable everywhere, merely unattributed.
+UPSTREAM: as-is. The fallback being written already means upstream anticipated
+      platforms without an account database; this only adds one to the test.
+diff --git a/src/karchive.cpp b/src/karchive.cpp
+index ae66632..ca4dca5 100644
+--- a/src/karchive.cpp
++++ b/src/karchive.cpp
+@@ -27,9 +27,16 @@
+ #include <assert.h>
+ 
+ #ifdef Q_OS_UNIX
++// wasi-libc has no <grp.h> and no <pwd.h>: a WASI component has no user or
++// group database, and no identity to look up in one. Qt defines Q_OS_UNIX on
++// this platform (qsystemdetection.h:155), which is what steers the file into
++// this branch in the first place. limits.h and unistd.h DO exist and are still
++// needed, so only the two account-database headers go.
++#ifndef Q_OS_WASI
+ #include <grp.h>
+-#include <limits.h> // PATH_MAX
+ #include <pwd.h>
++#endif
++#include <limits.h> // PATH_MAX
+ #include <unistd.h>
+ #endif
+ #ifdef Q_OS_WIN
+@@ -505,9 +512,15 @@ void KArchive::setErrorString(const QString &errorStr)
+     d->errorStr = errorStr;
+ }
+ 
++// The owner/group names below are written into the archive ENTRIES (tar's
++// uname/gname fields). With no account database the honest value is the empty
++// string, which is exactly what upstream's own generic `#else` branch already
++// returns for any platform that is neither UNIX nor Windows. Archives written
++// by a wk node therefore carry no owner name -- readable everywhere, just
++// unattributed.
+ static QString getCurrentUserName()
+ {
+-#if defined(Q_OS_UNIX)
++#if defined(Q_OS_UNIX) && !defined(Q_OS_WASI)
+     struct passwd *pw = getpwuid(getuid());
+     return pw ? QFile::decodeName(pw->pw_name) : QString::number(getuid());
+ #elif defined(Q_OS_WIN)
+@@ -525,7 +538,7 @@ static QString getCurrentUserName()
+ 
+ static QString getCurrentGroupName()
+ {
+-#if defined(Q_OS_UNIX)
++#if defined(Q_OS_UNIX) && !defined(Q_OS_WASI)
+     struct group *grp = getgrgid(getgid());
+     return grp ? QFile::decodeName(grp->gr_name) : QString::number(getgid());
+ #elif defined(Q_OS_WIN)

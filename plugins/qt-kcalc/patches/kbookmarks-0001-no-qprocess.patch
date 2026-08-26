@@ -1,0 +1,57 @@
+WHAT: guard KEditBookmarks launch of the `keditbookmarks` binary on
+      QT_CONFIG(process).
+WHY:  keditbookmarks.cpp:12 `#include <QProcess>` and wk qtbase is
+      FEATURE_process=OFF -- no fork/exec across a WASI component boundary. The
+      class exists for one thing: QProcess::startDetached() on a separate
+      keditbookmarks executable. With the guard it reports the SAME failure
+      upstream already reports when that binary is not installed -- an
+      OpenResult with m_sucess=false and a user-visible message -- rather than
+      pretending it started. A wk node that wanted a bookmark editor would wire
+      a separate NODE, not spawn a child process.
+      NOTE: KBookmarks is not in KCalc dependency graph at all. It is built
+      here because it is cheap and it widens the proven stack -- KXmlGui does
+      not need it.
+UPSTREAM: as-is. QT_CONFIG(process) is a real Qt feature switch and the
+      not-installed failure path was already written.
+diff --git a/src/keditbookmarks.cpp b/src/keditbookmarks.cpp
+index 09eeb60..8a9fbfc 100644
+--- a/src/keditbookmarks.cpp
++++ b/src/keditbookmarks.cpp
+@@ -9,7 +9,9 @@
+ 
+ #include <QGuiApplication>
+ #include <QObject>
++#if QT_CONFIG(process)
+ #include <QProcess>
++#endif
+ #include <QStandardPaths>
+ 
+ #include "kbookmarksettings_p.h"
+@@ -49,6 +51,21 @@ KEditBookmarks::OpenResult KEditBookmarks::openForFileAtAddress(const QString &f
+ 
+ KEditBookmarks::OpenResult KEditBookmarks::startKEditBookmarks(const QStringList &args)
+ {
++#if !QT_CONFIG(process)
++    // FEATURE_process=OFF: no fork/exec across a WASI component boundary, so
++    // the `keditbookmarks` BINARY this class exists to launch cannot be run.
++    // Report the same failure upstream already reports when the binary is not
++    // installed -- an OpenResult with m_sucess=false and a message -- rather
++    // than pretending it started. The caller is a menu item that shows the
++    // error to the user.
++    // A wk node that wanted a bookmark editor would wire a SEPARATE NODE, not
++    // spawn a child process.
++    Q_UNUSED(args);
++    OpenResult result;
++    result.m_sucess = false;
++    result.m_errorMessage = QObject::tr("The keditbookmarks executable was not found");
++    return result;
++#else
+     const QString exec = QStandardPaths::findExecutable(QStringLiteral(KEDITBOOKMARKS_BINARY));
+     if (!exec.isEmpty()) {
+         bool success = QProcess::startDetached(exec, args);
+@@ -70,4 +87,5 @@ KEditBookmarks::OpenResult KEditBookmarks::startKEditBookmarks(const QStringList
+     OpenResult result;
+     result.m_sucess = true;
+     return result;
++#endif
+ }

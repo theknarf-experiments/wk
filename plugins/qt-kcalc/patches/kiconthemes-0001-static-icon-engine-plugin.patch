@@ -1,0 +1,53 @@
+WHAT: build KIconEnginePlugin as a STATIC archive on WASI instead of a MODULE.
+WHY:  `add_library(... MODULE ...)` means "a library meant to be dlopen d", and
+      wasm32-wasip2 has no such thing. The link fails with
+      `error: unexpected argument --no-undefined found` from
+      wasm-component-ld while producing bin/KIconEnginePlugin.so -- an error
+      that names a linker flag and not the actual problem.
+      This plugin is NOT optional decoration: it is what makes
+      QIcon::fromTheme() hand back a KIconEngine rather than Qt own icon
+      engine, i.e. it is the entire reason an application gets KDE icon-theme
+      semantics (theme inheritance, scaled directories, KIconEffect) instead of
+      Qt simpler lookup. Dropping it would silently downgrade every icon in
+      the app. So it becomes a static archive the application links and names
+      with Q_IMPORT_PLUGIN -- the same shape the wk QPA plugin and the qsvg
+      image-format/icon-engine plugins already use.
+      QT_STATICPLUGIN is the define that makes moc emit
+      qt_static_plugin_KIconEnginePlugin() instead of the dlopen entry point;
+      without it Q_IMPORT_PLUGIN in the app has nothing to reference.
+UPSTREAM: as-is in spirit. Qt own static builds do exactly this; upstream
+      would more likely key it on `NOT BUILD_SHARED_LIBS` than on the platform
+      name, which would be the better patch.
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index ef464ec..700293a 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -99,7 +99,27 @@ install(FILES
+   DESTINATION ${KDE_INSTALL_INCLUDEDIR_KF}/KIconThemes COMPONENT Devel
+ )
+ 
+-add_library(KIconEnginePlugin MODULE kiconengineplugin.cpp)
++# MODULE means "a library meant to be dlopen'd", and on wasm32-wasip2 there is
++# no such thing: wasm-component-ld rejects the MODULE link line outright with
++# `error: unexpected argument '--no-undefined' found` while trying to produce
++# bin/KIconEnginePlugin.so.
++#
++# This plugin is not optional decoration -- it is what makes QIcon::fromTheme()
++# return a KIconEngine instead of Qt's own, i.e. it is the entire reason an
++# application gets KDE icon-theme lookup (inherits, scaled directories, icon
++# effects) rather than Qt's simpler one. So it becomes a STATIC archive that
++# the application links and names with Q_IMPORT_PLUGIN, exactly like the wk
++# QPA plugin and the qsvg plugins already do.
++#
++# QT_STATICPLUGIN is the define that makes moc emit the
++# qt_static_plugin_KIconEnginePlugin() registration function instead of the
++# dlopen entry point; without it Q_IMPORT_PLUGIN in the app fails to link.
++if(CMAKE_SYSTEM_NAME STREQUAL "WASI")
++    add_library(KIconEnginePlugin STATIC kiconengineplugin.cpp)
++    target_compile_definitions(KIconEnginePlugin PRIVATE QT_STATICPLUGIN)
++else()
++    add_library(KIconEnginePlugin MODULE kiconengineplugin.cpp)
++endif()
+ 
+ target_link_libraries(KIconEnginePlugin
+     PRIVATE

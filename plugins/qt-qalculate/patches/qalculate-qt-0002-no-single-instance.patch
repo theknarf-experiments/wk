@@ -1,0 +1,111 @@
+WHAT: compile out the single-instance IPC (QLockFile + QLocalSocket/QLocalServer)
+      on __wasi__.
+WHY:  it is the ONLY thing in this application that uses QtNetwork -- there are
+      zero QNetwork* references in the whole of src/, and `QT += network` in
+      qalculate-qt.pro exists for these two classes alone. wk's Qt is built
+      with QT_FEATURE_localsocket off; QLocalSocket's headers are not even
+      installed in plugins/qt/sysroot, so this is a compile error, not a
+      runtime one.
+      More to the point, the feature has no meaning here. A wk node IS one
+      instance: its own process, its own vfs, its own surface. There is no
+      second copy of the app to hand a command line to, and a lock file in the
+      node's private filesystem can only ever be uncontended.
+      SHAPE OF THE PATCH, and why it is not simply a deletion: serverNewConnection()
+      and socketReadyRead() keep their declarations and their (now empty)
+      definitions. moc does not see __wasi__ -- it is a compiler builtin, not a
+      -D that AUTOMOC forwards -- so a header guarded on it would still emit
+      metaobject entries for slots the compiler had removed, and the app would
+      fail to link with undefined qt_static_metacall targets. The member
+      pointers need no guard at all: qalculatewindow.h only forward-declares
+      `class QLocalSocket;`.
+UPSTREAM: not-as-is. Upstream would want a configure-time switch (they already
+      have `--new-instance`), not an #ifdef on a platform macro.
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -20,7 +20,9 @@
+ #include <QLockFile>
+ #include <QStandardPaths>
+ #include <QtGlobal>
++#ifndef __wasi__
+ #include <QLocalSocket>
++#endif
+ #include <QTranslator>
+ #include <QDir>
+ #include <QTextStream>
+@@ -187,6 +189,13 @@ int main(int argc, char **argv) {
+ 
+ 	std::string homedir = getLocalDir();
+ 	recursiveMakeDir(homedir);
++#ifndef __wasi__
++	// The single-instance handshake. A wk node IS one instance: it has its
++	// own process, its own vfs and its own surface, there is no second copy to
++	// hand the command line to, and wk's Qt has no QLocalSocket to hand it
++	// with (QT_FEATURE_localsocket is off -- the headers are not even
++	// installed). Dropping it is not a workaround for a missing capability;
++	// the capability has no meaning here.
+ 	QLockFile lockFile(QString::fromStdString(buildPath(homedir, "qalculate-qt.lock")));
+ 	if(settings->allow_multiple_instances < 1 && !parser->isSet(nOption) && !lockFile.tryLock(100)) {
+ 		if(lockFile.error() == QLockFile::LockFailedError) {
+@@ -247,6 +256,7 @@ int main(int argc, char **argv) {
+ 			}
+ 		}
+ 	}
++#endif
+ 
+ #ifndef __APPLE__
+ 	app.setWindowIcon(LOAD_APP_ICON("qalculate-qt"));
+--- a/src/qalculatewindow.cpp
++++ b/src/qalculatewindow.cpp
+@@ -9,8 +9,10 @@
+     (at your option) any later version.
+ */
+ 
++#ifndef __wasi__
+ #include <QLocalSocket>
+ #include <QLocalServer>
++#endif
+ #include <QCommandLineParser>
+ #include <QPlainTextEdit>
+ #include <QVBoxLayout>
+@@ -962,10 +964,17 @@ QalculateWindow::QalculateWindow() : QMainWindow() {
+ 	addDockWidget(Qt::TopDockWidgetArea, rpnDock);
+ 	if(!settings->rpn_mode) rpnDock->hide();
+ 
++#ifndef __wasi__
++	// A wk node is one instance by construction; nothing can connect. See the
++	// matching block in main.cpp.
+ 	QLocalServer::removeServer("qalculate-qt");
+ 	server = new QLocalServer(this);
+ 	server->listen("qalculate-qt");
+ 	connect(server, SIGNAL(newConnection()), this, SLOT(serverNewConnection()));
++#else
++	socket = NULL;
++	server = NULL;
++#endif
+ 
+ 	mstruct = new MathStructure();
+ 	mstruct_exact.setUndefined();
+@@ -3686,12 +3695,15 @@ void QalculateWindow::onExpandPartialFractionsClicked() {
+ 	executeCommand(COMMAND_EXPAND_PARTIAL_FRACTIONS);
+ }
+ void QalculateWindow::serverNewConnection() {
++#ifndef __wasi__
+ 	socket = server->nextPendingConnection();
+ 	if(socket) {
+ 		connect(socket, SIGNAL(readyRead()), this, SLOT(socketReadyRead()));
+ 	}
++#endif
+ }
+ void QalculateWindow::socketReadyRead() {
++#ifndef __wasi__
+ 	QString command = socket->readAll();
+ 	if(!command.isEmpty() && command[0] == '+') {
+ 		settings->window_state = saveState();
+@@ -3748,6 +3760,7 @@ void QalculateWindow::socketReadyRead() {
+ 	}
+ 	command = command.mid(1).trimmed();
+ 	if(!command.isEmpty()) {expressionEdit->setExpression(command); calculate();}
++#endif
+ }
+ void QalculateWindow::onActivateRequested(const QStringList &arguments, const QString&) {
+ 	if(!arguments.isEmpty()) {

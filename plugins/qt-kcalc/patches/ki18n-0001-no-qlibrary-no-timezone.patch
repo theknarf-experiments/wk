@@ -1,0 +1,93 @@
+WHAT: guard KLocalizedString Transcript plugin loading on QT_CONFIG(library),
+      and KTimeZone::country() on QT_CONFIG(timezone).
+WHY:  two unrelated failures in one repo.
+      klocalizedstring.cpp:20 is `#include <QLibrary>` and wk qtbase is
+      FEATURE_library=OFF, so the header is not installed and the file dies at
+      the include. Transcript is KDE i18n scripting layer -- a shared object
+      full of QJSEngine scripts, dlopen d on demand for translation-side plural
+      and case rules. The STATIC alternative upstream already has
+      (HAVE_STATIC_KTRANSCRIPT) needs BUILD_WITH_QML, i.e. a QJSEngine, i.e.
+      QtQml, which plugins/qt does not build -- so on this platform Transcript
+      is genuinely unavailable. That is a state loadTranscript() is already
+      written to produce ("null indicates that Transcript is not available")
+      and every caller already handles. And with the passthrough libintl there
+      are no catalogs, hence no ~script blocks for it to interpret anyway.
+      localedata/ktimezone.cpp:30 needs QTimeZone(QByteArray) and territory(),
+      both gone with FEATURE_timezone=OFF; the error names the cast rather than
+      the feature. KTimeZone::fromLocation() -- the spatial index, which is the
+      interesting half and is pure data -- keeps working; only the
+      timezone-to-country mapping returns {}. Nothing in KCalc graph uses
+      KI18nLocaleData at all.
+UPSTREAM: as-is for the ktimezone hunk. not-as-is for the Transcript one --
+      upstream would want a third HAVE_* configure variable rather than a
+      QT_CONFIG test inlined in the #if chain.
+diff --git a/src/i18n/klocalizedstring.cpp b/src/i18n/klocalizedstring.cpp
+index 2a6e216..cbf4e85 100644
+--- a/src/i18n/klocalizedstring.cpp
++++ b/src/i18n/klocalizedstring.cpp
+@@ -17,7 +17,9 @@
+ #include <QFile>
+ #include <QFileInfo>
+ #include <QHash>
++#if QT_CONFIG(library)
+ #include <QLibrary>
++#endif
+ #include <QList>
+ #include <QMutexLocker>
+ #include <QPluginLoader>
+@@ -1312,7 +1314,7 @@ void KLocalizedStringPrivate::locateScriptingModule(const QByteArray &domain, co
+ extern "C" {
+ #if HAVE_STATIC_KTRANSCRIPT
+ extern KTranscript *load_transcript();
+-#else
++#elif QT_CONFIG(library)
+ typedef KTranscript *(*InitFunc)();
+ #endif
+ }
+@@ -1328,6 +1330,25 @@ void KLocalizedStringPrivate::loadTranscript()
+ 
+ #if HAVE_STATIC_KTRANSCRIPT
+     s->ktrs = load_transcript();
++#elif !QT_CONFIG(library)
++    // Transcript is KDE's scripting layer for translation-side plural/case
++    // rules: a .so full of QJSEngine scripts, dlopen'd on demand. wk's qtbase
++    // is FEATURE_library=OFF (wasm has no dlopen), so <QLibrary> is not even
++    // installed -- klocalizedstring.cpp:20 failed with "'QLibrary' file not
++    // found" before this guard.
++    //
++    // The static route the branch above takes needs BUILD_WITH_QML, i.e. a
++    // QJSEngine, i.e. QtQml -- which plugins/qt does not build. So on this
++    // platform Transcript is genuinely unavailable, and s->ktrs stays null,
++    // which is the state this function is already written to produce ("null
++    // indicates that Transcript is not available" a few lines up) and which
++    // every caller already handles.
++    //
++    // Nothing is lost that this port could have had: with the passthrough
++    // libintl there are no catalogs, so there are no ~script blocks for
++    // Transcript to interpret in the first place.
++    qCDebug(KI18N) << "Transcript is unavailable: this Qt has no runtime library loading.";
++    return;
+ #else
+     // QPluginLoader is just used to find the plugin
+     QPluginLoader loader(QStringLiteral("kf6/ktranscript"));
+diff --git a/src/localedata/ktimezone.cpp b/src/localedata/ktimezone.cpp
+index fd14b51..7be6aa2 100644
+--- a/src/localedata/ktimezone.cpp
++++ b/src/localedata/ktimezone.cpp
+@@ -27,5 +27,16 @@ KCountry KTimeZone::country(const char *ianaId)
+         return {};
+     }
+ 
++#if QT_CONFIG(timezone)
+     return KCountry::fromQLocale(QTimeZone(ianaId).territory());
++#else
++    // FEATURE_timezone=OFF in wk's qtbase leaves QTimeZone as a stub with no
++    // QTimeZone(QByteArray) constructor and no territory() -- the failure
++    // reads as "no matching conversion for functional-style cast from 'const
++    // char *' to 'QTimeZone'", which points at the cast rather than at the
++    // feature. There is no zone database in a wk node to answer from either.
++    // KTimeZone::fromLocation() -- the spatial index, which is the actually
++    // interesting half of this class and is pure data -- is unaffected.
++    return {};
++#endif
+ }

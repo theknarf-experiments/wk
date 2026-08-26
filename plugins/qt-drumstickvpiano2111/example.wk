@@ -1,0 +1,68 @@
+// vim: set filetype=kdl :
+// drumstick-vpiano as a wk node — a REAL Qt 6 MIDI application, playing a real
+// synth on the other end of a wk MIDI wire. Run it from the repo root with:
+//
+//   wk run plugins/qt-drumstickvpiano2111/example.wk
+//
+// Build both halves first (and note the Qt one is hours):
+//
+//   cd plugins/qt-drumstickvpiano2111 && mise run build
+//   cd plugins/fluidsynth && ./build.sh
+//
+// This file carries its OWN `dependencies` block rather than importing
+// ../../workspace.wk, so it is self-contained: nothing outside this plugin
+// directory has to change to try the node. Move the entry into workspace.wk
+// when the port stops being an experiment — that is where every other node
+// type is registered, and it is what lets you add one from the canvas UI.
+//
+// WHAT TO DO WITH IT. Click the keys: each one sends a MIDI note along the
+// wire to the SoundFont synth, which plays it out of your speakers. Then play
+// the wk `piano` node on the left: its notes travel the other way, into the
+// Qt app, which lights the matching key up and — because MIDI-thru is on in
+// the image — passes them straight through to the synth as well. The View menu
+// changes the note names and the key colours; Edit > Connections shows the one
+// MIDI port a wk node has, called "wk fabric".
+//
+// FOR A USB KEYBOARD, swap the `piano` node for `midiin`, which opens the
+// first connected hardware MIDI device (`wk midi devices` lists them):
+//
+//   midiin "" "01KWVPIANO0000000000000MI05" {
+//       pos -420.0 300.0
+//       size 130.0 44.0
+//   }
+//   midi "01KWVPIANO0000000000000MI05" "01KWVPIANO0000000000000VP01"
+//
+// ...and delete the `piano` node and its wire. The default here is the
+// software piano so the demo runs on any machine.
+dependencies {
+    vpiano "docker://plugins/qt-drumstickvpiano2111/Dockerfile" {
+        description "drumstick-vpiano 2.11.1 — a real Qt 6 virtual piano; MIDI in and out"
+    }
+    fluidsynth "docker://plugins/fluidsynth/Dockerfile" {
+        description "SoundFont synth (FluidLite engine + TimGM6mb.sf2): MIDI in, real instruments out"
+    }
+    piano "plugins/piano/target/wasm32-wasip1/debug/piano.wasm" {
+        description "on-screen keyboard emitting MIDI"
+    }
+}
+workspace "01KWVPIANO000000000000WS00" {
+    node "vpiano" "01KWVPIANO0000000000000VP01" {
+        pos 380.0 80.0
+        size 1000.0 420.0
+    }
+    node "fluidsynth" "01KWVPIANO0000000000000FS02" {
+        pos 1440.0 80.0
+        size 360.0 200.0
+    }
+    node "piano" "01KWVPIANO0000000000000PN03" {
+        pos -220.0 80.0
+        size 560.0 220.0
+    }
+    note "01KWVPIANO0000000000000NT04" {
+        text "drumstick-vpiano 2.11.1\nQt 6.8.4 Widgets on wasm32-wasip2\n\nThe piano in the middle is a real Qt\napp. It imports wk:midi/midi, so wk\ngives it MIDI ports like any other\nnode.\n\nClick its keys -> notes travel right,\nto the SoundFont synth.\nPlay wk's own piano on the left ->\nnotes travel in, light the keys up,\nand pass through to the synth.\n\nKNOWN GAPS\n* the Connections dialog lists exactly\n  ONE port, \"wk fabric\". That is not a\n  bug: a node has one MIDI inbox and\n  one outbox, and where they go is\n  decided by the wires on this canvas\n* MIDI input is POLLED at 1 ms, because\n  wk:midi has no pollable. Expect a few\n  ms of jitter; fine for playing, not\n  for a tight sequencer\n* no window decorations: the main\n  window fills the surface, dialogs\n  float above it\n* no IME, so no dead keys or CJK"
+        pos -220.0 340.0
+        size 560.0 440.0
+    }
+    midi "01KWVPIANO0000000000000VP01" "01KWVPIANO0000000000000FS02"
+    midi "01KWVPIANO0000000000000PN03" "01KWVPIANO0000000000000VP01"
+}
