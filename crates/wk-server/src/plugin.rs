@@ -163,6 +163,13 @@ pub struct Node {
     /// The Screen Capture frame slot granted to this node by a capture wire
     /// (`None` while unwired). Set by the server's capture reconciler.
     pub capture_src: crate::capture::SharedCaptureSrc,
+    /// The host clipboard board granted to this node by a clipboard wire
+    /// (`None` while unwired), and whether its capability token currently
+    /// allows reading / writing it. All three are refreshed by the server's
+    /// `sync_clipboard` every tick, so attenuating a token revokes live.
+    pub clip_src: crate::clipboard::SharedClipSrc,
+    pub clip_read: crate::clipboard::ClipPermit,
+    pub clip_write: crate::clipboard::ClipPermit,
     /// Whether this node may run programs via `wk:exec`, refreshed from its
     /// capability token each tick so attenuation revokes it live.
     pub exec_permit: crate::exec::ExecPermit,
@@ -194,6 +201,9 @@ pub struct NodeSetup {
     /// Whether the component imports `wk:capture` — the UI only draws a Capture
     /// port on nodes that actually consume captured frames.
     pub capture: bool,
+    /// Whether the component imports `wk:clipboard` — the UI only draws a
+    /// Clipboard port on nodes that actually copy and paste.
+    pub clipboard: bool,
     /// Whether the component imports `wk:fs/provider` — it serves a filesystem,
     /// so other nodes may mount it (the UI offers it as a mount source).
     pub fs_provider: bool,
@@ -231,6 +241,11 @@ impl Node {
     /// `false` until the component has finished compiling.
     pub fn imports_capture(&self) -> bool {
         self.setup.get().is_some_and(|s| s.capture)
+    }
+    /// Whether this node copies and pastes (imports `wk:clipboard`). `false`
+    /// until the component has finished compiling.
+    pub fn imports_clipboard(&self) -> bool {
+        self.setup.get().is_some_and(|s| s.clipboard)
     }
     /// Whether this node serves a filesystem (imports `wk:fs/provider`), so
     /// other nodes may mount it. `false` until the component has compiled.
@@ -348,6 +363,17 @@ pub struct HostState {
     /// node; `None` while unwired) + the last frame sequence this store saw.
     pub(crate) capture_src: crate::capture::SharedCaptureSrc,
     pub(crate) capture_seq: u64,
+    /// The host clipboard board granted by a clipboard wire (shared with the
+    /// node; `None` while unwired), plus the two permits its capability token
+    /// grants. Read and write are separate: a token may allow copying OUT of
+    /// a node without letting it see what the user copied anywhere else.
+    pub(crate) clip_src: crate::clipboard::SharedClipSrc,
+    pub(crate) clip_read: crate::clipboard::ClipPermit,
+    pub(crate) clip_write: crate::clipboard::ClipPermit,
+    /// Whether this store has already logged a denied clipboard read. The
+    /// guest is told nothing, but the first refusal per node belongs in the
+    /// host log or "my app cannot paste" has no diagnosis anywhere.
+    pub(crate) clip_denied_logged: bool,
     /// What this store needs to serve `wk:exec` (run another program from the
     /// node's filesystem). `None` for contexts that may not exec at all —
     /// build steps and children, which keeps `RUN` hermetic.
@@ -913,6 +939,16 @@ fn component_imports_capture(component: &Component, engine: &Engine) -> bool {
         .any(|(name, _)| name.starts_with("wk:capture/"))
 }
 
+/// Whether a component imports `wk:clipboard` — i.e. it copies and pastes, so
+/// the UI should offer it a Clipboard port. Importing is not permission: the
+/// port is only an affordance for drawing the wire that grants it.
+fn component_imports_clipboard(component: &Component, engine: &Engine) -> bool {
+    component
+        .component_type()
+        .imports(engine)
+        .any(|(name, _)| name.starts_with("wk:clipboard/"))
+}
+
 /// Whether a component imports `wk:fs/provider` — i.e. it serves a filesystem
 /// other nodes can mount, so the server offers it as a mount source.
 fn component_imports_fs_provider(component: &Component, engine: &Engine) -> bool {
@@ -1052,6 +1088,14 @@ impl PluginHost {
             term_io: crate::terminal::TermIo::new(),
             capture_src: crate::capture::new_src(),
             capture_seq: 0,
+            // No clipboard. Only a NODE wired to a Clipboard node on the
+            // canvas gets one, and this store is not a node — it is a build
+            // step, an http request, an exec'd child or a bare surface probe.
+            // Both permits stay false, so `get` returns none and `set` drops.
+            clip_src: crate::clipboard::new_src(),
+            clip_read: crate::clipboard::new_permit(),
+            clip_write: crate::clipboard::new_permit(),
+            clip_denied_logged: false,
             // Children may nest further, up to exec::MAX_DEPTH.
             exec: Some(crate::exec::ExecCtx {
                 host: Arc::new(self.clone()),
@@ -1194,6 +1238,14 @@ impl crate::images::BuildRunner for PluginHost {
             term_io: crate::terminal::TermIo::new(),
             capture_src: crate::capture::new_src(),
             capture_seq: 0,
+            // No clipboard. Only a NODE wired to a Clipboard node on the
+            // canvas gets one, and this store is not a node — it is a build
+            // step, an http request, an exec'd child or a bare surface probe.
+            // Both permits stay false, so `get` returns none and `set` drops.
+            clip_src: crate::clipboard::new_src(),
+            clip_read: crate::clipboard::new_permit(),
+            clip_write: crate::clipboard::new_permit(),
+            clip_denied_logged: false,
             // A RUN step may spawn programs from the image it is building.
             // That is the point of RUN — `RUN ["/bin/bash.wasm", "-c", "mkdir
             // -p /etc && cp a b"]` is a shell running real commands — and it
@@ -1442,6 +1494,9 @@ impl PluginHost {
         crate::options::add_to_linker(&mut linker)?;
         crate::tty::add_to_linker(&mut linker)?;
         crate::capture::add_to_linker(&mut linker)?;
+        // wk:clipboard — the HOST's system clipboard, gated on a wire to a
+        // Clipboard node plus two separately-attenuable token actions.
+        crate::clipboard::add_to_linker(&mut linker)?;
         wasi::surface::surface::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
         wasi::graphics_context::graphics_context::add_to_linker::<_, HasSelf<_>>(
             &mut linker,
@@ -1507,6 +1562,14 @@ impl PluginHost {
             term_io: term_io.clone().unwrap_or_else(crate::terminal::TermIo::new),
             capture_src: crate::capture::new_src(),
             capture_seq: 0,
+            // No clipboard. Only a NODE wired to a Clipboard node on the
+            // canvas gets one, and this store is not a node — it is a build
+            // step, an http request, an exec'd child or a bare surface probe.
+            // Both permits stay false, so `get` returns none and `set` drops.
+            clip_src: crate::clipboard::new_src(),
+            clip_read: crate::clipboard::new_permit(),
+            clip_write: crate::clipboard::new_permit(),
+            clip_denied_logged: false,
             midi_in: midi_in.clone(),
             midi_router: midi.clone(),
             scene_reg: crate::scene::new_registry(),
@@ -1611,6 +1674,15 @@ impl PluginHost {
                 .map(|c| c.layers.clone())
                 .unwrap_or_default(),
             capture_src: crate::capture::new_src(),
+            // DENIED until the server's reconciler says otherwise — the
+            // opposite default from exec_permit below, and deliberately so.
+            // Exec grants a node nothing it does not already have (running a
+            // program out of its own filesystem); the clipboard is a genuine
+            // cross-sandbox channel, so the window between spawn and the
+            // first tick must not be an open one.
+            clip_src: crate::clipboard::new_src(),
+            clip_read: crate::clipboard::new_permit(),
+            clip_write: crate::clipboard::new_permit(),
             // Allowed until the server's reconciler says otherwise (it runs
             // before the guest does).
             exec_permit: crate::exec::new_permit(true),
@@ -1668,6 +1740,7 @@ impl PluginHost {
         let imports_sockets = component_imports_sockets(&component, &self.engine);
         let imports_midi = component_imports_midi(&component, &self.engine);
         let imports_capture = component_imports_capture(&component, &self.engine);
+        let imports_clipboard = component_imports_clipboard(&component, &self.engine);
         let imports_fs_provider = component_imports_fs_provider(&component, &self.engine);
         let net_stack = if !is_http && imports_sockets {
             // Seeded from the node id so a node keeps its address across
@@ -1689,6 +1762,7 @@ impl PluginHost {
             midi: imports_midi,
             net: imports_sockets,
             capture: imports_capture,
+            clipboard: imports_clipboard,
             fs_provider: imports_fs_provider,
         };
         // Publish; the server now sees a ready node.
@@ -1784,6 +1858,12 @@ impl PluginHost {
             term_io: node.term_io.clone(),
             capture_src: node.capture_src.clone(),
             capture_seq: 0,
+            // Shared with the node, so the server's `sync_clipboard` can point
+            // this at a board and flip the permits while the guest is running.
+            clip_src: node.clip_src.clone(),
+            clip_read: node.clip_read.clone(),
+            clip_write: node.clip_write.clone(),
+            clip_denied_logged: false,
             exec: Some(crate::exec::ExecCtx {
                 host: Arc::new(self.clone()),
                 depth: 0,
@@ -1920,6 +2000,14 @@ mod tests {
             term_io: crate::terminal::TermIo::new(),
             capture_src: crate::capture::new_src(),
             capture_seq: 0,
+            // No clipboard. Only a NODE wired to a Clipboard node on the
+            // canvas gets one, and this store is not a node — it is a build
+            // step, an http request, an exec'd child or a bare surface probe.
+            // Both permits stay false, so `get` returns none and `set` drops.
+            clip_src: crate::clipboard::new_src(),
+            clip_read: crate::clipboard::new_permit(),
+            clip_write: crate::clipboard::new_permit(),
+            clip_denied_logged: false,
             exec: None,
             midi_in: crate::midi::new_inbox(),
             midi_router: host.midi.clone(),
@@ -2467,6 +2555,667 @@ mod tests {
             s.wake();
         }
         node.kill.store(true, Ordering::Relaxed);
+    }
+
+    /// A real Qt app COPIES to and PASTES from the HOST's system clipboard.
+    ///
+    /// This is `wk:clipboard` end to end, through the layer a user actually
+    /// touches: `Cmd/Ctrl+A` then `Cmd/Ctrl+C` in a `QLineEdit`, and
+    /// `QClipboard::text()` for the paste side. Nothing in `qt-smoke` calls
+    /// the shim — it calls `QClipboard`, which only reaches `QWkClipboard`
+    /// because `QWkIntegration::clipboard()` returns one, which is exactly the
+    /// path any Qt app's Copy takes. What is asserted on is the HOST side of
+    /// the bridge: the board's `outbox` is the string the local client's
+    /// `pump_clipboard` would hand to `arboard::set_text`, so a match there is
+    /// "this text reached the machine's clipboard" minus one function call.
+    ///
+    /// The gate is exercised as its own claim first: the node is spawned with
+    /// both permits FALSE (the default a fresh node gets — a Clipboard wire is
+    /// what turns them on), and the guest's opening `CLIP` line must show an
+    /// empty clipboard even though a board is already sitting there full of
+    /// text. That is the difference between "the bridge works" and "the bridge
+    /// is a hole".
+    ///
+    /// Frames are pumped by hand exactly like the paint test; the guest
+    /// re-narrates its clipboard on the same repeating timer that publishes
+    /// the button rect, because there is no host-side change notification for
+    /// a `QClipboard::dataChanged()` to hang on.
+    #[test]
+    fn qt_app_copies_and_pastes_through_the_host_clipboard() {
+        let wasm = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/qt/qt-smoke.wasm");
+        if !wasm.exists() {
+            eprintln!("skipping: build plugins/qt first (./build-smoke.sh)");
+            return;
+        }
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let surfaces: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        host.spawn(
+            &wasm,
+            "qt-smoke",
+            id,
+            &[],
+            surfaces.clone(),
+            nodes.clone(),
+            Vec::new(),
+            Some(crate::images::ContainerSetup {
+                layers: Vec::new(),
+                env: vec![("WK_SMOKE_SELFTEST".into(), "1".into())],
+            }),
+        )
+        .expect("spawn");
+
+        let node = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+            loop {
+                if let Some(n) = nodes.lock().unwrap().iter().find(|n| n.id == id).cloned() {
+                    break n;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "qt-smoke node never appeared"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        // A Clipboard node's board, holding what "the host clipboard" contains.
+        // Attached to the node the way `Server::sync_clipboard` attaches it,
+        // but with BOTH PERMITS OFF — the state of a node that has a board in
+        // reach and a token that says no.
+        let board = crate::clipboard::new_board();
+        const PASTED: &str = "wk pasted this into Qt";
+        {
+            let mut b = board.lock().unwrap();
+            b.present = true;
+            b.seq = 1;
+            b.text = PASTED.to_string();
+        }
+        *node.clip_src.lock().unwrap() = Some(board.clone());
+
+        let surface = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            loop {
+                if let Some(s) = surfaces.lock().unwrap().first().cloned() {
+                    break s;
+                }
+                assert!(
+                    !node.finished.load(Ordering::Relaxed),
+                    "qt-smoke exited before opening a surface; node log:\n{}",
+                    String::from_utf8_lossy(&node.term_io.log_read(0).0)
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "qt-smoke never opened a surface; node log:\n{}",
+                    String::from_utf8_lossy(&node.term_io.log_read(0).0)
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+
+        let pump_frame = || {
+            let mut s = surface.lock().unwrap();
+            s.frame_ready = true;
+            s.wake();
+        };
+        let log_now = || String::from_utf8_lossy(&node.term_io.log_read(0).0).to_string();
+        // The NEWEST reading, since the guest republishes on a timer.
+        let clip_line = |log: &str| -> Option<String> {
+            log.lines()
+                .rfind(|l| l.starts_with("CLIP "))
+                .map(String::from)
+        };
+        let pump_until = |want: &dyn Fn(&str) -> bool, secs: u64, what: &str| -> String {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            loop {
+                pump_frame();
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                let log = log_now();
+                if want(&log) {
+                    return log;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what}; node log:\n{log}"
+                );
+            }
+        };
+
+        // ---- 1. DENIED: a board in reach, a token that says no ------------
+        // The guest is up and reading its clipboard, and it sees nothing.
+        let log = pump_until(
+            &|l: &str| clip_line(l).is_some(),
+            180,
+            "qt-smoke never narrated its clipboard",
+        );
+        let first = clip_line(&log).unwrap();
+        assert_eq!(
+            first, "CLIP owns=0 ''",
+            "a node with NO clipboard grant read the host clipboard; the token gate is a hole. \
+             Board holds {PASTED:?}. node log:\n{log}"
+        );
+        eprintln!("qt-smoke: clipboard denied without a grant ({first})");
+
+        // ---- 2. PASTE: grant read, and Qt sees what the host holds ---------
+        node.clip_read.store(true, Ordering::Relaxed);
+        let want = format!("CLIP owns=0 '{PASTED}'");
+        let log = pump_until(
+            &|l: &str| clip_line(l).as_deref() == Some(want.as_str()),
+            60,
+            "QClipboard::text() never returned what the host clipboard held",
+        );
+        let _ = log;
+        eprintln!("qt-smoke: pasted the host clipboard into Qt ({want})");
+
+        // ---- 3. COPY: type into the QLineEdit, then select-all + copy ------
+        // Which physical modifier means "shortcut" depends on the host, and
+        // the guest learns it from WK_HOST_OS — so the test has to agree with
+        // it or the chord lands on a different Qt shortcut entirely (Ctrl+A is
+        // MoveToStartOfLine on macOS, not SelectAll, and it would clear the
+        // selection the copy needs).
+        let mac = std::env::consts::OS == "macos";
+        let typed = |key: Key, text: &str, chord: bool| {
+            let ev = KeyEvent {
+                key: Some(key),
+                text: Some(text.into()),
+                alt_key: false,
+                ctrl_key: chord && !mac,
+                meta_key: chord && mac,
+                shift_key: false,
+                repeat: false,
+            };
+            let mut s = surface.lock().unwrap();
+            s.key_down.push_back(ev.clone());
+            s.key_up.push_back(ev);
+            s.wake();
+        };
+
+        const COPIED: &str = "wk";
+        typed(Key::KeyW, "w", false);
+        typed(Key::KeyK, "k", false);
+        let log = pump_until(
+            &|l: &str| l.contains(&format!("EDIT '{COPIED}'")),
+            60,
+            "the text to be copied never reached the QLineEdit",
+        );
+        let _ = log;
+
+        typed(Key::KeyA, "a", true); // select all
+        typed(Key::KeyC, "c", true); // copy
+
+        // ...and `write` is still DENIED, so this copy must go NOWHERE. What
+        // it proves is the useful half of the read/write split: the node's own
+        // in-process clipboard keeps working — Qt owns it and holds the text —
+        // while nothing reaches the machine. This is the state a
+        //
+        //   check if operation($k,$t,$a), $k != "clipboard" || $a == "read"
+        //
+        // attenuation puts an app in, and it is worth pinning, because a
+        // write-gate that silently leaked would look identical from inside the
+        // guest (a denied `set` returns nothing, on purpose).
+        let want = format!("CLIP owns=1 '{COPIED}'");
+        let log = pump_until(
+            &|l: &str| clip_line(l).as_deref() == Some(want.as_str()),
+            60,
+            "Cmd/Ctrl+C did not even reach Qt's own clipboard",
+        );
+        let _ = log;
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < until {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            assert!(
+                board.lock().unwrap().outbox.is_none(),
+                "a node with clipboard/write DENIED wrote to the host clipboard;                  node log:\n{}",
+                log_now()
+            );
+        }
+        eprintln!("qt-smoke: copy stayed inside the node while write was denied ({want})");
+
+        // Now grant `write` and copy again. The selection is untouched, so the
+        // same chord is all it takes.
+        node.clip_write.store(true, Ordering::Relaxed);
+        typed(Key::KeyC, "c", true);
+
+        // The assertion that matters: the string is in the board's OUTBOX,
+        // which is precisely what the local client's `pump_clipboard` hands to
+        // `arboard::Clipboard::set_text`.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            if board.lock().unwrap().outbox.is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Cmd/Ctrl+C in the QLineEdit never reached the host clipboard \
+                 (the board's outbox is still empty); node log:\n{}",
+                log_now()
+            );
+        }
+        let out = board.lock().unwrap().outbox.take().unwrap();
+        assert_eq!(
+            out,
+            COPIED,
+            "the wrong text was copied to the host clipboard; node log:\n{}",
+            log_now()
+        );
+        eprintln!("qt-smoke: Cmd/Ctrl+C in a QLineEdit put {out:?} on the host clipboard");
+
+        // ---- 4. OWNERSHIP: apply the copy the way the client's pump does ---
+        // Publishing our own write back must NOT read to the guest as "someone
+        // else copied": Qt has to keep saying it owns the clipboard, which is
+        // what keeps `m_userMimeData` (and with it every non-text format an
+        // in-node copy carried) alive.
+        {
+            let mut b = board.lock().unwrap();
+            b.seq += 1;
+            b.text = out.clone();
+        }
+        let want = format!("CLIP owns=1 '{COPIED}'");
+        let log = pump_until(
+            &|l: &str| clip_line(l).as_deref() == Some(want.as_str()),
+            60,
+            "Qt did not keep ownership of a clipboard it had just written",
+        );
+        let _ = log;
+        eprintln!("qt-smoke: Qt still owns the clipboard after its own copy ({want})");
+
+        // ---- 5. A FOREIGN copy takes ownership away ------------------------
+        const FOREIGN: &str = "copied somewhere else entirely";
+        {
+            let mut b = board.lock().unwrap();
+            b.seq += 1;
+            b.text = FOREIGN.to_string();
+        }
+        let want = format!("CLIP owns=0 '{FOREIGN}'");
+        let log = pump_until(
+            &|l: &str| clip_line(l).as_deref() == Some(want.as_str()),
+            60,
+            "Qt kept claiming a clipboard another application had taken",
+        );
+        let _ = log;
+        eprintln!("qt-smoke: a foreign copy took the clipboard back ({want})");
+
+        // ---- 6. REVOCATION is live ----------------------------------------
+        // Attenuating a token flips `clip_read` on the next tick with the guest
+        // still running; nothing is restarted and nothing is torn down.
+        node.clip_read.store(false, Ordering::Relaxed);
+        let log = pump_until(
+            &|l: &str| clip_line(l).as_deref() == Some("CLIP owns=0 ''"),
+            60,
+            "revoking clipboard/read did not stop a running guest from reading it",
+        );
+        let _ = log;
+        eprintln!("qt-smoke: revoking the grant blinded a running guest");
+
+        {
+            let mut s = surface.lock().unwrap();
+            s.closed = true;
+            s.wake();
+        }
+        node.kill.store(true, Ordering::Relaxed);
+    }
+
+    /// A Qt guest is woken by a SOCKET.
+    ///
+    /// `plugins/qt/qt-net.wasm` is a QGuiApplication that shows no window and
+    /// registers no QTimer: it starts a non-blocking connect() to a peer on
+    /// the fabric and then sits in `QGuiApplication::exec()` with nothing but
+    /// a `QSocketNotifier`. This test deliberately **never pumps a frame**, so
+    /// the only thing in the guest's world that can wake
+    /// `QWkEventDispatcher`'s single blocking `ppoll` is the file descriptor.
+    /// Before socket notifiers existed that block was `wkgfx_wait_frame()` and
+    /// this test could only hang.
+    ///
+    /// Both halves of the notifier contract are asserted, in order:
+    /// `SOCKET CONNECTED` can only be printed from a **Write** activation
+    /// (wasi-libc registers a CONNECTING socket's own pollable and completes
+    /// finish-connect in its poll_finish), and `SOCKET RECV` only from
+    /// **Read** activations that ran until EOF — level-triggered, several
+    /// passes, no polling timer anywhere.
+    ///
+    /// The peer is `plugins/netserve`, the same plain-BSD-sockets node the
+    /// fabric tests use, addressed BY NODE NAME so the fabric's
+    /// ip-name-lookup is in the path too.
+    #[test]
+    fn qt_socket_notifier_wakes_on_the_fabric() {
+        let qt_wasm = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/qt/qt-net.wasm");
+        let srv_wasm =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/netserve/netserve.wasm");
+        if !qt_wasm.exists() || !srv_wasm.exists() {
+            eprintln!("skipping: build plugins/qt (./build-net.sh) and plugins/netserve first");
+            return;
+        }
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let surfaces: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
+
+        // Both nodes import wasi:sockets, so both stay idle after spawn until
+        // they are wired and Run — which is exactly the handle this test
+        // needs: the server must be listening before the client dials.
+        let spawn = |path: &Path, name: &str| -> SharedNode {
+            let id = NodeId::new();
+            host.spawn(
+                path,
+                name,
+                id,
+                &[],
+                surfaces.clone(),
+                nodes.clone(),
+                Vec::new(),
+                None,
+            )
+            .expect("spawn");
+            let node = nodes
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|n| n.id == id)
+                .cloned()
+                .expect("node registered");
+            // First-ever wasmtime compile of a 12 MB Qt component takes
+            // minutes; cached runs break out in milliseconds.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+            while !node.is_runnable() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{name} never compiled"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            node
+        };
+
+        let server = spawn(&srv_wasm, "netserve");
+        let client = spawn(&qt_wasm, "qt-net");
+
+        // One shared Network, like a netlink in a .wk workspace.
+        let shared_net = NodeId::new();
+        for n in [&server, &client] {
+            n.net_stack().expect("fabric stack").lock().unwrap().net = shared_net;
+        }
+
+        host.run_node(&server, &["8080".to_string()])
+            .expect("run netserve");
+        {
+            let stack = server.net_stack().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                let listening = stack.lock().unwrap().sockets.iter().any(|(_, s)| {
+                    matches!(
+                        s,
+                        smoltcp::socket::Socket::Tcp(t)
+                            if t.state() == smoltcp::socket::tcp::State::Listen
+                    )
+                });
+                if listening {
+                    break;
+                }
+                assert!(
+                    !server.finished.load(Ordering::Relaxed),
+                    "netserve exited before listening"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "netserve never started listening"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        host.run_node(&client, &["netserve".to_string(), "8080".to_string()])
+            .expect("run qt-net");
+
+        let log_now = || String::from_utf8_lossy(&client.term_io.log_read(0).0).to_string();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        let log = loop {
+            let log = log_now();
+            assert!(
+                !log.contains("SOCKET FAIL"),
+                "qt-net reported a socket failure; node log:\n{log}"
+            );
+            if log.contains("SOCKET RECV") {
+                break log;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "qt-net never got a socket readiness callback. Its event loop has \
+                 no window and no timer, so this is the socket notifier failing, \
+                 not a slow paint; node log:\n{log}"
+            );
+            // NOTE: no frame is pumped here. That is the point of the test.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+
+        // Ordering matters: CONNECTING is printed before exec() is entered, so
+        // everything after it was delivered by the dispatcher's poll.
+        let at = |needle: &str| {
+            log.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}"))
+        };
+        assert!(at("SOCKET WAITING") < at("SOCKET CONNECTED"), "log:\n{log}");
+        assert!(at("SOCKET CONNECTED") < at("SOCKET READ"), "log:\n{log}");
+        // Level-triggered, and this is the evidence: the Read notifier is
+        // never disabled between the two, so `SOCKET RECV` (printed only when
+        // read() returns 0) is a SECOND activation of a notifier that was
+        // already ready once and was left enabled.
+        assert!(at("SOCKET READ") < at("SOCKET RECV"), "log:\n{log}");
+        assert!(
+            log.contains("hello from a wk node"),
+            "qt-net did not receive netserve's banner; node log:\n{log}"
+        );
+        eprintln!(
+            "qt-net: {}",
+            log.lines()
+                .filter(|l| l.starts_with("SOCKET"))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+
+        client.kill.store(true, Ordering::Relaxed);
+        server.kill.store(true, Ordering::Relaxed);
+    }
+
+    /// QtNetwork itself — the module, not just the dispatcher — talks to
+    /// another wk node.
+    ///
+    /// `qt_socket_notifier_wakes_on_the_fabric` above proves the lower half:
+    /// a raw fd can wake `QWkEventDispatcher`. This proves the upper half, and
+    /// it is a different claim, because `plugins/qt/build-qtbase.sh` builds
+    /// QtNetwork for a genuine `WASI` CMake platform — where half of Qt's own
+    /// network feature CONDITIONs are written `NOT WASM` and so autodetect
+    /// back ON against a libc that cannot honour them.
+    ///
+    /// `plugins/qt/qt-qtnetwork.wasm` runs three stages against
+    /// `plugins/netserve`, addressed BY NODE NAME, and each names its own
+    /// layer if it fails:
+    ///
+    /// * `DNS OK` — `QHostInfo::lookupHost()`. With `FEATURE_thread=OFF`,
+    ///   qhostinfo.cpp's QThreadPool path compiles out and the lookup runs
+    ///   inline, but the result still arrives as a posted event, and the name
+    ///   is answered by the fabric's own resolver through wasi:sockets
+    ///   ip-name-lookup.
+    /// * `TCP RECV` — `QTcpSocket` driven purely by
+    ///   connected/readyRead/disconnected. No `waitForReadyRead()`, which
+    ///   would block inside `qt_safe_poll()` and prove only that ppoll works;
+    ///   going through the signals is what puts QAbstractSocket's own
+    ///   notifiers in the dispatcher's poll set.
+    /// * `HTTP STATUS 200` — `QNetworkAccessManager`. Upstream this stack
+    ///   does not exist without threads (`qt_feature("http" CONDITION
+    ///   QT_FEATURE_thread)`, and Qt 6.8's backend really does `new QThread` +
+    ///   `QHttpThreadDelegate`). `patches/qtbase-0009` makes the delegate live
+    ///   on the calling thread, which is *correct* rather than approximate
+    ///   here: with `QT_CONFIG(thread)` off, qobject.cpp compiles the
+    ///   BlockingQueuedConnection arm out entirely, so those emits become
+    ///   direct calls. If that reasoning is wrong, this assert is where it
+    ///   shows.
+    ///
+    /// There is no TLS stage and there cannot be one: `QT_FEATURE_ssl` is 0
+    /// (no SecureTransport off-Apple, no Schannel, no OpenSSL cross-built for
+    /// wasm32-wasip2). The guest prints `TLS ABSENT` and the test asserts on
+    /// it, so that the day a TLS backend appears this test fails loudly rather
+    /// than quietly continuing to claim less than the port can do.
+    #[test]
+    fn qt_network_speaks_to_a_wk_node() {
+        let qt_wasm =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/qt/qt-qtnetwork.wasm");
+        let srv_wasm =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/netserve/netserve.wasm");
+        if !qt_wasm.exists() || !srv_wasm.exists() {
+            eprintln!(
+                "skipping: build plugins/qt (./build-qtnetwork.sh) and plugins/netserve first"
+            );
+            return;
+        }
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let surfaces: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
+
+        // Both nodes import wasi:sockets, so both stay idle after spawn until
+        // they are wired and Run — the handle this test needs, because the
+        // server must be listening before the client dials.
+        let spawn = |path: &Path, name: &str| -> SharedNode {
+            let id = NodeId::new();
+            host.spawn(
+                path,
+                name,
+                id,
+                &[],
+                surfaces.clone(),
+                nodes.clone(),
+                Vec::new(),
+                None,
+            )
+            .expect("spawn");
+            let node = nodes
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|n| n.id == id)
+                .cloned()
+                .expect("node registered");
+            // First-ever wasmtime compile of a 13 MB Qt component takes
+            // minutes; cached runs break out in milliseconds.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+            while !node.is_runnable() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{name} never compiled"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            node
+        };
+
+        let server = spawn(&srv_wasm, "netserve");
+        let client = spawn(&qt_wasm, "qt-qtnetwork");
+
+        // One shared Network, like a netlink in a .wk workspace.
+        let shared_net = NodeId::new();
+        for n in [&server, &client] {
+            n.net_stack().expect("fabric stack").lock().unwrap().net = shared_net;
+        }
+
+        host.run_node(&server, &["8080".to_string()])
+            .expect("run netserve");
+        {
+            let stack = server.net_stack().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                let listening = stack.lock().unwrap().sockets.iter().any(|(_, s)| {
+                    matches!(
+                        s,
+                        smoltcp::socket::Socket::Tcp(t)
+                            if t.state() == smoltcp::socket::tcp::State::Listen
+                    )
+                });
+                if listening {
+                    break;
+                }
+                assert!(
+                    !server.finished.load(Ordering::Relaxed),
+                    "netserve exited before listening"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "netserve never started listening"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        host.run_node(&client, &["netserve".to_string(), "8080".to_string()])
+            .expect("run qt-qtnetwork");
+
+        let log_now = || String::from_utf8_lossy(&client.term_io.log_read(0).0).to_string();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        let log = loop {
+            let log = log_now();
+            for stage in ["DNS FAIL", "TCP FAIL", "HTTP FAIL", "TLS FAIL", "NET FAIL"] {
+                assert!(
+                    !log.contains(stage),
+                    "qt-qtnetwork reported {stage}; node log:\n{log}"
+                );
+            }
+            if log.contains("TLS REJECTED") {
+                break log;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "qt-qtnetwork never reached its last stage; node log:\n{log}"
+            );
+            // No frame is pumped: nothing here paints.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+
+        let at = |needle: &str| {
+            log.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}; node log:\n{log}"))
+        };
+        // Ordering is the evidence that each stage really drove the next: the
+        // TCP stage is started from inside the DNS callback and the HTTP stage
+        // from inside disconnected(), so this sequence cannot be produced by
+        // anything except the event loop delivering all three.
+        assert!(at("DNS OK") < at("TCP CONNECTED"), "log:\n{log}");
+        assert!(at("TCP CONNECTED") < at("TCP RECV"), "log:\n{log}");
+        assert!(at("TCP RECV") < at("HTTP STATUS 200"), "log:\n{log}");
+        assert!(
+            log.matches("hello from a wk node").count() >= 2,
+            "both QTcpSocket and QNetworkAccessManager should have read \
+             netserve's banner; node log:\n{log}"
+        );
+        // TLS, as a NEGATIVE result and a security property rather than a
+        // missing feature. `TLS ABSENT` is what the build decided
+        // (QT_FEATURE_ssl 0); `TLS REJECTED` is what the guest OBSERVED when
+        // it aimed an https:// URL at the plaintext peer. A silent downgrade
+        // to cleartext would have printed `HTTP STATUS 200` twice and `TLS
+        // FAIL` — which the loop above already refuses.
+        assert!(
+            log.contains("TLS ABSENT") && !log.contains("TLS BUILT"),
+            "QT_FEATURE_ssl changed; update this test and PORTING.md rather \
+             than deleting the assert; node log:\n{log}"
+        );
+        assert!(at("HTTP STATUS 200") < at("TLS REJECTED"), "log:\n{log}");
+        eprintln!(
+            "qt-qtnetwork: {}",
+            log.lines()
+                .filter(|l| {
+                    ["NET ", "TLS ", "DNS ", "TCP ", "HTTP "]
+                        .iter()
+                        .any(|p| l.starts_with(p))
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+
+        client.kill.store(true, Ordering::Relaxed);
+        server.kill.store(true, Ordering::Relaxed);
     }
 
     /// The real thing: UNMODIFIED doomgeneric (plugins/doom) boots Freedoom

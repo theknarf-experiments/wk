@@ -11,6 +11,7 @@
 pub mod audio;
 pub mod auth;
 pub mod capture;
+pub mod clipboard;
 pub mod exec;
 pub mod execpipe;
 pub mod fetch;

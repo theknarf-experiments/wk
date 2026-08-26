@@ -341,6 +341,69 @@ mod tests {
         ));
     }
 
+    /// The HOST clipboard is default-deny and its two actions are separately
+    /// attenuable — the whole security story of `wk:clipboard` in one test.
+    ///
+    /// Note what is NOT here: any `can_use("clipboard", ...)` no-wire
+    /// exception of the sort `scene` and `exec` carry above. Those two gain a
+    /// node no cross-sandbox authority; the clipboard hands it whatever the
+    /// user last copied anywhere on the machine, so it must never be ambient.
+    #[test]
+    fn clipboard_needs_a_wire_and_splits_into_read_and_write() {
+        let root = KeyPair::new();
+        let token = mint_node_base(&root);
+        let wired = [("clipboard", "clip1".to_string())];
+        let ok = |t: &[u8], w: &[(&str, String)], a: &str| {
+            authorize_use(root.public(), t, w, "clipboard", "clip1", a)
+        };
+
+        // Wired: both halves.
+        assert!(ok(&token, &wired, "read"));
+        assert!(ok(&token, &wired, "write"));
+        // Unwired: neither, and no way to tell the Clipboard node is there.
+        assert!(!ok(&token, &[], "read"));
+        assert!(!ok(&token, &[], "write"));
+        // Wired to a DIFFERENT clipboard node grants nothing on this one.
+        let other = [("clipboard", "clip2".to_string())];
+        assert!(!ok(&token, &other, "read"));
+
+        // Copy-out only: the grant most sandboxed apps actually need. A node
+        // may put its own selection on the host clipboard and can never see
+        // what the user copied out of a password manager.
+        let write_only = attenuate(
+            &token,
+            r#"check if operation($k, $t, $a), $k != "clipboard" || $a == "write";"#,
+        );
+        assert!(ok(&write_only, &wired, "write"));
+        assert!(!ok(&write_only, &wired, "read"));
+
+        // Paste-in only, the mirror image (an app that may read the user's
+        // clipboard but must not clobber it).
+        let read_only = attenuate(
+            &token,
+            r#"check if operation($k, $t, $a), $k != "clipboard" || $a == "read";"#,
+        );
+        assert!(ok(&read_only, &wired, "read"));
+        assert!(!ok(&read_only, &wired, "write"));
+
+        // The full mute: wired or not, this node has no clipboard.
+        let muted = attenuate(
+            &token,
+            r#"check if operation($k, $t, $a), $k != "clipboard";"#,
+        );
+        assert!(!ok(&muted, &wired, "read"));
+        assert!(!ok(&muted, &wired, "write"));
+        // ...and it cuts nothing else.
+        assert!(authorize_use(
+            root.public(),
+            &muted,
+            &[("file", "vol1".to_string())],
+            "file",
+            "vol1",
+            "write"
+        ));
+    }
+
     #[test]
     fn scene_show_is_allowed_without_a_wire_and_mutable_away() {
         let root = KeyPair::new();

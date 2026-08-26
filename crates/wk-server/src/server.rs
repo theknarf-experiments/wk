@@ -203,6 +203,8 @@ pub struct View {
     pub net_links: Vec<(NodeId, NodeId)>,
     /// Screen-capture grants as (app, Capture node).
     pub capture_links: Vec<(NodeId, NodeId)>,
+    /// Host-clipboard grants as (app, Clipboard node).
+    pub clipboard_links: Vec<(NodeId, NodeId)>,
     /// API grants as (app, Api node).
     pub api_links: Vec<(NodeId, NodeId)>,
     /// Per-serve container-port overrides as (served, hostport) → guest port, so
@@ -214,6 +216,10 @@ pub struct View {
     /// Each Capture node's frame slot — the local client writes captured
     /// canvas frames into these (only while the node has a wired app).
     pub capture_feeds: HashMap<NodeId, crate::capture::SharedFrameSlot>,
+    /// Each Clipboard node's board — the local client pumps the host's real
+    /// system clipboard through these (it owns the only `arboard` handle;
+    /// wk-server never touches a platform clipboard API).
+    pub clipboard_boards: HashMap<NodeId, crate::clipboard::SharedBoard>,
     /// Api nodes on the canvas (wk's client API as a capability source).
     pub api_nodes: HashSet<NodeId>,
     /// http node id -> HostPort node id.
@@ -350,9 +356,11 @@ impl View {
             midi_links: keep_pairs(&self.midi_links, mine),
             net_links: keep_pairs(&self.net_links, mine),
             capture_links: keep_pairs(&self.capture_links, mine),
+            clipboard_links: keep_pairs(&self.clipboard_links, mine),
             api_links: keep_pairs(&self.api_links, mine),
             serve_ports: keep_pair_map(&self.serve_ports, mine),
             capture_feeds: keep_map(&self.capture_feeds, mine),
+            clipboard_boards: keep_map(&self.clipboard_boards, mine),
             api_nodes: keep_set(&self.api_nodes, mine),
             attached: keep_set(&self.attached, mine),
             serves: keep_map(&self.serves, mine),
@@ -373,6 +381,7 @@ impl View {
             Wire::Midi(s, d) => self.midi_links.contains(&(s, d)),
             Wire::Serve(h, hp) => self.serves.get(&h) == Some(&hp),
             Wire::Capture(a, c) => self.capture_links.contains(&(a, c)),
+            Wire::Clipboard(a, c) => self.clipboard_links.contains(&(a, c)),
             Wire::Api(a, n) => self.api_links.contains(&(a, n)),
             Wire::Net(app, net) => self.net_links.contains(&(app, net)),
         }
@@ -389,6 +398,7 @@ enum WireRel {
     Serve,
     NetLink,
     CaptureLink,
+    ClipboardLink,
     ApiLink,
 }
 
@@ -400,6 +410,7 @@ fn wire_ends(w: Wire) -> (NodeId, NodeId) {
         | Wire::Serve(a, b)
         | Wire::Net(a, b)
         | Wire::Capture(a, b)
+        | Wire::Clipboard(a, b)
         | Wire::Api(a, b) => (a, b),
     }
 }
@@ -491,6 +502,9 @@ pub enum Kind {
     Note,
     /// A Screen Capture node: grants wired apps captured frames.
     Capture,
+    /// A Clipboard node: grants wired apps the HOST's system clipboard —
+    /// `read` and `write` as separate, separately-attenuable token actions.
+    Clipboard,
     /// The wk client API as a node: grants wired apps API access over their
     /// virtual network.
     Api,
@@ -574,6 +588,8 @@ pub struct Graph {
     pub net_links: Vec<(NodeId, NodeId)>,
     /// Screen-capture grants, as (app node id, Capture node id).
     pub capture_links: Vec<(NodeId, NodeId)>,
+    /// Host-clipboard grants, as (app node id, Clipboard node id).
+    pub clipboard_links: Vec<(NodeId, NodeId)>,
     /// API grants, as (app node id, Api node id).
     pub api_links: Vec<(NodeId, NodeId)>,
 
@@ -682,6 +698,12 @@ pub struct Server {
     /// Each Capture node's frame slot (the client fills it; wired apps read
     /// it through their `capture_src`, kept in sync by [`Self::sync_captures`]).
     capture_feeds: HashMap<NodeId, crate::capture::SharedFrameSlot>,
+    /// Each Clipboard node's board (the client pumps the real host clipboard
+    /// through it; wired apps read and write it through their `clip_src`,
+    /// kept in sync by [`Self::sync_clipboard`]). wk-server never touches a
+    /// platform clipboard API itself — a Clipboard node with no client
+    /// pumping it is simply an empty one.
+    clipboard_boards: HashMap<NodeId, crate::clipboard::SharedBoard>,
     /// Open hardware MIDI inputs, one per MidiIn node: holds the device
     /// connection alive (dropping it closes the device); its callback feeds the
     /// MIDI router as the node. Pure runtime state, rebuilt from `graph.midi_ins`
@@ -763,6 +785,7 @@ impl Server {
             port_errors: HashMap::new(),
             uplinks: HashMap::new(),
             capture_feeds: HashMap::new(),
+            clipboard_boards: HashMap::new(),
             midi_devices: HashMap::new(),
             attached: std::collections::HashSet::new(),
             unplaced: Vec::new(),
@@ -813,6 +836,7 @@ impl Server {
             (WireRel::Serve, &saved.serves),
             (WireRel::NetLink, &saved.net_links),
             (WireRel::CaptureLink, &saved.capture_links),
+            (WireRel::ClipboardLink, &saved.clipboard_links),
             (WireRel::ApiLink, &saved.api_links),
         ] {
             for &(a, b) in pairs {
@@ -852,6 +876,11 @@ impl Server {
         for &(a, c) in &saved.capture_links {
             if exists(self, a, c) {
                 self.toggle_capture(a, c);
+            }
+        }
+        for &(a, c) in &saved.clipboard_links {
+            if exists(self, a, c) {
+                self.toggle_clipboard(a, c);
             }
         }
         for &(a, n) in &saved.api_links {
@@ -1006,6 +1035,15 @@ impl Server {
         let id = self.alloc_id();
         self.place(id, Kind::Capture, ws, pos, [FILE_W, FILE_H]);
         self.capture_feeds.insert(id, crate::capture::new_slot());
+    }
+
+    /// Add a Clipboard capability node (its board starts empty; the local
+    /// client pumps the host clipboard through it while an app is wired).
+    fn add_clipboard_node(&mut self, pos: [f32; 2], ws: NodeId) {
+        let id = self.alloc_id();
+        self.place(id, Kind::Clipboard, ws, pos, [FILE_W, FILE_H]);
+        self.clipboard_boards
+            .insert(id, crate::clipboard::new_board());
     }
 
     /// Add a wk API capability node (apps wired to it can drive wk over their
@@ -1228,6 +1266,7 @@ impl Server {
             // A note wires to nothing and runs nothing; just drop it.
             Some(Kind::Note) => self.forget(id),
             Some(Kind::Capture) => self.remove_capture_node(id),
+            Some(Kind::Clipboard) => self.remove_clipboard_node(id),
             Some(Kind::Api) => self.remove_api_node(id),
             Some(Kind::MidiIn) => self.remove_midi_in_node(id),
             // Its net wire lives in net_links with the service as the "member"
@@ -1253,6 +1292,21 @@ impl Server {
     fn toggle_capture(&mut self, app: NodeId, cap: NodeId) {
         wiring::toggle_unique(&mut self.graph.capture_links, app, cap);
         self.sync_captures();
+    }
+
+    /// Remove a Clipboard node: revoke every grant through it, drop its board.
+    fn remove_clipboard_node(&mut self, id: NodeId) {
+        self.graph.clipboard_links.retain(|&(_, clip)| clip != id);
+        self.clipboard_boards.remove(&id);
+        self.sync_clipboard();
+        self.forget(id);
+    }
+
+    /// Toggle a host-clipboard grant (one Clipboard node per app), then point
+    /// wired apps at their granted board and refresh their permits.
+    fn toggle_clipboard(&mut self, app: NodeId, clip: NodeId) {
+        wiring::toggle_unique(&mut self.graph.clipboard_links, app, clip);
+        self.sync_clipboard();
     }
 
     /// Remove an Api node: revoke every grant through it.
@@ -1301,6 +1355,54 @@ impl Server {
                 }
             });
             *node.capture_src.lock().unwrap() = feed;
+        }
+    }
+
+    /// Point every app node's `clip_src` at its granted Clipboard node's board
+    /// (or clear it) and refresh its two permits from its capability token.
+    ///
+    /// TWO `node_may_use` calls, not one. `clipboard`/`read` and
+    /// `clipboard`/`write` are independent actions on the same wire — the same
+    /// split `sync_mounts` uses for `file` read/write, rather than the
+    /// by-direction split `midi` uses, because an app↔Clipboard wire has no
+    /// direction. That is what makes
+    ///
+    /// ```text
+    /// wk token attenuate <node> \
+    ///   'check if operation($k,$t,$a), $k != "clipboard" || $a == "write"'
+    /// ```
+    ///
+    /// mean "may copy out, may never see what the user copied elsewhere".
+    ///
+    /// The board is attached when EITHER action is allowed and cleared when
+    /// neither is, so a node denied both cannot even tell a Clipboard node is
+    /// there. Runs every tick, so revocation is live: the auth cache is keyed
+    /// on the token+wires fingerprint, so a `wk token attenuate` takes effect
+    /// on the next pass without restarting the guest.
+    fn sync_clipboard(&mut self) {
+        let nodes: Vec<crate::plugin::SharedNode> = self.node_reg.lock().unwrap().clone();
+        for node in nodes {
+            let pair = self
+                .graph
+                .clipboard_links
+                .iter()
+                .find(|&&(app, _)| app == node.id)
+                .copied();
+            let (read, write) = match pair {
+                Some((app, clip)) => (
+                    self.node_may_use(app, "clipboard", clip, "read"),
+                    self.node_may_use(app, "clipboard", clip, "write"),
+                ),
+                None => (false, false),
+            };
+            node.clip_read
+                .store(read, std::sync::atomic::Ordering::Relaxed);
+            node.clip_write
+                .store(write, std::sync::atomic::Ordering::Relaxed);
+            let board = pair
+                .filter(|_| read || write)
+                .and_then(|(_, clip)| self.clipboard_boards.get(&clip).cloned());
+            *node.clip_src.lock().unwrap() = board;
         }
     }
 
@@ -1474,6 +1576,7 @@ impl Server {
             Some(Kind::Network | Kind::Gateway) => NodeClass::Net,
             Some(Kind::Iroh | Kind::Veilid) => NodeClass::Uplink,
             Some(Kind::Capture) => NodeClass::Capture,
+            Some(Kind::Clipboard) => NodeClass::Clipboard,
             Some(Kind::Api) => NodeClass::Api,
             Some(Kind::MidiIn) => NodeClass::MidiSource,
             Some(Kind::HostService) => NodeClass::HostSvc,
@@ -1491,6 +1594,7 @@ impl Server {
             Some(Wire::Serve(http, hostport)) => self.toggle_serve(http, hostport),
             Some(Wire::Net(app, net)) => self.toggle_net(app, net),
             Some(Wire::Capture(app, cap)) => self.toggle_capture(app, cap),
+            Some(Wire::Clipboard(app, clip)) => self.toggle_clipboard(app, clip),
             Some(Wire::Api(app, api)) => self.toggle_api(app, api),
             Some(Wire::Midi(src, dst)) => {
                 // Two apps normally wire MIDI — but if one of them serves a
@@ -2095,6 +2199,12 @@ impl Server {
                 .map(|&(_, c)| ("capture", c)),
         );
         w.extend(
+            g.clipboard_links
+                .iter()
+                .filter(|&&(a, _)| a == id)
+                .map(|&(_, c)| ("clipboard", c)),
+        );
+        w.extend(
             g.api_links
                 .iter()
                 .filter(|&&(a, _)| a == id)
@@ -2394,6 +2504,7 @@ impl Server {
             Wire::Midi(s, d) => self.graph.midi_links.contains(&(s, d)),
             Wire::Serve(h, hp) => self.graph.serve_links.contains(&(h, hp)),
             Wire::Capture(a, c) => self.graph.capture_links.contains(&(a, c)),
+            Wire::Clipboard(a, c) => self.graph.clipboard_links.contains(&(a, c)),
             Wire::Api(a, n) => self.graph.api_links.contains(&(a, n)),
             Wire::Net(app, net) => self.graph.net_links.contains(&(app, net)),
         }
@@ -2425,6 +2536,11 @@ impl Server {
             Wire::Capture(app, cap) => {
                 if self.graph.capture_links.contains(&(app, cap)) {
                     self.toggle_capture(app, cap);
+                }
+            }
+            Wire::Clipboard(app, clip) => {
+                if self.graph.clipboard_links.contains(&(app, clip)) {
+                    self.toggle_clipboard(app, clip);
                 }
             }
             Wire::Api(app, api) => {
@@ -2476,6 +2592,7 @@ impl Server {
         self.sync_midi();
         self.sync_net_membership();
         self.sync_captures();
+        self.sync_clipboard();
         self.sync_exec();
         self.sync_serves();
         self.sync_apis();
@@ -2504,9 +2621,11 @@ impl Server {
         self.graph
             .serve_links
             .retain(|&(h, hp)| h != id && hp != id);
+        self.graph.clipboard_links.retain(|&(app, _)| app != id);
         self.sync_mounts();
         self.sync_midi();
         self.sync_captures();
+        self.sync_clipboard();
         self.sync_serves();
         self.forget(id);
     }
@@ -2610,6 +2729,7 @@ impl Server {
                 let serves = ws_wires(&self.graph.serve_links, WireRel::Serve);
                 let net_links = ws_wires(&self.graph.net_links, WireRel::NetLink);
                 let capture_links = ws_wires(&self.graph.capture_links, WireRel::CaptureLink);
+                let clipboard_links = ws_wires(&self.graph.clipboard_links, WireRel::ClipboardLink);
                 let api_links = ws_wires(&self.graph.api_links, WireRel::ApiLink);
                 // Persist mount-path overrides for this workspace's binds.
                 let mount_paths = connections
@@ -2631,6 +2751,7 @@ impl Server {
                     serve_ports,
                     net_links,
                     capture_links,
+                    clipboard_links,
                     api_links,
                 }
             })
@@ -2792,6 +2913,7 @@ impl Server {
                 NodeKind::Veilid => self.add_veilid_node(pos, ws),
                 NodeKind::Note => self.add_note(pos, ws),
                 NodeKind::Capture => self.add_capture_node(pos, ws),
+                NodeKind::Clipboard => self.add_clipboard_node(pos, ws),
                 NodeKind::Api => self.add_api_node(pos, ws),
                 NodeKind::MidiIn => self.add_midi_in_node(pos, ws),
                 NodeKind::HostService => self.add_host_service(pos, ws),
@@ -3022,6 +3144,7 @@ impl Server {
                 text: self.graph.note_text.get(&id).cloned().unwrap_or_default(),
             },
             Kind::Capture => SnapKind::Capture,
+            Kind::Clipboard => SnapKind::Clipboard,
             Kind::Api => SnapKind::Api,
             Kind::MidiIn => SnapKind::MidiIn {
                 device: self.graph.midi_ins.get(&id).cloned().unwrap_or_default(),
@@ -3092,6 +3215,12 @@ impl Server {
         wires.extend(
             self.graph
                 .capture_links
+                .iter()
+                .filter(|&&(a, c)| a == id || c == id),
+        );
+        wires.extend(
+            self.graph
+                .clipboard_links
                 .iter()
                 .filter(|&&(a, c)| a == id || c == id),
         );
@@ -3258,6 +3387,12 @@ impl Server {
                     .entry(s.id)
                     .or_insert_with(crate::capture::new_slot);
             }
+            SnapKind::Clipboard => {
+                self.place(s.id, Kind::Clipboard, ws, s.pos, s.size);
+                self.clipboard_boards
+                    .entry(s.id)
+                    .or_insert_with(crate::clipboard::new_board);
+            }
             SnapKind::Api => {
                 self.place(s.id, Kind::Api, ws, s.pos, s.size);
             }
@@ -3294,6 +3429,7 @@ impl Server {
             || self.graph.net_links.iter().any(|&(x, y)| pair(x, y))
             || self.graph.serve_links.iter().any(|&(h, hp)| pair(h, hp))
             || self.graph.capture_links.iter().any(|&(x, y)| pair(x, y))
+            || self.graph.clipboard_links.iter().any(|&(x, y)| pair(x, y))
             || self.graph.api_links.iter().any(|&(x, y)| pair(x, y))
     }
 
@@ -3463,9 +3599,11 @@ impl Server {
             midi_links: self.graph.midi_links.clone(),
             net_links: self.graph.net_links.clone(),
             capture_links: self.graph.capture_links.clone(),
+            clipboard_links: self.graph.clipboard_links.clone(),
             api_links: self.graph.api_links.clone(),
             serve_ports: self.graph.serve_ports.clone(),
             capture_feeds: self.capture_feeds.clone(),
+            clipboard_boards: self.clipboard_boards.clone(),
             api_nodes,
             attached: self.attached.clone(),
             serves,
@@ -3528,6 +3666,7 @@ impl Server {
                 Some(Kind::Veilid) => "veilid",
                 Some(Kind::Note) => "note",
                 Some(Kind::Capture) => "capture",
+                Some(Kind::Clipboard) => "clipboard",
                 Some(Kind::Api) => "api",
                 Some(Kind::MidiIn) => "midiin",
                 Some(Kind::HostService) => "hostservice",
@@ -3603,6 +3742,7 @@ impl Server {
         wires.extend(wire("midi", &v.midi_links));
         wires.extend(wire("net", &v.net_links));
         wires.extend(wire("capture", &v.capture_links));
+        wires.extend(wire("clipboard", &v.clipboard_links));
         wires.extend(wire("api", &v.api_links));
         wires.extend(v.serves.iter().map(|(&http, &hp)| WireInfo {
             kind: "serve".to_string(),
@@ -3977,6 +4117,9 @@ mod model_tests {
                 env: Vec::new(),
                 layers: Vec::new(),
                 capture_src: crate::capture::new_src(),
+                clip_src: crate::clipboard::new_src(),
+                clip_read: crate::clipboard::new_permit(),
+                clip_write: crate::clipboard::new_permit(),
                 exec_permit: crate::exec::new_permit(true),
                 fs_serve: wk_vfs::ProviderConn::new(),
             });
@@ -3987,6 +4130,7 @@ mod model_tests {
                 midi: false,
                 net: false,
                 capture: false,
+                clipboard: false,
                 fs_provider,
             });
             node
@@ -4037,6 +4181,9 @@ mod model_tests {
                 env: Vec::new(),
                 layers: Vec::new(),
                 capture_src: crate::capture::new_src(),
+                clip_src: crate::clipboard::new_src(),
+                clip_read: crate::clipboard::new_permit(),
+                clip_write: crate::clipboard::new_permit(),
                 exec_permit: crate::exec::new_permit(true),
                 fs_serve: wk_vfs::ProviderConn::new(),
             })
@@ -4049,6 +4196,7 @@ mod model_tests {
                 midi: false,
                 net: false,
                 capture: false,
+                clipboard: false,
                 fs_provider,
             });
         };
@@ -4492,6 +4640,7 @@ mod model_tests {
                 serves: Vec::new(),
                 serve_ports: std::collections::BTreeMap::new(),
                 capture_links: Vec::new(),
+                clipboard_links: Vec::new(),
                 api_links: Vec::new(),
                 net_links: Vec::new(),
             }],

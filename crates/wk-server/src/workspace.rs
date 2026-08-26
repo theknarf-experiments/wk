@@ -92,7 +92,8 @@ fn node_ident(n: &KdlNode) -> Option<NodeIdent> {
             .map(|s| NodeIdent::Import(s.to_string())),
         "dependencies" => Some(NodeIdent::Dependencies),
         "workspace" => n.get(0).and_then(node_id).map(NodeIdent::Workspace),
-        "connection" | "midi" | "serve" | "netlink" | "capturelink" | "apilink" => {
+        "connection" | "midi" | "serve" | "netlink" | "capturelink" | "clipboardlink"
+        | "apilink" => {
             let a = n.get(0).and_then(node_id)?;
             let b = n.get(1).and_then(node_id)?;
             Some(NodeIdent::Wire(name.to_string(), a, b))
@@ -361,6 +362,11 @@ pub enum SnapKind {
     /// A Screen Capture capability node: apps wired to it may read captured
     /// frames (see the `capturelink` pairs).
     Capture,
+    /// A Clipboard capability node: apps wired to it may read and/or write the
+    /// HOST's system clipboard (see the `clipboardlink` pairs). Which of the
+    /// two a given app may do is a token decision, not a file one — the wire
+    /// is the grant, the token attenuates it.
+    Clipboard,
     /// The wk client API as a node: apps wired to it may drive wk over their
     /// virtual network (see the `apilink` pairs).
     Api,
@@ -459,6 +465,9 @@ pub struct Workspace {
     pub net_links: Vec<(NodeId, NodeId)>,
     /// Screen-capture grants as (app id, Capture node id).
     pub capture_links: Vec<(NodeId, NodeId)>,
+    /// Host-clipboard grants as (app id, Clipboard node id). A `.wk` file
+    /// written before clipboard existed simply has none, and loads unchanged.
+    pub clipboard_links: Vec<(NodeId, NodeId)>,
     /// API grants as (app id, Api node id).
     pub api_links: Vec<(NodeId, NodeId)>,
 }
@@ -476,6 +485,7 @@ impl Workspace {
             serve_ports: BTreeMap::new(),
             net_links: Vec::new(),
             capture_links: Vec::new(),
+            clipboard_links: Vec::new(),
             api_links: Vec::new(),
         }
     }
@@ -831,6 +841,7 @@ fn parse_workspace(n: &KdlNode) -> Option<Workspace> {
             }
             "netlink" => ws.net_links.extend(pair(c)),
             "capturelink" => ws.capture_links.extend(pair(c)),
+            "clipboardlink" => ws.clipboard_links.extend(pair(c)),
             "apilink" => ws.api_links.extend(pair(c)),
             _ => ws.nodes.extend(parse_snap(c)),
         }
@@ -869,6 +880,9 @@ fn workspace_kdl(ws: &Workspace) -> KdlNode {
     }
     for &(app, cap) in &ws.capture_links {
         ch.nodes_mut().push(pair_kdl("capturelink", app, cap));
+    }
+    for &(app, clip) in &ws.clipboard_links {
+        ch.nodes_mut().push(pair_kdl("clipboardlink", app, clip));
     }
     for &(app, api) in &ws.api_links {
         ch.nodes_mut().push(pair_kdl("apilink", app, api));
@@ -941,6 +955,7 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
                 .and_then(|n| u16::try_from(n).ok())?,
         },
         "capture" => SnapKind::Capture,
+        "clipboard" => SnapKind::Clipboard,
         "api" => SnapKind::Api,
         "midiin" => SnapKind::MidiIn {
             device: n
@@ -1006,6 +1021,7 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         SnapKind::Veilid { .. } => "veilid",
         SnapKind::Note { .. } => "note",
         SnapKind::Capture => "capture",
+        SnapKind::Clipboard => "clipboard",
         SnapKind::Api => "api",
         SnapKind::MidiIn { .. } => "midiin",
         SnapKind::HostService { .. } => "hostservice",
@@ -1759,6 +1775,7 @@ mod tests {
                     serve_ports: BTreeMap::from([((synth, port), 3000u16)]),
                     net_links: vec![(synth, net)],
                     capture_links: vec![(synth, chan)],
+                    clipboard_links: Vec::new(),
                     api_links: vec![(synth, net)],
                 },
                 Workspace {
@@ -1975,6 +1992,7 @@ mod tests {
             uplink_fields().prop_map(|(secret, peer)| SnapKind::Veilid { secret, peer }),
             value_str().prop_map(|text| SnapKind::Note { text }),
             Just(SnapKind::Capture),
+            Just(SnapKind::Clipboard),
             Just(SnapKind::Api),
             (value_str(), value_str())
                 .prop_map(|(name, target)| SnapKind::HostService { name, target }),
@@ -2016,6 +2034,7 @@ mod tests {
         )
             .prop_map(|(id, nodes, conns, midi, serves, netlinks)| Workspace {
                 capture_links: netlinks.clone(),
+                clipboard_links: netlinks.clone(),
                 api_links: netlinks.clone(),
                 id,
                 nodes,

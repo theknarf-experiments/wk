@@ -88,9 +88,29 @@ void wkgfx_wait_frame(void);
  * For guests that own a real event loop and must also wake on their OWN
  * deadlines — a Qt QTimer, an animation tick — rather than only when the host
  * decides to paint. Built on wasi:io/poll's multi-pollable `poll` plus a
- * wasi:clocks deadline pollable, which is also where socket pollables will go
- * when a guest needs to select() over the network too. */
+ * wasi:clocks deadline pollable.
+ *
+ * A guest that must ALSO wait on sockets wants ../gfx-compat/wkgfx_poll.h
+ * instead: the frame gets a file descriptor there and joins libc's own
+ * poll() list, rather than sockets joining this one. (A wasi:io pollable
+ * cannot be extracted from a libc fd — see that header for why.) Do not mix
+ * the two on one surface: both consume the same one-shot frame readiness. */
 int wkgfx_wait_frame_timeout(int64_t timeout_ns);
+
+/* Consume a pending frame event WITHOUT waiting for one, and return 1 if there
+ * was one. This is the second half of wkgfx_wait_frame() for a caller that
+ * learned the frame was ready from somebody else's poll — see wkgfx_poll.h.
+ *
+ * It is not optional bookkeeping: `get-frame` is also where the host reports a
+ * CLOSED surface, by trapping, which is how a node exits when its window goes
+ * away. A loop that notices frame readiness and never calls this spins forever
+ * on a closed surface. */
+int wkgfx_take_frame(void);
+
+/* The raw wasi:io/poll pollable handle behind the frame, or 0 before
+ * wkgfx_open(). Only for shims that need to hand this pollable to a DIFFERENT
+ * poll set than wkgfx's own; ordinary guests never touch it. */
+uint32_t wkgfx_frame_pollable(void);
 
 /* Present a whole RGBA frame of `w` x `h` pixels. If (w, h) equals the live
  * surface size this is a direct blit; otherwise the frame is scaled to the

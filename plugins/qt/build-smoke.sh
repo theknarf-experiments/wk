@@ -34,6 +34,7 @@ SYSROOT="$PWD/sysroot"
 HOST_PREFIX="${QT_HOST_PATH:-$PWD/host}"
 BUILD="$PWD/build-target/smoke"
 GFXCOMPAT="$PWD/../gfx-compat"
+CLIPCOMPAT="$PWD/../clipboard-compat"
 FONTDIR="$PWD/smoke/fonts"
 LOGDIR="${LOGDIR:-$PWD/logs}"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
@@ -81,6 +82,8 @@ echo "=== font: $FONT -> smoke/fonts/$(basename "$FONT")"
 # --- bindings ------------------------------------------------------------
 mkdir -p "$GFXCOMPAT/gen"
 wit-bindgen c --world wkgfx "$GFXCOMPAT/wit" --out-dir "$GFXCOMPAT/gen" >/dev/null
+mkdir -p "$CLIPCOMPAT/gen"
+wit-bindgen c --world wkclipboard "$CLIPCOMPAT/wit" --out-dir "$CLIPCOMPAT/gen" >/dev/null
 
 # --- configure + build ---------------------------------------------------
 LOG="$LOGDIR/target-smoke.log"
@@ -93,6 +96,7 @@ env PATH="$BUILD_PATH" cmake -G Ninja -S "$PWD/smoke" -B "$BUILD" \
     -DQT_HOST_PATH="$HOST_PREFIX" \
     -DCMAKE_BUILD_TYPE=Release \
     -DWK_GFX_COMPAT="$GFXCOMPAT" \
+    -DWK_CLIP_COMPAT="$CLIPCOMPAT" \
     -DWK_QPA_LIB="$SYSROOT/lib/libqwk.a" \
     -DWK_SMOKE_FONT="$STAGED" \
     2>&1 | tee "$LOG"

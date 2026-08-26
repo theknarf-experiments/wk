@@ -130,6 +130,11 @@ const HOSTFILE_BORDER: [f32; 4] = [0.30, 0.45, 0.65, 1.0];
 /// Screen Capture nodes: recording-red chrome (a capability, like Network).
 const CAPTURE_BG: [f32; 4] = [0.22, 0.10, 0.12, 1.0];
 const CAPTURE_BORDER: [f32; 4] = [0.80, 0.30, 0.35, 1.0];
+/// Clipboard nodes: amber chrome. A capability like Capture and Api, and the
+/// colour is meant to read as a warning: this node hands whatever the user
+/// last copied ANYWHERE to whatever app is wired to it.
+const CLIPBOARD_BG: [f32; 4] = [0.22, 0.16, 0.06, 1.0];
+const CLIPBOARD_BORDER: [f32; 4] = [0.90, 0.68, 0.25, 1.0];
 /// Api nodes: bright-cyan chrome (wk's own client API as a capability).
 const API_BG: [f32; 4] = [0.08, 0.16, 0.22, 1.0];
 const API_BORDER: [f32; 4] = [0.30, 0.75, 0.90, 1.0];
@@ -299,6 +304,11 @@ struct App {
     editing_mount: Option<((NodeId, NodeId), String)>,
     /// Frame counter for throttling canvas readback (Screen Capture nodes).
     capture_tick: u64,
+    /// When the clipboard pump last read the host clipboard. `arboard` has no
+    /// change notification, so "did it change?" is a poll and a diff — and on
+    /// X11 each poll is a synchronous round trip to whichever process owns the
+    /// selection, so it is throttled rather than run every pass.
+    clip_polled: Option<std::time::Instant>,
     /// When inspecting a node's virtual filesystem (a modal overlay).
     inspect: Option<Inspector>,
     /// Background-fetched listings/previews for inspector paths that cross a
@@ -427,6 +437,7 @@ impl App {
             editing_note: None,
             editing_mount: None,
             capture_tick: 0,
+            clip_polled: None,
             inspect: None,
             browse: ProviderBrowse::new(),
             drop_hovering: false,
@@ -487,7 +498,7 @@ impl App {
     /// the single port their kind participates in.
     fn node_ports(&self, id: NodeId) -> Vec<Port> {
         use PortDir::{In, Out};
-        use PortKind::{Api, Bind, Capture, Midi, Net, Serve};
+        use PortKind::{Api, Bind, Capture, Clipboard, Midi, Net, Serve};
         let v = &self.view;
         let one = |kind, dir| vec![Port { kind, dir }];
         if v.notes.contains_key(&id) {
@@ -502,6 +513,8 @@ impl App {
             one(Net, Out) // an uplink dials into (a host service publishes into) a Network
         } else if v.capture_feeds.contains_key(&id) {
             one(Capture, Out) // a Capture node grants apps
+        } else if v.clipboard_boards.contains_key(&id) {
+            one(Clipboard, Out) // a Clipboard node grants apps
         } else if v.api_nodes.contains(&id) {
             one(Api, Out) // an Api node grants apps
         } else if v.midi_ins.contains_key(&id) {
@@ -520,6 +533,7 @@ impl App {
             let midi = node.as_ref().is_some_and(|n| n.imports_midi());
             let net = node.as_ref().is_some_and(|n| n.imports_net());
             let capture = node.as_ref().is_some_and(|n| n.imports_capture());
+            let clipboard = node.as_ref().is_some_and(|n| n.imports_clipboard());
             let provides_fs = v.fs_providers.contains(&id);
             // The API is reached over the app's virtual network, so the port
             // appears on any app that can speak to a network at all.
@@ -540,6 +554,12 @@ impl App {
             if capture {
                 ports.push(Port {
                     kind: Capture,
+                    dir: In,
+                });
+            }
+            if clipboard {
+                ports.push(Port {
+                    kind: Clipboard,
                     dir: In,
                 });
             }
@@ -662,6 +682,145 @@ impl App {
     fn clipboard_text(&mut self) -> Option<String> {
         let text = self.clipboard.as_mut()?.get_text().ok()?;
         Some(text.trim().to_string())
+    }
+
+    /// Move text between the HOST's system clipboard and every Clipboard
+    /// node's board. The only place in wk that touches a platform clipboard.
+    ///
+    /// Out first, then in. A guest's `set` lands in the board's `outbox` and
+    /// is drained here; on success the board's own `text`/`seq` are updated to
+    /// match, so the guest's own copy does NOT read back to it a moment later
+    /// as "somebody else changed the clipboard" (which is what would break
+    /// QWkClipboard's `ownsMode`, and with it Qt's "is this selection still
+    /// mine?" bookkeeping).
+    ///
+    /// The read half is a poll and a diff because `arboard` has no change
+    /// notification at all — there is no `changeCount`, no watcher — so a
+    /// `wasi:io/poll` pollable in the WIT would be a promise the host cannot
+    /// keep. Throttled to `CLIP_POLL`: on X11 every `get_text` is a
+    /// synchronous round trip to whichever process owns the selection, and a
+    /// wk instance polling that at frame rate is a bad neighbour. The
+    /// compromise costs a paste that lands within the throttle window a stale
+    /// read; reading on demand from inside the guest's `get` is not available,
+    /// because `arboard::Clipboard` belongs to this thread.
+    ///
+    /// Every `arboard` failure is a no-op, never a panic and never a
+    /// guest-visible trap — the same `.ok()`-swallowing the ticket-copy path
+    /// above uses. An empty clipboard, an image where text was asked for, and
+    /// another X11 client holding the selection are all normal.
+    fn pump_clipboard(&mut self) {
+        // Only boards with a wired app, the way the capture pump only reads
+        // the canvas back for a Capture node someone is actually using. A
+        // Clipboard node sitting unwired on the canvas should not make wk poll
+        // the window system forever, and nothing could read the result anyway.
+        let present = self.clipboard.is_some();
+        let boards: Vec<_> = self
+            .view
+            .clipboard_boards
+            .iter()
+            .filter(|(id, _)| self.view.clipboard_links.iter().any(|(_, c)| c == *id))
+            .map(|(_, b)| b.clone())
+            .collect();
+        if boards.is_empty() {
+            return;
+        }
+
+        // Out: drain what guests asked to copy.
+        for board in &boards {
+            let outgoing = {
+                let mut b = board.lock().unwrap();
+                b.present = present;
+                b.outbox.take()
+            };
+            let Some(text) = outgoing else { continue };
+            let ok = self
+                .clipboard
+                .as_mut()
+                .is_some_and(|c| c.set_text(text.clone()).is_ok());
+            if ok {
+                // Publish it as the current value ourselves. Without this the
+                // next poll sees "the clipboard changed" and bumps seq, and
+                // the node that just copied concludes it lost ownership.
+                let mut b = board.lock().unwrap();
+                if b.text != text {
+                    b.seq += 1;
+                    b.text = text;
+                }
+                // The poll below would only re-read what we just wrote.
+                self.clip_polled = Some(std::time::Instant::now());
+            }
+        }
+
+        // In: has anything (this node, another app, another machine's
+        // synced clipboard) changed what the host holds?
+        let due = self
+            .clip_polled
+            .is_none_or(|t| t.elapsed() >= Self::CLIP_POLL);
+        if !due {
+            return;
+        }
+        self.clip_polled = Some(std::time::Instant::now());
+        let Some(text) = self.clipboard.as_mut().and_then(|c| c.get_text().ok()) else {
+            return; // empty, an image, occupied, or no clipboard at all
+        };
+        for board in &boards {
+            let mut b = board.lock().unwrap();
+            // seq moves only on an actual change, so a guest can tell "still
+            // mine" from "someone else copied". seq == 0 means never observed,
+            // so the first read always publishes — including an empty string,
+            // which is a real clipboard state.
+            if b.seq == 0 || b.text != text {
+                b.seq += 1;
+                b.text.clone_from(&text);
+            }
+        }
+    }
+
+    /// How often the host clipboard is re-read. Fast enough that a Cmd+V in a
+    /// node usually sees what the user copied a moment ago; slow enough not to
+    /// hammer an X11 selection owner. A `Focused(true)` on the window forces a
+    /// read regardless, which covers the common "copy elsewhere, switch to wk,
+    /// paste" sequence.
+    const CLIP_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+    /// What a Clipboard node currently GRANTS, as the label its widget shows.
+    ///
+    /// This is half the security argument for having a Clipboard node at all:
+    /// a user must be able to see at a glance which app can read what they
+    /// copied. It reports the app's live permits (which the server's
+    /// `sync_clipboard` refreshes from its capability token every tick), not
+    /// the mere existence of the wire — so `wk token attenuate` shows up here
+    /// as "write only" or "denied" within a tick.
+    fn clipboard_grant(&self, clip: NodeId) -> (String, [f32; 4]) {
+        let Some(&(app, _)) = self.view.clipboard_links.iter().find(|&&(_, c)| c == clip) else {
+            return (
+                "wire an app to grant it".to_string(),
+                [0.55, 0.7, 0.72, 1.0],
+            );
+        };
+        let Some(node) = self.view.app_node(app) else {
+            return ("wired".to_string(), [0.8, 0.65, 0.5, 1.0]);
+        };
+        use std::sync::atomic::Ordering::Relaxed;
+        let (r, w) = (node.clip_read.load(Relaxed), node.clip_write.load(Relaxed));
+        let present = self
+            .view
+            .clipboard_boards
+            .get(&clip)
+            .is_some_and(|b| b.lock().unwrap().present);
+        if !present {
+            // No `arboard` on this machine (or wk is running headless on a
+            // box with no display server). Say so rather than implying a
+            // working bridge — otherwise "paste does nothing" has no cause.
+            return ("no host clipboard".to_string(), [0.8, 0.5, 0.45, 1.0]);
+        }
+        match (r, w) {
+            (true, true) => ("● read + write".to_string(), [0.95, 0.75, 0.35, 1.0]),
+            (true, false) => ("● read only".to_string(), [0.9, 0.7, 0.4, 1.0]),
+            (false, true) => ("● write only".to_string(), [0.75, 0.7, 0.5, 1.0]),
+            // Wired but the token says no: the wire is drawn, the grant is not.
+            (false, false) => ("denied by token".to_string(), [0.8, 0.5, 0.45, 1.0]),
+        }
     }
 
     /// Put uplink `id`'s own ticket on the clipboard, and flag the widget to
@@ -870,6 +1029,7 @@ impl App {
             Wire::Serve(http, hp) => (http, hp, PortKind::Serve),
             Wire::Net(app, net) => (app, net, PortKind::Net),
             Wire::Capture(app, cap) => (cap, app, PortKind::Capture),
+            Wire::Clipboard(app, clip) => (clip, app, PortKind::Clipboard),
             Wire::Api(app, api) => (api, app, PortKind::Api),
         };
         if self.view.win_pos.contains_key(&src) && self.view.win_pos.contains_key(&dst) {
@@ -915,6 +1075,12 @@ impl App {
                     .map(|&(x, y)| Wire::Capture(x, y))
             })
             .or_else(|| {
+                s.clipboard_links
+                    .iter()
+                    .find(|&&(x, y)| pair(x, y))
+                    .map(|&(x, y)| Wire::Clipboard(x, y))
+            })
+            .or_else(|| {
                 s.api_links
                     .iter()
                     .find(|&&(x, y)| pair(x, y))
@@ -932,6 +1098,11 @@ impl App {
             .map(|&(f, a)| Wire::Bind(f, a))
             .chain(s.midi_links.iter().map(|&(s, d)| Wire::Midi(s, d)))
             .chain(s.capture_links.iter().map(|&(a, c)| Wire::Capture(a, c)))
+            .chain(
+                s.clipboard_links
+                    .iter()
+                    .map(|&(a, c)| Wire::Clipboard(a, c)),
+            )
             .chain(s.api_links.iter().map(|&(a, n)| Wire::Api(a, n)))
             .chain(s.serves.iter().map(|(&h, &hp)| Wire::Serve(h, hp)))
             .chain(s.net_links.iter().map(|&(a, n)| Wire::Net(a, n)));
@@ -1071,6 +1242,11 @@ impl App {
             "Add Screen Capture",
             d("grants wired apps the captured canvas (frames)"),
             PaletteCmd::AddCapture,
+        ));
+        v.push(PaletteRow::new(
+            "Add Clipboard",
+            d("grants wired apps the HOST's system clipboard (read/write)"),
+            PaletteCmd::AddClipboard,
         ));
         v.push(PaletteRow::new(
             "Add API",
@@ -1430,6 +1606,14 @@ impl App {
                 let pos = self.view_center([FILE_W, FILE_H], self.view.capture_feeds.len());
                 self.conn.send(Command::Create(Resource::Node {
                     kind: NodeKind::Capture,
+                    pos,
+                    ws,
+                }));
+            }
+            PaletteCmd::AddClipboard => {
+                let pos = self.view_center([FILE_W, FILE_H], self.view.clipboard_boards.len());
+                self.conn.send(Command::Create(Resource::Node {
+                    kind: NodeKind::Clipboard,
                     pos,
                     ws,
                 }));
@@ -2422,6 +2606,16 @@ impl App {
                     status.to_string(),
                     status_col,
                 ))
+            } else if self.view.clipboard_boards.contains_key(&id) {
+                let (status, status_col) = self.clipboard_grant(id);
+                Some(Chrome(
+                    CLIPBOARD_BORDER,
+                    CLIPBOARD_BG,
+                    "clipboard".to_string(),
+                    TEXT,
+                    status,
+                    status_col,
+                ))
             } else if self.view.api_nodes.contains(&id) {
                 let wired = self.view.api_links.iter().any(|&(_, n)| n == id);
                 let (status, status_col) = if wired {
@@ -3015,6 +3209,9 @@ impl App {
         }
         for &(app, cap) in &self.view.capture_links {
             links.push((app, cap, PortKind::Capture));
+        }
+        for &(app, clip) in &self.view.clipboard_links {
+            links.push((app, clip, PortKind::Clipboard));
         }
         for &(app, api) in &self.view.api_links {
             links.push((app, api, PortKind::Api));
@@ -3841,6 +4038,7 @@ impl App {
                     let is_note = self.view.notes.contains_key(&id);
                     let is_capture = self.view.capture_feeds.contains_key(&id);
                     let is_api = self.view.api_nodes.contains(&id);
+                    let is_clipboard = self.view.clipboard_boards.contains_key(&id);
                     if is_note {
                         // Note: close (top-right), drag from the top strip, or
                         // click the body to edit the text.
@@ -3860,7 +4058,14 @@ impl App {
                             let cur = self.view.notes.get(&id).cloned().unwrap_or_default();
                             self.editing_note = Some((id, cur));
                         }
-                    } else if is_file || is_port || is_net || is_uplink || is_capture || is_api {
+                    } else if is_file
+                        || is_port
+                        || is_net
+                        || is_uplink
+                        || is_capture
+                        || is_api
+                        || is_clipboard
+                    {
                         // Canvas widget nodes (file / HostPort / Network / Iroh):
                         // close, adjust port (HostPort −/+ buttons), edit the
                         // peer ticket (Iroh, lower half), or move.
@@ -4100,11 +4305,17 @@ impl App {
                 draw_connection(&mut quads, white, a, b, sel, col, zf, full);
             }
         }
-        // Network membership wires (app node — Network node).
         for &(app, cap) in &self.view.capture_links {
             if let Some((a, b)) = self.wire_endpoints(Wire::Capture(app, cap)) {
                 let sel = self.wire_sel == Some(Wire::Capture(app, cap));
                 let col = CAPTURE_BORDER;
+                draw_connection(&mut quads, white, a, b, sel, col, zf, full);
+            }
+        }
+        for &(app, clip) in &self.view.clipboard_links {
+            if let Some((a, b)) = self.wire_endpoints(Wire::Clipboard(app, clip)) {
+                let sel = self.wire_sel == Some(Wire::Clipboard(app, clip));
+                let col = CLIPBOARD_BORDER;
                 draw_connection(&mut quads, white, a, b, sel, col, zf, full);
             }
         }
@@ -4115,6 +4326,7 @@ impl App {
                 draw_connection(&mut quads, white, a, b, sel, col, zf, full);
             }
         }
+        // Network membership wires (app node — Network node).
         for &(app, net) in &self.view.net_links {
             if let Some((a, b)) = self.wire_endpoints(Wire::Net(app, net)) {
                 let sel = self.wire_sel == Some(Wire::Net(app, net));
@@ -4375,6 +4587,34 @@ impl App {
                         title: "screen capture",
                         title_col: TEXT,
                         status,
+                        status_col,
+                        status_scale: 0.7,
+                        copy_ticket: false,
+                    },
+                );
+                continue;
+            }
+
+            // A Clipboard node: a capability widget whose status is the GRANT,
+            // not the wire — see `clipboard_grant`.
+            if self.view.clipboard_boards.contains_key(&id) {
+                let (status, status_col) = self.clipboard_grant(id);
+                self.draw_widget(
+                    &mut quads,
+                    &mut gfx,
+                    white,
+                    zf,
+                    mp,
+                    clip,
+                    full,
+                    WidgetChrome {
+                        id,
+                        r,
+                        border: CLIPBOARD_BORDER,
+                        bg: CLIPBOARD_BG,
+                        title: "clipboard",
+                        title_col: TEXT,
+                        status: &status,
                         status_col,
                         status_scale: 0.7,
                         copy_ticket: false,
@@ -5703,6 +5943,13 @@ impl ApplicationHandler for App {
             );
             return;
         }
+        // The clipboard pump runs ABOVE the headless guard on purpose: it is
+        // the only host-facing capability here that does not need a window.
+        // `arboard` needs a display CONNECTION, which survives "Go headless"
+        // — so a node wired to a Clipboard node keeps copying and pasting
+        // after the canvas is gone. Putting it in `frame()` beside the capture
+        // pump would freeze it the moment the user went headless.
+        self.pump_clipboard();
         if self.headless {
             return; // nothing to draw, nobody watching
         }
@@ -5736,6 +5983,11 @@ impl ApplicationHandler for App {
                     gfx.resize();
                 }
             }
+            // Coming back to wk is exactly when the host clipboard is most
+            // likely to have changed behind our back ("copy in a browser,
+            // switch to wk, paste"), so force the throttled poll to fire on
+            // the next pass instead of waiting out its interval.
+            WindowEvent::Focused(true) => self.clip_polled = None,
             WindowEvent::CursorMoved { position, .. } => {
                 // (3D look mode reads raw `DeviceEvent::MouseMotion` deltas —
                 // the cursor is grabbed and frozen while it's held.)
@@ -6260,6 +6512,9 @@ mod inspect_tests {
             env: Vec::new(),
             layers: Vec::new(),
             capture_src: wk_server::capture::new_src(),
+            clip_src: wk_server::clipboard::new_src(),
+            clip_read: wk_server::clipboard::new_permit(),
+            clip_write: wk_server::clipboard::new_permit(),
             exec_permit: wk_server::exec::new_permit(true),
             fs_serve: wk_server::vfs::ProviderConn::new(),
         })

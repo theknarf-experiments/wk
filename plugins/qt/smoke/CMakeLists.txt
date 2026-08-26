@@ -4,11 +4,13 @@
 # things are not optional and all three are easy to get wrong:
 #
 #   1. link libqwk.a (the wk QPA plugin) and write Q_IMPORT_PLUGIN in main.cpp;
-#   2. link gfx-compat's wkgfx_component_type.o DIRECTLY, not via an archive.
-#      It carries only a `component-type` custom section that wasm-component-ld
-#      reads at link time to build the component's imports; nothing references
-#      it, so the linker drops it if it arrives as an archive member and the
-#      result is a component with no wasi:surface import at all;
+#   2. link gfx-compat's wkgfx_component_type.o and clipboard-compat's
+#      wkclipboard_component_type.o DIRECTLY, not via an archive.
+#      Each carries only a `component-type` custom section that
+#      wasm-component-ld reads at link time to build the component's imports;
+#      nothing references them, so the linker drops one that arrives as an
+#      archive member and the result is a component missing that import
+#      entirely;
 #   3. ship a font. Qt 6 bundles none. This target compiles one in as a Qt
 #      resource under :/fonts, which QWkFontDatabase falls back to when the
 #      node has no font directory in its VFS.
@@ -24,6 +26,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(WK_GFX_COMPAT "${CMAKE_CURRENT_SOURCE_DIR}/../../gfx-compat" CACHE PATH
     "plugins/gfx-compat, the wasi-gfx C shim")
+set(WK_CLIP_COMPAT "${CMAKE_CURRENT_SOURCE_DIR}/../../clipboard-compat" CACHE PATH
+    "plugins/clipboard-compat, the wk:clipboard C shim")
 set(WK_QPA_LIB "${CMAKE_CURRENT_SOURCE_DIR}/../sysroot/lib/libqwk.a" CACHE FILEPATH
     "the wk QPA plugin archive built by ../build-qpa.sh")
 set(WK_SMOKE_FONT "" CACHE FILEPATH "TTF staged into fonts/ by ../build-smoke.sh")
@@ -43,5 +47,11 @@ target_link_libraries(qt-smoke PRIVATE
     Qt6::Widgets Qt6::Gui Qt6::Core Qt6::FbSupportPrivate
 )
 
-# The component-type object. See note 2 above.
-target_link_options(qt-smoke PRIVATE "${WK_GFX_COMPAT}/gen/wkgfx_component_type.o")
+# The component-type objects, one per world the app imports. See note 2 above:
+# each carries only a `component-type` custom section, nothing references
+# them, so they must arrive as objects on the link line and not as archive
+# members. plugins/doom/build.sh links wkgfx's and wkaudio's the same way.
+target_link_options(qt-smoke PRIVATE
+    "${WK_GFX_COMPAT}/gen/wkgfx_component_type.o"
+    "${WK_CLIP_COMPAT}/gen/wkclipboard_component_type.o"
+)

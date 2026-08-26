@@ -41,9 +41,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(WK_GFX_COMPAT "${CMAKE_CURRENT_SOURCE_DIR}/../../gfx-compat" CACHE PATH
     "plugins/gfx-compat, the wasi-gfx C shim")
 
+# clipboard-compat: the C shim over wk:clipboard, its OWN shim rather than an
+# addition to gfx-compat. gfx-compat's world imports only `wasi:` packages —
+# it is the WASI graphics shim — and folding a `wk:`-custom import into it
+# would make doom, quake, mupdf, netsurf, paint, triangle and gfx-smoke all
+# link a clipboard import none of them uses (and grow a Clipboard port on the
+# canvas). Same archive rules as above: wkclip.c and gen/wkclip.c go in,
+# gen/wkclipboard_component_type.o does not.
+set(WK_CLIP_COMPAT "${CMAKE_CURRENT_SOURCE_DIR}/../../clipboard-compat" CACHE PATH
+    "plugins/clipboard-compat, the wk:clipboard C shim")
+
 add_library(qwk STATIC
     main.cpp
     qwkbackingstore.cpp
+    qwkclipboard.cpp
     qwkcompositor.cpp
     qwkeventdispatcher.cpp
     qwkfontdatabase.cpp
@@ -54,10 +65,23 @@ add_library(qwk STATIC
     qwktheme.cpp
     qwkwindow.cpp
     "${WK_GFX_COMPAT}/wkgfx.c"
+    "${WK_GFX_COMPAT}/wkgfx_poll.c"
     "${WK_GFX_COMPAT}/gen/wkgfx.c"
+    "${WK_CLIP_COMPAT}/wkclip.c"
+    "${WK_CLIP_COMPAT}/gen/wkclipboard.c"
 )
 
-target_include_directories(qwk PUBLIC "${WK_GFX_COMPAT}")
+# wkgfx_poll.c is the only file here that reaches into wasi-libc's PRIVATE
+# descriptor table (to give the frame pollable a file descriptor, so that one
+# ppoll waits on the frame, the timers and the sockets at once — see
+# gfx-compat/wkgfx_poll.h). That layout is transcribed, not included, so it is
+# pinned to one wasi-libc revision and a mismatch corrupts memory silently
+# instead of failing to link. ../build-qpa.sh carries the wasi-sdk-34-rc.2
+# guard that makes the pin real; this is the note explaining why it matters.
+# It is deliberately NOT in wkgfx.c: doom, netsurf and every other gfx-compat
+# consumer compile that file and none of them should inherit libc internals.
+
+target_include_directories(qwk PUBLIC "${WK_GFX_COMPAT}" "${WK_CLIP_COMPAT}")
 
 # QT_STATICPLUGIN is what makes Q_PLUGIN_METADATA emit
 # qt_static_plugin_QWkIntegrationPlugin() instead of the dlopen entry points.

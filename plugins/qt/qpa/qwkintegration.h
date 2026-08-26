@@ -12,6 +12,8 @@
 QT_BEGIN_NAMESPACE
 
 class QWkScreen;
+class QWkClipboard;
+class QPlatformClipboard;
 class QPlatformFontDatabase;
 class QPlatformInputContext;
 
@@ -32,6 +34,9 @@ public:
 
     QPlatformFontDatabase *fontDatabase() const override;
     QPlatformInputContext *inputContext() const override;
+#if !defined(QT_NO_CLIPBOARD)
+    QPlatformClipboard *clipboard() const override;
+#endif
     QStringList themeNames() const override;
     QPlatformTheme *createPlatformTheme(const QString &name) const override;
 
@@ -43,6 +48,9 @@ private:
     QWkScreen *m_screen = nullptr;
     mutable QPlatformFontDatabase *m_fontDatabase = nullptr;
     mutable QPlatformInputContext *m_inputContext = nullptr;
+#if !defined(QT_NO_CLIPBOARD)
+    mutable QWkClipboard *m_clipboard = nullptr;
+#endif
 };
 
 QT_END_NAMESPACE

@@ -119,6 +119,23 @@ int wkgfx_wait_frame_timeout(int64_t timeout_ns) {
     return got_frame;
 }
 
+int wkgfx_take_frame(void) {
+    if (!G.open)
+        return 0;
+    /* Note what this does NOT do: it does not touch the pollable. The host's
+     * frame readiness is one-shot and is consumed by the `poll` that observed
+     * it (wk's SurfacePollable clears frame_ready when its future resolves),
+     * so by the time we get here the wake has already been spent. What
+     * `get-frame` is still needed for is the CLOSED surface: the host reports
+     * that by trapping out of this very call. */
+    wasi_surface_surface_frame_event_t fe;
+    return wasi_surface_surface_method_surface_get_frame(surf(), &fe) ? 1 : 0;
+}
+
+uint32_t wkgfx_frame_pollable(void) {
+    return G.open ? G.frame_pollable.__handle : 0;
+}
+
 /* Ensure the staging buffer matches the live surface size. */
 static void stage_fit(uint32_t sw, uint32_t sh) {
     if (G.stage && G.stage_w == sw && G.stage_h == sh)

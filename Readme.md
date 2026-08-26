@@ -54,10 +54,13 @@ can_use($kind, $target, $action) <- wired($kind, $target), operation($kind, $tar
 The server re-checks it every tick, feeding the canvas graph in as
 `wired(kind, target)` facts and each grant as an `operation(kind, target,
 action)`. Kinds: `file`, `midi`, `port`, `net`, `gateway` (host access is its
-own kind, so it can be cut off separately), `capture`, and `scene` (a node's
-`wk:scene` 3D objects — no wire needed, so a second rule in the base token
-allows it outright). Actions: `read`/`write` on files, `send`/`receive` on
-MIDI, `read` on capture, `show` on scene, `use` for the rest. Because the
+own kind, so it can be cut off separately), `capture`, `clipboard`, and
+`scene` (a node's `wk:scene` 3D objects — no wire needed, so a second rule in
+the base token allows it outright; `clipboard` deliberately has no such
+exception, because unlike a node's own 3D objects the host clipboard is a
+genuine cross-sandbox channel). Actions: `read`/`write` on files and on the
+clipboard, `send`/`receive` on MIDI, `read` on capture, `show` on scene, `use`
+for the rest. Because the
 policy lives in the token, it can be narrowed offline by *attenuation*
 (appending checks needs no key) or replaced wholesale to make access work
 differently:
@@ -68,6 +71,8 @@ wk token attenuate vim 'check if operation($k, $t, $a), $k != "net"'            
 wk token attenuate vim 'check if operation($k, $t, $a), $k != "file" || $a == "read"' # files read-only
 wk token attenuate vim 'check if operation($k, $t, $a), $k != "gateway"'             # no host access
 wk token attenuate totem 'check if operation($k, $t, $a), $k != "scene"'             # mute its 3D objects
+wk token attenuate qt 'check if operation($k, $t, $a), $k != "clipboard" || $a == "write"'  # may copy out, never read
+wk token attenuate qt 'check if operation($k, $t, $a), $k != "clipboard"'           # no host clipboard at all
 wk token reset vim                               # back to wired ⇒ usable
 ```
 

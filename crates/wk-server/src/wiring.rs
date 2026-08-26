@@ -26,6 +26,9 @@ pub enum NodeClass {
     HostSvc,
     /// A Screen Capture node — wires only to an app (granting it frames).
     Capture,
+    /// A Clipboard node — wires only to an app (granting it the host's
+    /// system clipboard).
+    Clipboard,
     /// A wk API node — wires only to an app (granting it API access).
     Api,
     /// A hardware MIDI input node — a MIDI *source* only (wires to an app's MIDI
@@ -59,6 +62,9 @@ pub fn classify(a: NodeId, b: NodeId, ca: NodeClass, cb: NodeClass) -> Option<Wi
         // The app is the first element; the capture source the second.
         (Capture, Other) => Some(Wire::Capture(b, a)),
         (Other, Capture) => Some(Wire::Capture(a, b)),
+        // The app is the first element; the Clipboard node the second.
+        (Clipboard, Other) => Some(Wire::Clipboard(b, a)),
+        (Other, Clipboard) => Some(Wire::Clipboard(a, b)),
         // The app is the first element; the API node the second.
         (Api, Other) => Some(Wire::Api(b, a)),
         (Other, Api) => Some(Wire::Api(a, b)),
@@ -233,6 +239,13 @@ mod tests {
             (Other, Api, Some(Wire::Api(a, b))),
             (Api, Api, None),
             (Api, Net, None),
+            // A Clipboard node grants an app the host clipboard; same shape
+            // as Capture and Api — app first, never special-to-special.
+            (Clipboard, Other, Some(Wire::Clipboard(b, a))),
+            (Other, Clipboard, Some(Wire::Clipboard(a, b))),
+            (Clipboard, Clipboard, None),
+            (Clipboard, Capture, None),
+            (Clipboard, Net, None),
         ];
         for (ca, cb, want) in cases {
             assert_eq!(classify(a, b, ca, cb), want, "classify({ca:?}, {cb:?})");
@@ -246,6 +259,7 @@ mod tests {
             Just(NodeClass::Net),
             Just(NodeClass::Uplink),
             Just(NodeClass::Capture),
+            Just(NodeClass::Clipboard),
             Just(NodeClass::Api),
             Just(NodeClass::MidiSource),
             Just(NodeClass::Other),
@@ -263,6 +277,7 @@ mod tests {
             | Wire::Serve(a, b)
             | Wire::Net(a, b)
             | Wire::Capture(a, b)
+            | Wire::Clipboard(a, b)
             | Wire::Api(a, b) => (a, b),
         }
     }

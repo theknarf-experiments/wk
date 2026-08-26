@@ -38,6 +38,11 @@ pub enum Wire {
     /// An app node's grant from an Api node (app, api) — the app may drive
     /// wk's client API over its virtual network while wired.
     Api(NodeId, NodeId),
+    /// An app node's grant from a Clipboard node (app, clipboard) — the app
+    /// may read and/or write the HOST's system clipboard while wired, subject
+    /// to the `clipboard`/`read` and `clipboard`/`write` actions its
+    /// capability token allows.
+    Clipboard(NodeId, NodeId),
 }
 
 /// The TCP port the wk API listens on inside a node's virtual network, when
@@ -152,6 +157,12 @@ pub enum NodeKind {
     /// and routes its messages to the app nodes it's wired to (a MIDI source,
     /// like the piano plugin).
     MidiIn,
+    /// A Clipboard node: a capability source granting wired apps the HOST's
+    /// system clipboard (the client owns the only handle to it). Read and
+    /// write are separate token actions on the one wire, so a node can be
+    /// allowed to copy out without being allowed to see what the user copied
+    /// somewhere else.
+    Clipboard,
     /// A host TCP service published into a Network: the reverse of a HostPort.
     /// Wired to a Network, it joins the fabric as a named peer; members dial
     /// `name:port` and the connection is bridged to the host address it

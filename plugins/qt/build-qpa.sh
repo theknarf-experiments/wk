@@ -41,6 +41,7 @@ SYSROOT="$PWD/sysroot"
 HOST_PREFIX="${QT_HOST_PATH:-$PWD/host}"
 BUILD="$PWD/build-target/qpa"
 GFXCOMPAT="$PWD/../gfx-compat"
+CLIPCOMPAT="$PWD/../clipboard-compat"
 LOGDIR="${LOGDIR:-$PWD/logs}"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
 BUILD_PATH="$WASI_SDK/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
@@ -64,6 +65,14 @@ echo "=== wit-bindgen (wkgfx world)"
 mkdir -p "$GFXCOMPAT/gen"
 wit-bindgen c --world wkgfx "$GFXCOMPAT/wit" --out-dir "$GFXCOMPAT/gen"
 
+# ...and the wk:clipboard world, a SEPARATE shim for the same reason
+# gfx-compat is one: its world imports only wasi: packages, and every other
+# gfx-compat consumer (doom, quake, netsurf, mupdf, paint) would otherwise
+# link a clipboard import it never calls. QWkClipboard is the only user.
+echo "=== wit-bindgen (wkclipboard world)"
+mkdir -p "$CLIPCOMPAT/gen"
+wit-bindgen c --world wkclipboard "$CLIPCOMPAT/wit" --out-dir "$CLIPCOMPAT/gen"
+
 LOG="$LOGDIR/target-qpa.log"
 echo "=== configuring the wk QPA plugin (log: $LOG)"
 env PATH="$BUILD_PATH" cmake -G Ninja -S "$PWD/qpa" -B "$BUILD" \
@@ -75,6 +84,7 @@ env PATH="$BUILD_PATH" cmake -G Ninja -S "$PWD/qpa" -B "$BUILD" \
     -DCMAKE_INSTALL_PREFIX="$SYSROOT" \
     -DCMAKE_BUILD_TYPE=Release \
     -DWK_GFX_COMPAT="$GFXCOMPAT" \
+    -DWK_CLIP_COMPAT="$CLIPCOMPAT" \
     2>&1 | tee "$LOG"
 
 echo "=== ninja"

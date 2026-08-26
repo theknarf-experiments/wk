@@ -266,15 +266,85 @@ CFG=(
     # QTimeZone; the fix then is to ship a zoneinfo tree in the node image.
     -DFEATURE_timezone=OFF
 
-    # Modules out of scope for M0-M3. network is OFF because both candidate
-    # apps are offline; when it comes back, networkinterface must be forced OFF
-    # explicitly (its CONDITION is only `NOT WASM`, so it stays ON for us
-    # despite wasip2 having no interface enumeration).
-    -DFEATURE_network=OFF
+    # NETWORK. On, because wk's fabric gives a node real BSD sockets and the
+    # QPA plugin's dispatcher now polls fds (see qpa/qwkeventdispatcher.cpp).
+    # QtNetwork is the one module where "a genuine WASI platform" costs the
+    # most: Qt's own Emscripten build writes half these CONDITIONs as
+    # `NOT WASM`, so for us they all autodetect back ON against a libc that
+    # cannot honour them. Each OFF below names the thing that is missing.
+    -DFEATURE_network=ON
+    # Interface enumeration. CONDITION is bare `NOT WASM`, so it stays ON for
+    # us -- and qnetworkinterface_unix.cpp then needs <net/if.h> (absent from
+    # the wasi sysroot entirely) plus getifaddrs/if_nametoindex/if_indextoname
+    # (headers present, symbols in NO library -- the eventfd trap again, see
+    # patches/README.md). Off makes the file compile to nothing via
+    # QT_NO_NETWORKINTERFACE. QHostAddress and QTcpSocket do not need it; only
+    # multicast, link-local scope ids and QNetworkInterface itself do.
+    -DFEATURE_networkinterface=OFF
+    -DFEATURE_getifaddrs=OFF
+    -DFEATURE_ipv6ifname=OFF
+    -DFEATURE_linux_netlink=OFF
+    # No <resolv.h>, so no res_ninit/res_setservers. QHostInfo falls back to
+    # plain getaddrinfo(), which is exactly what we want: wk's fabric answers
+    # node names through wasi:sockets ip-name-lookup (plugins/fetch/fetch.c is
+    # the reference). dnslookup is CONDITION QT_FEATURE_thread and so would go
+    # off by itself; pinned because QDnsLookup would otherwise need a
+    # resolver we do not have the moment threads come back.
+    -DFEATURE_libresolv=OFF
+    -DFEATURE_res_setservers=OFF
+    -DFEATURE_dnslookup=OFF
+    # AF_UNIX: <sys/un.h> exists in the sysroot but wasi:sockets has no unix
+    # domain at all, so QLocalSocket would compile and fail at runtime.
+    -DFEATURE_localserver=OFF
+    # <netinet/sctp.h> absent.
+    -DFEATURE_sctp=OFF
+    # A wk node reaches the outside world through its Network's gateway, not
+    # through a proxy, and system_proxies would consult the BUILD machine.
+    -DFEATURE_networkproxy=OFF
+    -DFEATURE_socks5=OFF
+    -DFEATURE_system_proxies=OFF
+    -DFEATURE_libproxy=OFF
+    -DFEATURE_networklistmanager=OFF
+    # topleveldomain is AUTODETECT NOT WASM, i.e. ON for us, and compiles a
+    # ~200KB binary dump of the Public Suffix List into every node just so the
+    # cookie jar can reject supercookies. Off until a node needs cookies.
+    -DFEATURE_topleveldomain=OFF
+    -DFEATURE_publicsuffix_qt=OFF
+    -DFEATURE_publicsuffix_system=OFF
+    # No brotli/zstd/gssapi in the sysroot; they would fail their find_package
+    # anyway, but pinning them keeps the configure output stable.
+    -DFEATURE_brotli=OFF
+    -DFEATURE_gssapi=OFF
+    # QNetworkDiskCache wants a writable cache dir in QStandardPaths; a node's
+    # vfs may not have one. The in-memory cache still works.
+    -DFEATURE_networkdiskcache=OFF
+    # QUdpSocket. The three datagram functions in qnativesocketengine_unix.cpp
+    # sit OUTSIDE QT_CONFIG(udpsocket), so turning this off does NOT remove
+    # their calls to recvmsg/sendmsg -- which wasi-libc declares and never
+    # defines. patches/qtbase-0008 supplies them over recvfrom/sendto, so the
+    # feature costs nothing extra and QUdpSocket links. It is NOT proven over
+    # the fabric; see PORTING.md.
+    -DFEATURE_udpsocket=ON
+    # HTTP. CONDITION is QT_FEATURE_thread upstream, because Qt 6.8's backend
+    # runs QHttpThreadDelegate on a QThread it creates. patches/qtbase-0009
+    # relaxes that and makes the delegate live on the calling thread, which is
+    # sound here precisely BECAUSE there are no threads: with QT_CONFIG(thread)
+    # off, qobject.cpp:4094 compiles BlockingQueuedConnection out and every
+    # such emit becomes a direct call. See the patch header for the argument.
+    -DFEATURE_http=ON
     -DFEATURE_sql=OFF
     -DFEATURE_testlib=OFF
     -DFEATURE_printsupport=OFF
     -DFEATURE_dbus=OFF
+    # TLS. There is no TLS backend for this platform: securetransport is
+    # CONDITION APPLE (the target is not), schannel is WIN32, and no OpenSSL is
+    # cross-built for wasm32-wasip2 here. So QT_FEATURE_ssl is 0 and https://
+    # simply does not exist for QNetworkAccessManager. Pinned rather than left
+    # derived so that the day someone cross-builds OpenSSL, this line is the
+    # one they have to delete on purpose.
+    -DFEATURE_ssl=OFF
+    -DFEATURE_dtls=OFF
+    -DFEATURE_ocsp=OFF
     -DFEATURE_openssl=OFF
     -DFEATURE_openssl_linked=OFF
     -DFEATURE_openssl_hash=OFF
@@ -367,21 +437,38 @@ else
 fi
 
 # --- a look at what configure actually decided -------------------------------
-# Cheap, and it catches the silent-failure modes early. thread must be OFF, and
-# poll_ppoll must be OFF too (ppoll does not exist in wasi-libc; the feature is
-# `CONDITION NOT WASM AND TEST_ppoll`, so it depends on that test failing
-# honestly rather than on a flag).
-if [ -f "$BUILD/src/corelib/qtcore-config.h" ]; then
-    echo "--- configure sanity (expect all of these to be 0/-1)"
-    grep -E "QT_FEATURE_(thread|poll_ppoll|dlopen|process|timezone|library) " \
-        "$BUILD/src/corelib/qtcore-config.h" || true
+# Cheap, and it catches the silent-failure modes early. thread must be OFF.
+#
+# poll_ppoll must be ON: wasi-sdk 34-rc.2 DOES define ppoll (llvm-nm over
+# libc.a shows `T ppoll`) and poll.h declares it, so the config test passes
+# honestly. That is load-bearing rather than incidental -- on wasip2 ppoll() IS
+# a single wasi:io/poll.poll over the descriptors' pollables plus a
+# monotonic-clock deadline, which is what lets QWkEventDispatcher put the wk
+# frame, Qt's timers and every QSocketNotifier fd into ONE blocking call.
+#
+# The four files are not interchangeable, and looking in only one of them is
+# why this check used to print two of the five things it claimed to check:
+# public GLOBAL features land in global/qconfig.h (`thread`), private global
+# ones in global/qconfig_p.h (`dlopen`), public per-module ones in
+# qtcore-config.h (`process`, `library`, `timezone`) and private per-module
+# ones in qtcore-config_p.h (`poll_ppoll`).
+for f in global/qconfig.h global/qconfig_p.h qtcore-config.h qtcore-config_p.h; do
+    [ -f "$BUILD/src/corelib/$f" ] || continue
+    grep -HE "QT_FEATURE_(thread|poll_ppoll|dlopen|process|timezone|library) " \
+        "$BUILD/src/corelib/$f" || true
+done | sed 's|^.*/||;s|^|    |' | sort -u | \
+    { echo "--- configure sanity (thread/dlopen/process/timezone/library -1, poll_ppoll 1)"; cat; }
+if [ -f "$BUILD/src/network/qtnetwork-config.h" ]; then
+    echo "--- network sanity (http 1, ssl 0, networkinterface 0)"
+    grep -E "QT_FEATURE_(http|ssl|udpsocket|networkinterface|dnslookup|localserver) " \
+        "$BUILD/src/network/qtnetwork-config.h" || true
 fi
 
 # --- build + install ---------------------------------------------------------
 # Staged on purpose: Core is where every wasi-libc gap lives, so failing there
 # is ten minutes of feedback instead of sixty. WK_QT_STAGES overrides
 # ("Core" to stop after QtCore; "all" to skip straight to everything).
-STAGES="${WK_QT_STAGES:-Core Gui Widgets all}"
+STAGES="${WK_QT_STAGES:-Core Network Gui Widgets all}"
 for stage in $STAGES; do
     if [ "$stage" = all ]; then
         echo "=== ninja (everything)"

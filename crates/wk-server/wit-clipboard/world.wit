@@ -1,0 +1,83 @@
+package wk:clipboard;
+
+/// The HOST's system clipboard, granted by wiring a node to a Clipboard node
+/// on the canvas. A wasm node can never reach NSPasteboard or an X11 selection
+/// itself; wk's local client owns the one `arboard::Clipboard` and publishes
+/// what it holds, exactly the way a Screen Capture node publishes frames. So
+/// clipboard access is an explicit, visible, revocable capability — not an
+/// ambient one — and that matters more here than it does for capture: whatever
+/// the user last copied ANYWHERE on the machine (a password manager, a
+/// terminal, a bank site) is readable through `get`, and `set` lets a node
+/// plant content for the user to paste somewhere else. This is a genuine
+/// cross-sandbox side channel and it is default-deny.
+///
+/// GATING, in two independent halves. A node is allowed nothing until it is
+/// wired to a Clipboard node, and even then `read` and `write` are separate
+/// capability-token actions, so a token can grant copy-out without paste-in:
+///
+///     wk token attenuate <node> \
+///       'check if operation($k, $t, $a), $k != "clipboard" || $a == "write"'
+///
+/// leaves `set` working and makes `get` return `none` forever. The base rule
+/// `can_use($k,$t,$a) <- wired($k,$t), operation($k,$t,$a)` is what makes the
+/// unwired case deny; `clipboard` deliberately has NO no-wire exception of the
+/// sort `scene` and `exec` have, because those grant no cross-sandbox
+/// authority and this does.
+interface clipboard {
+    /// What the host clipboard holds, plus a sequence number.
+    ///
+    /// `seq` starts at 1 for the first text the host ever observes and
+    /// increments only when the text actually CHANGES. It exists because
+    /// `arboard` has no change notification of any kind — no `changeCount`,
+    /// no watcher — so the host produces this by polling and diffing, and a
+    /// guest that wants "did someone else copy something?" compares seq rather
+    /// than the string. It is also how a toolkit tells "the clipboard is still
+    /// mine" from "another app took it": remember the seq your own `set`
+    /// produced and compare (this is what QWkClipboard::ownsMode does).
+    record snapshot {
+        seq: u64,
+        text: string,
+    }
+
+    /// The host clipboard's current contents.
+    ///
+    /// `none` means the node may not read it — no Clipboard wire, or a token
+    /// that denies `clipboard`/`read` — OR the host has no clipboard at all
+    /// (a headless machine with no display server), OR it holds something
+    /// that is not text. Those cases are deliberately indistinguishable to the
+    /// guest: a denied node must not be able to probe for the existence of a
+    /// clipboard it cannot see. The host logs the first denied read per node,
+    /// so the deny is visible in `wk logs` to the person running wk, just not
+    /// to the sandbox.
+    ///
+    /// Cheap to call: it reads a value the host has already published, so a
+    /// toolkit may call it from inside a synchronous `QPlatformClipboard::
+    /// mimeData()` without blocking on the window system.
+    get: func() -> option<snapshot>;
+
+    /// Put `text` on the host clipboard.
+    ///
+    /// Returns nothing and a denied write is silently dropped, like
+    /// `wk:midi`'s `send` — a node that may not write learns nothing from
+    /// trying. The write is queued for the client's next event-loop pass
+    /// rather than applied inline, because the only thread that may touch
+    /// `arboard` is the one that owns the window system connection.
+    ///
+    /// TEXT ONLY, and that is a deliberate cut rather than a stub. `arboard`'s
+    /// read side is text or an RGBA image and there is no `get_html`, so a
+    /// `list<tuple<string, list<u8>>>` MIME map would be a two-entry map
+    /// pretending to be general. A toolkit loses nothing in-process: Qt's
+    /// QWkClipboard keeps the QMimeData the app itself set and hands it back
+    /// verbatim while the app still owns the clipboard, so copying an image
+    /// inside one node and pasting it back is lossless; only the hop across
+    /// the host is text. Images can be added later as a separate
+    /// `get-image`/`set-image` pair — `arboard`'s `image-data` feature is
+    /// already on, and its RGBA8+w+h shape is byte-for-byte `wk:capture`'s
+    /// `frame` — without retrofitting a MIME map onto this.
+    set: func(text: string);
+}
+
+/// The host side: wk implements (imports) the clipboard interface for guests.
+world clipboard-host {
+    import clipboard;
+}

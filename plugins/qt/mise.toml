@@ -48,6 +48,26 @@ depends = ["build-qpa"]
 # checks the composited surface is a real widget frame.
 run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-smoke.sh"
 
+[tasks.build-net]
+description = "Build plugins/qt/qt-net.wasm -- the QSocketNotifier test node"
+dir = "{{config_root}}"
+depends = ["build-qpa"]
+# A Qt node with no window and no timer that waits on a TCP socket, so the
+# only thing that can wake its event loop is the fd. Verified by the wk-server
+# test `qt_socket_notifier_wakes_on_the_fabric`, which runs it against
+# plugins/netserve on a shared fabric WITHOUT ever pumping a frame.
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-net.sh"
+
+[tasks.build-qtnetwork]
+description = "Build plugins/qt/qt-qtnetwork.wasm -- QtNetwork over wk's fabric"
+dir = "{{config_root}}"
+depends = ["build-qpa"]
+# The pair with build-net is deliberate: qt-net.wasm proves the DISPATCHER
+# wakes on an fd and links no QtNetwork at all, this one proves the MODULE.
+# QHostInfo + QTcpSocket + QNetworkAccessManager against plugins/netserve,
+# verified by the wk-server test `qt_network_speaks_to_a_wk_node`.
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-qtnetwork.sh"
+
 [tasks.build]
 description = "Build the Qt port: host tools + cross qtbase (self-skips while patches/ is empty)"
 dir = "{{config_root}}"

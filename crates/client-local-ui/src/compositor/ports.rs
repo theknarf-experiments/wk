@@ -19,6 +19,7 @@ pub(super) enum PortKind {
     Serve,
     Net,
     Capture,
+    Clipboard,
     Api,
 }
 
@@ -31,6 +32,7 @@ impl PortKind {
             PortKind::Serve => HOSTPORT_WIRE,
             PortKind::Net => NET_WIRE_COL,
             PortKind::Capture => CAPTURE_BORDER,
+            PortKind::Clipboard => CLIPBOARD_BORDER,
             PortKind::Api => API_BORDER,
         }
     }

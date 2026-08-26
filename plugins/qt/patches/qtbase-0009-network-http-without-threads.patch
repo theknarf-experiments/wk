@@ -1,0 +1,220 @@
+Subject: network: QNetworkAccessManager's HTTP stack without threads
+
+WHAT / WHY
+
+  src/network/configure.cmake
+      `qt_feature("http" ... CONDITION QT_FEATURE_thread)`. With
+      FEATURE_thread=OFF -- which this port cannot change, because wasi-libc's
+      pthread_create is a stub returning ENOTSUP -- that excludes the ENTIRE
+      QT_FEATURE_http source scope from libQt6Network: qhttpnetworkconnection,
+      all of http2/, qnetworkreplyhttpimpl, qrestaccessmanager,
+      qhttpsocketengine. QNetworkAccessManager survives but can only do
+      file:// and data://. Qt's own wasm build dodges this with
+      qnetworkreplywasmimpl.cpp under `CONDITION WASM`, i.e. it hands the
+      whole job to the browser's fetch(); we are not WASM and have no browser.
+      The condition is dropped and the three thread assumptions behind it are
+      fixed below.
+
+  src/network/access/qnetworkaccessmanager.cpp
+      createThread() does `new QThread; thread->start()`. With
+      QT_CONFIG(thread) off that object is not a thread: qthread.cpp's
+      non-thread QThreadPrivate gives it its OWN QThreadData with no event
+      dispatcher, start() only sets a flag, and nothing ever drains its
+      post-event queue -- so moving the delegate onto it makes every
+      QueuedConnection to the delegate vanish silently. Returning
+      QThread::currentThread() instead is not an approximation of threading,
+      it is the CORRECT semantics for a single-threaded process:
+
+        * moveToThread(currentThread()) short-circuits to "already in this
+          thread" and returns true;
+        * the delegate's QueuedConnections are delivered by the application's
+          own event loop, in order;
+        * the BlockingQueuedConnections become DIRECT calls -- qobject.cpp
+          wraps that entire arm of QMetaObject::activate() in
+          `#if QT_CONFIG(thread)` (qobject.cpp:4094 in 6.8.4), so with threads
+          off it falls through to the direct path. Which is exactly what
+          "block until the other thread has answered" degenerates to when
+          there is no other thread.
+
+      destroyThread() correspondingly must not run: quitting the caller's
+      thread would exit the application's event loop.
+
+  src/network/access/qnetworkreplyhttpimpl.cpp
+      The same two changes for the internal SynchronousRequestAttribute path,
+      which builds its own QThread rather than the manager's. Without them a
+      synchronous reply would post startRequest to a dead queue and fail on
+      QHttpThreadDelegate's own 30-second watchdog.
+
+  src/network/access/qhttpthreaddelegate{_p.h,.cpp}
+      `static QThreadStorage<QNetworkAccessCache *> connections;`.
+      QThreadStorage's out-of-line half lives in qthreadstorage.cpp, which
+      src/corelib/CMakeLists.txt compiles only under
+      `CONDITION QT_FEATURE_thread` -- so the template header compiles fine and
+      the APPLICATION link fails on QThreadStorageData. With one thread,
+      thread-local is global; replaced by a three-method struct over a plain
+      static with the same hasLocalData/localData/setLocalData interface,
+      including setLocalData's delete-the-previous-value behaviour that
+      startRequestSynchronously() relies on.
+
+  PROVEN, not argued: the wk-server test `qt_network_speaks_to_a_wk_node`
+  drives a real QNetworkAccessManager::get() from a wk node against
+  plugins/netserve on the same fabric and asserts HTTP STATUS 200 plus the
+  body. HTTP/1.1 cleartext only -- QT_FEATURE_ssl is 0 on this platform, so
+  https:// has no backend at all.
+
+UPSTREAM
+  not-as-is. The thread-storage and createThread hunks are honest
+  single-thread fallbacks that upstream might take as `#if !QT_CONFIG(thread)`
+  arms. Relaxing the feature CONDITION is a policy change they would want
+  behind a real no-thread CI configuration first, and would probably want to
+  do together with the QNetworkAccessManager synchronous path, HTTP/2 and the
+  authentication cache getting the same review.
+
+--- a/src/network/configure.cmake
++++ b/src/network/configure.cmake
+@@ -261,7 +261,6 @@
+     SECTION "Networking"
+     LABEL "HTTP"
+     PURPOSE "Provides support for the Hypertext Transfer Protocol in QNetworkAccessManager."
+-    CONDITION QT_FEATURE_thread
+ )
+ qt_feature_definition("http" "QT_NO_HTTP" NEGATE VALUE "1")
+ qt_feature("udpsocket" PUBLIC
+--- a/src/network/access/qnetworkaccessmanager.cpp
++++ b/src/network/access/qnetworkaccessmanager.cpp
+@@ -1721,6 +1721,20 @@
+ 
+ QThread * QNetworkAccessManagerPrivate::createThread()
+ {
++#if !QT_CONFIG(thread)
++    // No threads on this platform (wasm32-wasip2). A QThread built with
++    // QT_CONFIG(thread) off is an object with its own QThreadData and no
++    // event dispatcher: start() only sets a flag, nothing ever drains its
++    // post-event queue, and moving the delegate onto it would silently
++    // swallow every QueuedConnection. Hand back the calling thread instead --
++    // then moveToThread() is a no-op, the delegate's queued signals go through
++    // the application's own event loop, and the BlockingQueuedConnections
++    // become direct calls (qobject.cpp compiles that arm out entirely when
++    // QT_CONFIG(thread) is 0, so activate() falls through to the direct
++    // path). That is the correct semantics for a single-threaded process, not
++    // an approximation of it.
++    return QThread::currentThread();
++#else
+     if (!thread) {
+         thread = new QThread;
+         thread->setObjectName(QStringLiteral("QNetworkAccessManager thread"));
+@@ -1728,10 +1742,16 @@
+     }
+     Q_ASSERT(thread);
+     return thread;
++#endif
+ }
+ 
+ void QNetworkAccessManagerPrivate::destroyThread()
+ {
++#if !QT_CONFIG(thread)
++    // createThread() never created one, and quitting the caller's thread here
++    // would exit the application's event loop.
++    Q_ASSERT(!thread);
++#else
+     if (thread) {
+         thread->quit();
+         thread->wait(QDeadlineTimer(5000));
+@@ -1741,6 +1761,7 @@
+             QObject::connect(thread, SIGNAL(finished()), thread, SLOT(deleteLater()));
+         thread = nullptr;
+     }
++#endif
+ }
+ 
+ 
+--- a/src/network/access/qnetworkreplyhttpimpl.cpp
++++ b/src/network/access/qnetworkreplyhttpimpl.cpp
+@@ -629,11 +629,20 @@
+ 
+     QThread *thread = nullptr;
+     if (synchronous) {
++#if !QT_CONFIG(thread)
++        // See QNetworkAccessManagerPrivate::createThread(). A synchronous
++        // request still works without threads: startRequestSynchronously()
++        // runs a nested QEventLoop, and because the delegate stays on this
++        // thread the QueuedConnection that starts the request is delivered by
++        // that nested loop rather than by a worker's.
++        thread = QThread::currentThread();
++#else
+         // A synchronous HTTP request uses its own thread
+         thread = new QThread();
+         thread->setObjectName(QStringLiteral("Qt HTTP synchronous thread"));
+         QObject::connect(thread, SIGNAL(finished()), thread, SLOT(deleteLater()));
+         thread->start();
++#endif
+     } else {
+         // We use the manager-global thread.
+         // At some point we could switch to having multiple threads if it makes sense.
+@@ -997,12 +1006,14 @@
+         if (delegate->incomingErrorCode != QNetworkReply::NoError)
+             httpError(delegate->incomingErrorCode, delegate->incomingErrorDetail);
+ 
++#if QT_CONFIG(thread)
+         thread->quit();
+         thread->wait(QDeadlineTimer(5000));
+         if (thread->isFinished())
+             delete thread;
+         else
+             QObject::connect(thread, SIGNAL(finished()), thread, SLOT(deleteLater()));
++#endif
+ 
+         finished();
+     } else {
+--- a/src/network/access/qhttpthreaddelegate_p.h
++++ b/src/network/access/qhttpthreaddelegate_p.h
+@@ -18,7 +18,11 @@
+ 
+ #include <QtNetwork/private/qtnetworkglobal_p.h>
+ #include <QObject>
++#if QT_CONFIG(thread)
+ #include <QThreadStorage>
++#else
++#include <QtCore/qglobal.h>
++#endif
+ #include <QNetworkProxy>
+ #include <QSslConfiguration>
+ #include <QSslError>
+@@ -154,7 +158,23 @@
+ protected:
+     // Cache for all the QHttpNetworkConnection objects.
+     // This is per thread.
++#if QT_CONFIG(thread)
+     static QThreadStorage<QNetworkAccessCache *> connections;
++#else
++    // QThreadStorage's out-of-line half lives in qthreadstorage.cpp, which
++    // src/corelib/CMakeLists.txt only compiles under CONDITION QT_FEATURE_thread
++    // -- so the template header compiles and the link fails on
++    // QThreadStorageData. With one thread, thread-local IS global; this is the
++    // same three-call interface over a plain static.
++    struct SingleThreadedCache
++    {
++        QNetworkAccessCache *value = nullptr;
++        bool hasLocalData() const { return value != nullptr; }
++        QNetworkAccessCache *localData() const { return value; }
++        void setLocalData(QNetworkAccessCache *v) { delete value; value = v; }
++    };
++    static SingleThreadedCache connections;
++#endif
+ 
+ };
+ 
+--- a/src/network/access/qhttpthreaddelegate.cpp
++++ b/src/network/access/qhttpthreaddelegate.cpp
+@@ -166,7 +166,11 @@
+ };
+ 
+ 
++#if QT_CONFIG(thread)
+ QThreadStorage<QNetworkAccessCache *> QHttpThreadDelegate::connections;
++#else
++QHttpThreadDelegate::SingleThreadedCache QHttpThreadDelegate::connections;
++#endif
+ 
+ 
+ QHttpThreadDelegate::~QHttpThreadDelegate()

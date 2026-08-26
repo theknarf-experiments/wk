@@ -14,7 +14,10 @@
 // button, verifies the label changed, and exits non-zero if the composited
 // screen image is blank. That is what makes this a test rather than a demo.
 // It also focuses the QLineEdit and echoes every change to it, so the host
-// test can type real wasi:surface key events into a real text field.
+// test can type real wasi:surface key events into a real text field, and it
+// narrates the clipboard (CLIP lines) so the host can prove that a Cmd/Ctrl+C
+// in the QLineEdit reached the machine's real clipboard and that a Cmd/Ctrl+V
+// pasted what the machine's real clipboard held.
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QLineEdit>
@@ -25,6 +28,8 @@
 #include <QtWidgets/QWidget>
 
 #include <QtWidgets/QStyle>
+
+#include <QtGui/QClipboard>
 
 #include <QtCore/QDebug>
 #include <QtCore/QtPlugin>
@@ -101,6 +106,19 @@ int main(int argc, char **argv)
         std::fflush(stdout);
     });
 
+    // The clipboard half of the smoke test. Nothing here calls wk:clipboard:
+    // it goes through QClipboard, which reaches QWkClipboard only because the
+    // QPA plugin's clipboard() override returns one — which is exactly the
+    // path a real app's Cmd+C takes. Every change is narrated so the host can
+    // assert on it, and reading QClipboard::text() is itself the assertion
+    // that a paste would find something.
+    auto clipReport = [] {
+        QClipboard *cb = QApplication::clipboard();
+        const QString t = cb->text();
+        std::printf("CLIP owns=%d '%s'\n", cb->ownsClipboard() ? 1 : 0, qPrintable(t));
+        std::fflush(stdout);
+    };
+
     layout->addWidget(title);
     layout->addStretch(1);
     layout->addWidget(count);
@@ -138,6 +156,7 @@ int main(int argc, char **argv)
             // without a click, and a click would first have to know where it
             // is.
             edit->setFocus();
+            clipReport();
             button->click();
             const bool ok = clicks == 1 && count->text() == QStringLiteral("Clicks: 1");
             std::printf("SELFTEST %s (clicks=%d label='%s')\n", ok ? "PASS" : "FAIL", clicks,
@@ -158,6 +177,13 @@ int main(int argc, char **argv)
             const QRect r(button->mapToGlobal(QPoint(0, 0)), button->size());
             std::printf("BUTTON %d %d %d %d\n", r.x(), r.y(), r.width(), r.height());
             std::fflush(stdout);
+            // Re-narrate the clipboard on the same timer. There is no host
+            // change notification behind wk:clipboard (nothing to hang a
+            // QClipboard::dataChanged() on for a FOREIGN copy), so polling is
+            // how the host test observes both directions: what this node put
+            // there after a Cmd/Ctrl+C, and what the host put there for a
+            // Cmd/Ctrl+V to find.
+            clipReport();
         });
         report->start(250);
     }

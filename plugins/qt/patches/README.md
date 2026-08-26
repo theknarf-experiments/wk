@@ -80,6 +80,8 @@ Keep this table in sync; `PORTING.md` links to it.
 | `qtbase-0005-corelib-no-tz-no-signals.patch` | `qtenvironmentvariables.cpp`, `qlockfile_unix.cpp` | No `tzset`/`tzname`, no `kill`, and `flock` declared but never defined | tz yes, lock semantics not-as-is |
 | `qtbase-0006-widgets-no-passwd-db.patch` | `src/widgets/dialogs/qfiledialog.cpp` | No `<pwd.h>`; `~user` expansion takes the VxWorks/Integrity path. **The only thing blocking QtWidgets.** | yes |
 | `qtbase-0007-corelib-no-mremap.patch` | `src/corelib/io/qresource.cpp` | `mremap` declared and its `MREMAP_*` flags defined, but no symbol anywhere | yes |
+| `qtbase-0008-network-wasi-socket-gaps.patch` | `src/network/socket/qnet_unix_p.h`, `src/network/socket/qnativesocketengine_unix.cpp` | No `<resolv.h>` at all; and wasi-libc hides `sendmsg`/`recvmsg`/`struct cmsghdr`/every `CMSG_*`/`SO_BROADCAST`/`SO_OOBINLINE`/`MSG_EOR` behind `__wasilibc_unmodified_upstream`, while the socket engine's datagram code sits **outside** `QT_CONFIG(udpsocket)` and needs them regardless | not-as-is |
+| `qtbase-0009-network-http-without-threads.patch` | `src/network/configure.cmake`, `qnetworkaccessmanager.cpp`, `qnetworkreplyhttpimpl.cpp`, `qhttpthreaddelegate{_p.h,.cpp}` | `qt_feature("http" CONDITION QT_FEATURE_thread)` excludes the whole HTTP stack; `createThread()` builds a QThread that never runs; `QThreadStorage`'s out-of-line half is not compiled without threads | not-as-is |
 
 ### One file, one patch
 

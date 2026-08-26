@@ -1,0 +1,17 @@
+package wk:clipboardcompat;
+
+/// The guest side of the wk:clipboard shim: a C or C++ program compiled
+/// against wkclip.h reads and writes the HOST's system clipboard, if — and
+/// only if — this node is wired to a Clipboard node on the canvas and its
+/// capability token still allows the action. The sibling of ../midi-compat's
+/// wkmidi world; the interface itself is vendored under wit/deps the same way.
+///
+/// It is deliberately NOT folded into ../gfx-compat. That world imports only
+/// `wasi:` packages — it is the WASI graphics shim, and a `wk:`-custom package
+/// in it breaks that invariant. Folding it in would also make doom, quake,
+/// mupdf, netsurf, paint, triangle and gfx-smoke each link a clipboard import
+/// that none of them uses, which shows up in `wk` as a Clipboard port on every
+/// graphical node.
+world wkclipboard {
+    import wk:clipboard/clipboard;
+}

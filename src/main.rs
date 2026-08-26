@@ -232,6 +232,10 @@ enum CreateKind {
     Iroh,
     Veilid,
     Capture,
+    /// The HOST's system clipboard as a node: wire an app to it to let the app
+    /// copy and paste. Read and write are separate token actions — see
+    /// `wk token attenuate` in the Readme.
+    Clipboard,
     /// The wk API as a node: wire an app to it to let the app drive wk
     Api,
     /// A hardware MIDI input node (value = device name; omit for the default)
@@ -253,6 +257,7 @@ impl CreateKind {
             CreateKind::Iroh => NodeKind::Iroh,
             CreateKind::Veilid => NodeKind::Veilid,
             CreateKind::Capture => NodeKind::Capture,
+            CreateKind::Clipboard => NodeKind::Clipboard,
             CreateKind::Api => NodeKind::Api,
             CreateKind::Midi => NodeKind::MidiIn,
             CreateKind::Note => NodeKind::Note,

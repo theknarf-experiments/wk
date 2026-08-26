@@ -1,6 +1,7 @@
 #include "qwkintegration.h"
 
 #include "qwkbackingstore.h"
+#include "qwkclipboard.h"
 #include "qwkeventdispatcher.h"
 #include "qwkfontdatabase.h"
 #include "qwkscreen.h"
@@ -62,6 +63,9 @@ QWkIntegration::~QWkIntegration()
         QWindowSystemInterface::handleScreenRemoved(m_screen); // deletes it
     delete m_fontDatabase;
     delete m_inputContext;
+#if !defined(QT_NO_CLIPBOARD)
+    delete m_clipboard;
+#endif
     if (s_instance == this)
         s_instance = nullptr;
 }
@@ -129,6 +133,24 @@ QPlatformInputContext *QWkIntegration::inputContext() const
         m_inputContext = new QPlatformInputContext;
     return m_inputContext;
 }
+
+#if !defined(QT_NO_CLIPBOARD)
+QPlatformClipboard *QWkIntegration::clipboard() const
+{
+    // Lazily, like fontDatabase() and inputContext(), and deliberately NOT in
+    // the constructor: wkgfx_open() has to be the first host call this plugin
+    // makes (the screen geometry is read back from it), and a clipboard
+    // constructed alongside it would put a wk:clipboard call ahead of that.
+    //
+    // Without this override QPlatformIntegration hands back a default
+    // QPlatformClipboard — a process-global QMimeData holder — so copy/paste
+    // works perfectly inside the node while being invisible to the machine it
+    // runs on. That is the "No clipboard" bullet in PORTING.md.
+    if (!m_clipboard)
+        m_clipboard = new QWkClipboard;
+    return m_clipboard;
+}
+#endif
 
 QStringList QWkIntegration::themeNames() const
 {
