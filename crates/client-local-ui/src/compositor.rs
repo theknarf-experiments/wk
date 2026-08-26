@@ -39,7 +39,7 @@ use camera3d::*;
 mod geometry;
 use geometry::*;
 mod input;
-use input::{encode_term_key, key_event};
+use input::{encode_term_key, key_event, KeyText};
 mod modals;
 use modals::*;
 mod palette;
@@ -364,6 +364,11 @@ struct App {
     look_delta: [f32; 2],
     fly_scroll: f32,
     keys_down: HashSet<KeyCode>,
+    /// The character each held key produced, so its release can carry the same
+    /// text its press did. Shared by the main and detached windows: winit routes
+    /// a press and its release to whichever window had focus, and a code is a
+    /// code either way.
+    key_text: KeyText,
     mods: ModifiersState,
     pan_delta: [f32; 2],
     /// Accumulated zoom multiplier this frame (1.0 = none); fed by Cmd/Ctrl +
@@ -453,6 +458,7 @@ impl App {
             look_delta: [0.0, 0.0],
             fly_scroll: 0.0,
             keys_down: HashSet::new(),
+            key_text: KeyText::default(),
             mods: ModifiersState::empty(),
             pan_delta: [0.0, 0.0],
             zoom_factor: 1.0,
@@ -831,6 +837,11 @@ impl App {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let pressed = event.state == ElementState::Pressed;
                     let mods = self.mods;
+                    // Resolved before borrowing the detached window — and
+                    // unconditionally, even for a window that has since been
+                    // dropped: the memo tracks which keys are down, so it must
+                    // see every event this window gets (see `KeyText`).
+                    let text = self.key_text.resolve(code, event.text.as_ref(), pressed);
                     if let Some(det) = self.detached.get_mut(&node_id) {
                         if pressed {
                             if let Some(bytes) = encode_term_key(code, event.text.as_deref(), mods)
@@ -839,7 +850,7 @@ impl App {
                             }
                         }
                         det.key_events
-                            .push((key_event(code, mods, event.repeat), pressed));
+                            .push((key_event(code, text, mods, event.repeat), pressed));
                     }
                 }
             }
@@ -5900,6 +5911,16 @@ impl ApplicationHandler for App {
                     } else {
                         self.keys_down.remove(&code);
                     }
+                    // The character this key types, resolved here for the same
+                    // reason `keys_down` is maintained here: it is held-key
+                    // state, and nearly every branch below can swallow the
+                    // event and `return` (the palette, the modals, wk's own
+                    // Cmd chords). A memo updated only on the paths that reach
+                    // a guest goes stale — a release eaten by the palette
+                    // leaves its press text behind for some later keystroke to
+                    // replay. Resolving up front costs one hash lookup and
+                    // keeps the memo honest.
+                    let text = self.key_text.resolve(code, event.text.as_ref(), pressed);
                     // The 3D view owns the keyboard: WASD/QE fly (read from
                     // `keys_down` each frame). Cmd/Ctrl+K still opens the
                     // palette, which then captures keys (incl. paste); Escape
@@ -5938,7 +5959,7 @@ impl ApplicationHandler for App {
                                 }
                             }
                             self.key_events
-                                .push((key_event(code, self.mods, event.repeat), pressed));
+                                .push((key_event(code, text, self.mods, event.repeat), pressed));
                             return;
                         }
                         if pressed && !event.repeat && code == KeyCode::KeyF {
@@ -6083,7 +6104,7 @@ impl ApplicationHandler for App {
                         }
                     }
                     self.key_events
-                        .push((key_event(code, self.mods, event.repeat), pressed));
+                        .push((key_event(code, text, self.mods, event.repeat), pressed));
                 }
             }
             _ => {}
