@@ -18,6 +18,7 @@ pub mod fetch;
 pub mod fsprov;
 pub mod http;
 pub mod images;
+pub mod instancing;
 pub mod midi;
 pub mod midihw;
 pub mod oci;

@@ -817,6 +817,14 @@ impl Server {
     /// Create a server and instantiate every workspace in the document (all tabs
     /// run at once). `path` is the `.wk` file to save back to.
     pub fn new(doc: &Document, path: PathBuf) -> Result<Self, String> {
+        // Check the document's instancing before anything starts. A `group`
+        // naming no definition — or one that contains itself — has no
+        // expansion, and running half of what the file says is worse than not
+        // running: the missing half would be saved back as gone. This lives
+        // here rather than in the loader because `wk add`/`wk remove` (and
+        // `wk pull`, which falls back to an empty document on any load error)
+        // must keep working on a file whose instancing is broken.
+        crate::instancing::expand(doc)?;
         let host = PluginHost::new().map_err(|e| format!("{e:#}"))?;
         let mut server = Server {
             host,
@@ -3564,6 +3572,12 @@ impl Server {
                     },
                 );
             }
+            // A `group` is an *instance* of another workspace, not a node.
+            // Nothing expands one into live nodes yet, so there is nothing to
+            // place — which leaves it in `unplaced`, exactly where an authored
+            // thing the runtime cannot model belongs: `save` re-emits it
+            // verbatim instead of deleting the user's instance on exit.
+            SnapKind::Group { .. } => return,
         }
         if let Some(p3) = s.pos3d {
             self.graph.pos3d.insert(s.id, p3);
@@ -4257,6 +4271,68 @@ mod model_tests {
         s.apply(Command::Delete(ResourceRef::Node(samples)));
         assert!(s.graph.connections.is_empty());
         assert!(!s.graph.boundary_ports.contains_key(&samples));
+    }
+
+    /// A `group` is authored content the runtime does not model yet: nothing
+    /// expands it, so it must survive load → run → save untouched (the
+    /// `unplaced` path), and a document whose instancing can't resolve must
+    /// refuse to start rather than run the half of it that does.
+    #[test]
+    fn a_group_survives_a_save_and_a_broken_one_refuses_to_start() {
+        use crate::workspace::{NodeSnap, SnapKind};
+        let ws = NodeId::new();
+        let inst = NodeId::new();
+        let src = NodeId::new();
+        let group = |definition: &str| NodeSnap {
+            id: inst,
+            pos: [10.0, 20.0],
+            size: [200.0, 120.0],
+            pos3d: None,
+            panel3d: true,
+            kind: SnapKind::Group {
+                definition: definition.to_string(),
+                in_wires: vec![("notes".to_string(), src)],
+                out_wires: Vec::new(),
+            },
+        };
+        let doc = |definition: &str| Document {
+            workspaces: vec![
+                Workspace {
+                    id: NodeId::new(),
+                    name: Some("voice".into()),
+                    tab: false,
+                    ..Workspace::new()
+                },
+                Workspace {
+                    id: ws,
+                    nodes: vec![group(definition)],
+                    ..Workspace::new()
+                },
+            ],
+            ..Document::empty()
+        };
+        let path = std::env::temp_dir().join("wk-group-save-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let s = Server::new(&doc("voice"), path.clone()).expect("server constructs");
+        // Nothing was placed for it — a group is an instance, not a node, and
+        // no expansion runs yet.
+        assert!(!s.node_exists(inst));
+        s.save();
+        let back = Document::load(&path).expect("reloads");
+        let tab = back
+            .workspaces
+            .iter()
+            .find(|w| w.id == ws)
+            .expect("the tab is still there");
+        assert_eq!(tab.nodes, vec![group("voice")], "the group came back whole");
+
+        // A group naming no definition is refused at startup, naming itself.
+        let err = match Server::new(&doc("vioce"), path.clone()) {
+            Err(e) => e,
+            Ok(_) => panic!("a group naming no definition must refuse to start"),
+        };
+        assert!(err.contains("\"vioce\""), "{err}");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Undoing a *moved* one-per-source wire restores the displaced link, not

@@ -73,16 +73,15 @@ const MODELINE: &str = "// vim: set filetype=kdl :";
 
 /// Which argument of a placed-node line carries the node id. Most kinds lead
 /// with it (`network "<id>"`); the named kinds put their own name or path first
-/// (`node "synth" "<id>"`); a boundary port declares a name *and* a connection
-/// kind before it (`inport "notes" "midi" "<id>"`). Both [`parse_snap`] and
-/// [`node_ident`] ask this one function — they used to keep separate lists,
-/// which drifted apart and silently cost a `hostservice` line its comments on
-/// every save.
+/// (`node "synth" "<id>"`, `group "voice" "<id>"`); a boundary port declares a
+/// name *and* a connection kind before it (`inport "notes" "midi" "<id>"`).
+/// Both [`parse_snap`] and [`node_ident`] ask this one function — they used to
+/// keep separate lists, which drifted apart and silently cost a `hostservice`
+/// line its comments on every save.
 fn id_arg_index(keyword: &str) -> usize {
     match keyword {
-        "node" | "volume" | "virtualfile" | "bindmount" | "hostfile" | "midiin" | "hostservice" => {
-            1
-        }
+        "node" | "volume" | "virtualfile" | "bindmount" | "hostfile" | "midiin" | "hostservice"
+        | "group" => 1,
         "inport" | "outport" => 2,
         _ => 0,
     }
@@ -105,6 +104,10 @@ enum NodeIdent {
     WorkspaceTab,
     Placed(NodeId),
     Wire(String, NodeId, NodeId),
+    /// A boundary wire inside a `group` block (`in "notes" "<node id>"`). Its
+    /// port name and the node it joins identify it within the block, so a
+    /// comment written above one survives a save like any other line's.
+    GroupWire(String, String, NodeId),
 }
 
 /// The identity of a top-level or in-workspace KDL node, if it has one.
@@ -124,6 +127,17 @@ fn node_ident(n: &KdlNode) -> Option<NodeIdent> {
             let a = n.get(0).and_then(node_id)?;
             let b = n.get(1).and_then(node_id)?;
             Some(NodeIdent::Wire(name.to_string(), a, b))
+        }
+        // Only ever seen inside a `group` block; at workspace level neither
+        // word names a node, so nothing else can collide with it.
+        "in" | "out" => {
+            let port = n.get(0).and_then(|v| v.as_string())?;
+            let node = n.get(1).and_then(node_id)?;
+            Some(NodeIdent::GroupWire(
+                name.to_string(),
+                port.to_string(),
+                node,
+            ))
         }
         // A placed node, boundary ports included: its id is its identity,
         // wherever on the line it sits.
@@ -411,6 +425,28 @@ pub enum SnapKind {
     /// standing in for the *consumer* on the far side — what an inner node's
     /// connection reaches once this workspace is used from elsewhere.
     OutPort { name: String, kind: PortKind },
+    /// An **instance** of another workspace: everything the definition named by
+    /// `definition` (a workspace's `name`, with `tab #false`) contains, stamped
+    /// into this canvas with ids derived from this node's own id. Written
+    /// `group "voice" "<instance id>"`.
+    ///
+    /// The instance id is what makes two copies of one definition distinct, so
+    /// it is what the id derivation keys on — see [`crate::instancing`], which
+    /// resolves the name and computes the ids.
+    Group {
+        definition: String,
+        /// `in "<port name>" "<node id>"`: a node on *this* canvas feeding one
+        /// of the definition's in-ports.
+        ///
+        /// Carried, not yet interpreted. Nothing expands a group into live
+        /// nodes yet, and typechecking a boundary wire against the port it
+        /// names belongs with the code that does — but dropping the lines in
+        /// the meantime would quietly lose the wiring the author wrote.
+        in_wires: Vec<(String, NodeId)>,
+        /// `out "<port name>" "<node id>"`: what one of the definition's
+        /// out-ports reaches on this canvas. See `in_wires`.
+        out_wires: Vec<(String, NodeId)>,
+    },
 }
 
 impl SnapKind {
@@ -647,7 +683,7 @@ impl Document {
 
     fn from_kdl(text: &str) -> Result<Self, String> {
         let doc: KdlDocument = text.parse().map_err(|e| format!("parse error: {e}"))?;
-        validate_ports(&doc)?;
+        validate_boundaries(&doc)?;
 
         // `import "other.wk"` lines (a path per node, resolved by load_resolved).
         let imports = doc
@@ -855,14 +891,15 @@ fn node_id(v: &KdlValue) -> Option<NodeId> {
     v.as_string()?.parse().ok()
 }
 
-/// Check every `inport`/`outport` line before the document becomes a model.
+/// Check every `inport`/`outport`/`group` line before the document becomes a
+/// model.
 ///
-/// Boundary ports are read from the raw KDL, not from the parsed workspaces,
-/// because a port the parser can't read is a port the parser *drops* — and a
-/// silently missing boundary is the one mistake in a definition that no later
-/// error can explain. A declaration is worth a load error; the rest of the
-/// format's tolerance is left alone.
-fn validate_ports(doc: &KdlDocument) -> Result<(), String> {
+/// These are read from the raw KDL, not from the parsed workspaces, because one
+/// the parser can't read is one the parser *drops* — and a silently missing
+/// boundary (or a silently missing instance) is the one mistake in a definition
+/// that no later error can explain. A declaration is worth a load error; the
+/// rest of the format's tolerance is left alone.
+fn validate_boundaries(doc: &KdlDocument) -> Result<(), String> {
     for ws in doc
         .nodes()
         .iter()
@@ -873,6 +910,10 @@ fn validate_ports(doc: &KdlDocument) -> Result<(), String> {
         // it means by writing `in` or `out`.
         let mut seen: std::collections::HashSet<(&str, String)> = std::collections::HashSet::new();
         for n in ws.children().map(|ch| ch.nodes()).unwrap_or(&[]) {
+            if n.name().value() == "group" {
+                validate_group(n)?;
+                continue;
+            }
             let dir = match n.name().value() {
                 d @ ("inport" | "outport") => d,
                 _ => continue,
@@ -919,6 +960,38 @@ fn validate_ports(doc: &KdlDocument) -> Result<(), String> {
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+/// Check one `group "<definition>" "<instance id>" { in/out … }` line.
+///
+/// Only its *shape*: whether the name resolves to a definition at all needs the
+/// whole document with its imports merged, and belongs to [`crate::instancing`]
+/// — which runs when a server starts, not when a file loads, so `wk add` and
+/// `wk remove` keep working on a file whose instancing is broken.
+fn validate_group(n: &KdlNode) -> Result<(), String> {
+    let name = n
+        .get(0)
+        .and_then(|v| v.as_string())
+        .ok_or(r#"group needs a definition name: group "voice" "<instance id>""#)?;
+    n.get(1).and_then(node_id).ok_or_else(|| {
+        format!(r#"group {name:?} needs an instance id: group {name:?} "<instance id>""#)
+    })?;
+    for c in n.children().map(|ch| ch.nodes()).unwrap_or(&[]) {
+        let dir = match c.name().value() {
+            d @ ("in" | "out") => d,
+            _ => continue,
+        };
+        let port = c.get(0).and_then(|v| v.as_string()).ok_or_else(|| {
+            format!(r#"group {name:?}: {dir} needs a port name: {dir} "notes" "<node id>""#)
+        })?;
+        c.get(1).and_then(node_id).ok_or_else(|| {
+            format!(
+                "group {name:?}: {dir} {port:?} needs the id of the node on this canvas to \
+                 join the port to"
+            )
+        })?;
     }
     Ok(())
 }
@@ -1038,13 +1111,14 @@ fn workspace_kdl(ws: &Workspace) -> KdlNode {
 /// Unknown names yield `None` (tolerated, like any unknown entry).
 fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
     let id = node_id(n.get(id_arg_index(n.name().value()))?)?;
-    // A boundary port is a *declaration* first and a placed node second, so it
-    // may leave the geometry block out entirely; every other kind is a canvas
-    // node that has always written one.
+    // A boundary port and a group instance are *declarations* first and placed
+    // nodes second, so either may leave the geometry block out entirely; every
+    // other kind is a canvas node that has always written one.
+    let declaration = matches!(n.name().value(), "inport" | "outport" | "group");
     let empty = KdlDocument::new();
     let ch = match n.children() {
         Some(ch) => ch,
-        None if matches!(n.name().value(), "inport" | "outport") => &empty,
+        None if declaration => &empty,
         None => return None,
     };
     let text = |name: &str| {
@@ -1127,6 +1201,27 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
                 SnapKind::OutPort { name, kind }
             }
         }
+        // `group "<definition name>" "<instance id>"`, with a boundary wire per
+        // `in`/`out` child. Like a port, a malformed one never reaches here:
+        // `validate_group` rejects the document first.
+        "group" => {
+            let mut in_wires = Vec::new();
+            let mut out_wires = Vec::new();
+            for c in ch.nodes() {
+                let wires = match c.name().value() {
+                    "in" => &mut in_wires,
+                    "out" => &mut out_wires,
+                    _ => continue,
+                };
+                let port = c.get(0)?.as_string()?.to_string();
+                wires.push((port, c.get(1).and_then(node_id)?));
+            }
+            SnapKind::Group {
+                definition: n.get(0)?.as_string()?.to_string(),
+                in_wires,
+                out_wires,
+            }
+        }
         "network" => SnapKind::Net { gateway: false },
         "gateway" => SnapKind::Net { gateway: true },
         "iroh" => SnapKind::Iroh {
@@ -1143,12 +1238,12 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
         let n = ch.get(key)?;
         Some([n.get(0).and_then(num)?, n.get(1).and_then(num)?])
     };
-    // A boundary port with no geometry takes the small-widget default. Nothing
+    // A declaration with no geometry takes the small-widget default. Nothing
     // else is that forgiving: a `note` without a `pos` is malformed, not a
     // note at the origin.
     let (pos, size) = match (xy("pos"), xy("size")) {
         (Some(pos), Some(size)) => (pos, size),
-        _ if kind.boundary().is_some() => (
+        _ if declaration => (
             xy("pos").unwrap_or([0.0, 0.0]),
             xy("size").unwrap_or([FILE_W, FILE_H]),
         ),
@@ -1197,6 +1292,7 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         SnapKind::HostService { .. } => "hostservice",
         SnapKind::InPort { .. } => "inport",
         SnapKind::OutPort { .. } => "outport",
+        SnapKind::Group { .. } => "group",
     };
     let mut node = KdlNode::new(name);
     // Named kinds lead with the name (or note text), then the id.
@@ -1217,6 +1313,10 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         SnapKind::InPort { name, kind } | SnapKind::OutPort { name, kind } => {
             node.push(str_entry(name));
             node.push(str_entry(kind.as_str()));
+        }
+        // An instance names the definition it stamps out, then its own id.
+        SnapKind::Group { definition, .. } => {
+            node.push(str_entry(definition));
         }
         _ => {}
     }
@@ -1244,6 +1344,22 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         }
         SnapKind::Note { text } => child_str("text", text),
         SnapKind::HostService { target, .. } => child_str("target", target),
+        // The boundary wires lead the block, like every other kind's own
+        // content, with the geometry after them.
+        SnapKind::Group {
+            in_wires,
+            out_wires,
+            ..
+        } => {
+            for (keyword, wires) in [("in", in_wires), ("out", out_wires)] {
+                for (port, node) in wires {
+                    let mut w = KdlNode::new(keyword);
+                    w.push(str_entry(port));
+                    w.push(KdlEntry::new(node.to_string()));
+                    ch.nodes_mut().push(w);
+                }
+            }
+        }
         // Only a persisted volume writes the flag; the default is ephemeral.
         SnapKind::Volume { persist: true, .. } => {
             let mut p = KdlNode::new("persist");
@@ -1764,6 +1880,105 @@ mod tests {
             port("outport", "notes", "midi", q)
         );
         assert!(load(through).is_ok());
+    }
+
+    #[test]
+    fn a_group_round_trips_with_its_boundary_wires() {
+        let ws = NodeId::from_u128(91);
+        let inst = NodeId::from_u128(92);
+        let src = NodeId::from_u128(93);
+        let dst = NodeId::from_u128(94);
+        let doc = Document::from_kdl(&format!(
+            "workspace \"{ws}\" {{\n  \
+             group \"voice\" \"{inst}\" {{ pos 10 20; size 200 120; \
+             in \"notes\" \"{src}\"; out \"audio\" \"{dst}\" }}\n}}"
+        ))
+        .expect("parses");
+        let node = &doc.workspaces[0].nodes[0];
+        assert_eq!(node.id, inst, "the instance id is the second argument");
+        assert_eq!(
+            node.kind,
+            SnapKind::Group {
+                definition: "voice".into(),
+                in_wires: vec![("notes".into(), src)],
+                out_wires: vec![("audio".into(), dst)],
+            }
+        );
+        assert_eq!(node.pos, [10.0, 20.0]);
+
+        // The written form names the definition before the instance id, and
+        // the boundary wires survive — they are the whole point of the block.
+        let text = doc.to_kdl();
+        assert!(
+            text.contains(&format!("group \"voice\" \"{inst}\"")),
+            "{text}"
+        );
+        assert!(text.contains(&format!("in \"notes\" \"{src}\"")), "{text}");
+        let back = Document::from_kdl(&text).expect("round-trips");
+        assert_eq!(back.workspaces[0].nodes, doc.workspaces[0].nodes);
+
+        // Like a boundary port, a group is a declaration first: written with
+        // no block at all it still places, at the default geometry.
+        let bare = Document::from_kdl(&format!(
+            "workspace \"{ws}\" {{\n  group \"voice\" \"{inst}\"\n}}"
+        ))
+        .expect("parses");
+        assert_eq!(bare.workspaces[0].nodes[0].size, [FILE_W, FILE_H]);
+    }
+
+    #[test]
+    fn a_malformed_group_is_a_load_error_not_a_dropped_instance() {
+        // A group the parser can't read is an instance that silently isn't
+        // there — the same failure a boundary port's validation exists to
+        // prevent, one level up.
+        let ws = NodeId::from_u128(95);
+        let inst = NodeId::from_u128(96);
+        let load = |body: String| {
+            Document::from_kdl(&format!("workspace \"{ws}\" {{\n{body}\n}}")).map(|_| ())
+        };
+        let err = load("  group \"voice\" { pos 0 0; size 10 10 }".to_string()).unwrap_err();
+        assert!(err.contains("instance id"), "{err}");
+        // A boundary wire needs both a port name and the node it joins.
+        let err = load(format!("  group \"voice\" \"{inst}\" {{ in \"notes\" }}")).unwrap_err();
+        assert!(err.contains("notes"), "{err}");
+        // The whole, well-formed thing loads.
+        assert!(load(format!(
+            "  group \"voice\" \"{inst}\" {{ in \"notes\" \"{ws}\" }}"
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn a_groups_comments_survive_a_save() {
+        // `Document::save` grafts comments on by node identity: a group's id is
+        // its *second* argument, and a boundary wire inside the block has no
+        // id at all — both need an identity of their own or the notes above
+        // them are gone on the first save.
+        let path = std::env::temp_dir().join("wk-group-comment-test.wk");
+        let ws = NodeId::from_u128(97);
+        let inst = NodeId::from_u128(98);
+        let src = NodeId::from_u128(99);
+        let original = format!(
+            "{MODELINE}\n\
+             workspace \"{ws}\" {{\n    \
+             // one of the eight voices\n    \
+             group \"voice\" \"{inst}\" {{\n        \
+             // the keyboard feeds this one\n        \
+             in \"notes\" \"{src}\"\n        \
+             pos 0 0\n        size 200 120\n    \
+             }}\n\
+             }}\n"
+        );
+        std::fs::write(&path, &original).unwrap();
+        let doc = Document::from_kdl(&original).expect("parses");
+        doc.save(&path).expect("saves");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("// one of the eight voices"), "{text}");
+        assert!(text.contains("// the keyboard feeds this one"), "{text}");
+        // And a second save is byte-identical (no churn from the new syntax).
+        Document::from_kdl(&text).unwrap().save(&path).unwrap();
+        assert_eq!(text, std::fs::read_to_string(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -2493,7 +2708,23 @@ mod tests {
                 .prop_map(|(name, target)| SnapKind::HostService { name, target }),
             (value_str(), port_kind()).prop_map(|(name, kind)| SnapKind::InPort { name, kind }),
             (value_str(), port_kind()).prop_map(|(name, kind)| SnapKind::OutPort { name, kind }),
+            (
+                value_str(),
+                prop::collection::vec(boundary_wire(), 0..3),
+                prop::collection::vec(boundary_wire(), 0..3),
+            )
+                .prop_map(|(definition, in_wires, out_wires)| SnapKind::Group {
+                    definition,
+                    in_wires,
+                    out_wires,
+                }),
         ]
+    }
+
+    /// One `in`/`out` line of a `group` block: a port name and the node on the
+    /// parent canvas it joins.
+    fn boundary_wire() -> impl Strategy<Value = (String, NodeId)> {
+        (value_str(), any_node_id())
     }
 
     /// A connection kind a boundary port may declare. `net` and `serve` are
