@@ -146,6 +146,10 @@ const MIDI_BORDER: [f32; 4] = [0.35, 0.75, 0.45, 1.0];
 /// the reverse of a HostPort).
 const HOSTSVC_BG: [f32; 4] = [0.07, 0.19, 0.18, 1.0];
 const HOSTSVC_BORDER: [f32; 4] = [0.25, 0.80, 0.70, 1.0];
+/// `group` nodes: violet chrome. An instance is a whole workspace standing in
+/// one node, so it gets a colour no single capability owns.
+const GROUP_BG: [f32; 4] = [0.14, 0.10, 0.22, 1.0];
+const GROUP_BORDER: [f32; 4] = [0.62, 0.48, 0.92, 1.0];
 
 /// Note nodes: a warm yellow sticky, dark text, for annotations.
 const NOTE_BG: [f32; 4] = [0.93, 0.86, 0.42, 1.0];
@@ -563,6 +567,16 @@ impl App {
             // dot faces inward: an *in*-port feeds this workspace's nodes (Out),
             // an *out*-port is fed by them (In).
             one(p.kind, if p.dir == PortDir::In { Out } else { In })
+        } else if let Some(g) = v.groups.get(&id) {
+            // An instance wears the definition's own boundary ports, facing
+            // outward: what the definition calls an in-port is an input here.
+            g.ports
+                .iter()
+                .map(|p| Port {
+                    kind: p.kind,
+                    dir: p.dir,
+                })
+                .collect()
         } else if v.midi_ins.contains_key(&id) {
             one(Midi, Out) // a hardware MIDI input drives apps
         } else {
@@ -1402,6 +1416,8 @@ impl App {
             svc.name.clone()
         } else if let Some(p) = self.view.boundary_ports.get(&id) {
             format!("{} {}", port_label(p.dir), p.name)
+        } else if let Some(g) = self.view.groups.get(&id) {
+            g.definition.clone()
         } else {
             "node".into()
         }
@@ -2717,6 +2733,15 @@ impl App {
                     TEXT,
                     format!("{} {}", port_label(p.dir), p.kind.as_str()),
                     col,
+                ))
+            } else if let Some(g) = self.view.groups.get(&id) {
+                Some(Chrome(
+                    GROUP_BORDER,
+                    GROUP_BG,
+                    g.definition.clone(),
+                    TEXT,
+                    group_status(g),
+                    GROUP_BORDER,
                 ))
             } else if let Some(device) = self.view.midi_ins.get(&id) {
                 let (status, status_col) = if device.is_empty() {
@@ -4111,6 +4136,7 @@ impl App {
                     let is_api = self.view.api_nodes.contains(&id);
                     let is_clipboard = self.view.clipboard_boards.contains_key(&id);
                     let is_boundary = self.view.boundary_ports.contains_key(&id);
+                    let is_group = self.view.groups.contains_key(&id);
                     if is_note {
                         // Note: close (top-right), drag from the top strip, or
                         // click the body to edit the text.
@@ -4138,6 +4164,7 @@ impl App {
                         || is_api
                         || is_clipboard
                         || is_boundary
+                        || is_group
                     {
                         // Canvas widget nodes (file / HostPort / Network / Iroh):
                         // close, adjust port (HostPort −/+ buttons), edit the
@@ -4822,6 +4849,35 @@ impl App {
                         title_col: TEXT,
                         status: &status,
                         status_col: col,
+                        status_scale: 0.7,
+                        copy_ticket: false,
+                    },
+                );
+                continue;
+            }
+
+            // A `group`: one instance of another workspace. It runs nothing
+            // itself, so the widget is the definition's name and the size of
+            // what it stands for; its edges are the definition's own ports.
+            if let Some(g) = self.view.groups.get(&id).cloned() {
+                let status = group_status(&g);
+                self.draw_widget(
+                    &mut quads,
+                    &mut gfx,
+                    white,
+                    zf,
+                    mp,
+                    clip,
+                    full,
+                    WidgetChrome {
+                        id,
+                        r,
+                        border: GROUP_BORDER,
+                        bg: GROUP_BG,
+                        title: &g.definition,
+                        title_col: TEXT,
+                        status: &status,
+                        status_col: GROUP_BORDER,
                         status_scale: 0.7,
                         copy_ticket: false,
                     },

@@ -36,6 +36,18 @@ pub(super) fn port_label(dir: PortDir) -> &'static str {
     }
 }
 
+/// What an instance's widget says under its name: how much of a workspace it
+/// is standing in for, and how it can be reached. A group's own ports are the
+/// definition's, so the count of them is the honest measure of its edge.
+pub(super) fn group_status(g: &wk_server::server::GroupInfo) -> String {
+    let node = |n: usize| if n == 1 { "node" } else { "nodes" };
+    match (g.nodes, g.ports.len()) {
+        (0, _) => "empty definition".to_string(),
+        (n, 0) => format!("{n} {}", node(n)),
+        (n, p) => format!("{n} {} · {p} ports", node(n)),
+    }
+}
+
 /// One typed connection point on a node.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct Port {

@@ -8,7 +8,7 @@
 //! and sizes are the server's because they're shared across clients and saved to
 //! the workspace file.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -198,6 +198,9 @@ pub struct View {
     /// Boundary-port nodes (canvas id -> its declaration), for the UI to draw
     /// and to give the right typed dot.
     pub boundary_ports: HashMap<NodeId, BoundaryPort>,
+    /// `group` nodes (canvas id -> what the instance is), for the UI to draw an
+    /// instance with the definition's own edges on it.
+    pub groups: HashMap<NodeId, GroupInfo>,
     pub net_nodes: HashSet<NodeId>,
     pub gateways: HashSet<NodeId>,
     pub uplinks: HashMap<NodeId, UplinkMeta>,
@@ -360,6 +363,7 @@ impl View {
             midi_ins: keep_map(&self.midi_ins, mine),
             host_services: keep_map(&self.host_services, mine),
             boundary_ports: keep_map(&self.boundary_ports, mine),
+            groups: keep_map(&self.groups, mine),
             net_nodes: keep_set(&self.net_nodes, mine),
             gateways: keep_set(&self.gateways, mine),
             uplinks: keep_map(&self.uplinks, mine),
@@ -469,8 +473,12 @@ enum Undo {
     },
     /// Restore a node's previous capability token (`None` = the default).
     Token(NodeId, Option<Vec<u8>>),
-    /// Remove a node that a create added.
-    Uncreate(NodeId),
+    /// Remove the nodes a create added. A list rather than one id because a
+    /// create can produce a whole tree — a `group` node plus every node its
+    /// instance expanded to — and [`Command::Undo`] pops exactly one entry, so
+    /// an entry per node would take ten presses of Ctrl-Z to undo one create,
+    /// leaving a half-dismantled live instance at each step.
+    Uncreate(Vec<NodeId>),
     /// Recreate a node that was removed, with its wiring.
     Recreate(Box<Snapshot>),
     /// Remove a workspace tab that an add created.
@@ -538,6 +546,14 @@ pub enum Kind {
     /// kind and name live in `Graph::boundary_ports`. In a plain tab it runs
     /// nothing and grants nothing — there is no other side yet.
     Boundary,
+    /// A `group` node: one **instance** of another workspace. The node itself
+    /// runs nothing — it is the handle for the nodes the expansion placed under
+    /// derived ids (see [`crate::instancing`] and `Server::instances`).
+    ///
+    /// New variants go at the END of this enum: [`Server::save`] orders a
+    /// workspace's nodes by `kind as u8`, so inserting one anywhere else would
+    /// rewrite the node order of every existing `.wk` file on its next save.
+    Group,
 }
 
 impl Kind {
@@ -597,6 +613,11 @@ pub struct Graph {
     /// and what kind of connection may cross it. Side table keyed by node id,
     /// like every other kind's payload.
     pub boundary_ports: HashMap<NodeId, BoundaryPort>,
+    /// `group` nodes: which definition each instantiates, and how this canvas
+    /// wires that definition's boundary ports. This is the *authored* fact —
+    /// what [`Server::save`] writes back. What it expands to is runtime state
+    /// (`Server::instances`), rebuilt from this on every load.
+    pub groups: HashMap<NodeId, GroupNode>,
 
     /// Volume binds as (volume id, app node id).
     pub connections: Vec<(NodeId, NodeId)>,
@@ -664,6 +685,52 @@ pub struct BoundaryPort {
     pub name: String,
     pub dir: PortDir,
     pub kind: PortKind,
+}
+
+/// What a client needs to draw a `group` node: which definition it is an
+/// instance of, the boundary ports that definition declares (the instance's own
+/// edges, in file order), and how many nodes it is currently running.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupInfo {
+    pub definition: String,
+    pub ports: Vec<BoundaryPort>,
+    /// Live nodes in this instance and everything nested inside it. Zero means
+    /// the definition is empty — or that the expansion could not resolve.
+    pub nodes: usize,
+}
+
+/// A `group` node's declaration: the definition it instantiates and the wires
+/// crossing that definition's boundary, by port name. The endpoints are nodes
+/// on *this* canvas; what they end up joined to is decided by the expansion,
+/// which collapses each port away (see [`crate::instancing`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupNode {
+    pub definition: String,
+    /// `in "<port>" "<node>"`: this canvas feeding one of the definition's
+    /// in-ports.
+    pub in_wires: Vec<(String, NodeId)>,
+    /// `out "<port>" "<node>"`: one of the definition's out-ports reaching a
+    /// node on this canvas.
+    pub out_wires: Vec<(String, NodeId)>,
+}
+
+/// One live instance: what a `group` node expanded to. Pure runtime state,
+/// rebuilt from the group node on every load — an instance is deliberately not
+/// a workspace, so none of it is ever written back to the `.wk` file.
+struct InstanceRec {
+    /// The tab the whole tree is shown in. Instance ids stay out of
+    /// `Graph::workspaces` (they are not tabs), so this is what a workspace
+    /// teardown and `wk ps` go by.
+    tab: NodeId,
+    /// The instance this one sits inside, or `None` for a `group` written
+    /// directly in a tab. Deleting an instance takes its descendants with it,
+    /// and an instance's `wk ps` label is built from its parent's.
+    parent: Option<NodeId>,
+    /// The definition's name — the label an instance is known by.
+    definition: String,
+    /// Every node this instance placed, so a teardown can find them all even
+    /// after their wiring is gone.
+    nodes: Vec<NodeId>,
 }
 
 impl HostService {
@@ -776,6 +843,11 @@ pub struct Server {
     /// level up: there a node the runtime can't model, here a whole workspace
     /// it won't.
     authored: Vec<(usize, Workspace)>,
+    /// Live instances, keyed by instance id — a `group` node's own id at the
+    /// top level, a derived id when the group is written inside a definition.
+    /// A `BTreeMap` because the order decides an instance's label when a tab
+    /// holds two of the same definition, and that must not wander between runs.
+    instances: BTreeMap<NodeId, InstanceRec>,
     /// App↔app wires whose kind (MIDI vs provider mount) can't be decided
     /// yet: `serves_fs()` is unknowable while an endpoint's component is
     /// still compiling. Re-tried each tick; applied through the normal
@@ -872,6 +944,7 @@ impl Server {
                 .filter(|(_, w)| !w.tab)
                 .map(|(i, w)| (i, w.clone()))
                 .collect(),
+            instances: BTreeMap::new(),
             pending_app_wires: Vec::new(),
             node_auth: None,
             auth_cache: HashMap::new(),
@@ -888,6 +961,17 @@ impl Server {
             server.instantiate(ws);
         }
         Ok(server)
+    }
+
+    /// Whether this node was placed by an expansion rather than written in the
+    /// file. Derived nodes live in an *instance*, never in a tab, so the check
+    /// is simply "is its workspace an instance" — which is also why nothing
+    /// that iterates `graph.workspaces` can reach one by accident.
+    fn is_derived(&self, id: NodeId) -> bool {
+        self.graph
+            .nodes
+            .get(&id)
+            .is_some_and(|rec| self.instances.contains_key(&rec.ws))
     }
 
     /// Spawn one workspace's nodes and re-apply its wiring (used at load).
@@ -927,6 +1011,33 @@ impl Server {
                 }
             }
         }
+        self.apply_wires(saved);
+        // Finally the instances. A `group`'s boundary wires reach nodes on
+        // this canvas, so every one of them has to exist before the expansion
+        // lands — which is why this is a pass of its own rather than part of
+        // materializing the group node.
+        for snap in &saved.nodes {
+            if matches!(snap.kind, SnapKind::Group { .. }) {
+                self.expand_group(saved.id, snap.id);
+            }
+        }
+    }
+
+    /// Materialize one instance's expanded content: its nodes (under derived
+    /// ids, in the instance's own "workspace") and its wiring. Unlike a tab, a
+    /// node that fails to materialize is *not* remembered — it is derived, so
+    /// the file already holds everything needed to try again next run, and
+    /// recording it would leave a wire pointing into a workspace that is not a
+    /// tab. Its wires are simply never applied.
+    fn instantiate_content(&mut self, content: &Workspace) {
+        for snap in &content.nodes {
+            self.materialize(content.id, snap, &[]);
+        }
+        self.apply_wires(content);
+    }
+
+    /// Re-establish one saved workspace's wiring, each relation as its own kind.
+    fn apply_wires(&mut self, saved: &Workspace) {
         // Re-apply each saved relation AS ITS OWN KIND — the file already
         // distinguishes them. Flattening everything through `rewire` (which
         // re-classifies by node kind) mistyped provider mounts: an app→app
@@ -980,6 +1091,115 @@ impl Server {
             self.graph.serve_ports.insert(pair, port);
         }
         self.sync_serves();
+    }
+
+    /// Bring one `group` node's instance to life: the definition's nodes under
+    /// derived ids, in the instance's own workspace, plus the wiring — the
+    /// definition's own, and the boundary wires already collapsed onto this
+    /// canvas's nodes. Nested groups come with it, each its own instance.
+    ///
+    /// The expansion is re-resolved from the definitions the file carries
+    /// rather than from a list computed at startup, so the one path serves
+    /// load, undo and reopening a closed tab alike.
+    fn expand_group(&mut self, ws: NodeId, id: NodeId) {
+        if self.instances.contains_key(&id) {
+            return; // already live
+        }
+        let Some(snap) = self.node_snap(id) else {
+            return;
+        };
+        // The definitions live in `authored` (the runtime models nothing else
+        // about them); the group goes into a workspace of its own so `expand`
+        // sees exactly this one instance tree.
+        let mut workspaces: Vec<Workspace> = self.authored.iter().map(|(_, w)| w.clone()).collect();
+        workspaces.push(Workspace {
+            id: ws,
+            nodes: vec![snap],
+            ..Workspace::new()
+        });
+        let doc = Document {
+            workspaces,
+            ..Document::empty()
+        };
+        // `Server::new` already refused a document whose instancing does not
+        // resolve, so this only fires for a group built at runtime.
+        let instances = match crate::instancing::expand(&doc) {
+            Ok(instances) => instances,
+            Err(e) => {
+                eprintln!("wk: cannot expand group: {e}");
+                return;
+            }
+        };
+        // Parents come first, so a nested instance's boundary endpoints are
+        // already placed by the time it is instantiated.
+        for inst in instances {
+            self.instances.insert(
+                inst.id,
+                InstanceRec {
+                    tab: inst.tab,
+                    parent: inst.parent,
+                    definition: inst.definition.clone(),
+                    nodes: inst.content.nodes.iter().map(|n| n.id).collect(),
+                },
+            );
+            self.instantiate_content(&inst.content);
+        }
+    }
+
+    /// Remove a `group` node: tear down the instance it stands for (and every
+    /// instance nested inside it) before forgetting the node itself. Anything
+    /// less would leave live guests running with no handle to reach them.
+    fn remove_group(&mut self, id: NodeId) {
+        self.tear_down_instance(id);
+        self.graph.groups.remove(&id);
+        self.forget(id);
+    }
+
+    /// Stop and forget one instance and everything nested inside it.
+    fn tear_down_instance(&mut self, id: NodeId) {
+        let nested: Vec<NodeId> = self
+            .instances
+            .iter()
+            .filter(|(_, rec)| rec.parent == Some(id))
+            .map(|(&i, _)| i)
+            .collect();
+        for child in nested {
+            self.tear_down_instance(child);
+        }
+        let Some(rec) = self.instances.remove(&id) else {
+            return;
+        };
+        for node in rec.nodes {
+            self.remove_any(node);
+        }
+    }
+
+    /// How `wk ps` names an instance: the definition's name, prefixed by the
+    /// instance it sits in, and numbered when a canvas holds more than one
+    /// instance of the same definition — otherwise two copies of `voice` would
+    /// print identically and neither could be told from the other.
+    fn instance_label(&self, id: NodeId) -> String {
+        let Some(rec) = self.instances.get(&id) else {
+            return String::new();
+        };
+        let siblings: Vec<NodeId> = self
+            .instances
+            .iter()
+            .filter(|(_, r)| {
+                r.parent == rec.parent && r.tab == rec.tab && r.definition == rec.definition
+            })
+            .map(|(&i, _)| i)
+            .collect();
+        let nth = siblings.iter().position(|&i| i == id).unwrap_or(0);
+        let own = if nth == 0 {
+            rec.definition.clone()
+        } else {
+            format!("{}{}", rec.definition, nth + 1)
+        };
+        match rec.parent {
+            Some(parent) => format!("{}/{own}", self.instance_label(parent)),
+            None => own,
+        }
     }
 
     /// Record a node's base fact: kind, workspace, and canvas geometry.
@@ -1333,6 +1553,17 @@ impl Server {
             // are per-endpoint, so there is nothing meaningful to copy.
             Some(Kind::Iroh) => self.add_iroh_node(off, ws),
             Some(Kind::Veilid) => self.add_veilid_node(off, ws),
+            // A second instance of the same definition, wired the same way. It
+            // takes a new id, so its nodes derive afresh and the two copies
+            // share nothing — which is the whole point of instancing.
+            Some(Kind::Group) => {
+                if let Some(g) = self.graph.groups.get(&id).cloned() {
+                    let new_id = self.alloc_id();
+                    self.place(new_id, Kind::Group, ws, off, size);
+                    self.graph.groups.insert(new_id, g);
+                    self.expand_group(ws, new_id);
+                }
+            }
             _ => {}
         }
     }
@@ -1358,6 +1589,7 @@ impl Server {
                 self.forget(id);
             }
             Some(Kind::Boundary) => self.remove_boundary_port(id),
+            Some(Kind::Group) => self.remove_group(id),
             None => {}
         }
     }
@@ -1505,6 +1737,11 @@ impl Server {
 
     /// Delete a workspace and every node in it. A no-op for the last workspace —
     /// a document always keeps at least one.
+    ///
+    /// `graph.workspaces` holds only tabs, so the "keep at least one" guard
+    /// counts tabs and an instance can never be closed as if it were one. The
+    /// nodes an instance placed are not in this tab (their workspace *is* the
+    /// instance) — they go with the `group` node that stands for them, which is.
     fn remove_workspace(&mut self, id: NodeId) {
         if self.graph.workspaces.len() <= 1 || !self.graph.workspaces.contains(&id) {
             return;
@@ -1685,6 +1922,7 @@ impl Server {
                 .boundary_ports
                 .get(&id)
                 .map_or(NodeClass::Other, |p| NodeClass::Boundary(p.dir, p.kind)),
+            Some(Kind::Group) => NodeClass::Instance,
             Some(Kind::App) | Some(Kind::Note) | None => NodeClass::Other,
         }
     }
@@ -2831,10 +3069,21 @@ impl Server {
                 // This workspace's wires of one relation: the ones whose source
                 // node lives here, plus any orphan wires (touching a node that
                 // never materialized) recorded against it — so both round-trip.
+                //
+                // A wire into an instance is skipped on both counts. Its far
+                // end is a derived node (`mine` is false for it, since an
+                // instance is not a tab), but the near end is a real node of
+                // this tab, so without the second test a collapsed boundary
+                // wire would be written into the file as if the author had
+                // drawn it — against an id that only exists while the server
+                // runs.
                 let ws_wires =
                     |links: &[(NodeId, NodeId)], rel: WireRel| -> Vec<(NodeId, NodeId)> {
-                        let mut v: Vec<(NodeId, NodeId)> =
-                            links.iter().filter(|(a, _)| mine(a)).copied().collect();
+                        let mut v: Vec<(NodeId, NodeId)> = links
+                            .iter()
+                            .filter(|(a, b)| mine(a) && !self.is_derived(*b))
+                            .copied()
+                            .collect();
                         v.extend(
                             self.unplaced_wires
                                 .iter()
@@ -2905,6 +3154,10 @@ impl Server {
     /// Apply a client [`Command`], recording an inverse for [`Command::Undo`]
     /// where the mutation is undoable. The single entry point for mutations.
     pub fn apply(&mut self, cmd: Command) {
+        if let Some(why) = self.refuse_structural_edit(&cmd) {
+            eprintln!("wk: {why}");
+            return;
+        }
         match &cmd {
             // Node creates: run, then record removal of whatever node appeared.
             Command::Create(Resource::Node { .. } | Resource::HostMount { .. })
@@ -2918,8 +3171,8 @@ impl Server {
                     .copied()
                     .filter(|id| !before.contains(id))
                     .collect();
-                for id in created {
-                    self.record(Undo::Uncreate(id));
+                if !created.is_empty() {
+                    self.record(Undo::Uncreate(created));
                 }
                 return;
             }
@@ -3022,6 +3275,44 @@ impl Server {
             | Command::Undo => {}
         }
         self.dispatch(cmd);
+    }
+
+    /// Why this command must be refused, if its target is inside an instance.
+    ///
+    /// An instance's nodes are *derived*: they exist because a definition says
+    /// so, and nothing about them can be written back to the `.wk` file. A
+    /// structural edit there would therefore be undone by the next restart —
+    /// silently, and after the user had already built on it. v1 answers "no"
+    /// out loud instead; editing the definition is what changes every instance
+    /// of it. Everything that is not structure (running a node, moving it,
+    /// changing its args) is left alone.
+    fn refuse_structural_edit(&self, cmd: &Command) -> Option<String> {
+        let inside = |id: NodeId| -> Option<String> {
+            self.is_derived(id).then(|| {
+                let label = self
+                    .graph
+                    .nodes
+                    .get(&id)
+                    .map(|rec| self.instance_label(rec.ws))
+                    .unwrap_or_default();
+                format!("{id} is inside instance {label:?}; edit the definition instead")
+            })
+        };
+        match cmd {
+            Command::Delete(ResourceRef::Node(id)) | Command::Duplicate(id) => inside(*id),
+            Command::Create(Resource::Wire { a, b }) => inside(*a).or_else(|| inside(*b)),
+            Command::Delete(ResourceRef::Wire(w)) => {
+                let (a, b) = wire_ends(*w);
+                inside(a).or_else(|| inside(b))
+            }
+            // A node added to an instance's canvas would vanish on restart for
+            // the same reason, and there is nowhere to write it down.
+            Command::Create(Resource::Node { ws, .. } | Resource::HostMount { ws, .. }) => self
+                .instances
+                .contains_key(ws)
+                .then(|| format!("{ws} is an instance; add the node to its definition instead")),
+            _ => None,
+        }
     }
 
     /// Perform a command's mutation (no undo recording).
@@ -3215,9 +3506,13 @@ impl Server {
                     self.write_token_file(id);
                 }
             }
-            Undo::Uncreate(id) => {
-                if self.node_exists(id) {
-                    self.remove_any(id);
+            Undo::Uncreate(ids) => {
+                // Guarded per id: removing a `group` already took its instance
+                // with it, so the derived nodes in the same entry are gone.
+                for id in ids {
+                    if self.node_exists(id) {
+                        self.remove_any(id);
+                    }
                 }
             }
             Undo::Recreate(s) => self.recreate(*s),
@@ -3299,6 +3594,14 @@ impl Server {
                         name: p.name.clone(),
                         kind: p.kind,
                     },
+                }
+            }
+            Kind::Group => {
+                let g = self.graph.groups.get(&id)?;
+                SnapKind::Group {
+                    definition: g.definition.clone(),
+                    in_wires: g.in_wires.clone(),
+                    out_wires: g.out_wires.clone(),
                 }
             }
         };
@@ -3384,9 +3687,14 @@ impl Server {
     }
 
     /// Bring a removed node back with the same id, then re-establish its wiring.
+    /// A `group` brings its whole instance back with it — the ids are derived
+    /// from the file, so what comes back is what was there.
     fn recreate(&mut self, s: Snapshot) {
         self.materialize(s.ws, &s.node, &s.file_data);
         self.rewire(&s.wires);
+        if matches!(s.node.kind, SnapKind::Group { .. }) {
+            self.expand_group(s.ws, s.node.id);
+        }
     }
 
     /// Materialize a node from its persisted shape into workspace `ws` — the
@@ -3572,12 +3880,25 @@ impl Server {
                     },
                 );
             }
-            // A `group` is an *instance* of another workspace, not a node.
-            // Nothing expands one into live nodes yet, so there is nothing to
-            // place — which leaves it in `unplaced`, exactly where an authored
-            // thing the runtime cannot model belongs: `save` re-emits it
-            // verbatim instead of deleting the user's instance on exit.
-            SnapKind::Group { .. } => return,
+            // A `group` places the instance's *handle* — the node the canvas
+            // draws and the file writes back. What it stands for is materialized
+            // by `expand_group`, once every node its boundary wires reach is on
+            // the canvas.
+            SnapKind::Group {
+                definition,
+                in_wires,
+                out_wires,
+            } => {
+                self.place(s.id, Kind::Group, ws, s.pos, s.size);
+                self.graph.groups.insert(
+                    s.id,
+                    GroupNode {
+                        definition: definition.clone(),
+                        in_wires: in_wires.clone(),
+                        out_wires: out_wires.clone(),
+                    },
+                );
+            }
         }
         if let Some(p3) = s.pos3d {
             self.graph.pos3d.insert(s.id, p3);
@@ -3628,6 +3949,10 @@ impl Server {
     }
 
     /// Bring a removed workspace back: its tab, all its nodes, then their wiring.
+    ///
+    /// Only a *tab* is ever recreated this way. A snapshot holds the nodes whose
+    /// `ws` is the tab, so an instance's derived nodes are not among them — the
+    /// `group` node is, and expanding it again is what brings them back.
     fn recreate_workspace(&mut self, s: WsSnapshot) {
         if !self.graph.workspaces.contains(&s.id) {
             let i = s.index.min(self.graph.workspaces.len());
@@ -3642,6 +3967,68 @@ impl Server {
         for node in &s.nodes {
             self.rewire(&node.wires);
         }
+        // Last, once every node a boundary wire could reach is back.
+        for node in &s.nodes {
+            if matches!(node.node.kind, SnapKind::Group { .. }) {
+                self.expand_group(node.ws, node.node.id);
+            }
+        }
+    }
+
+    /// Every `group` node as the client sees it. A group's edges are the
+    /// definition's boundary ports, which live in the authored workspace — the
+    /// live graph never holds them, since expansion collapses each one into the
+    /// wire that crosses it.
+    fn group_infos(&self) -> HashMap<NodeId, GroupInfo> {
+        self.graph
+            .groups
+            .iter()
+            .map(|(&id, g)| {
+                let ports = self
+                    .authored
+                    .iter()
+                    .find(|(_, w)| w.name.as_deref() == Some(&g.definition))
+                    .map(|(_, w)| {
+                        w.nodes
+                            .iter()
+                            .filter_map(|n| {
+                                let (dir, kind) = n.kind.boundary()?;
+                                let name = match &n.kind {
+                                    SnapKind::InPort { name, .. }
+                                    | SnapKind::OutPort { name, .. } => name.clone(),
+                                    _ => return None,
+                                };
+                                Some(BoundaryPort { name, dir, kind })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let nodes = self.instance_size(id);
+                (
+                    id,
+                    GroupInfo {
+                        definition: g.definition.clone(),
+                        ports,
+                        nodes,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// How many live nodes an instance holds, counting every instance nested
+    /// inside it — what an instance's widget reports as its size.
+    fn instance_size(&self, id: NodeId) -> usize {
+        let Some(rec) = self.instances.get(&id) else {
+            return 0;
+        };
+        rec.nodes.len()
+            + self
+                .instances
+                .iter()
+                .filter(|(_, r)| r.parent == Some(id))
+                .map(|(&child, _)| self.instance_size(child))
+                .sum::<usize>()
     }
 
     /// A read-only snapshot of everything a client needs to render this frame.
@@ -3754,6 +4141,7 @@ impl Server {
             midi_ins: self.graph.midi_ins.clone(),
             host_services: self.graph.host_services.clone(),
             boundary_ports: self.graph.boundary_ports.clone(),
+            groups: self.group_infos(),
             net_nodes,
             gateways,
             uplinks,
@@ -3839,7 +4227,19 @@ impl Server {
                     Some(PortDir::Out) => "outport",
                     _ => "inport",
                 },
+                Some(Kind::Group) => "group",
                 None => "unknown",
+            }
+        };
+        // Where a node sits, as the CLI should print it: an instance is not a
+        // tab, so a derived node reports the tab its instance is shown in and
+        // carries the instance in its *name* instead — which is also what makes
+        // two instances of one definition tellable apart.
+        let placement = |id: NodeId| -> (NodeId, String) {
+            let ws = v.node_ws.get(&id).copied().unwrap_or_default();
+            match self.instances.get(&ws) {
+                Some(rec) => (rec.tab, format!("{}/", self.instance_label(ws))),
+                None => (ws, String::new()),
             }
         };
         let nodes = v
@@ -3855,14 +4255,20 @@ impl Server {
                     // A boundary port's name is how a wire from outside picks
                     // it, so it is the one thing `wk ps` must show.
                     p.name.clone()
+                } else if v.groups.contains_key(&id) {
+                    // An instance is known by the definition it instantiates —
+                    // through the same label its own nodes are prefixed with,
+                    // so `voice2` and everything in `voice2/` read as one thing.
+                    self.instance_label(id)
                 } else {
                     String::new()
                 };
+                let (ws, scope) = placement(id);
                 NodeInfo {
                     id,
                     kind: kind_str(id).to_string(),
-                    name,
-                    ws: v.node_ws.get(&id).copied().unwrap_or_default(),
+                    name: format!("{scope}{name}"),
+                    ws,
                     pos: v.win_pos.get(&id).copied().unwrap_or([0.0, 0.0]),
                     size: v.win_size.get(&id).copied().unwrap_or([0.0, 0.0]),
                     args: v.node_args.get(&id).cloned().unwrap_or_default(),
@@ -4273,65 +4679,410 @@ mod model_tests {
         assert!(!s.graph.boundary_ports.contains_key(&samples));
     }
 
-    /// A `group` is authored content the runtime does not model yet: nothing
-    /// expands it, so it must survive load → run → save untouched (the
-    /// `unplaced` path), and a document whose instancing can't resolve must
-    /// refuse to start rather than run the half of it that does.
-    #[test]
-    fn a_group_survives_a_save_and_a_broken_one_refuses_to_start() {
+    /// A group node with the definition it names, as a whole document. The
+    /// definition is a named Volume behind an in-port — nothing that needs
+    /// wasm, so the whole instance materializes in a plain unit test.
+    fn instancing_doc(definition: &str, tab: NodeId, inst: NodeId) -> Document {
         use crate::workspace::{NodeSnap, SnapKind};
-        let ws = NodeId::new();
-        let inst = NodeId::new();
-        let src = NodeId::new();
-        let group = |definition: &str| NodeSnap {
-            id: inst,
+        let snap = |id: NodeId, kind: SnapKind| NodeSnap {
+            id,
             pos: [10.0, 20.0],
             size: [200.0, 120.0],
             pos3d: None,
             panel3d: true,
-            kind: SnapKind::Group {
-                definition: definition.to_string(),
-                in_wires: vec![("notes".to_string(), src)],
-                out_wires: Vec::new(),
-            },
+            kind,
         };
-        let doc = |definition: &str| Document {
+        let (port, vol) = (NodeId::from_u128(0xF01), NodeId::from_u128(0xF02));
+        Document {
             workspaces: vec![
                 Workspace {
-                    id: NodeId::new(),
+                    id: NodeId::from_u128(0xF00),
                     name: Some("voice".into()),
                     tab: false,
+                    nodes: vec![
+                        snap(
+                            port,
+                            SnapKind::InPort {
+                                name: "notes".into(),
+                                kind: PortKind::Midi,
+                            },
+                        ),
+                        snap(
+                            vol,
+                            SnapKind::Volume {
+                                name: "chan".into(),
+                                persist: false,
+                            },
+                        ),
+                    ],
                     ..Workspace::new()
                 },
                 Workspace {
-                    id: ws,
-                    nodes: vec![group(definition)],
+                    id: tab,
+                    nodes: vec![snap(
+                        inst,
+                        SnapKind::Group {
+                            definition: definition.to_string(),
+                            in_wires: Vec::new(),
+                            out_wires: Vec::new(),
+                        },
+                    )],
+                    ..Workspace::new()
+                },
+            ],
+            ..Document::empty()
+        }
+    }
+
+    /// A `group` runs its definition — and none of what it runs may reach the
+    /// `.wk` file. The instance's nodes are derived: they exist because the
+    /// definition says so, and writing them back would turn one instance into
+    /// two on the next load. So load → run → save must hand the file back with
+    /// nothing but the group line in it.
+    #[test]
+    fn a_group_runs_its_definition_without_writing_any_of_it_back() {
+        let path = std::env::temp_dir().join("wk-group-save-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let (tab, inst) = (NodeId::new(), NodeId::new());
+        let doc = instancing_doc("voice", tab, inst);
+        let s = Server::new(&doc, path.clone()).expect("server constructs");
+
+        // The group itself is a node on the tab's canvas...
+        assert_eq!(s.kind_of(inst), Some(Kind::Group));
+        // ...and the definition's HostPort is live under a derived id, in the
+        // instance rather than in the tab. The in-port is not: a boundary port
+        // is a marker on the definition's canvas, never a runtime thing.
+        let derived: Vec<NodeId> = s.instances[&inst].nodes.clone();
+        assert_eq!(derived.len(), 1, "one node: the volume, not the in-port");
+        assert_eq!(s.kind_of(derived[0]), Some(Kind::File));
+        assert_eq!(
+            s.graph.nodes[&derived[0]].ws, inst,
+            "it belongs to the instance"
+        );
+        assert!(
+            !s.graph.workspaces.contains(&inst),
+            "an instance is not a tab"
+        );
+
+        s.save();
+        let back = Document::load(&path).expect("reloads");
+        let saved = back
+            .workspaces
+            .iter()
+            .find(|w| w.id == tab)
+            .expect("the tab is still there");
+        assert_eq!(
+            saved.nodes.len(),
+            1,
+            "only the group line: {:?}",
+            saved.nodes
+        );
+        assert_eq!(saved.nodes[0].id, inst);
+        assert_eq!(
+            Document::load(&path).expect("reloads"),
+            back,
+            "a second save/load cycle is a fixpoint"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A document whose instancing can't resolve must refuse to start rather
+    /// than run the half of it that does — the missing half would be saved back
+    /// as deliberately gone.
+    #[test]
+    fn a_group_naming_no_definition_refuses_to_start() {
+        let path = std::env::temp_dir().join("wk-group-broken-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let doc = instancing_doc("vioce", NodeId::new(), NodeId::new());
+        let err = match Server::new(&doc, path.clone()) {
+            Err(e) => e,
+            Ok(_) => panic!("a group naming no definition must refuse to start"),
+        };
+        assert!(err.contains("\"vioce\""), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Two groups of one definition are two independent sets of live nodes —
+    /// the point of instancing. Their ids are derived from the instance, so
+    /// nothing is shared and nothing collides.
+    #[test]
+    fn two_instances_of_a_definition_run_independently() {
+        let path = std::env::temp_dir().join("wk-group-twice-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let (tab, first, second) = (NodeId::new(), NodeId::new(), NodeId::new());
+        let mut doc = instancing_doc("voice", tab, first);
+        let twin = doc.workspaces[1].nodes[0].clone();
+        doc.workspaces[1]
+            .nodes
+            .push(crate::workspace::NodeSnap { id: second, ..twin });
+        let mut s = Server::new(&doc, path.clone()).expect("server constructs");
+        let a = s.instances[&first].nodes.clone();
+        let b = s.instances[&second].nodes.clone();
+        assert_eq!((a.len(), b.len()), (1, 1));
+        assert_ne!(a[0], b[0], "two instances must not share a node");
+
+        // `wk ps` has to tell them apart, or neither can be addressed.
+        let snap = s.ipc_snapshot();
+        // Sorted, because a snapshot's node order is the live table's, not the
+        // file's — what matters is that the two labels differ and say which
+        // instance each node is in.
+        let mut names: Vec<&str> = snap
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "volume")
+            .map(|n| n.name.as_str())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["voice/chan", "voice2/chan"], "{names:?}");
+        // And each derived node reports the *tab* it is shown in, since an
+        // instance is not a workspace the CLI could name.
+        assert!(snap.nodes.iter().all(|n| n.ws == tab));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Deleting the `group` node tears the instance down. Anything less leaves
+    /// live guests running with nothing on the canvas to reach them — and undo
+    /// must bring the whole instance back in ONE press, not one per node.
+    #[test]
+    fn deleting_a_group_tears_its_instance_down_and_undo_is_one_step() {
+        let path = std::env::temp_dir().join("wk-group-delete-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let (tab, inst) = (NodeId::new(), NodeId::new());
+        let mut s =
+            Server::new(&instancing_doc("voice", tab, inst), path.clone()).expect("constructs");
+        let derived = s.instances[&inst].nodes.clone();
+        assert!(derived.iter().all(|&id| s.node_exists(id)));
+
+        s.apply(Command::Delete(ResourceRef::Node(inst)));
+        assert!(!s.node_exists(inst));
+        assert!(s.instances.is_empty(), "the instance outlived its group");
+        assert!(derived.iter().all(|&id| !s.node_exists(id)));
+
+        s.apply(Command::Undo);
+        assert!(s.node_exists(inst), "one undo brings the group back");
+        assert!(
+            derived.iter().all(|&id| s.node_exists(id)),
+            "...and everything it stands for, in the same press"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Duplicating a group is how a second instance is made on the canvas: the
+    /// same definition, a new id, and therefore its own nodes. Undo must take
+    /// the whole copy back in ONE press — the create produced a group node
+    /// *and* everything under it, and one entry per node would leave a
+    /// half-dismantled live instance between presses.
+    #[test]
+    fn duplicating_a_group_makes_a_second_instance_and_undo_is_one_step() {
+        let path = std::env::temp_dir().join("wk-group-duplicate-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let (tab, inst) = (NodeId::new(), NodeId::new());
+        let mut s =
+            Server::new(&instancing_doc("voice", tab, inst), path.clone()).expect("constructs");
+        let before: HashSet<NodeId> = s.graph.nodes.keys().copied().collect();
+
+        s.apply(Command::Duplicate(inst));
+        let added: Vec<NodeId> = s
+            .graph
+            .nodes
+            .keys()
+            .copied()
+            .filter(|id| !before.contains(id))
+            .collect();
+        assert_eq!(added.len(), 2, "a group node plus the volume it stands for");
+        assert_eq!(s.instances.len(), 2, "two independent instances");
+        let originals = s.instances[&inst].nodes.clone();
+        assert!(
+            added.iter().all(|id| !originals.contains(id)),
+            "the copy must not share a node with the original"
+        );
+
+        s.apply(Command::Undo);
+        assert!(added.iter().all(|&id| !s.node_exists(id)));
+        assert_eq!(s.instances.len(), 1, "one press, one instance removed");
+        assert!(originals.iter().all(|&id| s.node_exists(id)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A structural edit inside an instance is refused server-side. Its nodes
+    /// are derived, so a delete there would be undone by the next restart —
+    /// silently, after the user had already built on it.
+    #[test]
+    fn an_instances_nodes_are_read_only_for_structure() {
+        let path = std::env::temp_dir().join("wk-group-readonly-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let (tab, inst) = (NodeId::new(), NodeId::new());
+        let mut s =
+            Server::new(&instancing_doc("voice", tab, inst), path.clone()).expect("constructs");
+        let derived = s.instances[&inst].nodes[0];
+
+        s.apply(Command::Delete(ResourceRef::Node(derived)));
+        assert!(s.node_exists(derived), "a derived node was deleted");
+        s.apply(Command::Duplicate(derived));
+        assert_eq!(
+            s.instances[&inst].nodes.len(),
+            1,
+            "a derived node was copied"
+        );
+        // Nor may a node be added to the instance's canvas: there is nowhere
+        // in the file to write it down.
+        s.apply(Command::Create(Resource::Node {
+            kind: NodeKind::Network,
+            pos: [0.0, 0.0],
+            ws: inst,
+        }));
+        assert!(
+            s.graph.nodes.values().all(|r| r.kind != Kind::Network),
+            "a node was added to an instance"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A boundary port never becomes a live node: the parent's wire *into* the
+    /// port and the definition's wire *out* of it collapse into one ordinary
+    /// wire, from the parent's own node straight to the instance's. And that
+    /// wire must not reach the file — its far end is a derived id, so writing
+    /// it would leave the next load with a wire to a node that isn't there yet.
+    ///
+    /// Uses a Note as the granted node: it classifies like an app without
+    /// needing a compiled component, so the whole path runs wasm-free.
+    #[test]
+    fn a_wire_crossing_a_boundary_collapses_and_stays_out_of_the_file() {
+        use crate::workspace::{NodeSnap, SnapKind};
+        let path = std::env::temp_dir().join("wk-group-collapse-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let snap = |id: NodeId, kind: SnapKind| NodeSnap {
+            id,
+            pos: [0.0, 0.0],
+            size: [130.0, 44.0],
+            pos3d: None,
+            panel3d: true,
+            kind,
+        };
+        let (def, tab) = (NodeId::from_u128(0xD00), NodeId::from_u128(0xD01));
+        let (port, note) = (NodeId::from_u128(0xD02), NodeId::from_u128(0xD03));
+        let (cap, inst) = (NodeId::from_u128(0xD04), NodeId::from_u128(0xD05));
+        let doc = Document {
+            workspaces: vec![
+                Workspace {
+                    id: def,
+                    name: Some("viewer".into()),
+                    tab: false,
+                    nodes: vec![
+                        snap(
+                            port,
+                            SnapKind::InPort {
+                                name: "frames".into(),
+                                kind: PortKind::Capture,
+                            },
+                        ),
+                        snap(note, SnapKind::Note { text: "eye".into() }),
+                    ],
+                    capture_links: vec![(note, port)],
+                    ..Workspace::new()
+                },
+                Workspace {
+                    id: tab,
+                    nodes: vec![
+                        snap(cap, SnapKind::Capture),
+                        snap(
+                            inst,
+                            SnapKind::Group {
+                                definition: "viewer".into(),
+                                in_wires: vec![("frames".into(), cap)],
+                                out_wires: Vec::new(),
+                            },
+                        ),
+                    ],
                     ..Workspace::new()
                 },
             ],
             ..Document::empty()
         };
-        let path = std::env::temp_dir().join("wk-group-save-test.wk");
-        let _ = std::fs::remove_file(&path);
-        let s = Server::new(&doc("voice"), path.clone()).expect("server constructs");
-        // Nothing was placed for it — a group is an instance, not a node, and
-        // no expansion runs yet.
-        assert!(!s.node_exists(inst));
+        let s = Server::new(&doc, path.clone()).expect("constructs");
+        let derived = s.instances[&inst].nodes[0];
+        assert_eq!(
+            s.kind_of(derived),
+            Some(Kind::Note),
+            "the note materialized"
+        );
+        assert!(
+            !s.node_exists(crate::instancing::derive_id(inst, port)),
+            "the boundary port must not become a live node"
+        );
+        assert_eq!(
+            s.graph.capture_links,
+            vec![(derived, cap)],
+            "the grant should run from the instance's note to the tab's Capture node"
+        );
+
         s.save();
         let back = Document::load(&path).expect("reloads");
-        let tab = back
-            .workspaces
-            .iter()
-            .find(|w| w.id == ws)
-            .expect("the tab is still there");
-        assert_eq!(tab.nodes, vec![group("voice")], "the group came back whole");
+        let saved = back.workspaces.iter().find(|w| w.id == tab).expect("tab");
+        assert!(
+            saved.capture_links.is_empty(),
+            "a collapsed wire was written to the file: {:?}",
+            saved.capture_links
+        );
+        assert_eq!(saved.nodes.len(), 2, "the Capture node and the group, only");
+        let _ = std::fs::remove_file(&path);
+    }
 
-        // A group naming no definition is refused at startup, naming itself.
-        let err = match Server::new(&doc("vioce"), path.clone()) {
-            Err(e) => e,
-            Ok(_) => panic!("a group naming no definition must refuse to start"),
-        };
-        assert!(err.contains("\"vioce\""), "{err}");
+    /// A persisted volume inside a definition keeps its bytes per *instance*.
+    /// Its sidecar is named by the derived id, and the prune keep-set is built
+    /// from the document about to be written — which by design holds no derived
+    /// node at all. Getting this wrong deletes the user's data on the way out.
+    #[test]
+    fn a_persisted_volume_inside_an_instance_keeps_its_sidecar() {
+        let path = std::env::temp_dir().join("wk-group-volume-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let (tab, inst) = (NodeId::new(), NodeId::new());
+        let mut doc = instancing_doc("voice", tab, inst);
+        let def = &mut doc.workspaces[0];
+        if let SnapKind::Volume { persist, .. } = &mut def.nodes[1].kind {
+            *persist = true;
+        }
+        let s = Server::new(&doc, path.clone()).expect("constructs");
+        let derived = s.instances[&inst].nodes[0];
+        let _ = std::fs::remove_dir_all(s.volume_dir());
+        std::fs::create_dir_all(s.volume_dir()).unwrap();
+        std::fs::write(s.volume_sidecar(derived), b"remember me").unwrap();
+        // A sidecar for a volume no instance claims any more is still pruned.
+        let stale = s.volume_dir().join(NodeId::from_u128(0xDEAD).to_string());
+        std::fs::write(&stale, b"nobody's").unwrap();
+
+        s.save();
+        assert!(
+            s.volume_sidecar(derived).exists(),
+            "an instance's volume lost its bytes at shutdown"
+        );
+        assert!(!stale.exists(), "a sidecar nothing claims is still pruned");
+        let _ = std::fs::remove_dir_all(s.volume_dir());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Closing the tab a group sits in must take the instance with it. The
+    /// derived nodes are not in the tab (their workspace is the instance), so
+    /// the tab teardown reaches them only through the group node.
+    #[test]
+    fn closing_a_tab_tears_down_the_instances_it_holds() {
+        let path = std::env::temp_dir().join("wk-group-tab-close-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let (tab, inst) = (NodeId::new(), NodeId::new());
+        let mut doc = instancing_doc("voice", tab, inst);
+        // A second tab, so closing the first isn't the "keep one" no-op.
+        doc.workspaces.push(Workspace::new());
+        let mut s = Server::new(&doc, path.clone()).expect("constructs");
+        let derived = s.instances[&inst].nodes.clone();
+
+        s.apply(Command::Delete(ResourceRef::Workspace(tab)));
+        assert!(s.instances.is_empty(), "the instance outlived its tab");
+        assert!(derived.iter().all(|&id| !s.node_exists(id)));
+
+        // And undoing the close brings the whole instance back with the tab.
+        s.apply(Command::Undo);
+        assert!(s.node_exists(inst));
+        assert!(derived.iter().all(|&id| s.node_exists(id)));
         let _ = std::fs::remove_file(&path);
     }
 

@@ -39,6 +39,11 @@ pub enum NodeClass {
     /// rather than inferred, so it carries its own connection kind and the end
     /// of that connection it plays.
     Boundary(PortDir, PortKind),
+    /// A `group` node — an **instance** of another workspace. Its edges are the
+    /// definition's boundary ports, which are wired in the file's `group` block
+    /// by port name; nothing on the live canvas connects to the instance node
+    /// itself, so it forms no wire with anything.
+    Instance,
     Other,
 }
 
@@ -310,6 +315,14 @@ mod tests {
             (Clipboard, Clipboard, None),
             (Clipboard, Capture, None),
             (Clipboard, Net, None),
+            // A `group` node wires to nothing at all: an instance's edges are
+            // the definition's ports, wired by name in the file's `group`
+            // block, and the expansion collapses them into wires between real
+            // nodes. Dragging onto the instance node itself connects nothing.
+            (Instance, Other, None),
+            (Other, Instance, None),
+            (Instance, File, None),
+            (Instance, Instance, None),
         ];
         for (ca, cb, want) in cases {
             assert_eq!(classify(a, b, ca, cb), want, "classify({ca:?}, {cb:?})");
@@ -328,6 +341,7 @@ mod tests {
             Just(NodeClass::Clipboard),
             Just(NodeClass::Api),
             Just(NodeClass::MidiSource),
+            Just(NodeClass::Instance),
             Just(NodeClass::Other),
         ]
     }
@@ -563,15 +577,19 @@ mod tests {
 
         /// A wire forms if and only if one side is an app node paired with a
         /// non-Uplink node, or the pair is an Uplink uplink and a Network — two
-        /// special nodes otherwise never wire. (Boundary ports have their own
-        /// rule above; this one is about the inferred classes.)
+        /// special nodes otherwise never wire. A `group` node is outside all of
+        /// it: an instance is wired through the definition's ports, by name, in
+        /// the file — never by a live wire to the instance node. (Boundary
+        /// ports have their own rule above; this one is about the inferred
+        /// classes.)
         #[test]
         fn classify_requires_an_app_or_uplink_endpoint(a in any_id(), b in any_id(), ca in any_plain_class(), cb in any_plain_class()) {
             use NodeClass::*;
             let wired = classify(a, b, ca, cb).is_some();
+            let instance = ca == Instance || cb == Instance;
             let app_pair = (ca == Other || cb == Other) && ca != Uplink && cb != Uplink;
             let uplink_pair = matches!((ca, cb), (Uplink, Net) | (Net, Uplink));
-            prop_assert_eq!(wired, app_pair || uplink_pair);
+            prop_assert_eq!(wired, !instance && (app_pair || uplink_pair));
         }
 
         /// Toggling the same pair twice restores the original link set, and a

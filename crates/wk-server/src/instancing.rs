@@ -23,8 +23,8 @@
 //! on purpose.
 
 use crate::workspace::{Document, NodeSnap, SnapKind, Workspace};
-use std::collections::BTreeMap;
-use wk_protocol::NodeId;
+use std::collections::{BTreeMap, HashMap};
+use wk_protocol::{NodeId, PortDir};
 
 /// The domain separator mixed into every derived id. It exists so this hash can
 /// never collide with another use of SHA-256 over node ids elsewhere in wk, and
@@ -72,18 +72,28 @@ pub struct Instance {
     pub definition: String,
     /// The id of the workspace that *is* that definition.
     pub defined_in: NodeId,
+    /// The tab the whole tree ultimately sits in. An instance is deliberately
+    /// *not* a tab (see the module docs on landmine 12), so this is what a
+    /// client's tab bar, `wk ps` and a workspace teardown go by.
+    pub tab: NodeId,
+    /// The instance this one is written inside, or `None` when its `group` node
+    /// is written directly in a tab.
+    pub parent: Option<NodeId>,
     /// The chain of definition names from the tab down to and including this
     /// one (`["chorus", "voice"]`) — how an error names where it is.
     pub path: Vec<String>,
     /// The definition's content with every id run through [`derive_id`]: nodes
     /// and wiring ready to be materialized.
     ///
-    /// `content.id` is the id of the **tab** the instance ultimately sits in,
-    /// not the instance's own: expansion is flat by design, so the nodes belong
-    /// to a real workspace and no reconciler ever learns instances exist.
+    /// `content.id` is the instance's own id, so a materialized node's
+    /// `NodeRec.ws` says which instance it belongs to and nothing that iterates
+    /// the document's *tabs* can reach it — which is what keeps derived nodes
+    /// out of the `.wk` file and out of a tab's canvas.
     /// `content.name`/`content.tab` carry nothing and are left at their
     /// defaults. Nested `group` nodes are *not* among `content.nodes`; each has
-    /// its own [`Instance`] in the expansion.
+    /// its own [`Instance`] in the expansion. Neither are the definition's
+    /// boundary ports: a port is a marker, not a runtime thing, so the wires
+    /// through it are already collapsed onto whatever the parent wired in.
     pub content: Workspace,
 }
 
@@ -102,12 +112,22 @@ pub fn expand(doc: &Document) -> Result<Vec<Instance>, String> {
     };
     for ws in doc.workspaces.iter().filter(|w| w.tab) {
         let site = site_label(ws);
-        for (id, definition) in groups_in(ws) {
-            ex.group(ws.id, &site, id, definition)?;
+        for node in groups_in(ws) {
+            // A group written in a tab wires to the tab's own nodes, so an
+            // endpoint on its `in`/`out` lines is already the live id.
+            ex.group(ws.id, &site, node.id, None, node, &|id| vec![id])?;
         }
     }
     Ok(ex.out)
 }
+
+/// How an endpoint written on a `group`'s `in`/`out` line resolves to live node
+/// ids. In a tab it is that node, verbatim. Inside a definition it is the
+/// derived node — unless it is one of the *containing* instance's own boundary
+/// ports, in which case it is whatever the level above wired into that port:
+/// nothing (so the wire is dropped rather than left dangling against a marker),
+/// or several nodes (so it fans out).
+type Outer<'f> = &'f dyn Fn(NodeId) -> Vec<NodeId>;
 
 /// The walk's state: the document's definitions, the chain of names from the
 /// tab down to where the walk is now (which is also how a cycle is spotted),
@@ -143,12 +163,43 @@ fn definitions(doc: &Document) -> Result<BTreeMap<&str, &Workspace>, String> {
     Ok(defs)
 }
 
-/// The `group` nodes of a workspace, in file order, as (instance id, name).
-fn groups_in(ws: &Workspace) -> impl Iterator<Item = (NodeId, &str)> {
-    ws.nodes.iter().filter_map(|n| match &n.kind {
-        SnapKind::Group { definition, .. } => Some((n.id, definition.as_str())),
+/// The `group` nodes of a workspace, in file order.
+fn groups_in(ws: &Workspace) -> impl Iterator<Item = &NodeSnap> {
+    ws.nodes
+        .iter()
+        .filter(|n| matches!(n.kind, SnapKind::Group { .. }))
+}
+
+/// A `group`'s boundary wiring as written: `(port name, endpoint)` per line.
+type BoundaryWires = [(String, NodeId)];
+
+/// A group node's parts, for a snap already known to be one.
+fn group_parts(n: &NodeSnap) -> (&str, &BoundaryWires, &BoundaryWires) {
+    match &n.kind {
+        SnapKind::Group {
+            definition,
+            in_wires,
+            out_wires,
+        } => (definition, in_wires, out_wires),
+        _ => unreachable!("only a group snap reaches here"),
+    }
+}
+
+/// A boundary port's direction and name, if this snap is one.
+fn port_of(n: &NodeSnap) -> Option<(PortDir, &str)> {
+    match &n.kind {
+        SnapKind::InPort { name, .. } => Some((PortDir::In, name)),
+        SnapKind::OutPort { name, .. } => Some((PortDir::Out, name)),
         _ => None,
-    })
+    }
+}
+
+/// The keyword an `in`/`out` boundary wire is written with.
+fn dir_word(dir: PortDir) -> &'static str {
+    match dir {
+        PortDir::In => "in",
+        PortDir::Out => "out",
+    }
 }
 
 /// How an error names where a group is written.
@@ -166,8 +217,11 @@ impl<'a> Expander<'a> {
         tab: NodeId,
         site: &str,
         instance: NodeId,
-        definition: &'a str,
+        parent: Option<NodeId>,
+        node: &'a NodeSnap,
+        outer: Outer,
     ) -> Result<(), String> {
+        let (definition, in_wires, out_wires) = group_parts(node);
         // A definition that contains itself, however indirectly, has no
         // expansion at all — so say which loop, not just that there is one.
         if let Some(at) = self.path.iter().position(|d| d == definition) {
@@ -216,39 +270,102 @@ impl<'a> Expander<'a> {
 
         self.path.push(definition.to_string());
         let id = |inner: NodeId| derive_id(instance, inner);
-        let pairs = |links: &[(NodeId, NodeId)]| -> Vec<(NodeId, NodeId)> {
-            links.iter().map(|&(a, b)| (id(a), id(b))).collect()
+
+        // What the level above wired into each of this definition's boundary
+        // ports, keyed by the port's derived id. A key with an empty list is a
+        // port the parent left unwired: every wire crossing it is dropped,
+        // because a port never becomes a live node for it to dangle from.
+        let mut ports: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
+        let mut named: HashMap<(PortDir, &str), NodeId> = HashMap::new();
+        for n in &def.nodes {
+            if let Some((dir, name)) = port_of(n) {
+                let derived = id(n.id);
+                named.insert((dir, name), derived);
+                ports.insert(derived, Vec::new());
+            }
+        }
+        for (dir, wires) in [(PortDir::In, in_wires), (PortDir::Out, out_wires)] {
+            for (name, endpoint) in wires {
+                let Some(&port) = named.get(&(dir, name.as_str())) else {
+                    let word = dir_word(dir);
+                    return Err(format!(
+                        "{site}: group {definition:?} wires `{word} {name:?}`, but definition \
+                         {definition:?} declares no {word}-port called {name:?}; a boundary \
+                         wire names one of the definition's own `{word}port` lines"
+                    ));
+                };
+                // Fan-in is just the same port named twice, so the bindings
+                // accumulate rather than replace.
+                ports.entry(port).or_default().extend(outer(*endpoint));
+            }
+        }
+
+        // One id inside the definition, as live ids: the derived node, or —
+        // when it is a boundary port — the nodes the parent bound it to. This
+        // is the whole collapse: `X -> port` outside plus `port -> Y` inside
+        // become a plain `X -> Y`, with no port left in the live graph. A
+        // port wired straight to the complementary port passes through for
+        // free, since both of its ends substitute.
+        let sub = |inner: NodeId| -> Vec<NodeId> {
+            let derived = id(inner);
+            match ports.get(&derived) {
+                Some(bound) => bound.clone(),
+                None => vec![derived],
+            }
         };
+        let pairs = |links: &[(NodeId, NodeId)]| -> Vec<(NodeId, NodeId)> {
+            let mut out = Vec::new();
+            for &(a, b) in links {
+                for x in sub(a) {
+                    for y in sub(b) {
+                        out.push((x, y));
+                    }
+                }
+            }
+            out
+        };
+        // A per-wire override follows every wire its key expanded into.
+        let keyed =
+            |src: &BTreeMap<(NodeId, NodeId), String>| -> BTreeMap<(NodeId, NodeId), String> {
+                let mut out = BTreeMap::new();
+                for ((a, b), v) in src {
+                    for pair in pairs(&[(*a, *b)]) {
+                        out.insert(pair, v.clone());
+                    }
+                }
+                out
+            };
+        let mut serve_ports: BTreeMap<(NodeId, NodeId), u16> = BTreeMap::new();
+        for (&(a, b), &port) in &def.serve_ports {
+            for pair in pairs(&[(a, b)]) {
+                serve_ports.insert(pair, port);
+            }
+        }
         self.out.push(Instance {
             id: instance,
             definition: definition.to_string(),
             defined_in: def.id,
+            tab,
+            parent,
             path: self.path.clone(),
             content: Workspace {
-                // The instance's nodes belong to the tab, so the live graph
-                // stays exactly as flat as it is today.
-                id: tab,
+                id: instance,
                 // A nested `group` is not a node of this instance: it is
                 // another instance, and it follows with its own derived ids.
+                // A boundary port is not one either — the wiring through it
+                // is already collapsed above.
                 nodes: def
                     .nodes
                     .iter()
                     .filter(|n| !matches!(n.kind, SnapKind::Group { .. }))
+                    .filter(|n| port_of(n).is_none())
                     .map(|n| NodeSnap {
                         id: id(n.id),
                         ..n.clone()
                     })
                     .collect(),
-                mount_paths: def
-                    .mount_paths
-                    .iter()
-                    .map(|(&(a, b), path)| ((id(a), id(b)), path.clone()))
-                    .collect(),
-                serve_ports: def
-                    .serve_ports
-                    .iter()
-                    .map(|(&(a, b), &port)| ((id(a), id(b)), port))
-                    .collect(),
+                mount_paths: keyed(&def.mount_paths),
+                serve_ports,
                 connections: pairs(&def.connections),
                 midi: pairs(&def.midi),
                 serves: pairs(&def.serves),
@@ -261,8 +378,15 @@ impl<'a> Expander<'a> {
         });
 
         let inner_site = format!("definition {definition:?}");
-        for (nested, name) in groups_in(def) {
-            self.group(tab, &inner_site, id(nested), name)?;
+        for nested in groups_in(def) {
+            self.group(
+                tab,
+                &inner_site,
+                id(nested.id),
+                Some(instance),
+                nested,
+                &sub,
+            )?;
         }
         self.path.pop();
         Ok(())
@@ -327,6 +451,48 @@ mod tests {
         )
     }
 
+    /// A group with boundary wiring: `(port name, endpoint id)` per direction.
+    fn wired_group(
+        id: u128,
+        definition: &str,
+        in_wires: &[(&str, u128)],
+        out_wires: &[(&str, u128)],
+    ) -> NodeSnap {
+        let list = |w: &[(&str, u128)]| -> Vec<(String, NodeId)> {
+            w.iter()
+                .map(|&(n, e)| (n.to_string(), NodeId::from_u128(e)))
+                .collect()
+        };
+        snap(
+            id,
+            SnapKind::Group {
+                definition: definition.to_string(),
+                in_wires: list(in_wires),
+                out_wires: list(out_wires),
+            },
+        )
+    }
+
+    fn inport(id: u128, name: &str, kind: wk_protocol::PortKind) -> NodeSnap {
+        snap(
+            id,
+            SnapKind::InPort {
+                name: name.to_string(),
+                kind,
+            },
+        )
+    }
+
+    fn outport(id: u128, name: &str, kind: wk_protocol::PortKind) -> NodeSnap {
+        snap(
+            id,
+            SnapKind::OutPort {
+                name: name.to_string(),
+                kind,
+            },
+        )
+    }
+
     fn doc(workspaces: Vec<Workspace>) -> Document {
         Document {
             workspaces,
@@ -378,9 +544,12 @@ mod tests {
             assert_ne!(*id, NodeId::from_u128(11));
             assert_ne!(*id, NodeId::from_u128(12));
         }
-        // Every instance's nodes land in the tab, not in some new workspace:
-        // the live graph is flat and the reconcilers never learn about groups.
-        assert!(out.iter().all(|i| i.content.id == NodeId::from_u128(20)));
+        // Every instance's nodes belong to the *instance*, and the instance
+        // remembers which tab it is shown in. Keeping the two apart is what
+        // stops a derived node reaching the `.wk` file or a tab's canvas.
+        assert!(out.iter().all(|i| i.content.id == i.id));
+        assert!(out.iter().all(|i| i.tab == NodeId::from_u128(20)));
+        assert!(out.iter().all(|i| i.parent.is_none()));
         // And the definition's node kinds come through untouched — only ids
         // are rewritten.
         assert_eq!(out[0].content.nodes[0].kind, app(11, "synth").kind);
@@ -453,6 +622,198 @@ mod tests {
         // A group node is never a node of its parent's content — it *is* the
         // child instance.
         assert!(out[0].content.nodes.is_empty());
+    }
+
+    #[test]
+    fn a_boundary_port_collapses_into_the_wire_that_crosses_it() {
+        use wk_protocol::PortKind;
+        // The shape the whole feature is for: a definition whose in-port feeds
+        // an inner app and whose out-port is fed by it. Expanded, the ports are
+        // gone and the parent's own nodes are wired straight to the inner one —
+        // a port is a marker on the file's canvas, never a runtime thing.
+        let (port_in, port_out, synth) = (
+            NodeId::from_u128(11),
+            NodeId::from_u128(12),
+            NodeId::from_u128(13),
+        );
+        let def = Workspace {
+            midi: vec![(port_in, synth), (synth, port_out)],
+            ..definition(
+                10,
+                "voice",
+                vec![
+                    inport(11, "notes", PortKind::Midi),
+                    outport(12, "audio", PortKind::Midi),
+                    app(13, "synth"),
+                ],
+            )
+        };
+        let d = doc(vec![
+            def,
+            tab(
+                20,
+                vec![
+                    app(21, "keyboard"),
+                    app(22, "speakers"),
+                    wired_group(23, "voice", &[("notes", 21)], &[("audio", 22)]),
+                ],
+            ),
+        ]);
+        let out = expand(&d).expect("expands");
+        let inst = &out[0];
+        let derived = derive_id(NodeId::from_u128(23), synth);
+        assert_eq!(
+            inst.content.nodes.iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![derived],
+            "only the inner app materializes; the ports do not"
+        );
+        assert_eq!(
+            inst.content.midi,
+            vec![
+                (NodeId::from_u128(21), derived),
+                (derived, NodeId::from_u128(22)),
+            ],
+            "the parent's nodes are wired straight to the instance's"
+        );
+    }
+
+    #[test]
+    fn an_unwired_port_drops_the_wires_that_cross_it_rather_than_dangling() {
+        use wk_protocol::PortKind;
+        // A group may leave a port unwired — the definition still runs, just
+        // without whatever was going to arrive. The inner wire has no source
+        // then, and a port never becomes a node, so leaving it in would point
+        // the live graph at an id nothing can resolve.
+        let def = Workspace {
+            midi: vec![(NodeId::from_u128(11), NodeId::from_u128(12))],
+            ..definition(
+                10,
+                "voice",
+                vec![inport(11, "notes", PortKind::Midi), app(12, "synth")],
+            )
+        };
+        let d = doc(vec![def, tab(20, vec![group(21, "voice")])]);
+        let out = expand(&d).expect("expands");
+        assert!(out[0].content.midi.is_empty());
+        assert_eq!(out[0].content.nodes.len(), 1, "the synth still runs");
+    }
+
+    #[test]
+    fn one_port_wired_twice_fans_the_wire_out() {
+        use wk_protocol::PortKind;
+        // Two `in "notes"` lines are two sources feeding the same edge. The
+        // collapse has to produce both wires — taking the last one would
+        // silently drop a connection the author wrote.
+        let def = Workspace {
+            midi: vec![(NodeId::from_u128(11), NodeId::from_u128(12))],
+            ..definition(
+                10,
+                "voice",
+                vec![inport(11, "notes", PortKind::Midi), app(12, "synth")],
+            )
+        };
+        let d = doc(vec![
+            def,
+            tab(
+                20,
+                vec![
+                    app(21, "keys"),
+                    app(22, "seq"),
+                    wired_group(23, "voice", &[("notes", 21), ("notes", 22)], &[]),
+                ],
+            ),
+        ]);
+        let out = expand(&d).expect("expands");
+        let synth = derive_id(NodeId::from_u128(23), NodeId::from_u128(12));
+        assert_eq!(
+            out[0].content.midi,
+            vec![
+                (NodeId::from_u128(21), synth),
+                (NodeId::from_u128(22), synth),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_port_of_a_nested_definition_reaches_through_to_the_tab() {
+        use wk_protocol::PortKind;
+        // A definition may pass a connection straight through to one it uses.
+        // The chain is `keyboard -> chorus:notes -> voice:notes -> synth`, and
+        // with both ports collapsed the live wire has to be the two ends of it.
+        let voice = Workspace {
+            midi: vec![(NodeId::from_u128(11), NodeId::from_u128(12))],
+            ..definition(
+                10,
+                "voice",
+                vec![inport(11, "notes", PortKind::Midi), app(12, "synth")],
+            )
+        };
+        let chorus = definition(
+            20,
+            "chorus",
+            vec![
+                inport(21, "notes", PortKind::Midi),
+                // The nested group's endpoint is the *outer* definition's own
+                // port, which is where the resolution has to keep going.
+                wired_group(22, "voice", &[("notes", 21)], &[]),
+            ],
+        );
+        let d = doc(vec![
+            voice,
+            chorus,
+            tab(
+                30,
+                vec![
+                    app(31, "keyboard"),
+                    wired_group(32, "chorus", &[("notes", 31)], &[]),
+                ],
+            ),
+        ]);
+        let out = expand(&d).expect("expands");
+        let inner = out
+            .iter()
+            .find(|i| i.definition == "voice")
+            .expect("the nested voice");
+        let synth = derive_id(inner.id, NodeId::from_u128(12));
+        assert_eq!(inner.content.midi, vec![(NodeId::from_u128(31), synth)]);
+        assert_eq!(inner.parent, Some(NodeId::from_u128(32)));
+        assert_eq!(inner.tab, NodeId::from_u128(30));
+    }
+
+    #[test]
+    fn a_boundary_wire_naming_no_port_is_an_error() {
+        use wk_protocol::PortKind;
+        // The definition's ports are the whole contract of a group, so a wire
+        // naming one that isn't there is a mistake worth stopping for — the
+        // alternative is a connection the author drew that silently isn't made.
+        let def = definition(10, "voice", vec![inport(11, "notes", PortKind::Midi)]);
+        let d = doc(vec![
+            def,
+            tab(
+                20,
+                vec![
+                    app(21, "keys"),
+                    wired_group(22, "voice", &[("note", 21)], &[]),
+                ],
+            ),
+        ]);
+        let err = expand(&d).unwrap_err();
+        assert!(err.contains("\"note\"") && err.contains("inport"), "{err}");
+
+        // Names are per direction: `out "notes"` is not the in-port of that name.
+        let def = definition(10, "voice", vec![inport(11, "notes", PortKind::Midi)]);
+        let d = doc(vec![
+            def,
+            tab(
+                20,
+                vec![
+                    app(21, "keys"),
+                    wired_group(22, "voice", &[], &[("notes", 21)]),
+                ],
+            ),
+        ]);
+        let err = expand(&d).unwrap_err();
+        assert!(err.contains("outport"), "{err}");
     }
 
     #[test]
