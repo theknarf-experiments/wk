@@ -24,26 +24,36 @@ const QUALITIES: [&str; 32] = [
 
 /// Things, not people: a node named after someone real invites a claim about
 /// them that a word list has no business making.
-const THINGS: [&str; 32] = [
-    "anchor", "beacon", "birch", "brook", "canyon", "cedar", "cinder", "comet", "delta", "ember",
-    "fjord", "garden", "harbor", "hollow", "island", "lantern", "meadow", "mesa", "orbit",
-    "pebble", "prairie", "reef", "ridge", "river", "signal", "summit", "thicket", "tide",
-    "trellis", "valley", "willow", "wharf",
+const THINGS: [&str; 64] = [
+    "anchor", "arbor", "basin", "beacon", "birch", "bluff", "brook", "canyon", "cedar", "cinder",
+    "cliff", "comet", "cove", "creek", "delta", "dune", "ember", "fern", "fjord", "forge",
+    "garden", "glade", "grove", "harbor", "haven", "hollow", "island", "jetty", "lagoon",
+    "lantern", "ledge", "maple", "meadow", "meander", "mesa", "moor", "narrows", "orbit",
+    "orchard", "pebble", "pier", "pine", "plateau", "prairie", "quarry", "rapids", "reef", "ridge",
+    "river", "shoal", "signal", "spire", "spring", "summit", "terrace", "thicket", "tide",
+    "trellis", "tundra", "valley", "vault", "wharf", "willow", "window",
 ];
 
 /// The name `id` generates: `quiet-harbor`, `nimble-tide`. Hyphenated rather
 /// than docker's underscore because a node name is also its address on the
 /// fabric, and a hostname may not contain an underscore.
 ///
-/// `nth` walks to another name for the same id, for the rare case where two
-/// ids land on the same pair — 1024 pairs is plenty for a workspace and far
-/// too few to assume uniqueness.
+/// `nth` walks to another name for the same id, for the case where two ids
+/// land on the same pair — 4096 pairs is plenty for a workspace and far too
+/// few to assume uniqueness.
 pub fn generated(id: NodeId, nth: usize) -> String {
-    // The two halves of the id feed the two words, so ids that differ anywhere
-    // move at least one of them.
-    let n = id.as_u128() ^ (nth as u128).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    let quality = QUALITIES[((n >> 64) % QUALITIES.len() as u128) as usize];
-    let thing = THINGS[(n % THINGS.len() as u128) as usize];
+    // Hashed, not sliced. Node ids are UUIDv7: two created moments apart share
+    // their leading bits, so taking the words from the id's own halves gave
+    // every node in a workspace the same first word — and with one word doing
+    // all the varying, collisions stopped being rare.
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"wk:node-name:v1");
+    h.update(id.as_u128().to_be_bytes());
+    h.update((nth as u64).to_be_bytes());
+    let d = h.finalize();
+    let quality = QUALITIES[d[0] as usize % QUALITIES.len()];
+    let thing = THINGS[d[1] as usize % THINGS.len()];
     format!("{quality}-{thing}")
 }
 
@@ -71,6 +81,34 @@ mod tests {
         let second = generated(id, 1);
         assert_ne!(first, second);
         assert_eq!(generated(id, 1), second, "and it is still deterministic");
+    }
+
+    /// Ids made moments apart must not cluster. Node ids are UUIDv7 and share
+    /// their leading bits, so a namer that took the words from the id's own
+    /// halves gave every node in a workspace the same first word — and with
+    /// one word doing all the varying, names collided constantly and every
+    /// collision wrote a `name` line into the user's file.
+    #[test]
+    fn ids_made_moments_apart_do_not_cluster() {
+        // The shape of a real run: consecutive ids, as `NodeId::new()` mints
+        // them within one workspace.
+        let base = NodeId::new().as_u128();
+        let names: Vec<String> = (0..24)
+            .map(|i| generated(NodeId::from_u128(base + i), 0))
+            .collect();
+        let firsts: std::collections::HashSet<&str> =
+            names.iter().map(|n| n.split('-').next().unwrap()).collect();
+        assert!(
+            firsts.len() > 12,
+            "24 consecutive ids should not share a handful of first words: {names:?}"
+        );
+        // Both words vary, so the whole 64×64 space is in play. Not that
+        // collisions never happen — 24 names over 4096 pairs collide about one
+        // time in eight, which is what the walk is for — but that they are the
+        // birthday paradox rather than a namer that only ever varies one word.
+        let seconds: std::collections::HashSet<&str> =
+            names.iter().map(|n| n.split('-').nth(1).unwrap()).collect();
+        assert!(seconds.len() > 12, "second words cluster too: {names:?}");
     }
 
     /// A name has to be a legal hostname: it is what a peer dials over the
