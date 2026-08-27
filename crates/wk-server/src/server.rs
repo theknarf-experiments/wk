@@ -743,6 +743,15 @@ pub struct Server {
     /// graph), kept as `(ws, relation, a, b)` so save round-trips them and an
     /// unplaced node comes back still wired once it can materialize.
     unplaced_wires: Vec<(NodeId, WireRel, NodeId, NodeId)>,
+    /// Workspaces the runtime deliberately does not run: `tab #false`
+    /// *definitions*, which exist to be used from elsewhere rather than opened.
+    /// Kept as `(position in the loaded document, the workspace)` so
+    /// [`Self::save`] — a full re-projection from the live graph, which knows
+    /// nothing about them — can splice them back exactly where they were
+    /// instead of writing them out of existence. The `unplaced` precedent, one
+    /// level up: there a node the runtime can't model, here a whole workspace
+    /// it won't.
+    authored: Vec<(usize, Workspace)>,
     /// App↔app wires whose kind (MIDI vs provider mount) can't be decided
     /// yet: `serves_fs()` is unknowable while an endpoint's component is
     /// still compiling. Re-tried each tick; applied through the normal
@@ -792,10 +801,19 @@ impl Server {
             workspace_path: path,
             graph: Graph {
                 available: doc.dependencies.clone(),
-                workspaces: doc.workspaces.iter().map(|w| w.id).collect(),
+                // Only tabs enter the live graph: a `tab #false` definition is
+                // not run, not shown, and not projected back out by `save` —
+                // it is carried verbatim in `authored` instead.
+                workspaces: doc
+                    .workspaces
+                    .iter()
+                    .filter(|w| w.tab)
+                    .map(|w| w.id)
+                    .collect(),
                 workspace_names: doc
                     .workspaces
                     .iter()
+                    .filter(|w| w.tab)
                     .filter_map(|w| w.name.clone().map(|n| (w.id, n)))
                     .collect(),
                 ..Graph::default()
@@ -815,6 +833,13 @@ impl Server {
             attached: std::collections::HashSet::new(),
             unplaced: Vec::new(),
             unplaced_wires: Vec::new(),
+            authored: doc
+                .workspaces
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| !w.tab)
+                .map(|(i, w)| (i, w.clone()))
+                .collect(),
             pending_app_wires: Vec::new(),
             node_auth: None,
             auth_cache: HashMap::new(),
@@ -827,7 +852,7 @@ impl Server {
             imported_deps: doc.imported_deps.clone(),
             imported_workspaces: doc.imported_workspaces.clone(),
         };
-        for ws in &doc.workspaces {
+        for ws in doc.workspaces.iter().filter(|w| w.tab) {
             server.instantiate(ws);
         }
         Ok(server)
@@ -2671,8 +2696,14 @@ impl Server {
 
     /// Write every opted-in volume's bytes to its sidecar file and prune stale
     /// sidecars (volumes since made ephemeral or removed). Called by
-    /// [`Self::save`].
-    fn save_persisted_volumes(&self) {
+    /// [`Self::save`] with the document it is about to write.
+    ///
+    /// The keep-set comes from that document, not from the live graph: a volume
+    /// can be in the file without running — inside a `tab #false` definition,
+    /// or on a node that failed to materialize — and it has no live bytes to
+    /// re-save. Pruning by liveness would delete the user's data at shutdown
+    /// for the crime of not being on screen.
+    fn save_persisted_volumes(&self, doc: &Document) {
         let persisted: Vec<(NodeId, Vec<u8>)> = self
             .graph
             .file_nodes
@@ -2695,9 +2726,17 @@ impl Server {
                 }
             }
         }
-        // Remove sidecars whose volume no longer persists (a no-op if the dir
-        // doesn't exist yet).
-        let keep: HashSet<String> = persisted.iter().map(|(id, _)| id.to_string()).collect();
+        // Remove sidecars whose volume no longer persists — every volume the
+        // file still asks to persist keeps its bytes, live or not (a no-op if
+        // the dir doesn't exist yet).
+        let keep: HashSet<String> = doc
+            .workspaces
+            .iter()
+            .flat_map(|w| &w.nodes)
+            .filter(|n| matches!(n.kind, SnapKind::Volume { persist: true, .. }))
+            .map(|n| n.id.to_string())
+            .chain(persisted.iter().map(|(id, _)| id.to_string()))
+            .collect();
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 if !keep.contains(&*entry.file_name().to_string_lossy()) {
@@ -2710,8 +2749,7 @@ impl Server {
     /// Each node projects through [`Self::node_snap`] — the same shape undo
     /// captures — ordered by kind then id, so saves are deterministic.
     pub fn save(&self) {
-        self.save_persisted_volumes();
-        let workspaces = self
+        let mut workspaces: Vec<Workspace> = self
             .graph
             .workspaces
             .iter()
@@ -2770,6 +2808,7 @@ impl Server {
                 Workspace {
                     id: ws_id,
                     name: self.graph.workspace_names.get(&ws_id).cloned(),
+                    tab: true,
                     nodes,
                     connections,
                     mount_paths,
@@ -2783,6 +2822,15 @@ impl Server {
                 }
             })
             .collect();
+        // Splice the authored definitions back in at the positions they were
+        // loaded from. Their recorded indices are into the *whole* list, and
+        // they arrive in ascending order, so by the time each one is inserted
+        // the entries before it are already in place and the file's block order
+        // is reproduced exactly. (`min` covers tabs closed during the session.)
+        for (at, ws) in &self.authored {
+            let at = (*at).min(workspaces.len());
+            workspaces.insert(at, ws.clone());
+        }
         // Carry the import provenance so `to_kdl` re-emits the `import` lines and
         // omits imported deps/workspaces — an autosave preserves the composition
         // rather than inlining every imported file.
@@ -2793,6 +2841,7 @@ impl Server {
             imported_deps: self.imported_deps.clone(),
             imported_workspaces: self.imported_workspaces.clone(),
         };
+        self.save_persisted_volumes(&doc);
         if let Err(e) = doc.save(&self.workspace_path) {
             eprintln!("failed to save workspace: {e}");
         }
@@ -4662,6 +4711,7 @@ mod model_tests {
             workspaces: vec![Workspace {
                 id: ws,
                 name: None,
+                tab: true,
                 nodes: vec![
                     NodeSnap {
                         id: ghost,
@@ -4787,6 +4837,130 @@ mod model_tests {
         let find = |id| back.workspaces.iter().find(|w| w.id == id).expect("tab");
         assert_eq!(find(named).name.as_deref(), Some("voice"));
         assert_eq!(find(unnamed).name, None, "an unnamed tab stays unnamed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `save` is a full re-projection from the live graph, so a workspace the
+    /// runtime deliberately does *not* run — a `tab #false` definition — would
+    /// be written out of existence on the first clean exit. The Server has to
+    /// carry the authored block instead: load → run → save must hand the file
+    /// back unchanged, comments and block order included.
+    #[test]
+    fn a_definition_workspace_survives_a_load_and_save_cycle_unchanged() {
+        let path = std::env::temp_dir().join("wk-definition-authored-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let (tab, def) = (NodeId::from_u128(101), NodeId::from_u128(102));
+        let (hp, vol, synth) = (
+            NodeId::from_u128(103),
+            NodeId::from_u128(104),
+            NodeId::from_u128(105),
+        );
+        // A running tab, then a definition holding everything the runtime would
+        // otherwise have to model to reproduce: a name, nodes, a wire, and a
+        // mount-path override.
+        let original = format!(
+            "workspace \"{tab}\" {{\n    \
+               hostport \"{hp}\" {{ port 8080; pos 0 0; size 10 10 }}\n}}\n\
+             // the voice, used from elsewhere\n\
+             workspace \"{def}\" {{\n    \
+               name \"voice\"\n    \
+               tab #false\n    \
+               volume \"chan\" \"{vol}\" {{ persist #true; pos 1 2; size 30 40 }}\n    \
+               node \"synth\" \"{synth}\" {{ pos 5 6; size 70 80; options 8 0.5 }}\n    \
+               connection \"{vol}\" \"{synth}\" \"/mnt/chan\"\n}}\n"
+        );
+        // Normalize once through the file writer, so the comparison below is
+        // about content rather than whitespace the formatter would rewrite on
+        // any save at all.
+        std::fs::write(&path, &original).unwrap();
+        Document::load(&path).expect("parses").save(&path).unwrap();
+        let normalized = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            normalized.contains("tab #false") && normalized.contains("// the voice"),
+            "the fixture itself has to carry what must survive:\n{normalized}"
+        );
+
+        let doc = Document::load(&path).expect("loads");
+        let mut s = Server::new(&doc, path.clone()).expect("server constructs");
+        // The definition does not run and no client hears about it: none of its
+        // nodes exist, and it is not a tab.
+        assert_eq!(s.graph.workspaces, vec![tab]);
+        assert_eq!(s.ipc_snapshot().workspaces, vec![tab]);
+        assert!(!s.node_exists(vol) && !s.node_exists(synth));
+        assert!(
+            s.graph.workspace_names.is_empty(),
+            "a definition's name is not a tab name"
+        );
+        // ...and not being modelled did not make it an *unplaced* node either:
+        // the whole block is held one level up.
+        assert!(s.unplaced.is_empty());
+
+        s.save();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            normalized,
+            "the definition did not come back byte-for-byte"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A volume inside a `tab #false` definition is in the file but not live,
+    /// so it has no bytes to re-save. Pruning sidecars by what is *running*
+    /// would delete that volume's data on the way out, silently and for good.
+    #[test]
+    fn a_volume_in_a_definition_keeps_its_sidecar() {
+        let path = std::env::temp_dir().join("wk-definition-volume-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let (tab, def) = (NodeId::from_u128(111), NodeId::from_u128(112));
+        let vol = NodeId::from_u128(113);
+        let doc = Document {
+            imports: Vec::new(),
+            imported_deps: std::collections::HashSet::new(),
+            imported_workspaces: std::collections::HashSet::new(),
+            dependencies: Vec::new(),
+            workspaces: vec![
+                Workspace {
+                    id: tab,
+                    ..Workspace::new()
+                },
+                Workspace {
+                    id: def,
+                    tab: false,
+                    nodes: vec![NodeSnap {
+                        id: vol,
+                        pos: [0.0, 0.0],
+                        size: [10.0, 10.0],
+                        pos3d: None,
+                        panel3d: true,
+                        kind: SnapKind::Volume {
+                            name: "chan".into(),
+                            persist: true,
+                        },
+                    }],
+                    ..Workspace::new()
+                },
+            ],
+        };
+        let s = Server::new(&doc, path.clone()).expect("server constructs");
+        let _ = std::fs::remove_dir_all(s.volume_dir());
+        std::fs::create_dir_all(s.volume_dir()).unwrap();
+        // Bytes written by an earlier run, back when the definition was a tab.
+        std::fs::write(s.volume_sidecar(vol), b"remember me").unwrap();
+        // And a sidecar for a volume nothing in the file mentions any more.
+        let stale = s.volume_dir().join(NodeId::from_u128(114).to_string());
+        std::fs::write(&stale, b"nobody's").unwrap();
+
+        s.save();
+        assert_eq!(
+            std::fs::read(s.volume_sidecar(vol)).unwrap(),
+            b"remember me",
+            "a volume the file still asks to persist lost its bytes"
+        );
+        assert!(
+            !stale.exists(),
+            "a sidecar no volume claims is still pruned"
+        );
+        let _ = std::fs::remove_dir_all(s.volume_dir());
         let _ = std::fs::remove_file(&path);
     }
 

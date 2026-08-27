@@ -94,6 +94,9 @@ enum NodeIdent {
     /// so the keyword alone identifies it — and it must have an identity, or a
     /// comment written above a workspace's name vanishes on the first save.
     WorkspaceName,
+    /// A workspace's `tab #false` line; like [`NodeIdent::WorkspaceName`],
+    /// unique within its block and in need of an identity to keep its comment.
+    WorkspaceTab,
     Placed(NodeId),
     Wire(String, NodeId, NodeId),
 }
@@ -109,6 +112,7 @@ fn node_ident(n: &KdlNode) -> Option<NodeIdent> {
         "dependencies" => Some(NodeIdent::Dependencies),
         "workspace" => n.get(0).and_then(node_id).map(NodeIdent::Workspace),
         "name" => Some(NodeIdent::WorkspaceName),
+        "tab" => Some(NodeIdent::WorkspaceTab),
         "connection" | "midi" | "serve" | "netlink" | "capturelink" | "clipboardlink"
         | "apilink" => {
             let a = n.get(0).and_then(node_id)?;
@@ -438,7 +442,8 @@ pub struct Document {
     /// Paths (relative to this file) of other `.wk` files to pull in.
     pub imports: Vec<String>,
     pub dependencies: Vec<Dependency>,
-    /// Always at least one; shown as tabs when there is more than one.
+    /// Always at least one, and — once resolved for running — always at least
+    /// one that is a tab. Shown as tabs when there is more than one.
     pub workspaces: Vec<Workspace>,
     /// Names of `dependencies` that came from an import — not re-serialized.
     /// Empty unless produced by [`Document::load_resolved`].
@@ -455,6 +460,12 @@ pub struct Workspace {
     /// `None` (absent) and `Some("")` (written, but blank) are distinct: only
     /// the former means "this workspace was never named".
     pub name: Option<String>,
+    /// Whether this workspace runs standalone as a canvas tab. `false` (written
+    /// as `tab #false`) makes it a *definition*: content that exists to be used
+    /// from elsewhere, not to be opened. The server never instantiates one and
+    /// clients never list it — so its content is authored-only, and
+    /// [`crate::server::Server`] has to carry it verbatim across a save.
+    pub tab: bool,
     /// Every placed node, of any kind (each serializes under its kind's KDL
     /// node name). File order is preserved.
     pub nodes: Vec<NodeSnap>,
@@ -489,6 +500,7 @@ impl Workspace {
         Workspace {
             id: NodeId::new(),
             name: None,
+            tab: true,
             nodes: Vec::new(),
             connections: Vec::new(),
             mount_paths: BTreeMap::new(),
@@ -561,7 +573,14 @@ impl Document {
             &mut ws_ids,
             &mut visited,
         )?;
-        if merged.workspaces.is_empty() {
+        // At least one *tab*, not merely one workspace: clients render the tab
+        // list straight from this, and `wk ps` fails outright on a document with
+        // none. A file that is nothing but definitions (every workspace
+        // `tab #false`) therefore gets a fresh scratch tab to open. Flipping an
+        // authored `tab #false` instead would be the cheaper fix and the wrong
+        // one — save re-projects this model, so it would quietly rewrite the
+        // user's file into something that no longer says what they wrote.
+        if !merged.workspaces.iter().any(|w| w.tab) {
             merged.workspaces.push(Workspace::new());
         }
         Ok(merged)
@@ -762,9 +781,11 @@ fn resolve_into(
     }
     for ws in doc.workspaces {
         // A deps-only file gets an auto-added blank workspace; don't let an
-        // import contribute a phantom empty tab. A *named* workspace is never
-        // phantom — someone wrote that name down — so it always comes through.
+        // import contribute a phantom empty tab. A *named* workspace, or one
+        // that opts out of being a tab, is never phantom — someone wrote that
+        // down deliberately — so it always comes through.
         let empty = ws.name.is_none()
+            && ws.tab
             && ws.nodes.is_empty()
             && ws.connections.is_empty()
             && ws.midi.is_empty()
@@ -825,6 +846,9 @@ fn parse_workspace(n: &KdlNode) -> Option<Workspace> {
                         .to_string(),
                 )
             }
+            // Absent means "this is a tab": opting out is the exception a file
+            // records, so only `tab #false` is ever written.
+            "tab" => ws.tab = c.get(0).and_then(|v| v.as_bool()).unwrap_or(true),
             "connection" => {
                 if let Some((a, b)) = pair(c) {
                     ws.connections.push((a, b));
@@ -864,6 +888,12 @@ fn workspace_kdl(ws: &Workspace) -> KdlNode {
     if let Some(name) = &ws.name {
         let mut n = KdlNode::new("name");
         n.push(str_entry(name));
+        ch.nodes_mut().push(n);
+    }
+    // Only a definition writes the flag; the default is a tab you can open.
+    if !ws.tab {
+        let mut n = KdlNode::new("tab");
+        n.push(KdlEntry::new(false));
         ch.nodes_mut().push(n);
     }
     for n in &ws.nodes {
@@ -1455,6 +1485,95 @@ mod tests {
     }
 
     #[test]
+    fn tab_false_round_trips_and_a_tab_is_the_default() {
+        let ws = NodeId::from_u128(41);
+        let id = NodeId::from_u128(42);
+        let doc = Document::from_kdl(&format!(
+            "workspace \"{ws}\" {{\n  \
+             name \"voice\"\n  tab #false\n  \
+             note \"{id}\" {{ text \"hi\"; pos 1 2; size 30 40 }}\n}}"
+        ))
+        .expect("parses");
+        assert!(!doc.workspaces[0].tab);
+        // The flag is not mistaken for a placed node, and sits with the name.
+        assert_eq!(doc.workspaces[0].nodes.len(), 1);
+
+        let text = doc.to_kdl();
+        assert!(text.contains("tab #false"), "not written: {text}");
+        let body = text.split_once('{').expect("workspace block").1;
+        assert!(
+            body.trim_start().starts_with("name \"voice\"\n"),
+            "name still leads, tab follows:\n{text}"
+        );
+        assert!(!Document::from_kdl(&text).unwrap().workspaces[0].tab);
+
+        // A workspace that never opted out is a tab, and writes no flag — every
+        // `.wk` file written before definitions existed is one of these.
+        let plain = Document::from_kdl(&format!("workspace \"{ws}\" {{\n}}")).expect("parses");
+        assert!(plain.workspaces[0].tab);
+        assert!(!plain.to_kdl().contains("tab"));
+    }
+
+    #[test]
+    fn a_document_of_only_definitions_still_resolves_to_one_tab() {
+        // Nothing in a definitions-only file is openable, but the client draws
+        // its tab list straight from the resolved document — so running one has
+        // to yield a canvas, without rewriting what the author actually wrote.
+        let dir = std::env::temp_dir().join("wk-definitions-only");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let defs = dir.join("defs.wk");
+        let a = NodeId::from_u128(51);
+        let b = NodeId::from_u128(52);
+        std::fs::write(
+            &defs,
+            format!(
+                "workspace \"{a}\" {{\n  name \"voice\"\n  tab #false\n}}\n\
+                 workspace \"{b}\" {{\n  name \"delay\"\n  tab #false\n}}\n"
+            ),
+        )
+        .unwrap();
+
+        let doc = Document::load_resolved(&defs).expect("resolves");
+        assert_eq!(doc.workspaces.len(), 3, "the two definitions plus a tab");
+        assert!(!doc.workspaces[0].tab && !doc.workspaces[1].tab);
+        assert!(doc.workspaces[2].tab, "a scratch tab to open");
+        assert_eq!(doc.workspaces[2].name, None);
+        // Both definitions kept exactly what they said.
+        assert_eq!(doc.workspaces[0].name.as_deref(), Some("voice"));
+        assert_eq!(doc.workspaces[1].name.as_deref(), Some("delay"));
+
+        // A file that already has a tab gets no extra one.
+        let mixed = dir.join("mixed.wk");
+        let c = NodeId::from_u128(53);
+        std::fs::write(
+            &mixed,
+            format!("import \"defs.wk\"\nworkspace \"{c}\" {{\n}}\n"),
+        )
+        .unwrap();
+        let doc = Document::load_resolved(&mixed).expect("resolves");
+        assert_eq!(
+            doc.workspaces.len(),
+            3,
+            "one tab + two imported definitions"
+        );
+        assert_eq!(doc.workspaces.iter().filter(|w| w.tab).count(), 1);
+        // A definition is never the "phantom empty workspace" an import drops:
+        // it comes through with its `tab #false` intact.
+        for id in [a, b] {
+            let ws = doc
+                .workspaces
+                .iter()
+                .find(|w| w.id == id)
+                .expect("imported");
+            assert!(!ws.tab);
+            assert!(doc.imported_workspaces.contains(&id));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_named_workspace_survives_being_imported_and_keeps_its_comment() {
         // Two things a name must not fall foul of: `resolve_into` drops a
         // workspace it judges "empty" (a name alone used to count as empty, so
@@ -1801,6 +1920,7 @@ mod tests {
                 Workspace {
                     id: wa,
                     name: Some("voice".into()),
+                    tab: true,
                     nodes: vec![
                         NodeSnap {
                             id: synth,
@@ -1893,8 +2013,11 @@ mod tests {
                     clipboard_links: Vec::new(),
                     api_links: vec![(synth, net)],
                 },
+                // A definition: it rides along in the same document but is not
+                // a tab, so `tab #false` has to survive the round-trip too.
                 Workspace {
                     id: wb,
+                    tab: false,
                     ..Workspace::new()
                 },
             ],
@@ -2149,6 +2272,7 @@ mod tests {
             // Includes the empty string, which must stay distinguishable from
             // an absent name across the round-trip.
             prop::option::of(value_str()),
+            any::<bool>(),
             prop::collection::vec(node_snap(), 0..6),
             prop::collection::vec(pair(), 0..3),
             prop::collection::vec(pair(), 0..3),
@@ -2156,12 +2280,13 @@ mod tests {
             prop::collection::vec(pair(), 0..3),
         )
             .prop_map(
-                |(id, name, nodes, conns, midi, serves, netlinks)| Workspace {
+                |(id, name, tab, nodes, conns, midi, serves, netlinks)| Workspace {
                     capture_links: netlinks.clone(),
                     clipboard_links: netlinks.clone(),
                     api_links: netlinks.clone(),
                     id,
                     name,
+                    tab,
                     nodes,
                     // Give every generated bind an explicit mount path so the 3rd-arg
                     // round-trip is exercised across the whole document space.
