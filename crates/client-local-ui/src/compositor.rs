@@ -1370,20 +1370,19 @@ impl App {
             .collect()
     }
 
-    /// Palette entries matching the current query (case-insensitive substring
-    /// of the label or the description).
+    /// Palette entries matching the current query, best match first (see
+    /// [`palette_rank`]). The sort is stable, so rows that match equally well
+    /// keep the deliberate order [`Self::palette_all`] built them in.
     fn palette_filtered(&self) -> Vec<PaletteRow> {
-        let q = self.palette_query.to_lowercase();
-        self.palette_all()
+        let mut rows: Vec<(u8, PaletteRow)> = self
+            .palette_all()
             .into_iter()
-            .filter(|r| {
-                q.is_empty()
-                    || r.label.to_lowercase().contains(&q)
-                    || r.desc
-                        .as_ref()
-                        .is_some_and(|d| d.to_lowercase().contains(&q))
+            .filter_map(|r| {
+                palette_rank(&r.label, r.desc.as_deref(), &self.palette_query).map(|s| (s, r))
             })
-            .collect()
+            .collect();
+        rows.sort_by_key(|(score, _)| *score);
+        rows.into_iter().map(|(_, r)| r).collect()
     }
 
     /// Largest valid scroll offset for `len` filtered rows.
