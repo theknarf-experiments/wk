@@ -27,6 +27,13 @@ instead stand for shared resources a plugin can wire to:
 - **HostPort** — a `localhost` port an HTTP node can be served on.
 - **Network / Gateway** — an isolated userspace network (smoltcp). A Gateway
   additionally grants its members access to the real host network.
+- **Router** — wire one to two or more Networks and their members can reach
+  each other, by address and by name, while every node stays on the single
+  network it belongs to. Every fabric address is unique process-wide, so a
+  router grants permission to cross rather than translating anything: no NAT,
+  no subnets. A name on your own net still wins over one across the bridge.
+  `example/router.wk` has curl on one network fetching from a Python server on
+  another.
 
 **Wiring** two nodes does something different depending on their kinds:
 
@@ -36,6 +43,7 @@ instead stand for shared resources a plugin can wire to:
 | node → node             | a MIDI link (source out → destination in)            |
 | HTTP node → HostPort    | serves the node on `127.0.0.1:<port>`                |
 | node → Network/Gateway  | joins the node to that virtual network               |
+| Router → Network        | bridges that network with the router's others        |
 | node → Api              | serves the wk API on the node's network (`api:1337`) |
 
 A document can hold several workspaces (shown as tabs); edits are undoable.

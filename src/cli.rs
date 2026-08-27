@@ -573,6 +573,7 @@ fn kind_label(kind: NodeKind) -> &'static str {
         NodeKind::Port => "hostport",
         NodeKind::Network => "network",
         NodeKind::Gateway => "gateway",
+        NodeKind::Router => "router",
         NodeKind::Iroh => "iroh",
         NodeKind::Veilid => "veilid",
         NodeKind::Note => "note",

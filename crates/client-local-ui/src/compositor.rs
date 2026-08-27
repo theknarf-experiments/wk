@@ -568,8 +568,13 @@ impl App {
             one(Serve, In) // apps serve to a HostPort
         } else if v.net_nodes.contains(&id) {
             one(Net, In) // members join a Network
-        } else if v.uplinks.contains_key(&id) || v.host_services.contains_key(&id) {
-            one(Net, Out) // an uplink dials into (a host service publishes into) a Network
+        } else if v.routers.contains(&id)
+            || v.uplinks.contains_key(&id)
+            || v.host_services.contains_key(&id)
+        {
+            // A router joins Networks the way an uplink does — and unlike any
+            // other member, it may hold several at once.
+            one(Net, Out)
         } else if v.capture_feeds.contains_key(&id) {
             one(Capture, Out) // a Capture node grants apps
         } else if v.clipboard_boards.contains_key(&id) {
@@ -1300,6 +1305,11 @@ impl App {
             PaletteCmd::AddGateway,
         ));
         v.push(PaletteRow::new(
+            "Add Router",
+            d("bridge two networks — their members reach each other, each node stays on its own"),
+            PaletteCmd::AddRouter,
+        ));
+        v.push(PaletteRow::new(
             "Add Iroh Uplink",
             d("extend a network to a remote peer"),
             PaletteCmd::AddIroh,
@@ -1424,6 +1434,8 @@ impl App {
             "gateway".into()
         } else if self.view.net_nodes.contains(&id) {
             "network".into()
+        } else if self.view.routers.contains(&id) {
+            "router".into()
         } else if let Some(u) = self.view.uplinks.get(&id) {
             u.kind.label().to_lowercase()
         } else if self.view.midi_ins.contains_key(&id) {
@@ -1647,6 +1659,14 @@ impl App {
                     kind: NodeKind::Network,
                     pos,
                     ws,
+                }));
+            }
+            PaletteCmd::AddRouter => {
+                let pos = self.view_center([FILE_W, FILE_H], self.view.routers.len());
+                self.conn.send(Command::Create(Resource::Node {
+                    kind: NodeKind::Router,
+                    pos,
+                    ws: self.active_ws,
                 }));
             }
             PaletteCmd::AddGateway => {
@@ -2680,6 +2700,31 @@ impl App {
                         format!("{members} node(s)")
                     },
                     [0.72, 0.62, 0.9, 1.0],
+                ))
+            } else if self.view.routers.contains(&id) {
+                let bridged = self
+                    .view
+                    .net_links
+                    .iter()
+                    .filter(|&&(m, _)| m == id)
+                    .count();
+                Some(Chrome(
+                    NET_BORDER,
+                    NET_BG,
+                    "Router".to_string(),
+                    TEXT,
+                    if bridged < 2 {
+                        // Its own status line says why it is doing nothing:
+                        // one network is not a bridge.
+                        format!("{bridged}/2 networks")
+                    } else {
+                        format!("bridging {bridged}")
+                    },
+                    if bridged < 2 {
+                        [0.55, 0.7, 0.72, 1.0]
+                    } else {
+                        [0.72, 0.62, 0.9, 1.0]
+                    },
                 ))
             } else if let Some(meta) = self.view.uplinks.get(&id) {
                 let (status, status_col) = if meta.peers > 0 {

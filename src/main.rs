@@ -236,6 +236,9 @@ enum CreateKind {
     Port,
     Network,
     Gateway,
+    /// A router: wire it to two or more Networks to let their members reach
+    /// each other, each node staying on its own network
+    Router,
     Iroh,
     Veilid,
     Capture,
@@ -261,6 +264,7 @@ impl CreateKind {
             CreateKind::Port => NodeKind::Port,
             CreateKind::Network => NodeKind::Network,
             CreateKind::Gateway => NodeKind::Gateway,
+            CreateKind::Router => NodeKind::Router,
             CreateKind::Iroh => NodeKind::Iroh,
             CreateKind::Veilid => NodeKind::Veilid,
             CreateKind::Capture => NodeKind::Capture,

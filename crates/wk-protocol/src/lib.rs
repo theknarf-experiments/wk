@@ -222,6 +222,9 @@ pub enum NodeKind {
     Network,
     /// A network whose members get host access.
     Gateway,
+    /// A router: bridges the Networks it is wired to, so nodes on either can
+    /// reach each other while each keeps its own network.
+    Router,
     /// An iroh uplink: extends a Network to a remote fabric over p2p QUIC.
     Iroh,
     /// A Veilid uplink: extends a Network to a remote fabric over Veilid's

@@ -14,6 +14,7 @@ pub(super) enum PaletteCmd {
     AddPort,
     AddNetwork,
     AddGateway,
+    AddRouter,
     AddIroh,
     AddVeilid,
     AddNote,

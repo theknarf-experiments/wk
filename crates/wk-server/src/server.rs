@@ -203,6 +203,8 @@ pub struct View {
     /// instance with the definition's own edges on it.
     pub groups: HashMap<NodeId, GroupInfo>,
     pub net_nodes: HashSet<NodeId>,
+    /// Router nodes: wired to two or more Networks, they bridge them.
+    pub routers: HashSet<NodeId>,
     pub gateways: HashSet<NodeId>,
     pub uplinks: HashMap<NodeId, UplinkMeta>,
     pub connections: Vec<(NodeId, NodeId)>,
@@ -366,6 +368,7 @@ impl View {
             boundary_ports: keep_map(&self.boundary_ports, mine),
             groups: keep_map(&self.groups, mine),
             net_nodes: keep_set(&self.net_nodes, mine),
+            routers: keep_set(&self.routers, mine),
             gateways: keep_set(&self.gateways, mine),
             uplinks: keep_map(&self.uplinks, mine),
             connections: keep_pairs(&self.connections, mine),
@@ -549,6 +552,10 @@ pub enum Kind {
     Port,
     Network,
     Gateway,
+    /// A router: bridges the Networks it is wired to. Unlike every other
+    /// member of a network, it may be wired to several — that is what it is
+    /// for — so its net links are plain pairs, not one-per-source.
+    Router,
     /// An iroh uplink: extends the Network it's wired to onto a remote fabric.
     Iroh,
     /// A Veilid uplink: like Iroh, over Veilid's onion-routed network.
@@ -844,6 +851,9 @@ pub struct Server {
     /// another process). Surfaced in the snapshot so `wk ps`/the UI can warn;
     /// cleared once the port binds or the serve wire is removed.
     port_errors: HashMap<NodeId, String>,
+    /// The fabric-side bridge behind each live Router node. Present only while
+    /// the router is wired to two or more Networks (see `sync_routers`).
+    routers: HashMap<NodeId, Arc<wk_fabric::netstack::RouterPort>>,
     /// Running uplinks (Iroh or Veilid), one per uplink node. Dropping one
     /// closes its endpoint and detaches its trunk.
     uplinks: HashMap<NodeId, UplinkHandle>,
@@ -978,6 +988,7 @@ impl Server {
             api_conn_server: None,
             pending_run: HashSet::new(),
             port_errors: HashMap::new(),
+            routers: HashMap::new(),
             uplinks: HashMap::new(),
             capture_feeds: HashMap::new(),
             clipboard_boards: HashMap::new(),
@@ -1636,6 +1647,14 @@ impl Server {
         self.place(id, Kind::Gateway, ws, pos, [FILE_W, FILE_H]);
     }
 
+    /// Create a Router node at `pos`. It bridges nothing until it is wired to
+    /// two or more Networks.
+    fn add_router_node(&mut self, pos: [f32; 2], ws: NodeId) {
+        let id = self.alloc_id();
+        self.place(id, Kind::Router, ws, pos, [FILE_W, FILE_H]);
+        self.sync_routers();
+    }
+
     /// Create an Iroh uplink node at `pos` with a fresh identity.
     fn add_iroh_node(&mut self, pos: [f32; 2], ws: NodeId) {
         let id = self.alloc_id();
@@ -1797,6 +1816,11 @@ impl Server {
             Some(Kind::HostService) => {
                 self.graph.net_links.retain(|&(svc, _)| svc != id);
                 self.forget(id);
+            }
+            Some(Kind::Router) => {
+                self.graph.net_links.retain(|&(m, _)| m != id);
+                self.forget(id);
+                self.sync_routers();
             }
             Some(Kind::Boundary) => self.remove_boundary_port(id),
             Some(Kind::Group) => self.remove_group(id),
@@ -2119,6 +2143,7 @@ impl Server {
             Some(Kind::File) => NodeClass::File,
             Some(Kind::Port) => NodeClass::Port,
             Some(Kind::Network | Kind::Gateway) => NodeClass::Net,
+            Some(Kind::Router) => NodeClass::Router,
             Some(Kind::Iroh | Kind::Veilid) => NodeClass::Uplink,
             Some(Kind::Capture) => NodeClass::Capture,
             Some(Kind::Clipboard) => NodeClass::Clipboard,
@@ -2188,6 +2213,14 @@ impl Server {
         } else {
             "net"
         };
+        // A router is the one member that may be on several networks at once —
+        // bridging them is what it is — so its wire is a plain pair rather than
+        // the one-per-source toggle every other member uses.
+        if self.kind_of(app_id) == Some(Kind::Router) {
+            wiring::toggle_pair(&mut self.graph.net_links, app_id, net_id);
+            self.sync_routers();
+            return;
+        }
         let joined = wiring::toggle_unique(&mut self.graph.net_links, app_id, net_id)
             // The immediate join is gated on the member's token too, not just
             // the per-tick sync — no one-tick window on the network.
@@ -2243,6 +2276,66 @@ impl Server {
             if g.net != want_net || g.host_access != want_host {
                 g.net = want_net;
                 g.host_access = want_host;
+            }
+        }
+    }
+
+    /// Re-publish every router's networks to the fabric. A router holds one
+    /// hub-side port for as long as it is wired to anything; the port's net
+    /// list is the wires it currently has, filtered by what its token allows,
+    /// so attenuating a router closes the bridge on the next tick.
+    fn sync_routers(&mut self) {
+        let ids: Vec<NodeId> = self
+            .graph
+            .nodes
+            .iter()
+            .filter(|(_, rec)| rec.kind == Kind::Router)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in ids {
+            let wired: Vec<NodeId> = self
+                .graph
+                .net_links
+                .iter()
+                .filter(|&&(member, _)| member == id)
+                .map(|&(_, net)| net)
+                .collect();
+            let nets: Vec<NodeId> = wired
+                .into_iter()
+                .filter(|&net| {
+                    let kind = if self.is_gateway(net) {
+                        "gateway"
+                    } else {
+                        "net"
+                    };
+                    self.node_may_use(id, kind, net, "use")
+                })
+                .collect();
+            match self.routers.get(&id) {
+                // Bridging fewer than two networks is not a bridge; drop the
+                // port so a half-wired router cannot leak anything.
+                _ if nets.len() < 2 => {
+                    if let Some(r) = self.routers.remove(&id) {
+                        self.host.hub().detach_router(&r);
+                    }
+                }
+                Some(r) => r.set_nets(nets),
+                None => {
+                    let r = self.host.hub().attach_router(nets);
+                    self.routers.insert(id, r);
+                }
+            }
+        }
+        // A router that no longer exists takes its bridge with it.
+        let gone: Vec<NodeId> = self
+            .routers
+            .keys()
+            .copied()
+            .filter(|id| self.kind_of(*id) != Some(Kind::Router))
+            .collect();
+        for id in gone {
+            if let Some(r) = self.routers.remove(&id) {
+                self.host.hub().detach_router(&r);
             }
         }
     }
@@ -3153,6 +3246,9 @@ impl Server {
         self.sync_mounts();
         self.sync_midi();
         self.sync_net_membership();
+        // A router's bridge follows its wires and its token, both of which can
+        // change between ticks without a command ever reaching this server.
+        self.sync_routers();
         self.sync_captures();
         self.sync_clipboard();
         self.sync_exec();
@@ -3594,6 +3690,7 @@ impl Server {
                     self.add_net_node(pos, ws);
                 }
                 NodeKind::Gateway => self.add_gateway_node(pos, ws),
+                NodeKind::Router => self.add_router_node(pos, ws),
                 NodeKind::Iroh => self.add_iroh_node(pos, ws),
                 NodeKind::Veilid => self.add_veilid_node(pos, ws),
                 NodeKind::Note => self.add_note(pos, ws),
@@ -3825,6 +3922,7 @@ impl Server {
             },
             Kind::Network => SnapKind::Net { gateway: false },
             Kind::Gateway => SnapKind::Net { gateway: true },
+            Kind::Router => SnapKind::Router,
             Kind::Iroh => SnapKind::Iroh {
                 secret: self.graph.iroh_secrets.get(&id).map(secret_hex),
                 peer: self.peer_ticket(id),
@@ -4102,6 +4200,10 @@ impl Server {
                 };
                 self.place(s.id, kind, ws, s.pos, s.size);
             }
+            SnapKind::Router => {
+                self.place(s.id, Kind::Router, ws, s.pos, s.size);
+                self.sync_routers();
+            }
             SnapKind::Iroh { secret, peer } => {
                 let secret = secret.as_deref().and_then(secret_bytes);
                 self.create_uplink(s.id, secret, s.pos, s.size, ws);
@@ -4367,6 +4469,13 @@ impl Server {
             .filter(|(_, r)| r.kind.is_net())
             .map(|(&id, _)| id)
             .collect();
+        let routers = self
+            .graph
+            .nodes
+            .iter()
+            .filter(|(_, r)| r.kind == Kind::Router)
+            .map(|(&id, _)| id)
+            .collect();
         let gateways = self
             .graph
             .nodes
@@ -4430,6 +4539,7 @@ impl Server {
             boundary_ports: self.graph.boundary_ports.clone(),
             groups: self.group_infos(),
             net_nodes,
+            routers,
             gateways,
             uplinks,
             connections: self.graph.connections.clone(),
@@ -4502,6 +4612,7 @@ impl Server {
                 Some(Kind::Port) => "hostport",
                 Some(Kind::Network) => "network",
                 Some(Kind::Gateway) => "gateway",
+                Some(Kind::Router) => "router",
                 Some(Kind::Iroh) => "iroh",
                 Some(Kind::Veilid) => "veilid",
                 Some(Kind::Note) => "note",
@@ -5963,6 +6074,112 @@ mod model_tests {
         let v2 = full.for_workspace(ws2);
         assert_eq!(v2.host_ports.len(), 1);
         assert_eq!(v2.net_nodes.len(), 0, "ws2 has no network");
+    }
+
+    /// A Router bridges the Networks it is wired to, and only while it is
+    /// wired to at least two: a router with one wire (or none) is not a bridge,
+    /// and must not leave a half-open one behind on the fabric.
+    #[test]
+    fn a_router_bridges_only_while_it_joins_two_networks() {
+        let mut s = fresh_server();
+        let ws = s.graph.workspaces[0];
+        let mk = |s: &mut Server, kind| {
+            let before: HashSet<NodeId> = s.graph.nodes.keys().copied().collect();
+            s.apply(Command::Create(Resource::Node {
+                kind,
+                pos: [10.0, 10.0],
+                ws,
+            }));
+            *s.graph
+                .nodes
+                .keys()
+                .find(|id| !before.contains(id))
+                .expect("a node was created")
+        };
+        let a = mk(&mut s, NodeKind::Network);
+        let b = mk(&mut s, NodeKind::Network);
+        let r = mk(&mut s, NodeKind::Router);
+        assert!(s.view().routers.contains(&r), "the client sees a router");
+        assert!(
+            !s.routers.contains_key(&r),
+            "an unwired router bridges nothing"
+        );
+
+        s.toggle_net(r, a);
+        assert!(
+            !s.routers.contains_key(&r),
+            "one network is not a bridge — and a port with a single net would \
+             let its members reach each other, which they already can"
+        );
+
+        // The second wire opens the bridge. Both nets are on it: unlike every
+        // other member, a router's links accumulate instead of replacing.
+        s.toggle_net(r, b);
+        let port = s.routers.get(&r).expect("wired to two nets, so bridging");
+        let mut nets = port.nets();
+        nets.sort();
+        let mut want = vec![a, b];
+        want.sort();
+        assert_eq!(nets, want);
+
+        // Unwiring closes it again, and so does deleting the router.
+        s.toggle_net(r, b);
+        assert!(
+            !s.routers.contains_key(&r),
+            "back to one net, back to no bridge"
+        );
+        s.toggle_net(r, b);
+        assert!(s.routers.contains_key(&r));
+        s.apply(Command::Delete(ResourceRef::Node(r)));
+        assert!(
+            !s.routers.contains_key(&r),
+            "a deleted router takes its bridge"
+        );
+        assert!(
+            !s.graph.net_links.iter().any(|&(m, _)| m == r),
+            "and its wires"
+        );
+    }
+
+    /// A Router is an ordinary canvas node in the file: it round-trips, and
+    /// its several net wires all survive (the one thing that would break if it
+    /// were saved like any other member, which may only be on one network).
+    #[test]
+    fn a_router_and_its_several_wires_round_trip() {
+        let path = std::env::temp_dir().join("wk-router-roundtrip-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let (ws, a, b, r) = (
+            NodeId::from_u128(301),
+            NodeId::from_u128(302),
+            NodeId::from_u128(303),
+            NodeId::from_u128(304),
+        );
+        std::fs::write(
+            &path,
+            format!(
+                "workspace \"{ws}\" {{\n    \
+                   network \"{a}\" {{ pos 0 0; size 10 10 }}\n    \
+                   network \"{b}\" {{ pos 0 40; size 10 10 }}\n    \
+                   router \"{r}\" {{ pos 60 20; size 10 10 }}\n    \
+                   netlink \"{r}\" \"{a}\"\n    \
+                   netlink \"{r}\" \"{b}\"\n}}\n"
+            ),
+        )
+        .unwrap();
+        Document::load(&path).expect("parses").save(&path).unwrap();
+        let normalized = std::fs::read_to_string(&path).unwrap();
+
+        let s = Server::new(&Document::load(&path).expect("loads"), path.clone())
+            .expect("server constructs");
+        assert_eq!(s.kind_of(r), Some(Kind::Router));
+        assert_eq!(
+            s.routers.get(&r).expect("bridging").nets().len(),
+            2,
+            "both wires reached the fabric"
+        );
+        s.save();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), normalized);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// `view().fs_providers` reports the app nodes whose compiled component

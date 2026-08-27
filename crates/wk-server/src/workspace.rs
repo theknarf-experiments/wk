@@ -379,6 +379,9 @@ pub enum SnapKind {
     Port { port: u16 },
     /// A Network node (or Gateway — a Network granting host access).
     Net { gateway: bool },
+    /// A Router node: wired to two or more Networks, it lets their members
+    /// reach each other while each node keeps the single network it is on.
+    Router,
     /// An uplink node extending a Network to a remote fabric. `secret` is the
     /// persisted identity — Iroh: a hex ed25519 key; Veilid: a DHT owner
     /// keypair string. It keeps the ticket stable across restarts, and anyone
@@ -1234,6 +1237,7 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
         }
         "network" => SnapKind::Net { gateway: false },
         "gateway" => SnapKind::Net { gateway: true },
+        "router" => SnapKind::Router,
         "iroh" => SnapKind::Iroh {
             secret: text("secret"),
             peer: text("peer"),
@@ -1292,6 +1296,7 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         SnapKind::Port { .. } => "hostport",
         SnapKind::Net { gateway: false } => "network",
         SnapKind::Net { gateway: true } => "gateway",
+        SnapKind::Router => "router",
         SnapKind::Iroh { .. } => "iroh",
         SnapKind::Veilid { .. } => "veilid",
         SnapKind::Note { .. } => "note",

@@ -39,6 +39,9 @@ pub enum NodeClass {
     /// rather than inferred, so it carries its own connection kind and the end
     /// of that connection it plays.
     Boundary(PortDir, PortKind),
+    /// A router node: joins Networks like an app does, except it may join
+    /// several — bridging them is the whole point of it.
+    Router,
     /// A `group` node — an **instance** of another workspace. Its edges are the
     /// definition's boundary ports, which are wired in the file's `group` block
     /// by port name; nothing on the live canvas connects to the instance node
@@ -77,8 +80,8 @@ pub fn classify(a: NodeId, b: NodeId, ca: NodeClass, cb: NodeClass) -> Option<Wi
         (Other, Port) => Some(Wire::Serve(a, b)),
         // The app (or uplink, or host service) is the first element; the
         // network the second.
-        (Net, Other) | (Net, Uplink) | (Net, HostSvc) => Some(Wire::Net(b, a)),
-        (Other, Net) | (Uplink, Net) | (HostSvc, Net) => Some(Wire::Net(a, b)),
+        (Net, Other) | (Net, Uplink) | (Net, HostSvc) | (Net, Router) => Some(Wire::Net(b, a)),
+        (Other, Net) | (Uplink, Net) | (HostSvc, Net) | (Router, Net) => Some(Wire::Net(a, b)),
         // The app is the first element; the capture source the second.
         (Capture, Other) => Some(Wire::Capture(b, a)),
         (Other, Capture) => Some(Wire::Capture(a, b)),

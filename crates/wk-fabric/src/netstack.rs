@@ -347,11 +347,34 @@ impl TrunkPort {
     }
 }
 
+/// A router: a node that bridges the virtual networks it is wired to, so a
+/// frame with no owner on its own net can still reach one on a neighbour.
+///
+/// Bridging is this cheap because every fabric address is unique across the
+/// whole process (see [`NetHub::alloc_ip`]) — there are no per-net subnets to
+/// translate between, so a router grants *permission* to cross rather than
+/// rewriting anything. Which is also why isolation is unaffected until someone
+/// wires one: a net no router names is reachable from nowhere else.
+pub struct RouterPort {
+    /// The networks this router joins (follows rewiring via [`Self::set_nets`]).
+    nets: Mutex<Vec<NodeId>>,
+}
+
+impl RouterPort {
+    pub fn nets(&self) -> Vec<NodeId> {
+        self.nets.lock().unwrap().clone()
+    }
+    pub fn set_nets(&self, nets: Vec<NodeId>) {
+        *self.nets.lock().unwrap() = nets;
+    }
+}
+
 /// The network hub: owns every node stack and drives them on a background
 /// thread, routing packets between same-network nodes.
 pub struct NetHub {
     stacks: Mutex<Vec<SharedStack>>,
     trunks: Mutex<Vec<Arc<TrunkPort>>>,
+    routers: Mutex<Vec<Arc<RouterPort>>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -361,6 +384,7 @@ impl NetHub {
         let hub = Arc::new(NetHub {
             stacks: Mutex::new(Vec::new()),
             trunks: Mutex::new(Vec::new()),
+            routers: Mutex::new(Vec::new()),
             stop: Arc::new(AtomicBool::new(false)),
         });
         let driver = hub.clone();
@@ -374,17 +398,34 @@ impl NetHub {
     /// Resolve a node `name` to its IPv4 address on virtual network `net`
     /// (fabric DNS) — the first other node with that name on the same network.
     pub fn resolve(&self, net: NodeId, name: &str) -> Option<Ipv4Address> {
-        self.stacks.lock().unwrap().iter().find_map(|s| {
-            let g = s.lock().unwrap();
-            (g.net == net && g.name == name).then_some(g.ip)
-        })
+        self.named(net, name, |g| g.ip)
     }
 
     /// Like [`resolve`](Self::resolve) but returns the node's fabric IPv6 address.
     pub fn resolve6(&self, net: NodeId, name: &str) -> Option<Ipv6Address> {
-        self.stacks.lock().unwrap().iter().find_map(|s| {
-            let g = s.lock().unwrap();
-            (g.net == net && g.name == name).then_some(g.ip6)
+        self.named(net, name, |g| g.ip6)
+    }
+
+    /// Fabric DNS: the first node called `name` on `net`, else the first on a
+    /// net a router bridges it to. Local names shadow routed ones, so bridging
+    /// two networks can never change who an existing name already meant.
+    fn named<T>(&self, net: NodeId, name: &str, pick: impl Fn(&NodeStack) -> T) -> Option<T> {
+        let stacks = self.stacks.lock().unwrap().clone();
+        let on = |want: NodeId| {
+            stacks.iter().find_map(|s| {
+                let g = s.lock().unwrap();
+                (g.net == want && g.name == name).then(|| pick(&g))
+            })
+        };
+        on(net).or_else(|| {
+            let routers: Vec<Vec<NodeId>> = self
+                .routers
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r.nets())
+                .collect();
+            Self::routed_nets(&routers, net).into_iter().find_map(on)
         })
     }
 
@@ -471,6 +512,46 @@ impl NetHub {
         trunk
     }
 
+    /// Attach a router bridging `nets`: a frame with no owner on one of them
+    /// may be delivered to an owner on another.
+    pub fn attach_router(&self, nets: Vec<NodeId>) -> Arc<RouterPort> {
+        let router = Arc::new(RouterPort {
+            nets: Mutex::new(nets),
+        });
+        self.routers.lock().unwrap().push(router.clone());
+        router
+    }
+
+    /// Remove a router (on unwire / node close); the nets it joined are
+    /// isolated from each other again.
+    pub fn detach_router(&self, router: &Arc<RouterPort>) {
+        self.routers
+            .lock()
+            .unwrap()
+            .retain(|r| !Arc::ptr_eq(r, router));
+    }
+
+    /// Every net reachable from `net` across routers, `net` itself excluded.
+    /// Transitive, so routers chained A-B and B-C put C in A's set — and a set
+    /// rather than a walk, so a ring of routers cannot loop a frame.
+    fn routed_nets(routers: &[Vec<NodeId>], net: NodeId) -> Vec<NodeId> {
+        let mut seen = vec![net];
+        let mut i = 0;
+        while i < seen.len() {
+            let from = seen[i];
+            i += 1;
+            for r in routers.iter().filter(|r| r.contains(&from)) {
+                for &n in r {
+                    if !seen.contains(&n) {
+                        seen.push(n);
+                    }
+                }
+            }
+        }
+        seen.remove(0);
+        seen
+    }
+
     /// Remove a trunk (on unwire / node close); its net's off-fabric frames
     /// drop again.
     pub fn detach_trunk(&self, trunk: &Arc<TrunkPort>) {
@@ -525,11 +606,29 @@ impl NetHub {
         // Frames a trunk injected deliver to local stacks only (split horizon:
         // an unknown dst must not bounce back out to the remote side).
         let trunks: Vec<Arc<TrunkPort>> = self.trunks.lock().unwrap().clone();
+        let routers: Vec<Vec<NodeId>> = self
+            .routers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.nets())
+            .collect();
         let deliver = |net: NodeId, frame: Frame, from_trunk: bool| {
             let Some(dst) = frame_dst(&frame) else { return };
-            if let Some((_, _, _, stack)) = routes.iter().find(|(n, v4, v6, _)| {
-                *n == net && (dst == IpAddress::Ipv4(*v4) || dst == IpAddress::Ipv6(*v6))
-            }) {
+            let owner = |on: NodeId| {
+                routes
+                    .iter()
+                    .find(|(n, v4, v6, _)| {
+                        *n == on && (dst == IpAddress::Ipv4(*v4) || dst == IpAddress::Ipv6(*v6))
+                    })
+                    .map(|(_, _, _, stack)| stack.clone())
+            };
+            // Its own net first, then anything a router bridges it to: a local
+            // address always wins, so wiring a router can never redirect
+            // traffic that was already being delivered.
+            if let Some(stack) =
+                owner(net).or_else(|| Self::routed_nets(&routers, net).into_iter().find_map(owner))
+            {
                 stack.lock().unwrap().device.deliver(frame);
             } else if !from_trunk {
                 for t in trunks.iter().filter(|t| t.net() == net) {
@@ -1101,6 +1200,110 @@ mod tests {
 
     /// Nodes on DIFFERENT virtual networks can't reach each other, even at the
     /// same address — the isolation boundary (off-network packets are dropped).
+    #[test]
+    fn a_router_bridges_two_networks_and_only_those() {
+        // The same shape as `different_networks_are_isolated` — a client and a
+        // server on separate nets — except a router joins the two. Bridging is
+        // permission, not translation: the server keeps its own address.
+        let server_ip = Ipv4Address::new(10, 0, 0, 2);
+        let hub = NetHub::new();
+        let (net_a, net_b, net_c) = (NodeId::new(), NodeId::new(), NodeId::new());
+        let client = hub.attach(net_a, Ipv4Address::new(10, 0, 0, 1), "client");
+        let server = hub.attach(net_b, server_ip, "server");
+        // A third net the router does not name stays sealed off (see below).
+        let outsider = hub.attach(net_c, Ipv4Address::new(10, 0, 0, 3), "server");
+        let _router = hub.attach_router(vec![net_a, net_b]);
+
+        let server_h = {
+            let mut g = server.lock().unwrap();
+            let h = g.sockets.add(tcp_socket());
+            g.sockets.get_mut::<tcp::Socket>(h).listen(80).unwrap();
+            h
+        };
+        let client_h = {
+            let mut g = client.lock().unwrap();
+            let h = g.sockets.add(tcp_socket());
+            let NodeStack { iface, sockets, .. } = &mut *g;
+            sockets
+                .get_mut::<tcp::Socket>(h)
+                .connect(iface.context(), (server_ip, 80), 49152)
+                .unwrap();
+            h
+        };
+        for _ in 0..200 {
+            hub.step();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            client
+                .lock()
+                .unwrap()
+                .sockets
+                .get::<tcp::Socket>(client_h)
+                .state(),
+            tcp::State::Established,
+            "the router should have carried the handshake across"
+        );
+        assert!(server
+            .lock()
+            .unwrap()
+            .sockets
+            .get::<tcp::Socket>(server_h)
+            .is_active());
+
+        // Fabric DNS follows the bridge, and the net the router never named is
+        // not reachable by name either — both "server" nodes exist, and the
+        // client resolves the one across its own router.
+        assert_eq!(hub.resolve(net_a, "server"), Some(server_ip));
+        assert_eq!(hub.resolve(net_c, "client"), None, "net C is not bridged");
+        drop(outsider);
+    }
+
+    /// A name on your own net always wins, so wiring a router cannot silently
+    /// redirect a name that already resolved — the property that keeps two
+    /// instances of one definition from stealing each other's traffic.
+    #[test]
+    fn a_local_name_shadows_one_across_a_router() {
+        let hub = NetHub::new();
+        let (mine, theirs) = (NodeId::new(), NodeId::new());
+        let local = Ipv4Address::new(10, 0, 0, 7);
+        let _near = hub.attach(mine, local, "python");
+        let _far = hub.attach(theirs, Ipv4Address::new(10, 0, 0, 8), "python");
+        let _router = hub.attach_router(vec![mine, theirs]);
+        assert_eq!(hub.resolve(mine, "python"), Some(local));
+    }
+
+    /// Detaching a router re-seals the nets it joined: the bridge is live
+    /// state, so unwiring one in the UI has to take effect immediately.
+    #[test]
+    fn detaching_a_router_reseals_the_nets() {
+        let hub = NetHub::new();
+        let (a, b) = (NodeId::new(), NodeId::new());
+        let _client = hub.attach(a, Ipv4Address::new(10, 0, 0, 1), "client");
+        let server_ip = Ipv4Address::new(10, 0, 0, 2);
+        let _server = hub.attach(b, server_ip, "server");
+        let router = hub.attach_router(vec![a, b]);
+        assert_eq!(hub.resolve(a, "server"), Some(server_ip));
+        hub.detach_router(&router);
+        assert_eq!(hub.resolve(a, "server"), None);
+    }
+
+    /// Routers chained A-B and B-C put C within reach of A, and a ring of them
+    /// terminates rather than looping a frame forever.
+    #[test]
+    fn routed_nets_are_transitive_and_ring_safe() {
+        let (a, b, c) = (NodeId::new(), NodeId::new(), NodeId::new());
+        let chain = vec![vec![a, b], vec![b, c]];
+        let mut reach = NetHub::routed_nets(&chain, a);
+        reach.sort();
+        let mut want = vec![b, c];
+        want.sort();
+        assert_eq!(reach, want, "A reaches C through B");
+
+        let ring = vec![vec![a, b], vec![b, c], vec![c, a]];
+        assert_eq!(NetHub::routed_nets(&ring, a).len(), 2, "each net once");
+    }
+
     #[test]
     fn different_networks_are_isolated() {
         let server_ip = Ipv4Address::new(10, 0, 0, 2);

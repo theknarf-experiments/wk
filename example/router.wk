@@ -1,0 +1,53 @@
+// vim: set filetype=kdl :
+// A router between two networks. `python` sits on net A, `curl` on net B, and
+// neither can see the other — until the router in the middle is wired to both.
+// Bridging is permission, not translation: every node keeps its own address
+// and its own network, which is why a node that may only ever be on ONE
+// network can still be reached from another.
+//
+// curl asks for http://python:8000/hello.txt BY NAME, so this also shows that
+// fabric DNS follows the bridge (a name on your own net still wins).
+//
+// Unwire either side of the router and curl stops resolving.
+//
+// From the repo root:  wk run example/router.wk
+import "../workspace.wk"
+workspace "01RTRNET00000000000000WS01" {
+    name "router demo"
+    node "curl" "01RTRNET00000000000000CR06" {
+        pos 760.0 60.0
+        size 420.0 260.0
+        args "-s" "http://python:8000/hello.txt"
+    }
+    node "python" "01RTRNET00000000000000PY05" {
+        pos 60.0 320.0
+        size 360.0 240.0
+        args "/app/server.py" "8000"
+    }
+    bindmount "example/httpfs-www" "01RTRNET00000000000000BM07" {
+        pos 60.0 120.0
+        size 220.0 120.0
+    }
+    network "01RTRNET00000000000000NA02" {
+        pos 520.0 360.0
+        size 130.0 44.0
+    }
+    network "01RTRNET00000000000000NB03" {
+        pos 520.0 120.0
+        size 130.0 44.0
+    }
+    router "01RTRNET00000000000000RT04" {
+        pos 520.0 240.0
+        size 130.0 44.0
+    }
+    note "01RTRNET00000000000000NT08" {
+        text "python is on net A.\ncurl is on net B.\n\nThe router bridges them, so\ncurl reaches python by name\nacross two networks — each\nnode still on its own.\n\nUnwire the router and the\nname stops resolving."
+        pos 60.0 600.0
+        size 340.0 220.0
+    }
+    connection "01RTRNET00000000000000BM07" "01RTRNET00000000000000PY05" "/app"
+    netlink "01RTRNET00000000000000PY05" "01RTRNET00000000000000NA02"
+    netlink "01RTRNET00000000000000CR06" "01RTRNET00000000000000NB03"
+    netlink "01RTRNET00000000000000RT04" "01RTRNET00000000000000NB03"
+    netlink "01RTRNET00000000000000RT04" "01RTRNET00000000000000NA02"
+}
