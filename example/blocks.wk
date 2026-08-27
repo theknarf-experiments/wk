@@ -1,0 +1,64 @@
+// vim: set filetype=kdl :
+// A workspace used as a building block. `voice` at the bottom of this file is a
+// DEFINITION: `tab #false` means it never opens as a tab of its own, it exists
+// to be instantiated. The tab above uses it twice — two `group "voice"` nodes,
+// each of which stamps out the whole definition (an arpeggiator into a synth)
+// with node ids derived from the group's own id, so the two instances are two
+// independent sets of running nodes.
+//
+// The definition's edge is its `inport "notes" "midi"`: a placed node wired to
+// the arp with an ordinary `midi` line. The call site says what arrives there
+// with `in "notes" "<node id>"` inside the group's block. At load the port
+// itself does not materialize — `piano -> notes` and `notes -> arp` collapse
+// into one live `piano -> arp` wire per instance, which is why one piano drives
+// both voices with nothing else wired.
+//
+// Play the piano: the left voice arpeggiates up, the right one down (each
+// instance keeps its own knob settings, since they are its own nodes).
+// `wk ps` shows them as `voice/arp`, `voice/synth`, `voice2/arp`, `voice2/synth`.
+//
+// example/blocks-imported.wk is this same tab with the definition moved into
+// example/voice.wk and imported — the call site does not change at all.
+//
+// From the repo root:  wk run example/blocks.wk
+import "../workspace.wk"
+workspace "01KZKMBK00000000000000WS01" {
+    node "piano" "01KZKMBK00000000000000PN02" {
+        pos 60.0 360.0
+        size 560.0 220.0
+    }
+    note "01KZKMBK00000000000000NT09" {
+        text "One definition, two instances.\n\n`voice` is a workspace with\n`tab #false`: an inport wired to\nan arp, wired to a synth.\n\nEach violet node below IS that\nworkspace, running. The piano is\nwired into both through their\n\"notes\" ports — drag from the\npiano's midi dot onto a voice's\ndot to wire another one."
+        pos 60.0 60.0
+        size 340.0 260.0
+    }
+    group "voice" "01KZKMBK00000000000000VC03" {
+        in "notes" "01KZKMBK00000000000000PN02"
+        pos 700.0 60.0
+        size 220.0 100.0
+    }
+    group "voice" "01KZKMBK00000000000000VC04" {
+        in "notes" "01KZKMBK00000000000000PN02"
+        pos 700.0 260.0
+        size 220.0 100.0
+    }
+}
+// The building block. Everything below is instantiated, never run on its own.
+workspace "01KZKMBK00000000000000DF05" {
+    name "voice"
+    tab #false
+    inport "notes" "midi" "01KZKMBK00000000000000NP06" {
+        pos 40.0 120.0
+        size 130.0 44.0
+    }
+    node "arp" "01KZKMBK00000000000000AR07" {
+        pos 220.0 60.0
+        size 300.0 200.0
+    }
+    node "synth" "01KZKMBK00000000000000SY08" {
+        pos 580.0 60.0
+        size 360.0 260.0
+    }
+    midi "01KZKMBK00000000000000NP06" "01KZKMBK00000000000000AR07"
+    midi "01KZKMBK00000000000000AR07" "01KZKMBK00000000000000SY08"
+}

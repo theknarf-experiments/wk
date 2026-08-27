@@ -1,0 +1,27 @@
+// vim: set filetype=kdl :
+// A definition on its own: nothing here is a tab, so this file runs nothing.
+// It is a library — `import "voice.wk"` and every workspace in the importing
+// file can write `group "voice" "<some id>"` to instantiate it.
+//
+// This is the same block that example/blocks.wk keeps inline, moved verbatim.
+// See example/blocks-imported.wk for the call site, which is unchanged by the
+// move: a definition is picked by name, and files are not namespaces.
+import "../workspace.wk"
+workspace "01KZKMBK00000000000000DF05" {
+    name "voice"
+    tab #false
+    inport "notes" "midi" "01KZKMBK00000000000000NP06" {
+        pos 40.0 120.0
+        size 130.0 44.0
+    }
+    node "arp" "01KZKMBK00000000000000AR07" {
+        pos 220.0 60.0
+        size 300.0 200.0
+    }
+    node "synth" "01KZKMBK00000000000000SY08" {
+        pos 580.0 60.0
+        size 360.0 260.0
+    }
+    midi "01KZKMBK00000000000000NP06" "01KZKMBK00000000000000AR07"
+    midi "01KZKMBK00000000000000AR07" "01KZKMBK00000000000000SY08"
+}

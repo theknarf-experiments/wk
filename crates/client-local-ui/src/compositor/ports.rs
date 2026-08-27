@@ -53,6 +53,24 @@ pub(super) fn group_status(g: &wk_server::server::GroupInfo) -> String {
 pub(super) struct Port {
     pub(super) kind: PortKind,
     pub(super) dir: PortDir,
+    /// Which of the node's ports this is, in `node_ports` order — the port's
+    /// identity.
+    ///
+    /// Kind and direction used to be identity enough, because no node had two
+    /// ports alike. An *instance* does: it wears the definition's boundary
+    /// ports, and a definition may perfectly well declare two `midi` in-ports
+    /// with different names. Without this the hit-test could not say which of
+    /// them a drag landed on, and `View::groups[id].ports` — which is in the
+    /// definition's file order, the same order [`super::Compositor::node_ports`]
+    /// builds — is what turns the slot back into the port's name.
+    pub(super) slot: usize,
+}
+
+/// A port of a kind and direction, before it knows where on the node it sits.
+/// [`super::Compositor::node_ports`] stamps the slots on in one pass, so no
+/// caller has to count.
+pub(super) fn port(kind: PortKind, dir: PortDir) -> Port {
+    Port { kind, dir, slot: 0 }
 }
 
 /// The y-centres for `n` ports stacked down a node edge (screen rect `r`),

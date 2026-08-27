@@ -24,7 +24,8 @@ use crate::render2d::{Quad, Renderer, TextureId};
 use crate::render3d::{MeshDraw, MeshGpu, Quad3, Renderer3d};
 use crate::text::Fonts;
 use wk_protocol::{
-    Command, NodeId, NodeKind, NodePatch, PortDir, PortKind, Resource, ResourceRef, ViewMode, Wire,
+    BoundaryWire, Command, NodeId, NodeKind, NodePatch, PortDir, PortKind, Resource, ResourceRef,
+    ViewMode, Wire,
 };
 use wk_server::plugin::{
     Key, KeyEvent, PointerButton, PointerEvent, ResizeEvent, ScrollEvent, SharedNode, SharedSurface,
@@ -113,9 +114,11 @@ fn rgba(c: [u8; 3]) -> [f32; 4] {
 enum DragMode {
     Move,
     Resize,
-    /// Dragging a connection wire out of a node's typed output port (of this
-    /// kind) toward a compatible input port on another node.
-    Connect(PortKind),
+    /// Dragging a connection wire out of one of a node's typed output ports
+    /// toward a compatible input port on another node. The whole [`Port`],
+    /// not just its kind: an instance can wear two output ports of one kind,
+    /// and which one the drag left decides which boundary wire it authors.
+    Connect(Port),
 }
 struct Drag {
     id: NodeId,
@@ -330,7 +333,7 @@ struct App {
     /// point to the panel centre.
     drag3d: Option<(NodeId, f32, [f32; 3])>,
     /// A wire drag in progress in 3D, from a node's typed out-port.
-    wire3d: Option<(NodeId, PortKind)>,
+    wire3d: Option<(NodeId, Port)>,
     /// Whether the cursor is currently grabbed+hidden for look mode.
     look_captured: bool,
     /// Last known viewport size in screen px (updated each frame), so newly
@@ -541,11 +544,22 @@ impl App {
     /// can mount volumes (bind in), send/receive MIDI, serve to a HostPort, join
     /// a Network, and receive capture frames; the small widget nodes each expose
     /// the single port their kind participates in.
+    /// A port's `slot` is its index here, stamped on in one pass at the end so
+    /// the hit-test, the drag and the wire lookup all name the same dot even
+    /// when a node wears two ports of one kind and direction.
     fn node_ports(&self, id: NodeId) -> Vec<Port> {
+        let mut ports = self.node_ports_unslotted(id);
+        for (i, p) in ports.iter_mut().enumerate() {
+            p.slot = i;
+        }
+        ports
+    }
+
+    fn node_ports_unslotted(&self, id: NodeId) -> Vec<Port> {
         use PortDir::{In, Out};
         use PortKind::{Api, Bind, Capture, Clipboard, Midi, Net, Serve};
         let v = &self.view;
-        let one = |kind, dir| vec![Port { kind, dir }];
+        let one = |kind, dir| vec![port(kind, dir)];
         if v.notes.contains_key(&id) {
             Vec::new()
         } else if v.file_nodes.contains_key(&id) {
@@ -570,13 +584,7 @@ impl App {
         } else if let Some(g) = v.groups.get(&id) {
             // An instance wears the definition's own boundary ports, facing
             // outward: what the definition calls an in-port is an input here.
-            g.ports
-                .iter()
-                .map(|p| Port {
-                    kind: p.kind,
-                    dir: p.dir,
-                })
-                .collect()
+            g.ports.iter().map(|p| port(p.kind, p.dir)).collect()
         } else if v.midi_ins.contains_key(&id) {
             one(Midi, Out) // a hardware MIDI input drives apps
         } else {
@@ -601,54 +609,30 @@ impl App {
             let serve = node
                 .as_ref()
                 .is_some_and(|n| n.http_path().is_some() || n.imports_net());
-            let mut ports = vec![Port {
-                kind: Bind,
-                dir: In,
-            }];
+            let mut ports = vec![port(Bind, In)];
             if midi {
-                ports.push(Port {
-                    kind: Midi,
-                    dir: In,
-                });
+                ports.push(port(Midi, In));
             }
             if capture {
-                ports.push(Port {
-                    kind: Capture,
-                    dir: In,
-                });
+                ports.push(port(Capture, In));
             }
             if clipboard {
-                ports.push(Port {
-                    kind: Clipboard,
-                    dir: In,
-                });
+                ports.push(port(Clipboard, In));
             }
             if api {
-                ports.push(Port { kind: Api, dir: In });
+                ports.push(port(Api, In));
             }
             if provides_fs {
-                ports.push(Port {
-                    kind: Bind,
-                    dir: Out,
-                });
+                ports.push(port(Bind, Out));
             }
             if midi {
-                ports.push(Port {
-                    kind: Midi,
-                    dir: Out,
-                });
+                ports.push(port(Midi, Out));
             }
             if serve {
-                ports.push(Port {
-                    kind: Serve,
-                    dir: Out,
-                });
+                ports.push(port(Serve, Out));
             }
             if net {
-                ports.push(Port {
-                    kind: Net,
-                    dir: Out,
-                });
+                ports.push(port(Net, Out));
             }
             ports
         }
@@ -671,21 +655,53 @@ impl App {
             })
     }
 
+    /// The screen anchor of one particular port of a node (by slot), if the
+    /// node is placed and has that many ports.
+    fn port_slot_pos(&self, id: NodeId, slot: usize) -> Option<[f32; 2]> {
+        if !self.view.win_pos.contains_key(&id) {
+            return None;
+        }
+        let ports = self.node_ports(id);
+        port_anchors(self.rect_of(id), &ports).get(slot).copied()
+    }
+
     /// The topmost node + port of direction `dir` whose dot is under `mp`. Ports
     /// sit on the node edge (half the disc outside the rect), so they're
     /// hit-tested against the whole disc.
-    fn port_under(&self, mp: [f32; 2], zf: f32, dir: PortDir) -> Option<(NodeId, PortKind)> {
+    fn port_under(&self, mp: [f32; 2], zf: f32, dir: PortDir) -> Option<(NodeId, Port)> {
         for &id in self.z.iter().rev() {
             let r = self.rect_of(id);
             let ports = self.node_ports(id);
             let anchors = port_anchors(r, &ports);
             for (p, a) in ports.iter().zip(&anchors) {
                 if p.dir == dir && near(mp, *a, PORT_R * zf + 3.0) {
-                    return Some((id, p.kind));
+                    return Some((id, *p));
                 }
             }
         }
         None
+    }
+
+    /// Finish a wire drag from one node's port to another's: connect, or
+    /// disconnect if that pair is already joined (the client decides create vs
+    /// delete; the server's create never disconnects). An instance at either
+    /// end makes it a boundary wire instead — one gesture, one command, one
+    /// undo step, whatever the expansion then makes of it.
+    fn finish_wire_drag(&mut self, src: (NodeId, Port), dst: (NodeId, Port)) {
+        if let Some(bw) = boundary_wire_for(&self.view, src, dst) {
+            self.conn.send(if boundary_authored(&self.view, &bw) {
+                Command::Delete(ResourceRef::Boundary(bw))
+            } else {
+                Command::Create(Resource::Boundary(bw))
+            });
+            return;
+        }
+        match self.wire_between(src.0, dst.0) {
+            Some(w) => self.conn.send(Command::Delete(ResourceRef::Wire(w))),
+            None => self
+                .conn
+                .send(Command::Create(Resource::Wire { a: src.0, b: dst.0 })),
+        }
     }
 
     /// Draw a node's typed connection ports as coloured dots — inputs down the
@@ -3117,7 +3133,7 @@ impl App {
                 self.palette_open = false;
                 self.palette_query.clear();
             }
-        } else if let Some((src, kind)) = self.wire3d {
+        } else if let Some((src, from)) = self.wire3d {
             // A wire drag: on release, connect to a node that accepts the kind
             // (its matching input port, or anywhere on such a node); dropping
             // on an already-wired pair removes the wire — 2D's toggle
@@ -3126,22 +3142,17 @@ impl App {
                 self.wire3d = None;
                 if let Some((_, i, _, _, zone)) = best {
                     let p = &panels[i];
-                    let accepts = match zone {
-                        Zone::Port(pi) => {
-                            let (port, _, _) = p.ports[pi];
-                            port.kind == kind && port.dir == PortDir::In
-                        }
-                        _ => p
-                            .ports
-                            .iter()
-                            .any(|&(port, _, _)| port.kind == kind && port.dir == PortDir::In),
+                    let fits = |&(port, _, _): &(Port, f32, f32)| {
+                        port.kind == from.kind && port.dir == PortDir::In
                     };
-                    if accepts && p.id != src {
-                        match self.wire_between(src, p.id) {
-                            Some(w) => self.conn.send(Command::Delete(ResourceRef::Wire(w))),
-                            None => self
-                                .conn
-                                .send(Command::Create(Resource::Wire { a: src, b: p.id })),
+                    let target = match zone {
+                        Zone::Port(pi) => Some(p.ports[pi]).filter(fits),
+                        _ => p.ports.iter().copied().find(fits),
+                    };
+                    if let Some((port, _, _)) = target {
+                        if p.id != src {
+                            let dst = (p.id, port);
+                            self.finish_wire_drag((src, from), dst);
                         }
                     }
                 }
@@ -3178,7 +3189,7 @@ impl App {
                         // Dragging out of an out-port starts a wire.
                         let (port, _, _) = p.ports[pi];
                         if down_edge && port.dir == PortDir::Out {
-                            self.wire3d = Some((p.id, port.kind));
+                            self.wire3d = Some((p.id, port));
                         }
                     }
                     zone => {
@@ -3278,6 +3289,21 @@ impl App {
         // kind's colour.
         let idx: HashMap<NodeId, usize> =
             panels.iter().enumerate().map(|(i, p)| (p.id, i)).collect();
+        let port_at = |p: &Panel, pu: f32, pv: f32| -> [f32; 3] {
+            [
+                p.center[0] + p.right[0] * pu,
+                p.center[1] + pv,
+                p.center[2] + p.right[2] * pu,
+            ]
+        };
+        // One particular port of a panel, by slot — how an instance's dots are
+        // told apart when the definition declares two of one kind.
+        let port_slot_world = |p: &Panel, slot: usize| -> Option<[f32; 3]> {
+            p.ports
+                .iter()
+                .find(|&&(port, _, _)| port.slot == slot)
+                .map(|&(_, pu, pv)| port_at(p, pu, pv))
+        };
         let port_world = |p: &Panel, kind: PortKind, dir: PortDir| -> [f32; 3] {
             match p
                 .ports
@@ -3326,11 +3352,38 @@ impl App {
                 ));
             }
         }
+        // Boundary wires, as on the flat canvas: the live wire they stand for
+        // ends inside the instance, where this room cannot see it.
+        for (&gid, g) in &self.view.groups {
+            for (dir, wires) in [(PortDir::In, &g.in_wires), (PortDir::Out, &g.out_wires)] {
+                for (name, node) in wires {
+                    let Some(slot) = g.ports.iter().position(|p| p.dir == dir && p.name == *name)
+                    else {
+                        continue;
+                    };
+                    let kind = g.ports[slot].kind;
+                    let (Some(&ig), Some(&inode)) = (idx.get(&gid), idx.get(node)) else {
+                        continue;
+                    };
+                    let Some(gp) = port_slot_world(&panels[ig], slot) else {
+                        continue;
+                    };
+                    let far = port_world(&panels[inode], kind, dir.opposite());
+                    let (from, to) = match dir {
+                        PortDir::In => (far, gp),
+                        PortDir::Out => (gp, far),
+                    };
+                    quads3.push(Quad3::ribbon(white, from, to, eye, 0.012, port_color(kind)));
+                }
+            }
+        }
         // The wire being dragged: from its source port to the cursor (the
         // hovered panel's depth, or a fixed reach into the room).
-        if let Some((src, kind)) = self.wire3d {
+        if let Some((src, sport)) = self.wire3d {
             if let Some(sp) = panels.iter().find(|p| p.id == src) {
-                let from = port_world(sp, kind, PortDir::Out);
+                let kind = sport.kind;
+                let from = port_slot_world(sp, sport.slot)
+                    .unwrap_or_else(|| port_world(sp, kind, PortDir::Out));
                 let reach = best.map(|(t, ..)| t).unwrap_or(2.5);
                 let to = [
                     o[0] + d[0] * reach,
@@ -3938,29 +3991,20 @@ impl App {
                 DragMode::Connect(_) if lmb => self.drag = Some(d),
                 // Released: wire to a target that accepts this kind — its matching
                 // input port, or anywhere on a node that has one, for convenience.
-                // Dragging over an existing wire removes it (the client decides
-                // create vs delete; the server's create never disconnects).
-                DragMode::Connect(kind) => {
+                DragMode::Connect(from) => {
                     let target = self
                         .port_under(mp, zf, PortDir::In)
-                        .filter(|&(_, k)| k == kind)
-                        .map(|(t, _)| t)
+                        .filter(|&(_, p)| p.kind == from.kind)
                         .or_else(|| {
-                            self.topmost_under(mp).filter(|&t| {
-                                self.node_ports(t)
-                                    .iter()
-                                    .any(|p| p.kind == kind && p.dir == PortDir::In)
-                            })
+                            let t = self.topmost_under(mp)?;
+                            let p = self
+                                .node_ports(t)
+                                .into_iter()
+                                .find(|p| p.kind == from.kind && p.dir == PortDir::In)?;
+                            Some((t, p))
                         });
-                    if let Some(target) = target {
-                        if target != d.id {
-                            match self.wire_between(d.id, target) {
-                                Some(w) => self.conn.send(Command::Delete(ResourceRef::Wire(w))),
-                                None => self
-                                    .conn
-                                    .send(Command::Create(Resource::Wire { a: d.id, b: target })),
-                            }
-                        }
+                    if let Some(target) = target.filter(|&(t, _)| t != d.id) {
+                        self.finish_wire_drag((d.id, from), target);
                     }
                 }
                 _ => {} // move/resize released: drop the drag
@@ -4111,12 +4155,12 @@ impl App {
             // Checked before the node-body hit-test so the port's outer half
             // (past the edge) is grabbable too.
             if !consumed {
-                if let Some((id, kind)) = self.port_under(mp, zf, PortDir::Out) {
+                if let Some((id, p)) = self.port_under(mp, zf, PortDir::Out) {
                     self.z.retain(|&x| x != id);
                     self.z.push(id);
                     self.drag = Some(Drag {
                         id,
-                        mode: DragMode::Connect(kind),
+                        mode: DragMode::Connect(p),
                         grab: [0.0, 0.0],
                     });
                     consumed = true;
@@ -4432,6 +4476,33 @@ impl App {
                 let sel = self.wire_sel == Some(Wire::Net(app, net));
                 let col = if sel { WIRE_SEL_COL } else { NET_WIRE_COL };
                 draw_connection(&mut quads, white, a, b, sel, col, zf, full);
+            }
+        }
+
+        // Boundary wires: a neighbour joined to one of an instance's ports.
+        // The live wire this becomes lands on a node *inside* the instance, so
+        // it is not on this canvas at all — without drawing the authored line
+        // the tab would show an instance connected to nothing.
+        for (&gid, g) in &self.view.groups {
+            for (dir, wires) in [(PortDir::In, &g.in_wires), (PortDir::Out, &g.out_wires)] {
+                for (name, node) in wires {
+                    let Some(slot) = g.ports.iter().position(|p| p.dir == dir && p.name == *name)
+                    else {
+                        continue; // a port the definition no longer declares
+                    };
+                    let kind = g.ports[slot].kind;
+                    let (Some(gp), true) = (
+                        self.port_slot_pos(gid, slot),
+                        self.view.win_pos.contains_key(node),
+                    ) else {
+                        continue;
+                    };
+                    let (a, b) = match dir {
+                        PortDir::In => (self.port_pos(*node, kind, PortDir::Out), gp),
+                        PortDir::Out => (gp, self.port_pos(*node, kind, PortDir::In)),
+                    };
+                    draw_connection(&mut quads, white, a, b, false, port_color(kind), zf, full);
+                }
             }
         }
 
@@ -5225,15 +5296,17 @@ impl App {
         // The wire being dragged out of a typed output port toward the cursor —
         // same curved arrow as a finished connection, in that kind's colour.
         if let Some(d) = &self.drag {
-            if let DragMode::Connect(kind) = d.mode {
-                let from = self.port_pos(d.id, kind, PortDir::Out);
+            if let DragMode::Connect(p) = d.mode {
+                let from = self
+                    .port_slot_pos(d.id, p.slot)
+                    .unwrap_or_else(|| self.port_pos(d.id, p.kind, PortDir::Out));
                 draw_connection(
                     &mut quads,
                     white,
                     from,
                     mp,
                     false,
-                    port_color(kind),
+                    port_color(p.kind),
                     zf,
                     full,
                 );
@@ -6569,6 +6642,51 @@ impl wk_protocol::Client<ServerHandle> for WindowClient {
     }
 }
 
+/// The boundary wire a drag from `src`'s port to `dst`'s port would author, if
+/// either end is an instance.
+///
+/// An instance has no wireable node of its own: its dots are the *definition's*
+/// boundary ports, and what joins one to a neighbour is a line in the group's
+/// block naming that port. Dropping on an instance's input dot writes
+/// `in "<port>" "<the other node>"`; dragging out of one of its output dots
+/// writes `out`. Which port is decided by the dot's slot, not its kind — a
+/// definition may declare two `midi` in-ports, and they are different edges.
+///
+/// Two instances give `None`: a boundary wire names one port and one node, so
+/// it has no way to say which port of the far group it meant.
+fn boundary_wire_for(v: &View, src: (NodeId, Port), dst: (NodeId, Port)) -> Option<BoundaryWire> {
+    let name = |(id, p): (NodeId, Port)| -> Option<String> {
+        Some(v.groups.get(&id)?.ports.get(p.slot)?.name.clone())
+    };
+    match (v.groups.contains_key(&src.0), v.groups.contains_key(&dst.0)) {
+        (false, true) => Some(BoundaryWire {
+            group: dst.0,
+            dir: PortDir::In,
+            port: name(dst)?,
+            node: src.0,
+        }),
+        (true, false) => Some(BoundaryWire {
+            group: src.0,
+            dir: PortDir::Out,
+            port: name(src)?,
+            node: dst.0,
+        }),
+        _ => None,
+    }
+}
+
+/// Whether a group's block already holds this exact line — a second drag over
+/// the same pair takes it away again, as it does for an ordinary wire.
+fn boundary_authored(v: &View, bw: &BoundaryWire) -> bool {
+    v.groups.get(&bw.group).is_some_and(|g| {
+        let wires = match bw.dir {
+            PortDir::In => &g.in_wires,
+            PortDir::Out => &g.out_wires,
+        };
+        wires.iter().any(|(p, n)| *p == bw.port && *n == bw.node)
+    })
+}
+
 /// The in-app path a bind wire mounts at: the per-connection override if set,
 /// else the source's own name — a file node's name, or an fs-provider app's
 /// (mirrors the server's `mount_path_for`).
@@ -6666,18 +6784,9 @@ mod inspect_tests {
     fn port_anchors_split_left_and_right_by_direction() {
         let r = [10.0, 100.0, 60.0, 200.0];
         let ports = vec![
-            Port {
-                kind: PortKind::Bind,
-                dir: PortDir::In,
-            },
-            Port {
-                kind: PortKind::Midi,
-                dir: PortDir::Out,
-            },
-            Port {
-                kind: PortKind::Midi,
-                dir: PortDir::In,
-            },
+            port(PortKind::Bind, PortDir::In),
+            port(PortKind::Midi, PortDir::Out),
+            port(PortKind::Midi, PortDir::In),
         ];
         let a = port_anchors(r, &ports);
         assert_eq!(a[0][0], r[0], "bind-in on the left edge");
@@ -6773,6 +6882,75 @@ mod inspect_tests {
             Some("srv")
         );
         assert_eq!(provider_serving(&v, app, "/srv"), None);
+    }
+
+    /// Dragging onto (or out of) an instance's port disc authors a boundary
+    /// wire naming *that* port — which is why a port's slot is its identity: a
+    /// definition may declare two ports of one kind, and a hit-test that knew
+    /// only "a midi input" could not say which of them the drag landed on.
+    #[test]
+    fn a_drag_touching_an_instance_names_the_port_it_landed_on() {
+        use wk_server::server::{BoundaryPort, GroupInfo};
+        let (inst, other, piano) = (NodeId::new(), NodeId::new(), NodeId::new());
+        let midi_in = |name: &str| BoundaryPort {
+            name: name.to_string(),
+            dir: PortDir::In,
+            kind: PortKind::Midi,
+        };
+        let mut v = View::default();
+        v.groups.insert(
+            inst,
+            GroupInfo {
+                definition: "voice".into(),
+                // Two in-ports of one kind: distinguishable only by slot.
+                ports: vec![
+                    midi_in("notes"),
+                    midi_in("clock"),
+                    BoundaryPort {
+                        name: "audio".into(),
+                        dir: PortDir::Out,
+                        kind: PortKind::Midi,
+                    },
+                ],
+                in_wires: vec![("clock".to_string(), piano)],
+                out_wires: Vec::new(),
+                nodes: 2,
+            },
+        );
+        let p = |slot| Port {
+            kind: PortKind::Midi,
+            dir: PortDir::In,
+            slot,
+        };
+        // Dropping on the second dot wires the second port, not the first.
+        let bw = boundary_wire_for(&v, (piano, p(0)), (inst, p(1))).expect("a boundary wire");
+        assert_eq!(
+            (bw.group, bw.dir, &*bw.port, bw.node),
+            (inst, PortDir::In, "clock", piano)
+        );
+        // ...and that line is already written, so the drag is a disconnect.
+        assert!(boundary_authored(&v, &bw));
+        let fresh = boundary_wire_for(&v, (piano, p(0)), (inst, p(0))).expect("a boundary wire");
+        assert_eq!(&*fresh.port, "notes");
+        assert!(!boundary_authored(&v, &fresh));
+
+        // Dragging *out* of an instance is its out-port reaching a neighbour.
+        let out = Port {
+            kind: PortKind::Midi,
+            dir: PortDir::Out,
+            slot: 2,
+        };
+        let bw = boundary_wire_for(&v, (inst, out), (other, p(0))).expect("a boundary wire");
+        assert_eq!(
+            (bw.group, bw.dir, &*bw.port, bw.node),
+            (inst, PortDir::Out, "audio", other)
+        );
+
+        // Two ordinary nodes are an ordinary wire, and two instances are
+        // nothing: the line could not say which port of the far group it meant.
+        assert!(boundary_wire_for(&v, (piano, p(0)), (other, p(0))).is_none());
+        v.groups.insert(other, v.groups[&inst].clone());
+        assert!(boundary_wire_for(&v, (inst, out), (other, p(0))).is_none());
     }
 
     /// The log panel strips ANSI escapes, normalises control bytes, and hard-

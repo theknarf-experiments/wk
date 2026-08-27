@@ -277,16 +277,44 @@ pub enum Resource {
     /// A new (empty) workspace with a client-minted id, so the client can switch
     /// its own view to the new tab immediately.
     Workspace { id: NodeId },
+    /// One line of a `group` block: a node on the instance's own canvas wired
+    /// to one of the definition's boundary ports.
+    Boundary(BoundaryWire),
 }
 
 /// A reference to an existing resource (for deletes).
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ResourceRef {
     Node(NodeId),
     Wire(Wire),
     /// Deleting a workspace removes every node in it. Ignored for the last
     /// workspace (a document always keeps at least one).
     Workspace(NodeId),
+    /// The `in`/`out` line naming exactly this port and node — a boundary wire
+    /// has no id of its own, so it is referred to by what it joins.
+    Boundary(BoundaryWire),
+}
+
+/// A **boundary wire**: `in "notes" "<node id>"` inside a `group` block, one
+/// node of the instance's own canvas joined to one of the definition's named
+/// boundary ports.
+///
+/// It is not a [`Wire`] and never becomes one. A wire joins two live nodes; a
+/// boundary wire is *authored* state on the group node, and what it produces is
+/// decided by the expansion — the port collapses away and the wires that
+/// crossed it land on the definition's inner nodes, one per node the port
+/// reaches (see `wk_server::instancing`). That is why it is its own resource:
+/// creating it edits the `.wk` file's `group` block, not the live graph.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct BoundaryWire {
+    /// The `group` node whose block the line is written in.
+    pub group: NodeId,
+    /// Which edge of the definition the port sits on — `in` or `out`.
+    pub dir: PortDir,
+    /// The port's name, as the definition's `inport`/`outport` line declares it.
+    pub port: String,
+    /// The node on the group's own canvas at the other end.
+    pub node: NodeId,
 }
 
 /// A partial update to a node; only the present fields change.
@@ -417,7 +445,11 @@ impl Command {
             Command::Create(Resource::Node { .. } | Resource::HostMount { .. }) => {
                 (ResourceKind::Node, Action::Create)
             }
-            Command::Create(Resource::Wire { .. }) => (ResourceKind::Wire, Action::Create),
+            // A boundary wire is a connection like any other as far as
+            // authority goes: it decides what crosses an instance's edge.
+            Command::Create(Resource::Wire { .. } | Resource::Boundary(_)) => {
+                (ResourceKind::Wire, Action::Create)
+            }
             Command::Create(Resource::Workspace { .. }) => {
                 (ResourceKind::Workspace, Action::Create)
             }
@@ -436,7 +468,9 @@ impl Command {
                 }
             }
             Command::Delete(ResourceRef::Node(_)) => (ResourceKind::Node, Action::Delete),
-            Command::Delete(ResourceRef::Wire(_)) => (ResourceKind::Wire, Action::Delete),
+            Command::Delete(ResourceRef::Wire(_) | ResourceRef::Boundary(_)) => {
+                (ResourceKind::Wire, Action::Delete)
+            }
             // Reconfiguring a bind's mount path or a serve's container port
             // modifies that wire.
             Command::SetMount { .. } | Command::SetServePort { .. } => {

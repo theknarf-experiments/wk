@@ -19,7 +19,8 @@ use crate::workspace::{
     secret_bytes, secret_hex, Dependency, Document, NodeSnap, SnapKind, Workspace,
 };
 use wk_protocol::{
-    Command, NodeId, NodeKind, PortDir, PortKind, Resource, ResourceRef, ViewMode, Wire,
+    BoundaryWire, Command, NodeId, NodeKind, PortDir, PortKind, Resource, ResourceRef, ViewMode,
+    Wire,
 };
 
 /// Default canvas size of a file / port / network node, in canvas pixels.
@@ -422,6 +423,25 @@ enum WireRel {
     ApiLink,
 }
 
+/// Every wire a saved workspace holds, tagged with the relation it belongs to.
+/// The `.wk` file keeps one list per relation; a caller that treats wires
+/// uniformly — deciding which of an instance's wires an edit added or took
+/// away, spotting the ones that touch an unplaced node — wants them flat.
+fn wires_of(saved: &Workspace) -> Vec<(WireRel, NodeId, NodeId)> {
+    [
+        (WireRel::Connection, &saved.connections),
+        (WireRel::Midi, &saved.midi),
+        (WireRel::Serve, &saved.serves),
+        (WireRel::NetLink, &saved.net_links),
+        (WireRel::CaptureLink, &saved.capture_links),
+        (WireRel::ClipboardLink, &saved.clipboard_links),
+        (WireRel::ApiLink, &saved.api_links),
+    ]
+    .into_iter()
+    .flat_map(|(rel, pairs)| pairs.iter().map(move |&(a, b)| (rel, a, b)))
+    .collect()
+}
+
 /// The two node ids a [`Wire`] joins.
 fn wire_ends(w: Wire) -> (NodeId, NodeId) {
     match w {
@@ -473,6 +493,10 @@ enum Undo {
     },
     /// Restore a node's previous capability token (`None` = the default).
     Token(NodeId, Option<Vec<u8>>),
+    /// Put a `group`'s boundary wire back the way it was: `true` re-authors the
+    /// `in`/`out` line, `false` takes it away again. One entry per edit, not
+    /// per live wire the re-expansion moved — the line is what the user drew.
+    Boundary(BoundaryWire, bool),
     /// Remove the nodes a create added. A list rather than one id because a
     /// create can produce a whole tree — a `group` node plus every node its
     /// instance expanded to — and [`Command::Undo`] pops exactly one entry, so
@@ -509,6 +533,11 @@ struct Snapshot {
     file_data: Vec<u8>,
     /// Every connection the node was part of, as raw node pairs.
     wires: Vec<(NodeId, NodeId)>,
+    /// Every `group` line that named this node. A boundary wire is authored
+    /// state on the *group*, not a wire between two nodes, so `wires` cannot
+    /// hold it — and without it, undoing a delete would bring the node back
+    /// with its instances no longer wired to it.
+    boundary: Vec<BoundaryWire>,
 }
 
 /// What kind of node this is. The base fact that used to be inferred by probing
@@ -694,6 +723,13 @@ pub struct BoundaryPort {
 pub struct GroupInfo {
     pub definition: String,
     pub ports: Vec<BoundaryPort>,
+    /// The boundary wires this canvas has authored, by port name — what the
+    /// `in`/`out` lines of the group's block say. A client draws these itself:
+    /// the live wire they become lands on a *derived* node, which is in the
+    /// instance rather than on this canvas, so nothing else on the tab would
+    /// show that the instance is connected at all.
+    pub in_wires: Vec<(String, NodeId)>,
+    pub out_wires: Vec<(String, NodeId)>,
     /// Live nodes in this instance and everything nested inside it. Zero means
     /// the definition is empty — or that the expansion could not resolve.
     pub nodes: usize,
@@ -1003,19 +1039,9 @@ impl Server {
             .filter(|(w, _)| *w == saved.id)
             .map(|(_, s)| s.id)
             .collect();
-        for (rel, pairs) in [
-            (WireRel::Connection, &saved.connections),
-            (WireRel::Midi, &saved.midi),
-            (WireRel::Serve, &saved.serves),
-            (WireRel::NetLink, &saved.net_links),
-            (WireRel::CaptureLink, &saved.capture_links),
-            (WireRel::ClipboardLink, &saved.clipboard_links),
-            (WireRel::ApiLink, &saved.api_links),
-        ] {
-            for &(a, b) in pairs {
-                if orphan.contains(&a) || orphan.contains(&b) {
-                    self.unplaced_wires.push((saved.id, rel, a, b));
-                }
+        for (rel, a, b) in wires_of(saved) {
+            if orphan.contains(&a) || orphan.contains(&b) {
+                self.unplaced_wires.push((saved.id, rel, a, b));
             }
         }
         self.apply_wires(saved);
@@ -1114,6 +1140,52 @@ impl Server {
         made
     }
 
+    /// Resolve what one `group` node stands for, without materializing any of
+    /// it: the definition's content under derived ids, its nested instances,
+    /// and its boundary wires already collapsed onto this canvas's nodes.
+    ///
+    /// The document handed to the expander is the authored definitions plus
+    /// *this* canvas — every node of it except the other groups, which each
+    /// resolve on their own and would otherwise come back as a second copy of
+    /// an instance that is already live. The canvas has to be there because a
+    /// boundary wire is typechecked against the node on its far end.
+    fn resolve_group(
+        &self,
+        ws: NodeId,
+        id: NodeId,
+    ) -> Result<Vec<crate::instancing::Instance>, String> {
+        let mut nodes: Vec<NodeSnap> = self
+            .graph
+            .nodes
+            .iter()
+            .filter(|(&n, rec)| rec.ws == ws && (n == id || rec.kind != Kind::Group))
+            .filter_map(|(&n, _)| self.node_snap(n))
+            .collect();
+        // A node the file holds but the runtime could not place is still a
+        // legal endpoint: the wire to it is preserved for when it can
+        // materialize, and refusing the expansion here would take the whole
+        // instance down with one unresolved dependency.
+        nodes.extend(
+            self.unplaced
+                .iter()
+                .filter(|(w, _)| *w == ws)
+                .map(|(_, s)| s.clone()),
+        );
+        // `graph.nodes` is a hash map, so sort: nothing about an expansion
+        // should depend on the order two unrelated neighbours came out in.
+        nodes.sort_by_key(|n| n.id);
+        let mut workspaces: Vec<Workspace> = self.authored.iter().map(|(_, w)| w.clone()).collect();
+        workspaces.push(Workspace {
+            id: ws,
+            nodes,
+            ..Workspace::new()
+        });
+        crate::instancing::expand(&Document {
+            workspaces,
+            ..Document::empty()
+        })
+    }
+
     /// Bring one `group` node's instance to life: the definition's nodes under
     /// derived ids, in the instance's own workspace, plus the wiring — the
     /// definition's own, and the boundary wires already collapsed onto this
@@ -1126,26 +1198,10 @@ impl Server {
         if self.instances.contains_key(&id) {
             return; // already live
         }
-        let Some(snap) = self.node_snap(id) else {
-            return;
-        };
-        // The definitions live in `authored` (the runtime models nothing else
-        // about them); the group goes into a workspace of its own so `expand`
-        // sees exactly this one instance tree.
-        let mut workspaces: Vec<Workspace> = self.authored.iter().map(|(_, w)| w.clone()).collect();
-        workspaces.push(Workspace {
-            id: ws,
-            nodes: vec![snap],
-            ..Workspace::new()
-        });
-        let doc = Document {
-            workspaces,
-            ..Document::empty()
-        };
-        // `Server::new` already refused a document whose instancing does not
-        // resolve, so this only fires for a group built at runtime.
-        let instances = match crate::instancing::expand(&doc) {
+        let instances = match self.resolve_group(ws, id) {
             Ok(instances) => instances,
+            // `Server::new` already refused a document whose instancing does
+            // not resolve, so this only fires for a group edited at runtime.
             Err(e) => {
                 eprintln!("wk: cannot expand group: {e}");
                 return;
@@ -1174,6 +1230,91 @@ impl Server {
                 rec.wires = made;
             }
         }
+    }
+
+    /// Whether this exact `in`/`out` line is already written in its group.
+    fn boundary_wired(&self, bw: &BoundaryWire) -> bool {
+        self.graph.groups.get(&bw.group).is_some_and(|g| {
+            let list = match bw.dir {
+                PortDir::In => &g.in_wires,
+                PortDir::Out => &g.out_wires,
+            };
+            list.iter().any(|(p, n)| *p == bw.port && *n == bw.node)
+        })
+    }
+
+    /// Author (or unauthor) one line of a `group`'s block — a boundary wire —
+    /// and bring the instance's live wiring in line with it.
+    ///
+    /// The edit is to the *group node*, not to the graph: `in "notes" "<id>"`
+    /// is what the `.wk` file holds and what [`Self::save`] writes back. What
+    /// it produces is decided by re-resolving the instance, so a wire the
+    /// author adds through the canvas and one they type into the file take
+    /// exactly the same path.
+    ///
+    /// A line the expansion refuses (a port that isn't there, a neighbour that
+    /// can't form that kind of connection) is rolled back and reported rather
+    /// than left in a group that no longer expands.
+    fn set_boundary_wire(&mut self, bw: &BoundaryWire, wired: bool) {
+        let Some(ws) = self.graph.nodes.get(&bw.group).map(|rec| rec.ws) else {
+            return;
+        };
+        let Some(before) = self.graph.groups.get(&bw.group).cloned() else {
+            eprintln!("wk: {} is not an instance", bw.group);
+            return;
+        };
+        let g = self.graph.groups.get_mut(&bw.group).expect("just cloned");
+        let list = match bw.dir {
+            PortDir::In => &mut g.in_wires,
+            PortDir::Out => &mut g.out_wires,
+        };
+        let at = list
+            .iter()
+            .position(|(p, n)| *p == bw.port && *n == bw.node);
+        match (wired, at) {
+            (true, None) => list.push((bw.port.clone(), bw.node)),
+            (false, Some(i)) => {
+                list.remove(i);
+            }
+            // Already as asked: no edit, and no re-expansion to churn the
+            // instance's wiring for nothing.
+            _ => return,
+        }
+        if let Err(e) = self.rewire_group(ws, bw.group) {
+            eprintln!("wk: {e}");
+            // Nothing was applied — the expansion failed before it touched the
+            // graph — so putting the authored lines back is the whole undo.
+            self.graph.groups.insert(bw.group, before);
+        }
+    }
+
+    /// Re-resolve a live instance and move its wiring to match, leaving its
+    /// nodes (and their guests) alone.
+    ///
+    /// A boundary wire decides which wires an instance has, never which nodes:
+    /// the derived ids come from the definition and the group's id, so they are
+    /// the same before and after. Tearing the instance down and expanding it
+    /// again would give the same answer — and restart every guest inside it to
+    /// get there.
+    fn rewire_group(&mut self, ws: NodeId, id: NodeId) -> Result<(), String> {
+        for inst in self.resolve_group(ws, id)? {
+            let want = wires_of(&inst.content);
+            // Not live (its expansion failed at load): nothing to move.
+            let Some(rec) = self.instances.get_mut(&inst.id) else {
+                continue;
+            };
+            let had = std::mem::take(&mut rec.wires);
+            for &(rel, a, b) in had.iter().filter(|w| !want.contains(w)) {
+                self.unwire_rel(rel, a, b);
+            }
+            let mut kept: Vec<(WireRel, NodeId, NodeId)> =
+                had.into_iter().filter(|w| want.contains(w)).collect();
+            kept.extend(self.apply_wires(&inst.content));
+            if let Some(rec) = self.instances.get_mut(&inst.id) {
+                rec.wires = kept;
+            }
+        }
+        Ok(())
     }
 
     /// Remove a `group` node: tear down the instance it stands for (and every
@@ -2898,6 +3039,14 @@ impl Server {
         self.graph.note_text.remove(&id);
         self.graph.host_services.remove(&id);
         self.graph.boundary_ports.remove(&id);
+        // A boundary wire is a wire: it goes with the node it named. Left
+        // behind, the group would keep drawing a line to nothing, and the file
+        // it is saved into would no longer load — an `in`/`out` line whose far
+        // end is not on the canvas is refused at load, on purpose.
+        for g in self.graph.groups.values_mut() {
+            g.in_wires.retain(|(_, n)| *n != id);
+            g.out_wires.retain(|(_, n)| *n != id);
+        }
         if let Some((kill, _)) = self.host_service_serves.remove(&id) {
             kill.store(true, Ordering::Relaxed);
         }
@@ -3296,6 +3445,21 @@ impl Server {
                     self.record(Undo::DropWorkspace(*id));
                 }
             }
+            // Authoring or removing a boundary wire is one edit and one undo
+            // entry, however many live wires the re-expansion moves: the line
+            // in the file is the thing that changed. Recorded *after* the fact
+            // — the expansion may refuse the line, and a refusal that still
+            // cost a press of Ctrl-Z would undo the edit before it instead.
+            Command::Create(Resource::Boundary(bw))
+            | Command::Delete(ResourceRef::Boundary(bw)) => {
+                let line = bw.clone();
+                let before = self.boundary_wired(&line);
+                self.dispatch(cmd);
+                if self.boundary_wired(&line) != before {
+                    self.record(Undo::Boundary(line, before));
+                }
+                return;
+            }
             Command::Update { id, patch } => {
                 if patch.pos.is_some() {
                     if let Some(rec) = self.graph.nodes.get(id) {
@@ -3380,6 +3544,14 @@ impl Server {
         match cmd {
             Command::Delete(ResourceRef::Node(id)) | Command::Duplicate(id) => inside(*id),
             Command::Create(Resource::Wire { a, b }) => inside(*a).or_else(|| inside(*b)),
+            // A boundary wire on a group that is itself inside an instance is
+            // the *definition's* line, not this canvas's: it would apply live
+            // and be gone on the next load, since nothing derived is written
+            // back. The far end is checked too — it is a node like any other.
+            Command::Create(Resource::Boundary(bw))
+            | Command::Delete(ResourceRef::Boundary(bw)) => {
+                inside(bw.group).or_else(|| inside(bw.node))
+            }
             Command::Delete(ResourceRef::Wire(w)) => {
                 let (a, b) = wire_ends(*w);
                 inside(a).or_else(|| inside(b))
@@ -3482,6 +3654,8 @@ impl Server {
                     }
                 }
             }
+            Command::Create(Resource::Boundary(bw)) => self.set_boundary_wire(&bw, true),
+            Command::Delete(ResourceRef::Boundary(bw)) => self.set_boundary_wire(&bw, false),
             Command::Delete(ResourceRef::Node(id)) => self.remove_any(id),
             Command::Delete(ResourceRef::Wire(w)) => self.disconnect_wire(w),
             Command::Delete(ResourceRef::Workspace(id)) => self.remove_workspace(id),
@@ -3594,6 +3768,7 @@ impl Server {
                     }
                 }
             }
+            Undo::Boundary(bw, wired) => self.set_boundary_wire(&bw, wired),
             Undo::Recreate(s) => self.recreate(*s),
             Undo::DropWorkspace(id) => self.remove_workspace(id),
             Undo::RecreateWorkspace(s) => self.recreate_workspace(*s),
@@ -3757,11 +3932,25 @@ impl Server {
                 .iter()
                 .filter(|&&(a, n)| a == id || n == id),
         );
+        let mut boundary: Vec<BoundaryWire> = Vec::new();
+        for (&group, g) in &self.graph.groups {
+            for (dir, wires) in [(PortDir::In, &g.in_wires), (PortDir::Out, &g.out_wires)] {
+                for (port, node) in wires.iter().filter(|(_, n)| *n == id) {
+                    boundary.push(BoundaryWire {
+                        group,
+                        dir,
+                        port: port.clone(),
+                        node: *node,
+                    });
+                }
+            }
+        }
         Some(Snapshot {
             ws,
             node,
             file_data,
             wires,
+            boundary,
         })
     }
 
@@ -3771,6 +3960,11 @@ impl Server {
     fn recreate(&mut self, s: Snapshot) {
         self.materialize(s.ws, &s.node, &s.file_data);
         self.rewire(&s.wires);
+        // The instances that were wired to it are still live, so re-authoring
+        // their lines re-expands them onto the node that just came back.
+        for bw in &s.boundary {
+            self.set_boundary_wire(bw, true);
+        }
         if matches!(s.node.kind, SnapKind::Group { .. }) {
             self.expand_group(s.ws, s.node.id);
         }
@@ -4088,6 +4282,8 @@ impl Server {
                     GroupInfo {
                         definition: g.definition.clone(),
                         ports,
+                        in_wires: g.in_wires.clone(),
+                        out_wires: g.out_wires.clone(),
                         nodes,
                     },
                 )
@@ -5104,6 +5300,327 @@ mod model_tests {
             saved.capture_links
         );
         assert_eq!(saved.nodes.len(), 2, "the Capture node and the group, only");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A definition whose in-port grants *two* inner nodes, and a tab holding
+    /// one instance of it, the Capture node that may cross its port, and a
+    /// Network node that may not. `wired` writes the `in "frames"` line into
+    /// the group's block, or leaves the instance unwired for a test that wires
+    /// it through the canvas.
+    ///
+    /// Notes stand in for apps throughout: they classify the same way without
+    /// needing a compiled component, so the whole path runs wasm-free.
+    /// The fixed ids [`boundary_doc`] places, so a test can name what it wires
+    /// to what. Fixed rather than minted because a derived id is a function of
+    /// the group's own id, and a failure that prints one should be readable.
+    struct BIds {
+        def: NodeId,
+        tab: NodeId,
+        port: NodeId,
+        eyes: [NodeId; 2],
+        cap: NodeId,
+        net: NodeId,
+        inst: NodeId,
+    }
+
+    fn bids() -> BIds {
+        BIds {
+            def: NodeId::from_u128(0xB00),
+            tab: NodeId::from_u128(0xB01),
+            port: NodeId::from_u128(0xB02),
+            eyes: [NodeId::from_u128(0xB03), NodeId::from_u128(0xB04)],
+            cap: NodeId::from_u128(0xB05),
+            net: NodeId::from_u128(0xB06),
+            inst: NodeId::from_u128(0xB07),
+        }
+    }
+
+    fn boundary_doc(wired: bool) -> Document {
+        use crate::workspace::{NodeSnap, SnapKind};
+        let snap = |id: NodeId, kind: SnapKind| NodeSnap {
+            id,
+            pos: [0.0, 0.0],
+            size: [130.0, 44.0],
+            pos3d: None,
+            panel3d: true,
+            kind,
+        };
+        let note = |id: NodeId, text: &str| {
+            snap(
+                id,
+                SnapKind::Note {
+                    text: text.to_string(),
+                },
+            )
+        };
+        let b = bids();
+        Document {
+            workspaces: vec![
+                Workspace {
+                    id: b.def,
+                    name: Some("viewer".into()),
+                    tab: false,
+                    nodes: vec![
+                        snap(
+                            b.port,
+                            SnapKind::InPort {
+                                name: "frames".into(),
+                                kind: PortKind::Capture,
+                            },
+                        ),
+                        note(b.eyes[0], "eye"),
+                        note(b.eyes[1], "other eye"),
+                    ],
+                    // One port feeding two nodes: the fan-out a boundary wire
+                    // has to produce, rather than one wire to whichever came
+                    // first.
+                    capture_links: vec![(b.eyes[0], b.port), (b.eyes[1], b.port)],
+                    ..Workspace::new()
+                },
+                Workspace {
+                    id: b.tab,
+                    nodes: vec![
+                        snap(b.cap, SnapKind::Capture),
+                        snap(b.net, SnapKind::Net { gateway: false }),
+                        snap(
+                            b.inst,
+                            SnapKind::Group {
+                                definition: "viewer".into(),
+                                in_wires: if wired {
+                                    vec![("frames".into(), b.cap)]
+                                } else {
+                                    Vec::new()
+                                },
+                                out_wires: Vec::new(),
+                            },
+                        ),
+                    ],
+                    ..Workspace::new()
+                },
+            ],
+            ..Document::empty()
+        }
+    }
+
+    /// The client's gesture: dragging a wire onto an instance's port disc.
+    /// What it authors is a line in the group's block — the instance has no
+    /// wireable node of its own — and what that line *does* is decided by
+    /// re-expanding: here one drag makes two live grants, because the
+    /// definition's port feeds two nodes. It is still one edit and one undo.
+    #[test]
+    fn wiring_an_instances_port_authors_a_boundary_wire_that_one_undo_takes_back() {
+        let path = std::env::temp_dir().join("wk-boundary-author-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let b = bids();
+        let mut s = Server::new(&boundary_doc(false), path.clone()).expect("constructs");
+        let derived = s.instances[&b.inst].nodes.clone();
+        assert_eq!(derived.len(), 2, "both inner nodes ran");
+        assert!(
+            s.graph.capture_links.is_empty(),
+            "an unwired port grants nothing"
+        );
+
+        let bw = BoundaryWire {
+            group: b.inst,
+            dir: PortDir::In,
+            port: "frames".into(),
+            node: b.cap,
+        };
+        s.apply(Command::Create(Resource::Boundary(bw.clone())));
+        assert_eq!(
+            s.graph.groups[&b.inst].in_wires,
+            vec![("frames".to_string(), b.cap)]
+        );
+        assert_eq!(
+            s.graph.capture_links,
+            vec![(derived[0], b.cap), (derived[1], b.cap)],
+            "one boundary wire, one grant per node the port reaches"
+        );
+        // The client is told what this canvas authored, because the live wire
+        // it became ends inside the instance where no tab can see it.
+        assert_eq!(
+            s.view().groups[&b.inst].in_wires,
+            vec![("frames".to_string(), b.cap)]
+        );
+        // It is the *file's* line: the group block carries it and the
+        // collapsed grants stay out.
+        s.save();
+        let back = Document::load(&path).expect("reloads");
+        let tab = back.workspaces.iter().find(|w| w.id == b.tab).expect("tab");
+        assert!(tab.capture_links.is_empty(), "{:?}", tab.capture_links);
+        let group = tab.nodes.iter().find(|n| n.id == b.inst).expect("group");
+        assert_eq!(
+            group.kind,
+            crate::workspace::SnapKind::Group {
+                definition: "viewer".into(),
+                in_wires: vec![("frames".into(), b.cap)],
+                out_wires: Vec::new(),
+            }
+        );
+
+        // Dragging the same pair again takes the line away, grants and all...
+        s.apply(Command::Delete(ResourceRef::Boundary(bw)));
+        assert!(s.graph.groups[&b.inst].in_wires.is_empty());
+        assert!(s.graph.capture_links.is_empty());
+        // ...and one Ctrl-Z restores it — one entry per line the user drew,
+        // never one per wire the expansion moved.
+        s.apply(Command::Undo);
+        assert_eq!(s.graph.capture_links.len(), 2);
+        s.apply(Command::Undo);
+        assert!(s.graph.capture_links.is_empty());
+        assert!(s.graph.groups[&b.inst].in_wires.is_empty());
+        // Through all of it the instance kept running: a boundary wire decides
+        // an instance's wiring, never which nodes it has.
+        assert_eq!(s.instances[&b.inst].nodes, derived);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Deleting the node a boundary wire names takes the line with it — and
+    /// undoing brings both back.
+    ///
+    /// A dangling line is not a cosmetic problem: an `in`/`out` line whose far
+    /// end is not on the canvas is refused at load, so leaving it behind would
+    /// write a `.wk` file that no longer starts.
+    #[test]
+    fn deleting_a_wired_neighbour_takes_the_boundary_wire_with_it_and_undo_restores_both() {
+        let path = std::env::temp_dir().join("wk-boundary-delete-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let b = bids();
+        let mut s = Server::new(&boundary_doc(true), path.clone()).expect("constructs");
+        assert_eq!(s.graph.capture_links.len(), 2, "the instance starts wired");
+
+        s.apply(Command::Delete(ResourceRef::Node(b.cap)));
+        assert!(
+            s.graph.groups[&b.inst].in_wires.is_empty(),
+            "the line outlived the node it named"
+        );
+        assert!(s.graph.capture_links.is_empty());
+        // What the file now says must still load, or the next start refuses.
+        s.save();
+        let back = Document::load(&path).expect("reloads");
+        Server::new(&back, path.clone()).expect("the saved document still starts");
+
+        s.apply(Command::Undo);
+        assert!(s.node_exists(b.cap));
+        assert_eq!(
+            s.graph.groups[&b.inst].in_wires,
+            vec![("frames".to_string(), b.cap)],
+            "undo brought the node back unwired"
+        );
+        assert_eq!(s.graph.capture_links.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A boundary wire the expansion won't have is refused whole: the group is
+    /// left exactly as it was, still expanded, rather than holding a line that
+    /// no longer resolves.
+    #[test]
+    fn a_boundary_wire_the_expansion_refuses_leaves_the_group_as_it_was() {
+        let path = std::env::temp_dir().join("wk-boundary-refuse-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let b = bids();
+        let mut s = Server::new(&boundary_doc(false), path.clone()).expect("constructs");
+        let derived = s.instances[&b.inst].nodes.clone();
+        let wire = |port: &str, node| {
+            Command::Create(Resource::Boundary(BoundaryWire {
+                group: b.inst,
+                dir: PortDir::In,
+                port: port.to_string(),
+                node,
+            }))
+        };
+        // A port the definition does not declare...
+        s.apply(wire("frame", b.cap));
+        // ...and a neighbour that cannot be the source of a `capture` wire.
+        s.apply(wire("frames", b.net));
+        assert!(
+            s.graph.groups[&b.inst].in_wires.is_empty(),
+            "a refused line was written into the group"
+        );
+        assert!(s.graph.capture_links.is_empty());
+        assert_eq!(s.instances[&b.inst].nodes, derived, "the instance survived");
+        // Nothing was recorded either, so Ctrl-Z does not undo the last real
+        // edit twice.
+        assert!(s.undo.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A boundary wire is authored state, and `save` is a full re-projection
+    /// from the live graph — so the group's `in` line, its comment, and the
+    /// definition it names must all come back byte for byte, both after a
+    /// plain load → run → save and after an edit somewhere else in the
+    /// document (what `wk node add` does: a `Create` through the same path).
+    #[test]
+    fn a_boundary_wire_survives_a_save_and_an_unrelated_edit() {
+        let path = std::env::temp_dir().join("wk-boundary-file-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let (tab, def) = (NodeId::from_u128(0xC00), NodeId::from_u128(0xC01));
+        let (cap, inst) = (NodeId::from_u128(0xC02), NodeId::from_u128(0xC03));
+        let (port, eye) = (NodeId::from_u128(0xC04), NodeId::from_u128(0xC05));
+        let original = format!(
+            "workspace \"{tab}\" {{\n    \
+               capture \"{cap}\" {{ pos 0 0; size 130 44 }}\n    \
+               group \"viewer\" \"{inst}\" {{\n        \
+                 // the screen this viewer watches\n        \
+                 in \"frames\" \"{cap}\"\n        \
+                 pos 10 20\n        size 200 120\n    }}\n}}\n\
+             workspace \"{def}\" {{\n    \
+               name \"viewer\"\n    tab #false\n    \
+               inport \"frames\" \"capture\" \"{port}\" {{ pos 0 0; size 130 44 }}\n    \
+               note \"{eye}\" {{ text \"eye\"; pos 0 0; size 130 44 }}\n    \
+               capturelink \"{eye}\" \"{port}\"\n}}\n"
+        );
+        // Normalize once through the writer so the comparison is about content
+        // rather than whitespace any save at all would rewrite.
+        std::fs::write(&path, &original).unwrap();
+        Document::load(&path).expect("parses").save(&path).unwrap();
+        let normalized = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            normalized.contains("// the screen this viewer watches"),
+            "the fixture carries the comment that must survive:\n{normalized}"
+        );
+
+        let doc = Document::load(&path).expect("loads");
+        let mut s = Server::new(&doc, path.clone()).expect("constructs");
+        assert_eq!(
+            s.graph.capture_links.len(),
+            1,
+            "the boundary wire is live: the instance's note is granted the tab's Capture"
+        );
+        s.save();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            normalized,
+            "the group's block did not come back unchanged"
+        );
+
+        // An edit elsewhere re-projects the whole document. The `in` line has
+        // no live wire of its own to be projected *from*, so it survives only
+        // because it is carried on the group node.
+        s.apply(Command::Create(Resource::Node {
+            kind: NodeKind::Note,
+            pos: [400.0, 400.0],
+            ws: tab,
+        }));
+        s.save();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains(&format!("in \"frames\" \"{cap}\"")),
+            "the boundary wire was deleted by an unrelated edit:\n{after}"
+        );
+        assert!(
+            after.contains("// the screen this viewer watches"),
+            "{after}"
+        );
+        assert!(
+            after.contains("name \"viewer\"") && after.contains("tab #false"),
+            "{after}"
+        );
+        assert!(
+            !after.contains("capturelink \"01"),
+            "a collapsed wire reached the tab:\n{after}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

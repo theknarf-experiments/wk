@@ -22,9 +22,10 @@
 //! [`tests::derived_ids_are_stable`] pins literal values so that can only happen
 //! on purpose.
 
+use crate::wiring::{self, NodeClass};
 use crate::workspace::{Document, NodeSnap, SnapKind, Workspace};
 use std::collections::{BTreeMap, HashMap};
-use wk_protocol::{NodeId, PortDir};
+use wk_protocol::{NodeId, PortDir, PortKind};
 
 /// The domain separator mixed into every derived id. It exists so this hash can
 /// never collide with another use of SHA-256 over node ids elsewhere in wk, and
@@ -111,14 +112,29 @@ pub fn expand(doc: &Document) -> Result<Vec<Instance>, String> {
         out: Vec::new(),
     };
     for ws in doc.workspaces.iter().filter(|w| w.tab) {
-        let site = site_label(ws);
+        let site = Site {
+            tab: ws.id,
+            label: site_label(ws),
+            canvas: &ws.nodes,
+        };
         for node in groups_in(ws) {
             // A group written in a tab wires to the tab's own nodes, so an
             // endpoint on its `in`/`out` lines is already the live id.
-            ex.group(ws.id, &site, node.id, None, node, &|id| vec![id])?;
+            ex.group(&site, node.id, None, node, &|id| vec![id])?;
         }
     }
     Ok(ex.out)
+}
+
+/// Where a group is written, as everything the expansion needs to know about
+/// the place: the tab the whole tree ultimately belongs to, how an error names
+/// the site, and the canvas a boundary wire's endpoints must be on.
+struct Site<'a> {
+    tab: NodeId,
+    label: String,
+    /// The workspace's own nodes. A boundary wire reaches *this* canvas and no
+    /// other, so this is both the endpoint lookup and the typecheck's input.
+    canvas: &'a [NodeSnap],
 }
 
 /// How an endpoint written on a `group`'s `in`/`out` line resolves to live node
@@ -185,11 +201,11 @@ fn group_parts(n: &NodeSnap) -> (&str, &BoundaryWires, &BoundaryWires) {
     }
 }
 
-/// A boundary port's direction and name, if this snap is one.
-fn port_of(n: &NodeSnap) -> Option<(PortDir, &str)> {
+/// A boundary port's direction, name and connection kind, if this snap is one.
+fn port_of(n: &NodeSnap) -> Option<(PortDir, &str, PortKind)> {
     match &n.kind {
-        SnapKind::InPort { name, .. } => Some((PortDir::In, name)),
-        SnapKind::OutPort { name, .. } => Some((PortDir::Out, name)),
+        SnapKind::InPort { name, kind } => Some((PortDir::In, name, *kind)),
+        SnapKind::OutPort { name, kind } => Some((PortDir::Out, name, *kind)),
         _ => None,
     }
 }
@@ -199,6 +215,58 @@ fn dir_word(dir: PortDir) -> &'static str {
     match dir {
         PortDir::In => "in",
         PortDir::Out => "out",
+    }
+}
+
+/// What a node written in a `.wk` file is, for the purpose of classifying the
+/// wire a boundary line would make. The runtime's `Server::class_of` decides
+/// the same thing from the live graph and the two must agree, or a file would
+/// load only to have its wiring refused (or the reverse) once it ran.
+///
+/// Everything but an app node is decided by its keyword alone, which is why
+/// this can be checked before anything starts. An app is [`NodeClass::Other`]
+/// — whether it *imports* MIDI is not knowable until its component compiles,
+/// so a `midi` port fed by an app that has no MIDI is a wire that simply never
+/// forms, exactly as it would be on the canvas.
+fn class_of(kind: &SnapKind) -> NodeClass {
+    match kind {
+        SnapKind::Volume { .. } | SnapKind::BindMount { .. } => NodeClass::File,
+        SnapKind::Port { .. } => NodeClass::Port,
+        SnapKind::Net { .. } => NodeClass::Net,
+        SnapKind::Iroh { .. } | SnapKind::Veilid { .. } => NodeClass::Uplink,
+        SnapKind::Capture => NodeClass::Capture,
+        SnapKind::Clipboard => NodeClass::Clipboard,
+        SnapKind::Api => NodeClass::Api,
+        SnapKind::MidiIn { .. } => NodeClass::MidiSource,
+        SnapKind::HostService { .. } => NodeClass::HostSvc,
+        SnapKind::InPort { name: _, kind } => NodeClass::Boundary(PortDir::In, *kind),
+        SnapKind::OutPort { name: _, kind } => NodeClass::Boundary(PortDir::Out, *kind),
+        SnapKind::Group { .. } => NodeClass::Instance,
+        SnapKind::App { .. } | SnapKind::Note { .. } => NodeClass::Other,
+    }
+}
+
+/// The word a `.wk` file writes a node with — how an error names the thing at
+/// the wrong end of a boundary wire.
+fn kind_word(kind: &SnapKind) -> &'static str {
+    match kind {
+        SnapKind::App { .. } => "node",
+        SnapKind::Volume { .. } => "volume",
+        SnapKind::BindMount { .. } => "bindmount",
+        SnapKind::Port { .. } => "hostport",
+        SnapKind::Net { gateway: false } => "network",
+        SnapKind::Net { gateway: true } => "gateway",
+        SnapKind::Iroh { .. } => "iroh",
+        SnapKind::Veilid { .. } => "veilid",
+        SnapKind::Note { .. } => "note",
+        SnapKind::Capture => "capture",
+        SnapKind::Clipboard => "clipboard",
+        SnapKind::Api => "api",
+        SnapKind::MidiIn { .. } => "midiin",
+        SnapKind::HostService { .. } => "hostservice",
+        SnapKind::InPort { .. } => "inport",
+        SnapKind::OutPort { .. } => "outport",
+        SnapKind::Group { .. } => "group",
     }
 }
 
@@ -214,14 +282,15 @@ impl<'a> Expander<'a> {
     /// Expand one group and, depth-first, every group its definition contains.
     fn group(
         &mut self,
-        tab: NodeId,
-        site: &str,
+        at: &Site<'a>,
         instance: NodeId,
         parent: Option<NodeId>,
         node: &'a NodeSnap,
         outer: Outer,
     ) -> Result<(), String> {
         let (definition, in_wires, out_wires) = group_parts(node);
+        // Every error below names the place the group is written.
+        let site = &at.label;
         // A definition that contains itself, however indirectly, has no
         // expansion at all — so say which loop, not just that there is one.
         if let Some(at) = self.path.iter().position(|d| d == definition) {
@@ -276,12 +345,12 @@ impl<'a> Expander<'a> {
         // port the parent left unwired: every wire crossing it is dropped,
         // because a port never becomes a live node for it to dangle from.
         let mut ports: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
-        let mut named: HashMap<(PortDir, &str), NodeId> = HashMap::new();
+        let mut named: HashMap<(PortDir, &str), (NodeId, PortKind)> = HashMap::new();
         let mut port_of_id: HashMap<NodeId, (PortDir, &str)> = HashMap::new();
         for n in &def.nodes {
-            if let Some((dir, name)) = port_of(n) {
+            if let Some((dir, name, kind)) = port_of(n) {
                 let derived = id(n.id);
-                named.insert((dir, name), derived);
+                named.insert((dir, name), (derived, kind));
                 port_of_id.insert(derived, (dir, name));
                 ports.insert(derived, Vec::new());
             }
@@ -320,14 +389,58 @@ impl<'a> Expander<'a> {
         }
         for (dir, wires) in [(PortDir::In, in_wires), (PortDir::Out, out_wires)] {
             for (name, endpoint) in wires {
-                let Some(&port) = named.get(&(dir, name.as_str())) else {
-                    let word = dir_word(dir);
+                let word = dir_word(dir);
+                let Some(&(port, kind)) = named.get(&(dir, name.as_str())) else {
+                    // A port of that name on the *other* edge is the likely
+                    // mistake, and a much better error than "no such port"
+                    // when the name is right there in the definition.
+                    if named.contains_key(&(dir.opposite(), name.as_str())) {
+                        let other = dir_word(dir.opposite());
+                        return Err(format!(
+                            "{site}: group {definition:?} wires `{word} {name:?}`, but {name:?} is \
+                             an {other}port of definition {definition:?}, not an {word}port; a \
+                             boundary wire's direction is the port's, so write it as `{other}`"
+                        ));
+                    }
                     return Err(format!(
                         "{site}: group {definition:?} wires `{word} {name:?}`, but definition \
                          {definition:?} declares no {word}-port called {name:?}; a boundary \
                          wire names one of the definition's own `{word}port` lines"
                     ));
                 };
+                // The far end has to be a node of the canvas the group is
+                // written on. Anywhere else and the wire would either dangle
+                // or reach across a tab boundary, which nothing else in a
+                // `.wk` file can do.
+                let Some(far) = at.canvas.iter().find(|n| n.id == *endpoint) else {
+                    return Err(format!(
+                        "{site}: group {definition:?} wires `{word} {name:?} \"{endpoint}\"`, but \
+                         no node with that id is on this canvas; a boundary wire joins one of \
+                         the group's own neighbours to the port"
+                    ));
+                };
+                // ...and it has to be a node the port's kind of connection can
+                // reach. Seen from the parent, an instance's in-port is a
+                // *consumer* — the same end of a wire the parent's own
+                // out-port would play — so the typecheck is the ordinary one
+                // against the complementary port. This is where a `midi` port
+                // fed by a HostPort, or wired to another instance (whose own
+                // ports the line cannot name), is stopped.
+                let want = NodeClass::Boundary(dir.opposite(), kind);
+                if wiring::classify(*endpoint, port, class_of(&far.kind), want).is_none() {
+                    return Err(format!(
+                        "{site}: group {definition:?} wires `{word} {name:?}` to a {} node, which \
+                         cannot be the {} end of a `{}` connection; {name:?} is a `{}` {word}port \
+                         of definition {definition:?}",
+                        kind_word(&far.kind),
+                        match dir {
+                            PortDir::In => "source",
+                            PortDir::Out => "destination",
+                        },
+                        kind.as_str(),
+                        kind.as_str(),
+                    ));
+                }
                 // Fan-in is just the same port named twice, so the bindings
                 // accumulate rather than replace.
                 ports.entry(port).or_default().extend(outer(*endpoint));
@@ -379,7 +492,7 @@ impl<'a> Expander<'a> {
             id: instance,
             definition: definition.to_string(),
             defined_in: def.id,
-            tab,
+            tab: at.tab,
             parent,
             path: self.path.clone(),
             content: Workspace {
@@ -411,16 +524,13 @@ impl<'a> Expander<'a> {
             },
         });
 
-        let inner_site = format!("definition {definition:?}");
+        let inner = Site {
+            tab: at.tab,
+            label: format!("definition {definition:?}"),
+            canvas: &def.nodes,
+        };
         for nested in groups_in(def) {
-            self.group(
-                tab,
-                &inner_site,
-                id(nested.id),
-                Some(instance),
-                nested,
-                &sub,
-            )?;
+            self.group(&inner, id(nested.id), Some(instance), nested, &sub)?;
         }
         self.path.pop();
         Ok(())
@@ -851,6 +961,103 @@ mod tests {
     }
 
     #[test]
+    fn a_boundary_wire_written_on_the_wrong_edge_says_which_edge_the_port_is_on() {
+        use wk_protocol::PortKind;
+        // The near-miss worth spelling out: the port exists and the name is
+        // spelled right, it is just the other edge of the definition. "no
+        // outport called notes" would send the author looking for a typo.
+        let def = definition(10, "voice", vec![outport(11, "audio", PortKind::Midi)]);
+        let d = doc(vec![
+            def,
+            tab(
+                20,
+                vec![
+                    app(21, "speakers"),
+                    wired_group(22, "voice", &[("audio", 21)], &[]),
+                ],
+            ),
+        ]);
+        let err = expand(&d).unwrap_err();
+        assert!(
+            err.contains("is an outport") && err.contains("write it as `out`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_boundary_wire_to_a_node_that_cannot_carry_the_connection_is_refused() {
+        use wk_protocol::PortKind;
+        // A port declares what may cross it, so the node on the other end has
+        // to be able to play that end of that kind of wire. Without this the
+        // collapse produces a live wire nothing classifies, which is silently
+        // never made — the author's line does nothing and says nothing.
+        let def = Workspace {
+            midi: vec![(NodeId::from_u128(11), NodeId::from_u128(12))],
+            ..definition(
+                10,
+                "voice",
+                vec![inport(11, "notes", PortKind::Midi), app(12, "synth")],
+            )
+        };
+        let hostport = snap(21, SnapKind::Port { port: 8080 });
+        let d = doc(vec![
+            def.clone(),
+            tab(
+                20,
+                vec![hostport, wired_group(22, "voice", &[("notes", 21)], &[])],
+            ),
+        ]);
+        let err = expand(&d).unwrap_err();
+        assert!(
+            err.contains("hostport") && err.contains("source") && err.contains("midi"),
+            "{err}"
+        );
+
+        // Wiring one instance to another is the same refusal, and the reason
+        // is worth keeping: a boundary wire names one port and one node, so it
+        // has no way to say *which* port of the far group it meant.
+        let d = doc(vec![
+            def,
+            tab(
+                20,
+                vec![
+                    group(21, "voice"),
+                    wired_group(22, "voice", &[("notes", 21)], &[]),
+                ],
+            ),
+        ]);
+        let err = expand(&d).unwrap_err();
+        assert!(err.contains("group"), "{err}");
+    }
+
+    #[test]
+    fn a_boundary_wire_to_a_node_that_is_not_on_this_canvas_is_refused() {
+        use wk_protocol::PortKind;
+        // A boundary wire joins the group to one of its own neighbours. An id
+        // from somewhere else — another tab, a node since deleted — would
+        // otherwise expand into a wire that either dangles or reaches across a
+        // tab boundary, which nothing else in a `.wk` file can do.
+        let def = Workspace {
+            midi: vec![(NodeId::from_u128(11), NodeId::from_u128(12))],
+            ..definition(
+                10,
+                "voice",
+                vec![inport(11, "notes", PortKind::Midi), app(12, "synth")],
+            )
+        };
+        let d = doc(vec![
+            def,
+            tab(20, vec![wired_group(22, "voice", &[("notes", 21)], &[])]),
+            tab(30, vec![app(21, "keys")]),
+        ]);
+        let err = expand(&d).unwrap_err();
+        assert!(
+            err.contains(&NodeId::from_u128(21).to_string()) && err.contains("this canvas"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn a_port_feeding_a_one_per_source_relation_is_refused() {
         use wk_protocol::PortKind;
         // `capturelink` and its two siblings are one grant per app. A port on
@@ -887,7 +1094,9 @@ mod tests {
 
         // The mirror shape is the useful one and stays legal: an inner node
         // granted the capability the parent wires in. Its source is derived, so
-        // it can displace nothing outside the instance.
+        // it can displace nothing outside the instance. The parent's end has to
+        // be a Capture *node* — that is what a `capture` in-port stands in for,
+        // and an app there could never grant anything.
         let def = Workspace {
             capture_links: vec![(NodeId::from_u128(12), NodeId::from_u128(11))],
             ..definition(
@@ -901,7 +1110,7 @@ mod tests {
             tab(
                 20,
                 vec![
-                    app(21, "cap"),
+                    snap(21, SnapKind::Capture),
                     wired_group(22, "viewer", &[("screen", 21)], &[]),
                 ],
             ),
@@ -1046,6 +1255,49 @@ mod tests {
         workspaces.push(tab(1, vec![group(2, "d0")]));
         let err = expand(&doc(workspaces)).unwrap_err();
         assert!(err.contains(&MAX_INSTANCES.to_string()), "{err}");
+    }
+
+    #[test]
+    fn the_blocks_example_expands_to_two_voices_and_does_not_notice_being_split_in_two_files() {
+        // The shipped example is the whole feature end to end: one definition,
+        // two instances, one piano reaching both through their in-ports.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../example");
+        let inline = Document::load_resolved(&dir.join("blocks.wk")).expect("blocks.wk resolves");
+        let out = expand(&inline).expect("blocks.wk expands");
+        assert_eq!(out.len(), 2, "two voices");
+        let piano = inline.workspaces[0]
+            .nodes
+            .iter()
+            .find(|n| matches!(&n.kind, SnapKind::App { name, .. } if name == "piano"))
+            .expect("the piano");
+        for inst in &out {
+            assert_eq!(inst.definition, "voice");
+            let names: Vec<&str> = inst
+                .content
+                .nodes
+                .iter()
+                .map(|n| match &n.kind {
+                    SnapKind::App { name, .. } => name.as_str(),
+                    _ => "?",
+                })
+                .collect();
+            assert_eq!(names, ["arp", "synth"], "the port did not materialize");
+            let (arp, synth) = (inst.content.nodes[0].id, inst.content.nodes[1].id);
+            // The piano is wired straight to *this* instance's arp: the
+            // definition's `notes -> arp` and the group's `in "notes" piano`
+            // have collapsed into one wire, with no port in between.
+            assert_eq!(inst.content.midi, vec![(piano.id, arp), (arp, synth)]);
+        }
+        // Two instances, two disjoint sets of nodes — that is what makes them
+        // independent voices rather than one voice drawn twice.
+        assert_ne!(out[0].content.nodes[0].id, out[1].content.nodes[0].id);
+
+        // The promise the feature is for: moving the definition into its own
+        // file and importing it leaves the call site alone. Not "much the
+        // same" — the same instances, node for node and wire for wire.
+        let split = Document::load_resolved(&dir.join("blocks-imported.wk"))
+            .expect("blocks-imported.wk resolves");
+        assert_eq!(expand(&split).expect("expands"), out);
     }
 
     #[test]
