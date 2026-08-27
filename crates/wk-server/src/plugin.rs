@@ -5980,4 +5980,99 @@ mod tests {
         }
         node.kill.store(true, Ordering::Relaxed);
     }
+    #[test]
+    fn world_node_publishes_a_glb_as_scenery_and_reloads_it() {
+        // wk has no built-in world: the surrounding plaza is a node reading a
+        // .glb out of its own filesystem and handing it to wk:scene as
+        // scenery. This is that whole path, minus the renderer.
+        let wasm = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../plugins/world/target/wasm32-wasip1/debug/world.wasm");
+        if !wasm.exists() {
+            eprintln!("skipping: build plugins/world first (cargo component build)");
+            return;
+        }
+        let glb = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example/home.glb"
+        ))
+        .expect("the home world ships with the repo");
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        host.spawn(
+            &wasm,
+            "world",
+            id,
+            &[], // no args: it picks up the first glTF wired into it
+            Arc::new(Mutex::new(Vec::new())),
+            nodes.clone(),
+            Vec::new(),
+            None,
+        )
+        .expect("spawn");
+
+        // The node registers synchronously; seed the world into it before the
+        // background compile lets the guest look, standing in for the bind
+        // mount example/home.wk wires up.
+        let node = nodes
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|n| n.id == id)
+            .cloned()
+            .expect("node registered");
+        node.fs.lock().unwrap().put_file_at("home.glb", glb.clone());
+
+        // Wait for the entity, then check what the view would draw: this
+        // node's geometry, byte for byte, flagged as scenery so it is never
+        // ray-picked and stands in for the fallback ground plane.
+        let published = |want: &[u8]| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let hit = host.scene_entities().into_iter().find(|e| {
+                    let e = e.lock().unwrap();
+                    e.node_id == id && e.glb.as_slice() == want
+                });
+                if let Some(e) = hit {
+                    let e = e.lock().unwrap();
+                    assert!(e.scenery, "a world is scenery, not a clickable object");
+                    assert_eq!(e.glb_hash, crate::scene::glb_hash(want), "cache key");
+                    assert_eq!(e.pos, [0.0; 3], "the world sits at its node's pose");
+                    return;
+                }
+                assert!(
+                    !node.finished.load(Ordering::Relaxed),
+                    "the world node exited without publishing its scenery"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no scenery entity appeared"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        published(&glb);
+
+        // Editing the file swaps the plaza under your feet — no restart. (The
+        // node never parses the blob; only the view does, so any changed bytes
+        // exercise the reload.)
+        let mut edited = glb.clone();
+        edited.extend_from_slice(b"\0edited");
+        node.fs
+            .lock()
+            .unwrap()
+            .put_file_at("home.glb", edited.clone());
+        published(&edited);
+        assert_eq!(
+            host.scene_entities()
+                .iter()
+                .filter(|e| e.lock().unwrap().node_id == id)
+                .count(),
+            1,
+            "the old world is dropped, not stacked"
+        );
+
+        node.kill.store(true, Ordering::Relaxed);
+    }
 }

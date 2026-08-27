@@ -23,7 +23,7 @@ use crate::host_shell::Gfx;
 use crate::render2d::{Quad, Renderer, TextureId};
 use crate::render3d::{MeshDraw, MeshGpu, Quad3, Renderer3d};
 use crate::text::Fonts;
-use wk_protocol::{Command, NodeId, NodeKind, NodePatch, Resource, ResourceRef, Wire};
+use wk_protocol::{Command, NodeId, NodeKind, NodePatch, Resource, ResourceRef, ViewMode, Wire};
 use wk_server::plugin::{
     Key, KeyEvent, PointerButton, PointerEvent, ResizeEvent, ScrollEvent, SharedNode, SharedSurface,
 };
@@ -264,6 +264,8 @@ struct App {
     /// The 3D workspace view (toggled from the palette): its fly camera, the
     /// canvas point mapped to straight-ahead, and the lazily-built renderer.
     mode_3d: bool,
+    /// The `wk view` sequence this client has already applied.
+    view_mode_seq: u64,
     /// Fly mode: free 6-DoF flight. Off = walk (grounded at eye height).
     fly3d: bool,
     cam3d: Camera3d,
@@ -275,11 +277,10 @@ struct App {
     /// High-res font + its own string cache for world-space (3D) text.
     fonts3d: Fonts,
     text_cache3d: TextCache,
-    /// The document's loaded 3D world scene: (source path, GPU meshes).
-    /// `Some` with empty meshes = the load failed (don't retry every frame).
-    world_scene: Option<(String, Vec<MeshGpu>)>,
-    /// GPU meshes for wk:scene entities, keyed by entity id (loaded from the
-    /// entity's GLB on first sight; empty = failed, don't retry).
+    /// GPU meshes for wk:scene entities, keyed by the content hash of their
+    /// GLB (loaded on first sight; empty = failed, don't retry). Hashing the
+    /// geometry rather than the entity id means a world node that restarts —
+    /// or ten nodes showing the same model — upload once between them.
     entity_meshes: HashMap<u64, EntityGpu>,
     /// A panel move in progress: the node, the grab distance along the cursor
     /// ray (scroll pushes/pulls it), and the world-space offset from the grab
@@ -417,6 +418,7 @@ impl App {
             },
             pan_target: [0.0, 0.0],
             mode_3d: false,
+            view_mode_seq: 0,
             fly3d: false,
             cam3d: Camera3d::new(),
             cyl_anchor: [0.0, 0.0],
@@ -425,7 +427,6 @@ impl App {
             term_raster: TermRaster::default(),
             fonts3d: Fonts::new(FONT3D_PX)?,
             text_cache3d: TextCache::default(),
-            world_scene: None,
             entity_meshes: HashMap::new(),
             drag3d: None,
             wire3d: None,
@@ -1660,20 +1661,36 @@ impl App {
                     },
                 });
             }
-            PaletteCmd::View3d => {
-                if self.mode_3d {
-                    self.mode_3d = false;
-                } else {
-                    // Anchor the cylinder on the centre of the current view so
-                    // the nodes you were looking at appear straight ahead.
-                    self.cyl_anchor = self.cam.to_canvas([fb[0] * 0.5, fb[1] * 0.5]);
-                    self.cam3d = Camera3d::new();
-                    self.mode_3d = true;
-                }
-            }
+            PaletteCmd::View3d => self.set_mode_3d(!self.mode_3d, fb),
             PaletteCmd::Quit => self.request_exit = true,
             PaletteCmd::Headless => self.request_headless = true,
         }
+    }
+
+    /// Enter or leave the 3D world. Shared by the palette's "3D View" and the
+    /// `wk view` command, so both land in exactly the same place.
+    fn set_mode_3d(&mut self, want: bool, fb: [f32; 2]) {
+        if want == self.mode_3d {
+            return;
+        }
+        if want {
+            // Anchor the cylinder on the centre of the current view so the
+            // nodes you were looking at appear straight ahead.
+            self.cyl_anchor = self.cam.to_canvas([fb[0] * 0.5, fb[1] * 0.5]);
+            self.cam3d = Camera3d::new();
+        }
+        self.mode_3d = want;
+    }
+
+    /// Apply a `wk view` request once, when its sequence advances past the one
+    /// this client last saw. A client that attaches later inherits the
+    /// sequence without being yanked by a request made before it existed.
+    fn apply_view_request(&mut self, (seq, mode): (u64, ViewMode), fb: [f32; 2]) {
+        if seq == self.view_mode_seq {
+            return;
+        }
+        self.view_mode_seq = seq;
+        self.set_mode_3d(mode.wants_3d(self.mode_3d), fb);
     }
 
     /// Create a new workspace tab and switch this client's view to it. The client
@@ -2762,7 +2779,10 @@ impl App {
 
         // ---- wk:scene entities: plugin-owned 3D objects riding their node ----
         struct Ent {
-            id: u64,
+            /// Content hash of the entity's GLB — the key into `entity_meshes`.
+            glb_hash: u64,
+            /// Scenery is drawn but never picked (see `wk:scene`'s set-scenery).
+            scenery: bool,
             model: [[f32; 4]; 4],
             /// World-space bounding sphere.
             center: [f32; 3],
@@ -2774,15 +2794,24 @@ impl App {
         let mut ents: Vec<Ent> = Vec::new();
         let mut live_ents: HashSet<u64> = HashSet::new();
         for shared in &scene_entities {
-            let (id, node_id, epos, eyaw, escale, glb) = {
+            let (id, node_id, epos, eyaw, escale, scenery, hash, glb) = {
                 let e = shared.lock().unwrap();
-                (e.id, e.node_id, e.pos, e.yaw, e.scale, e.glb.clone())
+                (
+                    e.id,
+                    e.node_id,
+                    e.pos,
+                    e.yaw,
+                    e.scale,
+                    e.scenery,
+                    e.glb_hash,
+                    e.glb.clone(),
+                )
             };
-            live_ents.insert(id);
-            // Load the entity's GLB into GPU meshes on first sight. (Only
-            // once the renderer exists — caching an empty result here is
-            // permanent, by design, for genuinely broken GLBs.)
-            if !self.entity_meshes.contains_key(&id) && self.renderer3d.is_some() {
+            live_ents.insert(hash);
+            // Load the entity's GLB into GPU meshes on first sight of this
+            // geometry. (Only once the renderer exists — caching an empty
+            // result here is permanent, by design, for genuinely broken GLBs.)
+            if !self.entity_meshes.contains_key(&hash) && self.renderer3d.is_some() {
                 let gpu = match crate::gltf_scene::load_bytes(&glb) {
                     Ok(cpu) => {
                         let r3d = self.renderer3d.as_ref();
@@ -2845,7 +2874,7 @@ impl App {
                         }
                     }
                 };
-                self.entity_meshes.insert(id, gpu);
+                self.entity_meshes.insert(hash, gpu);
             }
             let Some(&(origin, nyaw)) = poses.get(&node_id) else {
                 continue;
@@ -2857,9 +2886,10 @@ impl App {
                     mat_scale(escale),
                 ),
             );
-            let cache = &self.entity_meshes[&id];
+            let cache = &self.entity_meshes[&hash];
             ents.push(Ent {
-                id,
+                glb_hash: hash,
+                scenery,
                 model,
                 center: transform_point3(model, cache.bound.0),
                 radius: cache.bound.1 * escale.max(0.01),
@@ -2872,10 +2902,10 @@ impl App {
             .entity_meshes
             .keys()
             .copied()
-            .filter(|id| !live_ents.contains(id))
+            .filter(|hash| !live_ents.contains(hash))
             .collect();
-        for id in stale {
-            if let Some(gpu) = self.entity_meshes.remove(&id) {
+        for hash in stale {
+            if let Some(gpu) = self.entity_meshes.remove(&hash) {
                 for t in gpu.owned_tex {
                     gfx.renderer.remove_texture(t);
                 }
@@ -2938,6 +2968,9 @@ impl App {
         if !self.rmb && !self.palette_open && self.drag3d.is_none() && self.wire3d.is_none() {
             let mut ent_hit: Option<(f32, usize)> = None;
             for (i, e) in ents.iter().enumerate() {
+                if e.scenery {
+                    continue; // you walk through the world, you don't click it
+                }
                 if let Some(t) = ray_sphere(o, d, e.center, e.radius) {
                     if t > 0.05 && ent_hit.is_none_or(|b| t < b.0) {
                         ent_hit = Some((t, i));
@@ -3109,41 +3142,11 @@ impl App {
         }
 
         // ---- build the world ----
-        // (Re)load the document's glTF world when its path changes; a failed
-        // load is remembered as empty so it isn't retried every frame.
-        if self.view.world.as_deref() != self.world_scene.as_ref().map(|(p, _)| p.as_str()) {
-            self.world_scene = self.view.world.clone().map(|path| {
-                let meshes = match crate::gltf_scene::load_file(&path) {
-                    Ok(cpu) => {
-                        let r3d = self.renderer3d.as_ref().unwrap();
-                        cpu.iter()
-                            .map(|m| {
-                                let tex = match &m.texture {
-                                    Some((w, h, px)) => gfx.renderer.create_texture(
-                                        &gfx.device,
-                                        &gfx.queue,
-                                        *w,
-                                        *h,
-                                        px,
-                                    ),
-                                    None => gfx.renderer.white,
-                                };
-                                r3d.upload_mesh(&gfx.device, m, tex)
-                            })
-                            .collect()
-                    }
-                    Err(e) => {
-                        eprintln!("world scene: {e}");
-                        Vec::new()
-                    }
-                };
-                (path, meshes)
-            });
-        }
-        let world_loaded = self
-            .world_scene
-            .as_ref()
-            .is_some_and(|(_, m)| !m.is_empty());
+        // A world is just a node's scenery now (see `wk:scene`'s set-scenery):
+        // if any is loaded, this workspace has a place to stand in.
+        let world_loaded = ents
+            .iter()
+            .any(|e| e.scenery && !self.entity_meshes[&e.glb_hash].meshes.is_empty());
 
         let eye = self.cam3d.pos;
         let white = gfx.renderer.white;
@@ -3353,21 +3356,10 @@ impl App {
 
         // ---- render: a depth pass for the world, then a 2D HUD pass ----
         let vp = self.cam3d.view_proj(fb[0] / fb[1].max(1.0));
-        let world_meshes: &[MeshGpu] = self
-            .world_scene
-            .as_ref()
-            .map(|(_, m)| m.as_slice())
-            .unwrap_or(&[]);
-        let mut all_meshes: Vec<&MeshGpu> = world_meshes.iter().collect();
-        let mut world_draws: Vec<MeshDraw> = (0..world_meshes.len())
-            .map(|i| MeshDraw {
-                mesh: i,
-                model: Renderer3d::ident(),
-                color: [1.0, 1.0, 1.0, 1.0],
-            })
-            .collect();
+        let mut all_meshes: Vec<&MeshGpu> = Vec::new();
+        let mut world_draws: Vec<MeshDraw> = Vec::new();
         for e in &ents {
-            if let Some(gpu) = self.entity_meshes.get(&e.id) {
+            if let Some(gpu) = self.entity_meshes.get(&e.glb_hash) {
                 for m in &gpu.meshes {
                     all_meshes.push(m);
                     world_draws.push(MeshDraw {
@@ -3646,6 +3638,16 @@ impl App {
                 gfx.renderer.remove_texture(tex);
             }
         }
+
+        // A `wk view` switch is applied before the slice below is picked, so
+        // it takes effect on this very frame rather than the next one.
+        self.apply_view_request(
+            full.view_mode,
+            [
+                gfx.surface_desc.width as f32,
+                gfx.surface_desc.height as f32,
+            ],
+        );
 
         // In 3D the whole document is one world — every workspace's nodes are
         // present (each workspace is just a cluster); 2D keeps per-tab views.

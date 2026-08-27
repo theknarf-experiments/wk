@@ -426,10 +426,6 @@ pub fn secret_bytes(s: &str) -> Option<[u8; 32]> {
 pub struct Document {
     /// Paths (relative to this file) of other `.wk` files to pull in.
     pub imports: Vec<String>,
-    /// Optional world scene for the 3D view: a glTF/GLB path relative to this
-    /// file (the VRChat-style "home world" the workspaces live inside). Only
-    /// the top-level file's world is used when imports are resolved.
-    pub world: Option<String>,
     pub dependencies: Vec<Dependency>,
     /// Always at least one; shown as tabs when there is more than one.
     pub workspaces: Vec<Workspace>,
@@ -502,7 +498,6 @@ impl Document {
     pub fn empty() -> Self {
         Document {
             imports: Vec::new(),
-            world: None,
             dependencies: Vec::new(),
             workspaces: vec![Workspace::new()],
             imported_deps: std::collections::HashSet::new(),
@@ -534,7 +529,6 @@ impl Document {
     pub fn load_resolved(path: &Path) -> Result<Self, String> {
         let mut merged = Document {
             imports: Vec::new(),
-            world: None,
             dependencies: Vec::new(),
             workspaces: Vec::new(),
             imported_deps: std::collections::HashSet::new(),
@@ -587,13 +581,6 @@ impl Document {
 
     fn from_kdl(text: &str) -> Result<Self, String> {
         let doc: KdlDocument = text.parse().map_err(|e| format!("parse error: {e}"))?;
-
-        // `world "scene.glb"` — the 3D view's surrounding scene, if any.
-        let world = doc
-            .get("world")
-            .and_then(|n| n.get(0))
-            .and_then(|v| v.as_string())
-            .map(str::to_string);
 
         // `import "other.wk"` lines (a path per node, resolved by load_resolved).
         let imports = doc
@@ -652,7 +639,6 @@ impl Document {
 
         Ok(Document {
             imports,
-            world,
             dependencies,
             workspaces,
             imported_deps: std::collections::HashSet::new(),
@@ -681,12 +667,6 @@ impl Document {
         for imp in &self.imports {
             let mut node = KdlNode::new("import");
             node.push(str_entry(imp));
-            doc.nodes_mut().push(node);
-        }
-
-        if let Some(w) = &self.world {
-            let mut node = KdlNode::new("world");
-            node.push(str_entry(w));
             doc.nodes_mut().push(node);
         }
 
@@ -755,7 +735,6 @@ fn resolve_into(
     let doc = Document::load(path)?;
     if !is_import {
         merged.imports = doc.imports.clone();
-        merged.world = doc.world.clone();
     }
     for dep in doc.dependencies {
         if dep_names.insert(dep.name.clone()) {
@@ -1353,21 +1332,19 @@ mod tests {
     }
 
     #[test]
-    fn pos3d_and_world_round_trip_through_kdl() {
+    fn pos3d_round_trips_through_kdl() {
         let ws = NodeId::from_u128(7);
         let id = NodeId::from_u128(8);
         let text = format!(
-            "world \"scenes/home.glb\"\nworkspace \"{ws}\" {{\n  \
+            "workspace \"{ws}\" {{\n  \
              note \"{id}\" {{ text \"hi\"; pos 1 2; size 30 40; pos3d 0.5 1.5 -2.0 0.7 }}\n}}"
         );
         let doc = Document::from_kdl(&text).expect("parses");
-        assert_eq!(doc.world.as_deref(), Some("scenes/home.glb"));
         let snap = &doc.workspaces[0].nodes[0];
         assert_eq!(snap.pos3d, Some([0.5, 1.5, -2.0, 0.7]));
 
         // Round-trip: serialize and parse again; both survive.
         let back = Document::from_kdl(&doc.to_kdl()).expect("round-trips");
-        assert_eq!(back.world.as_deref(), Some("scenes/home.glb"));
         assert_eq!(
             back.workspaces[0].nodes[0].pos3d,
             Some([0.5, 1.5, -2.0, 0.7])
@@ -1378,7 +1355,6 @@ mod tests {
         ))
         .expect("parses");
         assert_eq!(plain.workspaces[0].nodes[0].pos3d, None);
-        assert_eq!(plain.world, None);
     }
 
     #[test]
@@ -1455,13 +1431,12 @@ mod tests {
     }
 
     #[test]
-    fn home_world_example_resolves_with_world_and_poses() {
+    fn home_world_example_resolves_with_a_world_node_and_poses() {
         let example = Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../example/home.wk"
         ));
         let doc = Document::load_resolved(example).expect("home.wk resolves");
-        assert_eq!(doc.world.as_deref(), Some("home.glb"));
         // The home workspace is present with posed nodes and the piano→synth wire.
         let ws = doc
             .workspaces
@@ -1471,6 +1446,25 @@ mod tests {
         let posed = ws.nodes.iter().filter(|n| n.pos3d.is_some()).count();
         assert!(posed >= 4, "all home nodes carry 3D poses (got {posed})");
         assert_eq!(ws.midi.len(), 1);
+        // The plaza itself is a node now: a `world` app with its panel off,
+        // fed the .glb by a bind mount wired into it.
+        let world = ws
+            .nodes
+            .iter()
+            .find(|n| matches!(&n.kind, SnapKind::App { name, .. } if name == "world"))
+            .expect("a world node");
+        assert!(!world.panel3d, "the world is geometry, not a card");
+        let glb = ws
+            .nodes
+            .iter()
+            .find(|n| matches!(&n.kind, SnapKind::BindMount { path } if path.ends_with("home.glb")))
+            .expect("home.glb bind mount");
+        assert!(
+            ws.connections
+                .iter()
+                .any(|c| c.0 == glb.id && c.1 == world.id),
+            "the .glb is mounted into the world node"
+        );
     }
 
     #[test]
@@ -1665,7 +1659,6 @@ mod tests {
             NodeId::new(),
         );
         let doc = Document {
-            world: None,
             imports: Vec::new(),
             imported_deps: std::collections::HashSet::new(),
             imported_workspaces: std::collections::HashSet::new(),
@@ -2060,7 +2053,6 @@ mod tests {
             prop::collection::vec(workspace_strat(), 1..3),
         )
             .prop_map(|(dependencies, workspaces)| Document {
-                world: None,
                 imports: Vec::new(),
                 dependencies,
                 workspaces,

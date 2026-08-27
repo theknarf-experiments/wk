@@ -1,14 +1,19 @@
 // vim: set filetype=kdl :
-// wk's home world — a VRChat-style plaza to exist in. The `world` line names
-// the glTF scene the 3D view surrounds you with (regenerate it with
-// `python3 scripts/gen-home-world.py`); the nodes carry free 3D poses
-// (`pos3d x y z yaw`) placing them around the plaza's centre. Enter with:
+// wk's home world — a VRChat-style plaza to exist in. The plaza is not built
+// into wk: the `world` node below IS the place. It reads example/home.glb out
+// of its own filesystem (the bind mount wired into it) and publishes the
+// geometry through wk:scene as scenery — so the world arrives the same way
+// the totem's crystal does, from a wasm node. Regenerate the .glb with
+// `python3 scripts/gen-home-world.py` and it reloads under your feet.
+//
+// The other nodes carry free 3D poses (`pos3d x y z yaw`) placing them around
+// the plaza's centre. Enter with:
 //
 //   wk run example/home.wk        then  Cmd+K -> "3D View"
 //
 // The piano is wired to the synth — walk up and play it.
+// Build the world node first: cd plugins/world && mise run build
 import "../workspace.wk"
-world "home.glb"
 workspace "01HQME0000000000000000WS00" {
     node "piano" "01HQME0000000000000000PN01" {
         pos 411.765625 25.94440460205078
@@ -31,6 +36,14 @@ workspace "01HQME0000000000000000WS00" {
         size 200.0 120.0
         pos3d 0.1311393529176712 -0.3173643946647644 3.482327699661255 2.814711570739746
     }
+    // The plaza itself: a node with no panel in 3D (`panel3d #false`), sitting
+    // at the world origin, whose only output is the ground you stand on.
+    node "world" "01HQME0000000000000000WD06" {
+        pos 40.0 340.0
+        size 260.0 120.0
+        pos3d 0.0 0.0 0.0 0.0
+        panel3d #false
+    }
     node "vim" "01KZXZB6DYFMS80ZBW479072WT" {
         pos 676.5054931640625 645.9148559570313
         size 360.0 260.0
@@ -40,11 +53,18 @@ workspace "01HQME0000000000000000WS00" {
         pos 1042.1175537109375 528.32666015625
         size 360.0 260.0
     }
+    bindmount "example/home.glb" "01HQME0000000000000000BM07" {
+        pos 40.0 500.0
+        size 220.0 120.0
+    }
     note "01HQME0000000000000000NT04" {
-        text "Welcome home.\n\nThis plaza is example/home.glb —\na glTF world named by the .wk file.\n\nRight-drag: look + WASD fly.\nGrab a card's label to move it\nanywhere; scroll pushes/pulls.\n\nThe piano feeds the synth:\nfocus it and play A W S E D F..."
+        text "Welcome home.\n\nThis plaza is a node: `world`,\nwith example/home.glb wired in.\n\nRight-drag: look + WASD fly.\nGrab a card's label to move it\nanywhere; scroll pushes/pulls.\n\nThe piano feeds the synth:\nfocus it and play A W S E D F..."
         pos 40.0 40.0
         size 340.0 250.0
         pos3d 0.0 0.75 -2.9000000953674316 0.0
     }
+    // The .glb into the world node: mounted at /home.glb, picked up as the
+    // first glTF in its filesystem.
+    connection "01HQME0000000000000000BM07" "01HQME0000000000000000WD06"
     midi "01HQME0000000000000000PN01" "01HQME0000000000000000SY02"
 }

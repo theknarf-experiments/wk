@@ -9,7 +9,7 @@ use std::path::Path;
 
 use wk_api::ipc::socket_path;
 use wk_protocol::ipc::{read_msg, write_msg, ClientMsg, ServerMsg, Snapshot};
-use wk_protocol::{Command, NodeKind, NodePatch, Resource, ResourceRef};
+use wk_protocol::{Command, NodeKind, NodePatch, Resource, ResourceRef, ViewMode};
 
 /// Connect to the running server for `workspace`, or a helpful error if none.
 pub(crate) fn connect(workspace: &Path) -> Result<UnixStream, String> {
@@ -440,6 +440,25 @@ pub fn stop(workspace: &Path, node: &str) -> Result<(), String> {
     let id = resolve(&snap, node)?.id;
     send_command(&mut stream, Command::Stop(id))?;
     println!("stopped {}", short(id));
+    Ok(())
+}
+
+/// `wk view <2d|3d|toggle>`: switch every attached client between the flat
+/// canvas and the 3D world — the palette's "3D View", from a shell. A headless
+/// server takes the request too; the next client to attach inherits it.
+pub fn view(workspace: &Path, mode: &str) -> Result<(), String> {
+    let mode = ViewMode::parse(mode)
+        .ok_or_else(|| format!("unknown view {mode:?} (expected 2d, 3d, or toggle)"))?;
+    let mut stream = connect(workspace)?;
+    send_command(&mut stream, Command::SetView(mode))?;
+    println!(
+        "view: {}",
+        match mode {
+            ViewMode::Flat => "2d",
+            ViewMode::World => "3d",
+            ViewMode::Toggle => "toggled",
+        }
+    );
     Ok(())
 }
 

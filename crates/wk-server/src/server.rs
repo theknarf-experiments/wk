@@ -18,7 +18,7 @@ use crate::wiring::{self, NodeClass};
 use crate::workspace::{
     secret_bytes, secret_hex, Dependency, Document, NodeSnap, SnapKind, Workspace,
 };
-use wk_protocol::{Command, NodeId, NodeKind, Resource, ResourceRef, Wire};
+use wk_protocol::{Command, NodeId, NodeKind, Resource, ResourceRef, ViewMode, Wire};
 
 /// Default canvas size of a file / port / network node, in canvas pixels.
 pub const FILE_W: f32 = 130.0;
@@ -176,9 +176,13 @@ pub struct View {
     /// their `wk:scene` objects alone.
     pub hidden_panel3d: HashSet<NodeId>,
     /// Every live wk:scene entity (plugin-owned 3D objects), across all nodes.
+    /// The surrounding world is in here too — a node publishing its plaza as
+    /// scenery, not a special case in the view.
     pub scene_entities: Vec<crate::scene::SharedEntity>,
-    /// The document's 3D world scene as an absolute glTF/GLB path, if set.
-    pub world: Option<String>,
+    /// The last `wk view` request and its sequence number. A client applies it
+    /// when the sequence advances past the one it last saw, so a request lands
+    /// once per client and a client attaching later isn't yanked by an old one.
+    pub view_mode: (u64, ViewMode),
     pub file_nodes: HashMap<NodeId, FileMeta>,
     pub host_ports: HashMap<NodeId, u16>,
     /// Note nodes (canvas id -> the sticky-note text).
@@ -341,7 +345,7 @@ impl View {
                 .filter(|e| mine(&e.lock().unwrap().node_id))
                 .cloned()
                 .collect(),
-            world: self.world.clone(),
+            view_mode: self.view_mode,
             file_nodes: keep_map(&self.file_nodes, mine),
             host_ports: keep_map(&self.host_ports, mine),
             notes: keep_map(&self.notes, mine),
@@ -749,11 +753,13 @@ pub struct Server {
     file_seq: u32,
     host_seq: u32,
 
+    /// The latest `wk view` request (sequence, mode); the sequence starts at 0
+    /// (nothing asked yet) and advances on each request.
+    view_mode: (u64, ViewMode),
+
     /// `import` directives from the loaded top-level `.wk` file, re-emitted on
     /// save so the composition is preserved.
     imports: Vec<String>,
-    /// The document's optional 3D world scene (glTF/GLB path, file-relative).
-    world: Option<String>,
     /// Dependency names / workspace ids that came from an import — omitted on
     /// save (they live in the imported files). See [`Document::load_resolved`].
     imported_deps: HashSet<String>,
@@ -797,8 +803,8 @@ impl Server {
             next_port: 8080,
             file_seq: 0,
             host_seq: 0,
+            view_mode: (0, ViewMode::Flat),
             imports: doc.imports.clone(),
-            world: doc.world.clone(),
             imported_deps: doc.imported_deps.clone(),
             imported_workspaces: doc.imported_workspaces.clone(),
         };
@@ -2764,7 +2770,6 @@ impl Server {
             dependencies: self.graph.available.clone(),
             workspaces,
             imported_deps: self.imported_deps.clone(),
-            world: self.world.clone(),
             imported_workspaces: self.imported_workspaces.clone(),
         };
         if let Err(e) = doc.save(&self.workspace_path) {
@@ -2888,6 +2893,7 @@ impl Server {
             | Command::SetServePort { .. }
             | Command::Run(_)
             | Command::Stop(_)
+            | Command::SetView(_)
             | Command::Undo => {}
         }
         self.dispatch(cmd);
@@ -2994,6 +3000,7 @@ impl Server {
             Command::Run(id) => self.run_node(id),
             Command::Stop(id) => self.stop_node(id),
             Command::Duplicate(id) => self.duplicate(id),
+            Command::SetView(mode) => self.view_mode = (self.view_mode.0 + 1, mode),
             Command::Undo => {
                 if let Some(u) = self.undo.pop() {
                     self.apply_undo(u);
@@ -3577,14 +3584,7 @@ impl Server {
                     })
                     .collect()
             },
-            world: self.world.as_ref().map(|w| {
-                self.workspace_path
-                    .parent()
-                    .unwrap_or_else(|| std::path::Path::new("."))
-                    .join(w)
-                    .to_string_lossy()
-                    .into_owned()
-            }),
+            view_mode: self.view_mode,
             file_nodes,
             host_ports: self.graph.host_ports.clone(),
             notes: self.graph.note_text.clone(),
@@ -3965,9 +3965,11 @@ mod model_tests {
                 id: 1,
                 node_id: app,
                 glb: Arc::new(Vec::new()),
+                glb_hash: 0,
                 pos: [0.0; 3],
                 yaw: 0.0,
                 scale: 1.0,
+                scenery: false,
                 events: std::collections::VecDeque::new(),
             })));
         s.apply(Command::SetToken {
@@ -4590,6 +4592,31 @@ mod model_tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// `wk view` is a request to whoever is *looking*, carried in the view as
+    /// (sequence, mode): each request advances the sequence exactly once, so a
+    /// client applies it once and a client attaching later isn't yanked by an
+    /// old one. It touches nothing else — least of all the document.
+    #[test]
+    fn a_view_request_advances_a_sequence_and_changes_nothing_else() {
+        let mut s = fresh_server();
+        let before = s.view();
+        assert_eq!(before.view_mode.0, 0, "nothing asked yet");
+
+        s.apply(Command::SetView(ViewMode::World));
+        let after = s.view();
+        assert_eq!(after.view_mode, (1, ViewMode::World));
+        assert_eq!(after.node_ids, before.node_ids, "no document change");
+
+        // A second request advances again, so a client that already applied
+        // the first still sees this one — even to the same mode.
+        s.apply(Command::SetView(ViewMode::World));
+        assert_eq!(s.view().view_mode, (2, ViewMode::World));
+
+        // And it is not undoable: undo has nothing to pop.
+        s.apply(Command::Undo);
+        assert_eq!(s.view().view_mode.0, 2);
+    }
+
     /// A node whose dependency isn't in the list (renamed/removed, or an
     /// offline uplink) can't materialize — but load→save must not silently
     /// delete it or the wire touching it. It round-trips verbatim so re-adding
@@ -4602,7 +4629,6 @@ mod model_tests {
         let file = NodeId::new();
         let doc = Document {
             imports: Vec::new(),
-            world: None,
             imported_deps: std::collections::HashSet::new(),
             imported_workspaces: std::collections::HashSet::new(),
             dependencies: Vec::new(), // "ghost" isn't here

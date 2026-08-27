@@ -431,15 +431,6 @@ impl Renderer3d {
         }
     }
 
-    /// The identity model matrix (column-major), for world meshes.
-    pub fn ident() -> [[f32; 4]; 4] {
-        let mut m = [[0.0; 4]; 4];
-        for (i, row) in m.iter_mut().enumerate() {
-            row[i] = 1.0;
-        }
-        m
-    }
-
     /// The depth view for a `w`×`h` framebuffer, recreated when the size
     /// changes. Returned by value (wgpu views are cheap handles) so the caller
     /// can hold it across a later `&mut self` draw call.

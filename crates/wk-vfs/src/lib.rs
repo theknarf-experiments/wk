@@ -82,6 +82,7 @@ impl<T: VfsView> VfsView for VfsImpl<T> {
     }
 }
 
+use wasi::clocks::wall_clock::Datetime;
 use wasi::filesystem::types::{
     Advice, DescriptorFlags, DescriptorStat, DescriptorType, DirectoryEntry, ErrorCode, Filesize,
     MetadataHashValue, NewTimestamp, OpenFlags, PathFlags,
@@ -1328,6 +1329,23 @@ fn snapshot_from(g: &Fs, node: u64, offset: u64) -> Option<Bytes> {
 /// Size of the host file in bytes (0 if it doesn't exist yet).
 fn host_size(path: &std::path::Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// A host-backed file's modification time, as wasi's `datetime`. In-memory
+/// nodes have none — nothing tracks when they changed — but a bind mount is a
+/// real file, and guests that watch one for edits (a world node reloading its
+/// `.glb`, a live-coded shader) need the timestamp to notice a change that
+/// leaves the size the same.
+fn host_mtime(path: &std::path::Path) -> Option<Datetime> {
+    let d = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some(Datetime {
+        seconds: d.as_secs(),
+        nanoseconds: d.subsec_nanos(),
+    })
 }
 
 /// Write `buf` into the host file at `offset`, creating it if needed.
@@ -2633,25 +2651,29 @@ fn node_is_referenced(fs: &Fs, id: u64) -> bool {
 }
 
 fn stat_node(fs: &Fs, id: u64) -> Option<DescriptorStat> {
-    let (ty, size) = match fs.nodes.get(&id)? {
-        Node::File(data) => (DescriptorType::RegularFile, data.len() as u64),
-        Node::RoFile(data) => (DescriptorType::RegularFile, data.len() as u64),
-        Node::Dir(_) => (DescriptorType::Directory, 0),
-        Node::Shared(sh) => (DescriptorType::RegularFile, sh.lock().unwrap().len() as u64),
-        Node::Host(p) => (DescriptorType::RegularFile, host_size(p)),
-        Node::Symlink(target) => (DescriptorType::SymbolicLink, target.len() as u64),
-        Node::Null | Node::Zero | Node::Random => (DescriptorType::CharacterDevice, 0),
+    let (ty, size, mtime) = match fs.nodes.get(&id)? {
+        Node::File(data) => (DescriptorType::RegularFile, data.len() as u64, None),
+        Node::RoFile(data) => (DescriptorType::RegularFile, data.len() as u64, None),
+        Node::Dir(_) => (DescriptorType::Directory, 0, None),
+        Node::Shared(sh) => (
+            DescriptorType::RegularFile,
+            sh.lock().unwrap().len() as u64,
+            None,
+        ),
+        Node::Host(p) => (DescriptorType::RegularFile, host_size(p), host_mtime(p)),
+        Node::Symlink(target) => (DescriptorType::SymbolicLink, target.len() as u64, None),
+        Node::Null | Node::Zero | Node::Random => (DescriptorType::CharacterDevice, 0, None),
         // The mount point itself stats as a directory; anything *inside* is
         // resolved remotely and never reaches this local-id path.
-        Node::Provider(_) => (DescriptorType::Directory, 0),
+        Node::Provider(_) => (DescriptorType::Directory, 0, None),
     };
     Some(DescriptorStat {
         type_: ty,
         link_count: 1,
         size,
         data_access_timestamp: None,
-        data_modification_timestamp: None,
-        status_change_timestamp: None,
+        data_modification_timestamp: mtime,
+        status_change_timestamp: mtime,
     })
 }
 
@@ -3796,6 +3818,44 @@ mod tests {
         assert!(resolve(&fs.lock().unwrap(), ROOT, "/h").is_none());
         assert_eq!(std::fs::read(&path).unwrap(), b"changed!");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn host_mapped_file_reports_its_mtime() {
+        // A guest watching a bind mount for edits (the world node reloading
+        // its .glb) sees a real modification time; in-memory nodes have none
+        // to report, and say so rather than inventing one.
+        let path = std::env::temp_dir().join("wk_host_mtime_test.txt");
+        std::fs::write(&path, b"v1").unwrap();
+        let fs = new_fs();
+        mount_host_file(&fs, "h", path.clone(), true);
+        fs.lock().unwrap().put_file_at("mem", b"v1".to_vec());
+
+        let stat = |name: &str| {
+            let g = fs.lock().unwrap();
+            stat_node(&g, resolve(&g, ROOT, name).expect("mounted")).unwrap()
+        };
+        let before = stat("/h").data_modification_timestamp.expect("host mtime");
+        assert!(stat("/mem").data_modification_timestamp.is_none());
+
+        // A same-size edit moves the timestamp — the case a size check misses.
+        filetime_bump(&path);
+        std::fs::write(&path, b"v2").unwrap();
+        let after = stat("/h").data_modification_timestamp.expect("host mtime");
+        assert!(
+            (after.seconds, after.nanoseconds) > (before.seconds, before.nanoseconds),
+            "mtime advanced ({before:?} -> {after:?})"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Push a file's mtime a second into the past, so a rewrite in the same
+    /// tick still registers as newer on filesystems with coarse timestamps.
+    fn filetime_bump(path: &std::path::Path) {
+        let old = std::fs::metadata(path).unwrap().modified().unwrap()
+            - std::time::Duration::from_secs(2);
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(old).unwrap();
     }
 
     #[test]

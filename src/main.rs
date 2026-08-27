@@ -154,6 +154,13 @@ enum Commands {
     /// Start every idle runnable node in the workspace
     Up,
 
+    /// Switch attached clients between the 2D canvas and the 3D world
+    View {
+        /// `2d` (flat canvas), `3d` (the world), or `toggle`
+        #[arg(default_value = "toggle")]
+        mode: String,
+    },
+
     /// Manage wk's local OCI image store
     Images {
         #[command(subcommand)]
@@ -446,6 +453,7 @@ fn main() -> Result<(), String> {
         Some(Commands::Restart { node }) => cli::restart(file, node),
         Some(Commands::Down) => cli::down(file),
         Some(Commands::Up) => cli::up(file),
+        Some(Commands::View { mode }) => cli::view(file, mode),
         Some(Commands::Images { cmd }) => images_cmd(cmd),
         Some(Commands::Midi { cmd }) => {
             let MidiCmd::Devices = cmd;

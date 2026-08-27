@@ -26,7 +26,17 @@ interface scene {
         /// Uniform scale (1.0 = authored size).
         set-scale: func(s: f32);
 
+        /// Mark this entity as scenery: part of the place rather than an
+        /// object in it. Scenery is never ray-picked — it raises no events and
+        /// never swallows a click meant for something behind it — and it
+        /// stands in for the ground plane the view draws when a workspace has
+        /// no world at all. This is how a world node publishes its floor,
+        /// sky, and buildings: geometry you walk through, not geometry you
+        /// grab.
+        set-scenery: func(scenery: bool);
+
         /// Pop the next pointer-ray interaction since the last call, if any.
+        /// Always none for scenery.
         poll-event: func() -> option<ray-event>;
     }
 }

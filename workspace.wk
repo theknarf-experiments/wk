@@ -54,6 +54,9 @@ dependencies {
     totem "plugins/totem/target/wasm32-wasip1/debug/totem.wasm" {
         description "a spinning 3D crystal (wk:scene) — click it in the 3D view"
     }
+    world "plugins/world/target/wasm32-wasip1/debug/world.wasm" {
+        description "the surrounding 3D world: wire a .glb in and this node IS the place (wk:scene scenery)"
+    }
     bash "docker://plugins/bash/Dockerfile" {
         description "wk-shell: real GNU bash + GNU coreutils (pipes, redirection, $(...))"
     }

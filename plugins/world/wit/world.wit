@@ -1,0 +1,17 @@
+package wk:place;
+
+/// The place itself, as a node. (`world` is a WIT keyword, so the interface
+/// calls it a place; on the canvas the node is `world`.) It reads a glTF/GLB
+/// out of its own vfs —
+/// whatever you wire into it: a bind mount, a volume, another node's wk:fs —
+/// and publishes it through `wk:scene` as scenery: geometry you walk through
+/// rather than click. Re-reads the file as it changes, so editing the world
+/// swaps it under your feet without a restart.
+///
+/// wk has no built-in world. A workspace surrounded by a plaza is a workspace
+/// with one of these wired up.
+world place {
+    import wk:scene/scene;
+
+    export run: func();
+}

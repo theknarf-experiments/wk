@@ -6,6 +6,10 @@ y=-1.6, node panels hovering around the origin): a circular two-tone floor,
 a ring of columns, a few pedestals, and a sky dome. Everything is vertex-
 coloured (no textures), one glTF mesh per part, Y-up, metres.
 
+The scene is not loaded by wk itself: example/home.wk wires this file into a
+`world` node, which publishes it through wk:scene as scenery. Regenerating it
+while that workspace is running swaps the plaza live.
+
 Pure stdlib; regenerate with:  python3 scripts/gen-home-world.py
 """
 

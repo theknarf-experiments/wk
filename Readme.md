@@ -209,7 +209,8 @@ logs, attach) are checked against the same key.
 ## 3D worlds
 
 Every `.wk` file is also a **world**, VRChat-style: open the command palette
-(Cmd+K) and pick **3D View** to walk it. All of the file's workspaces exist in
+(Cmd+K) and pick **3D View** to walk it — or, from a shell, `wk view 3d`
+(`2d`, or bare `wk view` to toggle), which switches every attached client. All of the file's workspaces exist in
 the world at once (each is a cluster of nodes); the 2D canvas keeps its
 per-tab views.
 
@@ -222,18 +223,27 @@ per-tab views.
 - **Poses** — a dragged node gets a free 3D pose, persisted in the file as
   `pos3d x y z yaw`. Nodes without one sit on a default cylinder derived from
   their 2D canvas position.
-- **World scenes** — a top-level `world "scene.glb"` line surrounds the
-  workspaces with a glTF scene. `example/home.wk` is a ready-made home world
+- **World scenes** — the surrounding place is a node, not a setting. Wire a
+  `.glb` into a `world` node (`plugins/world`) and it publishes the geometry
+  as *scenery* — geometry you walk through, never ray-picked, standing in for
+  the fallback ground plane. The file can come from anywhere a node's
+  filesystem can: a bind mount, a volume, a container image, another node's
+  `wk:fs`. Edit it and the plaza reloads under your feet; nothing about the
+  world is built into wk. `example/home.wk` is a ready-made home world
   (`scripts/gen-home-world.py` regenerates its plaza):
 
   ```sh
+  cd plugins/world && mise run build   # then, from the repo root:
   cargo run -- run example/home.wk     # then Cmd+K -> 3D View
   ```
 
 - **`wk:scene`** — a plugin can be a real 3D object instead of (or as well
   as) a panel: it hands wk a GLB blob and a live transform, and polls
   hover/press/release ray events. `plugins/totem` is the reference — a
-  spinning crystal you can click (and Cmd+drag to carry).
+  spinning crystal you can click (and Cmd+drag to carry). An entity marked
+  *scenery* (`set-scenery`) opts out of picking entirely: it is the ground and
+  the buildings, not something you grab — which is what makes a world-sized
+  object possible without it swallowing every click.
 - **Panels off** — such a node can drop its flat card and *be* its 3D object.
   Click the object to focus it (the HUD reads `keyboard → totem`), then
   Cmd+K → **Hide Panel**; **Show Panel** brings the card back. The object
@@ -242,7 +252,8 @@ per-tab views.
   `panel3d #false`. Wiring a hidden node needs its ports, so do that from the
   2D canvas — or show the panel again. A node with no live object keeps its
   panel regardless, so a crashed guest can never leave an invisible node
-  behind.
+  behind. Scenery is the exception to "still clickable": a hidden world node
+  is reached from the 2D canvas (or `wk node`), since you walk through it.
 
 ## Setup
 
@@ -282,8 +293,9 @@ cargo run -- run                  # open the workspace in a window
 ```
 
 Every `.wk` file is its own workspace; pass `-f/--file` to operate on a specific
-one (defaults to `workspace.wk`). Other commands: `list`, `remove <name>`, and
-`publish` (below). `run --headless` loads and runs the workspace with no window,
+one (defaults to `workspace.wk`). Other commands: `list`, `remove <name>`,
+`view <2d|3d|toggle>` (switch attached clients between the canvas and the 3D
+world), and `publish` (below). `run --headless` loads and runs the workspace with no window,
 keeping the guests alive until Ctrl-C.
 
 ## The shell (`wk-shell`)

@@ -37,19 +37,41 @@ pub struct EntityState {
     pub node_id: NodeId,
     /// The GLB blob, immutable after construction.
     pub glb: Arc<Vec<u8>>,
+    /// Content hash of `glb` — the client keys its GPU mesh cache on this, so
+    /// identical geometry uploads once no matter how many entities (or how
+    /// many restarts of the owning node) it appears through.
+    pub glb_hash: u64,
     /// Position relative to the node's pose origin.
     pub pos: [f32; 3],
     /// Rotation around +y, radians (composed after the node's yaw).
     pub yaw: f32,
     pub scale: f32,
+    /// Scenery: geometry that is part of the place, not an object in it. The
+    /// client never ray-picks it (so a world-sized entity can't swallow every
+    /// click) and takes its presence as "this workspace has a world", which
+    /// suppresses the fallback ground plane.
+    pub scenery: bool,
     /// Pointer-ray interactions queued by the client, drained by the guest.
     pub events: VecDeque<RayEvent>,
 }
 
+/// FNV-1a over the GLB bytes: a cheap content id for the client's mesh cache.
+/// Not a security boundary — a collision costs the wrong geometry, and both
+/// blobs came from the same host anyway.
+pub fn glb_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 impl EntityState {
     /// Queue an interaction (bounded so an unread queue can't grow forever).
+    /// Scenery is never picked, so it never queues anything.
     pub fn push_event(&mut self, ev: RayEvent) {
-        if self.events.len() < 256 {
+        if !self.scenery && self.events.len() < 256 {
             self.events.push_back(ev);
         }
     }
@@ -96,10 +118,12 @@ impl wk::scene::scene::HostEntity for HostState {
         let shared = Arc::new(Mutex::new(EntityState {
             id: NEXT_ENTITY_ID.fetch_add(1, Ordering::Relaxed),
             node_id: self.node_id,
+            glb_hash: glb_hash(&glb),
             glb: Arc::new(glb),
             pos: [0.0, 0.0, 0.0],
             yaw: 0.0,
             scale: 1.0,
+            scenery: false,
             events: VecDeque::new(),
         }));
         self.scene_reg.lock().unwrap().push(shared.clone());
@@ -122,6 +146,16 @@ impl wk::scene::scene::HostEntity for HostState {
     fn set_scale(&mut self, this: Resource<SceneEntity>, s: f32) -> Result<()> {
         let e = self.table().get(&this)?;
         e.shared.lock().unwrap().scale = s;
+        Ok(())
+    }
+
+    fn set_scenery(&mut self, this: Resource<SceneEntity>, scenery: bool) -> Result<()> {
+        let e = self.table().get(&this)?;
+        let mut st = e.shared.lock().unwrap();
+        st.scenery = scenery;
+        if scenery {
+            st.events.clear(); // anything queued before the flag is moot
+        }
         Ok(())
     }
 
@@ -148,9 +182,11 @@ mod tests {
             id: 1,
             node_id: NodeId::nil(),
             glb: Arc::new(Vec::new()),
+            glb_hash: 0,
             pos: [0.0; 3],
             yaw: 0.0,
             scale: 1.0,
+            scenery: false,
             events: VecDeque::new(),
         }));
         registry.lock().unwrap().push(shared.clone());
@@ -163,20 +199,44 @@ mod tests {
         assert_eq!(registry.lock().unwrap().len(), 0);
     }
 
-    #[test]
-    fn event_queue_is_bounded() {
-        let mut e = EntityState {
+    fn bare_entity() -> EntityState {
+        EntityState {
             id: 1,
             node_id: NodeId::nil(),
             glb: Arc::new(Vec::new()),
+            glb_hash: 0,
             pos: [0.0; 3],
             yaw: 0.0,
             scale: 1.0,
+            scenery: false,
             events: VecDeque::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn event_queue_is_bounded() {
+        let mut e = bare_entity();
         for _ in 0..500 {
             e.push_event(RayEvent::Hover);
         }
         assert_eq!(e.events.len(), 256);
+    }
+
+    #[test]
+    fn scenery_never_queues_events() {
+        // The client shouldn't pick scenery at all, but a stale pick racing
+        // the flag must not leave events for a guest that never polls.
+        let mut e = bare_entity();
+        e.scenery = true;
+        e.push_event(RayEvent::Press);
+        assert!(e.events.is_empty());
+    }
+
+    #[test]
+    fn identical_geometry_hashes_alike() {
+        // The client's mesh cache dedupes on this: same bytes, same key.
+        assert_eq!(glb_hash(b"glTF\x02"), glb_hash(b"glTF\x02"));
+        assert_ne!(glb_hash(b"glTF\x02"), glb_hash(b"glTF\x03"));
+        assert_ne!(glb_hash(b""), glb_hash(b"\0"));
     }
 }

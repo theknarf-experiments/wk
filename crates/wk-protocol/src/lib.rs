@@ -289,6 +289,42 @@ pub enum Command {
     Duplicate(NodeId),
     /// Undo the last undoable mutation.
     Undo,
+    /// Switch attached clients between the flat canvas and the 3D world (the
+    /// palette's "3D View", reachable from `wk view`). Cosmetic: it changes
+    /// how the document is *looked at*, never the document.
+    SetView(ViewMode),
+}
+
+/// How a client shows the document: the flat 2D canvas, or the 3D world every
+/// workspace lives in at once.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum ViewMode {
+    #[default]
+    Flat,
+    World,
+    /// Whichever the client isn't in.
+    Toggle,
+}
+
+impl ViewMode {
+    /// Parse a CLI word: `2d`/`flat`, `3d`/`world`, `toggle`.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "2d" | "flat" | "canvas" => Some(ViewMode::Flat),
+            "3d" | "world" => Some(ViewMode::World),
+            "toggle" => Some(ViewMode::Toggle),
+            _ => None,
+        }
+    }
+
+    /// Apply to a client currently in `is_3d`, giving the mode it should be in.
+    pub fn wants_3d(self, is_3d: bool) -> bool {
+        match self {
+            ViewMode::Flat => false,
+            ViewMode::World => true,
+            ViewMode::Toggle => !is_3d,
+        }
+    }
 }
 
 impl Command {
@@ -332,6 +368,9 @@ impl Command {
             // Undo can restore or remove anything it previously recorded, so it
             // needs document-wide write authority.
             Command::Undo => (ResourceKind::Document, Action::Update),
+            // Looking at the document differently is the weakest thing a
+            // client can ask for: cosmetic, and document-wide.
+            Command::SetView(_) => (ResourceKind::Document, Action::Arrange),
         }
     }
 }
@@ -351,4 +390,36 @@ impl Command {
 /// client at runtime behind `dyn Client<C>`.
 pub trait Client<C> {
     fn run(self: Box<Self>, conn: C) -> Result<(), String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn view_mode_parses_the_words_a_shell_would_type() {
+        assert_eq!(ViewMode::parse("3d"), Some(ViewMode::World));
+        assert_eq!(ViewMode::parse("3D"), Some(ViewMode::World));
+        assert_eq!(ViewMode::parse("2d"), Some(ViewMode::Flat));
+        assert_eq!(ViewMode::parse("toggle"), Some(ViewMode::Toggle));
+        assert_eq!(ViewMode::parse("sideways"), None);
+    }
+
+    #[test]
+    fn view_mode_resolves_against_the_clients_current_mode() {
+        // Explicit modes are idempotent — `wk view 3d` twice leaves you in 3D,
+        // which a plain toggle wouldn't.
+        assert!(ViewMode::World.wants_3d(false) && ViewMode::World.wants_3d(true));
+        assert!(!ViewMode::Flat.wants_3d(true) && !ViewMode::Flat.wants_3d(false));
+        assert!(ViewMode::Toggle.wants_3d(false) && !ViewMode::Toggle.wants_3d(true));
+    }
+
+    #[test]
+    fn switching_view_is_the_weakest_right_there_is() {
+        // Looking at the document differently must never need write authority.
+        assert_eq!(
+            Command::SetView(ViewMode::World).required(),
+            (ResourceKind::Document, Action::Arrange)
+        );
+    }
 }

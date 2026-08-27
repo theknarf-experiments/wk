@@ -16,21 +16,9 @@ pub struct CpuMesh {
     pub texture: Option<(u32, u32, Vec<u8>)>,
 }
 
-/// Load a `.glb`/`.gltf` file from disk and flatten its default scene.
-pub fn load_file(path: &str) -> Result<Vec<CpuMesh>, String> {
-    // GLB is self-contained: share the byte path with plugin scene entities.
-    // A `.gltf` may reference external buffer/image files, so it imports by
-    // path instead.
-    if path.ends_with(".glb") {
-        let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
-        return load_bytes(&bytes).map_err(|e| format!("{path}: {e}"));
-    }
-    let (doc, buffers, images) = gltf::import(path).map_err(|e| format!("load {path}: {e}"))?;
-    Ok(flatten(&doc, &buffers, &images))
-}
-
-/// Load a GLB from bytes (the path a plugin's scene entities ship geometry
-/// through, and what `.glb` world files reduce to).
+/// Load a GLB from bytes — the only way geometry reaches the view: every
+/// mesh, from a spinning totem to the surrounding world itself, arrives as a
+/// `wk:scene` entity's self-contained blob.
 pub fn load_bytes(bytes: &[u8]) -> Result<Vec<CpuMesh>, String> {
     let (doc, buffers, images) =
         gltf::import_slice(bytes).map_err(|e| format!("parse glb: {e}"))?;
@@ -247,8 +235,11 @@ mod tests {
     #[test]
     fn home_world_glb_loads() {
         // The shipped home world parses and has real geometry in every mesh.
+        // (The world node reads exactly these bytes out of its vfs and hands
+        // them to `wk:scene`.)
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../example/home.glb");
-        let meshes = load_file(path).expect("home.glb loads");
+        let bytes = std::fs::read(path).expect("home.glb is readable");
+        let meshes = load_bytes(&bytes).expect("home.glb loads");
         assert!(meshes.len() >= 4, "sky/floor/columns/pedestals");
         for m in &meshes {
             assert!(!m.positions.is_empty() && !m.indices.is_empty());
