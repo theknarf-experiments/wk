@@ -101,6 +101,29 @@ impl Drop for SceneEntity {
     }
 }
 
+impl HostState {
+    /// Register a new entity, scenery or not, and hand the guest its resource.
+    /// The flag is set before the registry sees it: an entity the size of a
+    /// plaza must never be visible to the view as something clickable, not
+    /// even for the frame between a constructor and a setter.
+    fn place(&mut self, glb: Vec<u8>, scenery: bool) -> Result<Resource<SceneEntity>> {
+        let shared = Arc::new(Mutex::new(EntityState {
+            id: NEXT_ENTITY_ID.fetch_add(1, Ordering::Relaxed),
+            node_id: self.node_id,
+            glb_hash: glb_hash(&glb),
+            glb: Arc::new(glb),
+            pos: [0.0, 0.0, 0.0],
+            yaw: 0.0,
+            scale: 1.0,
+            scenery,
+            events: VecDeque::new(),
+        }));
+        self.scene_reg.lock().unwrap().push(shared.clone());
+        let registry = self.scene_reg.clone();
+        Ok(self.table().push(SceneEntity { shared, registry })?)
+    }
+}
+
 pub fn add_to_linker(l: &mut Linker<HostState>) -> Result<()> {
     wk::scene::scene::add_to_linker::<_, HasScene>(l, |s| s)?;
     Ok(())
@@ -115,20 +138,11 @@ impl wk::scene::scene::Host for HostState {}
 
 impl wk::scene::scene::HostEntity for HostState {
     fn new(&mut self, glb: Vec<u8>) -> Result<Resource<SceneEntity>> {
-        let shared = Arc::new(Mutex::new(EntityState {
-            id: NEXT_ENTITY_ID.fetch_add(1, Ordering::Relaxed),
-            node_id: self.node_id,
-            glb_hash: glb_hash(&glb),
-            glb: Arc::new(glb),
-            pos: [0.0, 0.0, 0.0],
-            yaw: 0.0,
-            scale: 1.0,
-            scenery: false,
-            events: VecDeque::new(),
-        }));
-        self.scene_reg.lock().unwrap().push(shared.clone());
-        let registry = self.scene_reg.clone();
-        Ok(self.table().push(SceneEntity { shared, registry })?)
+        self.place(glb, false)
+    }
+
+    fn scenery(&mut self, glb: Vec<u8>) -> Result<Resource<SceneEntity>> {
+        self.place(glb, true)
     }
 
     fn set_position(&mut self, this: Resource<SceneEntity>, x: f32, y: f32, z: f32) -> Result<()> {
@@ -146,16 +160,6 @@ impl wk::scene::scene::HostEntity for HostState {
     fn set_scale(&mut self, this: Resource<SceneEntity>, s: f32) -> Result<()> {
         let e = self.table().get(&this)?;
         e.shared.lock().unwrap().scale = s;
-        Ok(())
-    }
-
-    fn set_scenery(&mut self, this: Resource<SceneEntity>, scenery: bool) -> Result<()> {
-        let e = self.table().get(&this)?;
-        let mut st = e.shared.lock().unwrap();
-        st.scenery = scenery;
-        if scenery {
-            st.events.clear(); // anything queued before the flag is moot
-        }
         Ok(())
     }
 

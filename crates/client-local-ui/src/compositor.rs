@@ -225,6 +225,40 @@ struct EntityGpu {
     bound: ([f32; 3], f32),
 }
 
+/// Frames a freshly created workspace stays "pending" — long enough for the
+/// server thread to apply the Create and publish it (a frame or two in
+/// practice), short enough that a refused create doesn't strand the client on
+/// a tab that will never exist.
+const PENDING_WS_FRAMES: u8 = 60;
+
+/// Which tab the client should be on once the server's view arrives, and what
+/// remains of a pending create.
+///
+/// A workspace this client just minted isn't in `tabs` yet — the server
+/// applies commands on its own thread — so a plain "is `active` still there?"
+/// check would drag the view back to the first tab and undo the switch. That
+/// is the Cmd+T race: the palette set `active` late enough in the frame to
+/// usually survive it, a keystroke didn't. Hold the switch while the create is
+/// pending; give up if it never lands, or if something else changed tabs.
+fn reconcile_active_ws(
+    tabs: &[NodeId],
+    active: NodeId,
+    pending: Option<(NodeId, u8)>,
+) -> (NodeId, Option<(NodeId, u8)>) {
+    let pending = match pending {
+        // It landed: the switch stands on its own from here.
+        Some((id, _)) if tabs.contains(&id) => None,
+        // Still waiting, and still where we put the user: keep holding.
+        Some((id, left)) if id == active && left > 0 => Some((id, left - 1)),
+        // Gave up, or the user moved on.
+        _ => None,
+    };
+    if !tabs.contains(&active) && pending.is_none() {
+        return (tabs.first().copied().unwrap_or(active), None);
+    }
+    (active, pending)
+}
+
 /// Whether a node's flat 2D panel is drawn in the 3D world. Hidden only when
 /// the document asks for it (`panel3d #false`) *and* the node has a `wk:scene`
 /// body to stand in its place — a node whose guest died (or whose objects a
@@ -266,6 +300,9 @@ struct App {
     mode_3d: bool,
     /// The `wk view` sequence this client has already applied.
     view_mode_seq: u64,
+    /// A workspace this client minted and switched to, not yet in the server's
+    /// view: `(id, frames left to wait)`. See [`reconcile_active_ws`].
+    pending_ws: Option<(NodeId, u8)>,
     /// Fly mode: free 6-DoF flight. Off = walk (grounded at eye height).
     fly3d: bool,
     cam3d: Camera3d,
@@ -419,6 +456,7 @@ impl App {
             pan_target: [0.0, 0.0],
             mode_3d: false,
             view_mode_seq: 0,
+            pending_ws: None,
             fly3d: false,
             cam3d: Camera3d::new(),
             cyl_anchor: [0.0, 0.0],
@@ -1698,6 +1736,9 @@ impl App {
         let id = NodeId::new();
         self.conn.send(Command::Create(Resource::Workspace { id }));
         self.active_ws = id;
+        // The server hasn't applied the Create yet; hold this switch until its
+        // view catches up (see `reconcile_active_ws`).
+        self.pending_ws = Some((id, PENDING_WS_FRAMES));
     }
 
     /// Move to the next (`forward`) or previous open tab, wrapping around.
@@ -3600,9 +3641,8 @@ impl App {
         // and advances the runtime on its own thread; we only read and send.
         let full = self.conn.view();
         self.tabs = full.workspaces.clone();
-        if !self.tabs.contains(&self.active_ws) {
-            self.active_ws = self.tabs.first().copied().unwrap_or(self.active_ws);
-        }
+        (self.active_ws, self.pending_ws) =
+            reconcile_active_ws(&self.tabs, self.active_ws, self.pending_ws);
         // Ports claimed by more than one HostPort (across every workspace, since
         // they all run) can't all bind — flag them.
         let mut port_count: HashMap<u16, u32> = HashMap::new();
@@ -6431,6 +6471,52 @@ fn provider_serving(v: &View, node: NodeId, path: &str) -> Option<String> {
 #[cfg(test)]
 mod inspect_tests {
     use super::*;
+
+    /// A new tab is switched to even though the server's view hasn't caught
+    /// up yet — the Cmd+T race.
+    #[test]
+    fn a_freshly_created_workspace_keeps_the_switch_until_it_lands() {
+        let old = NodeId::from_u128(1);
+        let new = NodeId::from_u128(2);
+        let tabs = vec![old];
+
+        // Frame 1: created and switched to; the server hasn't published it.
+        let (active, pending) = reconcile_active_ws(&tabs, new, Some((new, PENDING_WS_FRAMES)));
+        assert_eq!(active, new, "the switch holds");
+        assert_eq!(pending, Some((new, PENDING_WS_FRAMES - 1)), "still waiting");
+
+        // Frame 2: it lands. The switch stands on its own now.
+        let (active, pending) = reconcile_active_ws(&[old, new], active, pending);
+        assert_eq!((active, pending), (new, None));
+    }
+
+    /// A create the server never applies must not strand the client on a tab
+    /// that doesn't exist.
+    #[test]
+    fn a_create_that_never_lands_falls_back() {
+        let old = NodeId::from_u128(1);
+        let ghost = NodeId::from_u128(2);
+        let (mut active, mut pending) = (ghost, Some((ghost, 2)));
+        for _ in 0..3 {
+            (active, pending) = reconcile_active_ws(&[old], active, pending);
+        }
+        assert_eq!((active, pending), (old, None), "back to a real tab");
+    }
+
+    /// The pre-existing behaviour, unchanged: an active tab that goes away
+    /// (closed, or deleted by another client) falls back to the first.
+    #[test]
+    fn a_vanished_tab_still_falls_back_at_once() {
+        let a = NodeId::from_u128(1);
+        let gone = NodeId::from_u128(9);
+        assert_eq!(reconcile_active_ws(&[a], gone, None), (a, None));
+        // ...and switching away from a pending tab drops the wait with it.
+        let other = NodeId::from_u128(3);
+        assert_eq!(
+            reconcile_active_ws(&[a, other], other, Some((gone, 5))),
+            (other, None)
+        );
+    }
 
     /// Port slots are evenly spaced with margins: one sits at the middle, and
     /// N stay strictly inside the node's vertical span in order.

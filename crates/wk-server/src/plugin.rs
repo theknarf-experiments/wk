@@ -6030,15 +6030,18 @@ mod tests {
         let published = |want: &[u8]| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
             loop {
-                let hit = host.scene_entities().into_iter().find(|e| {
+                // Copy what we need out from under the lock: an assert that
+                // fires while holding it would poison the entity for the
+                // guest thread and bury this failure under another.
+                let hit = host.scene_entities().into_iter().find_map(|e| {
                     let e = e.lock().unwrap();
-                    e.node_id == id && e.glb.as_slice() == want
+                    (e.node_id == id && e.glb.as_slice() == want)
+                        .then_some((e.scenery, e.glb_hash, e.pos))
                 });
-                if let Some(e) = hit {
-                    let e = e.lock().unwrap();
-                    assert!(e.scenery, "a world is scenery, not a clickable object");
-                    assert_eq!(e.glb_hash, crate::scene::glb_hash(want), "cache key");
-                    assert_eq!(e.pos, [0.0; 3], "the world sits at its node's pose");
+                if let Some((scenery, hash, pos)) = hit {
+                    assert!(scenery, "a world is scenery, not a clickable object");
+                    assert_eq!(hash, crate::scene::glb_hash(want), "cache key");
+                    assert_eq!(pos, [0.0; 3], "the world sits at its node's pose");
                     return;
                 }
                 assert!(

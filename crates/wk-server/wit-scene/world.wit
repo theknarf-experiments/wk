@@ -19,21 +19,23 @@ interface scene {
     resource entity {
         constructor(glb: list<u8>);
 
+        /// Construct scenery: part of the place rather than an object in it.
+        /// Scenery is never ray-picked — it raises no events and never
+        /// swallows a click meant for something behind it — and it stands in
+        /// for the ground plane the view draws when a workspace has no world
+        /// at all. This is how a world node publishes its floor, sky, and
+        /// buildings: geometry you walk through, not geometry you grab.
+        ///
+        /// Scenery at birth, not by a later call: an entity the size of a
+        /// plaza must never exist, even for a frame, as something clickable.
+        scenery: static func(glb: list<u8>) -> entity;
+
         /// Position relative to the node's pose origin, metres.
         set-position: func(x: f32, y: f32, z: f32);
         /// Rotation around the +y axis, radians (applied after the node's yaw).
         set-rotation-y: func(radians: f32);
         /// Uniform scale (1.0 = authored size).
         set-scale: func(s: f32);
-
-        /// Mark this entity as scenery: part of the place rather than an
-        /// object in it. Scenery is never ray-picked — it raises no events and
-        /// never swallows a click meant for something behind it — and it
-        /// stands in for the ground plane the view draws when a workspace has
-        /// no world at all. This is how a world node publishes its floor,
-        /// sky, and buildings: geometry you walk through, not geometry you
-        /// grab.
-        set-scenery: func(scenery: bool);
 
         /// Pop the next pointer-ray interaction since the last call, if any.
         /// Always none for scenery.

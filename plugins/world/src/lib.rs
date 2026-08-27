@@ -76,8 +76,7 @@ fn run_with(path: String) {
 
 /// Hand a GLB to `wk:scene` as scenery at this node's pose.
 fn scenery(glb: &[u8]) -> Entity {
-    let ent = Entity::new(glb);
-    ent.set_scenery(true);
+    let ent = Entity::scenery(glb);
     ent.set_position(0.0, 0.0, 0.0);
     ent
 }

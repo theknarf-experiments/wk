@@ -9,10 +9,10 @@ interface scene {
 
     resource entity {
         constructor(glb: list<u8>);
+        scenery: static func(glb: list<u8>) -> entity;
         set-position: func(x: f32, y: f32, z: f32);
         set-rotation-y: func(radians: f32);
         set-scale: func(s: f32);
-        set-scenery: func(scenery: bool);
         poll-event: func() -> option<ray-event>;
     }
 }

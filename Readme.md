@@ -240,10 +240,11 @@ per-tab views.
 - **`wk:scene`** — a plugin can be a real 3D object instead of (or as well
   as) a panel: it hands wk a GLB blob and a live transform, and polls
   hover/press/release ray events. `plugins/totem` is the reference — a
-  spinning crystal you can click (and Cmd+drag to carry). An entity marked
-  *scenery* (`set-scenery`) opts out of picking entirely: it is the ground and
-  the buildings, not something you grab — which is what makes a world-sized
-  object possible without it swallowing every click.
+  spinning crystal you can click (and Cmd+drag to carry). An entity built as
+  *scenery* (`entity.scenery`) opts out of picking entirely: it is the ground
+  and the buildings, not something you grab — which is what makes a
+  world-sized object possible without it swallowing every click. Scenery at
+  birth, never by a later call, so a plaza is never briefly clickable.
 - **Panels off** — such a node can drop its flat card and *be* its 3D object.
   Click the object to focus it (the HUD reads `keyboard → totem`), then
   Cmd+K → **Hide Panel**; **Show Panel** brings the card back. The object
