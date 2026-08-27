@@ -23,7 +23,9 @@ use crate::host_shell::Gfx;
 use crate::render2d::{Quad, Renderer, TextureId};
 use crate::render3d::{MeshDraw, MeshGpu, Quad3, Renderer3d};
 use crate::text::Fonts;
-use wk_protocol::{Command, NodeId, NodeKind, NodePatch, Resource, ResourceRef, ViewMode, Wire};
+use wk_protocol::{
+    Command, NodeId, NodeKind, NodePatch, PortDir, PortKind, Resource, ResourceRef, ViewMode, Wire,
+};
 use wk_server::plugin::{
     Key, KeyEvent, PointerButton, PointerEvent, ResizeEvent, ScrollEvent, SharedNode, SharedSurface,
 };
@@ -556,6 +558,11 @@ impl App {
             one(Clipboard, Out) // a Clipboard node grants apps
         } else if v.api_nodes.contains(&id) {
             one(Api, Out) // an Api node grants apps
+        } else if let Some(p) = v.boundary_ports.get(&id) {
+            // A boundary port stands in for the node on the far side, so its
+            // dot faces inward: an *in*-port feeds this workspace's nodes (Out),
+            // an *out*-port is fed by them (In).
+            one(p.kind, if p.dir == PortDir::In { Out } else { In })
         } else if v.midi_ins.contains_key(&id) {
             one(Midi, Out) // a hardware MIDI input drives apps
         } else {
@@ -687,10 +694,10 @@ impl App {
             let (col, rad) = if near(mp, a, pr + 3.0) {
                 (PORT_HOT, pr * 1.4)
             } else if p.dir == PortDir::In {
-                let c = p.kind.color();
+                let c = port_color(p.kind);
                 ([c[0] * 0.7, c[1] * 0.7, c[2] * 0.7, 1.0], pr)
             } else {
-                (p.kind.color(), pr)
+                (port_color(p.kind), pr)
             };
             quads.push(Quad::disc(circle, a, rad, col, clip));
         }
@@ -1393,6 +1400,8 @@ impl App {
             "midi in".into()
         } else if let Some(svc) = self.view.host_services.get(&id) {
             svc.name.clone()
+        } else if let Some(p) = self.view.boundary_ports.get(&id) {
+            format!("{} {}", port_label(p.dir), p.name)
         } else {
             "node".into()
         }
@@ -2699,6 +2708,16 @@ impl App {
                     status.to_string(),
                     status_col,
                 ))
+            } else if let Some(p) = self.view.boundary_ports.get(&id) {
+                let col = port_color(p.kind);
+                Some(Chrome(
+                    col,
+                    [col[0] * 0.22, col[1] * 0.22, col[2] * 0.22, 1.0],
+                    p.name.clone(),
+                    TEXT,
+                    format!("{} {}", port_label(p.dir), p.kind.as_str()),
+                    col,
+                ))
             } else if let Some(device) = self.view.midi_ins.get(&id) {
                 let (status, status_col) = if device.is_empty() {
                     ("no device".to_string(), [0.8, 0.65, 0.5, 1.0])
@@ -3278,7 +3297,7 @@ impl App {
                     port_world(&panels[ib], kind, PortDir::In),
                     eye,
                     0.012,
-                    kind.color(),
+                    port_color(kind),
                 ));
             }
         }
@@ -3293,7 +3312,7 @@ impl App {
                     o[1] + d[1] * reach,
                     o[2] + d[2] * reach,
                 ];
-                quads3.push(Quad3::ribbon(white, from, to, eye, 0.012, kind.color()));
+                quads3.push(Quad3::ribbon(white, from, to, eye, 0.012, port_color(kind)));
             }
         }
         // Panels: a backing plate (highlighted while dragged), the content
@@ -3381,7 +3400,7 @@ impl App {
             // Typed ports as discs riding the panel edges (inputs dimmer, the
             // hovered one lit and enlarged — hover is also the drop target).
             for (pi, &(port, pu, pv)) in p.ports.iter().enumerate() {
-                let c = port.kind.color();
+                let c = port_color(port.kind);
                 let (col, r) = if hot_port == Some((p.id, pi)) {
                     (PORT_HOT, PORT3D_R * 1.4)
                 } else if port.dir == PortDir::In {
@@ -4091,6 +4110,7 @@ impl App {
                     let is_capture = self.view.capture_feeds.contains_key(&id);
                     let is_api = self.view.api_nodes.contains(&id);
                     let is_clipboard = self.view.clipboard_boards.contains_key(&id);
+                    let is_boundary = self.view.boundary_ports.contains_key(&id);
                     if is_note {
                         // Note: close (top-right), drag from the top strip, or
                         // click the body to edit the text.
@@ -4117,6 +4137,7 @@ impl App {
                         || is_capture
                         || is_api
                         || is_clipboard
+                        || is_boundary
                     {
                         // Canvas widget nodes (file / HostPort / Network / Iroh):
                         // close, adjust port (HostPort −/+ buttons), edit the
@@ -4777,6 +4798,37 @@ impl App {
                 continue;
             }
 
+            // A boundary port: the smallest widget there is — its name, and
+            // what may cross it, in that connection kind's own colour.
+            if let Some(p) = self.view.boundary_ports.get(&id).cloned() {
+                let col = port_color(p.kind);
+                let status = format!("{} {}", port_label(p.dir), p.kind.as_str());
+                self.draw_widget(
+                    &mut quads,
+                    &mut gfx,
+                    white,
+                    zf,
+                    mp,
+                    clip,
+                    full,
+                    WidgetChrome {
+                        id,
+                        r,
+                        border: col,
+                        // A dark wash of the kind's colour, so the port reads
+                        // as belonging to its wire without shouting.
+                        bg: [col[0] * 0.22, col[1] * 0.22, col[2] * 0.22, 1.0],
+                        title: &p.name,
+                        title_col: TEXT,
+                        status: &status,
+                        status_col: col,
+                        status_scale: 0.7,
+                        copy_ticket: false,
+                    },
+                );
+                continue;
+            }
+
             // A note: a yellow annotation panel (no ports, no title bar).
             if let Some(note_text) = self.view.notes.get(&id) {
                 let (text, editing) = match &self.editing_note {
@@ -5119,7 +5171,16 @@ impl App {
         if let Some(d) = &self.drag {
             if let DragMode::Connect(kind) = d.mode {
                 let from = self.port_pos(d.id, kind, PortDir::Out);
-                draw_connection(&mut quads, white, from, mp, false, kind.color(), zf, full);
+                draw_connection(
+                    &mut quads,
+                    white,
+                    from,
+                    mp,
+                    false,
+                    port_color(kind),
+                    zf,
+                    full,
+                );
             }
         }
 

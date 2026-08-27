@@ -45,6 +45,88 @@ pub enum Wire {
     Clipboard(NodeId, NodeId),
 }
 
+/// What a connection *carries*, named independently of the two nodes on its
+/// ends. One variant per [`Wire`] kind.
+///
+/// Two things need this without knowing about each other: the canvas, which
+/// gives each connection kind its own colour and its own dot on a node's edge,
+/// and a workspace **boundary port**, which declares the kind of connection
+/// that may cross a definition's edge before there is any node to infer it
+/// from. It lives here rather than in either of them for that reason.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+pub enum PortKind {
+    /// A volume (or fs provider) mounted into an app — [`Wire::Bind`].
+    Bind,
+    /// A MIDI stream from a source to a destination — [`Wire::Midi`].
+    Midi,
+    /// A node's service published on a HostPort — [`Wire::Serve`].
+    Serve,
+    /// Membership of a virtual network — [`Wire::Net`].
+    Net,
+    /// A screen-capture grant — [`Wire::Capture`].
+    Capture,
+    /// A host-clipboard grant — [`Wire::Clipboard`].
+    Clipboard,
+    /// A wk API grant — [`Wire::Api`].
+    Api,
+}
+
+impl PortKind {
+    /// The stable word a `.wk` file writes for this kind.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PortKind::Bind => "bind",
+            PortKind::Midi => "midi",
+            PortKind::Serve => "serve",
+            PortKind::Net => "net",
+            PortKind::Capture => "capture",
+            PortKind::Clipboard => "clipboard",
+            PortKind::Api => "api",
+        }
+    }
+
+    /// Read the word back, or `None` if it names no connection kind.
+    pub fn parse(s: &str) -> Option<Self> {
+        PortKind::ALL.into_iter().find(|k| k.as_str() == s)
+    }
+
+    pub const ALL: [PortKind; 7] = [
+        PortKind::Bind,
+        PortKind::Midi,
+        PortKind::Serve,
+        PortKind::Net,
+        PortKind::Capture,
+        PortKind::Clipboard,
+        PortKind::Api,
+    ];
+
+    /// Every kind's word, for an error message that lists the alternatives.
+    pub fn words() -> String {
+        PortKind::ALL
+            .iter()
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Which end of a connection something is: `In` receives, `Out` sends.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+pub enum PortDir {
+    In,
+    Out,
+}
+
+impl PortDir {
+    /// The other end — what a port must meet to form a connection.
+    pub fn opposite(self) -> Self {
+        match self {
+            PortDir::In => PortDir::Out,
+            PortDir::Out => PortDir::In,
+        }
+    }
+}
+
 /// The TCP port the wk API listens on inside a node's virtual network, when
 /// the node is wired to an Api node. Fabric DNS resolves the endpoint as
 /// `api`, so a guest dials `api:1337` and speaks the [`ipc`] wire protocol
@@ -412,6 +494,20 @@ mod tests {
         assert!(ViewMode::World.wants_3d(false) && ViewMode::World.wants_3d(true));
         assert!(!ViewMode::Flat.wants_3d(true) && !ViewMode::Flat.wants_3d(false));
         assert!(ViewMode::Toggle.wants_3d(false) && !ViewMode::Toggle.wants_3d(true));
+    }
+
+    #[test]
+    fn every_port_kind_round_trips_through_its_word() {
+        // The word is what a `.wk` file stores, so a kind that doesn't come
+        // back from its own spelling would lose a boundary port on reload.
+        for k in PortKind::ALL {
+            assert_eq!(PortKind::parse(k.as_str()), Some(k), "{k:?}");
+        }
+        assert_eq!(PortKind::parse("nonsense"), None);
+        // The word list an error message offers actually names them all.
+        for k in PortKind::ALL {
+            assert!(PortKind::words().contains(k.as_str()), "{k:?} listed");
+        }
     }
 
     #[test]

@@ -9,41 +9,31 @@ pub(super) const PORT_R: f32 = 6.0;
 /// A port lights up when the cursor is over it (hover / valid drop target).
 pub(super) const PORT_HOT: [f32; 4] = [0.55, 0.80, 1.0, 1.0];
 
-/// A connection kind a node can carry on a typed port. Maps 1:1 to a [`Wire`]
-/// variant and gives the port (and its wire) a distinct colour, so the canvas
-/// shows *what* a connection carries rather than a single generic in/out dot.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum PortKind {
-    Bind,
-    Midi,
-    Serve,
-    Net,
-    Capture,
-    Clipboard,
-    Api,
-}
-
-impl PortKind {
-    /// The dot / wire colour for this kind.
-    pub(super) fn color(self) -> [f32; 4] {
-        match self {
-            PortKind::Bind => WIRE_COL,
-            PortKind::Midi => MIDI_WIRE_COL,
-            PortKind::Serve => HOSTPORT_WIRE,
-            PortKind::Net => NET_WIRE_COL,
-            PortKind::Capture => CAPTURE_BORDER,
-            PortKind::Clipboard => CLIPBOARD_BORDER,
-            PortKind::Api => API_BORDER,
-        }
+/// The dot / wire colour for a connection kind, so the canvas shows *what* a
+/// connection carries rather than a single generic in/out dot.
+///
+/// [`PortKind`] itself lives in `wk-protocol`: a boundary port declares one in
+/// the `.wk` file, so the server names the same kinds and the two must agree.
+/// A free function rather than a method because the type is not ours.
+pub(super) fn port_color(kind: PortKind) -> [f32; 4] {
+    match kind {
+        PortKind::Bind => WIRE_COL,
+        PortKind::Midi => MIDI_WIRE_COL,
+        PortKind::Serve => HOSTPORT_WIRE,
+        PortKind::Net => NET_WIRE_COL,
+        PortKind::Capture => CAPTURE_BORDER,
+        PortKind::Clipboard => CLIPBOARD_BORDER,
+        PortKind::Api => API_BORDER,
     }
 }
 
-/// Whether a node is the source (`Out`, right edge) or target (`In`, left edge)
-/// of a typed connection.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum PortDir {
-    In,
-    Out,
+/// What a boundary port's direction is called on the canvas — the word an
+/// author writes in the `.wk` file, so the node reads as what it is.
+pub(super) fn port_label(dir: PortDir) -> &'static str {
+    match dir {
+        PortDir::In => "inport",
+        PortDir::Out => "outport",
+    }
 }
 
 /// One typed connection point on a node.

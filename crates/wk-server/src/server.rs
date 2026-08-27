@@ -18,7 +18,9 @@ use crate::wiring::{self, NodeClass};
 use crate::workspace::{
     secret_bytes, secret_hex, Dependency, Document, NodeSnap, SnapKind, Workspace,
 };
-use wk_protocol::{Command, NodeId, NodeKind, Resource, ResourceRef, ViewMode, Wire};
+use wk_protocol::{
+    Command, NodeId, NodeKind, PortDir, PortKind, Resource, ResourceRef, ViewMode, Wire,
+};
 
 /// Default canvas size of a file / port / network node, in canvas pixels.
 pub const FILE_W: f32 = 130.0;
@@ -193,6 +195,9 @@ pub struct View {
     /// HostService nodes (canvas id -> fabric name + host target), for the UI
     /// to label and edit them.
     pub host_services: HashMap<NodeId, HostService>,
+    /// Boundary-port nodes (canvas id -> its declaration), for the UI to draw
+    /// and to give the right typed dot.
+    pub boundary_ports: HashMap<NodeId, BoundaryPort>,
     pub net_nodes: HashSet<NodeId>,
     pub gateways: HashSet<NodeId>,
     pub uplinks: HashMap<NodeId, UplinkMeta>,
@@ -354,6 +359,7 @@ impl View {
             notes: keep_map(&self.notes, mine),
             midi_ins: keep_map(&self.midi_ins, mine),
             host_services: keep_map(&self.host_services, mine),
+            boundary_ports: keep_map(&self.boundary_ports, mine),
             net_nodes: keep_set(&self.net_nodes, mine),
             gateways: keep_set(&self.gateways, mine),
             uplinks: keep_map(&self.uplinks, mine),
@@ -527,6 +533,11 @@ pub enum Kind {
     /// the reverse of a HostPort (fabric-dialable host service, not
     /// host-dialable fabric service).
     HostService,
+    /// A workspace boundary port: the named, typed edge a connection crosses
+    /// when this workspace is used from another one. Its direction, connection
+    /// kind and name live in `Graph::boundary_ports`. In a plain tab it runs
+    /// nothing and grants nothing — there is no other side yet.
+    Boundary,
 }
 
 impl Kind {
@@ -582,6 +593,10 @@ pub struct Graph {
     /// `addr:port` the connection bridges to. The fabric side listens on the
     /// target's port.
     pub host_services: HashMap<NodeId, HostService>,
+    /// Boundary-port nodes: what each one is called, which direction it faces
+    /// and what kind of connection may cross it. Side table keyed by node id,
+    /// like every other kind's payload.
+    pub boundary_ports: HashMap<NodeId, BoundaryPort>,
 
     /// Volume binds as (volume id, app node id).
     pub connections: Vec<(NodeId, NodeId)>,
@@ -640,6 +655,15 @@ pub struct HostService {
     pub name: String,
     /// The host `addr:port` each accepted connection is bridged to.
     pub target: String,
+}
+
+/// A boundary port's declaration: the name a wire from outside picks it by,
+/// which edge of the workspace it sits on, and what may cross it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundaryPort {
+    pub name: String,
+    pub dir: PortDir,
+    pub kind: PortKind,
 }
 
 impl HostService {
@@ -1325,8 +1349,23 @@ impl Server {
                 self.graph.net_links.retain(|&(svc, _)| svc != id);
                 self.forget(id);
             }
+            Some(Kind::Boundary) => self.remove_boundary_port(id),
             None => {}
         }
+    }
+
+    /// Remove a boundary port. It has no runtime effect to unwind — nothing was
+    /// ever mounted, routed or granted through it — but its wires live in the
+    /// ordinary relations, so they go with it rather than dangling.
+    fn remove_boundary_port(&mut self, id: NodeId) {
+        let untouched = |&(a, b): &(NodeId, NodeId)| a != id && b != id;
+        self.graph.connections.retain(untouched);
+        self.graph.midi_links.retain(untouched);
+        self.graph.capture_links.retain(untouched);
+        self.graph.clipboard_links.retain(untouched);
+        self.graph.api_links.retain(untouched);
+        prune_side_map(&mut self.graph.mount_paths, &self.graph.connections);
+        self.forget(id);
     }
 
     /// Remove a Capture node: revoke every grant through it, drop its feed.
@@ -1631,6 +1670,13 @@ impl Server {
             Some(Kind::Api) => NodeClass::Api,
             Some(Kind::MidiIn) => NodeClass::MidiSource,
             Some(Kind::HostService) => NodeClass::HostSvc,
+            // A boundary port's class is *declared*, not inferred: it comes
+            // from the side table placed alongside the node record.
+            Some(Kind::Boundary) => self
+                .graph
+                .boundary_ports
+                .get(&id)
+                .map_or(NodeClass::Other, |p| NodeClass::Boundary(p.dir, p.kind)),
             Some(Kind::App) | Some(Kind::Note) | None => NodeClass::Other,
         }
     }
@@ -2542,6 +2588,7 @@ impl Server {
         self.graph.veilid_ids.remove(&id);
         self.graph.note_text.remove(&id);
         self.graph.host_services.remove(&id);
+        self.graph.boundary_ports.remove(&id);
         if let Some((kill, _)) = self.host_service_serves.remove(&id) {
             kill.store(true, Ordering::Relaxed);
         }
@@ -3233,6 +3280,19 @@ impl Server {
                     target: svc.target.clone(),
                 }
             }
+            Kind::Boundary => {
+                let p = self.graph.boundary_ports.get(&id)?;
+                match p.dir {
+                    PortDir::In => SnapKind::InPort {
+                        name: p.name.clone(),
+                        kind: p.kind,
+                    },
+                    PortDir::Out => SnapKind::OutPort {
+                        name: p.name.clone(),
+                        kind: p.kind,
+                    },
+                }
+            }
         };
         Some(NodeSnap {
             id,
@@ -3489,6 +3549,21 @@ impl Server {
                     },
                 );
             }
+            // A boundary port is placed and wired like any other node, but it
+            // spawns nothing and reconciles nothing: in a plain tab there is no
+            // other side of the boundary for its wires to reach.
+            SnapKind::InPort { name, kind } | SnapKind::OutPort { name, kind } => {
+                let (dir, _) = s.kind.boundary().expect("an in/out port is a boundary");
+                self.place(s.id, Kind::Boundary, ws, s.pos, s.size);
+                self.graph.boundary_ports.insert(
+                    s.id,
+                    BoundaryPort {
+                        name: name.clone(),
+                        dir,
+                        kind: *kind,
+                    },
+                );
+            }
         }
         if let Some(p3) = s.pos3d {
             self.graph.pos3d.insert(s.id, p3);
@@ -3664,6 +3739,7 @@ impl Server {
             notes: self.graph.note_text.clone(),
             midi_ins: self.graph.midi_ins.clone(),
             host_services: self.graph.host_services.clone(),
+            boundary_ports: self.graph.boundary_ports.clone(),
             net_nodes,
             gateways,
             uplinks,
@@ -3745,6 +3821,10 @@ impl Server {
                 Some(Kind::Api) => "api",
                 Some(Kind::MidiIn) => "midiin",
                 Some(Kind::HostService) => "hostservice",
+                Some(Kind::Boundary) => match self.graph.boundary_ports.get(&id).map(|p| p.dir) {
+                    Some(PortDir::Out) => "outport",
+                    _ => "inport",
+                },
                 None => "unknown",
             }
         };
@@ -3757,6 +3837,10 @@ impl Server {
                     n.name.clone()
                 } else if let Some(f) = v.file_nodes.get(&id) {
                     f.name.clone()
+                } else if let Some(p) = v.boundary_ports.get(&id) {
+                    // A boundary port's name is how a wire from outside picks
+                    // it, so it is the one thing `wk ps` must show.
+                    p.name.clone()
                 } else {
                     String::new()
                 };
@@ -4080,6 +4164,99 @@ mod model_tests {
             token: Vec::new(),
         });
         assert_eq!(s.view().scene_entities.len(), 1, "unmuted");
+    }
+
+    /// A boundary port in a plain tab: it places, wires by its declared kind,
+    /// projects back to the file unchanged — and runs nothing. There is no
+    /// other side of the boundary in a tab, so the whole node is inert.
+    #[test]
+    fn a_boundary_port_places_and_wires_but_runs_nothing_in_a_tab() {
+        let mut s = fresh_server();
+        let ws = s.graph.workspaces[0];
+        let notes = NodeId::from_u128(101);
+        let samples = NodeId::from_u128(102);
+        let place_port = |s: &mut Server, id: NodeId, kind: SnapKind| {
+            s.materialize(
+                ws,
+                &NodeSnap {
+                    id,
+                    pos: [0.0, 0.0],
+                    size: [FILE_W, FILE_H],
+                    pos3d: None,
+                    panel3d: true,
+                    kind,
+                },
+                &[],
+            );
+        };
+        place_port(
+            &mut s,
+            notes,
+            SnapKind::InPort {
+                name: "notes".into(),
+                kind: PortKind::Midi,
+            },
+        );
+        place_port(
+            &mut s,
+            samples,
+            SnapKind::OutPort {
+                name: "samples".into(),
+                kind: PortKind::Bind,
+            },
+        );
+        // Materializing a port spawns no guest: it is a declaration, not a
+        // program, and a tab full of them starts nothing.
+        assert!(s.node_reg.lock().unwrap().is_empty());
+
+        // An app node (a placed record is enough — wiring reads the graph) and
+        // a volume, to wire the two ports to.
+        let app = NodeId::from_u128(103);
+        s.place(app, Kind::App, ws, [0.0, 0.0], [100.0, 100.0]);
+        s.apply(Command::Create(Resource::Node {
+            kind: NodeKind::Volume,
+            pos: [0.0, 0.0],
+            ws,
+        }));
+        let vol = *s.graph.file_nodes.keys().next().expect("volume placed");
+
+        // Each port wires as the kind it declares, in the orientation an
+        // expansion can collapse: the in-port is the MIDI *source*, the
+        // out-port the bind's *destination*.
+        s.apply(Command::Create(Resource::Wire { a: app, b: notes }));
+        assert_eq!(s.graph.midi_links, vec![(notes, app)]);
+        s.apply(Command::Create(Resource::Wire { a: vol, b: samples }));
+        assert_eq!(s.graph.connections, vec![(vol, samples)]);
+        // Nothing was actually mounted — there is no filesystem behind a port.
+        assert!(s.mounted.is_empty());
+
+        // A wire of the wrong kind is refused outright, not reclassified: the
+        // MIDI port meeting a volume must not become a bind.
+        s.apply(Command::Create(Resource::Wire { a: vol, b: notes }));
+        assert_eq!(s.graph.connections, vec![(vol, samples)], "no new bind");
+        assert_eq!(s.graph.midi_links, vec![(notes, app)], "and no new route");
+
+        // Both ports project back to exactly what the file said.
+        assert_eq!(
+            s.node_snap(notes).expect("in-port projects").kind,
+            SnapKind::InPort {
+                name: "notes".into(),
+                kind: PortKind::Midi,
+            }
+        );
+        assert_eq!(
+            s.node_snap(samples).expect("out-port projects").kind,
+            SnapKind::OutPort {
+                name: "samples".into(),
+                kind: PortKind::Bind,
+            }
+        );
+
+        // Deleting one takes its wires with it rather than leaving them
+        // dangling against an id nothing can resolve.
+        s.apply(Command::Delete(ResourceRef::Node(samples)));
+        assert!(s.graph.connections.is_empty());
+        assert!(!s.graph.boundary_ports.contains_key(&samples));
     }
 
     /// Undoing a *moved* one-per-source wire restores the displaced link, not

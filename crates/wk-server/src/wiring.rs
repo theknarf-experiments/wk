@@ -9,7 +9,7 @@
 //! `Server` — so they are cheap to test exhaustively.
 
 use std::collections::{HashMap, HashSet};
-use wk_protocol::{NodeId, Wire};
+use wk_protocol::{NodeId, PortDir, PortKind, Wire};
 
 /// What a node is, for the purpose of classifying a wire between two nodes. A
 /// node is exactly one of these (file/port/net node sets are disjoint; anything
@@ -34,6 +34,11 @@ pub enum NodeClass {
     /// A hardware MIDI input node — a MIDI *source* only (wires to an app's MIDI
     /// input, never a destination).
     MidiSource,
+    /// A workspace **boundary port**: a placed stand-in for a node on the other
+    /// side of the workspace's edge. Unlike every other class it is *declared*
+    /// rather than inferred, so it carries its own connection kind and the end
+    /// of that connection it plays.
+    Boundary(PortDir, PortKind),
     Other,
 }
 
@@ -49,6 +54,16 @@ pub enum NodeClass {
 /// twice — can't be wired.
 pub fn classify(a: NodeId, b: NodeId, ca: NodeClass, cb: NodeClass) -> Option<Wire> {
     use NodeClass::*;
+    // A boundary port is matched first and on its own terms: it declares
+    // exactly one connection kind, so a partner that doesn't fit is refused
+    // outright rather than falling through to a looser rule below (an app on
+    // the far end of a `midi` port must not become a bind).
+    if let Boundary(dir, kind) = ca {
+        return boundary_wire(a, dir, kind, b, cb);
+    }
+    if let Boundary(dir, kind) = cb {
+        return boundary_wire(b, dir, kind, a, ca);
+    }
     match (ca, cb) {
         (File, Other) => Some(Wire::Bind(a, b)),
         (Other, File) => Some(Wire::Bind(b, a)),
@@ -74,6 +89,55 @@ pub fn classify(a: NodeId, b: NodeId, ca: NodeClass, cb: NodeClass) -> Option<Wi
         (Other, MidiSource) => Some(Wire::Midi(b, a)),
         (Other, Other) => Some(Wire::Midi(a, b)),
         _ => None,
+    }
+}
+
+/// The wire a boundary port forms with the node it is wired to, already in its
+/// canonical orientation.
+///
+/// An **in**-port stands in for whatever the far side will supply — the volume
+/// of a bind, the source of a MIDI link, the capability node of a grant — and
+/// takes that end of the wire. An **out**-port stands in for the far side's
+/// *consumer* and takes the other end. Expansion can then collapse an outer
+/// `X -> inport` and an inner `inport -> Y` into a plain `X -> Y` of the same
+/// kind, with no port left in the live graph.
+///
+/// The complementary port of the same kind is a legal partner too — an in-port
+/// wired straight to an out-port passes a connection through a definition
+/// without an inner node in the middle.
+fn boundary_wire(
+    port: NodeId,
+    dir: PortDir,
+    kind: PortKind,
+    other: NodeId,
+    oc: NodeClass,
+) -> Option<Wire> {
+    use NodeClass::*;
+    use PortDir::{In, Out};
+    // The far end fits if it is the class this port's own end joins to, or the
+    // matching port of the same kind on the opposite edge.
+    let fits = |want: NodeClass| oc == want || oc == Boundary(dir.opposite(), kind);
+    match (dir, kind) {
+        // An in-port supplies what an app consumes.
+        (In, PortKind::Bind) => fits(Other).then_some(Wire::Bind(port, other)),
+        (In, PortKind::Midi) => fits(Other).then_some(Wire::Midi(port, other)),
+        (In, PortKind::Capture) => fits(Other).then_some(Wire::Capture(other, port)),
+        (In, PortKind::Clipboard) => fits(Other).then_some(Wire::Clipboard(other, port)),
+        (In, PortKind::Api) => fits(Other).then_some(Wire::Api(other, port)),
+        // An out-port consumes what an inner node provides. A bind's provider
+        // is a file node or an app serving `wk:fs/provider` (which mounts into
+        // things exactly like a volume); a MIDI source is an app or a hardware
+        // input.
+        (Out, PortKind::Bind) => (fits(File) || oc == Other).then_some(Wire::Bind(other, port)),
+        (Out, PortKind::Midi) => {
+            (fits(Other) || oc == MidiSource).then_some(Wire::Midi(other, port))
+        }
+        (Out, PortKind::Capture) => fits(Capture).then_some(Wire::Capture(port, other)),
+        (Out, PortKind::Clipboard) => fits(Clipboard).then_some(Wire::Clipboard(port, other)),
+        (Out, PortKind::Api) => fits(Api).then_some(Wire::Api(port, other)),
+        // Refused at load (see `workspace::validate_ports`) — but classify is
+        // total, and refusing the wire is the safe answer if one ever exists.
+        (_, PortKind::Net | PortKind::Serve) => None,
     }
 }
 
@@ -252,7 +316,9 @@ mod tests {
         }
     }
 
-    fn any_class() -> impl Strategy<Value = NodeClass> {
+    /// Every class a node's kind can be *inferred* to have — the ones the
+    /// pre-boundary-port rules were written for.
+    fn any_plain_class() -> impl Strategy<Value = NodeClass> {
         prop_oneof![
             Just(NodeClass::File),
             Just(NodeClass::Port),
@@ -266,8 +332,188 @@ mod tests {
         ]
     }
 
+    fn any_port_kind() -> impl Strategy<Value = PortKind> {
+        prop::sample::select(PortKind::ALL.to_vec())
+    }
+
+    fn any_dir() -> impl Strategy<Value = PortDir> {
+        prop_oneof![Just(PortDir::In), Just(PortDir::Out)]
+    }
+
+    /// Any class at all, boundary ports included.
+    fn any_class() -> impl Strategy<Value = NodeClass> {
+        prop_oneof![
+            9 => any_plain_class(),
+            4 => (any_dir(), any_port_kind()).prop_map(|(d, k)| NodeClass::Boundary(d, k)),
+        ]
+    }
+
+    /// What a wire carries — the port kind it would cross a boundary as.
+    fn wire_kind(w: Wire) -> PortKind {
+        match w {
+            Wire::Bind(..) => PortKind::Bind,
+            Wire::Midi(..) => PortKind::Midi,
+            Wire::Serve(..) => PortKind::Serve,
+            Wire::Net(..) => PortKind::Net,
+            Wire::Capture(..) => PortKind::Capture,
+            Wire::Clipboard(..) => PortKind::Clipboard,
+            Wire::Api(..) => PortKind::Api,
+        }
+    }
+
     fn any_id() -> impl Strategy<Value = NodeId> {
         any::<u128>().prop_map(NodeId::from_u128)
+    }
+
+    #[test]
+    fn a_boundary_port_stands_in_for_the_node_on_the_far_side() {
+        use NodeClass::*;
+        use PortDir::{In, Out};
+        let (a, b) = (id(1), id(2));
+        let boundary = |dir, kind| Boundary(dir, kind);
+        let cases = [
+            // An in-port supplies what an app consumes, so it takes the
+            // supplier's end: expansion replaces it with the node the parent
+            // wired in, and `X -> port -> app` collapses to `X -> app`.
+            (
+                boundary(In, PortKind::Bind),
+                Other,
+                Some(Wire::Bind(a, b)),
+                "a volume arriving from outside",
+            ),
+            (
+                boundary(In, PortKind::Midi),
+                Other,
+                Some(Wire::Midi(a, b)),
+                "notes arriving from outside",
+            ),
+            (
+                boundary(In, PortKind::Capture),
+                Other,
+                Some(Wire::Capture(b, a)),
+                "a capture grant arriving from outside",
+            ),
+            (
+                boundary(In, PortKind::Clipboard),
+                Other,
+                Some(Wire::Clipboard(b, a)),
+                "a clipboard grant from outside",
+            ),
+            (
+                boundary(In, PortKind::Api),
+                Other,
+                Some(Wire::Api(b, a)),
+                "an API grant from outside",
+            ),
+            // An out-port stands in for the consumer on the far side, so the
+            // inner node keeps the producer's end of the wire.
+            (
+                File,
+                boundary(Out, PortKind::Bind),
+                Some(Wire::Bind(a, b)),
+                "an inner volume exposed outward",
+            ),
+            (
+                Other,
+                boundary(Out, PortKind::Bind),
+                Some(Wire::Bind(a, b)),
+                "an inner fs provider exposed outward",
+            ),
+            (
+                Other,
+                boundary(Out, PortKind::Midi),
+                Some(Wire::Midi(a, b)),
+                "an inner app's notes leaving",
+            ),
+            (
+                MidiSource,
+                boundary(Out, PortKind::Midi),
+                Some(Wire::Midi(a, b)),
+                "inner hardware MIDI leaving",
+            ),
+            (
+                Capture,
+                boundary(Out, PortKind::Capture),
+                Some(Wire::Capture(b, a)),
+                "an inner Capture node offered outward",
+            ),
+            (
+                Api,
+                boundary(Out, PortKind::Api),
+                Some(Wire::Api(b, a)),
+                "an inner Api node offered outward",
+            ),
+            // A port wired to the wrong class is refused, not reclassified —
+            // a `midi` port meeting a volume is a mistake, not a bind.
+            (
+                boundary(In, PortKind::Midi),
+                File,
+                None,
+                "a midi port is not a mount point",
+            ),
+            (
+                boundary(In, PortKind::Bind),
+                Net,
+                None,
+                "a bind port does not join a network",
+            ),
+            (
+                boundary(Out, PortKind::Capture),
+                Other,
+                None,
+                "an app is not a capture source",
+            ),
+            (
+                boundary(Out, PortKind::Bind),
+                Net,
+                None,
+                "a network is not a filesystem",
+            ),
+            // Two ports of the same kind on opposite edges pass a connection
+            // straight through the definition, with no inner node in between.
+            (
+                boundary(In, PortKind::Bind),
+                boundary(Out, PortKind::Bind),
+                Some(Wire::Bind(a, b)),
+                "a bind passed through",
+            ),
+            (
+                boundary(Out, PortKind::Midi),
+                boundary(In, PortKind::Midi),
+                Some(Wire::Midi(b, a)),
+                "notes passed through, written the other way round",
+            ),
+            // ...but only of the same kind, and only opposite edges.
+            (
+                boundary(In, PortKind::Bind),
+                boundary(Out, PortKind::Midi),
+                None,
+                "kinds must match",
+            ),
+            (
+                boundary(In, PortKind::Midi),
+                boundary(In, PortKind::Midi),
+                None,
+                "two inputs have nothing to say to each other",
+            ),
+            // Net and serve ports are refused at load; if one ever reached the
+            // canvas it must still not wire.
+            (
+                boundary(In, PortKind::Net),
+                Net,
+                None,
+                "net ports are not supported yet",
+            ),
+            (
+                boundary(Out, PortKind::Serve),
+                Port,
+                None,
+                "serve ports are not supported yet",
+            ),
+        ];
+        for (ca, cb, want, why) in cases {
+            assert_eq!(classify(a, b, ca, cb), want, "{why}: ({ca:?}, {cb:?})");
+        }
     }
 
     fn wire_ends(w: Wire) -> (NodeId, NodeId) {
@@ -293,11 +539,34 @@ mod tests {
             }
         }
 
+        /// A boundary port only ever forms a wire of the kind it declares. This
+        /// is the whole point of a *typed* boundary: a port wired to a node of
+        /// the wrong class is refused, never quietly reclassified into whatever
+        /// that node happens to accept.
+        #[test]
+        fn a_boundary_port_only_forms_the_kind_it_declares(
+            a in any_id(),
+            b in any_id(),
+            dir in any_dir(),
+            kind in any_port_kind(),
+            oc in any_class(),
+        ) {
+            let port = NodeClass::Boundary(dir, kind);
+            // Either argument order: the canvas hands over whichever node the
+            // user dragged from.
+            for (ca, cb) in [(port, oc), (oc, port)] {
+                if let Some(w) = classify(a, b, ca, cb) {
+                    prop_assert_eq!(wire_kind(w), kind);
+                }
+            }
+        }
+
         /// A wire forms if and only if one side is an app node paired with a
         /// non-Uplink node, or the pair is an Uplink uplink and a Network — two
-        /// special nodes otherwise never wire.
+        /// special nodes otherwise never wire. (Boundary ports have their own
+        /// rule above; this one is about the inferred classes.)
         #[test]
-        fn classify_requires_an_app_or_uplink_endpoint(a in any_id(), b in any_id(), ca in any_class(), cb in any_class()) {
+        fn classify_requires_an_app_or_uplink_endpoint(a in any_id(), b in any_id(), ca in any_plain_class(), cb in any_plain_class()) {
             use NodeClass::*;
             let wired = classify(a, b, ca, cb).is_some();
             let app_pair = (ca == Other || cb == Other) && ca != Uplink && cb != Uplink;

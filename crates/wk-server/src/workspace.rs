@@ -17,10 +17,11 @@
 //! }
 //! ```
 
+use crate::server::{FILE_H, FILE_W};
 use kdl::{KdlDocument, KdlEntry, KdlEntryFormat, KdlNode, KdlValue};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use wk_protocol::NodeId;
+use wk_protocol::{NodeId, PortDir, PortKind};
 
 /// A KDL entry for a string value that always serializes *quoted*.
 ///
@@ -70,16 +71,21 @@ pub const DEFAULT_WORKSPACE: &str = "workspace.wk";
 /// harmlessly (the parser ignores it).
 const MODELINE: &str = "// vim: set filetype=kdl :";
 
-/// Whether a placed-node keyword carries its own name/path first, pushing the
-/// node id to the second argument (`node "synth" "<id>"`) rather than the first
-/// (`network "<id>"`). Both [`parse_snap`] and [`node_ident`] ask this — they
-/// used to keep separate lists, which drifted apart and silently cost a
-/// `hostservice` line its comments on every save.
-fn kind_is_named(keyword: &str) -> bool {
-    matches!(
-        keyword,
-        "node" | "volume" | "virtualfile" | "bindmount" | "hostfile" | "midiin" | "hostservice"
-    )
+/// Which argument of a placed-node line carries the node id. Most kinds lead
+/// with it (`network "<id>"`); the named kinds put their own name or path first
+/// (`node "synth" "<id>"`); a boundary port declares a name *and* a connection
+/// kind before it (`inport "notes" "midi" "<id>"`). Both [`parse_snap`] and
+/// [`node_ident`] ask this one function — they used to keep separate lists,
+/// which drifted apart and silently cost a `hostservice` line its comments on
+/// every save.
+fn id_arg_index(keyword: &str) -> usize {
+    match keyword {
+        "node" | "volume" | "virtualfile" | "bindmount" | "hostfile" | "midiin" | "hostservice" => {
+            1
+        }
+        "inport" | "outport" => 2,
+        _ => 0,
+    }
 }
 
 /// The identity that pairs a freshly-generated KDL node with the same node in
@@ -119,8 +125,9 @@ fn node_ident(n: &KdlNode) -> Option<NodeIdent> {
             let b = n.get(1).and_then(node_id)?;
             Some(NodeIdent::Wire(name.to_string(), a, b))
         }
-        // A placed node: named kinds carry the id second, others first.
-        _ => node_id(n.get(usize::from(kind_is_named(name)))?).map(NodeIdent::Placed),
+        // A placed node, boundary ports included: its id is its identity,
+        // wherever on the line it sits.
+        _ => node_id(n.get(id_arg_index(name))?).map(NodeIdent::Placed),
     }
 }
 
@@ -391,6 +398,30 @@ pub enum SnapKind {
     /// A host TCP service published into the Network it's wired to, as fabric
     /// peer `name`; connections bridge to the host `target` (`addr:port`).
     HostService { name: String, target: String },
+    /// A workspace **boundary in-port**: the named, typed edge through which a
+    /// connection enters this workspace. It is a placed node so it can be
+    /// wired to inner nodes with ordinary wire lines — the wiring is what
+    /// typechecks the boundary and what says how far in a connection reaches.
+    ///
+    /// It stands in for whatever supplies the connection from outside (the
+    /// volume of a bind, the source of a MIDI link, the capability node of a
+    /// grant), so in a plain tab it stands in for nothing and does nothing.
+    InPort { name: String, kind: PortKind },
+    /// A workspace **boundary out-port**: the mirror of [`SnapKind::InPort`],
+    /// standing in for the *consumer* on the far side — what an inner node's
+    /// connection reaches once this workspace is used from elsewhere.
+    OutPort { name: String, kind: PortKind },
+}
+
+impl SnapKind {
+    /// A boundary port's direction and connection kind, if this is one.
+    pub fn boundary(&self) -> Option<(PortDir, PortKind)> {
+        match self {
+            SnapKind::InPort { kind, .. } => Some((PortDir::In, *kind)),
+            SnapKind::OutPort { kind, .. } => Some((PortDir::Out, *kind)),
+            _ => None,
+        }
+    }
 }
 
 /// Hex-encode an uplink secret for persistence.
@@ -616,6 +647,7 @@ impl Document {
 
     fn from_kdl(text: &str) -> Result<Self, String> {
         let doc: KdlDocument = text.parse().map_err(|e| format!("parse error: {e}"))?;
+        validate_ports(&doc)?;
 
         // `import "other.wk"` lines (a path per node, resolved by load_resolved).
         let imports = doc
@@ -823,6 +855,74 @@ fn node_id(v: &KdlValue) -> Option<NodeId> {
     v.as_string()?.parse().ok()
 }
 
+/// Check every `inport`/`outport` line before the document becomes a model.
+///
+/// Boundary ports are read from the raw KDL, not from the parsed workspaces,
+/// because a port the parser can't read is a port the parser *drops* — and a
+/// silently missing boundary is the one mistake in a definition that no later
+/// error can explain. A declaration is worth a load error; the rest of the
+/// format's tolerance is left alone.
+fn validate_ports(doc: &KdlDocument) -> Result<(), String> {
+    for ws in doc
+        .nodes()
+        .iter()
+        .filter(|n| n.name().value() == "workspace")
+    {
+        // Names are unique *per direction*: an in-port and an out-port called
+        // "notes" are two ends of the same idea, and a `group` block says which
+        // it means by writing `in` or `out`.
+        let mut seen: std::collections::HashSet<(&str, String)> = std::collections::HashSet::new();
+        for n in ws.children().map(|ch| ch.nodes()).unwrap_or(&[]) {
+            let dir = match n.name().value() {
+                d @ ("inport" | "outport") => d,
+                _ => continue,
+            };
+            let name = n.get(0).and_then(|v| v.as_string()).ok_or_else(|| {
+                format!(r#"{dir} needs a name: {dir} "notes" "midi" "<node id>""#)
+            })?;
+            let word = n.get(1).and_then(|v| v.as_string()).ok_or_else(|| {
+                format!(
+                    "{dir} {name:?} needs a connection kind ({}) as its second argument",
+                    PortKind::words()
+                )
+            })?;
+            let kind = PortKind::parse(word).ok_or_else(|| {
+                format!(
+                    "{dir} {name:?} has unknown connection kind {word:?}; expected one of {}",
+                    PortKind::words()
+                )
+            })?;
+            // Both refused kinds are "exactly one per node" relations, which a
+            // boundary would have to *move* rather than add — silently, and
+            // for a node the author of the definition can't see.
+            match kind {
+                PortKind::Net => {
+                    return Err(format!(
+                        "{dir} {name:?} is a net port, which wk does not support yet: an app \
+                         belongs to exactly one network, so a net wire crossing a boundary \
+                         would move an inner node off its own network instead of adding one"
+                    ))
+                }
+                PortKind::Serve => {
+                    return Err(format!(
+                        "{dir} {name:?} is a serve port, which wk does not support yet: a node \
+                         is served through exactly one HostPort, so a serve wire crossing a \
+                         boundary would take over an inner node's existing one"
+                    ))
+                }
+                _ => {}
+            }
+            if !seen.insert((dir, name.to_string())) {
+                return Err(format!(
+                    "two {dir}s named {name:?} in the same workspace; a boundary port's name \
+                     is how a wire from outside picks it, so it must be unique per direction"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parse a `workspace "<id>" { ...canvas... }` block.
 fn parse_workspace(n: &KdlNode) -> Option<Workspace> {
     let id = node_id(n.get(0)?)?;
@@ -937,10 +1037,16 @@ fn workspace_kdl(ws: &Workspace) -> KdlNode {
 /// Parse one placed node of any kind, dispatching on the KDL node name.
 /// Unknown names yield `None` (tolerated, like any unknown entry).
 fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
-    // Named kinds (`node "<name>" <id>`) carry the name first; the rest are
-    // `<kind> <id>`.
-    let id = node_id(n.get(usize::from(kind_is_named(n.name().value())))?)?;
-    let ch = n.children()?;
+    let id = node_id(n.get(id_arg_index(n.name().value()))?)?;
+    // A boundary port is a *declaration* first and a placed node second, so it
+    // may leave the geometry block out entirely; every other kind is a canvas
+    // node that has always written one.
+    let empty = KdlDocument::new();
+    let ch = match n.children() {
+        Some(ch) => ch,
+        None if matches!(n.name().value(), "inport" | "outport") => &empty,
+        None => return None,
+    };
     let text = |name: &str| {
         ch.get(name)
             .and_then(|x| x.get(0))
@@ -1009,6 +1115,18 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
             name: n.get(0)?.as_string()?.to_string(),
             target: text("target")?,
         },
+        // `inport "<name>" "<connection kind>" "<id>"`. A malformed one never
+        // reaches here: `validate_ports` rejects the whole document first, so
+        // a typo in a boundary port is an error, not a vanished node.
+        kw @ ("inport" | "outport") => {
+            let name = n.get(0)?.as_string()?.to_string();
+            let kind = PortKind::parse(n.get(1)?.as_string()?)?;
+            if kw == "inport" {
+                SnapKind::InPort { name, kind }
+            } else {
+                SnapKind::OutPort { name, kind }
+            }
+        }
         "network" => SnapKind::Net { gateway: false },
         "gateway" => SnapKind::Net { gateway: true },
         "iroh" => SnapKind::Iroh {
@@ -1021,8 +1139,21 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
         },
         _ => return None,
     };
-    let pos = ch.get("pos")?;
-    let size = ch.get("size")?;
+    let xy = |key: &str| -> Option<[f32; 2]> {
+        let n = ch.get(key)?;
+        Some([n.get(0).and_then(num)?, n.get(1).and_then(num)?])
+    };
+    // A boundary port with no geometry takes the small-widget default. Nothing
+    // else is that forgiving: a `note` without a `pos` is malformed, not a
+    // note at the origin.
+    let (pos, size) = match (xy("pos"), xy("size")) {
+        (Some(pos), Some(size)) => (pos, size),
+        _ if kind.boundary().is_some() => (
+            xy("pos").unwrap_or([0.0, 0.0]),
+            xy("size").unwrap_or([FILE_W, FILE_H]),
+        ),
+        _ => return None,
+    };
     let pos3d = ch.get("pos3d").and_then(|p| {
         Some([
             p.get(0).and_then(num)?,
@@ -1039,8 +1170,8 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
         .unwrap_or(true);
     Some(NodeSnap {
         id,
-        pos: [pos.get(0).and_then(num)?, pos.get(1).and_then(num)?],
-        size: [size.get(0).and_then(num)?, size.get(1).and_then(num)?],
+        pos,
+        size,
         pos3d,
         panel3d,
         kind,
@@ -1064,6 +1195,8 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         SnapKind::Api => "api",
         SnapKind::MidiIn { .. } => "midiin",
         SnapKind::HostService { .. } => "hostservice",
+        SnapKind::InPort { .. } => "inport",
+        SnapKind::OutPort { .. } => "outport",
     };
     let mut node = KdlNode::new(name);
     // Named kinds lead with the name (or note text), then the id.
@@ -1079,6 +1212,11 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         }
         SnapKind::HostService { name, .. } => {
             node.push(str_entry(name));
+        }
+        // A boundary port reads as what it is: `inport "notes" "midi" "<id>"`.
+        SnapKind::InPort { name, kind } | SnapKind::OutPort { name, kind } => {
+            node.push(str_entry(name));
+            node.push(str_entry(kind.as_str()));
         }
         _ => {}
     }
@@ -1512,6 +1650,120 @@ mod tests {
         let plain = Document::from_kdl(&format!("workspace \"{ws}\" {{\n}}")).expect("parses");
         assert!(plain.workspaces[0].tab);
         assert!(!plain.to_kdl().contains("tab"));
+    }
+
+    #[test]
+    fn boundary_ports_round_trip_and_may_leave_their_geometry_out() {
+        let ws = NodeId::from_u128(61);
+        let (a, b) = (NodeId::from_u128(62), NodeId::from_u128(63));
+        let doc = Document::from_kdl(&format!(
+            "workspace \"{ws}\" {{\n  \
+             name \"voice\"\n  tab #false\n  \
+             inport \"notes\" \"midi\" \"{a}\" {{ pos 10 20; size 130 44 }}\n  \
+             outport \"samples\" \"bind\" \"{b}\"\n}}"
+        ))
+        .expect("parses");
+        let nodes = &doc.workspaces[0].nodes;
+        assert_eq!(
+            nodes[0].kind,
+            SnapKind::InPort {
+                name: "notes".into(),
+                kind: PortKind::Midi,
+            }
+        );
+        assert_eq!(nodes[0].pos, [10.0, 20.0]);
+        // A port is a declaration first: written without a block it still
+        // places, at the default the canvas would have given it anyway.
+        assert_eq!(
+            nodes[1].kind,
+            SnapKind::OutPort {
+                name: "samples".into(),
+                kind: PortKind::Bind,
+            }
+        );
+        assert_eq!(nodes[1].size, [FILE_W, FILE_H]);
+
+        // The written form names the port and its kind before the id, and both
+        // survive the trip back.
+        let text = doc.to_kdl();
+        assert!(
+            text.contains(&format!("inport \"notes\" \"midi\" \"{a}\"")),
+            "{text}"
+        );
+        let back = Document::from_kdl(&text).expect("round-trips");
+        assert_eq!(back.workspaces[0].nodes, *nodes);
+    }
+
+    #[test]
+    fn a_boundary_ports_comment_survives_a_save() {
+        // `Document::save` grafts comments on by node identity, and a port's id
+        // is its third argument — a line the identity function reads wrongly
+        // loses the comment above it on the very first save.
+        let path = std::env::temp_dir().join("wk-port-comment-test.wk");
+        let ws = NodeId::from_u128(71);
+        let p = NodeId::from_u128(72);
+        let original = format!(
+            "{MODELINE}\n\
+             workspace \"{ws}\" {{\n    \
+             tab #false\n    \
+             // the notes the caller plays into this voice\n    \
+             inport \"notes\" \"midi\" \"{p}\" {{ pos 0 0; size 130 44 }}\n\
+             }}\n"
+        );
+        std::fs::write(&path, &original).unwrap();
+        let doc = Document::from_kdl(&original).expect("parses");
+        doc.save(&path).expect("saves");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("// the notes the caller plays into this voice"),
+            "{text}"
+        );
+        // And a second save is byte-identical (no churn from the new syntax).
+        Document::from_kdl(&text).unwrap().save(&path).unwrap();
+        assert_eq!(text, std::fs::read_to_string(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_malformed_boundary_port_is_a_load_error_not_a_dropped_node() {
+        let ws = NodeId::from_u128(81);
+        let p = NodeId::from_u128(82);
+        let q = NodeId::from_u128(83);
+        let load = |body: String| {
+            Document::from_kdl(&format!("workspace \"{ws}\" {{\n{body}\n}}")).map(|_| ())
+        };
+        let port = |kw: &str, name: &str, kind: &str, id: NodeId| {
+            format!("  {kw} \"{name}\" \"{kind}\" \"{id}\" {{ pos 0 0; size 10 10 }}")
+        };
+
+        // An unreadable kind names the mistake and the alternatives, instead of
+        // the node quietly not being there.
+        let err = load(port("inport", "notes", "mid", p)).unwrap_err();
+        assert!(err.contains("\"mid\"") && err.contains("midi"), "{err}");
+
+        // v1 refuses the two "exactly one per node" relations, and says why.
+        let err = load(port("inport", "web", "net", p)).unwrap_err();
+        assert!(err.contains("exactly one network"), "{err}");
+        let err = load(port("outport", "http", "serve", p)).unwrap_err();
+        assert!(err.contains("HostPort"), "{err}");
+
+        // Two ports of the same direction can't share a name — a wire from
+        // outside picks a port by that name and would have no way to choose.
+        let dup = format!(
+            "{}\n{}",
+            port("inport", "notes", "midi", p),
+            port("inport", "notes", "bind", q)
+        );
+        let err = load(dup).unwrap_err();
+        assert!(err.contains("notes"), "{err}");
+        // ...but the same name on opposite edges is the normal way to say
+        // "this passes through".
+        let through = format!(
+            "{}\n{}",
+            port("inport", "notes", "midi", p),
+            port("outport", "notes", "midi", q)
+        );
+        assert!(load(through).is_ok());
     }
 
     #[test]
@@ -2239,7 +2491,36 @@ mod tests {
             Just(SnapKind::Api),
             (value_str(), value_str())
                 .prop_map(|(name, target)| SnapKind::HostService { name, target }),
+            (value_str(), port_kind()).prop_map(|(name, kind)| SnapKind::InPort { name, kind }),
+            (value_str(), port_kind()).prop_map(|(name, kind)| SnapKind::OutPort { name, kind }),
         ]
+    }
+
+    /// A connection kind a boundary port may declare. `net` and `serve` are
+    /// excluded: they parse, but `validate_ports` refuses them at load, so a
+    /// document containing one is deliberately not round-trippable.
+    fn port_kind() -> impl Strategy<Value = PortKind> {
+        prop::sample::select(vec![
+            PortKind::Bind,
+            PortKind::Midi,
+            PortKind::Capture,
+            PortKind::Clipboard,
+            PortKind::Api,
+        ])
+    }
+
+    /// Make every boundary port's name unique within its direction, which the
+    /// format requires — the generator would otherwise produce documents that
+    /// are legal to write and (correctly) refused on the way back in.
+    fn uniquify_port_names(nodes: &mut [NodeSnap]) {
+        for (i, n) in nodes.iter_mut().enumerate() {
+            match &mut n.kind {
+                SnapKind::InPort { name, .. } | SnapKind::OutPort { name, .. } => {
+                    name.push_str(&i.to_string())
+                }
+                _ => {}
+            }
+        }
     }
 
     fn node_snap() -> impl Strategy<Value = NodeSnap> {
@@ -2280,26 +2561,29 @@ mod tests {
             prop::collection::vec(pair(), 0..3),
         )
             .prop_map(
-                |(id, name, tab, nodes, conns, midi, serves, netlinks)| Workspace {
-                    capture_links: netlinks.clone(),
-                    clipboard_links: netlinks.clone(),
-                    api_links: netlinks.clone(),
-                    id,
-                    name,
-                    tab,
-                    nodes,
-                    // Give every generated bind an explicit mount path so the 3rd-arg
-                    // round-trip is exercised across the whole document space.
-                    mount_paths: conns
-                        .iter()
-                        .map(|&p| (p, "/mnt/data".to_string()))
-                        .collect(),
-                    // Likewise a container port on every generated serve.
-                    serve_ports: serves.iter().map(|&p| (p, 3000u16)).collect(),
-                    connections: conns,
-                    midi,
-                    serves,
-                    net_links: netlinks,
+                |(id, name, tab, mut nodes, conns, midi, serves, netlinks)| {
+                    uniquify_port_names(&mut nodes);
+                    Workspace {
+                        capture_links: netlinks.clone(),
+                        clipboard_links: netlinks.clone(),
+                        api_links: netlinks.clone(),
+                        id,
+                        name,
+                        tab,
+                        nodes,
+                        // Give every generated bind an explicit mount path so the 3rd-arg
+                        // round-trip is exercised across the whole document space.
+                        mount_paths: conns
+                            .iter()
+                            .map(|&p| (p, "/mnt/data".to_string()))
+                            .collect(),
+                        // Likewise a container port on every generated serve.
+                        serve_ports: serves.iter().map(|&p| (p, 3000u16)).collect(),
+                        connections: conns,
+                        midi,
+                        serves,
+                        net_links: netlinks,
+                    }
                 },
             )
     }
