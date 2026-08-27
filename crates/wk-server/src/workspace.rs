@@ -517,6 +517,11 @@ pub struct Document {
     pub imported_deps: std::collections::HashSet<String>,
     /// Ids of `workspaces` that came from an import — not re-serialized.
     pub imported_workspaces: std::collections::HashSet<NodeId>,
+    /// The tab [`Self::load_resolved`] invented because the document had none —
+    /// a place to stand in a file that is nothing but definitions. Provenance,
+    /// like the two sets above: the user never wrote it, so as long as it is
+    /// still empty nothing may write it back (see [`crate::server::Server::save`]).
+    pub scratch_tab: Option<NodeId>,
 }
 
 /// One workspace: a canvas of nodes and the wiring between them, with its own id.
@@ -597,6 +602,7 @@ impl Document {
             workspaces: vec![Workspace::new()],
             imported_deps: std::collections::HashSet::new(),
             imported_workspaces: std::collections::HashSet::new(),
+            scratch_tab: None,
         }
     }
 
@@ -628,6 +634,7 @@ impl Document {
             workspaces: Vec::new(),
             imported_deps: std::collections::HashSet::new(),
             imported_workspaces: std::collections::HashSet::new(),
+            scratch_tab: None,
         };
         let mut dep_names = std::collections::HashSet::new();
         let mut ws_ids = std::collections::HashSet::new();
@@ -648,7 +655,9 @@ impl Document {
         // one — save re-projects this model, so it would quietly rewrite the
         // user's file into something that no longer says what they wrote.
         if !merged.workspaces.iter().any(|w| w.tab) {
-            merged.workspaces.push(Workspace::new());
+            let scratch = Workspace::new();
+            merged.scratch_tab = Some(scratch.id);
+            merged.workspaces.push(scratch);
         }
         Ok(merged)
     }
@@ -746,6 +755,7 @@ impl Document {
             workspaces,
             imported_deps: std::collections::HashSet::new(),
             imported_workspaces: std::collections::HashSet::new(),
+            scratch_tab: None,
         })
     }
 
@@ -2369,6 +2379,7 @@ mod tests {
             imports: Vec::new(),
             imported_deps: std::collections::HashSet::new(),
             imported_workspaces: std::collections::HashSet::new(),
+            scratch_tab: None,
             dependencies: vec![
                 Dependency {
                     name: "triangle".into(),
@@ -2831,6 +2842,7 @@ mod tests {
                 workspaces,
                 imported_deps: std::collections::HashSet::new(),
                 imported_workspaces: std::collections::HashSet::new(),
+                scratch_tab: None,
             })
     }
 

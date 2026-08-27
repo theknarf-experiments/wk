@@ -926,6 +926,11 @@ pub struct Server {
     /// save (they live in the imported files). See [`Document::load_resolved`].
     imported_deps: HashSet<String>,
     imported_workspaces: HashSet<NodeId>,
+    /// The tab the loader invented for a file that declared none (see
+    /// [`Document::scratch_tab`]). It is not authored content: `save` leaves it
+    /// out of the file for as long as it stays empty, so opening a file of pure
+    /// definitions cannot write a stray `workspace { }` block into it.
+    scratch_tab: Option<NodeId>,
 }
 
 impl Server {
@@ -999,6 +1004,7 @@ impl Server {
             imports: doc.imports.clone(),
             imported_deps: doc.imported_deps.clone(),
             imported_workspaces: doc.imported_workspaces.clone(),
+            scratch_tab: doc.scratch_tab,
         };
         for ws in doc.workspaces.iter().filter(|w| w.tab) {
             server.instantiate(ws);
@@ -3354,6 +3360,11 @@ impl Server {
                 }
             })
             .collect();
+        // The invented tab is the loader's, not the author's: writing it back
+        // would grow a stray empty `workspace` block in a definitions-only file
+        // on every run. It earns its place in the file as soon as anything is
+        // put in it.
+        workspaces.retain(|w| Some(w.id) != self.scratch_tab || !w.nodes.is_empty());
         // Splice the authored definitions back in at the positions they were
         // loaded from. Their recorded indices are into the *whole* list, and
         // they arrive in ascending order, so by the time each one is inserted
@@ -3372,6 +3383,7 @@ impl Server {
             workspaces,
             imported_deps: self.imported_deps.clone(),
             imported_workspaces: self.imported_workspaces.clone(),
+            scratch_tab: self.scratch_tab,
         };
         self.save_persisted_volumes(&doc);
         if let Err(e) = doc.save(&self.workspace_path) {
@@ -6493,6 +6505,7 @@ mod model_tests {
             imports: Vec::new(),
             imported_deps: std::collections::HashSet::new(),
             imported_workspaces: std::collections::HashSet::new(),
+            scratch_tab: None,
             dependencies: Vec::new(), // "ghost" isn't here
             workspaces: vec![Workspace {
                 id: ws,
@@ -6578,6 +6591,7 @@ mod model_tests {
             imports: Vec::new(),
             imported_deps: std::collections::HashSet::new(),
             imported_workspaces: std::collections::HashSet::new(),
+            scratch_tab: None,
             dependencies: Vec::new(),
             workspaces: vec![
                 Workspace {
@@ -6623,6 +6637,72 @@ mod model_tests {
         let find = |id| back.workspaces.iter().find(|w| w.id == id).expect("tab");
         assert_eq!(find(named).name.as_deref(), Some("voice"));
         assert_eq!(find(unnamed).name, None, "an unnamed tab stays unnamed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A file that is nothing but definitions still needs somewhere to stand,
+    /// so the loader invents a tab — but that tab is the loader's, not the
+    /// author's. Writing it back grew a stray `workspace "…" { }` block in the
+    /// user's library file on every single run.
+    #[test]
+    fn the_invented_tab_of_a_definitions_only_file_is_not_written_back() {
+        let path = std::env::temp_dir().join("wk-scratch-tab-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let def = NodeId::from_u128(201);
+        let original = format!("workspace \"{def}\" {{\n    name \"voice\"\n    tab #false\n}}\n");
+        std::fs::write(&path, &original).unwrap();
+        Document::load(&path).expect("parses").save(&path).unwrap();
+        let normalized = std::fs::read_to_string(&path).unwrap();
+
+        let doc = Document::load_resolved(&path).expect("loads");
+        let scratch = doc.scratch_tab.expect("a definitions-only file gets a tab");
+        let s = Server::new(&doc, path.clone()).expect("server constructs");
+        assert_eq!(
+            s.graph.workspaces,
+            vec![scratch],
+            "there is a tab to stand on"
+        );
+
+        s.save();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            normalized,
+            "running a library file must not write to it"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The other half: the invented tab is skipped because it is *empty*, not
+    /// because it is invented. Put something in it and it is a workspace like
+    /// any other — otherwise a node dropped on it would vanish at exit.
+    #[test]
+    fn the_invented_tab_is_saved_once_something_is_put_in_it() {
+        let path = std::env::temp_dir().join("wk-scratch-tab-used-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let def = NodeId::from_u128(202);
+        std::fs::write(
+            &path,
+            format!("workspace \"{def}\" {{\n    name \"voice\"\n    tab #false\n}}\n"),
+        )
+        .unwrap();
+
+        let doc = Document::load_resolved(&path).expect("loads");
+        let scratch = doc.scratch_tab.expect("a definitions-only file gets a tab");
+        let mut s = Server::new(&doc, path.clone()).expect("server constructs");
+        s.apply(Command::Create(Resource::Node {
+            kind: NodeKind::Network,
+            pos: [10.0, 10.0],
+            ws: scratch,
+        }));
+        s.save();
+
+        let back = Document::load(&path).expect("reloads");
+        let tab = back
+            .workspaces
+            .iter()
+            .find(|w| w.id == scratch)
+            .expect("the tab is in the file now");
+        assert_eq!(tab.nodes.len(), 1, "with what was put on it");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -6703,6 +6783,7 @@ mod model_tests {
             imports: Vec::new(),
             imported_deps: std::collections::HashSet::new(),
             imported_workspaces: std::collections::HashSet::new(),
+            scratch_tab: None,
             dependencies: Vec::new(),
             workspaces: vec![
                 Workspace {
