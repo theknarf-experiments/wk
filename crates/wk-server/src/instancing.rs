@@ -69,8 +69,14 @@ pub struct Instance {
     /// written in a tab, itself a derived id when it is written inside another
     /// definition.
     pub id: NodeId,
-    /// The definition's name, as the `group` line wrote it.
+    /// The definition's name, as the `group` line wrote it — the instance's
+    /// *type*.
     pub definition: String,
+    /// What this instance is called, scoped by the instances it sits inside
+    /// (`chorus-voice`). Unique across the document by construction, and every
+    /// node inside is named after it, which is what makes two instances of one
+    /// definition tell apart on the fabric and in `wk ps`.
+    pub name: String,
     /// The id of the workspace that *is* that definition.
     pub defined_in: NodeId,
     /// The tab the whole tree ultimately sits in. An instance is deliberately
@@ -117,13 +123,45 @@ pub fn expand(doc: &Document) -> Result<Vec<Instance>, String> {
             label: site_label(ws),
             canvas: &ws.nodes,
         };
-        for node in groups_in(ws) {
+        for (node, name) in groups_in(ws).zip(local_names(&ws.nodes)) {
             // A group written in a tab wires to the tab's own nodes, so an
             // endpoint on its `in`/`out` lines is already the live id.
-            ex.group(&site, node.id, None, node, &|id| vec![id])?;
+            ex.group(&site, node.id, None, node, &name, &|id| vec![id])?;
         }
     }
     Ok(ex.out)
+}
+
+/// The local name of each `group` on one canvas, in document order: what the
+/// line says, else a name derived from the group's own id.
+///
+/// Deriving from the id rather than from the definition is what makes the name
+/// stable: an instance keeps it when another is added or removed, and two
+/// instances of one definition are never `voice` and `voice-2` — a sibling
+/// ordering that would renumber the moment one of them went away, taking a
+/// fabric address with it.
+fn local_names(canvas: &[NodeSnap]) -> Vec<String> {
+    let mut taken: Vec<String> = Vec::new();
+    for node in canvas
+        .iter()
+        .filter(|n| matches!(n.kind, SnapKind::Group { .. }))
+    {
+        let SnapKind::Group { name, .. } = &node.kind else {
+            unreachable!("filtered to groups")
+        };
+        // Named like any other node: from its own id unless the line says
+        // otherwise. An instance is not "the voice one" — it is a thing that
+        // happens to stamp out `voice`, and several of them can.
+        let candidate = match name {
+            Some(chosen) => chosen.clone(),
+            None => (0..)
+                .map(|nth| crate::nodename::generated(node.id, nth))
+                .find(|c| !taken.contains(c))
+                .expect("an unbounded walk finds a free name"),
+        };
+        taken.push(candidate);
+    }
+    taken
 }
 
 /// Where a group is written, as everything the expansion needs to know about
@@ -196,6 +234,7 @@ fn group_parts(n: &NodeSnap) -> (&str, &BoundaryWires, &BoundaryWires) {
             definition,
             in_wires,
             out_wires,
+            ..
         } => (definition, in_wires, out_wires),
         _ => unreachable!("only a group snap reaches here"),
     }
@@ -288,6 +327,7 @@ impl<'a> Expander<'a> {
         instance: NodeId,
         parent: Option<NodeId>,
         node: &'a NodeSnap,
+        name: &str,
         outer: Outer,
     ) -> Result<(), String> {
         let (definition, in_wires, out_wires) = group_parts(node);
@@ -493,6 +533,7 @@ impl<'a> Expander<'a> {
         self.out.push(Instance {
             id: instance,
             definition: definition.to_string(),
+            name: name.to_string(),
             defined_in: def.id,
             tab: at.tab,
             parent,
@@ -510,6 +551,28 @@ impl<'a> Expander<'a> {
                     .filter(|n| port_of(n).is_none())
                     .map(|n| NodeSnap {
                         id: id(n.id),
+                        // A name the definition *chose* is chosen inside the
+                        // definition's own scope, so an instance qualifies it:
+                        // two instances would otherwise both hold a node
+                        // called `arp`. An unnamed node needs none of that —
+                        // its name comes from its derived id, which is already
+                        // unique per instance.
+                        kind: match &n.kind {
+                            SnapKind::App {
+                                dep,
+                                name: Some(own),
+                                options,
+                                args,
+                                token,
+                            } => SnapKind::App {
+                                dep: dep.clone(),
+                                name: Some(format!("{name}-{own}")),
+                                options: options.clone(),
+                                args: args.clone(),
+                                token: token.clone(),
+                            },
+                            other => other.clone(),
+                        },
                         ..n.clone()
                     })
                     .collect(),
@@ -531,8 +594,12 @@ impl<'a> Expander<'a> {
             label: format!("definition {definition:?}"),
             canvas: &def.nodes,
         };
-        for nested in groups_in(def) {
-            self.group(&inner, id(nested.id), Some(instance), nested, &sub)?;
+        // A nested instance is named inside its parent: `chorus-voice`, so a
+        // definition used twice inside another definition still yields two
+        // distinct scopes however deep the nesting goes.
+        for (nested, local) in groups_in(def).zip(local_names(&def.nodes)) {
+            let scoped = format!("{name}-{local}");
+            self.group(&inner, id(nested.id), Some(instance), nested, &scoped, &sub)?;
         }
         self.path.pop();
         Ok(())
@@ -592,6 +659,7 @@ mod tests {
             id,
             SnapKind::Group {
                 definition: definition.to_string(),
+                name: None,
                 in_wires: Vec::new(),
                 out_wires: Vec::new(),
             },
@@ -614,6 +682,7 @@ mod tests {
             id,
             SnapKind::Group {
                 definition: definition.to_string(),
+                name: None,
                 in_wires: list(in_wires),
                 out_wires: list(out_wires),
             },

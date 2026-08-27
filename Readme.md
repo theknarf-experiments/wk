@@ -19,7 +19,23 @@ A workspace is a canvas of **nodes**, saved to a `.wk` file ([KDL](https://kdl.d
 syntax). A node is a **plugin instance** by default: it renders into a virtual
 surface (GPU via `wasi:webgpu`, or a CPU frame buffer) that `wk` composites into
 its window, or it runs in a terminal (`wasi:cli` command components). Some nodes
-instead stand for shared resources a plugin can wire to:
+instead stand for shared resources a plugin can wire to (below).
+
+A node has a **type** and a **name**, the way a container has an image and a
+name of its own. The type is the dependency it runs — `python`, `synth` — and
+several nodes can share one, so it cannot be an identity. The name is what a
+peer dials on the fabric and what every `wk` command takes; unnamed nodes get
+one derived from their id (`quiet-harbor`), and you name a node when something
+needs to find it:
+
+```kdl
+node "python" "01KZ…" { name "www" }   // type python, called www
+```
+
+`wk ps` prints both. Nothing writes a generated name into the file — it comes
+from the id, which is already there.
+
+The shared-resource kinds:
 
 - **File** — a shared file, either in-memory (VirtualFile) or backed by a real
   host file (HostMappedFile). The filesystem has real symlinks, so images that

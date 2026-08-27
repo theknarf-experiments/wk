@@ -445,7 +445,14 @@ pub enum SnapKind {
     /// it is what the id derivation keys on — see [`crate::instancing`], which
     /// resolves the name and computes the ids.
     Group {
+        /// Which definition this instantiates — its *type*, exactly as an app
+        /// node's `dep` is. Several instances can share one.
         definition: String,
+        /// What this instance is *called*. Absent means "the same as the
+        /// definition"; a second instance of one is named when it is loaded,
+        /// and every node inside an instance is named after it, so this is the
+        /// scope that makes an instance's members addressable at all.
+        name: Option<String>,
         /// `in "<port name>" "<node id>"`: a node on *this* canvas feeding one
         /// of the definition's in-ports.
         ///
@@ -1240,6 +1247,7 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
             }
             SnapKind::Group {
                 definition: n.get(0)?.as_string()?.to_string(),
+                name: text("name"),
                 in_wires,
                 out_wires,
             }
@@ -1352,12 +1360,20 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         n.push(str_entry(value));
         ch.nodes_mut().push(n);
     };
+    // A chosen name leads the block, for both kinds that can have one. Emitted
+    // before the match rather than as an arm of it: a group also writes its
+    // boundary wires there, and a first-wins arm would have silently dropped
+    // them from every named instance.
+    if let SnapKind::App {
+        name: Some(name), ..
+    }
+    | SnapKind::Group {
+        name: Some(name), ..
+    } = &s.kind
+    {
+        child_str("name", name);
+    }
     match &s.kind {
-        // A node called something other than its type says so; one called
-        // after its type says nothing, so the common line stays `node "python"`.
-        SnapKind::App {
-            name: Some(name), ..
-        } => child_str("name", name),
         SnapKind::Iroh { secret, peer } | SnapKind::Veilid { secret, peer } => {
             if let Some(sec) = secret {
                 child_str("secret", sec);
@@ -1911,6 +1927,30 @@ mod tests {
         assert!(load(through).is_ok());
     }
 
+    /// A *named* group keeps its boundary wires through a save. Both are
+    /// children of the same block, and emitting the name as another arm of the
+    /// match that writes the wires would have dropped every `in`/`out` line
+    /// from any instance someone bothered to name — silently, in their file.
+    #[test]
+    fn a_named_group_keeps_its_boundary_wires() {
+        let (ws, group, peer) = (
+            NodeId::from_u128(401),
+            NodeId::from_u128(402),
+            NodeId::from_u128(403),
+        );
+        let text = format!(
+            "workspace \"{ws}\" {{\n    \
+               group \"voice\" \"{group}\" {{ name \"lead\"; in \"notes\" \"{peer}\" }}\n}}\n"
+        );
+        let doc = Document::from_kdl(&text).expect("parses");
+        let back = Document::from_kdl(&doc.to_kdl()).expect("round-trips");
+        let SnapKind::Group { name, in_wires, .. } = &back.workspaces[0].nodes[0].kind else {
+            panic!("a group")
+        };
+        assert_eq!(name.as_deref(), Some("lead"));
+        assert_eq!(in_wires, &vec![("notes".to_string(), peer)]);
+    }
+
     #[test]
     fn a_group_round_trips_with_its_boundary_wires() {
         let ws = NodeId::from_u128(91);
@@ -1929,6 +1969,7 @@ mod tests {
             node.kind,
             SnapKind::Group {
                 definition: "voice".into(),
+                name: None,
                 in_wires: vec![("notes".into(), src)],
                 out_wires: vec![("audio".into(), dst)],
             }
@@ -2320,11 +2361,13 @@ mod tests {
             .iter()
             .find(|w| !w.nodes.is_empty())
             .expect("browser workspace");
-        // netsurf's launch args point at the python node's fabric name.
+        // netsurf's launch args point at the server node's *name* — `www`,
+        // which the file chooses, because a node's type (`python`) is not an
+        // address and several nodes could share it.
         assert!(ws.nodes.iter().any(|n| matches!(
             &n.kind,
             SnapKind::App { dep, args, .. }
-                if dep == "netsurf" && args.iter().any(|a| a.starts_with("http://python:"))
+                if dep == "netsurf" && args.iter().any(|a| a.starts_with("http://www:"))
         )));
         // Both peers join the same network; the www dir feeds the server.
         assert_eq!(ws.net_links.len(), 2);
@@ -2744,14 +2787,16 @@ mod tests {
             (value_str(), port_kind()).prop_map(|(name, kind)| SnapKind::OutPort { name, kind }),
             (
                 value_str(),
+                prop::option::of(value_str()),
                 prop::collection::vec(boundary_wire(), 0..3),
                 prop::collection::vec(boundary_wire(), 0..3),
             )
-                .prop_map(|(definition, in_wires, out_wires)| SnapKind::Group {
+                .prop_map(|(definition, name, in_wires, out_wires)| SnapKind::Group {
                     definition,
+                    name,
                     in_wires,
                     out_wires,
-                }),
+                },),
         ]
     }
 

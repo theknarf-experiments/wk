@@ -72,6 +72,16 @@ pub(crate) fn resolve<'a>(
     query: &str,
 ) -> Result<&'a wk_protocol::ipc::NodeInfo, String> {
     let q = query.to_lowercase();
+    let ambiguous = |many: &[&wk_protocol::ipc::NodeInfo]| {
+        format!(
+            "{query:?} is ambiguous — matches {} nodes: {}",
+            many.len(),
+            many.iter()
+                .map(|n| format!("{} ({})", n.name, short(n.id)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     let matches: Vec<_> = snap
         .nodes
         .iter()
@@ -80,16 +90,23 @@ pub(crate) fn resolve<'a>(
         })
         .collect();
     match matches.as_slice() {
+        [one] => return Ok(one),
+        [] => {}
+        many => return Err(ambiguous(many)),
+    }
+    // Nothing is called that — but a type is a fair way to ask for a node when
+    // it names exactly one, which is the common case and what someone typing
+    // `wk logs curl` means. Two nodes of a type is an ambiguity, not a guess:
+    // the whole reason a name is not a type is that several can share one.
+    let by_type: Vec<_> = snap
+        .nodes
+        .iter()
+        .filter(|n| n.node_type.eq_ignore_ascii_case(query))
+        .collect();
+    match by_type.as_slice() {
         [one] => Ok(one),
         [] => Err(format!("no node matches {query:?} (see `wk ps`)")),
-        many => Err(format!(
-            "{query:?} is ambiguous — matches {} nodes: {}",
-            many.len(),
-            many.iter()
-                .map(|n| short(n.id))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
+        many => Err(ambiguous(many)),
     }
 }
 

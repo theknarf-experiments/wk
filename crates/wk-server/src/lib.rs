@@ -21,6 +21,7 @@ pub mod images;
 pub mod instancing;
 pub mod midi;
 pub mod midihw;
+pub mod nodename;
 pub mod oci;
 pub mod options;
 pub mod plugin;

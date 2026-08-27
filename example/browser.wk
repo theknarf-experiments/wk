@@ -3,6 +3,11 @@
 //
 //   wk run example/browser.wk
 //
+// The python node is *named* `www` — a node's name is its own, not its type
+// (several nodes can run `python`), and the name is what a peer dials on the
+// fabric. Unnamed nodes get one derived from their id; name a node when
+// something needs to find it.
+//
 // The netsurf node is a wasm container (docker://plugins/netsurf/Dockerfile):
 // NetSurf 3.11's framebuffer frontend, its window a wasi-gfx surface through
 // libnsfb's wk backend, its HTTP a real libcurl on the userspace fabric.
@@ -18,9 +23,10 @@ workspace "01N3TSRF00000000000000WS00" {
     node "netsurf" "01N3TSRF00000000000000NS01" {
         pos 80.0 380.0
         size 820.0 640.0
-        args "http://python:8088/"
+        args "http://www:8088/"
     }
     node "python" "01N3TSRF00000000000000PY02" {
+        name "www"
         pos 520.0 80.0
         size 380.0 240.0
         args "/app/server.py" "8088"

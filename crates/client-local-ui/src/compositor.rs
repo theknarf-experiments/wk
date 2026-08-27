@@ -1424,7 +1424,12 @@ impl App {
 
     /// A short human label for a node (for palette search / "go to").
     fn node_label(&self, id: NodeId) -> String {
-        if let Some(n) = self.view.app_node(id) {
+        if let Some(label) = self.view.node_labels.get(&id) {
+            // What the server says to call it: a chosen name, else the type.
+            // Not the node's `name`, which for an unnamed node is a generated
+            // handle — useful for dialling it, useless on a card.
+            label.clone()
+        } else if let Some(n) = self.view.app_node(id) {
             n.name.clone()
         } else if let Some(f) = self.view.file_nodes.get(&id) {
             f.name.clone()
