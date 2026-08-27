@@ -277,11 +277,45 @@ impl<'a> Expander<'a> {
         // because a port never becomes a live node for it to dangle from.
         let mut ports: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
         let mut named: HashMap<(PortDir, &str), NodeId> = HashMap::new();
+        let mut port_of_id: HashMap<NodeId, (PortDir, &str)> = HashMap::new();
         for n in &def.nodes {
             if let Some((dir, name)) = port_of(n) {
                 let derived = id(n.id);
                 named.insert((dir, name), derived);
+                port_of_id.insert(derived, (dir, name));
                 ports.insert(derived, Vec::new());
+            }
+        }
+
+        // A one-per-source relation has room for exactly one destination per
+        // node, so a wire whose source is a port does not *add* anything to
+        // whatever the parent wires in: the collapse hands that node a second
+        // grant, and `toggle_unique` resolves it by dropping the first. The
+        // first is a link written on the parent's own canvas, and `save`
+        // re-projects the live graph, so the displacement would quietly delete
+        // a line from the user's file — and two instances of the definition
+        // would take the grant from each other the same way. This is the same
+        // objection that refuses `net` and `serve` as port kinds; here it is
+        // the wire's direction rather than the port's kind that decides, since
+        // a port on the *destination* side leaves an inner node as the source.
+        for (word, links) in [
+            ("serve", &def.serves),
+            ("netlink", &def.net_links),
+            ("capturelink", &def.capture_links),
+            ("clipboardlink", &def.clipboard_links),
+            ("apilink", &def.api_links),
+        ] {
+            for &(src, _) in links {
+                if let Some(&(dir, name)) = port_of_id.get(&id(src)) {
+                    return Err(format!(
+                        "{site}: group {definition:?} cannot be instantiated: its {}port \
+                         {name:?} is the source of a `{word}` wire, which wk does not support \
+                         yet — a node holds exactly one of these at a time, so crossing the \
+                         boundary here would take that connection away from whatever the \
+                         parent wires into {name:?} rather than adding one",
+                        dir_word(dir)
+                    ));
+                }
             }
         }
         for (dir, wires) in [(PortDir::In, in_wires), (PortDir::Out, out_wires)] {
@@ -814,6 +848,70 @@ mod tests {
         ]);
         let err = expand(&d).unwrap_err();
         assert!(err.contains("outport"), "{err}");
+    }
+
+    #[test]
+    fn a_port_feeding_a_one_per_source_relation_is_refused() {
+        use wk_protocol::PortKind;
+        // `capturelink` and its two siblings are one grant per app. A port on
+        // the *source* side means the parent's own node is the app, so the
+        // collapse would move that node's grant onto the instance's capability
+        // node — dropping a wire the parent's canvas holds, which `save` then
+        // erases from the file.
+        let def = Workspace {
+            capture_links: vec![(NodeId::from_u128(11), NodeId::from_u128(12))],
+            ..definition(
+                10,
+                "viewer",
+                vec![
+                    inport(11, "screen", PortKind::Capture),
+                    app(12, "capture-node"),
+                ],
+            )
+        };
+        let d = doc(vec![
+            def,
+            tab(
+                20,
+                vec![
+                    app(21, "app"),
+                    wired_group(22, "viewer", &[("screen", 21)], &[]),
+                ],
+            ),
+        ]);
+        let err = expand(&d).unwrap_err();
+        assert!(
+            err.contains("\"screen\"") && err.contains("capturelink"),
+            "{err}"
+        );
+
+        // The mirror shape is the useful one and stays legal: an inner node
+        // granted the capability the parent wires in. Its source is derived, so
+        // it can displace nothing outside the instance.
+        let def = Workspace {
+            capture_links: vec![(NodeId::from_u128(12), NodeId::from_u128(11))],
+            ..definition(
+                10,
+                "viewer",
+                vec![inport(11, "screen", PortKind::Capture), app(12, "eye")],
+            )
+        };
+        let d = doc(vec![
+            def,
+            tab(
+                20,
+                vec![
+                    app(21, "cap"),
+                    wired_group(22, "viewer", &[("screen", 21)], &[]),
+                ],
+            ),
+        ]);
+        let out = expand(&d).expect("expands");
+        let eye = derive_id(NodeId::from_u128(22), NodeId::from_u128(12));
+        assert_eq!(
+            out[0].content.capture_links,
+            vec![(eye, NodeId::from_u128(21))]
+        );
     }
 
     #[test]

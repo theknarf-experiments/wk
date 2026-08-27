@@ -411,7 +411,7 @@ impl View {
 /// Which saved-workspace relation a raw `(a, b)` pair belongs to. Used only to
 /// round-trip wires touching an unplaced node (see `Server::unplaced_wires`),
 /// where the node kinds needed to classify a live [`Wire`] aren't available.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum WireRel {
     Connection,
     Midi,
@@ -731,6 +731,13 @@ struct InstanceRec {
     /// Every node this instance placed, so a teardown can find them all even
     /// after their wiring is gone.
     nodes: Vec<NodeId>,
+    /// Every wire the expansion actually made. The endpoints do not say who
+    /// made a wire: a definition that passes a connection straight through, in
+    /// one port and out the complementary one, collapses to a wire between two
+    /// nodes of the *parent* canvas. That one has to be kept out of the `.wk`
+    /// file and torn down with the group like any other, and only this record
+    /// can find it.
+    wires: Vec<(WireRel, NodeId, NodeId)>,
 }
 
 impl HostService {
@@ -1029,15 +1036,21 @@ impl Server {
     /// the file already holds everything needed to try again next run, and
     /// recording it would leave a wire pointing into a workspace that is not a
     /// tab. Its wires are simply never applied.
-    fn instantiate_content(&mut self, content: &Workspace) {
+    ///
+    /// Returns the wires it made, which is what the instance is remembered by:
+    /// see [`InstanceRec::wires`].
+    fn instantiate_content(&mut self, content: &Workspace) -> Vec<(WireRel, NodeId, NodeId)> {
         for snap in &content.nodes {
             self.materialize(content.id, snap, &[]);
         }
-        self.apply_wires(content);
+        self.apply_wires(content)
     }
 
     /// Re-establish one saved workspace's wiring, each relation as its own kind.
-    fn apply_wires(&mut self, saved: &Workspace) {
+    /// Returns the wires this call actually made — a wire already there is not
+    /// among them, since it belongs to whoever made it first.
+    fn apply_wires(&mut self, saved: &Workspace) -> Vec<(WireRel, NodeId, NodeId)> {
+        let mut made: Vec<(WireRel, NodeId, NodeId)> = Vec::new();
         // Re-apply each saved relation AS ITS OWN KIND — the file already
         // distinguishes them. Flattening everything through `rewire` (which
         // re-classifies by node kind) mistyped provider mounts: an app→app
@@ -1049,36 +1062,43 @@ impl Server {
         for &(f, a) in &saved.connections {
             if exists(self, f, a) {
                 self.toggle_file(f, a);
+                made.push((WireRel::Connection, f, a));
             }
         }
         for &(s, d) in &saved.midi {
             if exists(self, s, d) {
                 self.toggle_midi(s, d);
+                made.push((WireRel::Midi, s, d));
             }
         }
         for &(h, p) in &saved.serves {
             if exists(self, h, p) {
                 self.toggle_serve(h, p);
+                made.push((WireRel::Serve, h, p));
             }
         }
         for &(m, n) in &saved.net_links {
             if exists(self, m, n) {
                 self.toggle_net(m, n);
+                made.push((WireRel::NetLink, m, n));
             }
         }
         for &(a, c) in &saved.capture_links {
             if exists(self, a, c) {
                 self.toggle_capture(a, c);
+                made.push((WireRel::CaptureLink, a, c));
             }
         }
         for &(a, c) in &saved.clipboard_links {
             if exists(self, a, c) {
                 self.toggle_clipboard(a, c);
+                made.push((WireRel::ClipboardLink, a, c));
             }
         }
         for &(a, n) in &saved.api_links {
             if exists(self, a, n) {
                 self.toggle_api(a, n);
+                made.push((WireRel::ApiLink, a, n));
             }
         }
         // Restore per-bind mount paths, then re-apply so mounts land at them.
@@ -1091,6 +1111,7 @@ impl Server {
             self.graph.serve_ports.insert(pair, port);
         }
         self.sync_serves();
+        made
     }
 
     /// Bring one `group` node's instance to life: the definition's nodes under
@@ -1140,9 +1161,18 @@ impl Server {
                     parent: inst.parent,
                     definition: inst.definition.clone(),
                     nodes: inst.content.nodes.iter().map(|n| n.id).collect(),
+                    wires: Vec::new(),
                 },
             );
-            self.instantiate_content(&inst.content);
+            // The record goes in before its content, so anything the
+            // materialization reaches already sees these nodes as an
+            // instance's, and is completed with the wiring that turned out to
+            // be made — which is not every wire the expansion asked for, since
+            // one already on the canvas belongs to whoever made it first.
+            let made = self.instantiate_content(&inst.content);
+            if let Some(rec) = self.instances.get_mut(&inst.id) {
+                rec.wires = made;
+            }
         }
     }
 
@@ -1169,8 +1199,41 @@ impl Server {
         let Some(rec) = self.instances.remove(&id) else {
             return;
         };
+        // Wires first: removing the nodes takes their wiring with it, but a
+        // pass-through wire has no node of this instance on either end and
+        // would otherwise be left behind on the parent's canvas.
+        for (rel, a, b) in rec.wires {
+            self.unwire_rel(rel, a, b);
+        }
         for node in rec.nodes {
             self.remove_any(node);
+        }
+    }
+
+    /// Undo one wire an expansion made, if it is still there. Each relation
+    /// toggles through its own path so the runtime effect (a mount, a route, a
+    /// grant) is undone with it.
+    fn unwire_rel(&mut self, rel: WireRel, a: NodeId, b: NodeId) {
+        let links = match rel {
+            WireRel::Connection => &self.graph.connections,
+            WireRel::Midi => &self.graph.midi_links,
+            WireRel::Serve => &self.graph.serve_links,
+            WireRel::NetLink => &self.graph.net_links,
+            WireRel::CaptureLink => &self.graph.capture_links,
+            WireRel::ClipboardLink => &self.graph.clipboard_links,
+            WireRel::ApiLink => &self.graph.api_links,
+        };
+        if !links.contains(&(a, b)) {
+            return; // already gone with one of its endpoints
+        }
+        match rel {
+            WireRel::Connection => self.toggle_file(a, b),
+            WireRel::Midi => self.toggle_midi(a, b),
+            WireRel::Serve => self.toggle_serve(a, b),
+            WireRel::NetLink => self.toggle_net(a, b),
+            WireRel::CaptureLink => self.toggle_capture(a, b),
+            WireRel::ClipboardLink => self.toggle_clipboard(a, b),
+            WireRel::ApiLink => self.toggle_api(a, b),
         }
     }
 
@@ -3042,6 +3105,16 @@ impl Server {
     /// Each node projects through [`Self::node_snap`] — the same shape undo
     /// captures — ordered by kind then id, so saves are deterministic.
     pub fn save(&self) {
+        // Every wire an expansion made. A collapsed boundary wire usually ends
+        // on a derived node, but a definition that passes a connection straight
+        // through joins two nodes of the parent canvas — nothing about the
+        // endpoints of *that* one says who made it, so only this record keeps
+        // it out of the file.
+        let derived_wires: HashSet<(WireRel, NodeId, NodeId)> = self
+            .instances
+            .values()
+            .flat_map(|rec| rec.wires.iter().copied())
+            .collect();
         let mut workspaces: Vec<Workspace> = self
             .graph
             .workspaces
@@ -3070,18 +3143,24 @@ impl Server {
                 // node lives here, plus any orphan wires (touching a node that
                 // never materialized) recorded against it — so both round-trip.
                 //
-                // A wire into an instance is skipped on both counts. Its far
-                // end is a derived node (`mine` is false for it, since an
-                // instance is not a tab), but the near end is a real node of
-                // this tab, so without the second test a collapsed boundary
+                // A wire an expansion made is skipped on both counts. Its far
+                // end is usually a derived node (`mine` is false for it, since
+                // an instance is not a tab) while its near end is a real node
+                // of this tab, so without the second test a collapsed boundary
                 // wire would be written into the file as if the author had
                 // drawn it — against an id that only exists while the server
-                // runs.
+                // runs. The third test catches the pass-through case, where
+                // both ends are the tab's own nodes and the wire would outlive
+                // the group that stands for it.
                 let ws_wires =
                     |links: &[(NodeId, NodeId)], rel: WireRel| -> Vec<(NodeId, NodeId)> {
                         let mut v: Vec<(NodeId, NodeId)> = links
                             .iter()
-                            .filter(|(a, b)| mine(a) && !self.is_derived(*b))
+                            .filter(|(a, b)| {
+                                mine(a)
+                                    && !self.is_derived(*b)
+                                    && !derived_wires.contains(&(rel, *a, *b))
+                            })
                             .copied()
                             .collect();
                         v.extend(
@@ -5025,6 +5104,192 @@ mod model_tests {
             saved.capture_links
         );
         assert_eq!(saved.nodes.len(), 2, "the Capture node and the group, only");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A boundary port on the *source* side of a one-per-source relation is
+    /// refused, because the collapse would hand an outer node a second grant of
+    /// something it may only have one of — and `toggle_unique` resolves that by
+    /// dropping whatever the outer node already had. That link is authored
+    /// content, and `save` re-projects the live graph, so the silent
+    /// displacement takes the user's `capturelink` line out of their file. Two
+    /// instances of one definition would steal it from each other the same way.
+    #[test]
+    fn a_port_that_would_move_an_outer_nodes_grant_is_refused() {
+        use crate::workspace::{NodeSnap, SnapKind};
+        let path = std::env::temp_dir().join("wk-group-displace-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let snap = |id: NodeId, kind: SnapKind| NodeSnap {
+            id,
+            pos: [0.0, 0.0],
+            size: [130.0, 44.0],
+            pos3d: None,
+            panel3d: true,
+            kind,
+        };
+        let (def, tab) = (NodeId::from_u128(0xE00), NodeId::from_u128(0xE01));
+        let (port, inner_cap) = (NodeId::from_u128(0xE02), NodeId::from_u128(0xE03));
+        let (app, own_cap, inst) = (
+            NodeId::from_u128(0xE04),
+            NodeId::from_u128(0xE05),
+            NodeId::from_u128(0xE06),
+        );
+        let doc = Document {
+            workspaces: vec![
+                Workspace {
+                    id: def,
+                    name: Some("viewer".into()),
+                    tab: false,
+                    nodes: vec![
+                        snap(
+                            port,
+                            SnapKind::InPort {
+                                name: "screen".into(),
+                                kind: PortKind::Capture,
+                            },
+                        ),
+                        snap(inner_cap, SnapKind::Capture),
+                    ],
+                    // The port stands in for an app *outside*, granted the
+                    // instance's own Capture node.
+                    capture_links: vec![(port, inner_cap)],
+                    ..Workspace::new()
+                },
+                Workspace {
+                    id: tab,
+                    nodes: vec![
+                        snap(app, SnapKind::Note { text: "app".into() }),
+                        snap(own_cap, SnapKind::Capture),
+                        snap(
+                            inst,
+                            SnapKind::Group {
+                                definition: "viewer".into(),
+                                in_wires: vec![("screen".into(), app)],
+                                out_wires: Vec::new(),
+                            },
+                        ),
+                    ],
+                    // ...which is also wired to a Capture node of its own.
+                    capture_links: vec![(app, own_cap)],
+                    ..Workspace::new()
+                },
+            ],
+            ..Document::empty()
+        };
+        let err = match Server::new(&doc, path.clone()) {
+            Err(e) => e,
+            Ok(s) => panic!(
+                "a port that moves an outer grant must be refused; capture links: {:?}",
+                s.graph.capture_links
+            ),
+        };
+        assert!(err.contains("\"screen\""), "names the port: {err}");
+        assert!(err.contains("capture"), "names the relation: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A definition may pass a connection straight through, in one port and out
+    /// the complementary one. Both ends of the resulting wire are then nodes of
+    /// the *parent*, so nothing about the endpoints says the expansion made it —
+    /// and a wire written to the file would outlive the group that stands for
+    /// it, indistinguishable from something the author drew.
+    #[test]
+    fn a_pass_through_definition_does_not_write_its_wire_into_the_file() {
+        use crate::workspace::{NodeSnap, SnapKind};
+        let path = std::env::temp_dir().join("wk-group-passthrough-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let snap = |id: NodeId, kind: SnapKind| NodeSnap {
+            id,
+            pos: [0.0, 0.0],
+            size: [130.0, 44.0],
+            pos3d: None,
+            panel3d: true,
+            kind,
+        };
+        let (def, tab) = (NodeId::from_u128(0xC00), NodeId::from_u128(0xC01));
+        let (pin, pout) = (NodeId::from_u128(0xC02), NodeId::from_u128(0xC03));
+        let (src, dst, inst) = (
+            NodeId::from_u128(0xC04),
+            NodeId::from_u128(0xC05),
+            NodeId::from_u128(0xC06),
+        );
+        let doc = Document {
+            workspaces: vec![
+                Workspace {
+                    id: def,
+                    name: Some("thru".into()),
+                    tab: false,
+                    nodes: vec![
+                        snap(
+                            pin,
+                            SnapKind::InPort {
+                                name: "from".into(),
+                                kind: PortKind::Midi,
+                            },
+                        ),
+                        snap(
+                            pout,
+                            SnapKind::OutPort {
+                                name: "to".into(),
+                                kind: PortKind::Midi,
+                            },
+                        ),
+                    ],
+                    midi: vec![(pin, pout)],
+                    ..Workspace::new()
+                },
+                Workspace {
+                    id: tab,
+                    nodes: vec![
+                        snap(
+                            src,
+                            SnapKind::Note {
+                                text: "keys".into(),
+                            },
+                        ),
+                        snap(
+                            dst,
+                            SnapKind::Note {
+                                text: "synth".into(),
+                            },
+                        ),
+                        snap(
+                            inst,
+                            SnapKind::Group {
+                                definition: "thru".into(),
+                                in_wires: vec![("from".into(), src)],
+                                out_wires: vec![("to".into(), dst)],
+                            },
+                        ),
+                    ],
+                    ..Workspace::new()
+                },
+            ],
+            ..Document::empty()
+        };
+        let mut s = Server::new(&doc, path.clone()).expect("constructs");
+        assert_eq!(
+            s.graph.midi_links,
+            vec![(src, dst)],
+            "the pass-through should join the tab's own two nodes"
+        );
+
+        s.save();
+        let back = Document::load(&path).expect("reloads");
+        let saved = back.workspaces.iter().find(|w| w.id == tab).expect("tab");
+        assert!(
+            saved.midi.is_empty(),
+            "the expansion's wire was written into the file as if the author drew it: {:?}",
+            saved.midi
+        );
+
+        // And deleting the group must take the wire with it: the instance's own
+        // nodes are not on either end, so nothing else can.
+        s.apply(Command::Delete(ResourceRef::Node(inst)));
+        assert!(
+            s.graph.midi_links.is_empty(),
+            "the pass-through wire outlived the group that made it"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
