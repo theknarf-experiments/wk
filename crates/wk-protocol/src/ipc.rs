@@ -30,8 +30,15 @@ pub struct NodeInfo {
     /// `app` | `volume` | `bindmount` | `hostport` | `network` | `gateway`
     /// | `iroh` | `veilid` | `note` | `capture` | `api`.
     pub kind: String,
-    /// The dependency/app name, file name, or note preview — else empty.
+    /// What this node is *called* — its identity: the fabric name a peer
+    /// dials, and what every CLI verb takes. For a file node, its file name;
+    /// for a note, a preview.
     pub name: String,
+    /// What an app node *is*: the dependency it runs, the way an image is a
+    /// container's type. Empty for every other kind. Several nodes can share
+    /// one type, which is exactly why it is not the name.
+    #[serde(default)]
+    pub node_type: String,
     /// Which workspace (tab) the node belongs to.
     pub ws: NodeId,
     pub pos: [f32; 2],
@@ -213,6 +220,7 @@ mod tests {
             workspaces: vec![id(10)],
             workspace_names: std::collections::HashMap::from([(id(10), "voice".to_string())]),
             nodes: vec![NodeInfo {
+                node_type: String::new(),
                 id: id(11),
                 kind: "app".into(),
                 name: "vim".into(),

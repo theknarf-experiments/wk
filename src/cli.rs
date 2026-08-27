@@ -820,9 +820,10 @@ pub fn ps(workspace: &Path) -> Result<(), String> {
     };
     // Tab-separated columns, docker-ps-like.
     println!(
-        "{:<12}  {:<11}  {:<16}{}  {:<9}  ARGS",
+        "{:<12}  {:<11}  {:<14}  {:<14}{}  {:<9}  ARGS",
         "ID",
         "KIND",
+        "TYPE",
         "NAME",
         ws_col("WORKSPACE"),
         "STATUS"
@@ -862,10 +863,20 @@ pub fn ps(workspace: &Path) -> Result<(), String> {
             },
             (None, false) => n.args.join(" "),
         };
+        // TYPE is what the node runs, NAME is what it is called — the same
+        // split docker ps draws between IMAGE and NAMES. They read alike for a
+        // workspace holding one of each, and stop reading alike the moment a
+        // second node of a type shows up, which is the point.
+        let node_type = if n.node_type.is_empty() {
+            "-"
+        } else {
+            &n.node_type
+        };
         println!(
-            "{:<12}  {:<11}  {:<16}{}  {:<9}  {}",
+            "{:<12}  {:<11}  {:<14}  {:<14}{}  {:<9}  {}",
             short(n.id),
             n.kind,
+            node_type,
             name,
             ws_col(&ws_label(&snap, n.ws)),
             status,
@@ -883,6 +894,7 @@ mod tests {
 
     fn node(id: u128, name: &str) -> NodeInfo {
         NodeInfo {
+            node_type: String::new(),
             id: NodeId::from_u128(id),
             kind: "app".into(),
             name: name.into(),

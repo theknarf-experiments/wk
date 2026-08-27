@@ -578,7 +578,8 @@ mod tests {
         snap(
             id,
             SnapKind::App {
-                name: name.to_string(),
+                dep: name.to_string(),
+                name: None,
                 options: Vec::new(),
                 args: Vec::new(),
                 token: None,
@@ -1270,7 +1271,7 @@ mod tests {
         let piano = inline.workspaces[0]
             .nodes
             .iter()
-            .find(|n| matches!(&n.kind, SnapKind::App { name, .. } if name == "piano"))
+            .find(|n| matches!(&n.kind, SnapKind::App { dep, .. } if dep == "piano"))
             .expect("the piano");
         for inst in &out {
             assert_eq!(inst.definition, "voice");
@@ -1279,7 +1280,7 @@ mod tests {
                 .nodes
                 .iter()
                 .map(|n| match &n.kind {
-                    SnapKind::App { name, .. } => name.as_str(),
+                    SnapKind::App { dep, .. } => dep.as_str(),
                     _ => "?",
                 })
                 .collect();

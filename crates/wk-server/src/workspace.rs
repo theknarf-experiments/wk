@@ -358,7 +358,15 @@ pub struct NodeSnap {
 pub enum SnapKind {
     /// An app node; `name` resolves against the dependency list.
     App {
-        name: String,
+        /// Which dependency this node runs — its *type*, the way an image name
+        /// is a container's type. Several nodes can share one.
+        dep: String,
+        /// What this node is *called*: its identity on the fabric, in `wk ps`,
+        /// and to every CLI verb that takes a node. Absent means "the same as
+        /// the type", which is what a workspace holding one of each wants; a
+        /// second node of a type is named when it is created, and that name is
+        /// written here and never changes on its own afterwards.
+        name: Option<String>,
         /// Option values (knob settings), persisted positionally.
         options: Vec<f32>,
         /// Launch args, editable in the GUI. Empty falls back to the
@@ -1156,7 +1164,8 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
                 })
                 .unwrap_or_default();
             SnapKind::App {
-                name: n.get(0)?.as_string()?.to_string(),
+                dep: n.get(0)?.as_string()?.to_string(),
+                name: text("name"),
                 options,
                 args,
                 token: text("token"),
@@ -1312,7 +1321,7 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
     let mut node = KdlNode::new(name);
     // Named kinds lead with the name (or note text), then the id.
     match &s.kind {
-        SnapKind::App { name, .. } | SnapKind::Volume { name, .. } => {
+        SnapKind::App { dep: name, .. } | SnapKind::Volume { name, .. } => {
             node.push(str_entry(name));
         }
         SnapKind::BindMount { path } => {
@@ -1344,6 +1353,11 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         ch.nodes_mut().push(n);
     };
     match &s.kind {
+        // A node called something other than its type says so; one called
+        // after its type says nothing, so the common line stays `node "python"`.
+        SnapKind::App {
+            name: Some(name), ..
+        } => child_str("name", name),
         SnapKind::Iroh { secret, peer } | SnapKind::Veilid { secret, peer } => {
             if let Some(sec) = secret {
                 child_str("secret", sec);
@@ -2173,7 +2187,7 @@ mod tests {
         let world = ws
             .nodes
             .iter()
-            .find(|n| matches!(&n.kind, SnapKind::App { name, .. } if name == "world"))
+            .find(|n| matches!(&n.kind, SnapKind::App { dep, .. } if dep == "world"))
             .expect("a world node");
         assert!(!world.panel3d, "the world is geometry, not a card");
         let glb = ws
@@ -2261,7 +2275,7 @@ mod tests {
         let hellofs = ws
             .nodes
             .iter()
-            .find(|n| matches!(&n.kind, SnapKind::App { name, .. } if name == "hellofs"))
+            .find(|n| matches!(&n.kind, SnapKind::App { dep, .. } if dep == "hellofs"))
             .expect("hellofs node")
             .id;
         assert_eq!(
@@ -2277,8 +2291,8 @@ mod tests {
         // hellofuse's file comes from its args (fuse_opt_parse).
         assert!(ws.nodes.iter().any(|n| matches!(
             &n.kind,
-            SnapKind::App { name, args, .. }
-                if name == "hellofuse" && args.iter().any(|a| a.starts_with("--name="))
+            SnapKind::App { dep, args, .. }
+                if dep == "hellofuse" && args.iter().any(|a| a.starts_with("--name="))
         )));
         assert!(ws.nodes.iter().any(
             |n| matches!(&n.kind, SnapKind::BindMount { path } if path.ends_with("demo-archive.zip"))
@@ -2309,8 +2323,8 @@ mod tests {
         // netsurf's launch args point at the python node's fabric name.
         assert!(ws.nodes.iter().any(|n| matches!(
             &n.kind,
-            SnapKind::App { name, args, .. }
-                if name == "netsurf" && args.iter().any(|a| a.starts_with("http://python:"))
+            SnapKind::App { dep, args, .. }
+                if dep == "netsurf" && args.iter().any(|a| a.starts_with("http://python:"))
         )));
         // Both peers join the same network; the www dir feeds the server.
         assert_eq!(ws.net_links.len(), 2);
@@ -2412,7 +2426,8 @@ mod tests {
                             pos3d: None,
                             panel3d: true,
                             kind: SnapKind::App {
-                                name: "synth".into(),
+                                dep: "synth".into(),
+                                name: None,
                                 options: vec![8.0, 0.6, 0.0, 1.0],
                                 args: vec!["netserve".into(), "80".into()],
                                 token: Some("c0ffee".into()),
@@ -2702,7 +2717,10 @@ mod tests {
                 ),
             )
                 .prop_map(|(name, options, args, token)| SnapKind::App {
-                    name,
+                    dep: name,
+                    // Identity is chosen by whoever creates a node, never
+                    // generated: an arbitrary one here would assert nothing.
+                    name: None,
                     options,
                     args,
                     token

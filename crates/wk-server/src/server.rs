@@ -624,6 +624,16 @@ pub struct Graph {
     pub nodes: HashMap<NodeId, NodeRec>,
     /// Per-node launch args (argv after the program name). Side table keyed by id.
     pub node_args: HashMap<NodeId, Vec<String>>,
+    /// Which dependency each app node runs — its *type*. A node's name is its
+    /// identity (what the fabric resolves and what `wk logs` takes), so the two
+    /// are separate the way an image is separate from a container: several
+    /// nodes can share one type, and none of them has to be called after it.
+    pub node_deps: HashMap<NodeId, String>,
+    /// What each app node is *called*. Assigned once, when the node is created
+    /// or loaded, and authoritative from then on — a live guest mirrors it as
+    /// its fabric name, but the name belongs to the node, not to the guest, so
+    /// it survives a crash and exists while a component is still compiling.
+    pub node_names: HashMap<NodeId, String>,
     /// Free 3D poses (`[x, y, z, yaw]`, world units) for nodes placed off the
     /// default layout cylinder. Side table: only posed nodes have entries.
     pub pos3d: HashMap<NodeId, [f32; 4]>,
@@ -1395,6 +1405,25 @@ impl Server {
         }
     }
 
+    /// A node name nothing else is using: `want` itself when it is free, else
+    /// `want-2`, `want-3`, … A node's name is its address on the fabric and
+    /// the handle every CLI verb takes, so two nodes sharing one would make
+    /// both unaddressable — and `Netstack::resolve` would silently pick
+    /// whichever attached first.
+    fn unique_node_name(&self, want: &str) -> String {
+        // Against the graph, not the live registry: a node that is still
+        // compiling has no guest yet, and two created in quick succession
+        // would otherwise both be handed the same name.
+        let taken = |n: &str| self.graph.node_names.values().any(|taken| taken == n);
+        if !taken(want) {
+            return want.to_string();
+        }
+        (2..)
+            .map(|i| format!("{want}-{i}"))
+            .find(|candidate| !taken(candidate))
+            .expect("an unbounded search finds a free name")
+    }
+
     /// How `wk ps` names an instance: the definition's name, prefixed by the
     /// instance it sits in, and numbered when a canvas holds more than one
     /// instance of the same definition — otherwise two copies of `voice` would
@@ -1469,9 +1498,13 @@ impl Server {
     /// Launch a dependency as a new app node at `pos` in workspace `ws`.
     fn launch(&mut self, dep: &Dependency, pos: [f32; 2], ws: NodeId) {
         let id = self.alloc_id();
+        // Named once, here, and persisted: a node's name never changes on its
+        // own afterwards, so nothing a later create does can move a hostname
+        // out from under a wire that already dials it.
+        let name = self.unique_node_name(&dep.name);
         if let Err(e) = self.host.spawn(
             &dep.local_path(),
-            &dep.name,
+            &name,
             id,
             &dep.effective_args(),
             self.registry.clone(),
@@ -1483,6 +1516,8 @@ impl Server {
             return;
         }
         self.place(id, Kind::App, ws, pos, [360.0, 260.0]);
+        self.graph.node_deps.insert(id, dep.name.clone());
+        self.graph.node_names.insert(id, name);
         self.graph.node_args.insert(id, dep.args.clone());
         self.write_token_file(id);
     }
@@ -1729,9 +1764,9 @@ impl Server {
         if let Some(node) = self.app_node(id) {
             let Some(dep) = self
                 .graph
-                .available
-                .iter()
-                .find(|d| d.name == node.name)
+                .node_deps
+                .get(&id)
+                .and_then(|want| self.graph.available.iter().find(|d| &d.name == want))
                 .cloned()
             else {
                 return;
@@ -1744,9 +1779,10 @@ impl Server {
                 .unwrap_or_else(|| dep.effective_args());
             let options = node.options.lock().unwrap().clone();
             let new_id = self.alloc_id();
+            let name = self.unique_node_name(&node.name);
             if let Err(e) = self.host.spawn(
                 &dep.local_path(),
-                &dep.name,
+                &name,
                 new_id,
                 &args,
                 self.registry.clone(),
@@ -1758,6 +1794,8 @@ impl Server {
                 return;
             }
             self.place(new_id, Kind::App, ws, off, size);
+            self.graph.node_deps.insert(new_id, dep.name.clone());
+            self.graph.node_names.insert(new_id, name);
             self.graph.node_args.insert(new_id, args);
             return;
         }
@@ -3130,6 +3168,8 @@ impl Server {
         self.graph.pos3d.remove(&id);
         self.graph.hidden_panel3d.remove(&id);
         self.graph.node_args.remove(&id);
+        self.graph.node_deps.remove(&id);
+        self.graph.node_names.remove(&id);
         self.graph.file_nodes.remove(&id);
         self.graph.host_ports.remove(&id);
         self.graph.node_tokens.remove(&id);
@@ -3898,7 +3938,20 @@ impl Server {
                 let node = self.app_node(id)?;
                 let options = node.options.lock().unwrap().clone();
                 SnapKind::App {
-                    name: node.name.clone(),
+                    dep: self
+                        .graph
+                        .node_deps
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_else(|| node.name.clone()),
+                    // Written only when it differs from the type: a lone
+                    // `python` node stays a plain `node "python"` line.
+                    name: self
+                        .graph
+                        .node_names
+                        .get(&id)
+                        .filter(|name| Some(*name) != self.graph.node_deps.get(&id))
+                        .cloned(),
                     options,
                     args: self.graph.node_args.get(&id).cloned().unwrap_or_default(),
                     token: self
@@ -4086,6 +4139,7 @@ impl Server {
     fn materialize(&mut self, ws: NodeId, s: &NodeSnap, file_data: &[u8]) {
         match &s.kind {
             SnapKind::App {
+                dep: dep_name,
                 name,
                 options,
                 args,
@@ -4095,11 +4149,19 @@ impl Server {
                     .graph
                     .available
                     .iter()
-                    .find(|d| &d.name == name)
+                    .find(|d| &d.name == dep_name)
                     .cloned()
                 else {
-                    eprintln!("workspace references unknown dependency {name:?}; skipping");
+                    eprintln!("workspace references unknown dependency {dep_name:?}; skipping");
                     return;
+                };
+                // Unnamed means "called after your type", which is what a
+                // workspace holding one of each wants. A second node of a type
+                // is disambiguated here, in file order, so the first one in the
+                // file keeps the plain name however many arrive later.
+                let ident = match name {
+                    Some(n) => n.clone(),
+                    None => self.unique_node_name(&dep.name),
                 };
                 // The node's saved (possibly-edited) args, else the dependency
                 // default (the file format doesn't distinguish "no args saved"
@@ -4109,9 +4171,11 @@ impl Server {
                 } else {
                     args.clone()
                 };
+                self.graph.node_deps.insert(s.id, dep.name.clone());
+                self.graph.node_names.insert(s.id, ident.clone());
                 if let Err(e) = self.host.spawn(
                     &dep.local_path(),
-                    &dep.name,
+                    &ident,
                     s.id,
                     &args,
                     self.registry.clone(),
@@ -4666,6 +4730,7 @@ impl Server {
                     id,
                     kind: kind_str(id).to_string(),
                     name: format!("{scope}{name}"),
+                    node_type: self.graph.node_deps.get(&id).cloned().unwrap_or_default(),
                     ws,
                     pos: v.win_pos.get(&id).copied().unwrap_or([0.0, 0.0]),
                     size: v.win_size.get(&id).copied().unwrap_or([0.0, 0.0]),
@@ -6076,6 +6141,84 @@ mod model_tests {
         assert_eq!(v2.net_nodes.len(), 0, "ws2 has no network");
     }
 
+    /// A node's TYPE is the dependency it runs; its NAME is what it is called.
+    /// They read alike until a second node of a type arrives — at which point
+    /// the newcomer is renamed, not the node that was already there, because a
+    /// name is a fabric address something may already be dialling.
+    #[test]
+    fn a_second_node_of_a_type_gets_its_own_name() {
+        let dir = std::env::temp_dir().join("wk-node-naming-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wasm = dir.join("echo.wasm");
+        // Not a real component: launch only needs the path to exist, and this
+        // test is about naming, not about anything the guest does.
+        std::fs::write(&wasm, b"\0asm\x01\0\0\0").unwrap();
+        let path = dir.join("naming.wk");
+        let doc = Document {
+            dependencies: vec![Dependency {
+                name: "python".into(),
+                source: crate::workspace::Source::Path(wasm.clone()),
+                args: Vec::new(),
+                description: None,
+            }],
+            ..Document::empty()
+        };
+        let mut s = Server::new(&doc, path.clone()).expect("server constructs");
+        let ws = s.graph.workspaces[0];
+        let add = |s: &mut Server| {
+            s.apply(Command::Create(Resource::Node {
+                kind: NodeKind::App { dep: 0 },
+                pos: [10.0, 10.0],
+                ws,
+            }));
+        };
+        add(&mut s);
+        add(&mut s);
+        let mut names: Vec<String> = s
+            .node_reg
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|n| n.name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["python".to_string(), "python-2".to_string()],
+            "the first keeps the plain name; only the newcomer is disambiguated"
+        );
+        // Both are the same type, and the type is what save writes as the
+        // node's keyword argument — the name only when it differs.
+        assert!(
+            s.graph.node_deps.values().all(|d| d == "python"),
+            "two nodes, one type"
+        );
+        s.save();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("node \"python\"").count(), 2, "{text}");
+        assert_eq!(text.matches("name \"python-2\"").count(), 1, "{text}");
+        assert!(
+            !text.contains("name \"python\""),
+            "a node called after its type says so by saying nothing:\n{text}"
+        );
+
+        // Reload: the written name is kept, and the unnamed one still resolves
+        // to its type — so a name, once assigned, never moves.
+        let back = Document::load(&path).expect("reloads");
+        let s2 = Server::new(&back, path.clone()).expect("reconstructs");
+        let mut names2: Vec<String> = s2
+            .node_reg
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|n| n.name.clone())
+            .collect();
+        names2.sort();
+        assert_eq!(names2, names, "names survive a round trip unchanged");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A Router bridges the Networks it is wired to, and only while it is
     /// wired to at least two: a router with one wire (or none) is not a bridge,
     /// and must not leave a half-open one behind on the fabric.
@@ -6736,7 +6879,8 @@ mod model_tests {
                         pos3d: None,
                         panel3d: true,
                         kind: SnapKind::App {
-                            name: "ghost".into(),
+                            dep: "ghost".into(),
+                            name: None,
                             options: vec![1.0, 2.0],
                             args: vec!["hello".into()],
                             token: None,
@@ -6782,7 +6926,8 @@ mod model_tests {
         assert_eq!(
             ghost_snap.kind,
             SnapKind::App {
-                name: "ghost".into(),
+                dep: "ghost".into(),
+                name: None,
                 options: vec![1.0, 2.0],
                 args: vec!["hello".into()],
                 token: None,
