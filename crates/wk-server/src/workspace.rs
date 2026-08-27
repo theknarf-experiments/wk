@@ -70,6 +70,18 @@ pub const DEFAULT_WORKSPACE: &str = "workspace.wk";
 /// harmlessly (the parser ignores it).
 const MODELINE: &str = "// vim: set filetype=kdl :";
 
+/// Whether a placed-node keyword carries its own name/path first, pushing the
+/// node id to the second argument (`node "synth" "<id>"`) rather than the first
+/// (`network "<id>"`). Both [`parse_snap`] and [`node_ident`] ask this — they
+/// used to keep separate lists, which drifted apart and silently cost a
+/// `hostservice` line its comments on every save.
+fn kind_is_named(keyword: &str) -> bool {
+    matches!(
+        keyword,
+        "node" | "volume" | "virtualfile" | "bindmount" | "hostfile" | "midiin" | "hostservice"
+    )
+}
+
 /// The identity that pairs a freshly-generated KDL node with the same node in
 /// the existing file, so a save can carry that node's comment across. Placed
 /// nodes and workspaces key on their stable id; wires on their kind + endpoints.
@@ -78,6 +90,10 @@ enum NodeIdent {
     Import(String),
     Dependencies,
     Workspace(NodeId),
+    /// A workspace's `name "voice"` line. There is at most one per workspace,
+    /// so the keyword alone identifies it — and it must have an identity, or a
+    /// comment written above a workspace's name vanishes on the first save.
+    WorkspaceName,
     Placed(NodeId),
     Wire(String, NodeId, NodeId),
 }
@@ -92,20 +108,15 @@ fn node_ident(n: &KdlNode) -> Option<NodeIdent> {
             .map(|s| NodeIdent::Import(s.to_string())),
         "dependencies" => Some(NodeIdent::Dependencies),
         "workspace" => n.get(0).and_then(node_id).map(NodeIdent::Workspace),
+        "name" => Some(NodeIdent::WorkspaceName),
         "connection" | "midi" | "serve" | "netlink" | "capturelink" | "clipboardlink"
         | "apilink" => {
             let a = n.get(0).and_then(node_id)?;
             let b = n.get(1).and_then(node_id)?;
             Some(NodeIdent::Wire(name.to_string(), a, b))
         }
-        _ => {
-            // A placed node: named kinds carry the id second, others first.
-            let named = matches!(
-                name,
-                "node" | "volume" | "virtualfile" | "bindmount" | "hostfile" | "midiin"
-            );
-            node_id(n.get(if named { 1 } else { 0 })?).map(NodeIdent::Placed)
-        }
+        // A placed node: named kinds carry the id second, others first.
+        _ => node_id(n.get(usize::from(kind_is_named(name)))?).map(NodeIdent::Placed),
     }
 }
 
@@ -440,6 +451,10 @@ pub struct Document {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Workspace {
     pub id: NodeId,
+    /// A human name for the tab (`name "voice"`), shown instead of its number.
+    /// `None` (absent) and `Some("")` (written, but blank) are distinct: only
+    /// the former means "this workspace was never named".
+    pub name: Option<String>,
     /// Every placed node, of any kind (each serializes under its kind's KDL
     /// node name). File order is preserved.
     pub nodes: Vec<NodeSnap>,
@@ -473,6 +488,7 @@ impl Workspace {
     pub fn new() -> Self {
         Workspace {
             id: NodeId::new(),
+            name: None,
             nodes: Vec::new(),
             connections: Vec::new(),
             mount_paths: BTreeMap::new(),
@@ -746,8 +762,10 @@ fn resolve_into(
     }
     for ws in doc.workspaces {
         // A deps-only file gets an auto-added blank workspace; don't let an
-        // import contribute a phantom empty tab.
-        let empty = ws.nodes.is_empty()
+        // import contribute a phantom empty tab. A *named* workspace is never
+        // phantom — someone wrote that name down — so it always comes through.
+        let empty = ws.name.is_none()
+            && ws.nodes.is_empty()
             && ws.connections.is_empty()
             && ws.midi.is_empty()
             && ws.serves.is_empty()
@@ -797,6 +815,16 @@ fn parse_workspace(n: &KdlNode) -> Option<Workspace> {
     };
     for c in n.children().map(|ch| ch.nodes()).unwrap_or(&[]) {
         match c.name().value() {
+            // `name ""` is a named-but-blank workspace, not an unnamed one — so
+            // a present line always yields `Some`, however empty.
+            "name" => {
+                ws.name = Some(
+                    c.get(0)
+                        .and_then(|v| v.as_string())
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            }
             "connection" => {
                 if let Some((a, b)) = pair(c) {
                     ws.connections.push((a, b));
@@ -832,6 +860,12 @@ fn workspace_kdl(ws: &Workspace) -> KdlNode {
     let mut node = KdlNode::new("workspace");
     node.push(KdlEntry::new(ws.id.to_string()));
     let mut ch = KdlDocument::new();
+    // The name leads the block: it is what the tab is called, so it reads first.
+    if let Some(name) = &ws.name {
+        let mut n = KdlNode::new("name");
+        n.push(str_entry(name));
+        ch.nodes_mut().push(n);
+    }
     for n in &ws.nodes {
         ch.nodes_mut().push(snap_kdl(n));
     }
@@ -875,11 +909,7 @@ fn workspace_kdl(ws: &Workspace) -> KdlNode {
 fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
     // Named kinds (`node "<name>" <id>`) carry the name first; the rest are
     // `<kind> <id>`.
-    let named = matches!(
-        n.name().value(),
-        "node" | "volume" | "virtualfile" | "bindmount" | "hostfile" | "midiin" | "hostservice"
-    );
-    let id = node_id(n.get(if named { 1 } else { 0 })?)?;
+    let id = node_id(n.get(usize::from(kind_is_named(n.name().value())))?)?;
     let ch = n.children()?;
     let text = |name: &str| {
         ch.get(name)
@@ -1384,6 +1414,96 @@ mod tests {
     }
 
     #[test]
+    fn a_workspace_name_round_trips_and_leads_the_block() {
+        let ws = NodeId::from_u128(21);
+        let id = NodeId::from_u128(22);
+        let doc = Document::from_kdl(&format!(
+            "workspace \"{ws}\" {{\n  \
+             node \"synth\" \"{id}\" {{ pos 1 2; size 30 40 }}\n  name \"voice\"\n}}"
+        ))
+        .expect("parses");
+        assert_eq!(doc.workspaces[0].name.as_deref(), Some("voice"));
+        // The name is not mistaken for a placed node.
+        assert_eq!(doc.workspaces[0].nodes.len(), 1);
+
+        // Serialization puts it first, whatever position it was authored in —
+        // the tab's name is what the block is about, so it reads before content.
+        let text = doc.to_kdl();
+        let body = text.split_once('{').expect("workspace block").1;
+        assert!(
+            body.trim_start().starts_with("name \"voice\""),
+            "name leads the block:\n{text}"
+        );
+        assert_eq!(
+            Document::from_kdl(&text).unwrap().workspaces[0]
+                .name
+                .as_deref(),
+            Some("voice")
+        );
+
+        // Absent stays absent (and writes no line); blank stays blank. The two
+        // are different states: only `None` means "never named".
+        let plain = Document::from_kdl(&format!("workspace \"{ws}\" {{\n}}")).expect("parses");
+        assert_eq!(plain.workspaces[0].name, None);
+        assert!(!plain.to_kdl().contains("name"));
+        let blank = Document::from_kdl(&format!("workspace \"{ws}\" {{\n  name \"\"\n}}")).unwrap();
+        assert_eq!(blank.workspaces[0].name.as_deref(), Some(""));
+        assert_eq!(
+            Document::from_kdl(&blank.to_kdl()).unwrap().workspaces[0].name,
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn a_named_workspace_survives_being_imported_and_keeps_its_comment() {
+        // Two things a name must not fall foul of: `resolve_into` drops a
+        // workspace it judges "empty" (a name alone used to count as empty, so
+        // an imported definition would vanish), and `Document::save` grafts
+        // comments by node identity (a `name` line without one loses the
+        // comment above it on the first save).
+        let dir = std::env::temp_dir().join("wk-named-ws-import");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("root.wk");
+        let child = dir.join("child.wk");
+        let named = NodeId::from_u128(31);
+        let own = NodeId::from_u128(32);
+        std::fs::write(
+            &root,
+            format!(
+                "{MODELINE}\n\
+                 workspace \"{named}\" {{\n    \
+                 // what this tab is for\n    \
+                 name \"voice\"\n}}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &child,
+            format!("import \"root.wk\"\nworkspace \"{own}\" {{\n}}\n"),
+        )
+        .unwrap();
+
+        let doc = Document::load_resolved(&child).unwrap();
+        let imported = doc
+            .workspaces
+            .iter()
+            .find(|w| w.id == named)
+            .expect("the named workspace came through the import");
+        assert_eq!(imported.name.as_deref(), Some("voice"));
+        assert!(doc.imported_workspaces.contains(&named));
+
+        // Re-saving the imported file keeps the name's comment.
+        let root_doc = Document::load(&root).unwrap();
+        root_doc.save(&root).unwrap();
+        let text = std::fs::read_to_string(&root).unwrap();
+        assert!(text.contains("// what this tab is for"), "{text}");
+        assert!(text.contains("name \"voice\""), "{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn import_merges_for_running_and_save_preserves_the_composition() {
         let dir = std::env::temp_dir().join("wk-import-test");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1443,6 +1563,7 @@ mod tests {
             .iter()
             .find(|w| !w.nodes.is_empty())
             .expect("home workspace");
+        assert_eq!(ws.name.as_deref(), Some("plaza"), "the tab is named");
         let posed = ws.nodes.iter().filter(|n| n.pos3d.is_some()).count();
         assert!(posed >= 4, "all home nodes carry 3D poses (got {posed})");
         assert_eq!(ws.midi.len(), 1);
@@ -1679,6 +1800,7 @@ mod tests {
             workspaces: vec![
                 Workspace {
                     id: wa,
+                    name: Some("voice".into()),
                     nodes: vec![
                         NodeSnap {
                             id: synth,
@@ -1855,6 +1977,7 @@ mod tests {
              // A demo. Run:\n\
              //   wk run x.wk\n\
              workspace \"{ws}\" {{\n    \
+             name \"demo\"\n    \
              // the published port\n    \
              hostport \"{hp}\" {{ port 8080; pos 0 0; size 10 10 }}\n\
              }}\n"
@@ -1872,6 +1995,10 @@ mod tests {
             "node note kept:\n{first}"
         );
         assert!(first.contains("port 8080"));
+        assert!(
+            first.contains("name \"demo\""),
+            "the tab's name kept:\n{first}"
+        );
 
         // Idempotent: re-parsing and saving the same model is byte-identical —
         // an unchanged workspace produces no diff churn.
@@ -2019,31 +2146,37 @@ mod tests {
     fn workspace_strat() -> impl Strategy<Value = Workspace> {
         (
             any_node_id(),
+            // Includes the empty string, which must stay distinguishable from
+            // an absent name across the round-trip.
+            prop::option::of(value_str()),
             prop::collection::vec(node_snap(), 0..6),
             prop::collection::vec(pair(), 0..3),
             prop::collection::vec(pair(), 0..3),
             prop::collection::vec(pair(), 0..3),
             prop::collection::vec(pair(), 0..3),
         )
-            .prop_map(|(id, nodes, conns, midi, serves, netlinks)| Workspace {
-                capture_links: netlinks.clone(),
-                clipboard_links: netlinks.clone(),
-                api_links: netlinks.clone(),
-                id,
-                nodes,
-                // Give every generated bind an explicit mount path so the 3rd-arg
-                // round-trip is exercised across the whole document space.
-                mount_paths: conns
-                    .iter()
-                    .map(|&p| (p, "/mnt/data".to_string()))
-                    .collect(),
-                // Likewise a container port on every generated serve.
-                serve_ports: serves.iter().map(|&p| (p, 3000u16)).collect(),
-                connections: conns,
-                midi,
-                serves,
-                net_links: netlinks,
-            })
+            .prop_map(
+                |(id, name, nodes, conns, midi, serves, netlinks)| Workspace {
+                    capture_links: netlinks.clone(),
+                    clipboard_links: netlinks.clone(),
+                    api_links: netlinks.clone(),
+                    id,
+                    name,
+                    nodes,
+                    // Give every generated bind an explicit mount path so the 3rd-arg
+                    // round-trip is exercised across the whole document space.
+                    mount_paths: conns
+                        .iter()
+                        .map(|&p| (p, "/mnt/data".to_string()))
+                        .collect(),
+                    // Likewise a container port on every generated serve.
+                    serve_ports: serves.iter().map(|&p| (p, 3000u16)).collect(),
+                    connections: conns,
+                    midi,
+                    serves,
+                    net_links: netlinks,
+                },
+            )
     }
 
     fn document() -> impl Strategy<Value = Document> {

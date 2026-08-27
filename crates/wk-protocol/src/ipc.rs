@@ -93,6 +93,11 @@ pub struct WireInfo {
 pub struct Snapshot {
     /// The workspaces (tabs), in order; the first is the default target.
     pub workspaces: Vec<NodeId>,
+    /// What each named workspace is called, keyed by its id. A map rather than a
+    /// list parallel to `workspaces`, so nothing here can drift out of step with
+    /// the tab order; unnamed workspaces simply have no entry.
+    #[serde(default)]
+    pub workspace_names: std::collections::HashMap<NodeId, String>,
     pub nodes: Vec<NodeInfo>,
     pub wires: Vec<WireInfo>,
     /// The launchable dependency names, for `wk add <name>`.
@@ -206,6 +211,7 @@ mod tests {
     fn snapshot_round_trips() {
         let snap = Snapshot {
             workspaces: vec![id(10)],
+            workspace_names: std::collections::HashMap::from([(id(10), "voice".to_string())]),
             nodes: vec![NodeInfo {
                 id: id(11),
                 kind: "app".into(),
@@ -239,6 +245,20 @@ mod tests {
         assert_eq!(back.nodes.len(), 1);
         assert_eq!(back.nodes[0].name, "vim");
         assert_eq!(back.available, vec!["vim", "triangle"]);
+        assert_eq!(
+            back.workspace_names.get(&id(10)).map(String::as_str),
+            Some("voice")
+        );
+
+        // Additive field: a snapshot from a peer that predates workspace names
+        // still deserializes, with no names rather than an error.
+        let older = line.replace(
+            &format!(r#""workspace_names":{{"{}":"voice"}},"#, id(10)),
+            "",
+        );
+        assert!(!older.contains("workspace_names"), "removed from: {older}");
+        let back: Snapshot = serde_json::from_str(&older).unwrap();
+        assert!(back.workspace_names.is_empty());
     }
 
     /// The framing is length-independent: multiple messages on one stream read

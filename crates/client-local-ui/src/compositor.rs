@@ -1785,14 +1785,25 @@ impl App {
         }
     }
 
+    /// What a tab is called: the workspace's name, else its 1-based position.
+    /// Drawing and hit-testing both go through this — a tab is only as wide as
+    /// its label, so the two must agree on the label or clicks land on the
+    /// wrong tab.
+    fn tab_label(&self, i: usize, id: NodeId) -> String {
+        match self.view.workspace_names.get(&id).map(|n| n.trim()) {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => format!("{}", i + 1),
+        }
+    }
+
     /// The tab rectangles (one per workspace, in order) and the trailing "+"
-    /// button rect. Tabs are labelled by their 1-based position and carry a
-    /// close box (see [`tab_close_btn`]).
+    /// button rect. Tabs are labelled by [`Self::tab_label`] and carry a close
+    /// box (see [`tab_close_btn`]).
     fn tab_layout(&self, gfx: &Gfx) -> (Vec<(NodeId, [f32; 4])>, [f32; 4]) {
         let mut rects = Vec::with_capacity(self.tabs.len());
         let mut x = 0.0;
         for (i, &id) in self.tabs.iter().enumerate() {
-            let label = gfx.fonts.measure(&format!("{}", i + 1)) as f32;
+            let label = gfx.fonts.measure(&self.tab_label(i, id)) as f32;
             let w = label + 2.0 * PAD + (TAB_H - 12.0).max(8.0) + 8.0;
             rects.push((id, [x, 0.0, x + w, TAB_H]));
             x += w;
@@ -5194,7 +5205,7 @@ impl App {
                     MENU_BG
                 };
                 quads.push(Quad::solid(white, r, bg, full));
-                let label = format!("{}", i + 1);
+                let label = self.tab_label(i, id);
                 self.text_cache.draw(
                     &mut quads,
                     &mut gfx.renderer,

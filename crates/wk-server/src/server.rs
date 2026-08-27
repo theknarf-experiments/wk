@@ -241,6 +241,9 @@ pub struct View {
     pub node_ws: HashMap<NodeId, NodeId>,
     /// The workspaces (tabs), in order.
     pub workspaces: Vec<NodeId>,
+    /// Workspace names keyed by workspace id — what the tab bar labels a tab
+    /// with. Only named tabs have an entry.
+    pub workspace_names: HashMap<NodeId, String>,
 }
 
 /// Bridge one accepted fabric connection to the host service at `target`:
@@ -374,7 +377,10 @@ impl View {
             nodes: self.nodes.iter().filter(|n| mine(&n.id)).cloned().collect(),
             surfaces: self.surfaces.clone(),
             node_ws: self.node_ws.clone(),
+            // The tab bar draws every tab, not just this one, so the names come
+            // through a per-workspace narrowing untouched — like `workspaces`.
             workspaces: self.workspaces.clone(),
+            workspace_names: self.workspace_names.clone(),
         }
     }
 
@@ -472,6 +478,8 @@ struct WsSnapshot {
     id: NodeId,
     /// Position in the tab order to restore it at.
     index: usize,
+    /// The tab's name, so undoing a close brings back what it was called.
+    name: Option<String>,
     nodes: Vec<Snapshot>,
 }
 
@@ -612,6 +620,12 @@ pub struct Graph {
 
     /// The workspaces (tabs) in this document, in order — including empty ones.
     pub workspaces: Vec<NodeId>,
+    /// Workspace names (`name "voice"`), keyed by workspace id. A side table so
+    /// `workspaces` stays a plain ordered id list; only named tabs have an
+    /// entry, and an entry may be blank (a workspace named the empty string).
+    /// The graph must carry this or [`Server::save`] — a full re-projection —
+    /// would write every name out of existence on the first clean exit.
+    pub workspace_names: HashMap<NodeId, String>,
     /// The workspace's launchable dependencies.
     pub available: Vec<Dependency>,
 }
@@ -779,6 +793,11 @@ impl Server {
             graph: Graph {
                 available: doc.dependencies.clone(),
                 workspaces: doc.workspaces.iter().map(|w| w.id).collect(),
+                workspace_names: doc
+                    .workspaces
+                    .iter()
+                    .filter_map(|w| w.name.clone().map(|n| (w.id, n)))
+                    .collect(),
                 ..Graph::default()
             },
             mounted: HashMap::new(),
@@ -1429,6 +1448,7 @@ impl Server {
             self.remove_any(n);
         }
         self.graph.workspaces.retain(|&w| w != id);
+        self.graph.workspace_names.remove(&id);
     }
 
     /// (Re)run an idle or exited node's guest with its current args.
@@ -2749,6 +2769,7 @@ impl Server {
                     .collect();
                 Workspace {
                     id: ws_id,
+                    name: self.graph.workspace_names.get(&ws_id).cloned(),
                     nodes,
                     connections,
                     mount_paths,
@@ -3463,6 +3484,7 @@ impl Server {
         Some(WsSnapshot {
             id: ws,
             index,
+            name: self.graph.workspace_names.get(&ws).cloned(),
             nodes,
         })
     }
@@ -3472,6 +3494,9 @@ impl Server {
         if !self.graph.workspaces.contains(&s.id) {
             let i = s.index.min(self.graph.workspaces.len());
             self.graph.workspaces.insert(i, s.id);
+        }
+        if let Some(name) = s.name {
+            self.graph.workspace_names.insert(s.id, name);
         }
         for node in &s.nodes {
             self.materialize(node.ws, &node.node, &node.file_data);
@@ -3614,6 +3639,7 @@ impl Server {
             surfaces,
             node_ws,
             workspaces: self.graph.workspaces.clone(),
+            workspace_names: self.graph.workspace_names.clone(),
         }
     }
 
@@ -3751,6 +3777,7 @@ impl Server {
         }));
         Snapshot {
             workspaces: v.workspaces.clone(),
+            workspace_names: v.workspace_names.clone(),
             nodes,
             wires,
             available: v.available.iter().map(|d| d.name.clone()).collect(),
@@ -4634,6 +4661,7 @@ mod model_tests {
             dependencies: Vec::new(), // "ghost" isn't here
             workspaces: vec![Workspace {
                 id: ws,
+                name: None,
                 nodes: vec![
                     NodeSnap {
                         id: ghost,
@@ -4699,6 +4727,90 @@ mod model_tests {
             "the wire to the unresolved node is preserved"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A workspace's name is authored content the Server has to *carry*: `save`
+    /// is a full re-projection from the live graph, so anything the runtime
+    /// doesn't model is erased from the `.wk` file on the first clean exit.
+    /// Load → run → save → load must give the name back, and both client paths
+    /// (the local UI's `View`, the CLI's `Snapshot`) must see it.
+    #[test]
+    fn workspace_names_survive_a_load_and_save_round_trip() {
+        let named = NodeId::new();
+        let unnamed = NodeId::new();
+        let doc = Document {
+            imports: Vec::new(),
+            imported_deps: std::collections::HashSet::new(),
+            imported_workspaces: std::collections::HashSet::new(),
+            dependencies: Vec::new(),
+            workspaces: vec![
+                Workspace {
+                    id: named,
+                    name: Some("voice".into()),
+                    ..Workspace::new()
+                },
+                Workspace {
+                    id: unnamed,
+                    ..Workspace::new()
+                },
+            ],
+        };
+        let path = std::env::temp_dir().join("wk-workspace-name-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let mut s = Server::new(&doc, path.clone()).expect("server constructs");
+        assert_eq!(
+            s.graph.workspace_names.get(&named).map(String::as_str),
+            Some("voice")
+        );
+        assert!(!s.graph.workspace_names.contains_key(&unnamed));
+
+        // The tab bar draws *every* tab, so narrowing the view to one workspace
+        // must not strip the other tabs' names.
+        let full = s.view();
+        assert_eq!(
+            full.for_workspace(unnamed)
+                .workspace_names
+                .get(&named)
+                .map(String::as_str),
+            Some("voice")
+        );
+        assert_eq!(
+            s.ipc_snapshot()
+                .workspace_names
+                .get(&named)
+                .map(String::as_str),
+            Some("voice")
+        );
+
+        s.save();
+        let back = Document::load(&path).expect("reloads");
+        let find = |id| back.workspaces.iter().find(|w| w.id == id).expect("tab");
+        assert_eq!(find(named).name.as_deref(), Some("voice"));
+        assert_eq!(find(unnamed).name, None, "an unnamed tab stays unnamed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Closing a tab takes its name with it — a name outliving its workspace
+    /// would resurface on whatever tab was created next — and undoing the close
+    /// brings the name back, not just the (then anonymous) tab.
+    #[test]
+    fn closing_a_workspace_drops_its_name_and_undo_restores_it() {
+        let mut s = fresh_server();
+        let ws2 = NodeId::new();
+        s.apply(Command::Create(Resource::Workspace { id: ws2 }));
+        s.graph.workspace_names.insert(ws2, "voice".into());
+
+        s.apply(Command::Delete(ResourceRef::Workspace(ws2)));
+        assert!(!s.graph.workspaces.contains(&ws2));
+        assert!(!s.graph.workspace_names.contains_key(&ws2));
+
+        s.apply(Command::Undo);
+        assert!(s.graph.workspaces.contains(&ws2));
+        assert_eq!(
+            s.graph.workspace_names.get(&ws2).map(String::as_str),
+            Some("voice"),
+            "undo restored the tab but forgot what it was called"
+        );
     }
 
     /// Two servers each grow an Iroh node wired to a Network; pasting one's

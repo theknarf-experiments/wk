@@ -43,6 +43,16 @@ fn short(id: wk_protocol::NodeId) -> String {
     id.to_string().chars().take(12).collect()
 }
 
+/// How output refers to a workspace: the name it was given, else the short form
+/// of its id. A workspace nobody named has nothing better to be called — and a
+/// name that is blank or all spaces is no more use than none at all.
+fn ws_label(snap: &Snapshot, ws: wk_protocol::NodeId) -> String {
+    match snap.workspace_names.get(&ws).map(|n| n.trim()) {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => short(ws),
+    }
+}
+
 /// Send one command and wait for the server's ack.
 fn send_command(stream: &mut UnixStream, cmd: Command) -> Result<(), String> {
     write_msg(stream, &ClientMsg::Command(cmd)).map_err(|e| e.to_string())?;
@@ -301,6 +311,10 @@ struct NodeReport<'a> {
     pos: [f32; 2],
     size: [f32; 2],
     workspace: String,
+    /// The workspace's name, when it has one — `workspace` stays the id, since
+    /// that is what other commands take.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_name: Option<String>,
     connections: Vec<Connection>,
 }
 
@@ -368,6 +382,7 @@ fn node_report<'a>(snap: &'a Snapshot, node: &'a wk_protocol::ipc::NodeInfo) -> 
         pos: node.pos,
         size: node.size,
         workspace: short(node.ws),
+        workspace_name: snap.workspace_names.get(&node.ws).cloned(),
         connections,
     }
 }
@@ -792,10 +807,24 @@ pub fn ps(workspace: &Path) -> Result<(), String> {
         println!("(no nodes; add one with `wk add <name>`)");
         return Ok(());
     }
+    // A workspace column only earns its width when there is more than one tab
+    // to tell apart — the same threshold the UI uses to draw the tab bar.
+    let show_ws = snap.workspaces.len() > 1;
+    let ws_col = |label: &str| {
+        if show_ws {
+            format!("  {label:<16}")
+        } else {
+            String::new()
+        }
+    };
     // Tab-separated columns, docker-ps-like.
     println!(
-        "{:<12}  {:<11}  {:<16}  {:<9}  ARGS",
-        "ID", "KIND", "NAME", "STATUS"
+        "{:<12}  {:<11}  {:<16}{}  {:<9}  ARGS",
+        "ID",
+        "KIND",
+        "NAME",
+        ws_col("WORKSPACE"),
+        "STATUS"
     );
     for n in &snap.nodes {
         let status = if n.error.is_some() {
@@ -833,10 +862,11 @@ pub fn ps(workspace: &Path) -> Result<(), String> {
             (None, false) => n.args.join(" "),
         };
         println!(
-            "{:<12}  {:<11}  {:<16}  {:<9}  {}",
+            "{:<12}  {:<11}  {:<16}{}  {:<9}  {}",
             short(n.id),
             n.kind,
             name,
+            ws_col(&ws_label(&snap, n.ws)),
             status,
             detail
         );
@@ -876,10 +906,38 @@ mod tests {
     fn snap(nodes: Vec<NodeInfo>) -> Snapshot {
         Snapshot {
             workspaces: vec![NodeId::from_u128(1)],
+            workspace_names: Default::default(),
             nodes,
             wires: vec![],
             available: vec![],
         }
+    }
+
+    /// Output names a workspace when the file did, and falls back to its short
+    /// id otherwise — a bare 26-char ULID is what the user was reading before,
+    /// so an unnamed (or blank-named) tab must not get worse.
+    #[test]
+    fn workspace_labels_prefer_the_name_and_fall_back_to_the_id() {
+        let ws = NodeId::from_u128(1);
+        let mut s = snap(vec![node(0xA1, "piano")]);
+        assert_eq!(ws_label(&s, ws), short(ws), "unnamed: the short id");
+
+        s.workspace_names.insert(ws, "voice".into());
+        assert_eq!(ws_label(&s, ws), "voice");
+        // A name of nothing but whitespace labels nothing; use the id.
+        s.workspace_names.insert(ws, "  ".into());
+        assert_eq!(ws_label(&s, ws), short(ws));
+
+        // `wk inspect` reports the name alongside the id it already printed —
+        // the id stays, because that is what other commands take.
+        s.workspace_names.insert(ws, "voice".into());
+        let json = serde_json::to_string(&node_report(&s, &s.nodes[0])).unwrap();
+        assert!(json.contains(r#""workspace_name":"voice""#), "{json}");
+        assert!(json.contains(&short(ws)), "the id is still there: {json}");
+        // An unnamed workspace omits the field rather than carrying a null.
+        s.workspace_names.clear();
+        let plain = serde_json::to_string(&node_report(&s, &s.nodes[0])).unwrap();
+        assert!(!plain.contains("workspace_name"), "{plain}");
     }
 
     #[test]
@@ -957,6 +1015,7 @@ mod tests {
         let notes = node(0xB2, "notes.txt");
         let s = Snapshot {
             workspaces: vec![NodeId::from_u128(1)],
+            workspace_names: Default::default(),
             nodes: vec![vim.clone(), notes.clone()],
             wires: vec![WireInfo {
                 kind: "bind".into(),
