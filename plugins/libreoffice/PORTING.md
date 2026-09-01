@@ -53,9 +53,20 @@ and does not repeat the reasoning.
   gap in `osl`; `core-0007` is the three `osl` subsystems that diverge whole
   (see decision 14); `core-0008` is a one-word host-portability fix to
   `unxgcc.mk` that has nothing to do with wasm (decision 15).
-* `mise.toml` — the staged tasks. Its `build` task **self-skips** while
-  `patches/` is empty, so the repo-wide `mise run build-plugins` sweep does not
-  sit in a LibreOffice build.
+* `mise.toml` — the staged tasks. Its `build` task was written to **self-skip**
+  while `patches/` is empty, so the repo-wide `mise run build-plugins` sweep
+  would not sit in a LibreOffice build.
+  **⚠ That guard no longer fires, and nobody noticed.** `mise.toml:105` tests
+  `ls patches/core-*.patch`, and `patches/` has held eight of them since M2. So
+  `mise run build` now runs `build-deps` → `build-configure` → `build-host` →
+  `./build-lo.sh` **with no argument**, i.e. the full M3 link — which is known
+  to fail, because `bridges` does not compile (see **Current state**). Any
+  repo-wide sweep that reaches this plugin will now spend minutes and then
+  fail. Left as-is deliberately rather than quietly rewritten: the guard's
+  *intent* is "skip until the port can complete a build", and choosing the new
+  condition — M3 linking, or an explicit opt-in variable — is a decision about
+  what the sweep is for, not a fact about the port. Whoever picks one should
+  also update this bullet and `mise.toml:101`'s description string.
 
 **There is no `vcl/wk/` yet**, so no rung above M3 has been attempted. What
 *has* been built is in **Current state**.
@@ -1331,31 +1342,126 @@ Reported, not installed, per the house rules:
 
 ## Current state
 
-| milestone | state |
-|---|---|
-| source pinned at `libreoffice-26.2.6.2` | **done** — `./src`, 1.8 GB, gitignored, `git status` clean between sessions (patches are applied by `build-configure.sh` and reverted after being regenerated) |
-| build scaffolding (`common.sh`, `preflight.sh`, three stages, `mise.toml`, `patches/`) | **done** — every script runs, refuses correctly, and touches nothing |
-| `./preflight.sh` | **green except the two host tools** — `mise run deps` builds `gmake` and `gperf` into `.hosttools` |
-| the two structural patches | **done** — `core-0001` (configure host arm), `core-0002` (`WASI_INTEL_GCC.mk`); six patches in all, each verified to apply to a pristine tree |
-| the wasip2 thread shim | **done** — `shim/wk-wasi-threads.c` → `libwkwasithreads.a`, on every link line via `gb_WASI_SHIM`. The abort was reproduced, then fixed, then the fix was verified to be the symbol actually linked (see below) |
-| E1 circular-archive link probe | **not started** |
-| E2 182 MB component on `PluginHost` | **not started** |
-| M0 configure completes | **done** — `build/config_host.mk` has `export OS=WASI` |
-| M1 native bootstrap | **done** — 39 entries in `build/workdir_for_build/LinkTarget/Executable`, `wasmbridgegen` among them |
-| M2 `libsal.a` cross-builds | **the archive half is done** — `./build-lo.sh sal.allbuild` runs to `[build MOD] sal` with no errors from a freshly patched pristine tree. **`build/instdir/program/libuno_sal.a`, 85 members** (2,401,182 bytes when built with `-pthread`; 2,395,198 after the decision-16 fix) (not `workdir/LinkTarget/Library/` — under `DISABLE_DYNLOADING` a gbuild Library's target *is* `instdir/program/lib<name>.a`; `workdir/LinkTarget/Library/` holds only the `.objectlist` and `.exports`). `llvm-objdump -h` says `file format wasm`; 276 defined `osl_*` symbols; the archive contains `pipe_wasi.o`, `process_wasi.o`, `signal_wasi.o` and none of `pipe.o`, `process.o`, `signal.o`. `zlib` and the UNO bridge cross-compile alongside it. **The "+ a wasip2 program that runs" half is NOT done** — no `.wasm` has been executed |
-| M2½ `salhelper` cross-builds | **done, and it needed no patch at all** — `./build-lo.sh salhelper.allbuild` reaches `[build MOD] salhelper` with **zero `error:` lines on the first attempt**. **`build/instdir/program/libuno_salhelpergcc3.a`, 5 members** (36,028 bytes with `-pthread`, 36,052 after the decision-16 fix) (`condition.o`, `dynload.o`, `simplereferenceobject.o`, `thread.o`, `timer.o`); `llvm-objdump -h` → `file format wasm`. The `uno_`/`gcc3` decoration in the filename comes from `gb_Library_set_is_ure_library_or_dependency`, not from anything we did. The first module in this port to cross-compile untouched — see decision 17 for what that does and does not prove |
-| M2¾ `store` + `registry` cross-build | **done, and neither needed a patch** — `./build-lo.sh store.allbuild` then `./build-lo.sh registry.allbuild`, each reaching `[build MOD]` with **zero `error:` lines and zero wasm-side `warning:` lines on the first attempt**. **`build/instdir/program/libstorelo.a`, 11 members** (171,528 bytes with `-pthread`, 172,782 after the decision-16 fix) (`object.o`, `lockbyte.o`, `storbase.o`, `storbios.o`, `storcach.o`, `stordata.o`, `stordir.o`, `storlckb.o`, `stortree.o`, `storpage.o`, `store.o`) and **`build/instdir/program/libreglo.a`, 6 members** (128,776 bytes with `-pthread`, 128,298 after the decision-16 fix) (`keyimpl.o`, `reflread.o`, `reflwrit.o`, `regimpl.o`, `registry.o`, `regkey.o`); `llvm-objdump -h` says `file format wasm` for both. These are the two libraries that read `services.rdb`/`types.rdb`, so this rung is about **file-format portability, not compilation** — see decision 18, which is where the on-disk layout was actually checked rather than assumed |
-| M2⅞ `unoidl` cross-builds, **and the port runs its first LibreOffice code** | **done; no source patch, but one platform-makefile fix that invalidates every object built before it** — `./build-lo.sh unoidl.allbuild` reaches `[build MOD] unoidl` with **zero `error:` lines on the first attempt**. **`build/instdir/program/libunoidllo.a`, 983,308 bytes, 7 members** (`sourcefileprovider.o`, `sourcetreeprovider.o`, `unoidl.o`, `unoidlprovider.o`, `legacyprovider.o`, `sourceprovider-parser.o`, `sourceprovider-scanner.o`); `llvm-objdump -h` → `file format wasm`. The rung's actual result is that a wasm32 binary linked against it **read back an `.rdb` written by the native arm64 `unoidl-write`** under wasmtime, and that doing so exposed the `-pthread` compile-flag miscompile of exception handling (decision 16). See decision 19 |
-| the `-pthread` compile-flag fix | **done, and it forced a rebuild of every wasm C++ object in the tree** — `core-0002` now filters `-pthread` out of `gb_LinkTarget_CXXFLAGS` as well as `gb_CXXFLAGS`. `sal`, `salhelper`, `store`, `registry` and `unoidl` were rebuilt from a cleared `workdir/CxxObject`: **`libuno_sal.a` 2,395,198 B / 85 members, `libuno_salhelpergcc3.a` 36,052 B / 5, `libstorelo.a` 172,782 B / 11, `libreglo.a` 128,298 B / 6, `libunoidllo.a` 983,308 B / 7**, zero errors across all five. The sizes all moved, which is the cheapest proof the recompile was real. **gbuild does NOT rebuild when a platform makefile changes** — the first attempt at this fix looked like a no-op for exactly that reason |
-| M2¹⁵⁄₁₆ `cppu` cross-builds, **and the UNO runtime core runs** | **done — one `osl` patch, none in `cppu` itself** — `./build-lo.sh cppu.allbuild` reaches `[build MOD] cppu` with **zero `error:` lines on the first attempt**. Five archives, all `file format wasm`: **`libuno_cppu.a` 354,092 B / 20 members** (`compat.o`, `cppu_opt.o`, `current.o`, `jobqueue.o`, `thread.o`, `threadident.o`, `threadpool.o`, `static_types.o`, `typelib.o`, `any.o`, `cascade_mapping.o`, `check.o`, `data.o`, `EnvDcp.o`, `EnvStack.o`, `IdentityMapping.o`, `lbenv.o`, `lbmap.o`, `loadmodule.o`, `sequence.o`), **`libuno_purpenvhelpergcc3.a` 22,272 B / 3**, **`libaffine_uno_uno.a` 10,904 B / 1**, **`liblog_uno_uno.a` 6,186 B / 1**, **`libunsafe_uno_uno.a` 4,882 B / 1**. The rung's content is the **run**, not the build: typelib static types, `XInterface`'s 3 members from `static_types.cxx` with no `.rdb`, `Any` over long/string/hyper/double, `Sequence` copy-on-write, `uno_getEnvironment("uno")`, the identity mapping, and a `css::uno::RuntimeException` caught by `css::uno::Exception&` — 8/8 checks, exit 0. It also flushed out `dlsym` (see decision 20), which is a **link** error and had been invisible for five modules. `libuno_sal.a` rebuilt to 2,394,402 B / 85 members with the `getentropy` arm |
-| the C++/UNO bridge (`bridges`) | **BLOCKED, and it is the only open blocker below M3** — `./build-lo.sh bridges.allbuild` compiles `abi.cxx`, `uno2cpp.cxx`, all six `cpp_uno/shared/*.cxx` and `StaticLibrary_emscriptencxxabi` cleanly, then dies on **one line**: `gcc3_wasm/cpp2uno.cxx:15: fatal error: 'emscripten.h' file not found`, the `EM_JS jsGetExportedSymbol` RTTI lookup. `core-0005` selected this bridge correctly — the failure is not the selection. **Do not "fix" it by returning nullptr**: measured this session, the synthesized-RTTI fallback cannot be caught at all on wasi-sdk 34. The mechanism a real fix needs (weak `extern "C" _ZTI…` references, resolving to the real address when present and to `nullptr` when not) was verified by running. See E4, which is now a build task rather than a study |
-| M3 `soffice.wasm` links headless | **not started** — but three of its blockers fell out of M2: `unxgcc.mk`'s `echo -n` (decision 15), `-pthread` on the link line and `-pthread` on the *compile* line (decision 16). All three hit EVERY object or executable, not just `sal`'s test helpers, so M3 would have died on them within a minute — the third one silently |
-| M4 `.pptx` → PDF | **not started** |
-| M5 svp renders a slide to PNG | **not started** |
-| M6–M10 the wk VCL backend and the node | **not started** |
+**Last re-verified end to end on 2026-09-01, from a pristine `src/` and a wiped
+build tree.** Until that run, every artefact in `build/` had been produced by a
+*working tree* — a `src/` that a session had patched, built in, and then
+reverted — and no one had ever checked that the eight files in `patches/` were
+what produced them. They are. The procedure, so it can be repeated:
+
+1. `git -C src checkout . && git -C src clean -fd` → `git -C src status
+   --porcelain` empty, `git -C src log -1` = `ad5cf9fd4`.
+2. `git -C src apply --check <ABSOLUTE path>` for each of the eight patches
+   against that pristine tree → **8/8 OK**.
+3. `rm -rf build/workdir build/instdir build/instdir_for_build` and every
+   gbuild-produced directory under `build/workdir_for_build` (`CxxObject`,
+   `CObject`, `GenCxxObject`, `GenCObject`, `LinkTarget`, `Dep`,
+   `CustomTarget`, `Executable`, `Misc`, `YaccTarget`, `LexTarget`).
+4. `./build-configure.sh` → `./build-host.sh` → `./build-lo.sh
+   <module>.allbuild` for `sal`, `salhelper`, `store`, `registry`, `unoidl`,
+   `cppu`, in that order. Zero `error:` lines in any of the six.
+5. **All eleven wasm archives came back byte-identical to the ones the earlier
+   sessions left behind** — same SHA-256, same size, same member list
+   (`llvm-ar` writes deterministically). The port's artefacts are a function of
+   the committed patch set and nothing else.
+6. The `cppu` runtime probe was recompiled against the rebuilt archives and
+   re-run: **8/8 checks, exit 0**. `bridges` was re-attempted and failed with
+   **exactly one** `error:` line, the same one.
+
+What that run deliberately did **not** re-derive — stated so that nobody reads
+more into "clean-room" than is there:
+
+* `build/workdir_for_build/UnpackedTarball` (706 MB of external sources) was
+  kept. No patch in `patches/` touches an external, so nothing in there is
+  under test and re-unpacking it would only re-measure `tar`.
+* `ccache` was warm (65 % hits), so the rebuild took 25 s for the native
+  bootstrap and 49 s for the six modules. **1,214 native and 155 wasm object
+  files were nevertheless regenerated from deleted state** — nothing was
+  reused off disk; only the *compiler* work was cached. **The "20–40 minutes"
+  estimate in `build-host.sh`'s header is still unmeasured on a cold cache**
+  — treat it as a guess, not a number.
+* Nothing above `cppu` was built, because `bridges` still does not compile.
+  Every "not started" row below is exactly as untouched as it was.
+
+| milestone | state | how this was verified |
+|---|---|---|
+| source pinned at `libreoffice-26.2.6.2` | **done** — `./src`, 1.8 GB, gitignored, never edited in place; patches are applied by `build-configure.sh` and reverted once regenerated | `git -C src log -1` → `ad5cf9fd4 Version 26.2.6.2`; `git -C src status --porcelain` empty at both ends of the session |
+| build scaffolding (`common.sh`, `preflight.sh`, three stages, `mise.toml`, `patches/`) | **done** — every script runs, refuses correctly, and touches nothing outside the plugin | **clean-room** — all three stages ran in order from a wiped build tree |
+| `./preflight.sh` | **green except the two host tools** — `mise run deps` builds `gmake` and `gperf` into `.hosttools` | *inherited* — not re-run on 2026-09-01; the two tools it provides were exercised by `build-configure.sh` |
+| the patch set | **done — EIGHT patches, 1,443 lines**, each verified to apply to a pristine tree *with an absolute path* (a relative one resolves inside `src/` and silently fails to open) | **clean-room** — 8/8 `git -C src apply --check` forward against pristine at the start of the session, and again after `src/` was restored at the end |
+| the wasip2 thread shim | **done** — `shim/wk-wasi-threads.c` → `libwkwasithreads.a`, on every link line via `gb_WASI_SHIM`, force-included with `--whole-archive` | *build* re-verified clean-room (`build-shim.sh` runs in all three stages; the `$(error)` guard fires when the archive is absent). *Behaviour* — the 51.9 ms / 201.3 ms timing harness and the `--why-extract` proof — is **inherited from the session that wrote it**, not re-run |
+| E1 circular-archive link probe | **partially answered, and "not started" understated it** — gbuild's *own* link recipe produced a real wasm component this session: `build/workdir/LinkTarget/Executable/osl_process_child`, **3,330,577 bytes**, from `sal` + `salhelper` + `zlib` + the shim, and it runs under wasmtime with exit 0. That is six archives in a chain, **not** the ~200-archive cycle `static.mk:26-51` describes, so the real question is still open | **clean-room** — the link is in `logs/verify-sal.out`; the component was executed |
+| E2 182 MB component on `PluginHost` | **not started** | — |
+| M0 configure completes | **done** — `build/config_host.mk` has `export OS=WASI` | **clean-room** — `./build-configure.sh` from pristine `src/`, `=== configured: OS=WASI` |
+| M1 native bootstrap | **done, and as of this session it is no longer an inherited claim** — every gbuild output under `workdir_for_build` was deleted and rebuilt: **520 `[build CXX]`, 55 links, 0 errors, 39 executables** in `workdir_for_build/LinkTarget/Executable`, **`wasmbridgegen` among them and freshly relinked**. 24.8 s on a warm ccache | **clean-room** — `logs/host-20260901-144746.log` |
+| M2 `libsal.a` cross-builds **and runs** | **done, both halves.** `./build-lo.sh sal.allbuild` → `[build MOD] sal`, zero errors. **`build/instdir/program/libuno_sal.a`, 2,394,402 bytes, 85 members** (not `workdir/LinkTarget/Library/` — under `DISABLE_DYNLOADING` a gbuild Library's target *is* `instdir/program/lib<name>.a`; `workdir/LinkTarget/Library/` holds only the `.objectlist` and `.exports`). `llvm-objdump -h` → `file format wasm`; `llvm-ar t` shows `pipe_wasi.o`, `process_wasi.o`, `signal_wasi.o` and **none** of `pipe.o`, `process.o`, `signal.o`. `zlib` (**102,012 B / 14 members**) and the UNO bridge's non-`gcc3_wasm` half cross-compile alongside | **clean-room**, byte-identical to the pre-existing archive. The earlier "the *+ a wasip2 program that runs* half is NOT done" is **no longer true** and has been deleted — it was overtaken at M2⅞ and again by the `osl_process_child` component above |
+| M2½ `salhelper` cross-builds | **done, and it needed no patch at all** — zero `error:` lines on the first attempt. **`libuno_salhelpergcc3.a`, 36,052 bytes, 5 members** (`condition.o`, `dynload.o`, `simplereferenceobject.o`, `thread.o`, `timer.o`). The `uno_`/`gcc3` decoration comes from `gb_Library_set_is_ure_library_or_dependency`, not from anything we did. See decision 17 for what a clean build does and does not prove | **clean-room**, byte-identical |
+| M2¾ `store` + `registry` cross-build | **done, and neither needed a patch** — **`libstorelo.a`, 172,782 bytes, 11 members** and **`libreglo.a`, 128,298 bytes, 6 members**, both `file format wasm`. The rung's content is **file-format portability, not compilation**: these are the two libraries that read `services.rdb`/`types.rdb`, and decision 18 is where the on-disk layout was measured rather than assumed | **clean-room**, both byte-identical. The record-layout diff itself is *inherited* — not re-run |
+| M2⅞ `unoidl` cross-builds, **and the port ran its first LibreOffice code** | **done; no source patch, but one platform-makefile fix that invalidated every object built before it** — **`libunoidllo.a`, 983,308 bytes, 7 members**. The rung's result is that a wasm32 binary read back an `.rdb` written by the native arm64 `unoidl-write`, and that doing so exposed the `-pthread` miscompile of exception handling (decision 16). See decision 19 | **clean-room** build, byte-identical. The `unoidl-write` → wasmtime round trip is *inherited* — not re-run this session |
+| the `-pthread` compile-flag fix | **done** — `core-0002` filters `-pthread` out of `gb_LinkTarget_CXXFLAGS` as well as `gb_CXXFLAGS`, because `unxgcc.mk:107` copies the value before `WASI_INTEL_GCC.mk` is ever read. **gbuild does NOT rebuild when a platform makefile changes**, which is why the first attempt at this fix looked like a no-op | **directly re-verified this session**: `touch src/sal/rtl/crc.cxx`, then `make verbose=t sal.allbuild`, then reading the actual `wasi-clang++` command line — `-pthread` appears **nowhere** on it. This is a stronger check than the byte-comparison, because it reads the flag rather than inferring it |
+| M2¹⁵⁄₁₆ `cppu` cross-builds, **and the UNO runtime core runs** | **done — one `osl` patch (`random.cxx`/`getentropy`, decision 20), none in `cppu` itself.** Five archives, all `file format wasm`: **`libuno_cppu.a` 354,092 B / 20 members**, **`libuno_purpenvhelpergcc3.a` 22,272 B / 3**, **`libaffine_uno_uno.a` 10,904 B / 1**, **`liblog_uno_uno.a` 6,186 B / 1**, **`libunsafe_uno_uno.a` 4,882 B / 1** | **clean-room** build, all five byte-identical, **and the run was repeated**: the probe from `logs/probes-cppu/cppu-runtime.cxx` recompiled against the rebuilt archives and executed under wasmtime — typelib static types, `XInterface`'s 3 members with no `.rdb`, `Any` over long/string/hyper/double, `Sequence` copy-on-write, `uno_getEnvironment("uno")`, the identity mapping, and a `css::uno::RuntimeException` caught by `css::uno::Exception&`. **8/8, exit 0** |
+| the C++/UNO bridge (`bridges`) | **BLOCKED — the only open blocker below M3.** `abi.cxx`, `uno2cpp.cxx`, all six `cpp_uno/shared/*.cxx` and `StaticLibrary_emscriptencxxabi` compile; `gcc3_wasm/cpp2uno.cxx:15` dies on `'emscripten.h' file not found`, the `EM_JS jsGetExportedSymbol` RTTI lookup. `core-0005` selected this bridge **correctly** — the failure is not the selection. **Do not "fix" it by returning `nullptr`**: the synthesized-RTTI fallback cannot be caught at all on wasi-sdk 34. See E4 | **clean-room** — `./build-lo.sh bridges.allbuild` → rc=1 with **exactly one** `error:` line, unchanged. The RTTI measurements behind E4 are *inherited* |
+| M3 `soffice.wasm` links headless | **not started** — but three of its blockers fell out of M2: `unxgcc.mk`'s `echo -n` (decision 15), `-pthread` on the link line and `-pthread` on the *compile* line (decision 16). All three hit every object or executable, not just `sal`'s test helpers, and the third one silently | — |
+| M4 `.pptx` → PDF | **not started** | — |
+| M5 svp renders a slide to PNG | **not started** | — |
+| M6–M10 the wk VCL backend and the node | **not started** | — |
+
+### Claims this document used to make that the re-verification retired
+
+Recorded rather than quietly deleted, because a plan that edits away its own
+wrong turns teaches nothing.
+
+* **"six patches in all"** — the patch-set row said six long after `core-0007`
+  and `core-0008` were written. It is **eight**, and the row now says how many
+  lines they are so the next drift is visible.
+* **"the `+ a wasip2 program that runs` half is NOT done — no `.wasm` has been
+  executed"** — true when written, false since M2⅞. Four separate things have
+  now run under wasmtime: the `unoidl` `.rdb` reader, the `cppu` 8-check probe,
+  the thread-shim harnesses, and `osl_process_child`, which is the first wasm
+  **component gbuild itself linked**.
+* **"E1 … not started"** — understated. Six LibreOffice archives now go through
+  `wasm-component-ld` in one left-to-right pass with no group flags, via
+  gbuild's own recipe. It is a chain and not the cycle, so E1 is *narrowed*,
+  not closed.
+* **M1 "done"** was, until this session, a claim about a directory that
+  happened to exist. `workdir_for_build`'s gbuild outputs had never been
+  deleted, so nothing had ever shown that the committed patches produce
+  `wasmbridgegen`. Now they have.
+* The M2 row quoted `libuno_sal.a` as 2,395,198 bytes. That was the size before
+  the `getentropy` arm of decision 20; the archive is **2,394,402** bytes and
+  has been since M2¹⁵⁄₁₆. Two rows of the same table disagreed with each other.
 
 ### What was verified by running something
 
+* **The whole chain reproduces from `patches/` alone, byte for byte**
+  (2026-09-01). From a pristine `src/` and with `build/workdir`,
+  `build/instdir`, `build/instdir_for_build` and every gbuild-produced
+  directory under `build/workdir_for_build` deleted:
+  `./build-configure.sh` → `=== configured: OS=WASI`;
+  `./build-host.sh` → 520 `[build CXX]`, 55 links, 0 errors, 39 executables
+  with `wasmbridgegen` freshly relinked;
+  `./build-lo.sh {sal,salhelper,store,registry,unoidl,cppu}.allbuild` → six
+  `[build MOD]` lines and 0 `error:` lines, leaving 155 object files under
+  `build/workdir` where the wipe had left none.
+  **All eleven archives came back with the same SHA-256, size and member list
+  as before the wipe** — `libuno_sal.a` 2,394,402 / 85,
+  `libuno_salhelpergcc3.a` 36,052 / 5, `libstorelo.a` 172,782 / 11,
+  `libreglo.a` 128,298 / 6, `libunoidllo.a` 983,308 / 7, `libuno_cppu.a`
+  354,092 / 20, `libuno_purpenvhelpergcc3.a` 22,272 / 3, `libaffine_uno_uno.a`
+  10,904 / 1, `liblog_uno_uno.a` 6,186 / 1, `libunsafe_uno_uno.a` 4,882 / 1,
+  `libzlib.a` 102,012 / 14. This is the first time anyone has shown that the
+  committed patches — rather than some session's working tree — are what
+  produced the artefacts in `build/`.
+* **A wasm component that gbuild itself linked, executed.**
+  `sal.allbuild` links `workdir/LinkTarget/Executable/osl_process_child`
+  (**3,330,577 bytes**) through `wasm-component-ld` from six archives plus the
+  shim, with no `--start-group`. `llvm-objdump` refuses it — *"invalid version
+  number: 65549"* is the component preamble, not a corrupt file — and
+  `wasmtime` runs it to exit 0. Every earlier "it links" claim in this document
+  was about an `ar` archive.
+* **`-pthread` really is off the compile line**, read rather than inferred:
+  `touch src/sal/rtl/crc.cxx` then `make verbose=t sal.allbuild`, and the
+  emitted `wasi-clang++` command contains `-fwasm-exceptions`, `-std=c++20`
+  and no `-pthread` anywhere.
 * `git clone --depth 1 --branch libreoffice-26.2.6.2` → `git describe --tags`
   confirms the tag; `configure.ac:2` confirms the version.
 * `aclocal -I m4 -I m4/mac && autoconf -I .` → rc 0, a 1,712,088-byte
@@ -1453,11 +1559,14 @@ Reported, not installed, per the house rules:
   `*_wasi.cxx`) — i.e. this milestone added nothing to `src/` at all.
 * **The patch set round-trips.** `git -C src diff` of the working tree is
   byte-identical to the tree produced by reverting to pristine and replaying
-  all eight patches (1338 lines either way — the sum of the eight files, so
-  nothing is duplicated between them or missing from them), and every patch
-  passes both `git apply --check` on a pristine tree and
-  `git apply --reverse --check` on a patched one, which is what makes
-  `build-configure.sh` re-runnable.
+  all eight patches, and every patch passes both `git apply --check` on a
+  pristine tree and `git apply --reverse --check` on a patched one, which is
+  what makes `build-configure.sh` re-runnable. **Re-measured 2026-09-01: the
+  working-tree diff is 1,443 lines and `cat patches/core-*.patch` is 1,443
+  lines** — the two agree exactly, so nothing is duplicated between the eight
+  files or missing from them. (It was 1,338 when this bullet was first written,
+  before `core-0006` grew the `getentropy` arm; a bare line count is a fragile
+  thing to quote and it should be re-run, not trusted.)
 * **`/bin/sh -c 'echo -n foo bar'` prints `-n foo bar` on this machine**, while
   `$(shell echo -n a b)` in a standalone makefile under the same GNU Make 4.x
   prints `a b` — make execs `/bin/echo` directly when there is no pipe, and
@@ -1621,13 +1730,17 @@ in a rendered frame); the claim that svp draws the full application chrome
 (a four-link chain through `salvtables.cxx:157`, `svpframe.cxx`,
 `syswin.cxx:877` and `brdwin.cxx:1963`, plus the fact that LO's entire test
 suite runs under `SAL_USE_VCLPLUGIN=svp`); every size estimate marked
-"estimated"; the native-bootstrap time estimate; and the whole reachability
-analysis of the threading sites.
+"estimated"; the native-bootstrap time estimate **for a cold `ccache`** (the
+warm number is now measured — see "Explicitly unknown"); and the whole
+reachability analysis of the threading sites.
 
 ### Explicitly unknown
 
 * Whether `wasm-ld` resolves LO's static archive graph without group flags.
-  **E1.**
+  **E1** — narrowed, not answered. gbuild's own recipe now links a real wasm
+  component (`osl_process_child`) from six archives with the group flags
+  stripped by `toolwrap/wasi-clang++`, and it runs. Six archives in a chain is
+  not the ~200-archive cycle of `static.mk:26-51`.
 * Whether wk's wasmtime instantiates a component of LibreOffice's size, and
   what it costs in compile time and RSS. **E2.**
 * How many condvar waits are reachable in practice. **M4.**
@@ -1646,8 +1759,20 @@ analysis of the threading sites.
 * Whether `osl::Directory` enumeration (used for the
   `<$ORIGIN/services>*` glob) works over wk-vfs, and whether `realpath()` —
   called on every font path by `psp::normPath` — behaves with wk-vfs symlinks.
-* Whether `/dev/urandom` exists in the wk VFS; `sal/osl/unx/random.cxx` falls
-  back to it.
-* Total download size of the 149 external tarballs. `make fetch` was not run.
-* Wall-clock for either build stage on this host. Not attempted, per the house
-  rules.
+* ~~Whether `/dev/urandom` exists in the wk VFS; `sal/osl/unx/random.cxx` falls
+  back to it.~~ **Resolved, and the question turned out to be the wrong one.**
+  `fopen("/dev/urandom")` returns NULL under wasmtime — a component's
+  filesystem is its preopens and there are no device nodes — so the fallback
+  cannot be reached at all, whatever the wk VFS does. `core-0006` puts
+  `osl_get_system_random_data` on `getentropy()` instead (decision 20).
+* ~~Total download size of the 149 external tarballs. `make fetch` was not
+  run.~~ **Resolved:** `make fetch` runs inside `build-host.sh` and has run
+  many times. `tarballs/` holds **106 files, 542 MB** — not 149; the count in
+  the earlier text was of `download.lst` entries, several of which this
+  configuration never fetches.
+* ~~Wall-clock for either build stage on this host. Not attempted, per the
+  house rules.~~ **Partially resolved, on a warm `ccache` only:**
+  `build-configure.sh` ≈ 2 min, `build-host.sh` **24.8 s** from deleted gbuild
+  outputs, the six module builds **49 s** together. A **cold**-cache number for
+  either stage is still unmeasured, and that is the number
+  `build-host.sh`'s "20–40 minutes" header is guessing at.
