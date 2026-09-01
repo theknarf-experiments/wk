@@ -1,0 +1,81 @@
+# Build this plugin: `mise run preflight` first, then `mise run build`.
+#
+# Three stages, because none can start until the previous one has finished:
+#
+#   build-configure  patches src/, then runs autogen.sh out of tree in ./build.
+#                    Produces config_host.mk (OS=WASI) and, via a whole second
+#                    nested configure, config_build.mk (native arm64 macOS).
+#                    Minutes. Milestone M0.
+#   build-host       `make cross-toolset` — the NATIVE bootstrap: ~26 code
+#                    generators (wasmbridgegen above all) plus a native ICU.
+#                    Estimated 20-40 min on this box, never measured.
+#                    Milestone M1.
+#   build-lo         the cross build. Hours, and the rung most likely to fail.
+#                    Milestones M2 (a module) and M3 (the link).
+#
+# Both build stages are long. Run them detached and tail ./logs rather than
+# waiting on a foreground timeout. `./build-lo.sh sal` builds one module and is
+# where you should start — every wasi-libc gap this port has to close lives in
+# sal, and finding them there costs minutes instead of at the end of a
+# multi-hour link.
+#
+# Host tools are NOT pinned here. LibreOffice wants GNU Make >= 4.2 and
+# gperf >= 3.1, neither of which macOS ships, and this repo's convention is to
+# report a missing host tool rather than silently install one. `mise run
+# preflight` names them with the exact configure.ac line that rejects them and
+# the brew command that fixes it.
+
+[tasks.preflight]
+description = "Probe the toolchain, the host tools and src/ — compiles nothing"
+dir = "{{config_root}}"
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./preflight.sh"
+
+[tasks.build-configure]
+description = "Configure LibreOffice for wasm32-wasip2 into ./build (M0)"
+dir = "{{config_root}}"
+# wasi-sdk comes from the root mise.toml [tools]; resolved at task time because
+# `mise where` cannot be used in an [env] template — it would recurse. Same
+# shape as plugins/qt. The scripts fall back to the mise install path when run
+# outside mise.
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-configure.sh"
+
+[tasks.build-host]
+description = "Native bootstrap: make cross-toolset, producing wasmbridgegen (M1)"
+dir = "{{config_root}}"
+depends = ["build-configure"]
+# Builds nothing for wasm; WASI_SDK is exported only so the shared guard in
+# common.sh fails loudly on a toolchain mismatch instead of half-building.
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-host.sh"
+
+[tasks.build-lo]
+description = "Cross-build LibreOffice for wasm32-wasip2 (M2/M3) — hours"
+dir = "{{config_root}}"
+depends = ["build-host"]
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-lo.sh"
+
+# The repo-wide `mise run build-plugins` (root mise.toml) invokes every
+# plugin's `build` task. This one must not turn that sweep into an overnight
+# LibreOffice build while the port is still scaffolding, so it self-skips until
+# patches/ has something in it — exactly the guard plugins/qt carries, and for
+# the same reason. Nothing can configure before those patches exist anyway:
+# build-configure.sh refuses, by design, with the list of what to write.
+#
+# The moment the first patch lands this becomes a real, and very long, build.
+[tasks.build]
+description = "Build the LibreOffice port (self-skips while patches/ is empty)"
+dir = "{{config_root}}"
+run = """
+set -e
+if ! ls patches/core-*.patch >/dev/null 2>&1; then
+  echo "libreoffice: scaffolding only -- no patches/core-*.patch yet, so there is nothing to build."
+  echo "    LibreOffice cannot configure for WASI without them: configure.ac has no wasi*)"
+  echo "    host arm and solenv/gbuild/platform has no WASI_*.mk. See PORTING.md."
+  echo "    To work on the port: ./preflight.sh, then ./build-configure.sh."
+  exit 0
+fi
+SDK=$(mise where github:WebAssembly/wasi-sdk)
+WASI_SDK="$SDK" ./build-configure.sh
+WASI_SDK="$SDK" ./build-host.sh
+WASI_SDK="$SDK" ./build-lo.sh
+echo "libreoffice: see ./build/instdir and PORTING.md 'Current state'"
+"""
