@@ -1,0 +1,71 @@
+diff --git a/sal/osl/unx/file_error_transl.cxx b/sal/osl/unx/file_error_transl.cxx
+index 539d4ccfc..88cb0fd3f 100644
+--- a/sal/osl/unx/file_error_transl.cxx
++++ b/sal/osl/unx/file_error_transl.cxx
+@@ -158,7 +158,9 @@ oslFileError oslTranslateFileError(int Errno)
+             return osl_File_E_MULTIHOP;
+ #endif /* MACOSX */
+ 
+-#if !defined(HAIKU)
++/* EUSERS ("too many users") is a NFS-era errno that wasi-libc does not define:
++ * there is no user table for a quota to be reached on. */
++#if !defined(HAIKU) && !defined(WASI)
+         case EUSERS:
+             return osl_File_E_USERS;
+ #endif
+diff --git a/sal/osl/unx/system.hxx b/sal/osl/unx/system.hxx
+index 078fa3489..9784da8fc 100644
+--- a/sal/osl/unx/system.hxx
++++ b/sal/osl/unx/system.hxx
+@@ -20,7 +20,12 @@
+ #pragma once
+ 
+ #include <errno.h>
++#if !defined(WASI)
++/* wasi-libc has no group database — no grp.h, no getgrgid — because a wasm
++ * component has no users or groups to look up. INIT_GROUPS below is stubbed
++ * for the same reason. */
+ #include <grp.h>
++#endif
+ 
+ /* Make sockets of type AF_UNIX use underlying FS rights */
+ #if defined(__sun) && !defined(_XOPEN_SOURCE)
+@@ -209,6 +214,29 @@ int macxp_resolveAlias(char *path, int buflen);
+ #   define  NO_PTHREAD_RTL
+ #endif
+ 
++#ifdef WASI
++/* Deliberately NOT included, and each absent for a different reason:
++ *   pthread.h   wasi-libc ships it, but pthread_create is an ENOTSUP stub.
++ *               Including it invites code that links and then fails at run
++ *               time; see PORTING.md on threads.
++ *   dlfcn.h     ships, and dlopen is a stub. DISABLE_DYNLOADING means nothing
++ *               should reach for it.
++ *   sys/un.h, netinet/tcp.h, sys/ioctl.h
++ *               no AF_UNIX and no socket ioctls under wasi-libc.
++ */
++#   include <sys/file.h>
++#   include <sys/uio.h>
++#   include <endian.h>
++#   include <sys/time.h>
++#   define  IORESOURCE_TRANSFER_BSD
++#   define  IOCHANNEL_TRANSFER_BSD_RENO
++#   define  NO_PTHREAD_PRIORITY
++#   define  INIT_GROUPS(name, gid) false
++/* NOT `#define pthread_testcancel()` the way the Emscripten arm does: wasi-libc
++ * declares the real function in its own pthread.h, and libc++ pulls that header
++ * in later, where the macro then eats the declaration's argument list. */
++#endif
++
+ #ifdef EMSCRIPTEN
+ #   include <pthread.h>
+ #   include <sys/file.h>
+@@ -231,7 +259,7 @@ int macxp_resolveAlias(char *path, int buflen);
+     !defined(__sun) && !defined(MACOSX) && \
+     !defined(OPENBSD) && !defined(DRAGONFLY) && \
+     !defined(IOS) && !defined(ANDROID) && \
+-    !defined(HAIKU) && !defined(EMSCRIPTEN)
++    !defined(HAIKU) && !defined(EMSCRIPTEN) && !defined(WASI)
+ #   error "Target platform not specified!"
+ #endif
+ 

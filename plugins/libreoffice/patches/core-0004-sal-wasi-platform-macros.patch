@@ -1,0 +1,53 @@
+diff --git a/include/osl/endian.h b/include/osl/endian.h
+index 8dd5387c0..d29de4284 100644
+--- a/include/osl/endian.h
++++ b/include/osl/endian.h
+@@ -67,6 +67,9 @@ extern "C" {
+ #   elif defined _BIG_ENDIAN
+ #       define OSL_BIGENDIAN
+ #   endif
++#elif defined WASI
++/* wasm is little-endian by specification, on every engine. */
++#   define OSL_LITENDIAN
+ #elif defined EMSCRIPTEN
+ #   define OSL_LITENDIAN
+ #else
+diff --git a/include/sal/alloca.h b/include/sal/alloca.h
+index 3e0c94942..bcd2fca80 100644
+--- a/include/sal/alloca.h
++++ b/include/sal/alloca.h
+@@ -25,7 +25,7 @@
+ #define INCLUDED_SAL_ALLOCA_H
+ 
+ #if defined(__sun) || defined(LINUX) || defined(ANDROID) || defined(HAIKU) || defined(MACOSX)      \
+-    || defined(IOS) || defined(EMSCRIPTEN)
++    || defined(IOS) || defined(EMSCRIPTEN) || defined(WASI)
+ 
+ #ifndef INCLUDED_ALLOCA_H
+ #include <alloca.h>
+diff --git a/include/sal/config.h b/include/sal/config.h
+index f666fed23..b9cea8bdc 100644
+--- a/include/sal/config.h
++++ b/include/sal/config.h
+@@ -83,6 +83,21 @@
+ #define SAL_CONFIGFILE(name) name "rc"
+ #endif
+ 
++#ifdef WASI
++#define SAL_UNX
++/* No dynamic loading at all (DISABLE_DYNLOADING): wasip2 has no dlopen, so
++ * SAL_DLLEXTENSION is never used to build a name that gets loaded. It is given
++ * the value it would have if it could be, rather than left undefined, because
++ * code that formats a library name still compiles and runs. */
++#define SAL_DLLEXTENSION ".wasm"
++#define SAL_EXEEXTENSION ""
++#define SAL_DLLPREFIX "lib"
++#define SAL_PATHSEPARATOR ':'
++#define SAL_PATHDELIMITER '/'
++#define SAL_NEWLINE_STRING "\n"
++#define SAL_CONFIGFILE(name) name "rc"
++#endif
++
+ #ifdef EMSCRIPTEN
+ #define SAL_UNX
+ #define SAL_DLLEXTENSION ".bc"

@@ -17,7 +17,21 @@
 # recipe that would drift on every rebase. The cost is that CC/CXX are scripts,
 # which configure records verbatim into config_host.mk — hence the absolute path
 # resolved at configure time.
-: "${WASI_SDK:?wasi-clang: WASI_SDK is not set}"
+# Resolve the SDK ourselves when the environment does not carry it. This is
+# not belt-and-braces: configure records CC/CXX into config_host.mk as this
+# script's path, so `make` run by hand in a module directory — the normal
+# LibreOffice inner loop — invokes it with whatever environment that shell has.
+# Failing there would look like a compiler bug rather than a missing variable.
+if [ -z "${WASI_SDK:-}" ]; then
+    if command -v mise >/dev/null 2>&1; then
+        WASI_SDK=$(mise where github:WebAssembly/wasi-sdk 2>/dev/null)
+    fi
+    : "${WASI_SDK:=$HOME/.local/share/mise/installs/github-web-assembly-wasi-sdk/wasi-sdk-34-rc.2}"
+fi
+[ -x "$WASI_SDK/bin/clang" ] || {
+    echo "wasi-clang: no wasi-sdk at $WASI_SDK (set WASI_SDK, or mise install)" >&2
+    exit 1
+}
 for arg do
     case "$arg" in
     -Wl,--start-group|-Wl,--end-group|--start-group|--end-group) ;;
