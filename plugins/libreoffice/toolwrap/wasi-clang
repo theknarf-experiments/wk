@@ -1,0 +1,28 @@
+#!/bin/sh
+# clang for the LibreOffice wasip2 build, minus two flags wasm-component-ld
+# cannot take.
+#
+# solenv/gbuild/platform/unxgcc.mk:155-166 wraps every link's library list in
+# -Wl,--start-group ... -Wl,--end-group. wasm-component-ld rejects both:
+#
+#     error: unexpected argument '--start-group' found
+#
+# and no equivalent exists, because wasm-ld resolves archives to a fixpoint
+# instead of in command-line order — the circular-dependency problem that
+# --start-group solves does not arise. Dropping them is correct, not a
+# workaround.
+#
+# This is a wrapper rather than an override of gb_LinkTarget__command_* in
+# WASI_INTEL_GCC.mk so the port does not carry ~60 lines of copied upstream link
+# recipe that would drift on every rebase. The cost is that CC/CXX are scripts,
+# which configure records verbatim into config_host.mk — hence the absolute path
+# resolved at configure time.
+: "${WASI_SDK:?wasi-clang: WASI_SDK is not set}"
+for arg do
+    case "$arg" in
+    -Wl,--start-group|-Wl,--end-group|--start-group|--end-group) ;;
+    *) set -- "$@" "$arg" ;;
+    esac
+    shift
+done
+exec "$WASI_SDK/bin/clang" "$@"

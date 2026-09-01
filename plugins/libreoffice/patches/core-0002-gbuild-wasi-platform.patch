@@ -1,0 +1,139 @@
+diff --git a/solenv/gbuild/platform/WASI_INTEL_GCC.mk b/solenv/gbuild/platform/WASI_INTEL_GCC.mk
+new file mode 100644
+index 000000000..502d812c2
+--- /dev/null
++++ b/solenv/gbuild/platform/WASI_INTEL_GCC.mk
+@@ -0,0 +1,133 @@
++# -*- Mode: makefile-gmake; tab-width: 4; indent-tabs-mode: t -*-
++#
++# This file is part of the LibreOffice project.
++#
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++#
++# wasm32-wasip2 through wasi-sdk, for the wk port. Derived from
++# EMSCRIPTEN_INTEL_GCC.mk, which is itself a thin delta over unxgcc.mk.
++#
++# The name is a lie twice over and deliberately so: this is wasm32, not INTEL,
++# and clang, not GCC. gbuild picks its platform file as
++# $(OS)_$(CPUNAME)_$(COM).mk, and configure.ac's wasi arm keeps Emscripten's
++# CPUNAME=INTEL / COM=GCC values because UNO's platform strings care that they
++# are *a known value*, not that they are true.
++#
++# What is dropped from the Emscripten file, and why — every one of these exists
++# only because emcc is a Python wrapper that generates JavaScript:
++#
++#   -pthread, -sUSE_PTHREADS, -sPTHREAD_POOL_SIZE, -sDEFAULT_PTHREAD_STACK_SIZE
++#                       wasip2 has no threads at all. This is the port's central
++#                       problem and it is not solved by a flag; see PORTING.md.
++#   --bind, -sEXPORTED_RUNTIME_METHODS, -sFORCE_FILESYSTEM, -sFETCH,
++#   -sPROXY_POSIX_SOCKETS, -lwebsocket.js
++#                       embind and the JS runtime. There is no JS here.
++#   -sTOTAL_MEMORY, -sSTACK_SIZE
++#                       emcc spellings; the wasm-ld equivalent is
++#                       -Wl,-z,stack-size and memory grows on demand.
++#   .worker.js / .wasm.debug.wasm.dwp auxtargets
++#                       artifacts only emcc produces.
++#   gb_EMSCRIPTEN_QTDEFS
++#                       the Qt5 VCL backend. This port compiles its backend
++#                       into libvcl instead (PORTING.md decision 2).
++#
++# What is KEPT that Emscripten drops: -Wl,--gc-sections. Emscripten's file
++# removes it because emcc's probe fails; ours passes, and on a link this size it
++# is worth having.
++
++include $(GBUILDDIR)/platform/unxgcc.mk
++
++gb_RUN_CONFIGURE := $(SRCDIR)/solenv/bin/run-configure
++
++# No .js, no .html: wasm-component-ld emits the component itself at link time,
++# so an executable's target name is its bare name. unxgcc.mk defaults this to
++# empty already; it is restated because EMSCRIPTEN_INTEL_GCC.mk:43 sets .js and
++# anyone reading the two side by side will look for it.
++gb_Executable_EXT :=
++
++# The exception/sjlj flag set, identical to the one plugins/qt proved on this
++# machine (see plugins/libreoffice/common.sh, which passes the same flags to
++# configure as part of CC/CXX for the *compile* half).
++#
++# -fwasm-exceptions is doing two jobs: it selects exnref exception handling
++# (wasmtime enables the proposal — crates/wk-server/src/plugin.rs), and it
++# selects wasi-sdk's eh/ variant of libc++/libc++abi. LibreOffice throws
++# everywhere and its bundled libpng/libjpeg are setjmp-based, so neither half
++# is optional.
++gb_WASI_EXCEPT := -fwasm-exceptions -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false
++gb_LinkTarget_EXCEPTIONFLAGS = $(gb_WASI_EXCEPT)
++gb_LinkTarget_CXXFLAGS += $(gb_WASI_EXCEPT)
++
++# The link half. -l flags cannot live in CC/CXX (they would be passed on every
++# compile step too), which is why EMSCRIPTEN_INTEL_GCC.mk:58 puts its own here.
++#
++# -lunwind -lsetjmp    the runtime support -fwasm-exceptions and the sjlj
++#                      lowering call into.
++# -lwasi-emulated-*    wasi-libc ships these as opt-in shims. LibreOffice needs
++#                      all four: signal (osl), mman (mmap-as-malloc), the
++#                      process clocks (osl's tick counters) and getpid (used in
++#                      temp-file naming).
++# -z stack-size        8 MiB. The default 64 KiB is nowhere near enough for
++#                      LibreOffice's recursive XML and layout code; this is the
++#                      same value plugins/qt settled on.
++gb_LinkTarget_LDFLAGS += \
++	-lunwind \
++	-lsetjmp \
++	-lwasi-emulated-signal \
++	-lwasi-emulated-mman \
++	-lwasi-emulated-process-clocks \
++	-lwasi-emulated-getpid \
++	-Wl,-z,stack-size=8388608 \
++
++# unxgcc.mk:155-166 wraps every link's library list in
++# -Wl,--start-group ... -Wl,--end-group, on both the DISABLE_DYNLOADING and the
++# ordinary branch. wasm-component-ld rejects the flag outright:
++#
++#     error: unexpected argument '--start-group' found
++#     tip: a similar argument exists: '--start-lib'
++#
++# and there is no equivalent, because wasm-ld resolves archives to a fixpoint
++# rather than in command-line order — the problem groups exist to solve does
++# not arise. Rather than fork ~60 lines of upstream's link recipe into this
++# file (where it would silently drift from unxgcc.mk on every rebase), CC and
++# CXX are wrapper scripts that drop the two flags; see
++# plugins/libreoffice/toolwrap/. This file only records why they exist.
++
++# Optimisation. -O1 rather than Emscripten's -O3: this port's first job is to
++# link at all and to be debuggable when it does not, and -O3 on a codebase this
++# size costs hours per iteration. Revisit once M4 passes.
++gb_COMPILEROPTFLAGS := -O1
++gb_COMPILERDEBUGOPTFLAGS := -O0
++gb_COMPILERNOOPTFLAGS := -O0
++gb_LINKEROPTFLAGS :=
++gb_LINKERSTRIPDEBUGFLAGS :=
++
++# Split DWARF is an Emscripten-only pipeline (-gseparate-dwarf feeds emdwp).
++# Plain -g here; the wasm is loaded by wasmtime, which reads standard DWARF.
++gb_DEBUGINFO_FLAGS = -g
++
++# The auxtargets Emscripten cleans up are its own generated JS. A wasip2 link
++# produces one component and its .linkdeps list, nothing else.
++define gb_Executable_Executable_platform
++$(call gb_LinkTarget_add_auxtargets,$(2),\
++	$(patsubst %.lib,%.linkdeps,$(3)) \
++)
++
++endef
++
++define gb_CppunitTest_CppunitTest_platform
++$(call gb_LinkTarget_add_auxtargets,$(2),\
++	$(patsubst %.lib,%.linkdeps,$(3)) \
++)
++
++endef
++
++define gb_Library_get_rpath
++endef
++
++define gb_Executable_get_rpath
++endef
++
++# vim: set noet sw=4 ts=4

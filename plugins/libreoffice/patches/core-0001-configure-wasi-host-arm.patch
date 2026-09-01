@@ -1,0 +1,117 @@
+diff --git a/configure.ac b/configure.ac
+index 73b529c98..89f7810f5 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1244,6 +1244,33 @@ haiku*)
+     _os=Haiku
+     ;;
+ 
++wasi*)
++    # wasm32-wasip2 through wasi-sdk, NOT emcc. Mirrors the emscripten arm
++    # below, minus everything that exists only because emcc is a Python wrapper
++    # around clang. Deliberate differences from it, each load-bearing:
++    #
++    #   no test_qt5      the VCL backend is compiled into libvcl (iOS/Android
++    #                    style), not a Qt plugin. wk's Qt port is Qt 6 anyway.
++    #   no split_debug   one fewer moving part in a build that has enough; the
++    #                    probe passes here (-ggdb2 is supported), so this can be
++    #                    turned on later if the .wasm gets unwieldy.
++    #
++    # usable_dlapi=no is not a preference: wasi-libc ships dlfcn.h and a libdl.a
++    # whose dlopen is a stub, so the headers lie and only this stops configure
++    # believing them.
++    usable_dlapi=no
++    using_freetype_fontconfig=yes
++    using_x11=yes
++    test_openldap=no
++    test_system_freetype=no
++    enable_compiler_plugins=no
++    enable_customtarget_components=yes
++    enable_wasm_strip=yes
++    with_system_zlib=no
++    with_theme="colibre"
++    _os=WASI
++    ;;
++
+ emscripten)
+     # API currently just exists in headers, not code
+     usable_dlapi=no
+@@ -3388,7 +3415,7 @@ dnl cross-compiling would imply a non-desktop OS.
+ if test $_os != iOS -a $_os != Android -a "$enable_fuzzers" != "yes"; then
+     BUILD_TYPE="$BUILD_TYPE DESKTOP"
+     AC_DEFINE(HAVE_FEATURE_DESKTOP)
+-    if test "$_os" != Emscripten; then
++    if test "$_os" != Emscripten -a "$_os" != WASI; then
+         AC_DEFINE(HAVE_FEATURE_MULTIUSER_ENVIRONMENT)
+     fi
+ fi
+@@ -3403,7 +3430,7 @@ if test "$enable_wasm_strip" = "yes"; then
+     enable_database_connectivity=no
+     enable_dbus=no
+     enable_dconf=no
+-    test "${enable_dynamic_loading+set}" = set -o "$_os" != Emscripten || enable_dynamic_loading=no
++    test "${enable_dynamic_loading+set}" = set -o \( "$_os" != Emscripten -a "$_os" != WASI \) || enable_dynamic_loading=no
+     enable_extension_integration=no
+     enable_extensions=no
+     enable_extension_update=no
+@@ -3482,8 +3509,8 @@ else
+     SCPDEFS="$SCPDEFS -DDISABLE_SCRIPTING"
+ fi
+ 
+-if test $_os = iOS -o $_os = Android -o $_os = Emscripten; then
+-    # Disable dynamic_loading always for iOS and Android
++if test $_os = iOS -o $_os = Android -o $_os = Emscripten -o $_os = WASI; then
++    # Disable dynamic_loading always for iOS, Android and the wasm platforms
+     enable_dynamic_loading=no
+ elif test -z "$enable_dynamic_loading"; then
+     # Otherwise enable it unless specifically disabled
+@@ -3568,7 +3595,7 @@ if test -n "${with_templates}"; then
+         AC_MSG_ERROR([unknown value --with-templates=$with_templates])
+     fi
+ else
+-    if test $_os != iOS -a $_os != Android -a $_os != Emscripten; then
++    if test $_os != iOS -a $_os != Android -a $_os != Emscripten -a $_os != WASI; then
+         AC_MSG_RESULT([enable all templates])
+     else
+         WITH_TEMPLATES=
+@@ -4308,7 +4335,7 @@ if test "$cross_compiling" = "yes"; then
+     if test "$enable_dynamic_loading" != yes -a "$enable_wasm_strip" = yes; then
+         ENABLE_WASM_STRIP=TRUE
+     fi
+-    if test "$_os" = "Emscripten"; then
++    if test "$_os" = "Emscripten" -o "$_os" = "WASI"; then
+         ENABLE_WASM_STRIP_ACCESSIBILITY=TRUE
+         ENABLE_WASM_STRIP_BASIC_DRAW_MATH_IMPRESS=TRUE
+         ENABLE_WASM_STRIP_CALC=TRUE
+@@ -5798,6 +5825,31 @@ solaris*)
+     SOLARINC="$SOLARINC -I/usr/local/include"
+     ;;
+ 
++wasi*)
++    COM=GCC
++    OS=WASI
++    RTL_OS=WASI
++    P_SEP=:
++
++    case "$host_cpu" in
++    wasm32|wasm64)
++        ;;
++    *)
++        AC_MSG_ERROR([Unsupported host_cpu $host_cpu for host_os $host_os])
++        ;;
++    esac
++    # CPUNAME=INTEL and PLATFORMID=linux_x86 are inherited from the emscripten
++    # arm below, and they are both lies: this is wasm32. They are kept because
++    # gbuild picks its platform makefile as $(OS)_$(CPUNAME)_$(COM).mk and
++    # RTL_ARCH/PLATFORMID feed UNO's platform strings, where "some existing
++    # value" matters far more than "the true one" — Emscripten has told the same
++    # lie since 2020. The consequence to remember: the platform file is
++    # WASI_INTEL_GCC.mk, not WASI_WASM32_GCC.mk.
++    CPUNAME=INTEL
++    RTL_ARCH=x86
++    PLATFORMID=linux_x86
++    ;;
++
+ emscripten*)
+     COM=GCC
+     OS=EMSCRIPTEN

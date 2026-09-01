@@ -71,7 +71,13 @@ LO_JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
 # Homebrew's aclocal additionally shells out to its versioned twin. Omitting one
 # surfaces as autogen.sh's bare "Failed to run aclocal at ... line 210", which
 # names neither the tool nor the PATH.
-LO_HOST_TOOLS="gmake make gperf ccache flex bison m4 gm4 perl python3 pkg-config
+# pkg-config is deliberately ABSENT. LibreOffice's configure refuses one it
+# does not recognise the origin of — "error: yes, from unknown origin. This
+# *will* break the build" (configure.ac's bogus-pkg-config check) — because on
+# macOS a Homebrew pkg-config makes the NATIVE bootstrap link against Homebrew
+# libraries that the cross build then has no equivalent of. LibreOffice builds
+# its externals from its own tarballs and wants no system pkg-config at all.
+LO_HOST_TOOLS="gmake make gperf ccache flex bison m4 gm4 perl python3
                autoconf autoheader autom4te autoreconf autoupdate ifnames
                aclocal aclocal-1.18 automake automake-1.18 libtool libtoolize glibtoolize
                zip unzip xsltproc xmllint tar curl git
@@ -148,8 +154,13 @@ LO_EMULATION_DEFS="-D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATE
 # solenv/gbuild/platform/WASI_INTEL_GCC.mk's gb_LinkTarget_LDFLAGS — i.e. in
 # patches/, exactly where EMSCRIPTEN_INTEL_GCC.mk:58 puts its own. Putting -l
 # flags in CC would pass them on compile steps too.
-LO_CC="$WASI_SDK/bin/clang --target=$LO_HOST_TRIPLE $LO_EH_FLAGS $LO_EMULATION_DEFS"
-LO_CXX="$WASI_SDK/bin/clang++ --target=$LO_HOST_TRIPLE $LO_EH_FLAGS $LO_EMULATION_DEFS"
+# Wrappers, not the drivers themselves: unxgcc.mk wraps every link's library
+# list in -Wl,--start-group/--end-group and wasm-component-ld rejects the flag
+# ("unexpected argument '--start-group' found"). toolwrap/ drops the two and
+# execs the real driver. See toolwrap/wasi-clang for why this is a wrapper
+# rather than an override of upstream's link recipe.
+LO_CC="$LO_ROOT/toolwrap/wasi-clang --target=$LO_HOST_TRIPLE $LO_EH_FLAGS $LO_EMULATION_DEFS"
+LO_CXX="$LO_ROOT/toolwrap/wasi-clang++ --target=$LO_HOST_TRIPLE $LO_EH_FLAGS $LO_EMULATION_DEFS"
 
 # Binutils. Pass them explicitly or configure.ac:7092's AC_CHECK_TOOLS falls
 # back to Apple's, which cannot read wasm archives. There is deliberately no
