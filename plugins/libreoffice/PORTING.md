@@ -298,13 +298,15 @@ needed (`autogen.sh:321` only prepends it for `--host=wasm*-emscripten`); no
 14. **`osl`'s WASI gaps split two ways, and the size of the divergence decides
     which.** LibreOffice already splits `osl` by platform directory
     (`sal/osl/unx` vs `sal/osl/w32`), so both shapes are native to the tree.
-    * **A small gap gets an in-file `#if defined(WASI)`** — `core-0006`. Nine
+    * **A small gap gets an in-file `#if defined(WASI)`** — `core-0006`. Ten
       files, none of them restructured: the `chown`/`lchown`/`getuid` calls in
       `file_misc.cxx` (policy: wk's vfs has no owners, so the call is dropped
       and the mode/timestamp half of the same function still runs), the
       synthetic `passwd` in `secimpl.hxx` + `security.cxx`, `tzset`/`timezone`
-      in `time.cxx`, and roughly a dozen socket constants and errnos that
-      wasi-libc keeps behind `__wasilibc_unmodified_upstream`.
+      in `time.cxx`, the `dlsym`/`/dev/urandom` pair in `random.cxx` replaced by
+      `getentropy` (added at the `cppu` rung — decision 20), and roughly a dozen
+      socket constants and errnos that wasi-libc keeps behind
+      `__wasilibc_unmodified_upstream`.
     * **A whole-subsystem divergence gets its own file** — `core-0007`, three
       of them, selected by an `ifeq ($(OS),WASI)` in `Library_sal.mk`:
       `process_wasi.cxx` (fork/exec/waitpid/socketpair/kill: 1200 lines of
@@ -591,6 +593,77 @@ needed (`autogen.sh:321` only prepends it for `--host=wasm*-emscripten`); no
       twin from the `workdir_for_build` native compile of the same generated
       file, so they are `bison`/`flex` codegen artefacts and say nothing about
       the target.
+20. **`cppu` compiles untouched, and the milestone is entirely about what it
+    *reaches*: `dlsym`, `getentropy` and a hard `abort()` in the thread pool.**
+    `./build-lo.sh cppu.allbuild` produced five wasm archives with zero `error:`
+    lines on the first attempt and no source patch. That is the fourth module in
+    a row to do so and it means nothing on its own — what this rung actually
+    established is below, and none of it was visible from the archive.
+    * **`cppu` is where `dlsym` first becomes reachable, and where a "polite"
+      stub would have aborted LibreOffice at UNO bootstrap.** The chain is
+      `lbenv.cxx`'s `rtl_getGlobalProcessId()` → `rtl_createUuid` →
+      `rtl_random_getBytes` → `osl_get_system_random_data`, and
+      `sal/osl/unx/random.cxx:25` opens with `dlsym(RTLD_DEFAULT,
+      "lok_open_urandom")`. wasi-libc **declares** `dlsym` in `<dlfcn.h>` and
+      defines it nowhere, so this is a *link* error — `wasm-ld: error:
+      libuno_sal.a(random.o): undefined symbol: dlsym` — the first time anything
+      pulls `random.o` in. `sal`, `salhelper`, `store`, `registry` and `unoidl`
+      never did; `cppu` does, on the very first `uno_getEnvironment`.
+    * **The fix is not allowed to be a stub, and this is the clearest example so
+      far of decision 14's "the test of a stub is what a caller does with the
+      answer".** `rtl/random.cxx:73-77` turns a `false` return into
+      `fprintf(stderr, "cannot read random device, aborting")` + `abort()`.
+      There is no degraded path. And the two things the Unix implementation
+      needs are both genuinely absent: `dlsym`, and `/dev/urandom` (verified —
+      `fopen("/dev/urandom")` returns `NULL` under wasmtime; a wasm component's
+      filesystem is its preopens and has no device nodes). The symbol being
+      looked up, `lok_open_urandom`, is a LibreOfficeKit hook, and LOK is
+      rejected by this port outright, so nothing is lost by never looking.
+    * **`getentropy()` is the real primitive here, not a stand-in** — wasi-libc
+      implements it directly on the wasi `random_get` import, which wasmtime
+      backs with the host CSPRNG. Its one wrinkle is a hard **256-byte cap per
+      call** (`getentropy(300)` fails with `EIO`/29 — verified by running),
+      hence the chunking loop. `core-0006` gains a tenth file for this; it is
+      the same in-file `#if defined(WASI)` shape as the other nine.
+    * **`cppu`'s thread pool is dead code in this port, and its landmine is an
+      unconditional `std::abort()`, not a wait.** `ORequestThread::launch()`
+      (`thread.cxx:126-128`) is literally `if (!create()) { std::abort(); }`, and
+      `osl::Thread::create()` can never succeed on wasip2. Verified by running:
+      `uno_threadpool_create()` + `uno_threadpool_destroy()` is **clean** (the
+      constructor spawns nothing, and `joinWorkers()` over an empty deque
+      returns at once — the same load-bearing luck as `~TimerManager` in
+      decision 17), while one `uno_threadpool_putJob` dies at
+      `abort` ← `ORequestThread::launch()` ← `ThreadPool::createThread` ←
+      `ThreadPool::addJob` ← `uno_threadpool_putJob`, exit 134, every frame
+      named. Reachability: the only callers of `uno_threadpool_*` outside `cppu`
+      are `binaryurp` (remote UNO over a pipe — and `osl` pipes are unsupported,
+      decision 14) and `bridges/source/jni_uno` (Java, off by decision 11).
+      **Do not patch it.** The two waits in `jobqueue.cxx:72` (untimed, aborts)
+      and `threadpool.cxx:121` (timed, the shim returns `ETIMEDOUT`) sit behind
+      the same wall.
+    * What was actually run, and passed, linked against `libuno_cppu.a` +
+      `libuno_salhelpergcc3.a` + `libuno_sal.a` + `libzlib.a` + the shim: the
+      static types (`long`, `string`, `com.sun.star.uno.XInterface`);
+      `XInterface`'s type description completing with **3 members from
+      `static_types.cxx` and no `.rdb` at all**, which is the bootstrap that
+      makes a registry-less process possible; `Any` round-tripping long, string,
+      hyper (a 64-bit value on a 32-bit target) and double, plus copy-compare;
+      `Sequence` copy-on-write, `realloc` and `Any` round-trip; `uno_getEnvironment("uno")`
+      creating the built-in binary UNO environment (which is what proves the
+      `getentropy` arm, since that call is what reaches `rtl_createUuid`);
+      `uno_getMapping(env, env)` giving the identity mapping from
+      `IdentityMapping.cxx`; and a `css::uno::RuntimeException` thrown and
+      **caught by its base class `css::uno::Exception`** with its `Message`
+      intact — a cppumaker-generated udkapi type unwinding through real RTTI,
+      which is the post-decision-16 regression check.
+    * **The C++/UNO bridge half is NOT covered by any of that**, and cannot be:
+      see the blocked row in Current state. The probe supplies its own stubs for
+      the two symbols `cppu` imports from it under `DISABLE_DYNLOADING` —
+      `CPPU_ENV_uno_ext_getMapping` (`lbmap.cxx:332`, via `selectMapFunc`) and
+      `CPPU_ENV_uno_initEnvironment` (`lbenv.cxx:1001`, via `loadEnv`). Those
+      two undefined symbols are the *whole* of `cppu`'s dependency on
+      `bridges`; there is no makefile edge between the modules, only a link-time
+      one, which is why `cppu.allbuild` succeeds while nothing can yet use it.
 
 ## wk VCL backend vs. LO's qt6 backend on our Qt — recommendation
 
@@ -991,18 +1064,60 @@ hangs the main thread forever.
 > pushed entries), and it fixes the zip save, threaded graphic import and all
 > three vcl bitmap filters at once.
 
-**4. The UNO C++ bridge.** `bridges/source/cpp_uno/gcc3_wasm` exists (997
-lines) but resolves synthesized vtable slots through `EM_JS
-jsGetExportedSymbol`. There is no JS.
-> **E4 (an afternoon, no build required): read `Executable_wasmbridgegen` and
-> `CustomTarget_gcc3_wasm.mk` and prototype the table.** The generator already
-> emits `generated-cxx.cxx`, `generated-asm.s` and an exports list, so it can
-> emit a `{name, fn}` array too. **The wasm-specific risk here is already
-> retired:** the exact `void X(void);` mis-declaration + cast-and-call pattern
-> that `native-code.py` uses was reproduced standalone and **linked silently
-> and ran correctly** under wasm32-wasip2, including with the definition inside
-> a static archive. Also audit `bridges/source/emscriptencxxabi/cxxabi.cxx`
-> against wasi-sdk 34's libcxxabi layout.
+**4. The UNO C++ bridge. THIS IS NOW THE ONE OPEN BLOCKER, and it has been
+narrowed to a single `#include` and a single function.** Everything else in
+`bridges` cross-compiles: `./build-lo.sh bridges.allbuild` builds `abi.cxx`,
+`uno2cpp.cxx`, all six `cpp_uno/shared/*.cxx` and
+`StaticLibrary_emscriptencxxabi` with **zero errors**, and dies on exactly one
+line — `bridges/source/cpp_uno/gcc3_wasm/cpp2uno.cxx:15: fatal error:
+'emscripten.h' file not found`. The only thing that header is there for is the
+`EM_JS jsGetExportedSymbol` at `:32`, whose only caller is `Rtti::getRtti`,
+whose only job is to find the address of a UNO exception type's `_ZTI…` RTTI
+object by name. There is no JS, and a wasm component has no runtime symbol
+table.
+
+**Two facts were measured this session and they settle the shape of the fix:**
+
+1. **The existing fallback is not usable, and "return nullptr" is therefore not
+   an option.** When `jsGetExportedSymbol` returns 0, `cpp2uno.cxx:117-135`
+   synthesizes a fresh `__class_type_info`/`__si_class_type_info` from a
+   `strdup`'d name. On Emscripten that is survivable. On wasi-sdk 34 it is not:
+   `<typeinfo>` picks `_LIBCPP_TYPEINFO_COMPARISON_IMPLEMENTATION 1` (the
+   "Unique" implementation, which compares `__type_name` **by address**) for
+   every platform that is not COFF/XCOFF or arm64 Apple. Verified by running: a
+   synthesized `__si_class_type_info` carrying the byte-identical mangled name
+   `N3tst7DerivedE` compares unequal to the real `typeid`, and `__cxa_throw`
+   with it falls through both `catch (Derived&)` and `catch (Base&)` into
+   `catch (...)`, while the same throw with the real RTTI is caught normally.
+   **Always synthesizing would mean every `catch (css::uno::Exception&)` in
+   LibreOffice silently missing every exception the bridge raises.**
+2. **A link-time table works, including the "symbol is not in this image" case,
+   which is the half that was not obvious.** `wasmbridgegen` **already**
+   enumerates every UNO exception type and computes its mangled RTTI name —
+   `scan()`'s `SORT_EXCEPTION_TYPE` arm calls `computeRttiSymbol`, and the names
+   go into the `exports` file so that Emscripten keeps and exports them. So the
+   generator needs no new knowledge, only a new output. Verified by running,
+   under `wasm32-wasip2` with this port's flag set:
+   `extern "C" extern char _ZTIN3tst7DerivedE __attribute__((weak));` binds to
+   the **real** RTTI address (`__cxa_throw` with it is caught by the real base
+   class), and a weak reference to a name that is in no object **links anyway
+   and reads as `nullptr`** — which is precisely `jsGetExportedSymbol`'s
+   returned-0 contract, so `cpp2uno.cxx`'s existing synthesize-fallback stays
+   reachable and unchanged for types nothing in the image ever catches. Weak
+   references also do not drag objects out of archives, so the table costs
+   nothing but its own entries.
+> **E4 is now "write it", not "prototype it".** The remaining decisions are
+> where the table lives (a fourth `wasmbridgegen` output compiled into
+> `libgcc3_uno.a`, next to `generated-cxx.cxx`, is the obvious place) and how
+> `getRtti` is spelled on WASI so the Emscripten path is untouched. Note the
+> table is ~one entry per UNO exception type across udkapi+offapi, so check the
+> generated file's size before assuming it is free. Also still to do: audit
+> `bridges/source/emscriptencxxabi/cxxabi.cxx` against wasi-sdk 34's libcxxabi
+> layout — it compiled, but "compiles" has been shown not to mean "unwinds".
+> **The wasm-specific risk on the *vtable* side is already retired:** the exact
+> `void X(void);` mis-declaration + cast-and-call pattern that `native-code.py`
+> uses was reproduced standalone and **linked silently and ran correctly**
+> under wasm32-wasip2, including with the definition inside a static archive.
 
 **5. The externals, especially cairo/pixman under meson.**
 `external/cairo/ExternalProject_pixman.mk:28-42` generates a meson cross-file
@@ -1232,6 +1347,8 @@ Reported, not installed, per the house rules:
 | M2¾ `store` + `registry` cross-build | **done, and neither needed a patch** — `./build-lo.sh store.allbuild` then `./build-lo.sh registry.allbuild`, each reaching `[build MOD]` with **zero `error:` lines and zero wasm-side `warning:` lines on the first attempt**. **`build/instdir/program/libstorelo.a`, 11 members** (171,528 bytes with `-pthread`, 172,782 after the decision-16 fix) (`object.o`, `lockbyte.o`, `storbase.o`, `storbios.o`, `storcach.o`, `stordata.o`, `stordir.o`, `storlckb.o`, `stortree.o`, `storpage.o`, `store.o`) and **`build/instdir/program/libreglo.a`, 6 members** (128,776 bytes with `-pthread`, 128,298 after the decision-16 fix) (`keyimpl.o`, `reflread.o`, `reflwrit.o`, `regimpl.o`, `registry.o`, `regkey.o`); `llvm-objdump -h` says `file format wasm` for both. These are the two libraries that read `services.rdb`/`types.rdb`, so this rung is about **file-format portability, not compilation** — see decision 18, which is where the on-disk layout was actually checked rather than assumed |
 | M2⅞ `unoidl` cross-builds, **and the port runs its first LibreOffice code** | **done; no source patch, but one platform-makefile fix that invalidates every object built before it** — `./build-lo.sh unoidl.allbuild` reaches `[build MOD] unoidl` with **zero `error:` lines on the first attempt**. **`build/instdir/program/libunoidllo.a`, 983,308 bytes, 7 members** (`sourcefileprovider.o`, `sourcetreeprovider.o`, `unoidl.o`, `unoidlprovider.o`, `legacyprovider.o`, `sourceprovider-parser.o`, `sourceprovider-scanner.o`); `llvm-objdump -h` → `file format wasm`. The rung's actual result is that a wasm32 binary linked against it **read back an `.rdb` written by the native arm64 `unoidl-write`** under wasmtime, and that doing so exposed the `-pthread` compile-flag miscompile of exception handling (decision 16). See decision 19 |
 | the `-pthread` compile-flag fix | **done, and it forced a rebuild of every wasm C++ object in the tree** — `core-0002` now filters `-pthread` out of `gb_LinkTarget_CXXFLAGS` as well as `gb_CXXFLAGS`. `sal`, `salhelper`, `store`, `registry` and `unoidl` were rebuilt from a cleared `workdir/CxxObject`: **`libuno_sal.a` 2,395,198 B / 85 members, `libuno_salhelpergcc3.a` 36,052 B / 5, `libstorelo.a` 172,782 B / 11, `libreglo.a` 128,298 B / 6, `libunoidllo.a` 983,308 B / 7**, zero errors across all five. The sizes all moved, which is the cheapest proof the recompile was real. **gbuild does NOT rebuild when a platform makefile changes** — the first attempt at this fix looked like a no-op for exactly that reason |
+| M2¹⁵⁄₁₆ `cppu` cross-builds, **and the UNO runtime core runs** | **done — one `osl` patch, none in `cppu` itself** — `./build-lo.sh cppu.allbuild` reaches `[build MOD] cppu` with **zero `error:` lines on the first attempt**. Five archives, all `file format wasm`: **`libuno_cppu.a` 354,092 B / 20 members** (`compat.o`, `cppu_opt.o`, `current.o`, `jobqueue.o`, `thread.o`, `threadident.o`, `threadpool.o`, `static_types.o`, `typelib.o`, `any.o`, `cascade_mapping.o`, `check.o`, `data.o`, `EnvDcp.o`, `EnvStack.o`, `IdentityMapping.o`, `lbenv.o`, `lbmap.o`, `loadmodule.o`, `sequence.o`), **`libuno_purpenvhelpergcc3.a` 22,272 B / 3**, **`libaffine_uno_uno.a` 10,904 B / 1**, **`liblog_uno_uno.a` 6,186 B / 1**, **`libunsafe_uno_uno.a` 4,882 B / 1**. The rung's content is the **run**, not the build: typelib static types, `XInterface`'s 3 members from `static_types.cxx` with no `.rdb`, `Any` over long/string/hyper/double, `Sequence` copy-on-write, `uno_getEnvironment("uno")`, the identity mapping, and a `css::uno::RuntimeException` caught by `css::uno::Exception&` — 8/8 checks, exit 0. It also flushed out `dlsym` (see decision 20), which is a **link** error and had been invisible for five modules. `libuno_sal.a` rebuilt to 2,394,402 B / 85 members with the `getentropy` arm |
+| the C++/UNO bridge (`bridges`) | **BLOCKED, and it is the only open blocker below M3** — `./build-lo.sh bridges.allbuild` compiles `abi.cxx`, `uno2cpp.cxx`, all six `cpp_uno/shared/*.cxx` and `StaticLibrary_emscriptencxxabi` cleanly, then dies on **one line**: `gcc3_wasm/cpp2uno.cxx:15: fatal error: 'emscripten.h' file not found`, the `EM_JS jsGetExportedSymbol` RTTI lookup. `core-0005` selected this bridge correctly — the failure is not the selection. **Do not "fix" it by returning nullptr**: measured this session, the synthesized-RTTI fallback cannot be caught at all on wasi-sdk 34. The mechanism a real fix needs (weak `extern "C" _ZTI…` references, resolving to the real address when present and to `nullptr` when not) was verified by running. See E4, which is now a build task rather than a study |
 | M3 `soffice.wasm` links headless | **not started** — but three of its blockers fell out of M2: `unxgcc.mk`'s `echo -n` (decision 15), `-pthread` on the link line and `-pthread` on the *compile* line (decision 16). All three hit EVERY object or executable, not just `sal`'s test helpers, so M3 would have died on them within a minute — the third one silently |
 | M4 `.pptx` → PDF | **not started** |
 | M5 svp renders a slide to PNG | **not started** |
@@ -1465,6 +1582,36 @@ Reported, not installed, per the house rules:
   returns 1). Non-zero, so `osl_mapFile`'s `osl_File_MapFlag_RandomAccess`
   page-touch loop terminates instead of spinning; and `FileHandle_Impl`'s read
   buffer is a 64 KiB `calloc` per open file handle rather than 4 KiB.
+* **`cppu` runs on wasm32-wasip2.** Eight checks, exit 0, under wasmtime: the
+  static types; `XInterface`'s type description completing with 3 members out of
+  `static_types.cxx` and no registry; `Any` round-tripping `long`, `string`,
+  `hyper` and `double` plus copy-compare; `Sequence` copy-on-write, `realloc`
+  and `Any` round-trip; `uno_getEnvironment("uno")`; `uno_getMapping(env, env)`
+  → the identity mapping; and a `css::uno::RuntimeException` thrown and caught
+  **by its base class** with `Message` intact.
+* **`getentropy()` works on wasip2 and caps at 256 bytes per call** — 16 bytes
+  succeeds, 300 fails with `EIO` (29). `fopen("/dev/urandom")` returns `NULL`.
+  Both matter because `rtl_random_getBytes` `abort()`s rather than degrading
+  when `osl_get_system_random_data` says no (decision 20).
+* **A synthesized `type_info` can never be caught on wasi-sdk 34.** A
+  hand-built `__si_class_type_info` with the byte-identical mangled name
+  compares unequal to the real `typeid` (`_LIBCPP_TYPEINFO_COMPARISON_IMPLEMENTATION`
+  defaults to 1, address comparison, on every non-COFF non-arm64-Apple target),
+  and `__cxa_throw` with it falls through `catch (Derived&)` **and**
+  `catch (Base&)` into `catch (...)`. This is what disqualifies the obvious
+  one-line "fix" for the UNO bridge; see blocker 4.
+* **A weak `extern "C"` reference to a `_ZTI…` symbol does the right thing in
+  both directions on wasm32-wasip2** — it binds to the real RTTI address when
+  the type is in the image (and a throw with it is caught by the real base
+  class), and links to `nullptr` when it is not, without dragging anything out
+  of an archive. That is the mechanism a WASI replacement for
+  `jsGetExportedSymbol` needs, and it is the half of E4 that was in doubt.
+* **`cppu`'s thread pool: create/destroy is clean, `putJob` aborts.**
+  `uno_threadpool_create()` spawns nothing and `uno_threadpool_destroy()`
+  returns normally; one `uno_threadpool_putJob` traps at
+  `abort` ← `ORequestThread::launch()` ← `ThreadPool::createThread` ←
+  `ThreadPool::addJob`, exit 134, every frame named. Only `binaryurp` and
+  `jni_uno` reach it, so it is dead code here — see decision 20.
 
 ### What is asserted from reading only
 

@@ -64,6 +64,71 @@ index 500a26a04..70320136b 100644
  }
  
  static int oslDoCopyLink(const char* pszSourceFileName, const char* pszDestFileName)
+diff --git a/sal/osl/unx/random.cxx b/sal/osl/unx/random.cxx
+index 35bc65911..bcd61a1c3 100644
+--- a/sal/osl/unx/random.cxx
++++ b/sal/osl/unx/random.cxx
+@@ -13,7 +13,53 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <unistd.h>
++#if !defined(WASI)
+ #include <dlfcn.h>
++#endif
++
++#if defined(WASI)
++
++/* WASI has neither of the two things the Unix implementation below needs, and
++ * the caller cannot survive being told so.
++ *
++ *  - `dlsym`. The configure arm sets usable_dlapi=no and wasi-libc declares
++ *    dlsym in <dlfcn.h> without defining it anywhere in libc.a, so the
++ *    reference is a link error rather than a runtime one. The symbol it looks
++ *    up, `lok_open_urandom`, is a LibreOfficeKit hook, and LibreOfficeKit is
++ *    rejected by this port outright (see PORTING.md's header) — so nothing is
++ *    lost by never looking for it.
++ *  - `/dev/urandom`. A wasm component's filesystem is its preopened
++ *    directories; there are no device nodes. Verified by running under
++ *    wasmtime: fopen("/dev/urandom") returns NULL.
++ *
++ * WHY THIS IS NOT ALLOWED TO BE A STUB THAT RETURNS false. rtl/random.cxx:73
++ * turns a false into `fprintf(stderr, "cannot read random device, aborting")`
++ * followed by abort(). And this is on the UNO bootstrap path, not some corner:
++ * cppu/source/uno/lbenv.cxx calls rtl_getGlobalProcessId() the first time
++ * anything asks for an environment, which is rtl_createUuid → rtl_random_getBytes
++ * → here. A polite `return false` would abort LibreOffice before the first
++ * component is ever instantiated.
++ *
++ * getentropy() is the real primitive on this target, not a stand-in: wasi-libc
++ * implements it directly on the wasi random_get import, which wasmtime backs
++ * with the host CSPRNG. Its only wrinkle is a hard 256-byte cap per call
++ * (larger requests fail with EIO — verified by running), hence the loop. */
++bool osl_get_system_random_data(char* buffer, size_t desired_len)
++{
++    assert(buffer);
++
++    while (desired_len != 0)
++    {
++        size_t const chunk = desired_len > 256 ? 256 : desired_len;
++        if (getentropy(buffer, chunk) != 0)
++            return false;
++        buffer += chunk;
++        desired_len -= chunk;
++    }
++    return true;
++}
++
++#else
+ 
+ bool osl_get_system_random_data(char* buffer, size_t desired_len)
+ {
+@@ -51,4 +97,6 @@ bool osl_get_system_random_data(char* buffer, size_t desired_len)
+     return false;
+ }
+ 
++#endif
++
+ /* vim:set shiftwidth=4 softtabstop=4 expandtab: */
 diff --git a/sal/osl/unx/secimpl.hxx b/sal/osl/unx/secimpl.hxx
 index e6628ae3f..151e6fdf0 100644
 --- a/sal/osl/unx/secimpl.hxx
