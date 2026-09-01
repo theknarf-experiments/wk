@@ -35,8 +35,37 @@ fi
 for arg do
     case "$arg" in
     -Wl,--start-group|-Wl,--end-group|--start-group|--end-group) ;;
+    # -pthread implies --shared-memory on wasm, which fails outright:
+    #   wasm-ld: error: --shared-memory is disallowed by errno.c.obj because it
+    #   was not compiled with 'atomics' or 'bulk-memory' features
+    # It arrives from PTHREAD_CFLAGS inside unxgcc.mk's gb_OSDEFS and reaches
+    # every external's own configure, where no gbuild variable can be cleared
+    # to stop it. wasip2 has no threads, so the flag has nothing to mean here.
+    -pthread) ;;
     *) set -- "$@" "$arg" ;;
     esac
     shift
 done
+# wasi-libc keeps mmap, signal, the process clocks and getpid behind opt-in
+# shim libraries, and they are needed by whoever LINKS, not by whoever compiles.
+# gbuild's own links get them from WASI_INTEL_GCC.mk, but an external's configure
+# runs its own link steps that gbuild never sees — libxml2's xmllint fails on
+# undefined mmap/munmap — and LDFLAGS cannot be used to reach them, because
+# gbuild treats a non-empty LDFLAGS as a REPLACEMENT for its own handling
+# rather than an addition.
+#
+# So they are appended here, and only on a link: a compile-only invocation
+# would merely warn that the -l is unused, but the noise would be in every
+# build log forever. Duplicates on gbuild's own links are harmless for -l.
+link=1
+for arg do
+    case "$arg" in
+    -c|-E|-S|-M|-MM) link=0 ;;
+    esac
+done
+if [ "$link" = 1 ]; then
+    set -- "$@" -lwasi-emulated-signal -lwasi-emulated-mman \
+        -lwasi-emulated-process-clocks -lwasi-emulated-getpid
+fi
+
 exec "$WASI_SDK/bin/clang" "$@"

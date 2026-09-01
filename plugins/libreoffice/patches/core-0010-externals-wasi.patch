@@ -1,0 +1,34 @@
+diff --git a/external/icu/UnpackedTarball_icu.mk b/external/icu/UnpackedTarball_icu.mk
+index 92777dd33..0695b1ac7 100644
+--- a/external/icu/UnpackedTarball_icu.mk
++++ b/external/icu/UnpackedTarball_icu.mk
+@@ -35,6 +35,7 @@ $(eval $(call gb_UnpackedTarball_add_patches,icu,\
+ 	external/icu/Wdeprecated-copy-dtor.patch \
+ 	external/icu/icu4c-windows-cygwin-cross.patch.1 \
+ 	external/icu/icu4c-emscripten-cross.patch.1 \
++	external/icu/icu4c-wasi-cross.patch.1 \
+ 	external/icu/icu4c-use-pkgdata-single-ccode-file-mode.patch.1 \
+ 	external/icu/icu4c-khmerbreakengine.patch.1 \
+ 	external/icu/icu4c-$(if $(filter ANDROID,$(OS)),android,rpath).patch.1 \
+diff --git a/external/openssl/ExternalProject_openssl.mk b/external/openssl/ExternalProject_openssl.mk
+index a31945fab..beedfeabf 100644
+--- a/external/openssl/ExternalProject_openssl.mk
++++ b/external/openssl/ExternalProject_openssl.mk
+@@ -53,6 +53,7 @@ OPENSSL_PLATFORM := \
+             $(if $(filter AARCH64,$(CPUNAME)),darwin64-arm64-cc)\
+ 	  ,\
+ 	    $(if $(filter EMSCRIPTEN,$(OS)),no-engine no-dso no-dgram no-srtp no-err no-ocsp no-psk no-ts no-asm) \
++	    $(if $(filter WASI,$(OS)),linux-generic32 no-threads no-apps no-sock no-ui-console no-engine no-dso no-dgram no-srtp no-err no-ocsp no-psk no-ts no-asm) \
+           )\
+         )\
+       )\
+@@ -84,7 +85,8 @@ $(call gb_ExternalProject_get_state_target,openssl,build):
+ 		$(if $(filter WNT,$(OS)), \
+ 			$(PERL) Configure, \
+ 			./config)) \
+-			$(OPENSSL_PLATFORM) no-dso no-shared no-tests no-multilib threads \
++			$(OPENSSL_PLATFORM) no-dso no-shared no-tests no-multilib \
++			$(if $(filter WASI,$(OS)),no-threads,threads) \
+ 			$(if $(filter-out ANDROID iOS WNT,$(OS)), \
+ 				$(if $(SYSBASE),-I$(SYSBASE)/usr/include -L$(SYSBASE)/usr/lib)) \
+ 			$(if $(filter MACOSX,$(OS)),--prefix=/@.__________________________________________________OOO) \

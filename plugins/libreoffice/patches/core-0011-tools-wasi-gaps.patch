@@ -1,0 +1,31 @@
+diff --git a/tools/source/misc/extendapplicationenvironment.cxx b/tools/source/misc/extendapplicationenvironment.cxx
+index a98d63bc4..abee9ac96 100644
+--- a/tools/source/misc/extendapplicationenvironment.cxx
++++ b/tools/source/misc/extendapplicationenvironment.cxx
+@@ -38,7 +38,11 @@ namespace tools
+ {
+ void extendApplicationEnvironment()
+ {
+-#if defined UNX && !defined EMSCRIPTEN
++// WASI joins EMSCRIPTEN here for the same reason: wasi-libc has no resource
++// limits — no rlimit, no RLIMIT_NOFILE — because a component's descriptor table
++// is the host's business, not the guest's. The comment below already says
++// failure is harmless; not asking at all is the same harmlessness.
++#if defined UNX && !defined EMSCRIPTEN && !defined WASI
+     // Try to set RLIMIT_NOFILE as large as possible (failure is harmless):
+     rlimit lim;
+     if (getrlimit(RLIMIT_NOFILE, &lim) == 0)
+diff --git a/tools/source/stream/strmunx.cxx b/tools/source/stream/strmunx.cxx
+index 28c548540..323bd270c 100644
+--- a/tools/source/stream/strmunx.cxx
++++ b/tools/source/stream/strmunx.cxx
+@@ -102,7 +102,8 @@ static ErrCode GetSvError( int nErrno )
+ #if defined(NETBSD) || \
+     defined(FREEBSD) || defined(MACOSX) || defined(OPENBSD) || \
+     defined(__FreeBSD_kernel__) || defined(DRAGONFLY) || \
+-    defined(IOS) || defined(HAIKU)
++    defined(IOS) || defined(HAIKU) || defined(WASI)
++        // WASI has EDEADLK and not the EDEADLOCK alias, like the BSDs above.
+         { EDEADLK,      SVSTREAM_LOCKING_VIOLATION },
+ #else
+         { EDEADLOCK,    SVSTREAM_LOCKING_VIOLATION },
