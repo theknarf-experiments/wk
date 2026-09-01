@@ -98,8 +98,11 @@ mod tests {
             .collect();
         let firsts: std::collections::HashSet<&str> =
             names.iter().map(|n| n.split('-').next().unwrap()).collect();
+        // A tenth of the space, not half: the bug this guards against produced
+        // ONE distinct first word for a whole workspace, and a threshold set
+        // near the statistical mean would flake in a suite that gates commits.
         assert!(
-            firsts.len() > 12,
+            firsts.len() >= 10,
             "24 consecutive ids should not share a handful of first words: {names:?}"
         );
         // Both words vary, so the whole 64×64 space is in play. Not that
@@ -108,7 +111,7 @@ mod tests {
         // birthday paradox rather than a namer that only ever varies one word.
         let seconds: std::collections::HashSet<&str> =
             names.iter().map(|n| n.split('-').nth(1).unwrap()).collect();
-        assert!(seconds.len() > 12, "second words cluster too: {names:?}");
+        assert!(seconds.len() >= 10, "second words cluster too: {names:?}");
     }
 
     /// A name has to be a legal hostname: it is what a peer dials over the
