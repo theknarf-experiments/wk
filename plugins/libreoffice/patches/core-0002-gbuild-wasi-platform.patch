@@ -1,9 +1,9 @@
 diff --git a/solenv/gbuild/platform/WASI_INTEL_GCC.mk b/solenv/gbuild/platform/WASI_INTEL_GCC.mk
 new file mode 100644
-index 000000000..ff4ff6a97
+index 000000000..773a9b7c5
 --- /dev/null
 +++ b/solenv/gbuild/platform/WASI_INTEL_GCC.mk
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,227 @@
 +# -*- Mode: makefile-gmake; tab-width: 4; indent-tabs-mode: t -*-
 +#
 +# This file is part of the LibreOffice project.
@@ -65,6 +65,46 @@ index 000000000..ff4ff6a97
 +# Cleared here rather than patched into unxgcc.mk because it is a genuine
 +# platform difference, which is what this file is for.
 +gb_CXX_LINKFLAGS :=
++
++# NOR ON THE COMPILE LINE, AND THIS HALF IS THE DANGEROUS ONE. Clearing
++# gb_CXX_LINKFLAGS above is not enough: unxgcc.mk:54-60 builds gb_CXXFLAGS with
++# `:=`, so it has ALREADY expanded $(gb_CXX_LINKFLAGS) and baked -pthread into
++# every C++ COMPILE command. Emptying the variable afterwards changes only the
++# link. Filter it back out of the flag list that actually reaches clang.
++#
++# Unlike the link half, this one does not fail loudly. It miscompiles exception
++# handling, silently, and the wreck surfaces at run time as an out-of-bounds
++# memory access with no message. Verified end to end under wasmtime:
++#
++#   * -pthread makes clang enable the atomics/bulk-memory target features, which
++#     switches thread-local storage to the real TLS model. The wasm EH/SjLj
++#     landing-pad context `__wasm_lpad_context` is then addressed TLS-relative
++#     (relocation R_WASM_MEMORY_ADDR_TLS_SLEB).
++#   * wasi-sdk's libunwind defines that symbol as an ordinary .bss global,
++#     because the sysroot is built without atomics.
++#   * With -pthread ALSO on the link line, lld says so and stops:
++#       relocation R_WASM_MEMORY_ADDR_TLS_SLEB cannot be used against
++#       non-TLS symbol `__wasm_lpad_context`
++#     With -pthread only on the compile line — exactly the state this file was
++#     in before — lld relaxes TLS to static addressing instead, links happily,
++#     and the landing pad reads far outside linear memory. Every `catch` in
++#     LibreOffice's own code traps: "memory fault at wasm address 0x12f4678 in
++#     linear memory of size 0x980000".
++#
++# Found by running unoidl's provider fallback (unoidl.cxx's loadProvider catches
++# FileFormatException and retries as legacy) under wasmtime, and bisected by
++# recompiling the same function with and without -pthread against the same
++# archives. Nothing before that milestone had EXECUTED a catch, which is why
++# four modules built and looked fine.
++#
++# BOTH variables have to be filtered, and gb_LinkTarget_CXXFLAGS is the one that
++# matters: unxgcc.mk:107 is `gb_LinkTarget_CXXFLAGS := $(gb_CXXFLAGS)`, an
++# immediate assignment made while unxgcc.mk is being included — i.e. before
++# anything in this file runs — and LinkTarget.mk:68 puts *that* on the compile
++# command. Filtering only gb_CXXFLAGS changes nothing at all; verified by
++# reading the command back out of `make verbose=t`.
++gb_CXXFLAGS := $(filter-out -pthread,$(gb_CXXFLAGS))
++gb_LinkTarget_CXXFLAGS := $(filter-out -pthread,$(gb_LinkTarget_CXXFLAGS))
 +
 +# No .js, no .html: wasm-component-ld emits the component itself at link time,
 +# so an executable's target name is its bare name. unxgcc.mk defaults this to

@@ -336,14 +336,44 @@ needed (`autogen.sh:321` only prepends it for `--host=wasm*-emscripten`); no
     running: `/bin/sh -c 'echo -n foo'` prints `-n foo` on this machine, while
     a bare `$(shell echo -n a b)` in a test makefile does not — because without
     a pipe make execs `/bin/echo` directly, and *that* one honours `-n`.
-16. **No `-pthread` on a WASI link line.** `unxgcc.mk:48-53` sets
-    `gb_CXX_LINKFLAGS := -pthread` whenever libc++ or libstdc++ is detected. On
-    a normal Unix that is nearly free advice; on wasm32 it is a target-feature
-    switch — clang expands it to `-matomics -mbulk-memory` and asks lld for
-    `--shared-memory`, and wasi-sdk's plain `wasm32-wasip2` sysroot has neither,
-    so the link dies with `wasm-ld: error: --shared-memory is disallowed by
-    Unwind-wasm.c.o`. `WASI_INTEL_GCC.mk` clears it. Nothing is lost:
+16. **No `-pthread` on a WASI link line — NOR ON A COMPILE LINE, and the second
+    half of that sentence was missing until the `unoidl` milestone.**
+    `unxgcc.mk:48-53` sets `gb_CXX_LINKFLAGS := -pthread` whenever libc++ or
+    libstdc++ is detected. On a normal Unix that is nearly free advice; on wasm32
+    it is a target-feature switch — clang expands it to `-matomics
+    -mbulk-memory` and asks lld for `--shared-memory`, and wasi-sdk's plain
+    `wasm32-wasip2` sysroot has neither, so the link dies with `wasm-ld: error:
+    --shared-memory is disallowed by Unwind-wasm.c.o`. Nothing is lost:
     `pthread_create` is an ENOTSUP stub on this target either way (decision 12).
+    * **`gb_CXX_LINKFLAGS := ` does not remove it from the compile command**, and
+      the original version of this decision assumed it did. `unxgcc.mk:55-60`
+      folds `$(gb_CXX_LINKFLAGS)` into `gb_CXXFLAGS` with `:=`, and
+      `unxgcc.mk:107` then does `gb_LinkTarget_CXXFLAGS := $(gb_CXXFLAGS)` —
+      both immediate assignments, both evaluated *while unxgcc.mk is being
+      included*, i.e. before a single line of `WASI_INTEL_GCC.mk` runs. Emptying
+      the variable afterwards changes only the link. So **every C++ object this
+      port has built so far carried `-pthread`**, and `make verbose=t` is the
+      only thing that says so.
+    * **The compile half does not fail loudly. It miscompiles exception
+      handling.** `-pthread` turns on the atomics/bulk-memory target features,
+      which switches thread-local storage to the real TLS model, so the wasm
+      EH/SjLj landing-pad context `__wasm_lpad_context` is addressed TLS-relative
+      (`R_WASM_MEMORY_ADDR_TLS_SLEB`) while wasi-sdk's libunwind defines it as an
+      ordinary `.bss` global. With `-pthread` *also* on the link line lld refuses
+      and names the symbol; with it on the compile line **only** — the state this
+      port was in — lld quietly relaxes TLS to static addressing, links, and the
+      landing pad reads far outside linear memory. **Every `catch` in
+      LibreOffice's own code traps**, as `memory fault at wasm address 0x12f4678
+      in linear memory of size 0x980000`, with no message and no useful frame.
+    * `WASI_INTEL_GCC.mk` now filters `-pthread` out of **both** `gb_CXXFLAGS`
+      and `gb_LinkTarget_CXXFLAGS`. Filtering only the first does nothing at all.
+      `gb_CFLAGS` never had it (`PTHREAD_CFLAGS` is empty in `config_host.mk`),
+      so C objects — `zlib` — were never affected.
+    * **Why four clean module milestones did not catch this**: nothing had ever
+      *executed* a `catch`. Archives compile and link with the bad relocation;
+      only running a throw that unwinds into LibreOffice code shows it. That is
+      the general lesson, not a detail about `-pthread`: a milestone that only
+      builds an archive proves nothing about the archive's exception handling.
 17. **`salhelper` needs no patch, and the reason it needs none is the shape to
     look for in every module above it.** It is the first module in this port to
     cross-compile completely untouched, and it is the first C++ *consumer* of
@@ -491,6 +521,76 @@ needed (`autogen.sh:321` only prepends it for `--host=wasm*-emscripten`); no
       set. Confirmed by `grep regview` over the build log returning nothing.
       Which means **this port still has not linked a single executable** — E1
       and the `--start-group` question remain entirely untouched.
+
+19. **`unoidl` needs no source patch either, and the milestone's real content is
+    that it is the first LibreOffice code this port has RUN.** The module builds
+    one library and nothing else: `Module_unoidl.mk` gates
+    `Executable_unoidl-check` on `$(call gb_not,$(CROSS_COMPILING))` and both
+    `unoidl-read`/`unoidl-write` on `ODK` in `BUILD_TYPE`, and this configuration
+    has `CROSS_COMPILING=TRUE` and no `ODK` — so the three executables are
+    build-side only, exactly like `registry`'s `regview`.
+    * **The new-format `.rdb` crosses arm64 → wasm32 by construction, not by
+      luck, and this was checked by running it rather than by reading.** Unlike
+      `store`'s page structs (decision 18, which had to be *measured*),
+      `unoidlprovider.cxx`'s `Memory16`/`Memory32`/`Memory64` are `unsigned char
+      byte[N]` with explicit little-endian shift-and-or accessors, and
+      `unoidl-write.cxx`'s `write16`/`write32`/`write64` are the mirror image —
+      byte-at-a-time into a `char` buffer. There is no struct overlay anywhere in
+      the format. The only endianness sites are the `float`/`double` union
+      punnings (`unoidlprovider.cxx:113,148` under `OSL_LITENDIAN`,
+      `unoidl-write.cxx:181,194` under `OSL_BIGENDIAN`), and both sides here are
+      little-endian.
+      **Verified end to end**: three `.idl` files → the native arm64
+      `unoidl-write` → a 347-byte `.rdb` → a `wasm32-wasip2` binary linked
+      against `libunoidllo.a` and run under wasmtime, which read back the struct
+      member list, `MaxSlides = 305419896` (`long`), `HugeValue =
+      1311768467463790320` (`hyper`, i.e. a 64-bit value on a 32-bit target),
+      `Ratio = 0.15625` (`double`) and the three enumerators. **This is the first
+      LibreOffice code in this port to execute at all.**
+    * **And executing it is what found the `-pthread` miscompile** (decision 16).
+      The trigger is `Manager::loadProvider` (`unoidl.cxx`), which catches
+      `FileFormatException` from `UnoidlProvider` and retries the file as legacy
+      `registry` format. Passing a *relative* URI makes `osl_openFile` fail with
+      21, which takes that catch — and the catch trapped. Four modules of clean
+      archives had proved nothing about it. Bisected by recompiling a verbatim
+      copy of `loadProvider` in a separate TU with and without `-pthread` against
+      the same archives: without it the fallback runs and reports `cannot open
+      legacy file: 6`; with it, the same out-of-bounds fault.
+    * **`osl_mapFile` is load-bearing here in a way it was not in `store`.**
+      `MappedFile`'s constructor (`unoidlprovider.cxx:262-283`) throws
+      `FileFormatException("cannot mmap: …")` when the mapping fails —
+      there is no `osl_readFileAt` fallback, unlike
+      `FileLockBytes_createInstance`. So decision 18's "mmap works on wasip2, as
+      a `malloc`+`pread` copy" is the only thing keeping the `.rdb` path alive,
+      and the copy semantics mean `types.rdb` costs its full size in RSS at open
+      time. Worth remembering for E2.
+    * `osl_File_MapFlag_RandomAccess` — which is what `MappedFile` passes — runs
+      `file.cxx:1451-1474`'s page-touch loop, `while (nSize > nPageSize)` over
+      `FileHandle_Impl::getpagesize()`. A zero page size would spin forever.
+      **`sysconf(_SC_PAGESIZE)` returns 65536 under wasmtime** (verified), the
+      wasm page size, so the loop terminates. The same call sizes
+      `FileHandle_Impl`'s read buffer (`file.cxx:214-219`), so every buffered
+      `osl` file handle on this target costs a 64 KiB `calloc` rather than the
+      4 KiB it costs on Linux — 16× per open file, and LibreOffice opens a lot.
+    * The `dirent.h` block in `sourcetreeprovider.cxx:28-88` is `#if defined
+      MACOSX || defined LINUX`, and `gb_OSDEFS` gives us `-DWASI`, so WASI takes
+      the `#else` — `return status.getFileName()`, the same arm Windows takes.
+      That is upstream's own fallback for "cannot recover the original spelling
+      of a filename", not a stub of ours, and `readdir_r` never has to exist.
+    * Undefined-symbol audit: `libunoidllo.a` wants fifteen `osl_*` symbols (file,
+      directory, mutex, thread-text-encoding) plus `initRegistry_Api`. Nothing
+      from `process_wasi.cxx`, `pipe_wasi.cxx` or `signal_wasi.cxx`; no
+      `osl::Condition`, `osl::Thread` or `std::condition_variable` anywhere in
+      the module, so the thread shim is again uninvolved. The `exit`, `stdin` and
+      `fprintf` references come from the generated flex scanner
+      (`yy_fatal_error`), which is on the `.idl`-source path, not the `.rdb` one.
+    * `unoidl` is also the first module whose **wasm** compiles emit warnings —
+      five of them, all in generated `bison`/`flex` output
+      (`workdir/YaccTarget/…/sourceprovider-parser.cxx`,
+      `workdir/LexTarget/…/sourceprovider-scanner.cxx`). Each has an identical
+      twin from the `workdir_for_build` native compile of the same generated
+      file, so they are `bison`/`flex` codegen artefacts and say nothing about
+      the target.
 
 ## wk VCL backend vs. LO's qt6 backend on our Qt — recommendation
 
@@ -1127,10 +1227,12 @@ Reported, not installed, per the house rules:
 | E2 182 MB component on `PluginHost` | **not started** |
 | M0 configure completes | **done** — `build/config_host.mk` has `export OS=WASI` |
 | M1 native bootstrap | **done** — 39 entries in `build/workdir_for_build/LinkTarget/Executable`, `wasmbridgegen` among them |
-| M2 `libsal.a` cross-builds | **the archive half is done** — `./build-lo.sh sal.allbuild` runs to `[build MOD] sal` with no errors from a freshly patched pristine tree. **`build/instdir/program/libuno_sal.a`, 2,401,182 bytes, 85 members** (not `workdir/LinkTarget/Library/` — under `DISABLE_DYNLOADING` a gbuild Library's target *is* `instdir/program/lib<name>.a`; `workdir/LinkTarget/Library/` holds only the `.objectlist` and `.exports`). `llvm-objdump -h` says `file format wasm`; 276 defined `osl_*` symbols; the archive contains `pipe_wasi.o`, `process_wasi.o`, `signal_wasi.o` and none of `pipe.o`, `process.o`, `signal.o`. `zlib` and the UNO bridge cross-compile alongside it. **The "+ a wasip2 program that runs" half is NOT done** — no `.wasm` has been executed |
-| M2½ `salhelper` cross-builds | **done, and it needed no patch at all** — `./build-lo.sh salhelper.allbuild` reaches `[build MOD] salhelper` with **zero `error:` lines on the first attempt**. **`build/instdir/program/libuno_salhelpergcc3.a`, 36,028 bytes, 5 members** (`condition.o`, `dynload.o`, `simplereferenceobject.o`, `thread.o`, `timer.o`); `llvm-objdump -h` → `file format wasm`. The `uno_`/`gcc3` decoration in the filename comes from `gb_Library_set_is_ure_library_or_dependency`, not from anything we did. The first module in this port to cross-compile untouched — see decision 17 for what that does and does not prove |
-| M2¾ `store` + `registry` cross-build | **done, and neither needed a patch** — `./build-lo.sh store.allbuild` then `./build-lo.sh registry.allbuild`, each reaching `[build MOD]` with **zero `error:` lines and zero wasm-side `warning:` lines on the first attempt**. **`build/instdir/program/libstorelo.a`, 171,528 bytes, 11 members** (`object.o`, `lockbyte.o`, `storbase.o`, `storbios.o`, `storcach.o`, `stordata.o`, `stordir.o`, `storlckb.o`, `stortree.o`, `storpage.o`, `store.o`) and **`build/instdir/program/libreglo.a`, 128,776 bytes, 6 members** (`keyimpl.o`, `reflread.o`, `reflwrit.o`, `regimpl.o`, `registry.o`, `regkey.o`); `llvm-objdump -h` says `file format wasm` for both. These are the two libraries that read `services.rdb`/`types.rdb`, so this rung is about **file-format portability, not compilation** — see decision 18, which is where the on-disk layout was actually checked rather than assumed |
-| M3 `soffice.wasm` links headless | **not started** — but two of its blockers fell out of M2 and are already fixed: `unxgcc.mk`'s `echo -n` (decision 15) and `-pthread` on the link line (decision 16). Both hit EVERY executable, not just `sal`'s test helpers, so M3 would have died on them within a minute |
+| M2 `libsal.a` cross-builds | **the archive half is done** — `./build-lo.sh sal.allbuild` runs to `[build MOD] sal` with no errors from a freshly patched pristine tree. **`build/instdir/program/libuno_sal.a`, 85 members** (2,401,182 bytes when built with `-pthread`; 2,395,198 after the decision-16 fix) (not `workdir/LinkTarget/Library/` — under `DISABLE_DYNLOADING` a gbuild Library's target *is* `instdir/program/lib<name>.a`; `workdir/LinkTarget/Library/` holds only the `.objectlist` and `.exports`). `llvm-objdump -h` says `file format wasm`; 276 defined `osl_*` symbols; the archive contains `pipe_wasi.o`, `process_wasi.o`, `signal_wasi.o` and none of `pipe.o`, `process.o`, `signal.o`. `zlib` and the UNO bridge cross-compile alongside it. **The "+ a wasip2 program that runs" half is NOT done** — no `.wasm` has been executed |
+| M2½ `salhelper` cross-builds | **done, and it needed no patch at all** — `./build-lo.sh salhelper.allbuild` reaches `[build MOD] salhelper` with **zero `error:` lines on the first attempt**. **`build/instdir/program/libuno_salhelpergcc3.a`, 5 members** (36,028 bytes with `-pthread`, 36,052 after the decision-16 fix) (`condition.o`, `dynload.o`, `simplereferenceobject.o`, `thread.o`, `timer.o`); `llvm-objdump -h` → `file format wasm`. The `uno_`/`gcc3` decoration in the filename comes from `gb_Library_set_is_ure_library_or_dependency`, not from anything we did. The first module in this port to cross-compile untouched — see decision 17 for what that does and does not prove |
+| M2¾ `store` + `registry` cross-build | **done, and neither needed a patch** — `./build-lo.sh store.allbuild` then `./build-lo.sh registry.allbuild`, each reaching `[build MOD]` with **zero `error:` lines and zero wasm-side `warning:` lines on the first attempt**. **`build/instdir/program/libstorelo.a`, 11 members** (171,528 bytes with `-pthread`, 172,782 after the decision-16 fix) (`object.o`, `lockbyte.o`, `storbase.o`, `storbios.o`, `storcach.o`, `stordata.o`, `stordir.o`, `storlckb.o`, `stortree.o`, `storpage.o`, `store.o`) and **`build/instdir/program/libreglo.a`, 6 members** (128,776 bytes with `-pthread`, 128,298 after the decision-16 fix) (`keyimpl.o`, `reflread.o`, `reflwrit.o`, `regimpl.o`, `registry.o`, `regkey.o`); `llvm-objdump -h` says `file format wasm` for both. These are the two libraries that read `services.rdb`/`types.rdb`, so this rung is about **file-format portability, not compilation** — see decision 18, which is where the on-disk layout was actually checked rather than assumed |
+| M2⅞ `unoidl` cross-builds, **and the port runs its first LibreOffice code** | **done; no source patch, but one platform-makefile fix that invalidates every object built before it** — `./build-lo.sh unoidl.allbuild` reaches `[build MOD] unoidl` with **zero `error:` lines on the first attempt**. **`build/instdir/program/libunoidllo.a`, 983,308 bytes, 7 members** (`sourcefileprovider.o`, `sourcetreeprovider.o`, `unoidl.o`, `unoidlprovider.o`, `legacyprovider.o`, `sourceprovider-parser.o`, `sourceprovider-scanner.o`); `llvm-objdump -h` → `file format wasm`. The rung's actual result is that a wasm32 binary linked against it **read back an `.rdb` written by the native arm64 `unoidl-write`** under wasmtime, and that doing so exposed the `-pthread` compile-flag miscompile of exception handling (decision 16). See decision 19 |
+| the `-pthread` compile-flag fix | **done, and it forced a rebuild of every wasm C++ object in the tree** — `core-0002` now filters `-pthread` out of `gb_LinkTarget_CXXFLAGS` as well as `gb_CXXFLAGS`. `sal`, `salhelper`, `store`, `registry` and `unoidl` were rebuilt from a cleared `workdir/CxxObject`: **`libuno_sal.a` 2,395,198 B / 85 members, `libuno_salhelpergcc3.a` 36,052 B / 5, `libstorelo.a` 172,782 B / 11, `libreglo.a` 128,298 B / 6, `libunoidllo.a` 983,308 B / 7**, zero errors across all five. The sizes all moved, which is the cheapest proof the recompile was real. **gbuild does NOT rebuild when a platform makefile changes** — the first attempt at this fix looked like a no-op for exactly that reason |
+| M3 `soffice.wasm` links headless | **not started** — but three of its blockers fell out of M2: `unxgcc.mk`'s `echo -n` (decision 15), `-pthread` on the link line and `-pthread` on the *compile* line (decision 16). All three hit EVERY object or executable, not just `sal`'s test helpers, so M3 would have died on them within a minute — the third one silently |
 | M4 `.pptx` → PDF | **not started** |
 | M5 svp renders a slide to PNG | **not started** |
 | M6–M10 the wk VCL backend and the node | **not started** |
@@ -1314,6 +1416,55 @@ Reported, not installed, per the house rules:
 * **`getcwd` returns `"/"` (non-`NULL`) under wasmtime, `PATH_MAX` is 4096.**
   Which makes `osl_getProcessWorkingDir` — reached from `store`'s
   relative-filename branch — return `osl_Process_E_None` and `file:///`.
+* **`unoidl` cross-compiles untouched, and a wasm32 binary then READ an `.rdb`
+  written by the native arm64 build-side tool.** `./build-lo.sh unoidl.allbuild`
+  → `[build MOD] unoidl`, `grep -c 'error:'` = 0, first attempt.
+  `build/instdir/program/libunoidllo.a` = **983,308 bytes / 7 members**,
+  `llvm-objdump -h` → `file format wasm`. Then: three one-entity `.idl` files
+  → `instdir_for_build/LibreOfficeDev26.2_SDK/bin/unoidl-write` (arm64) → a
+  347-byte `probe.rdb` starting `55 4e 4f 49 44 4c ff 00` → a `wasm32-wasip2`
+  executable linked from `libunoidllo.a + libreglo.a + libstorelo.a +
+  libuno_salhelpergcc3.a + libuno_sal.a + libzlib.a` and run under
+  `wasmtime --dir=.::/`, which printed the five struct members with their types,
+  `MaxSlides = 305419896`, `HugeValue = 1311768467463790320`,
+  `Ratio = 0.1562500000` and `RED/GREEN/BLUE = 1/2/4`, exit 0.
+  **The first LibreOffice code this port has executed.**
+* **`-pthread` on the wasm COMPILE line breaks every `catch`, and the bisect is
+  reproducible in three commands.** Running the above with a *relative* URI
+  takes `Manager::loadProvider`'s `catch (FileFormatException &)` fallback and
+  trapped: `memory fault at wasm address 0x12f4678 in linear memory of size
+  0x980000`, exit 134, with `loadProvider` the only LibreOffice frame. A
+  verbatim copy of `loadProvider` compiled in a separate TU against the *same*
+  archives ran the fallback correctly — so the difference was the flags, not the
+  code. Recompiling that copy with `-pthread` added and nothing else reproduced
+  the identical fault. Putting `-pthread` on the link line too turns the same
+  bug into a diagnosable error: `relocation R_WASM_MEMORY_ADDR_TLS_SLEB cannot
+  be used against non-TLS symbol '__wasm_lpad_context'`, plus `--shared-memory
+  is disallowed by Unwind-wasm.c.o`. After the `core-0002` fix and a full
+  rebuild, the same binary reports `FileFormatException on probe.rdb: cannot
+  open legacy file: 6` and exits 1. See decision 16.
+* **`make verbose=t` is the only way to see a compile flag in this build**, and
+  it is worth the two minutes. It is what showed `-pthread` sitting between
+  `-std=c++20` and `-fwasm-exceptions` on the wasm command line, and what showed
+  that the first attempted fix (`gb_CXXFLAGS := $(filter-out …)`) had changed
+  nothing, because `unxgcc.mk:107` had already copied the value into
+  `gb_LinkTarget_CXXFLAGS`.
+* **gbuild does not rebuild when a platform makefile changes.** After editing
+  `WASI_INTEL_GCC.mk`, `./build-lo.sh unoidl.allbuild` compiled nothing and
+  exited 0. The five modules had to be forced with `rm -rf
+  build/workdir/{CxxObject,GenCxxObject,LinkTarget,Module}` and their `Dep/`
+  twins; `workdir_for_build` is a separate tree and was left alone, so the
+  native bootstrap did not have to be repeated.
+* **Six LibreOffice archives linked into one wasm component with no group
+  flags** — `wasm-component-ld` resolved `unoidl → reg → store → salhelper →
+  sal → zlib` in a single left-to-right pass, 4,099,070 bytes out. That is not
+  E1 (the real graph is ~200 archives and genuinely circular; this one is a
+  chain), but it is the first evidence in that direction and the first time
+  LibreOffice archives have been through the component linker at all.
+* **`sysconf(_SC_PAGESIZE)` returns 65536 under wasmtime** (`_SC_NPROCESSORS_ONLN`
+  returns 1). Non-zero, so `osl_mapFile`'s `osl_File_MapFlag_RandomAccess`
+  page-touch loop terminates instead of spinning; and `FileHandle_Impl`'s read
+  buffer is a 64 KiB `calloc` per open file handle rather than 4 KiB.
 
 ### What is asserted from reading only
 
