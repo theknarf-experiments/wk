@@ -46,10 +46,13 @@ and does not repeat the reasoning.
   link-line override it also covers libc++, libc++abi and the externals. All
   three build stages run it; `WASI_INTEL_GCC.mk` refuses to parse without it.
   See decision 12.
-* `patches/` — `core-0001` … `core-0006` plus its `README.md`. The two the
+* `patches/` — `core-0001` … `core-0008` plus its `README.md`. The two the
   header calls structural (`core-0001` the `configure.ac` host arm,
   `core-0002` the gbuild platform file) are the two `build-configure.sh`
-  refuses to run without.
+  refuses to run without. `core-0006` is every small in-file `#if defined(WASI)`
+  gap in `osl`; `core-0007` is the three `osl` subsystems that diverge whole
+  (see decision 14); `core-0008` is a one-word host-portability fix to
+  `unxgcc.mk` that has nothing to do with wasm (decision 15).
 * `mise.toml` — the staged tasks. Its `build` task **self-skips** while
   `patches/` is empty, so the repo-wide `mise run build-plugins` sweep does not
   sit in a LibreOffice build.
@@ -292,6 +295,55 @@ needed (`autogen.sh:321` only prepends it for `--host=wasm*-emscripten`); no
     internal CPython 3.12.14 for the build machine. The host's Python 3.14.7
     runs `native-code.py -g core -g draw` fine (verified: exit 0, 1447 lines,
     508 map entries).
+14. **`osl`'s WASI gaps split two ways, and the size of the divergence decides
+    which.** LibreOffice already splits `osl` by platform directory
+    (`sal/osl/unx` vs `sal/osl/w32`), so both shapes are native to the tree.
+    * **A small gap gets an in-file `#if defined(WASI)`** — `core-0006`. Nine
+      files, none of them restructured: the `chown`/`lchown`/`getuid` calls in
+      `file_misc.cxx` (policy: wk's vfs has no owners, so the call is dropped
+      and the mode/timestamp half of the same function still runs), the
+      synthetic `passwd` in `secimpl.hxx` + `security.cxx`, `tzset`/`timezone`
+      in `time.cxx`, and roughly a dozen socket constants and errnos that
+      wasi-libc keeps behind `__wasilibc_unmodified_upstream`.
+    * **A whole-subsystem divergence gets its own file** — `core-0007`, three
+      of them, selected by an `ifeq ($(OS),WASI)` in `Library_sal.mk`:
+      `process_wasi.cxx` (fork/exec/waitpid/socketpair/kill: 1200 lines of
+      primitives wasip2 does not have), `pipe_wasi.cxx` (an osl pipe is a named
+      AF_UNIX socket, and wasi-libc's `struct sockaddr_un` has **no `sun_path`
+      member at all** — the file cannot compile, never mind connect), and
+      `signal_wasi.cxx` (450 lines of `sigaction`/`siginfo_t`/`sigset_t`
+      replaced by two functions).
+    **They live in `sal/osl/unx/` with a `_wasi` suffix, NOT in a new
+    `sal/osl/wasi/`.** WASI reuses the other twenty-odd `unx` sources unchanged;
+    a directory of its own would advertise a platform port that does not exist
+    and would need copies of all of them to work.
+    The test of a stub is what a caller does with the answer, not whether it
+    compiles: `osl_getLastPipeError` returns `osl_Pipe_E_invalidError`
+    specifically because `officeipcthread.cxx:739-772` **retries forever** on
+    any other value, and `osl_joinProcessWithTimeout` deliberately does not
+    return `osl_Process_E_TimedOut` for the same reason. Same principle as the
+    thread shim's untimed wait: fail loudly at the fault, never livelock.
+15. **`unxgcc.mk`'s `$(shell echo -n …)` breaks on a macOS build host** —
+    `core-0008`, and it is not a wasm bug. The `DISABLE_DYNLOADING` branch of
+    `gb_LinkTarget__command_dynamiclink` builds its `-l` list with
+    `$(shell echo -n … | tee $@.linkdeps)`. The pipe forces make through
+    `$(SHELL)` = `/bin/sh`, and macOS's `/bin/sh` has a POSIX `echo` builtin
+    that prints `-n` **as a word**; the literal `-n` reaches the compiler as
+    `clang++: error: unknown argument: '-n'`. It has never bitten anyone
+    because iOS — the only other `DISABLE_DYNLOADING` target built on macOS —
+    takes `macosx.mk` instead of this file. Fixed with `printf '%s '`, which is
+    POSIX, identical on Linux, and emits nothing for an empty list. Verified by
+    running: `/bin/sh -c 'echo -n foo'` prints `-n foo` on this machine, while
+    a bare `$(shell echo -n a b)` in a test makefile does not — because without
+    a pipe make execs `/bin/echo` directly, and *that* one honours `-n`.
+16. **No `-pthread` on a WASI link line.** `unxgcc.mk:48-53` sets
+    `gb_CXX_LINKFLAGS := -pthread` whenever libc++ or libstdc++ is detected. On
+    a normal Unix that is nearly free advice; on wasm32 it is a target-feature
+    switch — clang expands it to `-matomics -mbulk-memory` and asks lld for
+    `--shared-memory`, and wasi-sdk's plain `wasm32-wasip2` sysroot has neither,
+    so the link dies with `wasm-ld: error: --shared-memory is disallowed by
+    Unwind-wasm.c.o`. `WASI_INTEL_GCC.mk` clears it. Nothing is lost:
+    `pthread_create` is an ENOTSUP stub on this target either way (decision 12).
 
 ## wk VCL backend vs. LO's qt6 backend on our Qt — recommendation
 
@@ -361,6 +413,22 @@ than the four items above.
 
 ## Traps this port already accounts for
 
+* **Applying `patches/` re-triggers configure, and a bare `build-lo.sh` cannot
+  survive it.** `build/Makefile:47-61` makes `config_host.mk` depend on
+  `$(SRCDIR)/configure.ac`, and `lo_apply_patches` rewrites `configure.ac` —
+  same bytes, new mtime — every time a session starts from a pristine `src/`.
+  Make then re-runs `autogen.sh` **from inside `build-lo.sh`**, whose `PATH`
+  deliberately excludes `.hosttools`, so the BUILD-side sub-configure dies for
+  want of GNU Make and gperf. That failure is not harmless: it **deletes
+  `build/config_build.mk`**, and the next `make` stops with `No rule to make
+  target '…/config_build.mk'`. Recovering costs a full `./build-configure.sh`
+  (~4 min). Two ways out, in order of preference:
+  1. run `./build-configure.sh` first in any session that applies patches — it
+     has the right `PATH` and is idempotent; or
+  2. if the patch content is genuinely unchanged from what the tree was
+     configured with, `touch build/config_host.mk` before `./build-lo.sh`.
+     This is a timestamp fix for a timestamp problem, and nothing else. Do not
+     reach for it after editing `configure.ac` for real.
 * **Same as Qt: the EH trap.** wasmtime runs with `wasm_exceptions` (exnref)
   and *rejects* wasi-sdk's default legacy encoding at instantiate time, so one
   bad translation unit poisons the component with an error pointing nowhere.
@@ -446,12 +514,25 @@ than the four items above.
   `svpinst.cxx:101` calls it. It is already `#ifdef`-ed out for
   EMSCRIPTEN/ANDROID/IOS; add WASI.
 * **`<pwd.h>` does not exist and `getuid()` is undeclared. Verified by
-  compiling.** `sal/osl/unx/secimpl.hxx` includes `<pwd.h>` and embeds a
-  `struct passwd`; `security.cxx:334` calls `getuid()`. This is a **build
-  break in `sal`**, the bottom-most module — not a runtime inconvenience. Copy
-  the ANDROID arm (`security.cxx:304-317`), which reads `HOME` straight out of
-  `rtl::Bootstrap` and returns. Consequence: never write
-  `UserInstallation=$SYSUSERHOME` the way iOS does; pass a literal path.
+  compiling. CLOSED in `core-0006`** — recorded here because the *shape* of the
+  fix is not what this document originally proposed. `sal/osl/unx/secimpl.hxx`
+  includes `<pwd.h>` and embeds a `struct passwd`; `security.cxx:334` calls
+  `getuid()`. This is a **build break in `sal`**, the bottom-most module — not
+  a runtime inconvenience.
+  The plan was to copy the ANDROID arm (`security.cxx:304-317`, `HOME` out of
+  `rtl::Bootstrap`). **The EMSCRIPTEN arm at `:131-160` was copied instead**,
+  because the ANDROID arm does not actually solve the build break: it only
+  changes where `osl_psz_getHomeDir` looks, and `oslSecurityImpl` still embeds
+  a `struct passwd` that no header declares. So `secimpl.hxx` declares the
+  record itself under `#if defined(WASI)` (seven members, only the ones osl
+  reads), and `osl_getCurrentSecurity` fills it with one synthetic user —
+  `wk`, uid/gid 1000, home `/root`, no loop and no `getpwuid_r`. `getuid()` is
+  gone rather than stubbed: the one place that compared it against `pw_uid` is
+  asking "is this the current user?", which has exactly one answer here.
+  The consequence the original bullet named still holds and is now load-bearing
+  in a second way: **never write `UserInstallation=$SYSUSERHOME`**, pass a
+  literal path. `$HOME` still wins over `pw_dir`; `pw_dir` is `/root` to agree
+  with the runtime image's `ENV HOME=/root` for the case where it does not.
 * **Three unguarded `dlsym`/`dlopen` calls. Verified by compiling and linking:**
   the header exists at `wasi-sysroot/include/wasm32-wasip2/dlfcn.h` but
   `wasm-ld: error: undefined symbol: dlsym` / `dlopen`. They are
@@ -899,8 +980,8 @@ Reported, not installed, per the house rules:
 | E2 182 MB component on `PluginHost` | **not started** |
 | M0 configure completes | **done** — `build/config_host.mk` has `export OS=WASI` |
 | M1 native bootstrap | **done** — 39 entries in `build/workdir_for_build/LinkTarget/Executable`, `wasmbridgegen` among them |
-| M2 `libsal.a` + a wasip2 program that runs | **in progress** — `zlib` and the UNO bridge cross-compile (`build/workdir/LinkTarget/StaticLibrary/libzlib.a`); `sal` is down to a handful of platform gaps (`chown`/`lchown`/`getuid`, `sys/wait.h`, and `<pthread.h>` not being included). Check `logs/lo-sal.allbuild-*.log` for the current list, newest last |
-| M3 `soffice.wasm` links headless | **not started** |
+| M2 `libsal.a` cross-builds | **the archive half is done** — `./build-lo.sh sal.allbuild` runs to `[build MOD] sal` with no errors from a freshly patched pristine tree. **`build/instdir/program/libuno_sal.a`, 2,401,182 bytes, 85 members** (not `workdir/LinkTarget/Library/` — under `DISABLE_DYNLOADING` a gbuild Library's target *is* `instdir/program/lib<name>.a`; `workdir/LinkTarget/Library/` holds only the `.objectlist` and `.exports`). `llvm-objdump -h` says `file format wasm`; 276 defined `osl_*` symbols; the archive contains `pipe_wasi.o`, `process_wasi.o`, `signal_wasi.o` and none of `pipe.o`, `process.o`, `signal.o`. `zlib` and the UNO bridge cross-compile alongside it. **The "+ a wasip2 program that runs" half is NOT done** — no `.wasm` has been executed |
+| M3 `soffice.wasm` links headless | **not started** — but two of its blockers fell out of M2 and are already fixed: `unxgcc.mk`'s `echo -n` (decision 15) and `-pthread` on the link line (decision 16). Both hit EVERY executable, not just `sal`'s test helpers, so M3 would have died on them within a minute |
 | M4 `.pptx` → PDF | **not started** |
 | M5 svp renders a slide to PNG | **not started** |
 | M6–M10 the wk VCL backend and the node | **not started** |
@@ -961,6 +1042,33 @@ Reported, not installed, per the house rules:
   can never be pulled in behind the shim's back.
 * `#include <pwd.h>` → *file not found*; `getuid()` → undeclared;
   `dlsym`/`dlopen` compile but fail to link with `undefined symbol`.
+* **`sal` cross-compiles.** `./build-lo.sh sal.allbuild` from a pristine tree
+  with all eight patches applied: `[build MOD] sal`, no errors,
+  `build/instdir/program/libuno_sal.a` = **2,401,182 bytes / 85 members**,
+  `llvm-objdump -h` → `file format wasm`, `llvm-nm --defined-only` → 276
+  `osl_*` symbols including `osl_executeProcess`, `osl_createPipe`,
+  `osl_getCurrentSecurity` and `onInitSignal()`. `llvm-ar t` confirms the
+  substitution really happened: `pipe_wasi.o`, `process_wasi.o` and
+  `signal_wasi.o` are members; `pipe.o`, `process.o` and `signal.o` are not.
+  The qa helper `Executable/osl_process_child` links too, which is the first
+  time anything in this port has been through `wasm-component-ld` end to end.
+* **The patch set round-trips.** `git -C src diff` of the working tree is
+  byte-identical to the tree produced by reverting to pristine and replaying
+  all eight patches (1338 lines either way — the sum of the eight files, so
+  nothing is duplicated between them or missing from them), and every patch
+  passes both `git apply --check` on a pristine tree and
+  `git apply --reverse --check` on a patched one, which is what makes
+  `build-configure.sh` re-runnable.
+* **`/bin/sh -c 'echo -n foo bar'` prints `-n foo bar` on this machine**, while
+  `$(shell echo -n a b)` in a standalone makefile under the same GNU Make 4.x
+  prints `a b` — make execs `/bin/echo` directly when there is no pipe, and
+  macOS's `/bin/echo` honours `-n`. That difference is the whole of decision 15.
+* **`tm_gmtoff` resolves on wasip2 in C++ but the name is conditional.**
+  wasi-libc declares the member as `__tm_gmtoff` and `<time.h>` renames it under
+  `_BSD_SOURCE`/`_GNU_SOURCE`; `clang++ --target=wasm32-wasip2 -std=c++20
+  -E -dM` shows `_GNU_SOURCE 1` (C++ mode sets it for libc++), so the rename is
+  in effect for every LibreOffice compile. A C compile with `-std=c23` would
+  NOT get it — worth knowing before adding a `.c` file that touches `struct tm`.
 * The `native-code.py` constructor-table pattern (`void X(void);` +
   cast-and-call) reproduced standalone: links silently, runs correctly, works
   from inside a static archive.

@@ -1,0 +1,30 @@
+diff --git a/solenv/gbuild/platform/unxgcc.mk b/solenv/gbuild/platform/unxgcc.mk
+index bb90b6527..945a5599f 100644
+--- a/solenv/gbuild/platform/unxgcc.mk
++++ b/solenv/gbuild/platform/unxgcc.mk
+@@ -129,6 +129,16 @@ gb_LinkTarget__NeedsCxxLinker = $(if $(CXXOBJECTS)$(GENCXXOBJECTS)$(EXTRAOBJECTL
+ # __ubsan_handle_dynamic_type_cache_miss_abort and __ubsan_vptr_type_cache from
+ # libclang_rt.ubsan_cxx-x86_64.a, and oosplash links against sal but itself only
+ # contains .c sources:
++#
++# printf, not `echo -n`, in the DISABLE_DYNLOADING branch below: that
++# $(shell ...) contains a pipe, so make runs it through $(SHELL) = /bin/sh
++# rather than exec-ing /bin/echo directly, and macOS's /bin/sh has a POSIX echo
++# builtin which prints "-n" as its first WORD. The literal -n then reaches the
++# linker: `clang++: error: unknown argument: '-n'`. This only bites a macOS
++# BUILD host with DISABLE_DYNLOADING, which until now meant nobody — iOS takes
++# macosx.mk rather than this file, and the Linux and Emscripten hosts that do
++# take it have a shell whose echo honours -n. printf '%s ' is POSIX, behaves
++# identically everywhere, and emits nothing at all for an empty list.
+ define gb_LinkTarget__command_dynamiclink
+ $(if $(call gb_LinkTarget__WantLock,$2), \
+    echo "$(call gb_Output_announce_str,$(2): wait for lock at $$(date -u),$(true),LNK,5)" ; \
+@@ -154,7 +164,7 @@ $(call gb_Helper_abbreviate_dirs,\
+ 		$(foreach extraobjectlist,$(EXTRAOBJECTLISTS),`cat $(extraobjectlist)`) \
+ 		$(if $(filter TRUE,$(DISABLE_DYNLOADING)), \
+ 		    -Wl$(COMMA)--start-group \
+-			$(shell echo -n \
++			$(shell printf '%s ' \
+ 				$(patsubst lib%.a,-l%,$(patsubst lib%.so,-l%,$(patsubst %.$(gb_Library_UDK_MAJORVER),%,$(foreach lib,$(LINKED_LIBS),$(call gb_Library_get_filename,$(lib)))))) \
+ 				$(foreach lib,$(LINKED_STATIC_LIBS),$(call gb_StaticLibrary_get_target,$(lib))) \
+ 				$(patsubst $(gb_LinkTarget__syslib),%,$(T_LIBS)) \

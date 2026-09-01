@@ -13,8 +13,231 @@ index 539d4ccfc..88cb0fd3f 100644
          case EUSERS:
              return osl_File_E_USERS;
  #endif
+diff --git a/sal/osl/unx/file_misc.cxx b/sal/osl/unx/file_misc.cxx
+index 500a26a04..70320136b 100644
+--- a/sal/osl/unx/file_misc.cxx
++++ b/sal/osl/unx/file_misc.cxx
+@@ -633,6 +633,13 @@ oslFileError SAL_CALL osl_replaceFile(rtl_uString* ustrFileURL, rtl_uString* ust
+ 
+     eRet = osl_moveFile(ustrFileURL, ustrDestURL);
+ 
++#if !defined(WASI)
++    /* Restore the group the destination had before the move. wasi-libc has no
++     * chown at all, and a wasm component has no user or group table for one to
++     * mean anything in: preopened directories carry the host's ownership and
++     * the guest cannot change it. Skipping the call loses nothing — st_gid on
++     * a WASI stat is whatever the host filesystem reports, and the replaced
++     * file keeps it. */
+     if (eRet == osl_File_E_None && nGid != -1)
+     {
+         int nRet = chown(destPath, -1, nGid);
+@@ -643,6 +650,9 @@ oslFileError SAL_CALL osl_replaceFile(rtl_uString* ustrFileURL, rtl_uString* ust
+                      "chown(" << destPath << "-1, " << nGid << "): " << UnixErrnoString(nRet));
+         }
+     }
++#else
++    (void) nGid;
++#endif
+ 
+     return eRet;
+ }
+@@ -944,6 +954,7 @@ void attemptChangeMetadata( const char* pszFileName, mode_t nMode, time_t nAcTim
+         }
+     }
+ 
++#if !defined(WASI)
+     if ( nUID != getuid() )
+     {
+         nUID=getuid();
+@@ -955,6 +966,14 @@ void attemptChangeMetadata( const char* pszFileName, mode_t nMode, time_t nAcTim
+     }
+     else
+         SAL_INFO("sal.file", "lchown(" << pszFileName << "): OK");
++#else
++    /* Neither lchown nor getuid exists in wasi-libc, and neither could do
++     * anything if it did: wk's vfs has no owners, so a copied file has no
++     * ownership to carry across. The rest of this function — the mode and the
++     * two timestamps — is metadata the vfs does model, and still runs. */
++    (void) nUID;
++    (void) nGID;
++#endif
+ }
+ 
+ static int oslDoCopyLink(const char* pszSourceFileName, const char* pszDestFileName)
+diff --git a/sal/osl/unx/secimpl.hxx b/sal/osl/unx/secimpl.hxx
+index e6628ae3f..151e6fdf0 100644
+--- a/sal/osl/unx/secimpl.hxx
++++ b/sal/osl/unx/secimpl.hxx
+@@ -21,7 +21,33 @@
+ 
+ #include <osl/security.h>
+ 
++#if defined(WASI)
++
++#include <sys/types.h>
++
++/* wasi-libc has no <pwd.h>: a wasm component has no user database to query,
++ * and there is no getpwuid_r to fill this in. osl's shape is still a passwd
++ * record, because every accessor below and in security.cxx reads one, so we
++ * declare the record and osl_getCurrentSecurity fills it with the single
++ * synthetic user described in PORTING.md. Only the members osl actually reads
++ * are declared; adding the rest would imply a fidelity that does not exist.
++ *
++ * pw_dir is the load-bearing one — LibreOffice derives the user-profile path
++ * from it — so it must be stable and non-empty, not merely non-crashing. */
++struct passwd
++{
++    char*  pw_name;
++    char*  pw_passwd;
++    uid_t  pw_uid;
++    gid_t  pw_gid;
++    char*  pw_gecos;
++    char*  pw_dir;
++    char*  pw_shell;
++};
++
++#else
+ #include <pwd.h>
++#endif
+ 
+ struct oslSecurityImpl
+ {
+diff --git a/sal/osl/unx/security.cxx b/sal/osl/unx/security.cxx
+index 733aa0dfc..09e3c680b 100644
+--- a/sal/osl/unx/security.cxx
++++ b/sal/osl/unx/security.cxx
+@@ -158,6 +158,42 @@ oslSecurity SAL_CALL osl_getCurrentSecurity()
+         p->m_pPasswd.pw_shell = buffer;
+         buffer += strlen(buffer) + 1;
+         return p;
++#elif defined(WASI)
++        /* One synthetic user, and no loop: wasi-libc has no user database, no
++         * getpwuid_r and no getuid, and in wk the node IS the process, so there
++         * is exactly one identity here and nobody to enumerate. Reporting
++         * failure instead is not an option — LibreOffice derives the
++         * user-profile path from this record, so the fields have to be stable
++         * (the same on every run, or a restart strands the profile) and
++         * non-empty, not merely non-crashing.
++         *
++         * pw_dir is "/root" to agree with the runtime image's `ENV HOME=/root`
++         * (PORTING.md, "The runtime image"). $HOME still wins over it in
++         * osl_psz_getHomeDir below; pw_dir is the answer when the image forgot
++         * to set it. pw_uid is non-zero so osl_isAdministrator says no: the
++         * component's authority comes from what the host preopened for it, not
++         * from a uid, and claiming root would only invite privileged paths. */
++        (void) found;
++        char * buffer = p->m_buffer;
++        assert(n >= 100);
++        strcpy(buffer, "wk");
++        p->m_pPasswd.pw_name = buffer;
++        buffer += strlen(buffer) + 1;
++        strcpy(buffer, "*");
++        p->m_pPasswd.pw_passwd = buffer;
++        buffer += strlen(buffer) + 1;
++        p->m_pPasswd.pw_uid = 1000;
++        p->m_pPasswd.pw_gid = 1000;
++        strcpy(buffer, "wk node");
++        p->m_pPasswd.pw_gecos = buffer;
++        buffer += strlen(buffer) + 1;
++        strcpy(buffer, "/root");
++        p->m_pPasswd.pw_dir = buffer;
++        buffer += strlen(buffer) + 1;
++        strcpy(buffer, "");
++        p->m_pPasswd.pw_shell = buffer;
++        buffer += strlen(buffer) + 1;
++        return p;
+ #else
+         switch (getpwuid_r(getuid(), &p->m_pPasswd, p->m_buffer, n, &found)) {
+         case ERANGE:
+@@ -332,7 +368,14 @@ static bool osl_psz_getHomeDir(oslSecurity Security, OString* pszDirectory)
+ #endif
+ 
+     /* if current user, check also environment for HOME */
++#if defined(WASI)
++    /* wasi-libc has no getuid, and osl_getCurrentSecurity minted the one and
++     * only identity this component will ever have, so "is this the current
++     * user?" is always yes. */
++    if (true)
++#else
+     if (getuid() == pSecImpl->m_pPasswd.pw_uid)
++#endif
+     {
+         char *pStr = nullptr;
+ #ifdef __sun
+diff --git a/sal/osl/unx/socket.cxx b/sal/osl/unx/socket.cxx
+index 28c7fd2e6..6c4a235a5 100644
+--- a/sal/osl/unx/socket.cxx
++++ b/sal/osl/unx/socket.cxx
+@@ -208,7 +208,16 @@ const struct
+     { ESOCKTNOSUPPORT, osl_Socket_E_TypeNoSupport     }, /* Socket type not supported */
+ #endif
+     { EOPNOTSUPP,      osl_Socket_E_OpNotSupport      }, /* Operation not supported on socket */
++    /* Three errnos wasi-libc does not define. Same treatment as
++       ESOCKTNOSUPPORT and ETOOMANYREFS above and below: DROP THE ROW rather
++       than map the name to 0, because row 0 of this table is
++       osl_Socket_E_None and an aliased 0 would report a real failure as
++       success. An unmapped errno already has a defined outcome —
++       osl_SocketErrorFromNative walks to the { -1, osl_Socket_E_InvalidError }
++       sentinel — so the loss is a coarser error, not a wrong one. */
++#ifdef EPFNOSUPPORT
+     { EPFNOSUPPORT,    osl_Socket_E_PfNoSupport       }, /* Protocol family not supported */
++#endif
+     { EAFNOSUPPORT,    osl_Socket_E_AfNoSupport       }, /* Address family not supported by
+                                                             protocol family */
+     { EADDRINUSE,      osl_Socket_E_AddrInUse         }, /* Address already in use */
+@@ -222,13 +231,17 @@ const struct
+     { ENOBUFS,         osl_Socket_E_NoBufferSpace     }, /* No buffer space available */
+     { EISCONN,         osl_Socket_E_IsConnected       }, /* Socket is already connected */
+     { ENOTCONN,        osl_Socket_E_NotConnected      }, /* Socket is not connected */
++#ifdef ESHUTDOWN
+     { ESHUTDOWN,       osl_Socket_E_Shutdown          }, /* Can't send after socket shutdown */
++#endif
+ #ifdef ETOOMANYREFS
+     { ETOOMANYREFS,    osl_Socket_E_TooManyRefs       }, /* Too many references: can't splice */
+ #endif
+     { ETIMEDOUT,       osl_Socket_E_TimedOut          }, /* Connection timed out */
+     { ECONNREFUSED,    osl_Socket_E_ConnRefused       }, /* Connection refused */
++#ifdef EHOSTDOWN
+     { EHOSTDOWN,       osl_Socket_E_HostDown          }, /* Host is down */
++#endif
+     { EHOSTUNREACH,    osl_Socket_E_HostUnreachable   }, /* No route to host */
+     { EWOULDBLOCK,     osl_Socket_E_WouldBlock        }, /* call would block on non-blocking socket */
+     { EALREADY,        osl_Socket_E_Already           }, /* operation already in progress */
+diff --git a/sal/osl/unx/sockimpl.hxx b/sal/osl/unx/sockimpl.hxx
+index e455d0ec0..37fdc3f9f 100644
+--- a/sal/osl/unx/sockimpl.hxx
++++ b/sal/osl/unx/sockimpl.hxx
+@@ -29,6 +29,19 @@
+ #define CLOSESOCKET_DOESNT_WAKE_UP_ACCEPT 1
+ #endif
+ 
++#if defined(WASI)
++/* wasi-libc's struct sockaddr_un carries a sun_family and NOTHING else — there
++ * are no UNIX-domain sockets on wasip2, so there is no path to hold (see
++ * __struct_sockaddr_un.h in the sysroot; the usual sun_path[108] is behind
++ * __wasilibc_unmodified_upstream and therefore absent). 108 is what every other
++ * libc uses, kept here only so oslPipeImpl keeps its shape for code that reads
++ * m_Name. Nothing on WASI ever fills it: sal/osl/unx/pipe_wasi.cxx replaces
++ * pipe.cxx and never constructs an address. */
++#define OSL_UNIX_PATH_MAX 108
++#else
++#define OSL_UNIX_PATH_MAX (sizeof sockaddr_un::sun_path)
++#endif
++
+ struct oslSocketImpl {
+     int                 m_Socket;
+     int                 m_nLastError;
+@@ -47,7 +60,7 @@ struct oslSocketAddrImpl
+ struct oslPipeImpl {
+     std::mutex m_Mutex;
+     int  m_Socket;
+-    char m_Name[sizeof sockaddr_un::sun_path];
++    char m_Name[OSL_UNIX_PATH_MAX];
+     oslInterlockedCount m_nRefCount;
+     bool m_bClosed;
+ #if defined(CLOSESOCKET_DOESNT_WAKE_UP_ACCEPT)
 diff --git a/sal/osl/unx/system.hxx b/sal/osl/unx/system.hxx
-index 078fa3489..9784da8fc 100644
+index 078fa3489..882898264 100644
 --- a/sal/osl/unx/system.hxx
 +++ b/sal/osl/unx/system.hxx
 @@ -20,7 +20,12 @@
@@ -30,20 +253,26 @@ index 078fa3489..9784da8fc 100644
  
  /* Make sockets of type AF_UNIX use underlying FS rights */
  #if defined(__sun) && !defined(_XOPEN_SOURCE)
-@@ -209,6 +214,29 @@ int macxp_resolveAlias(char *path, int buflen);
+@@ -209,6 +214,35 @@ int macxp_resolveAlias(char *path, int buflen);
  #   define  NO_PTHREAD_RTL
  #endif
  
 +#ifdef WASI
-+/* Deliberately NOT included, and each absent for a different reason:
-+ *   pthread.h   wasi-libc ships it, but pthread_create is an ENOTSUP stub.
-+ *               Including it invites code that links and then fails at run
-+ *               time; see PORTING.md on threads.
++/* pthread.h IS included. wasi-libc's pthread_create is an ENOTSUP stub, but
++ * its mutexes, condition variables and thread-specific keys are real, working,
++ * uncontended implementations, and osl uses those unconditionally —
++ * profile.cxx calls pthread_mutex_init/lock/unlock directly. Leaving the header
++ * out only moves the failure from "the one thing that cannot work" to "sal does
++ * not compile". The two waits that could not work are handled once, on the link
++ * line, by shim/libwkwasithreads.a; see PORTING.md decision 12.
++ *
++ * Deliberately NOT included, and each absent for a different reason:
 + *   dlfcn.h     ships, and dlopen is a stub. DISABLE_DYNLOADING means nothing
 + *               should reach for it.
 + *   sys/un.h, netinet/tcp.h, sys/ioctl.h
 + *               no AF_UNIX and no socket ioctls under wasi-libc.
 + */
++#   include <pthread.h>
 +#   include <sys/file.h>
 +#   include <sys/uio.h>
 +#   include <endian.h>
@@ -60,7 +289,7 @@ index 078fa3489..9784da8fc 100644
  #ifdef EMSCRIPTEN
  #   include <pthread.h>
  #   include <sys/file.h>
-@@ -231,7 +259,7 @@ int macxp_resolveAlias(char *path, int buflen);
+@@ -231,7 +265,7 @@ int macxp_resolveAlias(char *path, int buflen);
      !defined(__sun) && !defined(MACOSX) && \
      !defined(OPENBSD) && !defined(DRAGONFLY) && \
      !defined(IOS) && !defined(ANDROID) && \
@@ -69,3 +298,125 @@ index 078fa3489..9784da8fc 100644
  #   error "Target platform not specified!"
  #endif
  
+@@ -307,6 +341,48 @@ int macxp_resolveAlias(char *path, int buflen);
+ #ifndef MSG_MAXIOVLEN
+ #   define MSG_MAXIOVLEN    0
+ #endif
++/* wasi-libc declares these only under __wasilibc_unmodified_upstream, i.e. not
++ * at all: wasi:sockets exposes no such options and no out-of-band data. They
++ * take the same 0 that SO_ACCEPTCONN and friends above take on the unx flavours
++ * that lack them — osl's Option/MsgFlag maps are enum-indexed, so the entries
++ * have to exist, and 0 makes setsockopt/recv reject the request at the call
++ * rather than silently apply the wrong option. */
++#ifndef SO_DEBUG
++#   define SO_DEBUG         0
++#endif
++#ifndef SO_DONTROUTE
++#   define SO_DONTROUTE     0
++#endif
++#ifndef SO_BROADCAST
++#   define SO_BROADCAST     0
++#endif
++#ifndef SO_LINGER
++#   define SO_LINGER        0
++#endif
++#ifndef SO_OOBINLINE
++#   define SO_OOBINLINE     0
++#endif
++#ifndef MSG_OOB
++#   define MSG_OOB          0
++#endif
++#ifndef MSG_DONTROUTE
++#   define MSG_DONTROUTE    0
++#endif
++/* Socket TYPES, unlike the options above, must stay DISTINCT and non-zero:
++ * osl_SocketTypeFromNative walks TypeMap comparing values, so two entries
++ * sharing 0 would make it report the wrong oslSocketType (and 0 is already
++ * osl_Socket_TypeInvalid's marker). These are the numbers every other libc
++ * uses, so passing one to socket() gets the honest EPROTONOSUPPORT from
++ * wasi:sockets rather than a mis-mapped success. */
++#ifndef SOCK_RAW
++#   define SOCK_RAW         3
++#endif
++#ifndef SOCK_RDM
++#   define SOCK_RDM         4
++#endif
++#ifndef SOCK_SEQPACKET
++#   define SOCK_SEQPACKET   5
++#endif
+ 
+ /* BEGIN HACK */
+ /* dummy define and declarations for IPX should be replaced by */
+@@ -320,6 +396,15 @@ int macxp_resolveAlias(char *path, int buflen);
+ #define NSPROTO_SPX      1256
+ #define NSPROTO_SPXII    1257
+ 
++/* Same dummy treatment for the address family itself, on platforms whose libc
++ * does not name it (wasi-libc puts AF_IPX behind __wasilibc_unmodified_upstream).
++ * NOT 0: FamilyMap is searched by value in osl_AddrFamilyFromNative, and 0 is
++ * AF_UNSPEC, so a zero here would make an unspecified address report itself as
++ * IPX. 1000 matches the NSPROTO_IPX dummy directly above. */
++#ifndef AF_IPX
++#   define AF_IPX        1000
++#endif
++
+ /* END HACK */
+ 
+ #ifdef NO_PTHREAD_RTL
+diff --git a/sal/osl/unx/time.cxx b/sal/osl/unx/time.cxx
+index cf5473ff2..a8ff90d2e 100644
+--- a/sal/osl/unx/time.cxx
++++ b/sal/osl/unx/time.cxx
+@@ -31,8 +31,20 @@
+ #endif
+ 
+ /* FIXME: detection should be done in configure script */
++/* WASI is on this list because wasi-libc's struct tm really does carry the
++ * member: it is declared as __tm_gmtoff, and <time.h> renames it to tm_gmtoff
++ * under _BSD_SOURCE/_GNU_SOURCE, which clang defines for every C++ compile on
++ * this target (checked with -E -dM under -std=c++20, the standard this build
++ * uses). Taking the tm_gmtoff branch is not merely convenient — it is the ONLY
++ * branch that compiles here, because the two alternatives read the globals
++ * `timezone` and `altzone`, which wasi-libc puts behind
++ * __wasilibc_unmodified_upstream with the comment "WASI has no timezone
++ * tables". The value will be 0: with no tz database, wasi-libc's localtime_r
++ * is gmtime_r, so local time IS UTC inside a component. That is the truth
++ * about the environment, not an approximation — and it is why the bias
++ * arithmetic below stays correct rather than merely compiling. */
+ #if defined(MACOSX) || defined(IOS) || defined(FREEBSD) || defined(NETBSD) || \
+-    defined(LINUX) || defined(OPENBSD) || defined(DRAGONFLY)
++    defined(LINUX) || defined(OPENBSD) || defined(DRAGONFLY) || defined(WASI)
+ #define STRUCT_TM_HAS_GMTOFF 1
+ 
+ #elif defined(__sun)
+@@ -155,7 +167,11 @@ sal_Bool SAL_CALL osl_getTimeValueFromDateTime( const oslDateTime* pDateTime, Ti
+         time_t bias;
+ 
+         /* timezone corrections */
++#if !defined(WASI)
++        /* No tzset in wasi-libc, and nothing for it to do: there is no TZ
++         * database in the component and no $TZ that could select one. */
+         tzset();
++#endif
+ 
+ #if defined(STRUCT_TM_HAS_GMTOFF)
+         /* members of struct tm are corrected by mktime */
+diff --git a/sal/osl/unx/uunxapi.cxx b/sal/osl/unx/uunxapi.cxx
+index 6af6fbb61..3d226f3e6 100644
+--- a/sal/osl/unx/uunxapi.cxx
++++ b/sal/osl/unx/uunxapi.cxx
+@@ -768,8 +768,14 @@ std::string UnixErrnoString(int nErrno)
+         case EOPNOTSUPP:
+             return "EOPNOTSUPP";
+ #endif
++/* One of the handful of names in this switch that upstream left unguarded.
++   wasi-libc does not define it — wasi:sockets has one protocol family, so
++   "protocol family not supported" has no number — and every neighbour here is
++   already spelled this way, so it costs nothing to join them. */
++#ifdef EPFNOSUPPORT
+         case EPFNOSUPPORT:
+             return "EPFNOSUPPORT";
++#endif
+         case EAFNOSUPPORT:
+             return "EAFNOSUPPORT";
+         case EADDRINUSE:

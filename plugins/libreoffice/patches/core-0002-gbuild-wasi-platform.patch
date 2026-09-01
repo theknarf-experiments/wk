@@ -1,9 +1,9 @@
 diff --git a/solenv/gbuild/platform/WASI_INTEL_GCC.mk b/solenv/gbuild/platform/WASI_INTEL_GCC.mk
 new file mode 100644
-index 000000000..2c76c8167
+index 000000000..ff4ff6a97
 --- /dev/null
 +++ b/solenv/gbuild/platform/WASI_INTEL_GCC.mk
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,187 @@
 +# -*- Mode: makefile-gmake; tab-width: 4; indent-tabs-mode: t -*-
 +#
 +# This file is part of the LibreOffice project.
@@ -48,6 +48,23 @@ index 000000000..2c76c8167
 +include $(GBUILDDIR)/platform/unxgcc.mk
 +
 +gb_RUN_CONFIGURE := $(SRCDIR)/solenv/bin/run-configure
++
++# NO -pthread ON THE LINK LINE. unxgcc.mk:48-53 sets gb_CXX_LINKFLAGS := -pthread
++# unconditionally when HAVE_LIBSTDCPP or HAVE_LIBCPP is set — configure detects
++# libc++, so we get it — with the rationale that libstdc++/libc++ want it when
++# <thread> is included. On a normal Unix it is nearly free. On wasm32 it is not
++# a hint but a TARGET FEATURE SWITCH: clang turns -pthread into -matomics
++# -mbulk-memory and asks lld for --shared-memory, and wasi-sdk's plain
++# wasm32-wasip2 sysroot is built without either, so the link dies with
++#
++#   wasm-ld: error: --shared-memory is disallowed by Unwind-wasm.c.o because it
++#            was not compiled with 'atomics' or 'bulk-memory' features.
++#
++# Threads are not coming back by adding a flag: pthread_create is an ENOTSUP
++# stub on this target (see the shim block below and PORTING.md decision 12).
++# Cleared here rather than patched into unxgcc.mk because it is a genuine
++# platform difference, which is what this file is for.
++gb_CXX_LINKFLAGS :=
 +
 +# No .js, no .html: wasm-component-ld emits the component itself at link time,
 +# so an executable's target name is its bare name. unxgcc.mk defaults this to

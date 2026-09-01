@@ -1,0 +1,411 @@
+diff --git a/include/osl/process.h b/include/osl/process.h
+index 14b9c2028..6f1daf207 100644
+--- a/include/osl/process.h
++++ b/include/osl/process.h
+@@ -66,6 +66,13 @@ typedef enum {
+     osl_Process_E_NoPermission,         /* permission denied */
+     osl_Process_E_Unknown,              /* unknown error */
+     osl_Process_E_InvalidError,         /* unmapped error */
++    /* This platform cannot start a process at all. Distinct from
++       osl_Process_E_NotFound, which claims the image is missing and would send
++       whoever reads the log looking for a file that is present and fine.
++       Returned by every spawning entry point on WASI (sal/osl/unx/process_wasi.cxx),
++       where there is no fork, no exec and no second process to become.
++       Appended AFTER the existing values so none of them is renumbered. */
++    osl_Process_E_NotSupported,         /* no process execution on this platform */
+     osl_Process_E_FORCE_EQUAL_SIZE = SAL_MAX_ENUM
+ } oslProcessError;
+ 
+diff --git a/sal/Library_sal.mk b/sal/Library_sal.mk
+index dae08b235..a9a10c48e 100644
+--- a/sal/Library_sal.mk
++++ b/sal/Library_sal.mk
+@@ -168,15 +168,12 @@ $(eval $(call gb_Library_add_exception_objects,sal,\
+ 	sal/osl/unx/module \
+ 	sal/osl/unx/mutex \
+ 	sal/osl/unx/nlsupport \
+-	sal/osl/unx/pipe \
+-	sal/osl/unx/process \
+ 	sal/osl/unx/process_impl \
+ 	sal/osl/unx/profile \
+ 	sal/osl/unx/random \
+ 	sal/osl/unx/readwrite_helper \
+ 	sal/osl/unx/salinit \
+ 	sal/osl/unx/security \
+-	sal/osl/unx/signal \
+ 	sal/osl/unx/socket \
+ 	sal/osl/unx/soffice \
+ 	sal/osl/unx/tempfile \
+@@ -184,6 +181,36 @@ $(eval $(call gb_Library_add_exception_objects,sal,\
+ 	sal/osl/unx/time \
+ ))
+ 
++# Three osl subsystems where WASI diverges from unx wholesale rather than in
++# places, so each gets a file of its own instead of an #if through the middle
++# of a long one. All three replacements live in sal/osl/unx/ rather than a
++# sal/osl/wasi/ of their own: WASI reuses the other twenty-odd unx sources
++# unchanged, so a separate directory would advertise a full platform port that
++# does not exist and would need copies of everything to work at all.
++#
++#   process  fork/exec/waitpid/socketpair/kill, none of which wasip2 has;
++#            in wk the node IS the process. See the header comment in
++#            process_wasi.cxx.
++#   pipe     an osl pipe is a named AF_UNIX socket, and wasi-libc's
++#            struct sockaddr_un has no sun_path member at all — it does not
++#            compile, never mind connect. See pipe_wasi.cxx.
++#   signal   sigaction/siginfo_t/sigset_t, none of which wasi-libc has, for a
++#            subsystem whose whole job (crash reporting) wasmtime does better
++#            from outside the instance. See signal_wasi.cxx.
++ifeq ($(OS),WASI)
++$(eval $(call gb_Library_add_exception_objects,sal,\
++	sal/osl/unx/pipe_wasi \
++	sal/osl/unx/process_wasi \
++	sal/osl/unx/signal_wasi \
++))
++else
++$(eval $(call gb_Library_add_exception_objects,sal,\
++	sal/osl/unx/pipe \
++	sal/osl/unx/process \
++	sal/osl/unx/signal \
++))
++endif
++
+ # Note that the uunxapi.mm file just includes the uunxapi.cxx one. Ditto for system.mm
+ ifeq ($(OS),MACOSX)
+ $(eval $(call gb_Library_add_objcxxobjects,sal,\
+diff --git a/sal/osl/unx/pipe_wasi.cxx b/sal/osl/unx/pipe_wasi.cxx
+new file mode 100644
+index 000000000..a5d8808a6
+--- /dev/null
++++ b/sal/osl/unx/pipe_wasi.cxx
+@@ -0,0 +1,115 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This file is part of the LibreOffice project.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/* The WASI replacement for sal/osl/unx/pipe.cxx.
++ *
++ * WHY: osl's pipe is a NAMED UNIX-DOMAIN SOCKET, start to finish —
++ * socket(AF_UNIX, SOCK_STREAM), bind/connect through a sockaddr_un whose
++ * sun_path is the pipe's name in the filesystem, unlink on close. wasip2 has no
++ * UNIX-domain sockets, and wasi-libc says so structurally rather than by
++ * returning an error: its struct sockaddr_un is
++ *
++ *     struct sockaddr_un { sa_family_t sun_family; };
++ *
++ * with no sun_path at all (share/wasi-sysroot/include/wasm32-wasip2/
++ * __struct_sockaddr_un.h, the real sun_path[108] sitting unreachable behind
++ * __wasilibc_unmodified_upstream). Every address line in pipe.cxx therefore
++ * fails to COMPILE, not to run, which is why this is a separate file and not a
++ * set of guards.
++ *
++ * WHY NOT EMULATED ON SOMETHING ELSE: an osl pipe exists so that a SECOND
++ * soffice process can hand its command line to the first. In wk the node is the
++ * process — the same premise as process_wasi.cxx — so there is no second
++ * instance to be talking to. Building the pipe over a TCP socket on wk's fabric
++ * would be inventing a subsystem, and it would invent one whose only client is
++ * a scenario that cannot arise.
++ *
++ * WHY osl_Pipe_E_invalidError SPECIFICALLY, and this is the load-bearing
++ * choice: desktop/source/app/officeipcthread.cxx:739-772 loops
++ *
++ *     create(CREATE) failed?  -> try create(OPEN)
++ *     create(OPEN)   failed?  -> if getError() is ConnectionRefused or
++ *                                invalidError, give up with IPC_STATUS_PIPE_ERROR
++ *                                otherwise sleep 10ms and GO ROUND AGAIN
++ *
++ * so any other error value turns a permanent condition into an infinite
++ * 10-millisecond spin with no diagnostic — the same silent-livelock failure
++ * mode the thread shim's untimed wait was written to avoid. invalidError is
++ * also the honest name: the enum's own comment calls it "unmapped error", and
++ * there is no errno here to map, because no call was made.
++ *
++ * CONSEQUENCE, to be dealt with at M4 and not papered over here: with this in
++ * place RequestHandler::Enable returns IPC_STATUS_PIPE_ERROR and soffice exits
++ * during bootstrap rather than hanging. That is a loud, single-line failure at
++ * a known site, which is what should happen until desktop/ is given a
++ * no-IPC arm. Do not soften this into a fake success.
++ */
++
++#include <sal/config.h>
++
++#include <osl/pipe.h>
++#include <sal/log.hxx>
++
++oslPipe SAL_CALL osl_createPipe(rtl_uString* /*strPipeName*/, oslPipeOptions /*Options*/,
++                                oslSecurity /*Security*/)
++{
++    SAL_WARN("sal.osl.pipe", "osl_createPipe: no UNIX-domain sockets on WASI");
++    return nullptr;
++}
++
++void SAL_CALL osl_acquirePipe(oslPipe /*pPipe*/)
++{
++    /* No handle is ever produced above, so there is nothing to count. */
++}
++
++void SAL_CALL osl_releasePipe(oslPipe /*pPipe*/) {}
++
++void SAL_CALL osl_closePipe(oslPipe /*pPipe*/) {}
++
++oslPipe SAL_CALL osl_acceptPipe(oslPipe /*pPipe*/)
++{
++    SAL_WARN("sal.osl.pipe", "osl_acceptPipe: no UNIX-domain sockets on WASI");
++    return nullptr;
++}
++
++sal_Int32 SAL_CALL osl_receivePipe(oslPipe /*pPipe*/, void* /*pBuffer*/, sal_Int32 /*BufferSize*/)
++{
++    /* -1, not 0: 0 is "the peer closed cleanly, you read everything", and
++     * osl_readPipe's caller would take it as end of a valid stream. */
++    return -1;
++}
++
++sal_Int32 SAL_CALL osl_sendPipe(oslPipe /*pPipe*/, const void* /*pBuffer*/,
++                                sal_Int32 /*BufferSize*/)
++{
++    return -1;
++}
++
++sal_Int32 SAL_CALL osl_readPipe(oslPipe /*pPipe*/, void* /*pBuffer*/, sal_Int32 /*BufferSize*/)
++{
++    /* 0 bytes transferred. osl_readPipe's contract is "if less than BufferSize,
++     * the pipe was closed", and the unx version reaches the same answer by
++     * looping on osl_receivePipe until it returns <= 0. */
++    return 0;
++}
++
++sal_Int32 SAL_CALL osl_writePipe(oslPipe /*pPipe*/, const void* /*pBuffer*/,
++                                 sal_Int32 /*BufferSize*/)
++{
++    return 0;
++}
++
++oslPipeError SAL_CALL osl_getLastPipeError(oslPipe /*Pipe*/)
++{
++    /* See the header comment: this exact value is what stops officeipcthread
++     * spinning. */
++    return osl_Pipe_E_invalidError;
++}
++
++/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/sal/osl/unx/process_wasi.cxx b/sal/osl/unx/process_wasi.cxx
+new file mode 100644
+index 000000000..88ed260f3
+--- /dev/null
++++ b/sal/osl/unx/process_wasi.cxx
+@@ -0,0 +1,150 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This file is part of the LibreOffice project.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/* The WASI replacement for sal/osl/unx/process.cxx.
++ *
++ * WHY A SEPARATE FILE RATHER THAN #if BLOCKS: process.cxx is 1200 lines built
++ * on primitives wasi-libc does not have and wasip2 cannot express — fork(),
++ * execv(), waitpid() and <sys/wait.h>, socketpair(AF_UNIX) for the
++ * child-status channel, setuid/setgid/initgroups, kill(), and a detached osl
++ * thread per child to reap it. Guarding that in place would mean an #if
++ * through the middle of nearly every function, and the leftovers (the child
++ * list, its mutex, the status thread) would be dead structure kept alive only
++ * to be compiled out. LibreOffice already splits osl by platform; this is the
++ * same split, one file wide.
++ *
++ * WHY NOT SUPPORTED RATHER THAN EMULATED: in wk the NODE is the process.
++ * "LibreOffice spawns a helper" has no meaning here — there is no second
++ * instance to spawn into, and wk's own answer to exec (the wk:exec capability)
++ * deliberately runs a program IN the node rather than beside it, so it is not
++ * a drop-in for fork+exec semantics either. Every caller in the tree is a
++ * helper LibreOffice does not need in this configuration: the xpdfimport
++ * converter, the updater, the Java loader, the OpenCL blacklist prober, the
++ * shell job, the extension manager's unopkg. Each of them checks the return
++ * and reports failure, which is exactly what should happen.
++ *
++ * WHY osl_Process_E_NotSupported AND NOT osl_Process_E_NotFound: the nearest
++ * pre-existing value means "image not found", which would send whoever reads
++ * the log hunting for a file that is present and fine. The enumerator is added
++ * at the END of the list, after osl_Process_E_InvalidError and before the
++ * osl_Process_E_FORCE_EQUAL_SIZE guard, so no existing value is renumbered;
++ * the two switches over oslProcessError in the tree (dp_misc.cxx:356,
++ * javaloader.cxx:145) both have a `default:` arm, so neither breaks.
++ *
++ * WHAT STILL WORKS: everything about the CURRENT process. That lives in
++ * process_impl.cxx (argv, environment, working directory, locale, executable
++ * file) and is untouched. osl_getProcessInfo below keeps answering
++ * osl_Process_IDENTIFIER for the current process, because getpid() is real on
++ * wasip2 and callers such as cppu/source/uno/lbenv.cxx:795 and
++ * comphelper/traceevent use it to tag names — they pass a null handle and are
++ * asking about themselves, not about a child.
++ */
++
++#include <sal/config.h>
++
++#include <osl/process.h>
++#include <sal/log.hxx>
++
++#include <unistd.h>
++
++oslProcessError SAL_CALL osl_executeProcess_WithRedirectedIO(
++    rtl_uString* /*ustrImageName*/, rtl_uString* /*ustrArguments*/[],
++    sal_uInt32 /*nArguments*/, oslProcessOption /*Options*/, oslSecurity /*Security*/,
++    rtl_uString* /*ustrWorkDir*/, rtl_uString* /*ustrEnvironment*/[],
++    sal_uInt32 /*nEnvironmentVars*/, oslProcess* pProcess, oslFileHandle* pInputWrite,
++    oslFileHandle* pOutputRead, oslFileHandle* pErrorRead)
++{
++    SAL_WARN("sal.osl", "osl_executeProcess: no child processes on WASI");
++
++    /* Leave every out-parameter as the caller will read it on failure. The unx
++     * implementation only ever writes them on success, so a caller that checks
++     * the return value first is safe either way; a caller that does not is
++     * safer with nullptr than with an uninitialised handle. */
++    if (pProcess != nullptr)
++        *pProcess = nullptr;
++    if (pInputWrite != nullptr)
++        *pInputWrite = nullptr;
++    if (pOutputRead != nullptr)
++        *pOutputRead = nullptr;
++    if (pErrorRead != nullptr)
++        *pErrorRead = nullptr;
++
++    return osl_Process_E_NotSupported;
++}
++
++oslProcessError SAL_CALL osl_executeProcess(
++    rtl_uString* ustrImageName, rtl_uString* ustrArguments[], sal_uInt32 nArguments,
++    oslProcessOption Options, oslSecurity Security, rtl_uString* ustrWorkDir,
++    rtl_uString* ustrEnvironment[], sal_uInt32 nEnvironmentVars, oslProcess* pProcess)
++{
++    return osl_executeProcess_WithRedirectedIO(ustrImageName, ustrArguments, nArguments, Options,
++                                               Security, ustrWorkDir, ustrEnvironment,
++                                               nEnvironmentVars, pProcess, nullptr, nullptr,
++                                               nullptr);
++}
++
++oslProcessError SAL_CALL osl_terminateProcess(oslProcess /*Process*/)
++{
++    /* Nothing was ever started, so there is no handle a caller could
++     * legitimately be holding, and none this could kill. */
++    return osl_Process_E_NotSupported;
++}
++
++oslProcess SAL_CALL osl_getProcess(oslProcessIdentifier /*Ident*/)
++{
++    /* The unx version answers only for processes that exist. None does: there
++     * are no children, and wasip2 gives a component no view of anything
++     * outside itself, so even the "alien process" path has nothing to find. */
++    return nullptr;
++}
++
++void SAL_CALL osl_freeProcessHandle(oslProcess /*Process*/)
++{
++    /* Nothing above ever allocates one. */
++}
++
++oslProcessError SAL_CALL osl_getProcessInfo(oslProcess Process, oslProcessData Fields,
++                                            oslProcessInfo* pInfo)
++{
++    if (pInfo == nullptr || pInfo->Size != sizeof(oslProcessInfo))
++        return osl_Process_E_Unknown;
++
++    pInfo->Fields = 0;
++
++    /* Only the current process (a null handle) can be described, and only its
++     * identity: getpid() is real on wasip2. There is no exit code, because
++     * nothing was spawned, and no heap or CPU accounting — the unx code reads
++     * those out of /proc, which does not exist here. Reporting Fields != the
++     * requested Fields is how this function already says "I could not answer
++     * all of that", so callers asking for more get the same E_Unknown they
++     * would get on a Unix without /proc. */
++    if (Process == nullptr && (Fields & osl_Process_IDENTIFIER))
++    {
++        pInfo->Ident = getpid();
++        pInfo->Fields |= osl_Process_IDENTIFIER;
++    }
++
++    return (pInfo->Fields == Fields) ? osl_Process_E_None : osl_Process_E_Unknown;
++}
++
++oslProcessError SAL_CALL osl_joinProcessWithTimeout(oslProcess /*Process*/,
++                                                    const TimeValue* /*pTimeout*/)
++{
++    /* Deliberately NOT osl_Process_E_TimedOut, which is the answer a caller
++     * would loop on. There is no process to wait for and no amount of waiting
++     * will produce one. */
++    return osl_Process_E_NotSupported;
++}
++
++oslProcessError SAL_CALL osl_joinProcess(oslProcess Process)
++{
++    return osl_joinProcessWithTimeout(Process, nullptr);
++}
++
++/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/sal/osl/unx/signal_wasi.cxx b/sal/osl/unx/signal_wasi.cxx
+new file mode 100644
+index 000000000..646710a99
+--- /dev/null
++++ b/sal/osl/unx/signal_wasi.cxx
+@@ -0,0 +1,53 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This file is part of the LibreOffice project.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/* The WASI replacement for sal/osl/unx/signal.cxx.
++ *
++ * WHY A SEPARATE FILE RATHER THAN #if BLOCKS: signal.cxx is 450 lines and
++ * essentially all of it is the POSIX signal machinery — a table of 20 signals,
++ * two handler typedefs taking siginfo_t*, sigaction/sigemptyset/sigprocmask,
++ * SA_RESTART|SA_SIGINFO, a chain-to-the-previous-handler path, and a backtrace
++ * printer. wasi-libc has none of that: no sigaction, no struct sigaction, no
++ * siginfo_t, no sigset_t, no SA_* flags. Guarding it in place would leave one
++ * `#if !defined(WASI)` wrapped around the whole file, which is a worse way of
++ * spelling "this file is not built here".
++ *
++ * WHAT IT DOES: nothing, successfully. osl's signal layer exists for crash
++ * REPORTING — printStack() on SIGSEGV, the breakpad hook, the "Fatal exception"
++ * banner. A wasm trap already produces a better artefact than any of that:
++ * wasmtime unwinds and prints the guest backtrace with function names, from
++ * outside the crashed instance, which a handler running inside it could not do.
++ * There is also nothing to install a handler ON — no engine delivers POSIX
++ * signals to a wasm guest.
++ *
++ * WHY "successfully" AND NOT "false": the two return values are not a
++ * pass/fail report to a caller that could react. signalshared.cxx stores
++ * onInitSignal()'s result in bInitSignal and re-runs the initialiser on every
++ * osl_addSignalHandler/osl_removeSignalHandler/osl_raiseSignal until it is
++ * true. Returning false would therefore not "report the truth" — it would make
++ * sal retry a no-op forever, once per call, and leave the flag permanently
++ * wrong. The signal HANDLER LIST is unaffected either way: osl_raiseSignal and
++ * the whole osl_Signal_User path are pure userspace bookkeeping in
++ * signalshared.cxx and keep working here, which is the part LibreOffice
++ * actually calls at run time.
++ *
++ * These are exactly the values the unx implementation returns on success —
++ * onInitSignal() true meaning "installed", onDeInitSignal() false meaning
++ * "no longer installed" — so nothing downstream can tell the difference.
++ */
++
++#include <sal/config.h>
++
++#include <signalshared.hxx>
++
++bool onInitSignal() { return true; }
++
++bool onDeInitSignal() { return false; }
++
++/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
