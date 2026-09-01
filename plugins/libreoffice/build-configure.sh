@@ -106,10 +106,14 @@ args=(
   # Two consequences worth knowing. (a) enable_sdremote=no removes the Impress
   # Remote, which is where 7 of sd/'s 8 thread-creation sites live — a free win
   # for the threadless story. (b) it also defines ENABLE_WASM_STRIP_PREMULTIPLY
-  # (config_host.mk.in:270 wires it straight to ENABLE_WASM_STRIP), which
-  # switches vcl/headless/CairoCommon.cxx:558,775 to NON-premultiplied alpha.
-  # That is the behaviour the wk compositor wants; note it beside
-  # --enable-cairo-rgba below, they are two halves of the same pixel decision.
+  # (config_host.mk.in:270 wires it straight to ENABLE_WASM_STRIP). That flag
+  # does NOT change the alpha convention, despite its name: at
+  # vcl/headless/CairoCommon.cxx:558,775 and BitmapTools.cxx:334 it only chooses
+  # between arithmetic and a 128 KB lookup table for the same premultiply and
+  # unpremultiply. The pixels stay premultiplied either way. Recorded because
+  # this comment used to claim the opposite, and that claim cost an hour of
+  # suspicion during a rendering fault that turned out to be a broken PNG
+  # decoder in the test harness, not LibreOffice at all.
   "--enable-wasm-strip"
 
   # ---- no dlopen, one statically-linked binary -------------------------------

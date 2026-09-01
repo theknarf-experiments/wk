@@ -70,3 +70,4 @@ harness/Cargo.lock
 # fonts LO needs get compiled/staged into the image -- but the files themselves
 # are not ours to commit.
 fonts/
+work/
