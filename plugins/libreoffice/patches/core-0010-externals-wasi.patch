@@ -218,6 +218,19 @@ index 0f542e684..f3c353265 100644
  			$(if $(filter FUZZERS,$(BUILD_TYPE)), \
  				--disable-shared, \
  				$(if $(filter LINUX,$(OS)), \
+diff --git a/external/fontconfig/Module_fontconfig.mk b/external/fontconfig/Module_fontconfig.mk
+index 391f6dabc..3892a0bf2 100644
+--- a/external/fontconfig/Module_fontconfig.mk
++++ b/external/fontconfig/Module_fontconfig.mk
+@@ -11,7 +11,7 @@ $(eval $(call gb_Module_Module,fontconfig))
+ 
+ $(eval $(call gb_Module_add_targets,fontconfig,\
+ 	ExternalProject_fontconfig \
+-	$(if $(filter EMSCRIPTEN,$(OS)),ExternalPackage_fontconfig_data) \
++	$(if $(filter EMSCRIPTEN WASI,$(OS)),ExternalPackage_fontconfig_data) \
+ 	$(if $(filter FONTCONFIG,$(BUILD_TYPE)),ExternalPackage_fontconfig) \
+ 	UnpackedTarball_fontconfig \
+ ))
 diff --git a/external/harfbuzz/ExternalProject_harfbuzz.mk b/external/harfbuzz/ExternalProject_harfbuzz.mk
 index 98ae5b93e..aeb5c6295 100644
 --- a/external/harfbuzz/ExternalProject_harfbuzz.mk

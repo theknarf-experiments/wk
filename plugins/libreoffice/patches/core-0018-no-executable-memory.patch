@@ -1,0 +1,30 @@
+diff --git a/bridges/source/cpp_uno/shared/vtablefactory.cxx b/bridges/source/cpp_uno/shared/vtablefactory.cxx
+index 96077742e..5076e41c0 100644
+--- a/bridges/source/cpp_uno/shared/vtablefactory.cxx
++++ b/bridges/source/cpp_uno/shared/vtablefactory.cxx
+@@ -104,11 +104,25 @@ extern "C" void * allocExec(
+     if (p == MAP_FAILED) {
+         p = nullptr;
+     }
++#if defined WASI
++    // No mprotect on WASI, and nothing for it to grant: wasi-libc's mman shim
++    // answers ENOSYS for PROT_EXEC, because wasm code lives in a separate
++    // address space that linear memory cannot name, let alone execute. What
++    // this arena hands out is not code either -- the gcc3_wasm bridge fills its
++    // "vtables" with function-table indices, which is why that bridge's
++    // flushCode is already an empty function. Read/write is the requirement.
++    //
++    // Without this the mprotect fails, the block is thrown away, the arena
++    // returns null and VtableFactory::createVtables throws std::bad_alloc --
++    // which is to say every UNO exception that has to cross the bridge kills
++    // the process, and reports itself as running out of memory.
++#else
+     else if (mprotect (p, n, PROT_READ | PROT_WRITE | PROT_EXEC) == -1)
+     {
+         munmap (p, n);
+         p = nullptr;
+     }
++#endif
+ #if defined MACOSX
+ done:
+ #endif

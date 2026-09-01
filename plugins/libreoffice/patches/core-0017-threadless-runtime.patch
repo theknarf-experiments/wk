@@ -1,0 +1,81 @@
+diff --git a/configmgr/source/components.cxx b/configmgr/source/components.cxx
+index 85e66a1f2..19c0f39db 100644
+--- a/configmgr/source/components.cxx
++++ b/configmgr/source/components.cxx
+@@ -305,12 +305,26 @@ void Components::writeModifications() {
+     case ModificationTarget::None:
+         break;
+     case ModificationTarget::File:
++#if defined WASI
++        // Synchronously, like the Dconf case below and for a plainer reason:
++        // there is no second thread to defer to. WriteThread is a debounce and
++        // nothing else -- it waits a second after being triggered so that a
++        // burst of setPropertyValue calls costs one write of the whole file.
++        // Without it the writes are more frequent; the file is the same.
++        try {
++            writeModFile(*this, modificationFileUrl_, data_);
++        } catch (css::uno::RuntimeException &) {
++            // Ignore write errors, instead of aborting, as WriteThread does:
++            TOOLS_WARN_EXCEPTION("configmgr", "error writing modifications");
++        }
++#else
+         if (!writeThread_.is()) {
+             writeThread_ = new WriteThread(
+                 &writeThread_, *this, modificationFileUrl_, data_);
+             writeThread_->launch();
+         }
+         writeThread_->trigger();
++#endif
+         break;
+     case ModificationTarget::Dconf:
+ #if ENABLE_DCONF
+diff --git a/desktop/source/app/officeipcthread.cxx b/desktop/source/app/officeipcthread.cxx
+index 9c1a04076..dafabc917 100644
+--- a/desktop/source/app/officeipcthread.cxx
++++ b/desktop/source/app/officeipcthread.cxx
+@@ -668,7 +668,12 @@ RequestHandler::Status RequestHandler::Enable(bool ipc)
+     if( pGlobal.is() )
+         return IPC_STATUS_OK;
+ 
+-#if !HAVE_FEATURE_DESKTOP || HAVE_FEATURE_MACOSX_SANDBOX || defined(EMSCRIPTEN)
++// WASI joins them. This is the "only one office per user" handshake: it opens a
++// named pipe and runs a thread to listen on it, so a second soffice can hand its
++// command line to the first. A component is alone in its own instance -- there
++// is no second one to hand anything to -- and it has neither osl pipes nor
++// pthread_create to do it with.
++#if !HAVE_FEATURE_DESKTOP || HAVE_FEATURE_MACOSX_SANDBOX || defined(EMSCRIPTEN) || defined(WASI)
+     ipc = false;
+ #endif
+ 
+diff --git a/package/source/zipapi/ZipFile.cxx b/package/source/zipapi/ZipFile.cxx
+index 62c1efb7a..598bf2ded 100644
+--- a/package/source/zipapi/ZipFile.cxx
++++ b/package/source/zipapi/ZipFile.cxx
+@@ -734,7 +734,10 @@ uno::Reference< XInputStream > ZipFile::createStreamForZipEntry(
+     if (!bUseBufferedStream)
+         return xSrcStream;
+ 
+-#ifndef EMSCRIPTEN
++// WASI joins EMSCRIPTEN: XBufferedThreadedStream inflates on a second thread so
++// the caller can read while it works, and there is no second thread. XBufferedStream
++// below is the same decompression done when it is asked for.
++#if !defined EMSCRIPTEN && !defined WASI
+     static const sal_Int32 nThreadingThreshold = 10000;
+ 
+     // "encrypted-package" is the only data stream, no point in threading it
+diff --git a/sax/source/fastparser/fastparser.cxx b/sax/source/fastparser/fastparser.cxx
+index 744458972..437ae8f40 100644
+--- a/sax/source/fastparser/fastparser.cxx
++++ b/sax/source/fastparser/fastparser.cxx
+@@ -825,7 +825,10 @@ void FastSaxParserImpl::parseStream(const InputSource& rStructSource)
+         rEntity.mxDocumentHandler->startDocument();
+     }
+ 
+-#ifdef EMSCRIPTEN
++// WASI for the same reason as EMSCRIPTEN: the threaded parser reads and
++// tokenises on a second thread and hands the tokens to the consumer, and there
++// is no second thread here. The non-threaded path below is the same parser.
++#if defined EMSCRIPTEN || defined WASI
+     rEntity.mbEnableThreads = false;
+ #else
+     if (!getenv("SAX_DISABLE_THREADS") && !m_bDisableThreadedParser)

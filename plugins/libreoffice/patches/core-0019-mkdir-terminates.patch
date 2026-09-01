@@ -1,0 +1,18 @@
+--- a/sal/osl/unx/file_misc.cxx
++++ b/sal/osl/unx/file_misc.cxx
+@@ -531,6 +531,15 @@
+     // return before
+     int pos = path_make_parent(dir_path);
+ 
++    // ...except when we do not. path_make_parent returns 0 and leaves the path
++    // alone once there is nothing left to strip, so an ENOENT on a top-level
++    // directory recurses on the same string forever. On Unix that cannot
++    // happen: mkdir("/a_dir") answers EEXIST or EACCES, never ENOENT. Under
++    // WASI it is the normal answer for any path outside a preopened directory,
++    // and the recursion exhausts the stack instead of reporting it.
++    if (pos == 0)
++        return osl_error;
++
+     osl_error = create_dir_recursively_(
+         dir_path, aDirectoryCreationCallbackFunc, pData);
+ 

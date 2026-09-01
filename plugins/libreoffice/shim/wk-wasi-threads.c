@@ -85,7 +85,9 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -223,3 +225,132 @@ int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex)
  * functions whose body is a bare `unreachable`: abort(), __stack_chk_fail_local()
  * and pthread_cond_wait(). There is no fourth landmine of this shape.
  */
+
+/* ------------------------------------------------------------------------
+ * Two traces, for the two failures this port keeps meeting blind.
+ *
+ * On wasm exception handling std::current_exception() is NULL inside a
+ * std::terminate handler when terminate was reached by an exception escaping a
+ * noexcept function -- verified with a five-line test case, not assumed. So the
+ * usual trick of rethrowing inside the handler to print e.what() cannot work,
+ * and an uncaught exception reaches the host as a bare
+ *
+ *     wasm trap: wasm `unreachable` instruction executed
+ *
+ * with no type and no message. The last place the type is still in hand is the
+ * throw itself. Likewise a std::bad_alloc says nothing about who asked for how
+ * much, and wasi-libc's dlmalloc does not go much past 2 GB.
+ *
+ * wasm-ld's --wrap (set in WASI_INTEL_GCC.mk) routes every throw and every
+ * malloc in the binary -- LibreOffice's, libc++'s and all ~149 external
+ * libraries' -- through here first. Both are off unless their environment
+ * variable is set, because LibreOffice throws thousands of exceptions it goes
+ * on to catch during an ordinary startup.
+ *
+ * The flags are read in a constructor rather than lazily on first use, and the
+ * malloc path formats its own decimal instead of calling snprintf. Both are
+ * scars: wasi-libc's getenv allocates (__wasilibc_ensure_environ), so reading
+ * the environment from inside malloc is unbounded recursion, and it presents as
+ * the trace being silent and the process dying somewhere else entirely.
+ * ------------------------------------------------------------------------ */
+
+static size_t wk_alloc_threshold = 0;
+static int wk_trace_throw = 0;
+static const char *wk_trap_throw = NULL;
+
+__attribute__((constructor)) static void wk_trace_init(void)
+{
+    const char *env = getenv("WK_LO_TRACE_ALLOC");
+    if (env != NULL)
+        wk_alloc_threshold = (size_t)strtoull(env, NULL, 0);
+    wk_trace_throw = getenv("WK_LO_TRACE_THROW") != NULL;
+    wk_trap_throw = getenv("WK_LO_TRAP_THROW");
+}
+
+void __real___cxa_throw(void *thrown, void *tinfo, void (*dest)(void *));
+
+void __wrap___cxa_throw(void *thrown, void *tinfo, void (*dest)(void *))
+{
+    if (wk_trace_throw && tinfo != NULL)
+    {
+        /* Itanium ABI: std::type_info is { vtable pointer; const char *name; },
+         * so the mangled name is the second pointer-sized word. Mangled rather
+         * than demangled on purpose -- __cxa_demangle allocates, and this runs
+         * with an exception already in flight. */
+        const char *name = ((const char *const *)tinfo)[1];
+        fprintf(stderr, "wk: throw %s\n", name != NULL ? name : "(no name)");
+        fflush(stderr);
+    }
+    if (wk_trap_throw != NULL && tinfo != NULL)
+    {
+        /* Abort at the throw rather than at the catch. wasmtime prints a
+         * backtrace for a trap, and a thrown-and-uncaught C++ exception gives
+         * one only from wherever std::terminate happened to be reached -- which
+         * on this platform is a frame with nothing to do with the cause. Set
+         * WK_LO_TRAP_THROW to a substring of the mangled type name and the
+         * backtrace names the code that threw it. */
+        const char *name = ((const char *const *)tinfo)[1];
+        if (name != NULL && strstr(name, wk_trap_throw) != NULL)
+        {
+            fprintf(stderr, "wk: trapping at throw of %s\n", name);
+            fflush(stderr);
+            abort();
+        }
+    }
+    __real___cxa_throw(thrown, tinfo, dest);
+}
+
+void *__real_malloc(size_t n);
+
+/* Append a decimal number to a buffer, returning the new end. */
+static char *wk_dec(char *p, size_t v)
+{
+    char tmp[24];
+    char *t = tmp + sizeof tmp;
+    do { *--t = (char)('0' + (v % 10)); v /= 10; } while (v != 0);
+    while (t != tmp + sizeof tmp)
+        *p++ = *t++;
+    return p;
+}
+
+void *__wrap_malloc(size_t n)
+{
+    if (wk_alloc_threshold != 0 && n >= wk_alloc_threshold)
+    {
+        /* Hand-rolled, and write(2) rather than stdio: everything in stdio can
+         * allocate, and allocating inside the allocator on the way to an
+         * allocation failure is how a diagnostic becomes the crash. */
+        char buf[32];
+        char *p = buf + sizeof buf;
+        size_t v = n;
+        *--p = '\n';
+        do { *--p = (char)('0' + (v % 10)); v /= 10; } while (v != 0);
+        *--p = ' ';
+        *--p = 'c'; *--p = 'o'; *--p = 'l'; *--p = 'l'; *--p = 'a'; *--p = 'm';
+        *--p = ' '; *--p = ':'; *--p = 'k'; *--p = 'w';
+        (void)!write(2, p, (size_t)(buf + sizeof buf - p));
+    }
+    void *p = __real_malloc(n);
+
+    /* Always reported, with no environment variable to ask for it: an
+     * allocation failure in a 32-bit address space is the end of the process,
+     * and the size and the heap it failed against are the whole diagnosis.
+     * Without this the caller sees only std::bad_alloc, which on this platform
+     * arrives as an unnamed trap. */
+    if (p == NULL && n != 0)
+    {
+        char buf[128];
+        char *q = buf;
+        const char *lead = "wk: malloc FAILED for ";
+        while (*lead != '\0') *q++ = *lead++;
+        q = wk_dec(q, n);
+        lead = " bytes, linear memory is ";
+        while (*lead != '\0') *q++ = *lead++;
+        q = wk_dec(q, (size_t)__builtin_wasm_memory_size(0) * 65536u);
+        lead = " bytes\n";
+        while (*lead != '\0') *q++ = *lead++;
+        (void)!write(2, buf, (size_t)(q - buf));
+    }
+
+    return p;
+}

@@ -1,9 +1,9 @@
 diff --git a/solenv/gbuild/platform/WASI_INTEL_GCC.mk b/solenv/gbuild/platform/WASI_INTEL_GCC.mk
 new file mode 100644
-index 000000000..e033dd754
+index 000000000..b8ac2e14e
 --- /dev/null
 +++ b/solenv/gbuild/platform/WASI_INTEL_GCC.mk
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,246 @@
 +# -*- Mode: makefile-gmake; tab-width: 4; indent-tabs-mode: t -*-
 +#
 +# This file is part of the LibreOffice project.
@@ -179,6 +179,15 @@ index 000000000..e033dd754
 +# -z stack-size        8 MiB. The default 64 KiB is nowhere near enough for
 +#                      LibreOffice's recursive XML and layout code; this is the
 +#                      same value plugins/qt settled on.
++# --wrap=__cxa_throw   routes every throw through the shim so an uncaught one
++#                      can be named. std::current_exception() is NULL in a
++#                      terminate handler under wasm EH, so the throw site is the
++#                      last place the type is known. Silent unless
++#                      WK_LO_TRACE_THROW is set; see shim/wk-wasi-threads.c.
++#                      WK_LO_TRAP_THROW=<mangled substring> aborts AT the throw,
++#                      so wasmtime's backtrace names the code that threw.
++# --wrap=malloc        the same, for allocation size. Silent unless
++#                      WK_LO_TRACE_ALLOC is set to a byte threshold.
 +gb_LinkTarget_LDFLAGS += \
 +	-Wl,--whole-archive $(gb_WASI_SHIM) -Wl,--no-whole-archive \
 +	-lunwind \
@@ -188,6 +197,8 @@ index 000000000..e033dd754
 +	-lwasi-emulated-process-clocks \
 +	-lwasi-emulated-getpid \
 +	-Wl,-z,stack-size=8388608 \
++	-Wl,--wrap=__cxa_throw \
++	-Wl,--wrap=malloc \
 +
 +# unxgcc.mk:155-166 wraps every link's library list in
 +# -Wl,--start-group ... -Wl,--end-group, on both the DISABLE_DYNLOADING and the

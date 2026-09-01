@@ -30,20 +30,23 @@ index 0a4ccf76e..f953747c3 100644
  #else
      OUString uri(get_this_libpath());
 diff --git a/desktop/source/app/sofficemain.cxx b/desktop/source/app/sofficemain.cxx
-index ac0f72ec5..5bb828ed3 100644
+index ac0f72ec5..a0d129cdd 100644
 --- a/desktop/source/app/sofficemain.cxx
 +++ b/desktop/source/app/sofficemain.cxx
-@@ -35,6 +35,9 @@
+@@ -35,6 +35,12 @@
  #include <systools/win32/test_desktop.hxx>
  #endif
  
 +#include <cstdio>
++#include <cstdlib>
 +#include <exception>
++#include <com/sun/star/uno/Exception.hpp>
++#include <rtl/ustring.hxx>
 +
  #include <rtl/bootstrap.hxx>
  #include <sal/main.h>
  #include <tools/extendapplicationenvironment.hxx>
-@@ -72,6 +75,12 @@ extern "C" int DESKTOP_DLLPUBLIC soffice_main()
+@@ -72,6 +78,34 @@ extern "C" int DESKTOP_DLLPUBLIC soffice_main()
  #if defined ANDROID
      try {
          rtl::Bootstrap::setIniFilename("file:///assets/program/lofficerc");
@@ -52,11 +55,33 @@ index ac0f72ec5..5bb828ed3 100644
 +    // "thrown Wasm exception" and no type, no message, and no frame below
 +    // soffice_main. A release build has no SAL_WARN either, so stderr here is
 +    // the only channel there is.
++    //
++    // The terminate handler covers the case the try/catch cannot: an exception
++    // escaping a noexcept context -- SalUserEventList::DispatchUserEvents is
++    // the one that bites -- where std::terminate runs before any catch. Then
++    // the trap is a bare `unreachable` inside abort() and the exception is
++    // never named at all.
++    std::set_terminate([] {
++        std::fprintf(stderr, "soffice: std::terminate\n");
++        if (std::exception_ptr const e = std::current_exception()) {
++            try {
++                std::rethrow_exception(e);
++            } catch (const css::uno::Exception & x) {
++                std::fprintf(stderr, "  uncaught UNO exception: %s\n",
++                             OUStringToOString(x.Message, RTL_TEXTENCODING_UTF8).getStr());
++            } catch (const std::exception & x) {
++                std::fprintf(stderr, "  uncaught: %s\n", x.what());
++            } catch (...) {
++                std::fprintf(stderr, "  uncaught exception of unknown type\n");
++            }
++        }
++        std::abort();
++    });
 +    try {
  #endif
      tools::extendApplicationEnvironment();
  
-@@ -126,6 +135,15 @@ extern "C" int DESKTOP_DLLPUBLIC soffice_main()
+@@ -126,6 +160,15 @@ extern "C" int DESKTOP_DLLPUBLIC soffice_main()
               OUStringToOString(e.Message, RTL_TEXTENCODING_UTF8).getStr());
          throw; // to get exception type printed
      }

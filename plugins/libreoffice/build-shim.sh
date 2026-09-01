@@ -52,8 +52,8 @@ rm -f "$SHIM_LIB"
 # Prove the archive defines what it claims to, rather than trusting that the
 # file compiled. A shim that silently stopped exporting pthread_cond_timedwait
 # would hand the abort back at run time, months later.
-for sym in pthread_cond_timedwait pthread_cond_wait; do
+for sym in pthread_cond_timedwait pthread_cond_wait __wrap___cxa_throw __wrap_malloc; do
     "$LO_NM" --defined-only "$SHIM_LIB" | grep -q " T $sym\$" \
         || lo_die "$SHIM_LIB does not define $sym"
 done
-echo "    defines pthread_cond_timedwait, pthread_cond_wait ($(wc -c <"$SHIM_LIB" | tr -d ' ') bytes)"
+echo "    defines pthread_cond_timedwait, pthread_cond_wait, __wrap___cxa_throw, __wrap_malloc ($(wc -c <"$SHIM_LIB" | tr -d ' ') bytes)"
