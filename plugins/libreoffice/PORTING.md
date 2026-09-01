@@ -388,6 +388,110 @@ needed (`autogen.sh:321` only prepends it for `--host=wasm*-emscripten`); no
       block. Verified by reading `conditn.cxx:101-130`; the standard guarantees
       the predicate is tested first.
 
+18. **`store` and `registry` need no patch either, but for a completely
+    different reason from `salhelper`'s — and the reason is the one that
+    matters most for this port.** These two libraries are what reads
+    `services.rdb` and `types.rdb`, and **those files are written at build time
+    by the native arm64 build-side tools and read at run time by the wasm32
+    binary**. A word-size or endianness dependence in the format would not
+    produce a compile error; it would produce a `CannotActivateFactoryException`
+    at first service lookup, months later. So the thing to check here was never
+    whether the module compiles — it was whether the *format* survives the
+    crossing. It does, and it was measured rather than assumed:
+    * **Every on-disk `store` page struct has identical size and alignment on
+      both sides.** Dumped with `clang++ -Xclang -fdump-record-layouts` twice —
+      once `--target=wasm32-wasip2 -I build/config_host`, once with the native
+      `/usr/bin/clang++ -I build/config_build` — over `OStorePageGuard`,
+      `OStorePageDescriptor`, `OStorePageLink`, `PageData`, `OStoreDataPageData`,
+      `OStoreIndirectionPageData`, `OStorePageKey`, `OStorePageNameBlock`,
+      `OStoreDirectoryDataBlock`, `OStoreDirectoryDataBlock::LinkTable`,
+      `OStoreDirectoryPageData`, `OStoreBTreeEntry` and `OStoreBTreeNodeData`.
+      `diff` of the two dumps: **identical**, down to `dsize` and the padding
+      (`OStoreDirectoryPageData` is `sizeof=420, dsize=417` on both).
+      **Use the two `config_*` directories, not one.** A first attempt compiled
+      the native side against `build/config_host` and got `sizeof=16, align=8`
+      for a struct of two `sal_uInt32` — a self-inflicted artefact, because
+      `SAL_TYPES_SIZEOFLONG` is 4 in `config_host` and 8 in `config_build` and
+      `sal/types.h:52` picks `long` for `sal_Int32` when it is 4.
+    * That mismatch is worth understanding rather than working around, because
+      it **confirms decision 9 from an angle decision 9 never claimed**. On
+      wasm32 `SIZEOFLONG` is 4, so `sal_Int32` is `long`; on the arm64 build
+      host it is `int`. Different underlying type, identical width, identical
+      layout — and "`sal_Int32` is `long`" is exactly the branch **32-bit Intel
+      Linux** takes. Keeping `CPUNAME=INTEL`/`RTL_ARCH=x86` does not merely
+      avoid unaudited `#ifdef`s; the type system genuinely lands on the `i386`
+      configuration, which upstream still builds. The only visible consequence
+      is that `SAL_PRIuUINT32` expands to `"lu"` here and `"u"` there, which is
+      why both compiles are warning-clean.
+    * Endianness is a non-question and the code says so: `store/source/
+      storbase.hxx:59` and `registry/source/reflread.cxx:471` are the tree's
+      only two `OSL_BIGENDIAN` sites in these modules, and `include/osl/
+      endian.h`'s WASI arm (`core-0004`) defines `OSL_LITENDIAN` because wasm is
+      little-endian *by specification*, on every engine. `registry`'s
+      `REGTYPE_IEEE_NATIVE` double punning then takes the same little-endian
+      arm x86 takes.
+    * `registry` has **no struct-layout dependence at all**: `reflcnst.hxx`
+      addresses the blob through `readUINT16`/`readUINT32` at
+      `sizeof(sal_uIntNN)`-derived byte offsets, never by overlaying a struct.
+    * **`mmap` works on wasip2 — verified by running, not by linking.**
+      `sys/mman.h` `#error`s unless `_WASI_EMULATED_MMAN` is set, and the
+      implementation lives in `libwasi-emulated-mman.a`, which `core-0002`
+      already puts on the link line. Its `mman.c.obj` undefines exactly
+      `malloc`, `free`, `pread` and `errno` — i.e. **a file mapping is a
+      `malloc` plus a `pread`, a copy and not a mapping**. Under wasmtime, both
+      `MAP_SHARED` and `MAP_PRIVATE` with `PROT_READ` over a real file succeed
+      and return the right bytes, a non-zero unaligned `offset` is honoured,
+      and a length past EOF zero-fills. So `sal/osl/unx/file.cxx:1445`'s
+      `MAP_SHARED` call — the one `osl_mapFile` is built on — is fine as-is.
+    * The copy semantics are harmless **here** for a reason worth naming,
+      because it will not hold everywhere: `MappedLockBytes` is constructed
+      only inside `if (eAccessMode == storeAccessMode::ReadOnly)`
+      (`lockbyte.cxx:851`), and its `writePageAt_Impl`/`writeAt_Impl`/
+      `setSize_Impl` all return an error unconditionally. Nothing ever writes
+      through a mapping, so "writes do not propagate" is unobservable. Any
+      *other* consumer of `osl_mapFile` that expects shared-write semantics is
+      a real bug on this target; there is no such consumer in these modules.
+    * And even that is belt-and-braces: `FileLockBytes_createInstance` treats a
+      failed mapping as an ordinary condition — `if (!rxLockBytes.is())` falls
+      through to a plain `FileLockBytes` on `osl_readFileAt`. **Two independent
+      reasons the `.rdb` read path works**, which is why no `osl_mapFile` stub
+      was written.
+    * **A trap that is currently disarmed, and must stay that way:
+      `fcntl(fd, F_SETLK, &flock)` returns `-1`/`ENOTSUP` (58) on wasip2**
+      (verified under wasmtime). That is the non-macOS branch of
+      `osl_openFile`'s locking block (`file.cxx:1262-1279`), and it does not
+      degrade — it `close()`s the fd and returns the error, so **every
+      write-mode `osl_openFile` in the whole product would fail**. It never
+      fires only because `osl_file_queryLocking` (`file.cxx:814-829`) returns
+      false unless `getenv("SAL_ENABLE_FILE_LOCKING")` is set, and
+      `HAVE_O_EXLOCK` is defined nowhere in the tree so the `getenv` branch is
+      the live one. **Never set `SAL_ENABLE_FILE_LOCKING` in the wk node's
+      environment.** This belongs in the runtime image's notes, not in a patch:
+      the correct WASI behaviour for a single-process node is exactly "no file
+      locking", and upstream already spells that as an unset variable.
+    * Neither module contains a single `osl::Condition`, `osl::Thread`,
+      `salhelper::Thread` or `std::condition_variable` — `grep` over both
+      `source/` trees returns nothing. All they use is `osl::Mutex`, which is a
+      working `pthread_mutex` here. **The thread shim is not involved at all**,
+      which is what makes decision 17's reachability rule unnecessary rather
+      than merely satisfied.
+    * Undefined-symbol audit of the two archives, as the cheap check that no
+      unsupported subsystem is reached: `libstorelo.a` wants sixteen `osl_*`
+      symbols, all file, mutex and URL; `libreglo.a` wants six plus `unlink`.
+      **Nothing from `process_wasi.cxx`, `pipe_wasi.cxx` or `signal_wasi.cxx`.**
+      The one that looked like an exception is not: `osl_getProcessWorkingDir`
+      lives in the *unmodified* `process_impl.cxx`, not in the replaced
+      `process.cxx`, and it is `getcwd` + a URL conversion. Under wasmtime
+      `getcwd` returns `"/"`, so `store`'s relative-path branch
+      (`lockbyte.cxx:228`) resolves to `file:///…` and returns
+      `osl_Process_E_None` — a truthful answer for a node whose vfs root is `/`.
+    * `regview` and `registry_helper` are **not built**, and that is
+      `Module_registry.mk` doing it, not us: `gb_CondExeRegistryTools`
+      (`Conditions.mk:19`) takes the empty arm whenever `DISABLE_DYNLOADING` is
+      set. Confirmed by `grep regview` over the build log returning nothing.
+      Which means **this port still has not linked a single executable** — E1
+      and the `--start-group` question remain entirely untouched.
+
 ## wk VCL backend vs. LO's qt6 backend on our Qt — recommendation
 
 **Recommendation: the wk VCL backend. The qt6 route is a strict superset of its
@@ -1025,6 +1129,7 @@ Reported, not installed, per the house rules:
 | M1 native bootstrap | **done** — 39 entries in `build/workdir_for_build/LinkTarget/Executable`, `wasmbridgegen` among them |
 | M2 `libsal.a` cross-builds | **the archive half is done** — `./build-lo.sh sal.allbuild` runs to `[build MOD] sal` with no errors from a freshly patched pristine tree. **`build/instdir/program/libuno_sal.a`, 2,401,182 bytes, 85 members** (not `workdir/LinkTarget/Library/` — under `DISABLE_DYNLOADING` a gbuild Library's target *is* `instdir/program/lib<name>.a`; `workdir/LinkTarget/Library/` holds only the `.objectlist` and `.exports`). `llvm-objdump -h` says `file format wasm`; 276 defined `osl_*` symbols; the archive contains `pipe_wasi.o`, `process_wasi.o`, `signal_wasi.o` and none of `pipe.o`, `process.o`, `signal.o`. `zlib` and the UNO bridge cross-compile alongside it. **The "+ a wasip2 program that runs" half is NOT done** — no `.wasm` has been executed |
 | M2½ `salhelper` cross-builds | **done, and it needed no patch at all** — `./build-lo.sh salhelper.allbuild` reaches `[build MOD] salhelper` with **zero `error:` lines on the first attempt**. **`build/instdir/program/libuno_salhelpergcc3.a`, 36,028 bytes, 5 members** (`condition.o`, `dynload.o`, `simplereferenceobject.o`, `thread.o`, `timer.o`); `llvm-objdump -h` → `file format wasm`. The `uno_`/`gcc3` decoration in the filename comes from `gb_Library_set_is_ure_library_or_dependency`, not from anything we did. The first module in this port to cross-compile untouched — see decision 17 for what that does and does not prove |
+| M2¾ `store` + `registry` cross-build | **done, and neither needed a patch** — `./build-lo.sh store.allbuild` then `./build-lo.sh registry.allbuild`, each reaching `[build MOD]` with **zero `error:` lines and zero wasm-side `warning:` lines on the first attempt**. **`build/instdir/program/libstorelo.a`, 171,528 bytes, 11 members** (`object.o`, `lockbyte.o`, `storbase.o`, `storbios.o`, `storcach.o`, `stordata.o`, `stordir.o`, `storlckb.o`, `stortree.o`, `storpage.o`, `store.o`) and **`build/instdir/program/libreglo.a`, 128,776 bytes, 6 members** (`keyimpl.o`, `reflread.o`, `reflwrit.o`, `regimpl.o`, `registry.o`, `regkey.o`); `llvm-objdump -h` says `file format wasm` for both. These are the two libraries that read `services.rdb`/`types.rdb`, so this rung is about **file-format portability, not compilation** — see decision 18, which is where the on-disk layout was actually checked rather than assumed |
 | M3 `soffice.wasm` links headless | **not started** — but two of its blockers fell out of M2 and are already fixed: `unxgcc.mk`'s `echo -n` (decision 15) and `-pthread` on the link line (decision 16). Both hit EVERY executable, not just `sal`'s test helpers, so M3 would have died on them within a minute |
 | M4 `.pptx` → PDF | **not started** |
 | M5 svp renders a slide to PNG | **not started** |
@@ -1180,6 +1285,35 @@ Reported, not installed, per the house rules:
 * `share/config/soffice.cfg` size breakdown (1650 of 1656 manifest entries
   resolved to sources and summed) and `icon-themes/colibre` zipped.
 * `df -h` → 309 GB free; `sysctl` → 10 cores, 32 GB.
+* **`store` and `registry` cross-build untouched.** `./build-lo.sh
+  store.allbuild` and `./build-lo.sh registry.allbuild`, each from the freshly
+  patched tree: `grep -c 'error:'` → **0** on both logs, and `grep 'warning:'`
+  filtered of the build-side noise → **0** on both. `git -C src status
+  --porcelain` afterwards lists exactly the 22 modified and 4 untracked paths
+  the eight patches describe and nothing else, so this milestone added nothing
+  to `src/`. Artefacts and member lists are in the M2¾ row.
+* **The on-disk `store` format is word-size independent.** Thirteen page
+  structs dumped with `-Xclang -fdump-record-layouts` under
+  `--target=wasm32-wasip2 -I build/config_host` and under native
+  `/usr/bin/clang++ -I build/config_build`; `diff` of the two → identical.
+  This is the fact that says the native build-side tools' `services.rdb` and
+  `types.rdb` are readable by the wasm32 binary. See decision 18, including the
+  `config_host`-vs-`config_build` mistake that makes the check look like it
+  fails when it does not.
+* **`mmap` of a real file works under wasmtime on wasip2.** `MAP_SHARED` and
+  `MAP_PRIVATE` with `PROT_READ` both return the file's bytes; a non-zero
+  unaligned `offset` is honoured (offset 6 of `"hello store"` → `"store"`); a
+  length past EOF zero-fills. It is `libwasi-emulated-mman.a`, whose
+  `mman.c.obj` undefines only `malloc`, `free`, `pread` and `errno` — so the
+  "mapping" is a copy. `llvm-nm` finds **no `mmap` in `libc.a` at all**; the
+  emulation archive is the only provider, and `core-0002` already links it.
+* **`fcntl(fd, F_SETLK, &flock)` returns `-1` with `errno` 58 (`ENOTSUP`) under
+  wasmtime.** Harmless today only because `osl_file_queryLocking` is gated on
+  `SAL_ENABLE_FILE_LOCKING`; see decision 18 for why that variable must never
+  be set in the runtime image.
+* **`getcwd` returns `"/"` (non-`NULL`) under wasmtime, `PATH_MAX` is 4096.**
+  Which makes `osl_getProcessWorkingDir` — reached from `store`'s
+  relative-filename branch — return `osl_Process_E_None` and `file:///`.
 
 ### What is asserted from reading only
 
