@@ -1,0 +1,44 @@
+diff --git a/solenv/gbuild/gbuild.mk b/solenv/gbuild/gbuild.mk
+index b3ae841c1..16ba823ce 100644
+--- a/solenv/gbuild/gbuild.mk
++++ b/solenv/gbuild/gbuild.mk
+@@ -194,6 +194,39 @@ gb_CONFIGURE_PLATFORMS := --build=$(BUILD_PLATFORM) --host=$(HOST_PLATFORM)
+ 
+ include $(GBUILDDIR)/platform/$(OS)_$(CPUNAME)_$(COM).mk
+ 
++# The meson cross-build file, shared by every external that uses meson: cairo,
++# pixman and harfbuzz had three byte-identical copies of it. Meson cannot read
++# environment variables from inside a cross file, so it has to be generated.
++#
++# TODO: this is pretty ugly...
++gb_MESON_python_listify = '$(subst $(WHITESPACE),'$(COMMA)',$(strip $(1)))'
++
++# WASI names the linker explicitly. Meson identifies one by grepping the first
++# line of `$(CC) -Wl,--version` for "LLD", and wasi-sdk's driver for wasip2 is
++# wasm-component-ld, which answers "wasm-component-ld 0.5.27" -- so meson stops
++# with "Unable to detect linker". -fuse-ld=lld reaches the wasm-ld underneath,
++# which does say LLD. These three externals all build static archives, so the
++# componentising step this bypasses has no work to do for them anyway.
++gb_MESON_cross_ld = $(call gb_MESON_python_listify,$(if $(filter WASI,$(OS)),lld,$(subst -fuse-ld=,,$(USE_LD))))
++
++# RTL_ARCH says x86 on a wasm32 build -- it is LibreOffice's name for the ABI
++# family, not the machine -- and meson would hand these projects their x86
++# branch and its SSE2 sources. wasm32 is a cpu_family meson knows.
++define gb_MESON_CROSS_FILE
++[binaries]
++c = [$(call gb_MESON_python_listify,$(gb_CC))]
++cpp = [$(call gb_MESON_python_listify,$(gb_CXX))]
++c_ld = [$(gb_MESON_cross_ld)]
++cpp_ld = [$(gb_MESON_cross_ld)]
++ar = '$(AR)'
++strip = '$(STRIP)'
++[host_machine]
++system = '$(if $(filter WNT,$(OS)),windows,$(if $(filter MACOSX,$(OS)),darwin,$(if $(filter ANDROID,$(OS)),android,$(if $(filter WASI,$(OS)),wasi,linux))))'
++cpu_family = '$(if $(filter WASI,$(OS)),wasm32,$(subst X86_64,x86_64,$(RTL_ARCH)))'
++cpu = '$(if $(filter WASI,$(OS)),wasm32,$(if $(filter x86,$(RTL_ARCH)),i686,$(if $(filter X86_64,$(RTL_ARCH)),x86_64,$(if $(filter AARCH64,$(RTL_ARCH)),aarch64,armv7))))'
++endian = '$(ENDIANNESS)'
++endef
++
+ # this is optional
+ include $(SRCDIR)/RepositoryFixes.mk
+ 

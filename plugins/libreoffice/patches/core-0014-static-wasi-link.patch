@@ -1,0 +1,102 @@
+diff --git a/desktop/Module_desktop.mk b/desktop/Module_desktop.mk
+index 862662e2a..746c88ecd 100644
+--- a/desktop/Module_desktop.mk
++++ b/desktop/Module_desktop.mk
+@@ -95,7 +95,10 @@ $(eval $(call gb_Module_add_targets,desktop,\
+     WinResTarget_swriter \
+ ))
+ 
+-else ifeq (,$(filter MACOSX ANDROID iOS HAIKU EMSCRIPTEN,$(OS)))
++# WASI joins the list: oosplash is the launcher that forks soffice.bin, waits
++# on a Unix socket and passes signals along. None of fork, AF_UNIX or sigaction
++# exists here, and a component that IS the office has nothing to launch anyway.
++else ifeq (,$(filter MACOSX ANDROID iOS HAIKU EMSCRIPTEN WASI,$(OS)))
+ 
+ ifeq (,$(filter FUZZERS,$(BUILD_TYPE)))
+ $(eval $(call gb_Module_add_targets,desktop,\
+diff --git a/sd/source/core/typemap.cxx b/sd/source/core/typemap.cxx
+index 4378ad2d2..605e24187 100644
+--- a/sd/source/core/typemap.cxx
++++ b/sd/source/core/typemap.cxx
+@@ -97,6 +97,9 @@
+ 
+ #ifdef DISABLE_DYNLOADING
+ /* Avoid clash with the ones from svx/source/form/typemap.cxx */
++/* ...and, for the eight below, from svx, starmath and sfx2's appbas.cxx.
++   Which names collide depends on which modules a static build links, so
++   this list is as long as the largest such build has needed so far. */
+ #define aSfxBoolItem_Impl sd_source_core_typemap_aSfxBoolItem_Impl
+ #define aSfxInt32Item_Impl sd_source_core_typemap_aSfxInt32Item_Impl
+ #define aSfxStringItem_Impl sd_source_core_typemap_aSfxStringItem_Impl
+@@ -115,6 +118,14 @@
+ #define aSvxUnderlineItem_Impl sd_source_core_typemap_aSvxUnderlineItem_Impl
+ #define aSvxOverlineItem_Impl sd_source_core_typemap_aSvxOverlineItem_Impl
+ #define aSvxWeightItem_Impl sd_source_core_typemap_aSvxWeightItem_Impl
++#define aSfxStringListItem_Impl sd_source_core_typemap_aSfxStringListItem_Impl
++#define aSfxUnoFrameItem_Impl sd_source_core_typemap_aSfxUnoFrameItem_Impl
++#define aSvxKerningItem_Impl sd_source_core_typemap_aSvxKerningItem_Impl
++#define aSvxLRSpaceItem_Impl sd_source_core_typemap_aSvxLRSpaceItem_Impl
++#define aSvxLineSpacingItem_Impl sd_source_core_typemap_aSvxLineSpacingItem_Impl
++#define aSvxULSpaceItem_Impl sd_source_core_typemap_aSvxULSpaceItem_Impl
++#define aSvxZoomItem_Impl sd_source_core_typemap_aSvxZoomItem_Impl
++#define aSvxZoomSliderItem_Impl sd_source_core_typemap_aSvxZoomSliderItem_Impl
+ #endif
+ 
+ #define SFX_TYPEMAP
+@@ -138,6 +149,14 @@
+ #undef aSvxShadowedItem_Impl
+ #undef aSvxTextLineItem_Impl
+ #undef aSvxWeightItem_Impl
++#undef aSfxStringListItem_Impl
++#undef aSfxUnoFrameItem_Impl
++#undef aSvxKerningItem_Impl
++#undef aSvxLRSpaceItem_Impl
++#undef aSvxLineSpacingItem_Impl
++#undef aSvxULSpaceItem_Impl
++#undef aSvxZoomItem_Impl
++#undef aSvxZoomSliderItem_Impl
+ #endif
+ 
+ /* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/shell/Module_shell.mk b/shell/Module_shell.mk
+index 58a598714..04f7ec961 100644
+--- a/shell/Module_shell.mk
++++ b/shell/Module_shell.mk
+@@ -105,6 +105,17 @@ ifneq ($(OS),WNT)
+ 
+ $(eval $(call gb_Module_add_targets,shell,\
+ 	StaticLibrary_xmlparser \
++))
++
++# cmdmail and friends exist to hand a document to the desktop's mail client,
++# and cmdmailsuppl.cxx does it with popen("xdg-email ..."). A component has no
++# process to spawn and no desktop to spawn it into, so the feature has nothing
++# to do on WASI -- senddoc is a shell script and uri_encode is the helper it
++# calls. xmlparser above stays: it is a plain XML reader that CppunitTest_shell_zip
++# links, and has nothing to do with any of this.
++ifneq ($(OS),WASI)
++
++$(eval $(call gb_Module_add_targets,shell,\
+ 	Executable_uri_encode \
+ 	Library_cmdmail \
+ 	$(if $(ENABLE_MACOSX_SANDBOX),,Package_senddoc) \
+@@ -114,6 +125,8 @@ endif
+ 
+ endif
+ 
++endif
++
+ $(eval $(call gb_Module_add_l10n_targets,shell,\
+     AllLangMoTarget_shell \
+ ))
+--- a/Repository.mk
++++ b/Repository.mk
+@@ -404,7 +404,7 @@
+ 	chart2 \
+ 	chart2api \
+ 	$(call gb_Helper_optional,OPENCL,clew) \
+-	$(if $(filter $(OS),WNT),,cmdmail) \
++	$(if $(filter WNT WASI,$(OS)),,cmdmail) \
+ 	configmgr \
+ 	ctl \
+ 	dba \

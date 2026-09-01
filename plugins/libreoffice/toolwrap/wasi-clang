@@ -63,9 +63,17 @@ for arg do
     -c|-E|-S|-M|-MM) link=0 ;;
     esac
 done
+#
+# -lunwind and -lsetjmp are here for the same reason and are not optional: they
+# hold __cpp_exception and __wasm_lpad_context, which every object compiled with
+# -fwasm-exceptions -mllvm -wasm-enable-sjlj refers to. A plain hello-world that
+# throws does not link without them. gbuild's own links get them from
+# WASI_INTEL_GCC.mk; libnumbertext's libtool link of its `spellout` tool does
+# not, and libtool is not going to grow an opinion about wasm runtime libraries.
 if [ "$link" = 1 ]; then
     set -- "$@" -lwasi-emulated-signal -lwasi-emulated-mman \
-        -lwasi-emulated-process-clocks -lwasi-emulated-getpid
+        -lwasi-emulated-process-clocks -lwasi-emulated-getpid \
+        -lunwind -lsetjmp
 fi
 
 exec "$WASI_SDK/bin/clang" "$@"

@@ -1,3 +1,281 @@
+diff --git a/external/argon2/ExternalProject_argon2.mk b/external/argon2/ExternalProject_argon2.mk
+index 80d6b0596..01ef0bada 100644
+--- a/external/argon2/ExternalProject_argon2.mk
++++ b/external/argon2/ExternalProject_argon2.mk
+@@ -39,12 +39,19 @@ else # $(COM)
+ 
+ # clear MAKEFILES because Makefile relies on built-in rules
+ 
++# NO_THREADS on WASI: argon2's thread.c calls pthread_create and pthread_exit,
++# which wasip2 does not have, and it is the `argon2` command-line tool -- not
++# libargon2.a, the only part LibreOffice links -- that fails to link without
++# them. NO_THREADS=1 compiles thread.c to nothing and drops argon2 to one lane,
++# which is what a single-threaded component gets either way.
++
+ $(call gb_ExternalProject_get_state_target,argon2,build):
+ 	$(call gb_Trace_StartRange,argon2,EXTERNAL)
+ 	$(call gb_ExternalProject_run,build,\
+ 		CFLAGS="$(CFLAGS) $(if $(filter-out WNT MACOSX,$(OS)),-fvisibility=hidden) -fPIC" \
+-		MAKEFLAGS= $(MAKE) \
++		MAKEFLAGS= $(MAKE) AR="$(AR)" \
+ 			OPTTARGET=$(if $(filter X86_64,$(CPUNAME)),x86-64,forcefail) \
++			$(if $(filter WASI,$(OS)),NO_THREADS=1) \
+ 		$(if $(CROSS_COMPILING),,&& $(MAKE) test) \
+ 	)
+ 	$(call gb_Trace_EndRange,argon2,EXTERNAL)
+diff --git a/external/argon2/UnpackedTarball_argon2.mk b/external/argon2/UnpackedTarball_argon2.mk
+index dc379cca9..c011e97b5 100644
+--- a/external/argon2/UnpackedTarball_argon2.mk
++++ b/external/argon2/UnpackedTarball_argon2.mk
+@@ -15,6 +15,7 @@ $(eval $(call gb_UnpackedTarball_add_patches,argon2,\
+ 	external/argon2/0001-Fix-possible-compiler-error-due-to-undefined-_MSC_VE.patch \
+ 	$(if $(filter WNT_AARCH64,$(OS)_$(CPUNAME)),external/argon2/0002-Add-WinARM64-vcxproj-config.patch) \
+ 	external/argon2/private-symbols.patch.0 \
++	external/argon2/ar-from-environment.patch.0 \
+ ))
+ 
+ # vim: set noet sw=4 ts=4:
+diff --git a/external/argon2/ar-from-environment.patch.0 b/external/argon2/ar-from-environment.patch.0
+new file mode 100644
+index 000000000..ed7a0e89b
+--- /dev/null
++++ b/external/argon2/ar-from-environment.patch.0
+@@ -0,0 +1,19 @@
++-*- Mode: Diff -*-
++
++argon2's Makefile spells the archiver as a literal `ar`, so a cross build gets
++whichever one the PATH happens to reach first. On macOS that is /usr/bin/ar,
++which writes a BSD archive whose members are padded to eight bytes with
++newlines; wasm-ld reads the padded length and stops with "argon2.o: section too
++large". Every other tool in the file already comes from a variable.
++
++--- Makefile
+++++ Makefile
++@@ -183,7 +183,7 @@
++ 		$(CC) $(CFLAGS) $(LIB_CFLAGS) $(LDFLAGS) $(SO_LDFLAGS) $^ -o $@
++ 
++ $(LIB_ST): 	$(OBJ)
++-		ar rcs $@ $^
+++		$(AR) rcs $@ $^
++ 
++ .PHONY: clean
++ clean:
+diff --git a/external/cairo/ExternalProject_cairo.mk b/external/cairo/ExternalProject_cairo.mk
+index 681544068..eb1a7190e 100644
+--- a/external/cairo/ExternalProject_cairo.mk
++++ b/external/cairo/ExternalProject_cairo.mk
+@@ -24,30 +24,6 @@ $(eval $(call gb_ExternalProject_use_externals,cairo,\
+ 	libxml2 \
+ ))
+ 
+-# We cannot use environment vars inside the meson cross-build file,
+-# so we're going to have to generate one on-the-fly.
+-# mungle variables into python list format
+-python_listify = '$(subst $(WHITESPACE),'$(COMMA)',$(strip $(1)))'
+-cross_c = $(call python_listify,$(gb_CC))
+-cross_cxx = $(call python_listify,$(gb_CXX))
+-cross_ld := $(call python_listify,$(subst -fuse-ld=,,$(USE_LD)))
+-
+-define gb_cairo_cross_compile
+-[binaries]
+-c = [$(cross_c)]
+-cpp = [$(cross_cxx)]
+-c_ld = [$(cross_ld)]
+-cpp_ld = [$(cross_ld)]
+-ar = '$(AR)'
+-strip = '$(STRIP)'
+-# TODO: this is pretty ugly...
+-[host_machine]
+-system = '$(if $(filter WNT,$(OS)),windows,$(if $(filter MACOSX,$(OS)),darwin,$(if $(filter ANDROID,$(OS)),android,linux)))'
+-cpu_family = '$(subst X86_64,x86_64,$(RTL_ARCH))'
+-cpu = '$(if $(filter x86,$(RTL_ARCH)),i686,$(if $(filter X86_64,$(RTL_ARCH)),x86_64,$(if $(filter AARCH64,$(RTL_ARCH)),aarch64,armv7)))'
+-endian = '$(ENDIANNESS)'
+-endef
+-
+ # Including -rtlib=compiler-rt in pixman_LIBS is a BAD HACK:  At least when compiling with Clang
+ # -fsanitize=undefined on Linux x86-64, the generated code references __muloti4, which is an
+ # extension provided by libclang_rt.builtins-x86_64.a runtime, but not by GCC's libgcc_s.so.1 (which
+@@ -76,7 +52,7 @@ endef
+ 
+ $(call gb_ExternalProject_get_state_target,cairo,build) :
+ 	$(call gb_Trace_StartRange,cairo,EXTERNAL)
+-	$(file >$(gb_UnpackedTarball_workdir)/cairo/cross-file.txt,$(gb_cairo_cross_compile))
++	$(file >$(gb_UnpackedTarball_workdir)/cairo/cross-file.txt,$(gb_MESON_CROSS_FILE))
+ 	$(call gb_ExternalProject_run,build,\
+ 		PYTHONWARNINGS= \
+ 		PKG_CONFIG_TOP_BUILD_DIR= \
+diff --git a/external/cairo/ExternalProject_pixman.mk b/external/cairo/ExternalProject_pixman.mk
+index c92599478..f68913e89 100644
+--- a/external/cairo/ExternalProject_pixman.mk
++++ b/external/cairo/ExternalProject_pixman.mk
+@@ -17,33 +17,9 @@ $(eval $(call gb_ExternalProject_use_externals,pixman,\
+ 	meson \
+ ))
+ 
+-# We cannot use environment vars inside the meson cross-build file,
+-# so we're going to have to generate one on-the-fly.
+-# mungle variables into python list format
+-python_listify = '$(subst $(WHITESPACE),'$(COMMA)',$(strip $(1)))'
+-cross_c = $(call python_listify,$(gb_CC))
+-cross_cxx = $(call python_listify,$(gb_CXX))
+-cross_ld := $(call python_listify,$(subst -fuse-ld=,,$(USE_LD)))
+-
+-define gb_pixman_cross_compile
+-[binaries]
+-c = [$(cross_c)]
+-cpp = [$(cross_cxx)]
+-c_ld = [$(cross_ld)]
+-cpp_ld = [$(cross_ld)]
+-ar = '$(AR)'
+-strip = '$(STRIP)'
+-# TODO: this is pretty ugly...
+-[host_machine]
+-system = '$(if $(filter WNT,$(OS)),windows,$(if $(filter MACOSX,$(OS)),darwin,$(if $(filter ANDROID,$(OS)),android,linux)))'
+-cpu_family = '$(subst X86_64,x86_64,$(RTL_ARCH))'
+-cpu = '$(if $(filter x86,$(RTL_ARCH)),i686,$(if $(filter X86_64,$(RTL_ARCH)),x86_64,$(if $(filter AARCH64,$(RTL_ARCH)),aarch64,armv7)))'
+-endian = '$(ENDIANNESS)'
+-endef
+-
+ $(call gb_ExternalProject_get_state_target,pixman,build) :
+ 	$(call gb_Trace_StartRange,pixman,EXTERNAL)
+-	$(file >$(gb_UnpackedTarball_workdir)/pixman/cross-file.txt,$(gb_pixman_cross_compile))
++	$(file >$(gb_UnpackedTarball_workdir)/pixman/cross-file.txt,$(gb_MESON_CROSS_FILE))
+ 	$(call gb_ExternalProject_run,build,\
+ 		export PIXMAP_CFLAGS="\
+ 			  $(if $(call gb_Module__symbols_enabled,pixman),$(gb_DEBUGINFO_FLAGS) ) \
+diff --git a/external/expat/ExternalProject_expat.mk b/external/expat/ExternalProject_expat.mk
+index 5a6f8ebee..f2989f177 100644
+--- a/external/expat/ExternalProject_expat.mk
++++ b/external/expat/ExternalProject_expat.mk
+@@ -21,7 +21,7 @@ $(call gb_ExternalProject_get_state_target,expat,configure) :
+ 			--without-dev-urandom --without-getentropy \
+ 			--without-sys-getrandom --without-getrandom\
+ 			$(if $(filter LINUX ANDROID,$(OS)),--with-sys-getrandom) \
+-			$(if $(filter EMSCRIPTEN MACOSX,$(OS)),--with-getentropy) \
++			$(if $(filter EMSCRIPTEN MACOSX WASI,$(OS)),--with-getentropy) \
+ 			$(gb_CONFIGURE_PLATFORMS) \
+ 			$(if $(CROSS_COMPILING),$(if $(filter INTEL ARM,$(CPUNAME)),ac_cv_c_bigendian=no)) \
+ 	,,expat_configure.log)
+diff --git a/external/expat/StaticLibrary_expat.mk b/external/expat/StaticLibrary_expat.mk
+index 6ca4fc84b..1462bb91f 100644
+--- a/external/expat/StaticLibrary_expat.mk
++++ b/external/expat/StaticLibrary_expat.mk
+@@ -46,7 +46,7 @@ ifeq ($(OS),WNT)
+ $(eval $(call gb_StaticLibrary_add_generated_cobjects,expat,\
+ 	UnpackedTarball/expat/lib/random_rand_s \
+ ))
+-else ifneq ($(filter EMSCRIPTEN MACOSX,$(OS)),)
++else ifneq ($(filter EMSCRIPTEN MACOSX WASI,$(OS)),)
+ $(eval $(call gb_StaticLibrary_add_generated_cobjects,expat,\
+ 	UnpackedTarball/expat/lib/random_getentropy \
+ ))
+diff --git a/external/fontconfig/ExternalProject_fontconfig.mk b/external/fontconfig/ExternalProject_fontconfig.mk
+index 0f542e684..f3c353265 100644
+--- a/external/fontconfig/ExternalProject_fontconfig.mk
++++ b/external/fontconfig/ExternalProject_fontconfig.mk
+@@ -21,6 +21,20 @@ $(eval $(call gb_ExternalProject_register_targets,fontconfig,\
+ # Can't have this inside the $(call gb_ExternalProject_run as it contains commas
+ fontconfig_add_fonts=/usr/share/X11/fonts/Type1,/usr/share/X11/fonts/TTF,/usr/local/share/fonts
+ 
++# The WASI arm below is the EMSCRIPTEN one with three answers supplied, because
++# each of these checks is an AC_RUN_IFELSE and a cross build cannot run them:
++#
++#   fstatfs, fstatvfs   no. wasi-libc has neither, and fontconfig only wants
++#                       them to decide whether a cache directory is on a
++#                       filesystem worth caching on.
++#   va_copy             yes -- unlike the Emscripten arm, which says no. clang
++#                       has va_copy; the answer is simply true. (fontconfig's
++#                       fallback, a plain assignment, happens to work on wasm32
++#                       too, so the emscripten answer is not a bug, just cautious.)
++#
++# The paths mirror the Emscripten arm: /instdir is where the install tree lands
++# inside the component's own filesystem.
++
+ $(call gb_ExternalProject_get_state_target,fontconfig,build) :
+ 	$(call gb_Trace_StartRange,fontconfig,EXTERNAL)
+ 	$(call gb_ExternalProject_run,build,\
+@@ -30,7 +44,7 @@ $(call gb_ExternalProject_get_state_target,fontconfig,build) :
+ 			$(if $(filter-out MACOSX,$(OS)),$(gb_VISIBILITY_FLAGS)) \
+ 			$(if $(filter EMSCRIPTEN,$(OS)),-pthread)" \
+ 			$(if $(filter ANDROID,$(OS)),LIBS="-lm") \
+-		$(if $(filter EMSCRIPTEN,$(OS)),LIBXML2_CFLAGS="$(LIBXML_CFLAGS)" LIBXML2_LIBS="$(LIBXML_LIBS)") \
++		$(if $(filter EMSCRIPTEN WASI,$(OS)),LIBXML2_CFLAGS="$(LIBXML_CFLAGS)" LIBXML2_LIBS="$(LIBXML_LIBS)") \
+ 		$(gb_RUN_CONFIGURE) ./configure \
+ 			--includedir=${WORKDIR}/UnpackedTarball/fontconfig \
+ 			--libdir=${WORKDIR}/UnpackedTarball/fontconfig/src/.libs \
+@@ -52,6 +66,14 @@ $(call gb_ExternalProject_get_state_target,fontconfig,build) :
+ 			    --enable-libxml2 \
+ 			    ac_cv_func_fstatfs=no ac_cv_func_fstatvfs=no ac_cv_va_copy=no \
+ 			) \
++			$(if $(filter WASI,$(OS)), \
++				--disable-shared \
++			    --with-baseconfigdir=/instdir/share/fontconfig \
++			    --with-cache-dir=/instdir/share/fontconfig/cache \
++			    --with-add-fonts=/instdir/share/fonts \
++			    --enable-libxml2 \
++			    ac_cv_func_fstatfs=no ac_cv_func_fstatvfs=no ac_cv_va_copy=yes \
++			) \
+ 			$(if $(filter FUZZERS,$(BUILD_TYPE)), \
+ 				--disable-shared, \
+ 				$(if $(filter LINUX,$(OS)), \
+diff --git a/external/harfbuzz/ExternalProject_harfbuzz.mk b/external/harfbuzz/ExternalProject_harfbuzz.mk
+index 98ae5b93e..aeb5c6295 100644
+--- a/external/harfbuzz/ExternalProject_harfbuzz.mk
++++ b/external/harfbuzz/ExternalProject_harfbuzz.mk
+@@ -19,35 +19,21 @@ $(eval $(call gb_ExternalProject_use_externals,harfbuzz,\
+ 	meson \
+ ))
+ 
+-# We cannot use environment vars inside the meson cross-build file,
+-# so we're going to have to generate one on-the-fly.
+-# mungle variables into python list format
+-python_listify = '$(subst $(WHITESPACE),'$(COMMA)',$(strip $(1)))'
+-cross_c = $(call python_listify,$(gb_CC))
+-cross_cxx = $(call python_listify,$(gb_CXX))
+-cross_ld := $(call python_listify,$(subst -fuse-ld=,,$(USE_LD)))
+-
+-define gb_harfbuzz_cross_compile
+-[binaries]
+-c = [$(cross_c)]
+-cpp = [$(cross_cxx)]
+-c_ld = [$(cross_ld)]
+-cpp_ld = [$(cross_ld)]
+-ar = '$(AR)'
+-strip = '$(STRIP)'
+-# TODO: this is pretty ugly...
+-[host_machine]
+-system = '$(if $(filter WNT,$(OS)),windows,$(if $(filter MACOSX,$(OS)),darwin,$(if $(filter ANDROID,$(OS)),android,linux)))'
+-cpu_family = '$(subst X86_64,x86_64,$(RTL_ARCH))'
+-cpu = '$(if $(filter x86,$(RTL_ARCH)),i686,$(if $(filter X86_64,$(RTL_ARCH)),x86_64,$(if $(filter AARCH64,$(RTL_ARCH)),aarch64,armv7)))'
+-endian = '$(ENDIANNESS)'
+-endef
++# HB_NO_PRAGMA_GCC_DIAGNOSTIC_ERROR on WASI: clang 23, which is what wasi-sdk 34
++# ships, folds -Wunused-template into -Wunused, and hb.hh contains
++# `#pragma GCC diagnostic error "-Wunused"` -- so harfbuzz 12.3.2 fails to
++# compile itself, on any platform whose clang is new enough. The macro is the
++# escape hatch harfbuzz ships for precisely this: those pragmas are its own
++# development hygiene, and they have no business failing a downstream build.
++# Note this collides with the -Dcpp_args= the symbols case emits below; they
++# cannot both apply, since that one only appears in a release build with
++# symbols enabled.
+ 
+ # cannot use CROSS_COMPILING as condition since we have cross-compilation "light" for cases where
+ # the builder can run the host binaries, like for example when compiling for win 32bit on win 64bit
+ $(call gb_ExternalProject_get_state_target,harfbuzz,build) : | $(call gb_ExternalExecutable_get_dependencies,python)
+ 	$(call gb_Trace_StartRange,harfbuzz,EXTERNAL)
+-	$(file >$(gb_UnpackedTarball_workdir)/harfbuzz/cross-file.txt,$(gb_harfbuzz_cross_compile))
++	$(file >$(gb_UnpackedTarball_workdir)/harfbuzz/cross-file.txt,$(gb_MESON_CROSS_FILE))
+ 	$(call gb_ExternalProject_run,build,\
+ 		PKG_CONFIG_PATH="${PKG_CONFIG_PATH}$(LIBO_PATH_SEPARATOR)$(gb_UnpackedTarball_workdir)/graphite$(if $(SYSTEM_ICU),,$(LIBO_PATH_SEPARATOR)$(gb_UnpackedTarball_workdir)/icu)" \
+ 		PYTHONWARNINGS= \
+@@ -56,6 +42,7 @@ $(call gb_ExternalProject_get_state_target,harfbuzz,build) : | $(call gb_Externa
+ 			$(if $(call gb_Module__symbols_enabled,harfbuzz),$(addsuffix "$(strip $(gb_DEBUGINFO_FLAGS))",-Dc_args= -Dcpp_args=)))) \
+ 			-Dauto_features=disabled \
+ 			-Dcpp_std=$(subst -std:,,$(subst -std=,,$(filter -std%,$(CXXFLAGS_CXX11)))) \
++			$(if $(filter WASI,$(OS)),-Dcpp_args=-DHB_NO_PRAGMA_GCC_DIAGNOSTIC_ERROR) \
+ 			-Dtests=disabled \
+ 			-Dutilities=disabled \
+ 			-Dicu=enabled \
 diff --git a/external/icu/UnpackedTarball_icu.mk b/external/icu/UnpackedTarball_icu.mk
 index 92777dd33..0695b1ac7 100644
 --- a/external/icu/UnpackedTarball_icu.mk
@@ -10,6 +288,149 @@ index 92777dd33..0695b1ac7 100644
  	external/icu/icu4c-use-pkgdata-single-ccode-file-mode.patch.1 \
  	external/icu/icu4c-khmerbreakengine.patch.1 \
  	external/icu/icu4c-$(if $(filter ANDROID,$(OS)),android,rpath).patch.1 \
+diff --git a/external/icu/icu4c-wasi-cross.patch.1 b/external/icu/icu4c-wasi-cross.patch.1
+new file mode 100644
+index 000000000..eb30f477d
+--- /dev/null
++++ b/external/icu/icu4c-wasi-cross.patch.1
+@@ -0,0 +1,48 @@
++Teach ICU's configure about a WASI host.
++
++ICU picks a host fragment and a platform name from $host, and knows neither
++wasm32-unknown-wasip2 nor any wasi triple: configure dies with "ERROR -
++configure could not detect your platform". LibreOffice already carries the
++same patch for Emscripten (icu4c-emscripten-cross.patch.1), which is the
++shape this follows.
++
++Both point at the Linux answers rather than a fragment of their own. From
++ICU's point of view wasi-libc IS the Linux case -- POSIX headers, little
++endian, no dylibs -- and everything the emscripten fragment adds beyond
++mh-linux is either about emcc's driver or about shared libraries, which this
++build does not produce (--disable-shared --enable-static, forced by
++DISABLE_DYNLOADING).
++
++--- icu/source/acinclude.m4
+++++ icu/source/acinclude.m4
++@@ -85,6 +85,7 @@
++ *-*-nto*)	icu_cv_host_frag=mh-qnx ;;
++ *-ncr-*)	icu_cv_host_frag=mh-mpras ;;
++ wasm*-*-emscripten*)	icu_cv_host_frag=mh-emscripten ;;
+++wasm*-*-wasi*)	icu_cv_host_frag=mh-linux ;;
++ *) 		icu_cv_host_frag=mh-unknown ;;
++ esac
++ 		]
++--- icu/source/configure.ac
+++++ icu/source/configure.ac
++@@ -1122,6 +1122,7 @@
++ case "${host}" in
++ 	*-*-solaris*) 	platform=U_SOLARIS ;;
++ 	*-*-linux*|*-*-gnu|*-*-k*bsd*-gnu|*-*-kopensolaris*-gnu)        platform=U_LINUX ;;
+++	wasm*-*-wasi*)	platform=U_LINUX ;;
++ 	*-*-*bsd*|*-*-dragonfly*) 	platform=U_BSD ;;
++ 	*-*-aix*) 	platform=U_AIX ;;
++ 	*-*-hpux*) 	platform=U_HPUX ;;
++--- icu/source/common/putilimp.h
+++++ icu/source/common/putilimp.h
++@@ -147,6 +147,10 @@
++    /* not defined */
++ #elif U_PLATFORM == U_PF_HAIKU
++     /* not defined, (well it is but a loop back to icu) */
+++#elif defined(__wasi__)
+++    /* not defined: wasi-libc has no timezone database and so no tzname. ICU
+++       treats an undefined U_TZNAME as "this platform cannot name its zone",
+++       which is the truth here rather than a workaround. */
++ #else
++ #   define U_TZNAME tzname
++ #endif
+diff --git a/external/liborcus/UnpackedTarball_liborcus.mk b/external/liborcus/UnpackedTarball_liborcus.mk
+index 6c1b846f2..34998079b 100644
+--- a/external/liborcus/UnpackedTarball_liborcus.mk
++++ b/external/liborcus/UnpackedTarball_liborcus.mk
+@@ -18,6 +18,12 @@ $(eval $(call gb_UnpackedTarball_add_patches,liborcus,\
+ 	external/liborcus/libtool.patch.0 \
+ ))
+ 
++ifeq ($(OS),WASI)
++$(eval $(call gb_UnpackedTarball_add_patches,liborcus,\
++	external/liborcus/wasi-no-mmap.patch.0 \
++))
++endif
++
+ ifeq ($(OS),WNT)
+ $(eval $(call gb_UnpackedTarball_add_patches,liborcus,\
+ 	external/liborcus/windows-constants-hack.patch \
+diff --git a/external/liborcus/wasi-no-mmap.patch.0 b/external/liborcus/wasi-no-mmap.patch.0
+new file mode 100644
+index 000000000..4e7aa5f81
+--- /dev/null
++++ b/external/liborcus/wasi-no-mmap.patch.0
+@@ -0,0 +1,66 @@
++--- src/parser/stream.cpp
+++++ src/parser/stream.cpp
++@@ -21,10 +21,15 @@
++ 
++ #include "filesystem_env.hpp"
++ 
+++// boost::uintmax_t below came in transitively through interprocess.
+++#include <boost/cstdint.hpp>
+++
+++#ifndef __wasi__
++ #include <boost/interprocess/file_mapping.hpp>
++ #include <boost/interprocess/mapped_region.hpp>
++ 
++ namespace bip = boost::interprocess;
+++#endif
++ 
++ namespace orcus {
++ 
++@@ -160,15 +165,39 @@
++ struct file_content::impl
++ {
++     boost::uintmax_t content_size;
+++#ifndef __wasi__
++     bip::file_mapping mapped_file;
++     bip::mapped_region mapped_region;
+++#endif
++ 
++     std::string buffer; // its own buffer in case of stream conversion.
++ 
++     const char* content;
++ 
++     impl() : content_size(0), content(nullptr) {}
+++
+++#ifdef __wasi__
+++    // Read rather than map. Boost.Interprocess refuses to build for wasi at
+++    // all -- no sys/shm.h, and it will not accept a platform without one --
+++    // and there is nothing to gain by insisting: a component's file is served
+++    // by the host through wk's vfs, so a mapping would be a copy wearing a
+++    // pointer. `buffer` is the same member the encoding-conversion path
+++    // already loads into, and every accessor reads through `content`, so this
+++    // is the only place that differs.
+++    impl(const fs::path& filepath) :
+++        content_size(fs::file_size(filepath)),
+++        content(nullptr)
+++    {
+++        std::ifstream is(filepath.string(), std::ios::binary);
+++        if (!is)
+++            throw general_error("failed to open file: " + filepath.string());
++ 
+++        buffer.resize(content_size);
+++        if (content_size)
+++            is.read(buffer.data(), content_size);
+++        content = buffer.data();
+++    }
+++#else
++     impl(const fs::path& filepath) :
++         content_size(fs::file_size(filepath)),
++         mapped_file(filepath.c_str(), bip::read_only),
++@@ -177,6 +206,7 @@
++     {
++         content = static_cast<const char*>(mapped_region.get_address());
++     }
+++#endif
++ };
++ 
++ file_content::file_content() :
 diff --git a/external/openssl/ExternalProject_openssl.mk b/external/openssl/ExternalProject_openssl.mk
 index a31945fab..beedfeabf 100644
 --- a/external/openssl/ExternalProject_openssl.mk
@@ -32,3 +453,82 @@ index a31945fab..beedfeabf 100644
  			$(if $(filter-out ANDROID iOS WNT,$(OS)), \
  				$(if $(SYSBASE),-I$(SYSBASE)/usr/include -L$(SYSBASE)/usr/lib)) \
  			$(if $(filter MACOSX,$(OS)),--prefix=/@.__________________________________________________OOO) \
+diff --git a/external/redland/UnpackedTarball_raptor.mk b/external/redland/UnpackedTarball_raptor.mk
+index 8491e104c..58ccb62e8 100644
+--- a/external/redland/UnpackedTarball_raptor.mk
++++ b/external/redland/UnpackedTarball_raptor.mk
+@@ -23,6 +23,7 @@ $(eval $(call gb_UnpackedTarball_add_patches,raptor,\
+ 	external/redland/raptor/raptor-freebsd.patch.1 \
+ 	external/redland/raptor/raptor-msvc.patch.1 \
+ 	external/redland/raptor/raptor-emscripten.patch.1 \
++	external/redland/raptor/raptor-wasi.patch.1 \
+ 	$(if $(filter-out WNT,$(OS)),external/redland/raptor/raptor-bundled-soname.patch.1) \
+ 	$(if $(filter ANDROID,$(OS)),external/redland/raptor/raptor-android.patch.1) \
+ 	external/redland/raptor/ubsan.patch \
+diff --git a/external/redland/UnpackedTarball_redland.mk b/external/redland/UnpackedTarball_redland.mk
+index ed589b2d6..a42f893a3 100644
+--- a/external/redland/UnpackedTarball_redland.mk
++++ b/external/redland/UnpackedTarball_redland.mk
+@@ -26,6 +26,7 @@ $(eval $(call gb_UnpackedTarball_set_patchlevel,redland,0))
+ $(eval $(call gb_UnpackedTarball_add_patches,redland,\
+ 	external/redland/redland/redland-freebsd.patch.1 \
+ 	external/redland/redland/redland-msvc.patch.1 \
++	external/redland/redland/redland-wasi.patch.1 \
+ 	$(if $(filter-out WNT,$(OS)),external/redland/redland/redland-bundled-soname.patch.1) \
+ 	$(if $(filter ANDROID,$(OS)),external/redland/redland/redland-android.patch.1) \
+ 	$(if $(CROSS_COMPILING),external/redland/redland/redland-xcompile.patch.1) \
+diff --git a/external/redland/raptor/raptor-wasi.patch.1 b/external/redland/raptor/raptor-wasi.patch.1
+new file mode 100644
+index 000000000..deabd9cee
+--- /dev/null
++++ b/external/redland/raptor/raptor-wasi.patch.1
+@@ -0,0 +1,18 @@
++-*- Mode: Diff -*-
++
++wasi-libc is musl-derived and has the glibc-shaped qsort_r, so raptor's Linux
++arm is the right one. It defines none of the macros that arm tests for, which
++is why an unpatched build stops at "Cannot detect operating system" rather than
++picking something wrong.
++
++--- raptor/src/sort_r.h
+++++ raptor/src/sort_r.h
++@@ -28,7 +28,7 @@
++ #  define _SORT_R_BSD
++ #elif (defined _GNU_SOURCE || defined __gnu_hurd__ || defined __GNU__ || \
++        defined __linux__ || defined __MINGW32__ || defined __GLIBC__ || \
++-       defined __CYGWIN__ || defined __EMSCRIPTEN__)
+++       defined __CYGWIN__ || defined __EMSCRIPTEN__ || defined __wasi__)
++ #  define _SORT_R_LINUX
++ #elif (defined _WIN32 || defined _WIN64 || defined __WINDOWS__)
++ #  define _SORT_R_WINDOWS
+diff --git a/external/redland/redland/redland-wasi.patch.1 b/external/redland/redland/redland-wasi.patch.1
+new file mode 100644
+index 000000000..42f5354c6
+--- /dev/null
++++ b/external/redland/redland/redland-wasi.patch.1
+@@ -0,0 +1,25 @@
++-*- Mode: Diff -*-
++
++wasi-libc declares mkstemp, mktemp, mkstemps and tmpnam but implements none of
++them -- they are stubbed out of the sysroot, so a link test finds no symbol and
++configure correctly answers no to all four. redland's remaining branch is a
++literal `HELP`, left there for a platform nobody expected to meet.
++
++The function is deprecated ("Do not use this, it is unsafe"), documented to
++return NULL on failure, and every caller checks. NULL is the honest answer for
++a component that has no temporary directory of its own.
++
++--- redland/src/rdf_files.c
+++++ redland/src/rdf_files.c
++@@ -118,7 +118,11 @@
++ 
++   return name;
++ #else /* not tmpnam(), mkstemp() or mktemp() */
+++#ifdef __wasi__
+++  return NULL;
+++#else
++ HELP
+++#endif
++ #endif
++ #endif
++ }

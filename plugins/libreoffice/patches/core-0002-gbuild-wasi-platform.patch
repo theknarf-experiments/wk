@@ -1,9 +1,9 @@
 diff --git a/solenv/gbuild/platform/WASI_INTEL_GCC.mk b/solenv/gbuild/platform/WASI_INTEL_GCC.mk
 new file mode 100644
-index 000000000..773a9b7c5
+index 000000000..e033dd754
 --- /dev/null
 +++ b/solenv/gbuild/platform/WASI_INTEL_GCC.mk
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,235 @@
 +# -*- Mode: makefile-gmake; tab-width: 4; indent-tabs-mode: t -*-
 +#
 +# This file is part of the LibreOffice project.
@@ -105,6 +105,14 @@ index 000000000..773a9b7c5
 +# reading the command back out of `make verbose=t`.
 +gb_CXXFLAGS := $(filter-out -pthread,$(gb_CXXFLAGS))
 +gb_LinkTarget_CXXFLAGS := $(filter-out -pthread,$(gb_LinkTarget_CXXFLAGS))
++
++# unxgcc.mk:254 hardcodes gb_Library_PLAINEXT_FOR_BUILD := .so, which names
++# artifacts on the BUILD machine, not this target. That is right when wasm is
++# cross-compiled from Linux, which is how upstream does it; from macOS the
++# build-side UNO bridge is libgcc3_uno.dylib, and every build-side executable
++# ends up depending on an instdir_for_build/.../libgcc3_uno.so that no rule
++# makes and nothing will ever create.
++gb_Library_PLAINEXT_FOR_BUILD := $(if $(filter MACOSX,$(OS_FOR_BUILD)),.dylib,.so)
 +
 +# No .js, no .html: wasm-component-ld emits the component itself at link time,
 +# so an executable's target name is its bare name. unxgcc.mk defaults this to

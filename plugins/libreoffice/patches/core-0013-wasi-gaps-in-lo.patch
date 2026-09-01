@@ -1,0 +1,227 @@
+diff --git a/comphelper/source/misc/lok.cxx b/comphelper/source/misc/lok.cxx
+index c8330f992..3b091bc45 100644
+--- a/comphelper/source/misc/lok.cxx
++++ b/comphelper/source/misc/lok.cxx
+@@ -314,8 +314,12 @@ void setTimezone(bool isSet, const OUString& rTimezone)
+         osl_clearEnvironment(u"TZ"_ustr.pData);
+     }
+ 
+-    // Update the timezone data.
++    // Update the timezone data. wasi-libc has no tzset: it ships no timezone
++    // database, so there is nothing for it to re-read, and TZ above is the
++    // whole of what a component knows about local time.
++#if !defined WASI
+     ::tzset();
++#endif
+ }
+ 
+ static void (*pStatusIndicatorCallback)(void *data, statusIndicatorCallbackType type, int percent, const char* pText)(nullptr);
+diff --git a/i18nutil/source/utility/paper.cxx b/i18nutil/source/utility/paper.cxx
+index ddad0b26d..4e3d89971 100644
+--- a/i18nutil/source/utility/paper.cxx
++++ b/i18nutil/source/utility/paper.cxx
+@@ -240,7 +240,10 @@ PaperInfo PaperInfo::getSystemDefaultPaper()
+         if (bInitialized)
+             return aInstance;
+ 
+-#if ! defined(MACOSX) && ! defined(EMSCRIPTEN)
++// WASI has no popen, and would have nothing to run through it if it did: a
++// component cannot spawn `paperconf`. Falls through to the locale-derived
++// default below, which is where a machine without libpaper ends up anyway.
++#if ! defined(MACOSX) && ! defined(EMSCRIPTEN) && ! defined(WASI)
+         // try libpaper
+         // #i78617# workaround missing paperconf command
+         FILE* pPipe = popen( "paperconf 2>/dev/null", "r" );
+diff --git a/shell/source/unix/exec/shellexec.cxx b/shell/source/unix/exec/shellexec.cxx
+index abc197acd..ccd515067 100644
+--- a/shell/source/unix/exec/shellexec.cxx
++++ b/shell/source/unix/exec/shellexec.cxx
+@@ -54,7 +54,11 @@ using namespace ::com::sun::star::lang;
+ using namespace ::com::sun::star::system::SystemShellExecuteFlags;
+ using namespace cppu;
+ 
+-#ifndef EMSCRIPTEN
++// WASI joins EMSCRIPTEN in having no popen: there is no shell to run
++// DESKTOP_LAUNCH or xdg-open in, and no process to run it as. It does not join
++// emscripten's answer either -- that one calls out to the browser, and a wk
++// node has no browser behind it -- so it gets a third arm below that says so.
++#if !defined EMSCRIPTEN && !defined WASI
+ namespace
+ {
+     void escapeForShell( OStringBuffer & rBuffer, const OString & rURL)
+@@ -80,7 +84,7 @@ ShellExec::ShellExec( const Reference< XComponentContext >& xContext ) :
+ 
+ void SAL_CALL ShellExec::execute( const OUString& aCommand, const OUString& aParameter, sal_Int32 nFlags )
+ {
+-#ifndef EMSCRIPTEN
++#if !defined EMSCRIPTEN && !defined WASI
+     OStringBuffer aBuffer, aLaunchBuffer;
+ 
+     if (comphelper::LibreOfficeKit::isActive())
+@@ -266,7 +270,7 @@ void SAL_CALL ShellExec::execute( const OUString& aCommand, const OUString& aPar
+     int nerr = errno;
+     throw SystemShellExecuteException(OUString::createFromAscii( strerror( nerr ) ),
+         static_cast < XSystemShellExecute * > (this), nerr );
+-#else // EMSCRIPTEN
++#elif defined EMSCRIPTEN
+     (void)nFlags;
+ 
+     css::uno::Reference< css::uri::XUriReference > uri(
+@@ -282,6 +286,15 @@ void SAL_CALL ShellExec::execute( const OUString& aCommand, const OUString& aPar
+                                           rtl_UriEncodeIgnoreEscapes, RTL_TEXTENCODING_UTF8));
+     emscripten_sync_run_in_main_runtime_thread(
+         EM_FUNC_SIG_VI, execute_browser, sEscapedURI.toUtf8().getStr());
++#else // WASI
++    (void)aParameter;
++    (void)nFlags;
++    // Nothing to hand the URI to. The host may grow a capability for this --
++    // "open this in whatever the user's desktop uses" is a reasonable thing for
++    // wk to offer a node -- and this is where it would go.
++    throw SystemShellExecuteException(
++        u"wk has no shell to execute into"_ustr,
++        static_cast<XSystemShellExecute*>(this), 42);
+ #endif
+ }
+ 
+diff --git a/svtools/source/control/inettbc.cxx b/svtools/source/control/inettbc.cxx
+index bc3cb6ece..b6cdc2874 100644
+--- a/svtools/source/control/inettbc.cxx
++++ b/svtools/source/control/inettbc.cxx
+@@ -17,7 +17,10 @@
+  *   the License at http://www.apache.org/licenses/LICENSE-2.0 .
+  */
+ 
+-#ifdef UNX
++// WASI is UNX by gb_OSDEFS, but wasi-libc has no pwd.h: a component has no
++// passwd database and no other users to have home directories. Every UNX block
++// in this file is here to expand `~user`, so they all take the same exception.
++#if defined UNX && !defined WASI
+ #include <pwd.h>
+ #endif
+ 
+@@ -259,7 +262,7 @@ void SvtMatchContext_Impl::ReadFolder( const OUString& rURL,
+         return;
+ 
+     bool bPureHomePath = false;
+-#ifdef UNX
++#if defined UNX && !defined WASI
+     bPureHomePath = aText.startsWith( "~" ) && aText.indexOf( '/' ) == -1;
+ #endif
+ 
+@@ -657,7 +660,7 @@ void SvtMatchContext_Impl::doExecute()
+ bool SvtURLBox_Impl::TildeParsing([[maybe_unused]] OUString& aText,
+                                   [[maybe_unused]] OUString& aBaseURL)
+ {
+-#ifdef UNX
++#if defined UNX && !defined WASI
+     if( aText.startsWith( "~" ) )
+     {
+         OUString aParseTilde;
+@@ -792,7 +795,7 @@ OUString SvtURLBox::ParseSmart( const OUString& _aText, const OUString& _aBaseUR
+ 
+             // take base URL and append current input
+             bool bWasAbsolute = false;
+-#ifdef UNX
++#if defined UNX && !defined WASI
+             // encode file URL correctly
+             aSmart = INetURLObject::encode( aSmart, INetURLObject::PART_FPATH, INetURLObject::EncodeMechanism::All );
+ #endif
+@@ -945,7 +948,7 @@ IMPL_LINK_NOARG(SvtURLBox, ChangedHdl, weld::ComboBox&, void)
+ 
+ IMPL_LINK_NOARG(SvtURLBox, FocusInHdl, weld::Widget&, void)
+ {
+-#ifndef UNX
++#if !defined UNX || defined WASI
+     // pb: don't select automatically on unix #93251#
+     m_xWidget->select_entry_region(0, -1);
+ #endif
+diff --git a/unotools/source/i18n/resmgr.cxx b/unotools/source/i18n/resmgr.cxx
+index f93e943b6..720c0e0cb 100644
+--- a/unotools/source/i18n/resmgr.cxx
++++ b/unotools/source/i18n/resmgr.cxx
+@@ -36,7 +36,10 @@
+ 
+ #include <string.h>
+ #include <stdio.h>
+-#if defined UNX && !defined MACOSX && !defined IOS && !defined ANDROID && !defined EMSCRIPTEN
++// No libintl on WASI. Only the gtk/gettext handoff below needs it — boost::locale
++// carries the translations LibreOffice itself reads, and nothing outside the
++// component is going to look up our .mo files.
++#if defined UNX && !defined MACOSX && !defined IOS && !defined ANDROID && !defined EMSCRIPTEN && !defined WASI
+ #   include <libintl.h>
+ #endif
+ 
+@@ -142,7 +145,7 @@ namespace Translate
+         OString sPath(OUStringToOString(path, eEncoding));
+ #endif
+         gen.add_messages_path(std::string(sPath));
+-#if defined UNX && !defined MACOSX && !defined IOS && !defined ANDROID && !defined EMSCRIPTEN
++#if defined UNX && !defined MACOSX && !defined IOS && !defined ANDROID && !defined EMSCRIPTEN && !defined WASI
+         // allow gettext to find these .mo files e.g. so gtk dialogs can use them
+         bindtextdomain(aPrefixName.data(), sPath.getStr());
+         // tdf#131069 gtk, and anything sane, always wants utf-8 strings as output
+diff --git a/vcl/headless/svpinst.cxx b/vcl/headless/svpinst.cxx
+index 7560f6ada..0dccebfcd 100644
+--- a/vcl/headless/svpinst.cxx
++++ b/vcl/headless/svpinst.cxx
+@@ -75,7 +75,7 @@ do { \
+ #define DBG_TESTSVPYIELDMUTEX() ((void)0)
+ #endif
+ 
+-#if !defined(ANDROID) && !defined(IOS) && !defined(EMSCRIPTEN)
++#if !defined(ANDROID) && !defined(IOS) && !defined(EMSCRIPTEN) && !defined(WASI)
+ 
+ static void atfork_child()
+ {
+@@ -97,7 +97,10 @@ SvpSalInstance::SvpSalInstance( std::unique_ptr<SalYieldMutex> pMutex )
+     m_MainThread = osl::Thread::getCurrentIdentifier();
+     if( s_pDefaultInstance == nullptr )
+         s_pDefaultInstance = this;
+-#if !defined(ANDROID) && !defined(IOS) && !defined(EMSCRIPTEN)
++// atfork_child resets this instance's wakeup pipe in a forked child. WASI has
++// no fork, so wasi-libc has no pthread_atfork to register it with, and the
++// handler could never run.
++#if !defined(ANDROID) && !defined(IOS) && !defined(EMSCRIPTEN) && !defined(WASI)
+     pthread_atfork(nullptr, nullptr, atfork_child);
+ #endif
+ #if defined EMSCRIPTEN
+diff --git a/vcl/unx/generic/print/genprnpsp.cxx b/vcl/unx/generic/print/genprnpsp.cxx
+index 73d83ab89..f6fdcf17c 100644
+--- a/vcl/unx/generic/print/genprnpsp.cxx
++++ b/vcl/unx/generic/print/genprnpsp.cxx
+@@ -35,7 +35,10 @@
+ 
+ // For spawning PDF and FAX generation
+ #include <unistd.h>
++#if !defined WASI
++// No wait() to declare: a component has no children to wait for.
+ #include <sys/wait.h>
++#endif
+ #include <sys/stat.h>
+ 
+ #include <comphelper/fileurl.hxx>
+--- a/include/sal/config.h
++++ b/include/sal/config.h
+@@ -119,6 +119,22 @@
+ #define sun sun
+ #endif
+ 
++/* The same kind of spell, for wasi-libc. <langinfo.h> defines ERA — and 58
++ * other names — as plain numbers, and libc++'s <locale> support header pulls
++ * it into practically every translation unit. glibc's langinfo.h writes those
++ * same names as `enum { ERA, ... }; #define ERA ERA`, a macro that expands to
++ * itself and so leaves an unrelated `Something::ERA` alone; musl's does not,
++ * and com::sun::star::i18n::CalendarFieldIndex::ERA stops parsing.
++ *
++ * Include it here, first, and take the name back. Nothing in LibreOffice calls
++ * nl_langinfo, so nothing loses anything. The other 58 are the same hazard
++ * waiting for the same kind of collision; add them here when one lands.
++ */
++#ifdef WASI
++#include <langinfo.h>
++#undef ERA
++#endif
++
+ #if defined __clang__
+ #if __has_warning("-Wpotentially-evaluated-expression")
+ #pragma GCC diagnostic ignored "-Wpotentially-evaluated-expression"
