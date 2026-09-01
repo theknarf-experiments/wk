@@ -98,15 +98,26 @@ run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-lo.sh"
 #
 # The moment the first patch lands this becomes a real, and very long, build.
 [tasks.build]
-description = "Build the LibreOffice port (self-skips while patches/ is empty)"
+description = "Build the LibreOffice port (opt-in: the full build is hours and does not link yet)"
 dir = "{{config_root}}"
 run = """
 set -e
-if ! ls patches/core-*.patch >/dev/null 2>&1; then
-  echo "libreoffice: scaffolding only -- no patches/core-*.patch yet, so there is nothing to build."
-  echo "    LibreOffice cannot configure for WASI without them: configure.ac has no wasi*)"
-  echo "    host arm and solenv/gbuild/platform has no WASI_*.mk. See PORTING.md."
-  echo "    To work on the port: ./preflight.sh, then ./build-configure.sh."
+# The repo-wide `mise run build-plugins` sweep calls every plugin's `build`
+# task under `set -e`, so this one must not turn that sweep into an overnight
+# LibreOffice build -- and right now it would not even be a SUCCESSFUL one: the
+# port stops at `bridges`, on a decision recorded in PORTING.md.
+#
+# The original guard was "skip while patches/ is empty", which stopped guarding
+# anything the moment the port started working. The condition that actually
+# matters is not "are there patches" but "is a full build known to complete",
+# so this is an explicit opt-in until that is true.
+if [ "${WK_LO_BUILD:-0}" != "1" ]; then
+  echo "libreoffice: skipping -- the full build is hours long and does not link yet."
+  echo "    It stops at bridges/gcc3_wasm (cpp2uno.cxx needs emscripten.h); see"
+  echo "    PORTING.md 'Current state' for where the port actually is."
+  echo "    Per-stage: ./preflight.sh, ./build-configure.sh, ./build-host.sh,"
+  echo "    ./build-lo.sh <module>.allbuild"
+  echo "    To run the whole thing anyway: WK_LO_BUILD=1 mise run build"
   exit 0
 fi
 ./build-deps.sh
