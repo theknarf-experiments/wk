@@ -37,6 +37,7 @@ LO_TARBALLS="$LO_ROOT/tarballs"    # --with-external-tar: the ~149 external tarb
 LO_PATCHES="$LO_ROOT/patches"      # the only tracked derived-from-upstream thing
 LO_LOGDIR="${LOGDIR:-$LO_ROOT/logs}"
 LO_TOOLBIN="$LO_ROOT/.toolbin"
+LO_HOSTTOOLS="$LO_ROOT/.hosttools"  # gmake/gperf this port builds; see build-deps.sh
 LO_TAG="libreoffice-26.2.6.2"      # what src/ must be at; see PORTING.md for why this tag
 
 # The target triple. Deliberately NOT wasm32-local-emscripten: this port adds a
@@ -174,7 +175,10 @@ lo_die() { echo "libreoffice/${LO_STAGE:-?}: $*" >&2; exit 1; }
 # exporting GNUMAKE is enough — we do not have to be first on PATH.
 lo_find_gnumake() {
     local c v
-    for c in "${GNUMAKE:-}" gmake make; do
+    # .hosttools first: `mise run deps` builds GNU Make there precisely because
+    # every make on this machine's PATH is too old, and searching PATH first
+    # would find 3.81 and reject it before reaching ours.
+    for c in "${GNUMAKE:-}" "$LO_HOSTTOOLS/bin/make" gmake make; do
         [ -n "$c" ] || continue
         command -v "$c" >/dev/null 2>&1 || continue
         v=$("$c" --version 2>/dev/null | head -1 | grep GNU | sed -e 's@^[^0-9]*@@' -e 's@ .*@@')
@@ -192,7 +196,7 @@ lo_find_gnumake() {
 # is Xcode's 3.0.3.
 lo_find_gperf() {
     local c v
-    for c in "${GPERF:-}" /opt/homebrew/bin/gperf gperf; do
+    for c in "${GPERF:-}" "$LO_HOSTTOOLS/bin/gperf" /opt/homebrew/bin/gperf gperf; do
         [ -n "$c" ] || continue
         command -v "$c" >/dev/null 2>&1 || continue
         v=$("$c" --version 2>/dev/null | head -1)

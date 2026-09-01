@@ -19,20 +19,46 @@
 # sal, and finding them there costs minutes instead of at the end of a
 # multi-hour link.
 #
-# Host tools are NOT pinned here. LibreOffice wants GNU Make >= 4.2 and
-# gperf >= 3.1, neither of which macOS ships, and this repo's convention is to
-# report a missing host tool rather than silently install one. `mise run
-# preflight` names them with the exact configure.ac line that rejects them and
-# the brew command that fixes it.
+# Host tools are declared here, like every other toolchain in this repo, so a
+# clone can build the port without anyone being told to `brew install` first.
+# They come from two places because mise can only reach one of them:
+#
+#   ccache          a mise [tools] pin below. Optional for correctness and
+#                   close to mandatory in practice: this is a two-stage build
+#                   of one of the largest C++ codebases there is, and without
+#                   it every configure-flag experiment re-pays the whole native
+#                   bootstrap.
+#   gmake, gperf    `mise run deps`, which builds them from pinned GNU tarballs
+#                   into .hosttools and links them into .toolbin. Not mise
+#                   [tools] because neither exists as an aqua or ubi package
+#                   (both are savannah releases, not GitHub ones) and mise's
+#                   asdf make plugin fails GPG verification without GNU's
+#                   signing key in your keyring. See build-deps.sh.
+#
+# configure.ac:6907 rejects GNU Make < 4.2 and :8201 rejects gperf < 3.1, both
+# as hard errors; macOS ships 3.81 and 3.0.3 respectively.
+
+[tools]
+"github:ccache/ccache" = "4.14"
+
+[tasks.deps]
+description = "Build the host tools macOS lacks (GNU Make >= 4.2, gperf >= 3.1) into .hosttools"
+dir = "{{config_root}}"
+# Idempotent and quick (~2 min, once). Every stage depends on it rather than
+# checking and complaining, because a build that can install its own
+# prerequisites is one less thing between a fresh clone and a first build.
+run = "./build-deps.sh"
 
 [tasks.preflight]
 description = "Probe the toolchain, the host tools and src/ — compiles nothing"
 dir = "{{config_root}}"
+depends = ["deps"]
 run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./preflight.sh"
 
 [tasks.build-configure]
 description = "Configure LibreOffice for wasm32-wasip2 into ./build (M0)"
 dir = "{{config_root}}"
+depends = ["deps"]
 # wasi-sdk comes from the root mise.toml [tools]; resolved at task time because
 # `mise where` cannot be used in an [env] template — it would recurse. Same
 # shape as plugins/qt. The scripts fall back to the mise install path when run
@@ -73,6 +99,7 @@ if ! ls patches/core-*.patch >/dev/null 2>&1; then
   echo "    To work on the port: ./preflight.sh, then ./build-configure.sh."
   exit 0
 fi
+./build-deps.sh
 SDK=$(mise where github:WebAssembly/wasi-sdk)
 WASI_SDK="$SDK" ./build-configure.sh
 WASI_SDK="$SDK" ./build-host.sh

@@ -81,12 +81,12 @@ echo "== 2. host tools =========================================================
 if gm="$(lo_find_gnumake)"; then
     ok "GNU Make >= 4.2: $gm ($("$gm" --version | head -1))"
 else
-    bad "GNU Make >= 4.2 not found (configure.ac:6907). /usr/bin/make here is $(make --version 2>/dev/null | head -1). Fix: brew install make"
+    bad "GNU Make >= 4.2 not found (configure.ac:6907). /usr/bin/make here is $(make --version 2>/dev/null | head -1). Fix: mise run deps"
 fi
 if gp="$(lo_find_gperf)"; then
     ok "gperf >= 3.1: $gp ($("$gp" --version | head -1))"
 else
-    bad "gperf >= 3.1 not found (configure.ac:8201). /usr/bin/gperf here is $(gperf --version 2>/dev/null | head -1). Fix: brew install gperf"
+    bad "gperf >= 3.1 not found (configure.ac:8201). /usr/bin/gperf here is $(gperf --version 2>/dev/null | head -1). Fix: mise run deps"
 fi
 
 # Hard requirements that do resolve on a normal developer machine.
@@ -109,7 +109,7 @@ fi
 # Soft: absent but survivable, each for a specific reason.
 command -v ccache >/dev/null 2>&1 \
     && ok "ccache -> $(command -v ccache)" \
-    || soft "ccache absent. Not fatal, but this is a two-stage build of one of the largest C++ codebases in existence on $LO_JOBS cores: without it every configure-flag experiment re-pays the whole native bootstrap. Fix: brew install ccache"
+    || soft "ccache absent. Not fatal, but this is a two-stage build of one of the largest C++ codebases in existence on $LO_JOBS cores: without it every configure-flag experiment re-pays the whole native bootstrap. Fix: mise install (it is pinned in mise.toml [tools])"
 command -v meson >/dev/null 2>&1 \
     && ok "meson -> $(command -v meson)" \
     || soft "meson absent. NOT fatal: configure.ac:14751 warns and falls back to the internal meson-1.8.3 from download.lst. cairo/pixman/harfbuzz build through it."

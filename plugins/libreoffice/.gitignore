@@ -45,6 +45,13 @@ gen/
 # which cannot parse exnref. Machine-specific by construction.
 .toolbin/
 
+# Host tools this port builds for itself because macOS ships versions
+# LibreOffice's configure rejects outright (GNU Make 3.81, gperf 3.0.3) and
+# neither is available through mise. `mise run deps` rebuilds both in ~2 min
+# from the pinned tarballs, so there is nothing here worth tracking.
+.hosttools/
+.hosttools-build/
+
 # Build logs (each stage tees one; they are large and machine-specific).
 logs/
 *.log
