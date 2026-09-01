@@ -243,9 +243,15 @@ fi
 # cppuhelper/source/shlib.cxx, which is where the first two expected failures
 # live (CannotActivateFactoryException "unknown constructor name", and a
 # DeploymentException on the services.rdb path).
-if [ "${WK_LO_DEBUG:-0}" = "1" ]; then
-    args+=("--enable-symbols" "--enable-sal-log")
-fi
+#
+# Two settings, because the two costs are not the same. WK_LO_DEBUG=log gets the
+# logging alone, which is what you want once the thing links: DWARF for a module
+# this size is many hundreds of megabytes for the linker to carry and write.
+# WK_LO_DEBUG=1 gets both.
+case "${WK_LO_DEBUG:-0}" in
+    1)   args+=("--enable-symbols" "--enable-sal-log") ;;
+    log) args+=("--enable-sal-log") ;;
+esac
 
 # ccache, if the machine has it, on BOTH sides. The forwarding is documented at
 # static/README.wasm.md:130-137 and implemented at configure.ac:6238. Without

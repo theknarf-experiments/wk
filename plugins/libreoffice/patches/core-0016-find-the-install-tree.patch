@@ -1,0 +1,120 @@
+diff --git a/cppuhelper/source/paths.cxx b/cppuhelper/source/paths.cxx
+index 0a4ccf76e..f953747c3 100644
+--- a/cppuhelper/source/paths.cxx
++++ b/cppuhelper/source/paths.cxx
+@@ -34,7 +34,10 @@
+ 
+ namespace {
+ 
+-#if !(defined ANDROID || defined EMSCRIPTEN)
++// WASI joins them: get_this_libpath asks dladdr where this function came from,
++// and a statically linked component has no dynamic loader to ask -- the call
++// returns false and the URI comes out empty.
++#if !(defined ANDROID || defined EMSCRIPTEN || defined WASI)
+ OUString get_this_libpath() {
+     static OUString s_uri = []() {
+         OUString uri;
+@@ -61,7 +64,13 @@ OUString cppu::getUnoIniUri() {
+     // and since rtlBootstrapHandle is not ref-counted doing anything
+     // clean here is hardish.
+     OUString uri("file:///assets/program");
+-#elif defined(EMSCRIPTEN)
++#elif defined(EMSCRIPTEN) || defined(WASI)
++    // Hard-coded for the same reason as ANDROID above, and to the same place
++    // Emscripten uses. Nothing softer is available: wasmtime hands a component
++    // only the basename in argv[0], wasi-libc's realpath always fails, and
++    // there is no dladdr -- so the install tree cannot be discovered at all,
++    // only agreed on. wk mounts it at /instdir, which is also where the
++    // fontconfig paths in ExternalProject_fontconfig.mk point.
+     OUString uri("file:///instdir/program");
+ #else
+     OUString uri(get_this_libpath());
+diff --git a/desktop/source/app/sofficemain.cxx b/desktop/source/app/sofficemain.cxx
+index ac0f72ec5..5bb828ed3 100644
+--- a/desktop/source/app/sofficemain.cxx
++++ b/desktop/source/app/sofficemain.cxx
+@@ -35,6 +35,9 @@
+ #include <systools/win32/test_desktop.hxx>
+ #endif
+ 
++#include <cstdio>
++#include <exception>
++
+ #include <rtl/bootstrap.hxx>
+ #include <sal/main.h>
+ #include <tools/extendapplicationenvironment.hxx>
+@@ -72,6 +75,12 @@ extern "C" int DESKTOP_DLLPUBLIC soffice_main()
+ #if defined ANDROID
+     try {
+         rtl::Bootstrap::setIniFilename("file:///assets/program/lofficerc");
++#elif defined WASI
++    // Same reason as the ANDROID arm below: without this the host sees only
++    // "thrown Wasm exception" and no type, no message, and no frame below
++    // soffice_main. A release build has no SAL_WARN either, so stderr here is
++    // the only channel there is.
++    try {
+ #endif
+     tools::extendApplicationEnvironment();
+ 
+@@ -126,6 +135,15 @@ extern "C" int DESKTOP_DLLPUBLIC soffice_main()
+              OUStringToOString(e.Message, RTL_TEXTENCODING_UTF8).getStr());
+         throw; // to get exception type printed
+     }
++#elif defined WASI
++    } catch (const css::uno::Exception &e) {
++        std::fprintf(stderr, "soffice: unhandled UNO exception: %s\n",
++                     OUStringToOString(e.Message, RTL_TEXTENCODING_UTF8).getStr());
++        throw;
++    } catch (const std::exception &e) {
++        std::fprintf(stderr, "soffice: unhandled %s\n", e.what());
++        throw;
++    }
+ #endif
+ }
+ 
+diff --git a/sal/osl/unx/process_impl.cxx b/sal/osl/unx/process_impl.cxx
+index 07eb23904..de46a3aa8 100644
+--- a/sal/osl/unx/process_impl.cxx
++++ b/sal/osl/unx/process_impl.cxx
+@@ -98,6 +98,13 @@ oslProcessError bootstrap_getExecutableFile(rtl_uString ** ppFileURL)
+ #ifdef EMSCRIPTEN
+     // Just return some dummy file: URL for now to see what happens
+     OUString fileURL = "vnd.sun.star.pathname:/instdir/program/soffice";
++#elif defined WASI
++    // WASI is in the same position and for stronger reasons: no dladdr to ask,
++    // and argv[0] is only the basename wasmtime was invoked with. A real file:
++    // URL rather than Emscripten's vnd.sun.star.pathname:, because $ORIGIN is
++    // derived from this and fundamentalrc expands <$ORIGIN/services>* by
++    // listing that directory -- which needs a URL osl::Directory can open.
++    OUString fileURL = "file:///instdir/program/soffice";
+     rtl_uString_acquire(fileURL.pData);
+     *ppFileURL = fileURL.pData;
+     return osl_Process_E_None;
+@@ -234,7 +241,17 @@ void SAL_CALL osl_setCommandArgs (int argc, char ** argv)
+             }
+             if (ppArgs[0] != nullptr)
+             {
+-#if HAVE_FEATURE_MACOSX_SANDBOX
++#if defined WASI
++                // The sandbox case below, only more so. wasmtime hands a
++                // component the BASENAME in argv[0] -- "soffice.bin", with no
++                // directory -- and wasi-libc's realpath is a stub that always
++                // fails, so nothing can turn it into a path. Left alone, every
++                // $ORIGIN in fundamentalrc expands against "soffice.bin" and
++                // the office's own services.rdb is never found.
++                // bootstrap_getExecutableFile already answers a file: URL here,
++                // so unlike the sandbox arm there is no system path to convert.
++                bootstrap_getExecutableFile(&ppArgs[0]);
++#elif HAVE_FEATURE_MACOSX_SANDBOX
+                 // If we are called with a relative path in argv[0] in a sandboxed process
+                 // osl::realpath() fails. So just use bootstrap_getExecutableFile() instead.
+                 // Somewhat silly to use argv[0] and tediously figure out the absolute path from it
+@@ -267,7 +284,7 @@ void SAL_CALL osl_setCommandArgs (int argc, char ** argv)
+                 {
+                     osl_getFileURLFromSystemPath (pArg0.pData, &(ppArgs[0]));
+                 }
+-#endif // !HAVE_FEATURE_MACOSX_SANDBOX
++#endif // !WASI && !HAVE_FEATURE_MACOSX_SANDBOX
+             }
+             g_command_args.m_nCount = argc;
+             g_command_args.m_ppArgs = ppArgs;
