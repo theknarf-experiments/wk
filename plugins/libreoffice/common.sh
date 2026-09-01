@@ -71,12 +71,8 @@ LO_JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
 # Homebrew's aclocal additionally shells out to its versioned twin. Omitting one
 # surfaces as autogen.sh's bare "Failed to run aclocal at ... line 210", which
 # names neither the tool nor the PATH.
-# pkg-config is deliberately ABSENT. LibreOffice's configure refuses one it
-# does not recognise the origin of — "error: yes, from unknown origin. This
-# *will* break the build" (configure.ac's bogus-pkg-config check) — because on
-# macOS a Homebrew pkg-config makes the NATIVE bootstrap link against Homebrew
-# libraries that the cross build then has no equivalent of. LibreOffice builds
-# its externals from its own tarballs and wants no system pkg-config at all.
+# pkg-config is not in this list because the one on PATH must NOT be used: see
+# toolwrap/pkg-config, which lo_link_toolbin installs instead.
 LO_HOST_TOOLS="gmake make gperf ccache flex bison m4 gm4 perl python3
                autoconf autoheader autom4te autoreconf autoupdate ifnames
                aclocal aclocal-1.18 automake automake-1.18 libtool libtoolize glibtoolize
@@ -88,6 +84,10 @@ lo_link_toolbin() {
         p="$(command -v "$t" 2>/dev/null || true)"
         [ -n "$p" ] && ln -sf "$p" "$LO_TOOLBIN/$t"
     done
+    # Our own wrappers, linked explicitly rather than resolved from PATH —
+    # `command -v pkg-config` would find Homebrew's, which is the one thing
+    # this wrapper exists to keep out of the build. See toolwrap/pkg-config.
+    ln -sf "$LO_ROOT/toolwrap/pkg-config" "$LO_TOOLBIN/pkg-config"
     return 0
 }
 

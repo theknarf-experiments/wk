@@ -1,0 +1,64 @@
+diff --git a/Repository.mk b/Repository.mk
+index 79eceddda..39c85c633 100644
+--- a/Repository.mk
++++ b/Repository.mk
+@@ -33,7 +33,8 @@ $(eval $(call gb_Helper_register_executables,NONE, \
+ 	concat-deps \
+ 	cpp \
+ 	cppunittester \
+-	$(if $(or $(filter EMSCRIPTEN,$(BUILD_TYPE_FOR_HOST)),$(filter EMSCRIPTEN,$(OS))),embindmaker wasmbridgegen) \
++	$(if $(or $(filter EMSCRIPTEN,$(BUILD_TYPE_FOR_HOST)),$(filter EMSCRIPTEN,$(OS))),embindmaker) \
++	$(if $(or $(filter EMSCRIPTEN WASM,$(BUILD_TYPE_FOR_HOST)),$(filter EMSCRIPTEN WASI,$(OS))),wasmbridgegen) \
+ 	gbuildtojson \
+ 	$(if $(filter MSC,$(COM)), \
+ 		gcc-wrapper \
+diff --git a/RepositoryModule_build.mk b/RepositoryModule_build.mk
+index c39b65cf9..c34aee657 100644
+--- a/RepositoryModule_build.mk
++++ b/RepositoryModule_build.mk
+@@ -47,7 +47,7 @@ $(eval $(call gb_Module_add_moduledirs,cross_toolset,\
+ 	shell \
+ 	solenv \
+ 	soltools \
+-	$(if $(filter EMSCRIPTEN,$(BUILD_TYPE_FOR_HOST)),static) \
++	$(if $(filter EMSCRIPTEN WASM,$(BUILD_TYPE_FOR_HOST)),static) \
+ 	stoc \
+ 	store \
+ 	tools \
+diff --git a/solenv/gbuild/extensions/pre_BuildTools.mk b/solenv/gbuild/extensions/pre_BuildTools.mk
+index 8ea180faa..36698af7d 100644
+--- a/solenv/gbuild/extensions/pre_BuildTools.mk
++++ b/solenv/gbuild/extensions/pre_BuildTools.mk
+@@ -16,7 +16,8 @@ gb_BUILD_TOOLS_executables = \
+ 		climaker \
+ 		cpp \
+ 		cppumaker \
+-		$(if $(filter EMSCRIPTEN,$(BUILD_TYPE_FOR_HOST)),embindmaker wasmbridgegen) \
++		$(if $(filter EMSCRIPTEN,$(BUILD_TYPE_FOR_HOST)),embindmaker) \
++		$(if $(filter EMSCRIPTEN WASM,$(BUILD_TYPE_FOR_HOST)),wasmbridgegen) \
+ 		gencoll_rule \
+ 		genconv_dict \
+ 		$(if $(WITH_GALLERY_BUILD),gengal) \
+diff --git a/static/Module_static.mk b/static/Module_static.mk
+index 4c57b94d7..db0b25eef 100644
+--- a/static/Module_static.mk
++++ b/static/Module_static.mk
+@@ -27,9 +27,18 @@ endif
+ 
+ endif
+ 
++# embindmaker generates Emscripten embind/JS bindings and is meaningless
++# without a JS runtime; wasmbridgegen generates the UNO C++/wasm bridge and is
++# needed by every wasm platform. Emscripten builds both, WASM (wasi) only the
++# second.
+ ifneq ($(filter EMSCRIPTEN,$(BUILD_TYPE_FOR_HOST)),)
+ $(eval $(call gb_Module_add_targets,static, \
+     Executable_embindmaker \
++))
++endif
++
++ifneq ($(filter EMSCRIPTEN WASM,$(BUILD_TYPE_FOR_HOST)),)
++$(eval $(call gb_Module_add_targets,static, \
+     Executable_wasmbridgegen \
+ ))
+ endif

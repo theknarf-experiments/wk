@@ -1,0 +1,30 @@
+#!/bin/sh
+# pkg-config with an empty default search path.
+#
+# Two constraints that look contradictory:
+#
+#   * LibreOffice's configure REFUSES a pkg-config whose origin it does not
+#     recognise (configure.ac:7178, "yes, from unknown origin. This *will*
+#     break the build"), because on macOS a Homebrew one makes the build link
+#     against Homebrew libraries the cross build has no equivalent of.
+#   * Several externals' own configure scripts REQUIRE one. liblangtag's dies
+#     with "configure: error: pkg-config not found" during `make cross-toolset`.
+#
+# configure.ac:7175 resolves it: a pkg-config that lists no packages in its
+# default search path is accepted, "since no packages available in default
+# searchpath". That is not a loophole, it is the actual property LibreOffice
+# cares about — it objects to what pkg-config would FIND, not to the binary.
+#
+# So: point PKG_CONFIG_LIBDIR at an empty directory. PKG_CONFIG_PATH is left
+# alone deliberately, and := rather than = so a recipe that sets either one
+# still gets what it asked for: LibreOffice's own ExternalProject recipes use
+# PKG_CONFIG_PATH to point at the libraries it built itself, and those must
+# keep working.
+here=$(cd "$(dirname "$0")" && pwd)
+: "${PKG_CONFIG_LIBDIR:=$here/../.pkgconfig-empty}"
+export PKG_CONFIG_LIBDIR
+for real in /opt/homebrew/bin/pkg-config /usr/local/bin/pkg-config /usr/bin/pkg-config; do
+    [ -x "$real" ] && exec "$real" "$@"
+done
+echo "pkg-config: no real pkg-config found to wrap" >&2
+exit 1

@@ -1,5 +1,5 @@
 diff --git a/configure.ac b/configure.ac
-index 73b529c98..89f7810f5 100644
+index 73b529c98..f47428c4c 100644
 --- a/configure.ac
 +++ b/configure.ac
 @@ -1244,6 +1244,33 @@ haiku*)
@@ -36,7 +36,24 @@ index 73b529c98..89f7810f5 100644
  emscripten)
      # API currently just exists in headers, not code
      usable_dlapi=no
-@@ -3388,7 +3415,7 @@ dnl cross-compiling would imply a non-desktop OS.
+@@ -1560,6 +1587,16 @@ if test "$_os" = "Emscripten"; then
+         AC_MSG_RESULT([no])
+     fi
+ fi
++
++dnl The wasm bootstrap tool. wasmbridgegen generates the UNO C++/wasm bridge,
++dnl and every wasm platform needs it — but the four gates that build it are
++dnl written against the literal string EMSCRIPTEN in BUILD_TYPE_FOR_HOST, which
++dnl a WASI host does not set. Hence a token of our own rather than pretending to
++dnl be Emscripten: it lets those gates keep embindmaker, Emscripten's embind/JS
++dnl binding generator, out of a build that has no JS runtime to bind to.
++if test "$_os" = WASI; then
++    BUILD_TYPE="$BUILD_TYPE WASM"
++fi
+ AC_SUBST(EMSDK_FILE_PACKAGER)
+ AC_SUBST(EMSCRIPTEN_EXTRA_QTLOADER_CONFIG)
+ AC_SUBST(EMSCRIPTEN_EXTRA_SOFFICE_PRE_JS)
+@@ -3388,7 +3425,7 @@ dnl cross-compiling would imply a non-desktop OS.
  if test $_os != iOS -a $_os != Android -a "$enable_fuzzers" != "yes"; then
      BUILD_TYPE="$BUILD_TYPE DESKTOP"
      AC_DEFINE(HAVE_FEATURE_DESKTOP)
@@ -45,7 +62,7 @@ index 73b529c98..89f7810f5 100644
          AC_DEFINE(HAVE_FEATURE_MULTIUSER_ENVIRONMENT)
      fi
  fi
-@@ -3403,7 +3430,7 @@ if test "$enable_wasm_strip" = "yes"; then
+@@ -3403,7 +3440,7 @@ if test "$enable_wasm_strip" = "yes"; then
      enable_database_connectivity=no
      enable_dbus=no
      enable_dconf=no
@@ -54,7 +71,7 @@ index 73b529c98..89f7810f5 100644
      enable_extension_integration=no
      enable_extensions=no
      enable_extension_update=no
-@@ -3482,8 +3509,8 @@ else
+@@ -3482,8 +3519,8 @@ else
      SCPDEFS="$SCPDEFS -DDISABLE_SCRIPTING"
  fi
  
@@ -65,7 +82,7 @@ index 73b529c98..89f7810f5 100644
      enable_dynamic_loading=no
  elif test -z "$enable_dynamic_loading"; then
      # Otherwise enable it unless specifically disabled
-@@ -3568,7 +3595,7 @@ if test -n "${with_templates}"; then
+@@ -3568,7 +3605,7 @@ if test -n "${with_templates}"; then
          AC_MSG_ERROR([unknown value --with-templates=$with_templates])
      fi
  else
@@ -74,7 +91,7 @@ index 73b529c98..89f7810f5 100644
          AC_MSG_RESULT([enable all templates])
      else
          WITH_TEMPLATES=
-@@ -4308,7 +4335,7 @@ if test "$cross_compiling" = "yes"; then
+@@ -4308,7 +4345,7 @@ if test "$cross_compiling" = "yes"; then
      if test "$enable_dynamic_loading" != yes -a "$enable_wasm_strip" = yes; then
          ENABLE_WASM_STRIP=TRUE
      fi
@@ -83,7 +100,7 @@ index 73b529c98..89f7810f5 100644
          ENABLE_WASM_STRIP_ACCESSIBILITY=TRUE
          ENABLE_WASM_STRIP_BASIC_DRAW_MATH_IMPRESS=TRUE
          ENABLE_WASM_STRIP_CALC=TRUE
-@@ -5798,6 +5825,31 @@ solaris*)
+@@ -5798,6 +5835,31 @@ solaris*)
      SOLARINC="$SOLARINC -I/usr/local/include"
      ;;
  

@@ -206,6 +206,12 @@ args=(
 )
 
 build_opts="--without-system-libxml --without-system-fontconfig --without-system-freetype --without-system-zlib"
+# The BUILD-side sub-configure runs the same bogus-pkg-config check and does NOT
+# inherit the host side's options, so the approval has to be given twice. The
+# host-side one is added to args below; this is its BUILD-side twin, and leaving
+# it out fails the whole configure at the very end with the check's message
+# naming .toolbin/pkg-config.
+build_opts="$build_opts --enable-bogus-pkg-config"
 
 # --disable-gui is the STAGING point, not the destination (PORTING.md decision
 # 10). It is only reachable at all because the WASI host arm copies Emscripten's
@@ -242,6 +248,17 @@ if command -v ccache >/dev/null 2>&1; then
 else
     echo "=== note: ccache absent; every reconfigure will re-pay the native bootstrap"
 fi
+
+# Approving our OWN pkg-config, not the system's. configure.ac:7178 refuses one
+# whose origin it cannot place, and Homebrew's pkgconf always reports two
+# virtual packages (pkg-config, pkgconf) that :7175's grep does not filter — so
+# the "no packages in the default searchpath" escape never fires here even with
+# the path emptied. toolwrap/pkg-config IS emptied: PKG_CONFIG_LIBDIR points at
+# an empty directory, so what this approves is a pkg-config that can see
+# nothing, which is exactly the property the check defends. The alternative,
+# no pkg-config at all, kills liblangtag's own configure during
+# `make cross-toolset`.
+args+=("--enable-bogus-pkg-config")
 
 args+=("--with-build-platform-configure-options=$build_opts")
 
