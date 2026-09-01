@@ -50,6 +50,14 @@ lo_require_src
 lo_require_configured
 lo_link_toolbin
 
+# The thread shim goes on every link line this stage produces (gb_WASI_SHIM in
+# WASI_INTEL_GCC.mk). Rebuilt here so the archive on disk is never stale after
+# an edit to shim/wk-wasi-threads.c. Note gbuild has no dependency on files
+# outside SRCDIR, so a changed shim does not by itself trigger a relink of
+# anything already built — delete the binary, or `make <module>.clean`, when
+# you change the shim's behaviour.
+./build-shim.sh || lo_die "build-shim.sh failed"
+
 GNUMAKE="$(lo_find_gnumake)" || lo_die "GNU Make >= 4.2 not found. Run ./preflight.sh"
 
 # The native bootstrap has to have happened: the cross build shells out to

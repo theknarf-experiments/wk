@@ -43,6 +43,14 @@ echo "=== patches"
 lo_apply_patches
 lo_require_patches
 
+# The wasip2 thread shim, before anything can run make. WASI_INTEL_GCC.mk names
+# the archive on every link line and hard-errors when it is missing, and that
+# file is included by gbuild on the HOST side of `make cross-toolset` too — so
+# it has to exist from the first make invocation, not just at link time. One C
+# file, about a second, idempotent. See shim/wk-wasi-threads.c for what it
+# overrides and why it cannot be a patch to src/.
+./build-shim.sh || lo_die "build-shim.sh failed"
+
 # The two host tools that are AC_MSG_ERROR, resolved here rather than left to
 # PATH order. See preflight.sh for the full probe and the brew hints.
 GNUMAKE="$(lo_find_gnumake)" || lo_die "GNU Make >= 4.2 not found (configure.ac:6907). Run ./preflight.sh"

@@ -40,6 +40,19 @@ LO_TOOLBIN="$LO_ROOT/.toolbin"
 LO_HOSTTOOLS="$LO_ROOT/.hosttools"  # gmake/gperf this port builds; see build-deps.sh
 LO_TAG="libreoffice-26.2.6.2"      # what src/ must be at; see PORTING.md for why this tag
 
+# The wasip2 thread shim: one C file overriding pthread_cond_timedwait so that
+# a wait which can only ever time out returns ETIMEDOUT instead of letting
+# libc++ abort(). Built by build-shim.sh, linked into every LibreOffice binary
+# by solenv/gbuild/platform/WASI_INTEL_GCC.mk.
+#
+# THE PATH IS LOAD-BEARING IN TWO PLACES and they must not drift: this variable
+# and the gb_WASI_SHIM assignment in patches/core-0002-gbuild-wasi-platform.patch,
+# which spells it $(SRCDIR)/../shim/libwkwasithreads.a — SRCDIR being
+# plugins/libreoffice/src. The makefile hard-errors when the file is missing
+# rather than linking without it, because a silently absent override is an
+# abort() at run time months later.
+LO_SHIM_LIB="$LO_ROOT/shim/libwkwasithreads.a"
+
 # The target triple. Deliberately NOT wasm32-local-emscripten: this port adds a
 # `wasi*)` host_os arm beside upstream's `emscripten)` one rather than pretending
 # to be Emscripten. See PORTING.md, "The strategy".

@@ -39,15 +39,23 @@ and does not repeat the reasoning.
   nothing, never touches `src/`. Run it first.
 * `build-configure.sh` (M0) → `build-host.sh` (M1) → `build-lo.sh` (M2/M3) —
   the three stages, each idempotent, each `tee`-ing into `./logs`.
-* `patches/` — empty but for its `README.md`, which names the two structural
-  patches `build-configure.sh` refuses to run without.
+* `shim/wk-wasi-threads.c` + `build-shim.sh` — the wasip2 thread shim: a
+  one-file static archive that overrides `pthread_cond_timedwait` so a wait
+  which can only ever time out returns `ETIMEDOUT` instead of letting libc++
+  `abort()`. Deliberately outside `src/` and outside `patches/`, because as a
+  link-line override it also covers libc++, libc++abi and the externals. All
+  three build stages run it; `WASI_INTEL_GCC.mk` refuses to parse without it.
+  See decision 12.
+* `patches/` — `core-0001` … `core-0006` plus its `README.md`. The two the
+  header calls structural (`core-0001` the `configure.ac` host arm,
+  `core-0002` the gbuild platform file) are the two `build-configure.sh`
+  refuses to run without.
 * `mise.toml` — the staged tasks. Its `build` task **self-skips** while
   `patches/` is empty, so the repo-wide `mise run build-plugins` sweep does not
   sit in a LibreOffice build.
 
-**Nothing has been built.** There is no `patches/core-*.patch` and no
-`vcl/wk/`, so nothing can even configure yet — by design, and the refusal is
-loud. See **Current state**.
+**There is no `vcl/wk/` yet**, so no rung above M3 has been attempted. What
+*has* been built is in **Current state**.
 
 Why 26.2.6.2 and not the newest tag: `git ls-remote` shows 26.8 only just
 branched (`libreoffice-26-8-branch-point` → `26.8.0.0.alpha1` → `26.8.0.3`), so
@@ -106,7 +114,9 @@ Two mitigations make it tractable rather than open-ended:
    running under wasmtime: `pthread_cond_wait` traps on `unreachable`;
    `std::condition_variable::wait_for` goes `__do_timed_wait` →
    `std::terminate()` → `abort()`, exit 134; `pthread_cond_timedwait` returns
-   `ENOTSUP` (58) rather than `ETIMEDOUT`. That inverts the usual porting
+   `ENOTSUP` (58) rather than `ETIMEDOUT` — that last one is what the thread
+   shim now overrides (decision 12), so the *timed* waits no longer abort; the
+   untimed ones still do, on purpose. That inverts the usual porting
    intuition — normally a missing thread means "deadlock, then bisect" — into
    "crash with a stack trace, patch the named site, repeat". Every reachable
    wait is findable in one run.
@@ -247,7 +257,35 @@ needed (`autogen.sh:321` only prepends it for `--host=wasm*-emscripten`); no
     non-Android, non-Windows target; `--disable-scripting` does it again
     independently. Every `loader="com.sun.star.loader.Java2"` component in the
     tree is a wizard, reportbuilder or scripting provider.
-12. **Python: runtime off, host required.** `enable_python=no` comes free from
+12. **The threading policy lives in one 200-line C file on the link line, not
+    in patches.** `shim/wk-wasi-threads.c` → `shim/libwkwasithreads.a`, built by
+    `build-shim.sh`, injected by `gb_WASI_SHIM` in `WASI_INTEL_GCC.mk`'s
+    `gb_LinkTarget_LDFLAGS` with `--whole-archive`. It overrides exactly two
+    libc functions, and the asymmetry between them is the decision:
+    * `pthread_cond_timedwait` **sleeps for the requested time on
+      `CLOCK_MONOTONIC` and returns `ETIMEDOUT`.** A wait that can only ever
+      time out should say so rather than let libc++ abort. The sleep is not
+      optional: returning instantly would turn `SvpSalInstance::ImplYield` into
+      a 100%-CPU spin, so this is a correctness *and* a power decision.
+    * `pthread_cond_wait` (untimed) **prints one sentence and aborts.** An
+      unsignallable wait with no deadline is a deadlock, not a timeout. The
+      three options were a spurious `return 0` (a silent livelock, because
+      every caller uses the predicate form and loops), sleeping forever (an
+      undebuggable hang), or crashing where the fault is. Failing loudly is the
+      only one that names the bug. If a *reachable* untimed wait appears, give
+      that call site a serial path; do not soften the shim.
+    Not overridden, each deliberately: `pthread_create` (already a clean
+    ENOTSUP), `pthread_join` (wasi-libc returns 0 without touching `*retval` —
+    a lie, but unobservable, since `pthread_create` can never succeed so there
+    is never a thread to join), and `pthread_barrier_wait` /
+    `__wasilibc_futex_wait` (both trap exactly when they would block, which is
+    right for the same reason the untimed wait is). A survey of all 847 members
+    of `libc.a` found exactly three functions whose body is a bare
+    `unreachable`: `abort`, `__stack_chk_fail_local` and `pthread_cond_wait`.
+    There is no fourth landmine of this shape.
+    **Why a link-line archive and not a patch:** it also covers libc++,
+    libc++abi and the ~149 externals, which we never patch.
+13. **Python: runtime off, host required.** `enable_python=no` comes free from
     the same block, but a *host* Python 3 is a hard build dependency
     (`native-code.py`, `constructors.py`, `com_GCC_class.mk`). **Pass
     `PYTHON=` explicitly** or `configure.ac:10689` may quietly build an
@@ -377,6 +415,20 @@ than the four items above.
   *yield mutex* is safe — `doAcquire` takes the main-thread branch and `break`s
   on `tryToAcquire()` success, only reaching the condvar when another thread
   holds the mutex, which cannot happen.
+  **The timed half of this is now closed by `shim/wk-wasi-threads.c`** — see
+  decision 12 — so `wait_for` sleeps and returns `cv_status::timeout`
+  everywhere, including in `osl_waitCondition`
+  (`sal/osl/unx/conditn.cxx:119`, which is the same `wait_for(…, predicate)`
+  shape and is reached long before VCL). The untimed half is deliberately still
+  a crash. **`DoYield` must still be overridden**: the shim makes the timed wait
+  survivable, it does not make svp's wake-up condition wake up.
+* **The root cause under that abort is a clock, not a thread.** wasi-libc's
+  `pthread_cond_timedwait` is musl's, and it waits by calling
+  `clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, …)`. Verified by running:
+  on wasip2 every `CLOCK_REALTIME` sleep — absolute or relative — returns
+  ENOTSUP (58) in 0.0 ms, while every `CLOCK_MONOTONIC` sleep works and takes
+  the time asked for. That is where the 58 comes from, and it is why the shim
+  can honour the caller's timeout instead of returning instantly.
 * **Do NOT copy `svpinst.cxx`'s `#if defined EMSCRIPTEN` block.** It sets
   `maAppData.m_bUseSystemLoop = true` and overrides `DoExecute` to call
   `emscripten_set_main_loop_arg`, because Emscripten must unwind the stack
@@ -748,6 +800,7 @@ Modelled on `plugins/qt` and `plugins/netsurf`. Three stages, plus a probe:
 | script | milestone | wall-clock |
 |---|---|---|
 | `preflight.sh` | — | seconds |
+| `build-shim.sh` | — | a second |
 | `build-configure.sh` | M0 | minutes |
 | `build-host.sh` (`make cross-toolset`) | M1 | 20–40 min, **estimated** |
 | `build-lo.sh` (`make`, or `make <module>`) | M2 / M3 | hours |
@@ -835,21 +888,18 @@ Reported, not installed, per the house rules:
 
 ## Current state
 
-**Nothing is built. Zero lines have been compiled for this target.** What
-exists is a pinned source tree and a survey deep enough to cost out the work
-and to name the two experiments that could kill it.
-
 | milestone | state |
 |---|---|
-| source pinned at `libreoffice-26.2.6.2` | **done** — `./src`, 1.8 GB, gitignored, `git status` clean |
+| source pinned at `libreoffice-26.2.6.2` | **done** — `./src`, 1.8 GB, gitignored, `git status` clean between sessions (patches are applied by `build-configure.sh` and reverted after being regenerated) |
 | build scaffolding (`common.sh`, `preflight.sh`, three stages, `mise.toml`, `patches/`) | **done** — every script runs, refuses correctly, and touches nothing |
-| `./preflight.sh` | **green except the two host tools** — 2 blocking (`gmake`, `gperf`), 5 advisory |
-| the two structural patches | **not started** — `build-configure.sh` refuses until they exist |
-| E1 circular-archive link probe | **not started** — do this first |
+| `./preflight.sh` | **green except the two host tools** — `mise run deps` builds `gmake` and `gperf` into `.hosttools` |
+| the two structural patches | **done** — `core-0001` (configure host arm), `core-0002` (`WASI_INTEL_GCC.mk`); six patches in all, each verified to apply to a pristine tree |
+| the wasip2 thread shim | **done** — `shim/wk-wasi-threads.c` → `libwkwasithreads.a`, on every link line via `gb_WASI_SHIM`. The abort was reproduced, then fixed, then the fix was verified to be the symbol actually linked (see below) |
+| E1 circular-archive link probe | **not started** |
 | E2 182 MB component on `PluginHost` | **not started** |
-| M0 configure completes | **probed, then reverted** — a throwaway patch reached the BUILD sub-configure; blocked on host `gmake` |
-| M1 native bootstrap | **not started** |
-| M2 `libsal.a` + a wasip2 program that runs | **not started** |
+| M0 configure completes | **done** — `build/config_host.mk` has `export OS=WASI` |
+| M1 native bootstrap | **done** — 39 entries in `build/workdir_for_build/LinkTarget/Executable`, `wasmbridgegen` among them |
+| M2 `libsal.a` + a wasip2 program that runs | **in progress** — `zlib` and the UNO bridge cross-compile (`build/workdir/LinkTarget/StaticLibrary/libzlib.a`); `sal` is down to a handful of platform gaps (`chown`/`lchown`/`getuid`, `sys/wait.h`, and `<pthread.h>` not being included). Check `logs/lo-sal.allbuild-*.log` for the current list, newest last |
 | M3 `soffice.wasm` links headless | **not started** |
 | M4 `.pptx` → PDF | **not started** |
 | M5 svp renders a slide to PNG | **not started** |
@@ -876,6 +926,39 @@ and to name the two experiments that could kill it.
   `hardware_concurrency()` → 1; `pthread_cond_wait` traps on `unreachable`;
   `std::condition_variable::wait_for` → `abort()`, exit 134; recursive mutexes,
   `pthread_key`, `sleep_for` and `sched_yield` all fine.
+* **The thread shim, end to end.** (a) The five-line `wait_for` program aborts
+  under wasmtime — `__do_timed_wait` → `std::terminate` → `abort`, exit 134 —
+  *before* the shim existed. (b) `pthread_cond_timedwait` called directly
+  returns **58 in 0.0 ms** with both a normal and a recursive mutex, and the
+  reason is the clock, not the mutex: `clock_nanosleep` on `CLOCK_REALTIME`
+  returns 58 immediately in both the absolute and the relative form, while
+  `nanosleep` and both `CLOCK_MONOTONIC` forms sleep the requested 50 ms.
+  (c) Linked against the shim, the same program prints `timeout` and exits 0,
+  and a timing harness shows `wait_for` sleeping 51.9 ms / 201.3 ms for 50 ms /
+  200 ms, with the `wait_for(…, predicate)` form — `osl_waitCondition`'s exact
+  shape — returning `false` after 102 ms. (d) `-Wl,--why-extract` names
+  `libwkwasithreads.a(wk-wasi-threads.o)` as the archive member that satisfied
+  libc++'s `pthread_cond_wait` reference, and **neither**
+  `libc.a(pthread_cond_wait.c.obj)` nor `libc.a(pthread_cond_timedwait.c.obj)`
+  appears in the extraction list at all. (e) Ordering is not academic: with
+  `libc.a` named explicitly *before* the shim the abort comes straight back —
+  which is why the makefile uses `--whole-archive`, verified to win even in
+  that adversarial order. (f) The whole thing relinked through
+  `toolwrap/wasi-clang++` with the exact `gb_LinkTarget_LDFLAGS` string the
+  platform makefile now emits, `-Wl,--start-group`/`--end-group` included and
+  dropped by the wrapper: links, runs, times out. (g) `WASI_INTEL_GCC.mk`
+  parsed under GNU Make 4.x both ways — the `$(error)` fires with the
+  "run build-shim.sh" message when the archive is absent, and expands to the
+  `--whole-archive` triple when it is present.
+* An `llvm-objdump` sweep over all 847 members of wasi-libc's `libc.a`: exactly
+  three functions have a bare `unreachable` body (`abort`,
+  `__stack_chk_fail_local`, `pthread_cond_wait`), plus `pthread_barrier_wait`
+  and `__wasilibc_futex_wait`, which trap only on the branch that would block.
+  `pthread_join` returns 0 without touching `*retval`; `pthread_mutex_timedlock`
+  and the `pthread_rwlock_*` family are real, working, uncontended
+  implementations. No object inside `libc.a` references `pthread_cond_wait`,
+  `pthread_cond_timedwait` or `__pthread_cond_timedwait`, so libc's own members
+  can never be pulled in behind the shim's back.
 * `#include <pwd.h>` → *file not found*; `getuid()` → undeclared;
   `dlsym`/`dlopen` compile but fail to link with `undefined symbol`.
 * The `native-code.py` constructor-table pattern (`void X(void);` +

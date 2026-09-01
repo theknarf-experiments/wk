@@ -55,6 +55,16 @@ dir = "{{config_root}}"
 depends = ["deps"]
 run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./preflight.sh"
 
+[tasks.build-shim]
+description = "Build the wasip2 thread shim archive every LibreOffice link needs (~1s)"
+dir = "{{config_root}}"
+# Not in the `depends` chain below: build-configure.sh, build-host.sh and
+# build-lo.sh each invoke ./build-shim.sh themselves, because the archive has
+# to exist before make parses WASI_INTEL_GCC.mk and that is true of all three
+# stages. This task exists so it can be run — and found — on its own after an
+# edit to shim/wk-wasi-threads.c.
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-shim.sh"
+
 [tasks.build-configure]
 description = "Configure LibreOffice for wasm32-wasip2 into ./build (M0)"
 dir = "{{config_root}}"

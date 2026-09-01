@@ -46,6 +46,12 @@ lo_require_src
 lo_require_configured
 lo_link_toolbin
 
+# Nothing here is built for wasm, but gbuild still parses the HOST platform
+# makefile, and WASI_INTEL_GCC.mk hard-errors if the thread shim archive is
+# absent. Rebuild it (a second, idempotent) rather than failing this stage on a
+# file that has nothing to do with the native bootstrap.
+./build-shim.sh || lo_die "build-shim.sh failed"
+
 GNUMAKE="$(lo_find_gnumake)" || lo_die "GNU Make >= 4.2 not found. Run ./preflight.sh"
 
 LOG="$LO_LOGDIR/host-$(date +%Y%m%d-%H%M%S).log"
