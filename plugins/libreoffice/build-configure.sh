@@ -310,22 +310,34 @@ echo "    log: $LOG"
 # from PATH. With wasi-sdk on PATH that sub-configure picks a wasm32 clang for
 # the NATIVE bootstrap and the failure surfaces hours later, in the middle of
 # `make cross-toolset`, as a link error about a native tool.
+# The toolchain goes in as ARGUMENTS, not as environment. autogen.sh records
+# its argv in autogen.lastrun and replays it whenever anything re-runs
+# configure — and the top-level Makefile does exactly that, unprompted, as soon
+# as configure.ac is newer than config_host.mk, which applying a patch makes
+# true. Passed as environment (which is how this script did it until it bit),
+# the assignments are absent from that replay, so make silently reconfigures
+# the CROSS build with plain `gcc` and the next compile fails somewhere with no
+# hint of why. autoconf treats `CC=...` on the command line as a precious
+# variable, so this is its supported route, not a trick.
+args+=(
+  "CC=$LO_CC"
+  "CXX=$LO_CXX"
+  "AR=$LO_AR"
+  "NM=$LO_NM"
+  "RANLIB=$LO_RANLIB"
+  "STRIP=$LO_STRIP"
+  "OBJDUMP=$LO_OBJDUMP"
+  "CC_FOR_BUILD=$LO_CC_FOR_BUILD"
+  "CXX_FOR_BUILD=$LO_CXX_FOR_BUILD"
+  "GNUMAKE=$GNUMAKE"
+  "GPERF=$GPERF"
+  "PYTHON=$PYTHON"
+)
+
 set +e
 (
   cd "$LO_BUILD"
   env PATH="$LO_HOST_PATH" \
-      CC="$LO_CC" \
-      CXX="$LO_CXX" \
-      AR="$LO_AR" \
-      NM="$LO_NM" \
-      RANLIB="$LO_RANLIB" \
-      STRIP="$LO_STRIP" \
-      OBJDUMP="$LO_OBJDUMP" \
-      CC_FOR_BUILD="$LO_CC_FOR_BUILD" \
-      CXX_FOR_BUILD="$LO_CXX_FOR_BUILD" \
-      GNUMAKE="$GNUMAKE" \
-      GPERF="$GPERF" \
-      PYTHON="$PYTHON" \
       PKG_CONFIG_LIBDIR="$PKG_CONFIG_LIBDIR" \
       "$LO_SRC/autogen.sh" "${args[@]}"
 ) 2>&1 | tee "$LOG"

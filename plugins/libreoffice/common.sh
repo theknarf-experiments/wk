@@ -97,10 +97,20 @@ lo_link_toolbin() {
         p="$(command -v "$t" 2>/dev/null || true)"
         [ -n "$p" ] && ln -sf "$p" "$LO_TOOLBIN/$t"
     done
-    # Our own wrappers, linked explicitly rather than resolved from PATH —
-    # `command -v pkg-config` would find Homebrew's, which is the one thing
-    # this wrapper exists to keep out of the build. See toolwrap/pkg-config.
+    # Anything we built or wrapped ourselves is linked explicitly, AFTER the
+    # loop above, because for each of these the copy on PATH is the one we are
+    # trying to avoid:
+    #   pkg-config  Homebrew's would let the native bootstrap link against
+    #               Homebrew libraries the cross build has no equivalent of.
+    #   make/gmake  macOS ships 3.81 and LibreOffice needs >= 4.2, so the loop
+    #               above would silently install the version configure rejects.
+    #   gperf       same story: Xcode's is 3.0.3, the floor is 3.1.
     ln -sf "$LO_ROOT/toolwrap/pkg-config" "$LO_TOOLBIN/pkg-config"
+    if [ -x "$LO_HOSTTOOLS/bin/make" ]; then
+        ln -sf "$LO_HOSTTOOLS/bin/make" "$LO_TOOLBIN/make"
+        ln -sf "$LO_HOSTTOOLS/bin/make" "$LO_TOOLBIN/gmake"
+    fi
+    [ -x "$LO_HOSTTOOLS/bin/gperf" ] && ln -sf "$LO_HOSTTOOLS/bin/gperf" "$LO_TOOLBIN/gperf"
     return 0
 }
 
