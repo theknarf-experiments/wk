@@ -344,6 +344,49 @@ needed (`autogen.sh:321` only prepends it for `--host=wasm*-emscripten`); no
     so the link dies with `wasm-ld: error: --shared-memory is disallowed by
     Unwind-wasm.c.o`. `WASI_INTEL_GCC.mk` clears it. Nothing is lost:
     `pthread_create` is an ENOTSUP stub on this target either way (decision 12).
+17. **`salhelper` needs no patch, and the reason it needs none is the shape to
+    look for in every module above it.** It is the first module in this port to
+    cross-compile completely untouched, and it is the first C++ *consumer* of
+    `osl` conditions to reach the compiler, so it is where the thread shim's two
+    halves become visible side by side in one archive. `llvm-nm
+    --undefined-only` on `timer.o` shows **both**
+    `std::condition_variable::__do_timed_wait` (the half the shim rescues) and
+    `std::condition_variable::wait` (the half the shim deliberately aborts on).
+    Neither is a landmine, and the distinction is the point:
+    * **Both live inside `TimerManager::run()`** (`timer.cxx:426` and `:434`),
+      which is the *body of an `osl::Thread`*. On wasip2 `create()` can never
+      succeed, so `run()` is never entered and neither wait is reachable. **A
+      wait on a thread that cannot be spawned is not a wait.** Do not patch
+      these; changing a thread body to be shim-safe is work spent on code that
+      cannot execute.
+    * `~TimerManager` opens with `if (!isRunning()) return;` *before* its
+      `notify_all()` and `join()`. Upstream wrote that for static-destruction
+      ordering in unit tests; it happens to be exactly the arm a threadless
+      build takes, which is why nothing hangs at exit. Luck, but load-bearing
+      luck — check for it rather than assuming it, in every `~Manager` of this
+      shape.
+    * The runtime consequence, which is a **behaviour gap, not a build gap, and
+      is deliberately left open**: with no `TimerManager` thread, a
+      `salhelper::Timer` is registered and then **never fires**. Its only three
+      callers are `connectivity`'s connection pool, `desktop/source/lib/init.cxx`
+      (LibreOfficeKit — rejected, see the header) and `fpicker`'s `fileview`.
+      **None is on the M4 headless-convert path**, so this bill comes due at
+      M6–M8, not before.
+    * The genuinely reachable untimed wait in this module is the *other* class:
+      `salhelper::ConditionWaiter`'s one-argument constructor →
+      `osl::Condition::wait()` → `osl_waitCondition(c, nullptr)` →
+      `conditn.cxx:125`, which is the untimed `wait(g, predicate)`. Its only
+      non-test caller is `unotools/source/ucbhelper/ucblockbytes.cxx`, **which
+      is on the document-load path** — four untimed sites (`:512`, `:545`,
+      `:562`, `:616`) beside one timed one (`:478`) that already catches
+      `timedout`. That is the concrete list to check when M4 aborts in the shim,
+      and per decision 12 the fix is a serial path at those call sites, never a
+      softer shim.
+    * Mitigating that: `wait(lock, pred)` is `while (!pred()) wait(lock);`, so
+      an `osl` condition that is **already set** returns without ever entering
+      `pthread_cond_wait`. The shim only fires on a wait that would genuinely
+      block. Verified by reading `conditn.cxx:101-130`; the standard guarantees
+      the predicate is tested first.
 
 ## wk VCL backend vs. LO's qt6 backend on our Qt — recommendation
 
@@ -981,6 +1024,7 @@ Reported, not installed, per the house rules:
 | M0 configure completes | **done** — `build/config_host.mk` has `export OS=WASI` |
 | M1 native bootstrap | **done** — 39 entries in `build/workdir_for_build/LinkTarget/Executable`, `wasmbridgegen` among them |
 | M2 `libsal.a` cross-builds | **the archive half is done** — `./build-lo.sh sal.allbuild` runs to `[build MOD] sal` with no errors from a freshly patched pristine tree. **`build/instdir/program/libuno_sal.a`, 2,401,182 bytes, 85 members** (not `workdir/LinkTarget/Library/` — under `DISABLE_DYNLOADING` a gbuild Library's target *is* `instdir/program/lib<name>.a`; `workdir/LinkTarget/Library/` holds only the `.objectlist` and `.exports`). `llvm-objdump -h` says `file format wasm`; 276 defined `osl_*` symbols; the archive contains `pipe_wasi.o`, `process_wasi.o`, `signal_wasi.o` and none of `pipe.o`, `process.o`, `signal.o`. `zlib` and the UNO bridge cross-compile alongside it. **The "+ a wasip2 program that runs" half is NOT done** — no `.wasm` has been executed |
+| M2½ `salhelper` cross-builds | **done, and it needed no patch at all** — `./build-lo.sh salhelper.allbuild` reaches `[build MOD] salhelper` with **zero `error:` lines on the first attempt**. **`build/instdir/program/libuno_salhelpergcc3.a`, 36,028 bytes, 5 members** (`condition.o`, `dynload.o`, `simplereferenceobject.o`, `thread.o`, `timer.o`); `llvm-objdump -h` → `file format wasm`. The `uno_`/`gcc3` decoration in the filename comes from `gb_Library_set_is_ure_library_or_dependency`, not from anything we did. The first module in this port to cross-compile untouched — see decision 17 for what that does and does not prove |
 | M3 `soffice.wasm` links headless | **not started** — but two of its blockers fell out of M2 and are already fixed: `unxgcc.mk`'s `echo -n` (decision 15) and `-pthread` on the link line (decision 16). Both hit EVERY executable, not just `sal`'s test helpers, so M3 would have died on them within a minute |
 | M4 `.pptx` → PDF | **not started** |
 | M5 svp renders a slide to PNG | **not started** |
@@ -1052,6 +1096,37 @@ Reported, not installed, per the house rules:
   `signal_wasi.o` are members; `pipe.o`, `process.o` and `signal.o` are not.
   The qa helper `Executable/osl_process_child` links too, which is the first
   time anything in this port has been through `wasm-component-ld` end to end.
+* **`salhelper` cross-compiles with the patch set unchanged.**
+  `./build-lo.sh salhelper.allbuild` → `[build MOD] salhelper`, **`grep -c
+  "error:"` on the log = 0**, first attempt, no eighth-patch edit and no ninth
+  patch. `build/instdir/program/libuno_salhelpergcc3.a` = **36,028 bytes /
+  5 members**, `llvm-objdump -h` → `file format wasm`. Every `warning:` in the
+  log is from the BUILD-side (native arm64) generated lexers and parsers
+  (`cfglex.cxx`, `xrmlex.cxx`, `sourceprovider-*.cxx`) — **not one warning came
+  from a wasm compile**. Log: `logs/session-salhelper-1.log`.
+* **The shim's two halves both appear in `timer.o`, and neither is reachable.**
+  `llvm-nm --undefined-only` on the archive lists
+  `_ZNSt3__218condition_variable15__do_timed_waitE…` *and*
+  `_ZNSt3__218condition_variable4waitERNS_11unique_lockINS_5mutexEEE`, alongside
+  `osl_createSuspendedThread`, `osl_joinWithThread` and `osl_waitCondition`.
+  Both condvar references are inside `TimerManager::run()`, an `osl::Thread`
+  body — see decision 17.
+* **`CppunitTest_salhelper_testapi` was correctly skipped**, confirming the
+  `gb_CAN_EXECUTE_HOST_CODE` reasoning in the traps section holds in practice:
+  `grep -c CppunitTest` on the build log = 0, because
+  `post_SpeedUpTargets.mk:15` puts `check` in `gb_Module_SKIPTARGETS`. Flipping
+  that one line is what it will take to run cppunit under wasmtime.
+* **`gb_Library_set_soversion_script` is inert under `DISABLE_DYNLOADING`.**
+  `salhelper` sets one (`source/gcc3.map`), as do `sal`, `cppu`, `cppuhelper`
+  and `purpenvhelper`. `unxgcc.mk:153-154` only expands `SOVERSIONSCRIPT` into
+  `--soname`/`--version-script` inside `gb_LinkTarget__command_dynamiclink`,
+  which a static `Library` target never reaches — so none of those five needs a
+  WASI arm, and `wasm-ld` never sees a version script.
+* **The eight patches still describe the tree exactly after a full session.**
+  All eight pass `git -C src apply --reverse --check` against the working tree
+  at the end of the `salhelper` work, and `git -C src status --porcelain` lists
+  only the four expected untracked files (`WASI_INTEL_GCC.mk` and the three
+  `*_wasi.cxx`) — i.e. this milestone added nothing to `src/` at all.
 * **The patch set round-trips.** `git -C src diff` of the working tree is
   byte-identical to the tree produced by reverting to pristine and replaying
   all eight patches (1338 lines either way — the sum of the eight files, so
