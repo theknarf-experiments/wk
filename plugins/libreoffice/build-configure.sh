@@ -225,18 +225,31 @@ build_opts="--without-system-libxml --without-system-fontconfig --without-system
 # naming .toolbin/pkg-config.
 build_opts="$build_opts --enable-bogus-pkg-config"
 
-# --disable-gui is the STAGING point, not the destination (PORTING.md decision
-# 10). It is only reachable at all because the WASI host arm copies Emscripten's
-# `using_x11=yes` fib — configure.ac:5949 makes --disable-gui itself require
-# using_x11=yes. Keep it through M0-M5 (headless .pptx->PDF, svp->PNG); drop it
-# at M6, when vcl/wk/ exists and the arm sets R="wk", because configure.ac:12561
-# refuses DISABLE_DYNLOADING + a GUI unless exactly one VCL plugin is
-# registered. Switching exercises a materially different module graph, so
-# expect to re-debug configure once when you do.
-if [ "${WK_LO_GUI:-0}" = "1" ]; then
-    echo "=== GUI build requested (WK_LO_GUI=1): omitting --disable-gui"
-else
-    args+=("--disable-gui")
+# --disable-gui was the staging point through M0-M5 (headless .pptx->PDF,
+# svp->PNG) and is now gone: HAVE_FEATURE_UI is on, the whole UI layer compiles
+# for wasm32, and vcl/wk is the backend. Three things had to line up for that,
+# all in the configure.ac wasi arm and all in patches/core-0001:
+#
+#   using_x11=no             the arm used to copy Emscripten's `using_x11=yes`
+#   using_headless_plugin=no fib, which existed only because configure.ac:6013
+#                            makes --disable-gui itself require X11. With the
+#                            GUI on, the fib has nothing to buy, and Android is
+#                            the honest model to copy instead.
+#   R="wk"                   configure.ac:12623 refuses DISABLE_DYNLOADING with
+#                            a GUI unless EXACTLY ONE VCL plugin is registered.
+#
+# USE_HEADLESS_CODE survives all of that (configure.ac:1354 gates it on
+# using_freetype_fontconfig), so vcl/headless's cairo graphics are still the
+# foundation. What goes is ENABLE_HEADLESS and its svp_create_SalInstance;
+# --headless now falls through salplug.cxx to create_SalInstance(), which is
+# vcl/wk's, and the conversion filters behave as before because WkSalInstance
+# is an SvpSalInstance.
+#
+# WK_LO_HEADLESS=1 puts --disable-gui back, for bisecting a UI-layer break
+# against a known-good shape. It also needs the arm's using_x11 back, so it is
+# a two-line change, not a knob — the variable only reminds you of that.
+if [ "${WK_LO_HEADLESS:-0}" = "1" ]; then
+    lo_die "WK_LO_HEADLESS: --disable-gui also needs using_x11=yes in the wasi arm of configure.ac (see patches/core-0001); set both or neither"
 fi
 
 # Symbols and sal logging. Off by default because they inflate an already very

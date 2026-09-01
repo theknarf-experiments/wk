@@ -1,0 +1,125 @@
+diff --git a/vcl/Library_vcl.mk b/vcl/Library_vcl.mk
+index 1452533b7..2e971e36c 100644
+--- a/vcl/Library_vcl.mk
++++ b/vcl/Library_vcl.mk
+@@ -29,6 +29,12 @@ else ifeq ($(OS),ANDROID)
+ $(eval $(call gb_Library_add_componentimpl,vcl,android))
+ else ifeq ($(OS),iOS)
+ $(eval $(call gb_Library_add_componentimpl,vcl,ios))
++else ifeq ($(OS),WASI)
++# The headless component set, because vcl/wk is vcl/headless with a frame: the
++# services registered here are the cairo/freetype ones, and the platform
++# services vcl.unx.component adds (X11 clipboard, drag and drop, session
++# management) have nothing to bind to.
++$(eval $(call gb_Library_add_componentimpl,vcl,headless))
+ else ifeq ($(DISABLE_GUI),TRUE)
+ $(eval $(call gb_Library_add_componentimpl,vcl,headless))
+ else
+@@ -674,7 +680,16 @@ $(eval $(call gb_Library_add_libs,vcl,\
+ ))
+ endif
+ 
+-ifeq ($(DISABLE_GUI),TRUE)
++ifeq ($(OS),WASI)
++# Before DISABLE_GUI, because this build has the UI enabled and still must not
++# get the OpenGL block below: wasm has no GL context to make current, and epoxy
++# resolves GL entry points with dlsym, which is exactly what this target does
++# not have.
++$(eval $(call gb_Library_add_exception_objects,vcl,\
++    vcl/wk/wkinst \
++))
++
++else ifeq ($(DISABLE_GUI),TRUE)
+ $(eval $(call gb_Library_add_exception_objects,vcl,\
+     vcl/headless/headlessinst \
+ ))
+diff --git a/vcl/wk/wkinst.cxx b/vcl/wk/wkinst.cxx
+new file mode 100644
+index 000000000..391830ea9
+--- /dev/null
++++ b/vcl/wk/wkinst.cxx
+@@ -0,0 +1,84 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This file is part of the LibreOffice project.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * The VCL backend for wk, LibreOffice running as a wasm component.
++ *
++ * It is built into libvcl rather than loaded as a plugin, the way iOS and
++ * Android are: there is no dlopen on wasip2, so configure names this the one
++ * and only VCL plugin (VCL_PLUGIN_INFO=wk) and salplug.cxx reaches it through
++ * the STATIC_SAL_INSTANCE path -- a direct call to create_SalInstance() below.
++ *
++ * It descends from SvpSalInstance because vcl/headless is already almost all of
++ * what a wasm component needs: cairo drawing into an image surface, freetype
++ * and fontconfig for glyphs, and no assumption of a windowing system. What
++ * headless does not have is anywhere to put the pixels or anywhere to get input
++ * from, and that -- a frame that owns a surface, a compositor that presents it
++ * to wk, and a translation of wk's input events into VCL's -- is what this
++ * directory is for.
++ *
++ * At this commit it is the headless instance under another name, which is the
++ * point: --disable-gui is gone and HAVE_FEATURE_UI is on, so the whole UI layer
++ * now compiles for wasm32, and this file exists to prove that the build shape
++ * is right before any of it is asked to draw. The conversion filters still work
++ * through it, because --headless sets bitmap rendering in salplug.cxx and then
++ * falls through to exactly this instance.
++ */
++
++#include <headless/svpinst.hxx>
++#include <headless/svpdummies.hxx>
++#include <headless/svpdata.hxx>
++
++#include <sal/log.hxx>
++
++namespace
++{
++class WkSalInstance : public SvpSalInstance
++{
++public:
++    explicit WkSalInstance(std::unique_ptr<SalYieldMutex> pMutex)
++        : SvpSalInstance(std::move(pMutex))
++    {
++    }
++
++    virtual SalSystem* CreateSalSystem() override;
++};
++
++class WkSalSystem : public SvpSalSystem
++{
++public:
++    WkSalSystem()
++        : SvpSalSystem()
++    {
++    }
++
++    virtual int ShowNativeDialog(const OUString& rTitle, const OUString& rMessage,
++                                 const std::vector<OUString>& rButtons) override
++    {
++        // Nowhere to show it yet. Logged rather than ignored because a native
++        // dialog here is always an error LibreOffice wanted a human to read --
++        // a broken user profile, an unreadable install -- and silently
++        // returning 0 turns that into behaviour with no explanation.
++        (void)rButtons;
++        SAL_WARN("vcl.wk", "native dialog, unshown: '" << rTitle << "': '" << rMessage << "'");
++        return 0;
++    }
++};
++
++SalSystem* WkSalInstance::CreateSalSystem() { return new WkSalSystem(); }
++}
++
++extern "C" SalInstance* create_SalInstance()
++{
++    WkSalInstance* pInstance = new WkSalInstance(std::make_unique<SvpSalYieldMutex>());
++    new SvpSalData();
++    return pInstance;
++}
++
++/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
