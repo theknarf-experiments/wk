@@ -738,6 +738,54 @@ pub fn mount(workspace: &Path, volume: &str, app: &str, path: &str) -> Result<()
     Ok(())
 }
 
+/// `wk channel <src> <dst> [channel]`: set which MIDI channel a wire carries.
+///
+/// A multi-track sequencer sends every part down every wire, so this is how you
+/// say "this synth plays the bass". Omitting the channel, or `0`, widens the
+/// wire back to all sixteen.
+pub fn channel(workspace: &Path, src: &str, dst: &str, channel: u8) -> Result<(), String> {
+    let mut stream = connect(workspace)?;
+    let snap = get_snapshot(&mut stream)?;
+    let src_id = resolve(&snap, src)?.id;
+    let dst_id = resolve(&snap, dst)?.id;
+    if !snap
+        .wires
+        .iter()
+        .any(|w| w.kind == "midi" && w.a == src_id && w.b == dst_id)
+    {
+        return Err(format!(
+            "{src} does not send MIDI to {dst} — wire them first with `wk wire`"
+        ));
+    }
+    if channel > 16 {
+        return Err(format!(
+            "{channel} is not a MIDI channel (1-16, or 0 for all)"
+        ));
+    }
+    send_command(
+        &mut stream,
+        Command::SetMidiChannel {
+            src: src_id,
+            dst: dst_id,
+            channel,
+        },
+    )?;
+    if channel == 0 {
+        println!(
+            "{} → {} now carries every MIDI channel",
+            short(src_id),
+            short(dst_id)
+        );
+    } else {
+        println!(
+            "{} → {} now carries MIDI channel {channel} only",
+            short(src_id),
+            short(dst_id)
+        );
+    }
+    Ok(())
+}
+
 /// `wk port <served> <hostport> <container>`: set the guest (container) port a
 /// serve wire forwards to — the container side of a Docker `host:container` map
 /// (the host side is the HostPort's own port). `0` resets to forward verbatim.

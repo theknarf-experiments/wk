@@ -349,6 +349,8 @@ struct App {
     /// When editing a bind wire's mount path (via its wire label): the wire's
     /// `(source, app)` pair and the in-progress text.
     editing_mount: Option<((NodeId, NodeId), String)>,
+    /// The MIDI wire whose channel is being typed, and the text so far.
+    editing_channel: Option<((NodeId, NodeId), String)>,
     /// Frame counter for throttling canvas readback (Screen Capture nodes).
     capture_tick: u64,
     /// When the clipboard pump last read the host clipboard. `arboard` has no
@@ -484,6 +486,7 @@ impl App {
             editing_args: None,
             editing_note: None,
             editing_mount: None,
+            editing_channel: None,
             capture_tick: 0,
             clip_polled: None,
             inspect: None,
@@ -1218,7 +1221,33 @@ impl App {
     /// The screen rect of a bind wire's mount-path label, centred on the
     /// wire's midpoint. Clicking it edits the path.
     fn mount_label_rect(&self, fonts: &Fonts, src: NodeId, app: NodeId) -> Option<[f32; 4]> {
-        let (a, b) = self.wire_endpoints(Wire::Bind(src, app))?;
+        self.wire_label_rect(
+            fonts,
+            Wire::Bind(src, app),
+            &self.mount_label_text(src, app),
+        )
+    }
+
+    /// The MIDI channel a wire carries, as the label shows it. `all` when the
+    /// whole stream goes down it, which is the default.
+    fn midi_label_text(&self, src: NodeId, dst: NodeId) -> String {
+        if let Some((w, s)) = &self.editing_channel {
+            if *w == (src, dst) {
+                return format!("ch: {s}\u{2588}");
+            }
+        }
+        channel_label(&self.view, src, dst)
+    }
+
+    /// The screen rect of a MIDI wire's channel label. Clicking it edits the
+    /// channel.
+    fn midi_label_rect(&self, fonts: &Fonts, src: NodeId, dst: NodeId) -> Option<[f32; 4]> {
+        self.wire_label_rect(fonts, Wire::Midi(src, dst), &self.midi_label_text(src, dst))
+    }
+
+    /// The screen rect for a label centred on a wire's midpoint.
+    fn wire_label_rect(&self, fonts: &Fonts, wire: Wire, text: &str) -> Option<[f32; 4]> {
+        let (a, b) = self.wire_endpoints(wire)?;
         let zf = self.cam.zoom;
         let arrow = connection_arrow(a, b, zf);
         // The quadratic bezier at t = 0.5.
@@ -1226,7 +1255,7 @@ impl App {
             0.25 * (arrow.start.0 + arrow.end.0) + 0.5 * arrow.control.0,
             0.25 * (arrow.start.1 + arrow.end.1) + 0.5 * arrow.control.1,
         ];
-        let w = fonts.measure(&self.mount_label_text(src, app)) as f32 + 2.0 * PAD;
+        let w = fonts.measure(text) as f32 + 2.0 * PAD;
         let h = fonts.line_height() as f32 + PAD;
         Some([
             mid[0] - w * 0.5,
@@ -1259,6 +1288,46 @@ impl App {
                 if let (Some((_, s)), Some(t)) = (self.editing_mount.as_mut(), text) {
                     for ch in t.chars().filter(|c| !c.is_control()) {
                         s.push(ch);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle a key press while typing a MIDI wire's channel. Enter commits
+    /// (blank, `0`, or anything that is not a channel number widens the wire
+    /// back to all sixteen); Escape cancels.
+    fn editing_channel_key(&mut self, code: KeyCode, text: Option<&str>) {
+        match code {
+            KeyCode::Escape => self.editing_channel = None,
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                if let Some(((src, dst), typed)) = self.editing_channel.take() {
+                    let channel = typed.trim().parse::<u8>().unwrap_or(0);
+                    self.conn.send(Command::SetMidiChannel {
+                        src,
+                        dst,
+                        channel: if (1..=16).contains(&channel) {
+                            channel
+                        } else {
+                            0
+                        },
+                    });
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some((_, s)) = self.editing_channel.as_mut() {
+                    s.pop();
+                }
+            }
+            _ => {
+                if let (Some((_, s)), Some(t)) = (self.editing_channel.as_mut(), text) {
+                    // Only digits, and never more than two: the field is a
+                    // channel number, and free text here would just be refused
+                    // on commit without saying so.
+                    for ch in t.chars().filter(|c| c.is_ascii_digit()) {
+                        if s.len() < 2 {
+                            s.push(ch);
+                        }
                     }
                 }
             }
@@ -3895,6 +3964,11 @@ impl App {
                 self.editing_mount = None;
             }
         }
+        if let Some((pair, _)) = &self.editing_channel {
+            if !self.view.midi_links.contains(pair) {
+                self.editing_channel = None;
+            }
+        }
         if self
             .kbd_focus
             .is_some_and(|id| !self.view.win_pos.contains_key(&id))
@@ -4108,13 +4182,34 @@ impl App {
                     .map(|_| (f, a)),
                 _ => None,
             };
+            // The same for a MIDI wire's channel label: click it to say which
+            // part goes down this cable.
+            let channel_label_hit = match self.wire_sel {
+                Some(Wire::Midi(a, b)) => self
+                    .midi_label_rect(&gfx.fonts, a, b)
+                    .filter(|r| contains(*r, mp))
+                    .map(|_| (a, b)),
+                _ => None,
+            };
             if let Some((f, a)) = mount_label_hit {
                 if self.editing_mount.as_ref().map(|(w, _)| *w) != Some((f, a)) {
                     self.editing_mount = Some(((f, a), mount_path(&self.view, f, a)));
                 }
                 consumed = true;
+            } else if let Some(pair) = channel_label_hit {
+                if self.editing_channel.as_ref().map(|(w, _)| *w) != Some(pair) {
+                    let current = self
+                        .view
+                        .midi_channels
+                        .get(&pair)
+                        .map(|c| c.to_string())
+                        .unwrap_or_default();
+                    self.editing_channel = Some((pair, current));
+                }
+                consumed = true;
             } else {
                 self.editing_mount = None;
+                self.editing_channel = None;
                 self.wire_sel = None;
             }
             // The filesystem inspector is modal: navigate on a row click,
@@ -5350,31 +5445,40 @@ impl App {
             self.draw_typed_ports(&mut quads, gfx.renderer.circle, id, zf, mp, full);
         }
 
-        // The selected bind wire's mount-path label, at the wire's midpoint:
-        // where the source (volume or fs-provider app) mounts inside the app.
-        // Click it to edit — Enter commits (blank resets to the default),
-        // Escape cancels.
+        // Labels sitting on a wire's midpoint. The mount path shows on the
+        // selected bind wire; a MIDI channel shows on the selected wire *and*
+        // on any wire narrowed to one channel, because which part a cable
+        // carries is something you have to be able to read without clicking
+        // anything. Click to edit — Enter commits, Escape cancels.
+        let mut wire_labels: Vec<([f32; 4], String)> = Vec::new();
         if let Some(Wire::Bind(f, a)) = self.wire_sel {
             if let Some(r) = self.mount_label_rect(&gfx.fonts, f, a) {
-                quads.push(Quad::solid(white, r, BORDER_COL, full));
-                let inset = [r[0] + 1.0, r[1] + 1.0, r[2] - 1.0, r[3] - 1.0];
-                quads.push(Quad::solid(white, inset, MENU_BG, full));
-                let label = self.mount_label_text(f, a);
-                let lh = gfx.fonts.line_height() as f32;
-                self.text_cache.draw(
-                    &mut quads,
-                    &mut gfx.renderer,
-                    &gfx.fonts,
-                    &gfx.device,
-                    &gfx.queue,
-                    &label,
-                    r[0] + PAD,
-                    r[1] + (r[3] - r[1] - lh) * 0.5,
-                    1.0,
-                    TEXT,
-                    full,
-                );
+                wire_labels.push((r, self.mount_label_text(f, a)));
             }
+        }
+        for (src, dst) in labelled_midi_wires(&self.view, self.wire_sel) {
+            if let Some(r) = self.midi_label_rect(&gfx.fonts, src, dst) {
+                wire_labels.push((r, self.midi_label_text(src, dst)));
+            }
+        }
+        for (r, label) in wire_labels {
+            quads.push(Quad::solid(white, r, BORDER_COL, full));
+            let inset = [r[0] + 1.0, r[1] + 1.0, r[2] - 1.0, r[3] - 1.0];
+            quads.push(Quad::solid(white, inset, MENU_BG, full));
+            let lh = gfx.fonts.line_height() as f32;
+            self.text_cache.draw(
+                &mut quads,
+                &mut gfx.renderer,
+                &gfx.fonts,
+                &gfx.device,
+                &gfx.queue,
+                &label,
+                r[0] + PAD,
+                r[1] + (r[3] - r[1] - lh) * 0.5,
+                1.0,
+                TEXT,
+                full,
+            );
         }
 
         // The wire being dragged out of a typed output port toward the cursor —
@@ -6661,6 +6765,13 @@ impl ApplicationHandler for App {
                         }
                         return;
                     }
+                    // Likewise while typing a MIDI wire's channel.
+                    if self.editing_channel.is_some() {
+                        if pressed {
+                            self.editing_channel_key(code, event.text.as_deref());
+                        }
+                        return;
+                    }
                     // Escape quits wk only when nothing is focused; otherwise it
                     // belongs to the focused app/terminal (vim lives on Escape).
                     if code == KeyCode::Escape && pressed && self.kbd_focus.is_none() {
@@ -6773,6 +6884,32 @@ fn boundary_authored(v: &View, bw: &BoundaryWire) -> bool {
 
 /// The in-app path a bind wire mounts at: the per-connection override if set,
 /// else the source's own name — a file node's name, or an fs-provider app's
+/// What a MIDI wire's channel label says: the one part it carries, or `all`.
+fn channel_label(v: &View, src: NodeId, dst: NodeId) -> String {
+    match v.midi_channels.get(&(src, dst)) {
+        Some(channel) => format!("ch: {channel}"),
+        None => "ch: all".to_string(),
+    }
+}
+
+/// Which MIDI wires show their channel on the canvas.
+///
+/// Every wire narrowed to one part does, because which part a cable carries is
+/// something you have to be able to read without clicking anything — that is
+/// the whole reason the setting is on the wire and not inside the synth. The
+/// selected wire does too, whatever it carries, since the label is how the
+/// channel gets changed. An unselected wire carrying everything says nothing:
+/// it is the default, and a label on every cable is noise.
+fn labelled_midi_wires(v: &View, selected: Option<Wire>) -> Vec<(NodeId, NodeId)> {
+    v.midi_links
+        .iter()
+        .copied()
+        .filter(|&(src, dst)| {
+            v.midi_channels.contains_key(&(src, dst)) || selected == Some(Wire::Midi(src, dst))
+        })
+        .collect()
+}
+
 /// (mirrors the server's `mount_path_for`).
 fn mount_path(v: &View, src: NodeId, app: NodeId) -> String {
     v.mount_paths.get(&(src, app)).cloned().unwrap_or_else(|| {
@@ -6926,6 +7063,51 @@ mod inspect_tests {
             exec_permit: wk_server::exec::new_permit(true),
             fs_serve: wk_server::vfs::ProviderConn::new(),
         })
+    }
+
+    /// A MIDI wire shows the part it carries, on the canvas, without being
+    /// clicked.
+    ///
+    /// This is the gap the setting was moved onto the wire to close: a
+    /// multi-track sequencer sends every part down every cable, so with the
+    /// channel living inside the synth there was nothing on the canvas saying
+    /// which synth played the bass, and nowhere to say it.
+    #[test]
+    fn a_narrowed_midi_wire_shows_its_channel_and_an_omni_one_stays_quiet() {
+        let (seq, bass, lead, drums) = (
+            NodeId::from_u128(1),
+            NodeId::from_u128(2),
+            NodeId::from_u128(3),
+            NodeId::from_u128(4),
+        );
+        let mut v = View {
+            midi_links: vec![(seq, bass), (seq, lead), (seq, drums)],
+            ..Default::default()
+        };
+        v.midi_channels.insert((seq, bass), 1);
+        v.midi_channels.insert((seq, lead), 2);
+
+        // The two narrowed wires are labelled; the one carrying everything is
+        // not, because a label on every cable is noise.
+        assert_eq!(
+            labelled_midi_wires(&v, None),
+            vec![(seq, bass), (seq, lead)]
+        );
+        assert_eq!(channel_label(&v, seq, bass), "ch: 1");
+        assert_eq!(channel_label(&v, seq, lead), "ch: 2");
+        assert_eq!(channel_label(&v, seq, drums), "ch: all");
+
+        // Selecting the omni wire labels it too — the label is how the channel
+        // is set, so it has to appear before there is one.
+        assert_eq!(
+            labelled_midi_wires(&v, Some(Wire::Midi(seq, drums))),
+            vec![(seq, bass), (seq, lead), (seq, drums)]
+        );
+        // Selecting something else does not add a label of its own.
+        assert_eq!(
+            labelled_midi_wires(&v, Some(Wire::Bind(seq, drums))).len(),
+            2
+        );
     }
 
     /// A bind wire's mount path defaults to its source's name — a file node's

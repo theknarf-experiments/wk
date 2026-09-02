@@ -384,6 +384,17 @@ pub enum Command {
         app: NodeId,
         path: String,
     },
+    /// Set which MIDI channel a midi wire (`src` → `dst`) carries: `1` to `16`
+    /// for a single part, `0` for all of them (the default).
+    ///
+    /// A multi-track sequencer sends every part down every wire, so this is how
+    /// the canvas says "this synth plays the bass" — on the wire, where it can
+    /// be seen, rather than in a setting inside the synth.
+    SetMidiChannel {
+        src: NodeId,
+        dst: NodeId,
+        channel: u8,
+    },
     /// Set the guest (container) port a serve wire (`served` → `hostport`)
     /// forwards to — the container side of a Docker `host:container` map. `0`
     /// resets it to the HostPort's own port (forward verbatim).
@@ -482,9 +493,9 @@ impl Command {
             }
             // Reconfiguring a bind's mount path or a serve's container port
             // modifies that wire.
-            Command::SetMount { .. } | Command::SetServePort { .. } => {
-                (ResourceKind::Wire, Action::Update)
-            }
+            Command::SetMount { .. }
+            | Command::SetServePort { .. }
+            | Command::SetMidiChannel { .. } => (ResourceKind::Wire, Action::Update),
             Command::Delete(ResourceRef::Workspace(_)) => (ResourceKind::Workspace, Action::Delete),
             // Swapping a node's capability token reconfigures the node.
             Command::SetToken { .. } => (ResourceKind::Node, Action::Update),

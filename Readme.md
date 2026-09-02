@@ -64,6 +64,11 @@ The shared-resource kinds:
 | Router → Network        | bridges that network with the router's others        |
 | node → Api              | serves the wk API on the node's network (`api:1337`) |
 
+A MIDI wire carries all sixteen channels unless you narrow it: select the wire
+and click its `ch:` label, or run `wk channel <src> <dst> <n>`. A narrowed wire
+keeps showing the channel it carries, so a multi-track sequencer feeding several
+synths reads off the canvas instead of out of each synth's settings.
+
 A document can hold several workspaces (shown as tabs); edits are undoable.
 
 ### Node capability tokens

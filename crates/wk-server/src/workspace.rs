@@ -571,6 +571,9 @@ pub struct Workspace {
     pub mount_paths: BTreeMap<(NodeId, NodeId), String>,
     /// MIDI links as (source, destination).
     pub midi: Vec<(NodeId, NodeId)>,
+    /// The one MIDI channel a link carries (1 to 16), for links that carry one
+    /// rather than all sixteen. Absent means the whole stream goes down it.
+    pub midi_channels: BTreeMap<(NodeId, NodeId), u8>,
     /// Serve wiring as (served node id, HostPort id).
     pub serves: Vec<(NodeId, NodeId)>,
     /// The guest (container) port a serve wire forwards to, keyed by
@@ -599,6 +602,7 @@ impl Workspace {
             connections: Vec::new(),
             mount_paths: BTreeMap::new(),
             midi: Vec::new(),
+            midi_channels: BTreeMap::new(),
             serves: Vec::new(),
             serve_ports: BTreeMap::new(),
             net_links: Vec::new(),
@@ -1063,7 +1067,17 @@ fn parse_workspace(n: &KdlNode) -> Option<Workspace> {
                     }
                 }
             }
-            "midi" => ws.midi.extend(pair(c)),
+            "midi" => {
+                if let Some((a, b)) = pair(c) {
+                    ws.midi.push((a, b));
+                    // Optional 3rd arg: the single MIDI channel this wire carries.
+                    if let Some(ch) = c.get(2).and_then(uint) {
+                        if (1..=16).contains(&ch) {
+                            ws.midi_channels.insert((a, b), ch as u8);
+                        }
+                    }
+                }
+            }
             "serve" => {
                 if let Some((a, b)) = pair(c) {
                     ws.serves.push((a, b));
@@ -1113,7 +1127,12 @@ fn workspace_kdl(ws: &Workspace) -> KdlNode {
         ch.nodes_mut().push(c);
     }
     for &(src, dst) in &ws.midi {
-        ch.nodes_mut().push(pair_kdl("midi", src, dst));
+        let mut m = pair_kdl("midi", src, dst);
+        // A wire narrowed to one channel rides along as a 3rd arg.
+        if let Some(&channel) = ws.midi_channels.get(&(src, dst)) {
+            m.push(KdlEntry::new(channel as i128));
+        }
+        ch.nodes_mut().push(m);
     }
     for &(served, hostport) in &ws.serves {
         let mut s = pair_kdl("serve", served, hostport);
@@ -1706,28 +1725,27 @@ mod tests {
             "and the file it points at is actually shipped"
         );
 
-        // The sequencer drives both synths; each answers its own channel.
+        // The sequencer drives both synths, and each *wire* carries one part.
+        // Putting the channel on the wire rather than inside the synth is the
+        // whole point: it is the thing the canvas can show.
+        let mut carried: Vec<u8> = Vec::new();
         for synth in &synths {
             assert!(
                 ws.midi.contains(&(sequencer, *synth)),
                 "the sequencer is wired to every synth"
             );
+            carried.push(
+                ws.midi_channels
+                    .get(&(sequencer, *synth))
+                    .copied()
+                    .unwrap_or_else(|| panic!("the wire to {synth} says which part it carries")),
+            );
         }
-        let channels: Vec<i32> = ws
-            .nodes
-            .iter()
-            .filter_map(|n| match &n.kind {
-                SnapKind::App { dep, options, .. } if dep == "synth" => {
-                    // The channel filter is the synth's last knob; 0 is omni.
-                    options.last().map(|v| *v as i32)
-                }
-                _ => None,
-            })
-            .collect();
+        carried.sort_unstable();
         assert_eq!(
-            channels,
+            carried,
             vec![1, 2],
-            "the two synths listen on different channels, or the parts pile up"
+            "the two wires carry different channels, or the parts pile up"
         );
     }
 
@@ -2775,6 +2793,7 @@ workspace "01KZKMAB00000000000000WS01" {
                     connections: vec![(chan, synth)],
                     mount_paths: BTreeMap::from([((chan, synth), "/data/notes.txt".to_string())]),
                     midi: vec![(msrc, mdst)],
+                    midi_channels: BTreeMap::new(),
                     serves: vec![(synth, port)],
                     serve_ports: BTreeMap::from([((synth, port), 3000u16)]),
                     net_links: vec![(synth, net)],
@@ -3115,8 +3134,10 @@ workspace "01KZKMAB00000000000000WS01" {
                             .iter()
                             .map(|&p| (p, "/mnt/data".to_string()))
                             .collect(),
-                        // Likewise a container port on every generated serve.
+                        // Likewise a container port on every generated serve,
+                        // and a channel on every generated MIDI wire.
                         serve_ports: serves.iter().map(|&p| (p, 3000u16)).collect(),
+                        midi_channels: midi.iter().map(|&p| (p, 7u8)).collect(),
                         connections: conns,
                         midi,
                         serves,

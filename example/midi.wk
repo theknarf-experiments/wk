@@ -4,9 +4,11 @@
 //
 // riff.mid is wired to the sequencer, so it opens on launch: two bars, a bass
 // part on MIDI channel 1 and a lead on channel 2, chained into a four-bar song.
-// Each synth's CHAN knob picks the channel it answers, which is what makes the
-// parts separate instruments rather than one pile of notes. Cmd+S writes the
-// song back to the file, and any other music program will open it.
+// Each wire out of the sequencer carries one channel, so the canvas itself says
+// which synth plays which part — select a MIDI wire and its `ch:` label is
+// editable, or use `wk channel <src> <dst> <n>`. (A synth's CHAN knob can filter
+// too, for a cable you cannot label, like a hardware keyboard's.) Cmd+S writes
+// the song back to the file, and any other music program will open it.
 //
 // The `midiin` node opens the first connected MIDI input device (`wk midi
 // devices` lists the inputs and outputs; set a name with the node's device
@@ -26,6 +28,11 @@
 // Drag the BPM, LEN and CH fields up and down. Drag the lane at the bottom to
 // shape velocities. The wheel scrolls the keyboard.
 //
+// Routing:  a MIDI wire carries every channel unless you say otherwise. Click a
+// wire to select it, then click its `ch:` label and type a channel number
+// (Enter commits, blank or 0 goes back to all). A narrowed wire keeps showing
+// its channel, so the patch reads off the canvas.
+//
 // Arranging:  the TRK row picks the part being edited (or press 1-8);
 // shift-click a track to mute it. The PAT row picks the bar, and + adds one;
 // Cmd+D duplicates the bar you are on. Shift-click a bar to append it to the
@@ -39,24 +46,24 @@ workspace "01KZKMAB00000000000000WS01" {
         pos 470.0 40.0
         size 560.0 220.0
     }
-    // The bass: answers MIDI channel 1 (the sequencer's track 1).
+    // The bass: fed by the wire carrying MIDI channel 1 (sequencer track 1).
     node "synth" "01KZKMAF00000000000000SY05" {
         pos 1090.0 300.0
         size 360.0 260.0
-        options 0.3 2.0 -12.0 900.0 6.0 0.01 0.28 1.0
+        options 0.3 2.0 -12.0 900.0 6.0 0.01 0.28 0.0
     }
-    // The lead: answers MIDI channel 2 (track 2).
-    node "synth" "01N5MID100000000000000SY08" {
+    // The lead: fed by the wire carrying channel 2 (track 2).
+    node "synth" "01N5M1D100000000000000SY08" {
         pos 1090.0 590.0
         size 360.0 260.0
-        options 0.22 1.0 0.0 2600.0 2.0 0.02 0.45 2.0
+        options 0.22 1.0 0.0 2600.0 2.0 0.02 0.45 0.0
     }
     node "sequencer" "01KZKMAG00000000000000SQ06" {
         pos 420.0 300.0
         size 820.0 560.0
     }
     note "01KZKMAC00000000000000NT02" {
-        text "Hardware MIDI -> piano -> sequencer -> two synths.\n\nriff.mid is the document: it opens on\nlaunch and Cmd+S writes it back, so the\nwork leaves as a normal MIDI file.\n\nTRK picks the part (1-8); shift-click\nto mute. CH sets its MIDI channel, and\neach synth's CHAN knob picks the one it\nanswers — that is what keeps the bass\nand the lead separate.\n\nPAT picks the bar, + adds one, Cmd+D\nduplicates. Shift-click a bar to append\nit to SNG; SONG plays the chain.\n\nSpace plays, R records. Recording keeps\nvelocity and note length."
+        text "Hardware MIDI -> piano -> sequencer -> two synths.\n\nriff.mid is the document: it opens on\nlaunch and Cmd+S writes it back, so the\nwork leaves as a normal MIDI file.\n\nTRK picks the part (1-8); shift-click\nto mute. CH sets its MIDI channel.\n\nEach wire out of the sequencer carries\none channel — see the ch: label on it.\nClick a wire, then its label, to change\nwhich part that synth plays.\n\nPAT picks the bar, + adds one, Cmd+D\nduplicates. Shift-click a bar to append\nit to SNG; SONG plays the chain.\n\nSpace plays, R records. Recording keeps\nvelocity and note length."
         pos 40.0 40.0
         size 360.0 520.0
     }
@@ -64,13 +71,13 @@ workspace "01KZKMAB00000000000000WS01" {
         pos 60.0 600.0
         size 130.0 44.0
     }
-    bindmount "example/riff.mid" "01N5MID100000000000000BM07" {
+    bindmount "example/riff.mid" "01N5M1D100000000000000BM07" {
         pos 230.0 600.0
         size 130.0 44.0
     }
-    connection "01N5MID100000000000000BM07" "01KZKMAG00000000000000SQ06"
+    connection "01N5M1D100000000000000BM07" "01KZKMAG00000000000000SQ06"
     midi "01KZKMAD00000000000000MD03" "01KZKMAE00000000000000PN04"
     midi "01KZKMAE00000000000000PN04" "01KZKMAG00000000000000SQ06"
-    midi "01KZKMAG00000000000000SQ06" "01KZKMAF00000000000000SY05"
-    midi "01KZKMAG00000000000000SQ06" "01N5MID100000000000000SY08"
+    midi "01KZKMAG00000000000000SQ06" "01KZKMAF00000000000000SY05" 1
+    midi "01KZKMAG00000000000000SQ06" "01N5M1D100000000000000SY08" 2
 }

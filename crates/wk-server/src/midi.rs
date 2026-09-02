@@ -12,6 +12,10 @@
 //! * The router remembers which notes each link has turned on, so unplugging a
 //!   cable or deleting a node releases them instead of leaving the synth
 //!   holding a chord forever.
+//! * A wire can carry one MIDI channel instead of all sixteen. A multi-track
+//!   sequencer sends every part down every wire, so without this the only way
+//!   to say "this synth plays the bass" is a setting buried inside the synth,
+//!   where the canvas cannot show it. See [`Routes::set_channel`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -130,12 +134,31 @@ pub fn new_inbox() -> SharedInbox {
 struct Link {
     dst: NodeId,
     inbox: SharedInbox,
+    /// The one MIDI channel this wire carries, 1 to 16. `None` — the default —
+    /// carries all of them.
+    channel: Option<u8>,
     /// The notes this wire has turned on and not yet turned off, as
     /// `(channel, note)`. Kept so the wire can release them if it is cut.
     held: HashSet<(u8, u8)>,
 }
 
 impl Link {
+    /// Does this wire carry `msg`?
+    ///
+    /// System messages — clock, start, stop, song position, system-exclusive —
+    /// always pass, whatever the wire is set to. They address the device rather
+    /// than a channel, and a part filtered down to one channel still has to
+    /// keep time with the rest of the song.
+    fn carries(&self, msg: &Message) -> bool {
+        let Some(want) = self.channel else {
+            return true;
+        };
+        match msg.first() {
+            Some(&status) if status < 0xF0 => (status & 0x0F) + 1 == want,
+            _ => true,
+        }
+    }
+
     /// Track what `msg` does to the set of sounding notes, so a later
     /// disconnect knows what to release.
     fn observe(&mut self, msg: &Message) {
@@ -190,8 +213,39 @@ impl Routes {
             v.push(Link {
                 dst,
                 inbox,
+                channel: None,
                 held: HashSet::new(),
             });
+        }
+    }
+
+    /// Set which MIDI channel a wire carries: `Some(1..=16)` for one part,
+    /// `None` for all of them.
+    ///
+    /// Narrowing a wire releases anything it is holding on the channels it no
+    /// longer carries, so changing it mid-chord does not leave a note sounding
+    /// with nothing left to turn it off.
+    pub fn set_channel(&mut self, src: NodeId, dst: NodeId, channel: Option<u8>) {
+        let channel = channel.filter(|c| (1..=16).contains(c));
+        let Some(v) = self.links.get_mut(&src) else {
+            return;
+        };
+        for link in v.iter_mut().filter(|l| l.dst == dst) {
+            if link.channel == channel {
+                continue;
+            }
+            link.channel = channel;
+            let orphaned: Vec<(u8, u8)> = link
+                .held
+                .iter()
+                .copied()
+                .filter(|&(c, note)| !link.carries(&vec![0x90 | c, note, 1]))
+                .collect();
+            let mut inbox = link.inbox.lock().unwrap();
+            for (c, note) in orphaned {
+                link.held.remove(&(c, note));
+                inbox.push(Event::now(vec![0x80 | c, note, 0]));
+            }
         }
     }
 
@@ -224,6 +278,9 @@ impl Routes {
             return;
         };
         for link in v.iter_mut() {
+            if !link.carries(&event.data) {
+                continue;
+            }
             link.observe(&event.data);
             link.inbox.lock().unwrap().push(event.clone());
         }
@@ -452,6 +509,101 @@ mod tests {
         assert!(
             drain(&inbox).is_empty(),
             "nothing is sounding, so nothing needs releasing"
+        );
+    }
+
+    #[test]
+    fn a_wire_set_to_one_channel_carries_only_that_part() {
+        // The reason this exists: a multi-track sequencer sends every part down
+        // every wire, so without it the only way to say "this synth plays the
+        // bass" is a setting buried inside the synth.
+        let mut routes = Routes::default();
+        let inbox = new_inbox();
+        let (seq, synth) = (NodeId::nil(), NodeId::new());
+        routes.connect(seq, synth, inbox.clone());
+        routes.set_channel(seq, synth, Some(3));
+
+        routes.send(seq, &Event::now(vec![0x90, 60, 100])); // channel 1
+        routes.send(seq, &Event::now(vec![0x92, 64, 100])); // channel 3
+        routes.send(seq, &Event::now(vec![0x95, 67, 100])); // channel 6
+        assert_eq!(
+            drain(&inbox),
+            vec![vec![0x92, 64, 100]],
+            "only the part this wire carries arrives"
+        );
+    }
+
+    #[test]
+    fn the_clock_goes_down_a_narrowed_wire_too() {
+        // System messages address the device, not a channel: a part filtered to
+        // one channel still has to keep time with the rest of the song.
+        let mut routes = Routes::default();
+        let inbox = new_inbox();
+        let (seq, synth) = (NodeId::nil(), NodeId::new());
+        routes.connect(seq, synth, inbox.clone());
+        routes.set_channel(seq, synth, Some(2));
+
+        for msg in [vec![0xFA], vec![0xF8], vec![0xFC]] {
+            routes.send(seq, &Event::now(msg));
+        }
+        assert_eq!(
+            drain(&inbox),
+            vec![vec![0xFA], vec![0xF8], vec![0xFC]],
+            "start, clock and stop all pass"
+        );
+    }
+
+    #[test]
+    fn narrowing_a_wire_releases_the_parts_it_stops_carrying() {
+        // Changing the channel mid-chord must not leave a note sounding with
+        // nothing left that can turn it off.
+        let mut routes = Routes::default();
+        let inbox = new_inbox();
+        let (seq, synth) = (NodeId::nil(), NodeId::new());
+        routes.connect(seq, synth, inbox.clone());
+        routes.send(seq, &Event::now(vec![0x90, 60, 100])); // channel 1
+        routes.send(seq, &Event::now(vec![0x92, 64, 100])); // channel 3
+        drain(&inbox);
+
+        routes.set_channel(seq, synth, Some(3));
+        let after = drain(&inbox);
+        assert_eq!(
+            after,
+            vec![vec![0x80, 60, 0]],
+            "the note on the channel it no longer carries is released, got {after:?}"
+        );
+
+        // And the surviving note is still tracked, so cutting the wire releases it.
+        routes.disconnect(seq, synth);
+        assert!(drain(&inbox).contains(&vec![0x82, 64, 0]));
+    }
+
+    #[test]
+    fn a_wire_carries_everything_until_it_is_told_otherwise() {
+        let mut routes = Routes::default();
+        let inbox = new_inbox();
+        let (seq, synth) = (NodeId::nil(), NodeId::new());
+        routes.connect(seq, synth, inbox.clone());
+        routes.set_channel(seq, synth, Some(4));
+        routes.set_channel(seq, synth, None);
+        for channel in 0..16u8 {
+            routes.send(seq, &Event::now(vec![0x90 | channel, 60, 100]));
+        }
+        assert_eq!(drain(&inbox).len(), 16, "all sixteen parts go down it");
+    }
+
+    #[test]
+    fn a_channel_outside_the_midi_range_is_refused_rather_than_wrapped() {
+        let mut routes = Routes::default();
+        let inbox = new_inbox();
+        let (seq, synth) = (NodeId::nil(), NodeId::new());
+        routes.connect(seq, synth, inbox.clone());
+        routes.set_channel(seq, synth, Some(17));
+        routes.send(seq, &Event::now(vec![0x90, 60, 100]));
+        assert_eq!(
+            drain(&inbox).len(),
+            1,
+            "a nonsense channel leaves the wire carrying everything"
         );
     }
 

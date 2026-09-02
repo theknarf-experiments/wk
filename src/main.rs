@@ -111,6 +111,17 @@ enum Commands {
         path: Option<String>,
     },
 
+    /// Set which MIDI channel a midi wire carries (a multi-track sequencer
+    /// sends every part down every wire; this says which one this synth plays)
+    Channel {
+        /// The sending node (name, or any part of its id)
+        src: String,
+        /// The receiving node
+        dst: String,
+        /// MIDI channel 1-16 (omit, or 0, to carry all of them)
+        channel: Option<u8>,
+    },
+
     /// Map a serve wire's guest port (the container side of `host:container`)
     Port {
         /// Served node (name, or any part of its id)
@@ -448,6 +459,9 @@ fn main() -> Result<(), String> {
         Some(Commands::Unwire { a, b }) => cli::unwire(file, a, b),
         Some(Commands::Mount { volume, app, path }) => {
             cli::mount(file, volume, app, path.as_deref().unwrap_or(""))
+        }
+        Some(Commands::Channel { src, dst, channel }) => {
+            cli::channel(file, src, dst, channel.unwrap_or(0))
         }
         Some(Commands::Port {
             served,

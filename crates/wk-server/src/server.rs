@@ -233,6 +233,10 @@ pub struct View {
     /// Per-serve container-port overrides as (served, hostport) → guest port, so
     /// the UI can show a HostPort's `host→container` mapping.
     pub serve_ports: HashMap<(NodeId, NodeId), u16>,
+    /// The single MIDI channel a midi wire carries (1 to 16), for the wires
+    /// that carry one. Absent means all sixteen, so a channel shown on a wire
+    /// always means the stream down it has been narrowed to one part.
+    pub midi_channels: HashMap<(NodeId, NodeId), u8>,
     /// Nodes a CLI client has attached to — the UI treats these as detached
     /// (it stops draining/feeding their terminal).
     pub attached: std::collections::HashSet<NodeId>,
@@ -390,6 +394,7 @@ impl View {
             clipboard_links: keep_pairs(&self.clipboard_links, mine),
             api_links: keep_pairs(&self.api_links, mine),
             serve_ports: keep_pair_map(&self.serve_ports, mine),
+            midi_channels: keep_pair_map(&self.midi_channels, mine),
             capture_feeds: keep_map(&self.capture_feeds, mine),
             clipboard_boards: keep_map(&self.clipboard_boards, mine),
             api_nodes: keep_set(&self.api_nodes, mine),
@@ -695,6 +700,10 @@ pub struct Graph {
     /// (served, hostport). Absent = the HostPort's own port (forward verbatim).
     /// Only meaningful for the wasi:sockets forward path; http serve ignores it.
     pub serve_ports: HashMap<(NodeId, NodeId), u16>,
+    /// The single MIDI channel a midi wire carries (1 to 16), for the wires
+    /// that carry one. Absent means all sixteen, so a channel shown on a wire
+    /// always means the stream down it has been narrowed to one part.
+    pub midi_channels: HashMap<(NodeId, NodeId), u8>,
     /// Network membership wires, as (app node id, Network node id).
     pub net_links: Vec<(NodeId, NodeId)>,
     /// Screen-capture grants, as (app node id, Capture node id).
@@ -1193,6 +1202,9 @@ impl Server {
         // Restore per-serve container ports, then re-bind so they take effect.
         for (&pair, &port) in &saved.serve_ports {
             self.graph.serve_ports.insert(pair, port);
+        }
+        for (&pair, &channel) in &saved.midi_channels {
+            self.graph.midi_channels.insert(pair, channel);
         }
         self.sync_serves();
         made
@@ -2500,6 +2512,20 @@ impl Server {
             .unwrap_or(host_port)
     }
 
+    /// Set which MIDI channel a midi wire carries. `0` widens it back to all
+    /// sixteen; `1` to `16` narrows it to that part.
+    fn set_midi_channel(&mut self, src: NodeId, dst: NodeId, channel: u8) {
+        if !self.graph.midi_links.contains(&(src, dst)) {
+            return; // not a MIDI wire
+        }
+        if (1..=16).contains(&channel) {
+            self.graph.midi_channels.insert((src, dst), channel);
+        } else {
+            self.graph.midi_channels.remove(&(src, dst));
+        }
+        self.sync_midi();
+    }
+
     /// Set (or clear) the guest port a serve wire maps to, rebinding it live. A
     /// `0`/absent container port resets to the HostPort's own port.
     fn set_serve_port(&mut self, served: NodeId, hostport: NodeId, container: u16) {
@@ -3231,6 +3257,16 @@ impl Server {
                 self.routed.insert((src, dst));
             }
         }
+        // Apply each live wire's channel every pass rather than only on
+        // connect: the setting can change without the wire being rewired, and
+        // `set_channel` is a no-op when it already matches.
+        for &(src, dst) in &self.routed {
+            routes.set_channel(src, dst, self.graph.midi_channels.get(&(src, dst)).copied());
+        }
+        // Forget the channel of a wire that no longer exists, so re-drawing it
+        // later starts from the default rather than a setting nobody can see.
+        drop(routes);
+        prune_side_map(&mut self.graph.midi_channels, &self.graph.midi_links);
     }
 
     /// Remove a file node; `sync_mounts` unmounts it from every app it was
@@ -3561,6 +3597,11 @@ impl Server {
                     .iter()
                     .filter_map(|pair| self.graph.serve_ports.get(pair).map(|&p| (*pair, p)))
                     .collect();
+                // ...and the channel each narrowed MIDI wire carries.
+                let midi_channels = midi
+                    .iter()
+                    .filter_map(|pair| self.graph.midi_channels.get(pair).map(|&c| (*pair, c)))
+                    .collect();
                 Workspace {
                     id: ws_id,
                     name: self.graph.workspace_names.get(&ws_id).cloned(),
@@ -3569,6 +3610,7 @@ impl Server {
                     connections,
                     mount_paths,
                     midi,
+                    midi_channels,
                     serves,
                     serve_ports,
                     net_links,
@@ -3742,6 +3784,7 @@ impl Server {
             // Not undoable: run, mount-path / serve-port edits, and undo itself.
             Command::SetMount { .. }
             | Command::SetServePort { .. }
+            | Command::SetMidiChannel { .. }
             | Command::Run(_)
             | Command::Stop(_)
             | Command::SetView(_)
@@ -3892,6 +3935,9 @@ impl Server {
             Command::Delete(ResourceRef::Wire(w)) => self.disconnect_wire(w),
             Command::Delete(ResourceRef::Workspace(id)) => self.remove_workspace(id),
             Command::SetMount { volume, app, path } => self.set_mount(volume, app, path),
+            Command::SetMidiChannel { src, dst, channel } => {
+                self.set_midi_channel(src, dst, channel)
+            }
             Command::SetServePort {
                 served,
                 hostport,
@@ -4728,6 +4774,7 @@ impl Server {
             clipboard_links: self.graph.clipboard_links.clone(),
             api_links: self.graph.api_links.clone(),
             serve_ports: self.graph.serve_ports.clone(),
+            midi_channels: self.graph.midi_channels.clone(),
             capture_feeds: self.capture_feeds.clone(),
             clipboard_boards: self.clipboard_boards.clone(),
             api_nodes,
@@ -6086,6 +6133,7 @@ mod model_tests {
                         ),
                     ],
                     midi: vec![(pin, pout)],
+                    midi_channels: BTreeMap::new(),
                     ..Workspace::new()
                 },
                 Workspace {
@@ -6707,6 +6755,52 @@ mod model_tests {
         assert_eq!(s.serve_port_for(served, hostport, 8080), 8080);
     }
 
+    /// `SetMidiChannel` narrows a MIDI wire to one part and `0` widens it back.
+    /// It only applies to wires that exist, and a wire that is removed forgets
+    /// its channel rather than keeping a setting nobody can see.
+    #[test]
+    fn set_midi_channel_narrows_then_widens_and_is_forgotten_with_the_wire() {
+        let mut s = fresh_server();
+        let (seq, synth) = (NodeId::new(), NodeId::new());
+        s.graph.midi_links.push((seq, synth));
+
+        s.apply(Command::SetMidiChannel {
+            src: seq,
+            dst: synth,
+            channel: 3,
+        });
+        assert_eq!(s.graph.midi_channels.get(&(seq, synth)).copied(), Some(3));
+
+        s.apply(Command::SetMidiChannel {
+            src: seq,
+            dst: synth,
+            channel: 0,
+        });
+        assert!(!s.graph.midi_channels.contains_key(&(seq, synth)));
+
+        // A pair that is not a MIDI wire is left alone.
+        let stranger = NodeId::new();
+        s.apply(Command::SetMidiChannel {
+            src: seq,
+            dst: stranger,
+            channel: 5,
+        });
+        assert!(!s.graph.midi_channels.contains_key(&(seq, stranger)));
+
+        // Unwiring forgets the channel, so redrawing the wire starts fresh.
+        s.apply(Command::SetMidiChannel {
+            src: seq,
+            dst: synth,
+            channel: 9,
+        });
+        s.graph.midi_links.clear();
+        s.sync_midi();
+        assert!(
+            !s.graph.midi_channels.contains_key(&(seq, synth)),
+            "a removed wire leaves no invisible setting behind"
+        );
+    }
+
     /// `SetMount` overrides where a bind mounts and remembers it in the graph;
     /// an empty path resets to the default (the volume's name at the root).
     #[test]
@@ -7048,6 +7142,7 @@ mod model_tests {
                 connections: vec![(file, ghost)],
                 mount_paths: std::collections::BTreeMap::new(),
                 midi: Vec::new(),
+                midi_channels: std::collections::BTreeMap::new(),
                 serves: Vec::new(),
                 serve_ports: std::collections::BTreeMap::new(),
                 capture_links: Vec::new(),
