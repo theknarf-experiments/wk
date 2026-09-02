@@ -127,3 +127,8 @@ WASI_SDK="$SDK" ./build-host.sh
 WASI_SDK="$SDK" ./build-lo.sh
 echo "libreoffice: see ./build/instdir and PORTING.md 'Current state'"
 """
+
+[tasks.image]
+description = "Assemble the runtime install tree and build image://libreoffice (needs a completed build-lo.sh)"
+dir = "{{config_root}}"
+run = "./build-image.sh"

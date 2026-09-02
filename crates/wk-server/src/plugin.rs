@@ -6095,24 +6095,31 @@ mod tests {
     #[test]
     fn libreoffice_impress_paints_its_window_through_vcl_wk() {
         let plugin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/libreoffice");
-        let instdir = plugin.join("build/instdir");
-        let wasm = instdir.join("program/soffice.bin");
+        let wasm = plugin.join("build/instdir/program/soffice.bin");
         if !wasm.exists() {
             eprintln!("skipping: build plugins/libreoffice first (./build-lo.sh)");
             return;
         }
+        // The install tree comes from image://libreoffice, exactly as it does
+        // for a node on the canvas -- NOT from a bind mount of build/instdir.
+        // Bind-mounting it here is what let a node type ship that threw
+        //   Cannot open uno ini file:///instdir/program/unorc
+        // the moment anyone added one from the Cmd+K palette: the test supplied
+        // a filesystem the shipped node had no way to get.
+        let Some(image_id) = crate::images::resolve_ref("libreoffice") else {
+            eprintln!("skipping: build the image (plugins/libreoffice/build-image.sh)");
+            return;
+        };
+        let image = crate::images::load_image(&image_id)
+            .expect("the libreoffice image")
+            .container_setup();
 
-        // A writable place for the user profile and for temp files. osl's
-        // mkdir walks up looking for a parent that exists, and on wasi every
-        // path outside a preopen answers ENOENT, so /tmp has to be real.
-        // std::env::temp_dir rather than a tempfile crate, matching the shader
-        // test: the directories outlive the guest by design, because a node log
-        // is worth reading after a failure.
+        // A writable place for the document. std::env::temp_dir rather than a
+        // tempfile crate, matching the shader test: the directory outlives the
+        // guest by design, because a node log is worth reading after a failure.
         let base = std::env::temp_dir().join(format!("wk-lo-{}", std::process::id()));
         let work = base.join("work");
-        let tmp = base.join("tmp");
         std::fs::create_dir_all(&work).expect("workdir");
-        std::fs::create_dir_all(&tmp).expect("tmpdir");
         std::fs::copy(plugin.join("work/mini.fodp"), work.join("mini.fodp"))
             .expect("the test document; run plugins/libreoffice/run-lo.sh once to create work/");
 
@@ -6129,19 +6136,22 @@ mod tests {
             nodes.clone(),
             Vec::new(),
             Some(crate::images::ContainerSetup {
-                layers: Vec::new(),
+                layers: image.layers.clone(),
                 env: {
-                    let mut env = vec![
-                        ("HOME".into(), "/work".into()),
-                        ("TMPDIR".into(), "/tmp".into()),
-                        // The build is configured with --enable-sal-log, and a
-                        // silent LibreOffice is indistinguishable from one that
-                        // never started. These warnings are the progress report.
-                        (
-                            "SAL_LOG".into(),
-                            std::env::var("WK_LO_SAL_LOG").unwrap_or_else(|_| "+WARN".into()),
-                        ),
-                    ];
+                    // The image's own env (HOME, TMPDIR), plus what only a test
+                    // wants. Nothing is invented: a test that supplies an
+                    // environment the shipped node does not get is testing a
+                    // configuration nobody runs, which is how the first version
+                    // of this test passed while `wk run ./example/impress.wk`
+                    // threw.
+                    let mut env = image.env.clone();
+                    // The build is configured with --enable-sal-log, and a
+                    // silent LibreOffice is indistinguishable from one that
+                    // never started. These warnings are the progress report.
+                    env.push((
+                        "SAL_LOG".into(),
+                        std::env::var("WK_LO_SAL_LOG").unwrap_or_else(|_| "+WARN".into()),
+                    ));
                     // The shim's own trace knobs (WK_LO_TRACE_THROW,
                     // WK_LO_TRAP_THROW, WK_LO_TRACE_ALLOC and vcl/wk's frame
                     // dumps) are forwarded rather than named, exactly as
@@ -6183,25 +6193,21 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
 
-        // The filesystem has to be there before the guest runs, which is easy
-        // here and is why the mounts are between compile and run rather than
-        // racing the guest as the shader test's single file can afford to.
-        // Writable, though nothing should write to it: fontconfig wants a
-        // cache directory inside it, and read-only turns that into a warning
-        // on every start.
-        crate::vfs::mount_host(&node.fs, "/instdir", instdir.clone(), true);
+        // The one wire example/impress.wk draws: the documents. /instdir came
+        // from the image layers, and there is no /tmp mount because a node's own
+        // filesystem root is writable. The mount goes between compile and run
+        // rather than racing the guest, which the shader test's single file can
+        // afford to do and a whole install tree cannot.
         crate::vfs::mount_host(&node.fs, "/work", work.clone(), true);
-        crate::vfs::mount_host(&node.fs, "/tmp", tmp.clone(), true);
 
         // The arguments belong to run_node, not to spawn: a networked node's
         // spawn arguments are the ones it would have auto-started with, and it
         // does not auto-start. Passing them here is what a Run from the UI does.
         host.run_node(
             &node,
-            &[
-                "-env:UserInstallation=file:///work/.profile".into(),
-                "/work/mini.fodp".into(),
-            ],
+            // The image's ENTRYPOINT already carries -env:UserInstallation, so
+            // this is what example/impress.wk's node passes and nothing more.
+            &["/work/mini.fodp".into()],
         )
         .expect("run libreoffice");
 
@@ -6240,6 +6246,29 @@ mod tests {
             s.frame_ready = true;
             s.wake();
         };
+
+        // The UI resizes the surface to the node's on-canvas size on the very
+        // first frame it drives (client-local-ui/src/compositor.rs's
+        // drive_surfaces), and example/impress.wk gives the node a size that is
+        // not 800x600. A test that never resizes is testing a configuration
+        // nobody runs -- which is exactly how this one passed while `wk run
+        // ./example/impress.wk` threw.
+        let resize_to = |w: u32, h: u32| {
+            let mut s = surface.lock().unwrap();
+            s.width = w;
+            s.height = h;
+            s.pixels = vec![0; (w * h * 4) as usize];
+            s.resize = Some(ResizeEvent {
+                width: w,
+                height: h,
+            });
+            s.frame_ready = true;
+            s.wake();
+        };
+
+        // The node in example/impress.wk is 1000x720, and the host is
+        // resize-authoritative.
+        resize_to(1000, 720);
 
         // What an Impress window is, as a histogram: mostly VCL's light grey
         // face colour, a substantial white area (the slide and the sidebar),
@@ -6327,6 +6356,33 @@ mod tests {
         }
         eprintln!("impress: layout settled");
 
+        // The window must FILL the surface. wkcompositor.cxx paints its
+        // background 0x303030 -- a mid-grey chosen so that anything showing
+        // through looks like the bug it is -- and a settled window that leaves
+        // any of it visible means a frame did not follow the host's resize.
+        //
+        // This is the assertion that was missing when the resize filter asked
+        // GetParent() == nullptr: LibreOffice's document window is parented to
+        // the hidden default frame, so it never grew, and the node presented an
+        // 800x600 window inside a 1000x720 surface with a band down two sides.
+        // Nothing failed. It just looked wrong, and the histogram below counted
+        // the band as "dark pixels" and passed.
+        {
+            let s = surface.lock().unwrap();
+            let bg = s
+                .pixels
+                .chunks_exact(4)
+                .filter(|p| p[0] == 0x30 && p[1] == 0x30 && p[2] == 0x30)
+                .count();
+            assert!(
+                bg < 1000,
+                "{bg} pixels of compositor background are still showing at {}x{}: \
+                 a frame did not follow the resize",
+                s.width,
+                s.height
+            );
+        }
+
         // Tab, which in Impress's editing view selects the next object on the
         // slide and draws handles around it. A key rather than a click because
         // it needs no coordinates and so cannot be aimed at the wrong thing;
@@ -6370,6 +6426,29 @@ mod tests {
             );
         };
         eprintln!("impress: Tab selected an object, {changed} px changed");
+
+        // Then stop pumping, and check it is still alive. This is the one thing
+        // the earlier version of this test never did, and it is what shipped a
+        // node that died a few seconds after anyone opened it with no document:
+        // SvpSalInstance::ImplYield's idle path is an untimed
+        // condition_variable::wait ("wait until something happens"), and in a
+        // component with one thread nothing can ever signal it. A window with a
+        // document in it always has work and never reaches that wait; the Start
+        // Center reaches it within seconds.
+        //
+        // No pump_frame() in this loop on purpose: the guest must find its own
+        // way to wake, which is what WkSalInstance::waitForSomething is for.
+        let idle_until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < idle_until {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(
+                !node.finished.load(Ordering::Relaxed),
+                "soffice died while idle -- something reached svp's untimed condvar wait; \
+                 node log:\n{}",
+                String::from_utf8_lossy(&node.term_io.log_read(0).0)
+            );
+        }
+        eprintln!("impress: survived 20s idle with nobody pumping frames");
 
         // A histogram proves "not blank", never "a window". WK_LO_DUMP=/tmp/f.ppm
         // writes the composited surface out so a human can look at it, which is

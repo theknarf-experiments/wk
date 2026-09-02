@@ -2,42 +2,38 @@
 //
 // LibreOffice Impress, running as a wasm component.
 //
-// soffice.bin is 190 MB of wasm and the install tree beside it is another
-// 450 MB, so this is a BindMount rather than an image: the tree is build
-// output, it is read-only at run time, and copying it into an OCI layer would
-// only make a second copy of something already on disk. It has to land at
-// exactly /instdir — nothing at run time can discover where it is, because
-// wasm has no dladdr, wasi-libc's realpath is a stub, and a guest gets a bare
-// name in argv[0]; the port hardcodes the path, and fontconfig was compiled
-// with it too.
+// The office needs no wires: `image://libreoffice` carries soffice.bin and its
+// whole install tree, because nothing at run time can discover where that tree
+// is — wasm has no dladdr, wasi-libc's realpath is a stub, and a guest gets a
+// bare name in argv[0] — so /instdir is compiled into the binary and the image
+// puts it exactly there. Build it once with `mise run image` in
+// plugins/libreoffice.
+//
+// The BindMount here is only the documents. Drop a .odp or .pptx into
+// example/impress-work and it appears in /work inside the node.
 //
 // The office links curl, so it imports wasi:sockets, so wk treats it as a
-// networked node: press its play button. First start compiles 190 MB and takes
-// a minute or two; after that the compile cache makes it seconds.
+// networked node: press its play button. The first start compiles 190 MB of
+// wasm and takes a minute or two; after that the compile cache makes it
+// seconds.
 //
-// The profile lives in the node's own in-memory filesystem (the
-// -env:UserInstallation argument in workspace.wk), so settings do not survive
-// a restart. Wire a Volume at /profile when they should.
+// The user profile lives in the node's own filesystem at /profile and does not
+// survive a restart. Wire a Volume there when it should.
 import "../workspace.wk"
-workspace "01N4LOIM00000000000000WS00" {
-    node "libreoffice" "01N4LOIM00000000000000LO01" {
+workspace "01N4101M00000000000000WS00" {
+    node "libreoffice" "01N4101M000000000000001001" {
         pos 60.0 60.0
         size 1000.0 720.0
-        args "-env:UserInstallation=file:///profile" "/work/deck.fodp"
+        args "/work/deck.fodp"
     }
-    bindmount "plugins/libreoffice/build/instdir" "01N4LOIM00000000000000BM02" {
-        pos -260.0 60.0
+    bindmount "example/impress-work" "01N4101M00000000000000BM03" {
+        pos -240.0 60.0
         size 200.0 44.0
     }
-    bindmount "example/impress-work" "01N4LOIM00000000000000BM03" {
-        pos -260.0 160.0
-        size 200.0 44.0
-    }
-    note "01N4LOIM00000000000000NT04" {
+    note "01N4101M00000000000000NT04" {
         text "LibreOffice Impress, compiled to\nwasm32-wasip2 and drawing through\nvcl/wk — a VCL backend that composites\nVCL's many SalFrames (each menu,\ntooltip and dialog is one) into the\nsingle surface a wk node has.\n\nPress play: it imports wasi:sockets\n(it links curl), so it waits to be run.\nThe first start compiles 190 MB.\n\nTab selects a shape. The sidebar and\nstatus bar follow the selection."
         pos 1100.0 60.0
         size 380.0 300.0
     }
-    connection "01N4LOIM00000000000000BM02" "01N4LOIM00000000000000LO01" "/instdir"
-    connection "01N4LOIM00000000000000BM03" "01N4LOIM00000000000000LO01" "/work"
+    connection "01N4101M00000000000000BM03" "01N4101M000000000000001001" "/work"
 }

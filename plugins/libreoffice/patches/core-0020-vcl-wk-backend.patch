@@ -633,10 +633,10 @@ index 000000000..51f1d7d23
 +/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
 diff --git a/vcl/wk/wkinst.cxx b/vcl/wk/wkinst.cxx
 new file mode 100644
-index 000000000..06fb05bcd
+index 000000000..e076b7e19
 --- /dev/null
 +++ b/vcl/wk/wkinst.cxx
-@@ -0,0 +1,273 @@
+@@ -0,0 +1,342 @@
 +/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 +/*
 + * This file is part of the LibreOffice project.
@@ -692,6 +692,7 @@ index 000000000..06fb05bcd
 +
 +#include <algorithm>
 +#include <cstdlib>
++#include <ctime>
 +#include <vector>
 +
 +namespace
@@ -735,6 +736,8 @@ index 000000000..06fb05bcd
 +private:
 +    void dumpFrames();
 +    void present();
++    void drainInput();
++    void waitForSomething();
 +    void resizeTo(uint32_t nWidth, uint32_t nHeight);
 +};
 +
@@ -806,14 +809,58 @@ index 000000000..06fb05bcd
 +    }
 +}
 +
++void WkSalInstance::waitForSomething()
++{
++    // The sleep DoYield is not allowed to do itself. Waiting on the host's next
++    // frame is the right clock: it is when there is something new to show, and
++    // it is also when input has arrived. The timeout is what keeps VCL's own
++    // timers running when the host is not painting us -- a node whose window is
++    // hidden gets no frames at all, and its blinking cursor and its autosave
++    // still have to tick.
++    //
++    // Consuming the frame is not bookkeeping either: get-frame is where the
++    // host reports a CLOSED surface, by trapping, and a guest that never
++    // consumes one never learns its window went away.
++    static const int64_t nIdleSliceNs = 16 * 1000 * 1000; // one frame at 60 Hz
++
++    if (m_bSurfaceOpen)
++    {
++        wkgfx_wait_frame_timeout(nIdleSliceNs);
++        drainInput();
++        return;
++    }
++
++    // No surface: a --headless conversion, which normally always has work and
++    // never gets here. A short sleep rather than a spin, so an idle headless
++    // run costs nothing.
++    struct timespec ts = { 0, 1000 * 1000 };
++    nanosleep(&ts, nullptr);
++}
++
 +void WkSalInstance::resizeTo(uint32_t nWidth, uint32_t nHeight)
 +{
 +    // The host is resize-authoritative: a wk node is sized on the canvas, and
-+    // the guest is told what it got. Only top-level frames follow it -- a menu
-+    // or a tooltip is sized by its content and would be destroyed by this.
++    // the guest is told what it got.
++    //
++    // Which frames follow it is decided by STYLE, not by parentage. The obvious
++    // test -- GetParent() == nullptr -- is wrong, and silently: LibreOffice's
++    // document window is parented to the hidden default frame, so "top-level
++    // only" skipped the one window that had to grow, and the node presented an
++    // 800x600 window inside a 1000x720 surface with a band of compositor
++    // background down two sides. Nothing failed; it just looked wrong.
++    //
++    // SIZEABLE and not transient is the honest question: a menu, a tooltip or a
++    // floating toolbar is sized by its content, and resizing it to the node
++    // would destroy it.
 +    for (SvpSalFrame* pFrame : m_aFrames)
 +    {
-+        if (pFrame->GetParent() != nullptr)
++        const SalFrameStyleFlags nStyle = pFrame->style();
++        const bool bTransient = bool(
++            nStyle
++            & (SalFrameStyleFlags::FLOAT | SalFrameStyleFlags::TOOLTIP
++               | SalFrameStyleFlags::SYSTEMCHILD | SalFrameStyleFlags::PLUG
++               | SalFrameStyleFlags::INTRO));
++        if (!(nStyle & SalFrameStyleFlags::SIZEABLE) || bTransient)
 +            continue;
 +        pFrame->SetPosSize(0, 0, static_cast<tools::Long>(nWidth),
 +                           static_cast<tools::Long>(nHeight),
@@ -821,6 +868,12 @@ index 000000000..06fb05bcd
 +                               | SAL_FRAME_POSSIZE_HEIGHT);
 +    }
 +    SAL_INFO("vcl.wk", "surface resized to " << nWidth << "x" << nHeight);
++    for (const SvpSalFrame* p : m_aFrames)
++    {
++        const SalFrameGeometry aGeom = p->GetUnmirroredGeometry();
++        SAL_INFO("vcl.wk", "  frame " << p << " style " << static_cast<sal_uInt64>(p->style())
++                                      << " now " << aGeom.width() << "x" << aGeom.height());
++    }
 +}
 +
 +void WkSalInstance::present()
@@ -866,29 +919,45 @@ index 000000000..06fb05bcd
 +    }
 +}
 +
++void WkSalInstance::drainInput()
++{
++    if (!m_bSurfaceOpen)
++        return;
++    wkgfx_event ev;
++    while (wkgfx_poll_event(&ev))
++    {
++        if (ev.type == WKGFX_RESIZE)
++            resizeTo(ev.width, ev.height);
++        else
++            m_aRouter.dispatch(m_aFrames, ev);
++    }
++}
++
 +bool WkSalInstance::DoYield(bool bWait, bool bHandleAllCurrentEvents)
 +{
-+    const bool bAny = SvpSalInstance::DoYield(bWait, bHandleAllCurrentEvents);
++    // bWait is deliberately NOT passed down. SvpSalInstance::ImplYield's idle
++    // path is an untimed condition_variable::wait -- svpinst.cxx computes
++    // nTimeoutMicroS = -1, "wait until something happens" -- and in a component
++    // with one thread nothing can ever happen to signal it. It is a deadlock,
++    // not a slow frame, which is why the shim turns pthread_cond_wait into an
++    // abort rather than letting it hang.
++    //
++    // It only bites when the office goes genuinely idle, so a window with a
++    // document in it never reaches it and the Start Center does within seconds.
++    const bool bAny = SvpSalInstance::DoYield(false, bHandleAllCurrentEvents);
 +
 +    // Input first: wk's queue is drained without blocking, the events are
 +    // delivered as VCL events, and the present below then shows what they did.
 +    // Draining before the present rather than after is the difference between
 +    // a click being visible this frame and next.
-+    if (m_bSurfaceOpen)
-+    {
-+        wkgfx_event ev;
-+        while (wkgfx_poll_event(&ev))
-+        {
-+            if (ev.type == WKGFX_RESIZE)
-+                resizeTo(ev.width, ev.height);
-+            else
-+                m_aRouter.dispatch(m_aFrames, ev);
-+        }
-+    }
++    drainInput();
 +
 +    // Present after dispatching, so what goes to the host is the state the
 +    // events just produced rather than the one before them.
 +    present();
++
++    if (!bAny && bWait)
++        waitForSomething();
 +
 +    if (m_nDumpAfter > 0 && ++m_nYields >= m_nDumpAfter)
 +    {

@@ -2269,13 +2269,12 @@ mod tests {
     }
 
     #[test]
-    fn impress_example_mounts_the_install_tree_at_instdir() {
-        // LibreOffice is the one node whose mount path is not a convenience:
-        // nothing at run time can discover where its install tree is -- wasm
-        // has no dladdr, wasi-libc's realpath is a stub, and a guest gets a
-        // bare name in argv[0] -- so cppuhelper, sal and fontconfig all have
-        // /instdir compiled into them. A wire to any other path produces a
-        // missing UNO service, which reads like anything but a wrong mount.
+    fn impress_example_needs_no_wire_for_the_install_tree() {
+        // The office is self-contained: image://libreoffice carries the whole
+        // install tree at /instdir, which is where the binary has it compiled
+        // in -- nothing at run time can discover it, because wasm has no
+        // dladdr, wasi-libc's realpath is a stub, and a guest gets a bare name
+        // in argv[0]. The only wire is the documents.
         let example = Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../example/impress.wk"
@@ -2291,26 +2290,39 @@ mod tests {
             .find(|w| !w.nodes.is_empty())
             .expect("impress workspace");
 
-        let instdir = ws
-            .nodes
-            .iter()
-            .find(|n| matches!(&n.kind, SnapKind::BindMount { path } if path.ends_with("instdir")))
-            .expect("the install tree is bind-mounted");
         let office = ws
             .nodes
             .iter()
             .find(|n| matches!(&n.kind, SnapKind::App { dep, .. } if dep == "libreoffice"))
             .expect("a libreoffice node");
+        let work = ws
+            .nodes
+            .iter()
+            .find(|n| {
+                matches!(&n.kind, SnapKind::BindMount { path } if path.ends_with("impress-work"))
+            })
+            .expect("the documents are bind-mounted");
         assert!(
-            ws.connections.contains(&(instdir.id, office.id)),
-            "the tree is wired to the office"
+            ws.connections.contains(&(work.id, office.id)),
+            "the documents are wired to the office"
         );
         assert_eq!(
             ws.mount_paths
-                .get(&(instdir.id, office.id))
+                .get(&(work.id, office.id))
                 .map(String::as_str),
-            Some("/instdir"),
-            "at exactly /instdir, which is compiled into the binary"
+            Some("/work"),
+            "at /work, which the node's argument names"
+        );
+        // The install tree is deliberately NOT wired. A node type that only
+        // works with a hand-wired 644 MB directory is a trap: unwired,
+        // soffice.bin throws "Cannot open uno ini
+        // file:///instdir/program/unorc" and reaches the host as an unnamed
+        // wasm exception in soffice_main, which is exactly how this was found.
+        assert!(
+            !ws.nodes.iter().any(
+                |n| matches!(&n.kind, SnapKind::BindMount { path } if path.ends_with("instdir"))
+            ),
+            "the install tree comes from image://libreoffice, not from a wire"
         );
     }
 
