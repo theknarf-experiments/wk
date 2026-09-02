@@ -122,6 +122,10 @@ dependencies {
     mupdf "docker://plugins/mupdf/Dockerfile" {
         description "MuPDF PDF reader (wire a PDF in; PgUp/PgDn pages, +/- zoom, scroll pans)"
     }
+    libreoffice "plugins/libreoffice/build/instdir/program/soffice.bin" {
+        description "LibreOffice Impress on wasm32-wasip2 (vcl/wk backend) — wire the install tree in at /instdir; see example/impress.wk"
+        args "-env:UserInstallation=file:///profile"
+    }
 }
 workspace "01KXNW9K5HE8SA351748KG6GFA" {
 }

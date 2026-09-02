@@ -2269,6 +2269,52 @@ mod tests {
     }
 
     #[test]
+    fn impress_example_mounts_the_install_tree_at_instdir() {
+        // LibreOffice is the one node whose mount path is not a convenience:
+        // nothing at run time can discover where its install tree is -- wasm
+        // has no dladdr, wasi-libc's realpath is a stub, and a guest gets a
+        // bare name in argv[0] -- so cppuhelper, sal and fontconfig all have
+        // /instdir compiled into them. A wire to any other path produces a
+        // missing UNO service, which reads like anything but a wrong mount.
+        let example = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example/impress.wk"
+        ));
+        let doc = Document::load_resolved(example).expect("impress.wk resolves");
+        assert!(
+            doc.dependencies.iter().any(|d| d.name == "libreoffice"),
+            "libreoffice available via the root import"
+        );
+        let ws = doc
+            .workspaces
+            .iter()
+            .find(|w| !w.nodes.is_empty())
+            .expect("impress workspace");
+
+        let instdir = ws
+            .nodes
+            .iter()
+            .find(|n| matches!(&n.kind, SnapKind::BindMount { path } if path.ends_with("instdir")))
+            .expect("the install tree is bind-mounted");
+        let office = ws
+            .nodes
+            .iter()
+            .find(|n| matches!(&n.kind, SnapKind::App { dep, .. } if dep == "libreoffice"))
+            .expect("a libreoffice node");
+        assert!(
+            ws.connections.contains(&(instdir.id, office.id)),
+            "the tree is wired to the office"
+        );
+        assert_eq!(
+            ws.mount_paths
+                .get(&(instdir.id, office.id))
+                .map(String::as_str),
+            Some("/instdir"),
+            "at exactly /instdir, which is compiled into the binary"
+        );
+    }
+
+    #[test]
     fn filesystems_example_wires_provider_mounts() {
         // The nodes-as-filesystems showcase: app→app connections (provider
         // mounts) ride the same relation as volume binds, each with its own
