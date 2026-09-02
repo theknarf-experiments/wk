@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# The music itself: the song model, the transport arithmetic and the MIDI-file
+# conversion live in workspace crates so they can be tested where tests run.
+# What is left here is the window: drawing, clicks, and talking to wk.
+wk-sequence = { path = "../../crates/wk-sequence" }
+wk-midifile = { path = "../../crates/wk-midifile" }
 wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
 
 [lib]

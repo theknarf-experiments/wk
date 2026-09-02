@@ -5419,6 +5419,212 @@ mod tests {
         node.kill.store(true, Ordering::Relaxed);
     }
 
+    /// The sequencer's work leaves: it opens a MIDI file wired to the node,
+    /// plays what is in it, and writes it back.
+    ///
+    /// A pattern that only exists inside the node is a sketch. This is the
+    /// whole path — a real `.mid` in the node's filesystem, parsed into a song,
+    /// scheduled onto the shared clock, and exported again — with a file
+    /// written by something other than the sequencer going in at the front.
+    #[test]
+    fn sequencer_opens_plays_and_saves_a_midi_file() {
+        let wasm = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../plugins/sequencer/target/wasm32-wasip1/debug/sequencer.wasm");
+        if !wasm.exists() {
+            eprintln!("skipping: build plugins/sequencer first (mise run build)");
+            return;
+        }
+
+        // A file as another program would write it: 480 ticks per quarter, a
+        // tempo the sequencer's defaults do not have, and two parts on their own
+        // channels. Nothing here matches what the node starts with, so anything
+        // it plays can only have come from the file.
+        use wk_midifile::{Event, EventKind, MidiFile};
+        let mut file = MidiFile::new(480);
+        file.tracks.push(vec![
+            Event::new(0, EventKind::tempo(400_000)), // 150 BPM
+            Event::new(0, EventKind::end_of_track()),
+        ]);
+        file.tracks.push(vec![
+            // A half note on channel 3, at a velocity worth recognising. Half a
+            // bar rather than a whole one, so it releases and retriggers and
+            // the loop can be timed.
+            Event::new(0, EventKind::Midi(vec![0x92, 55, 97])),
+            Event::new(960, EventKind::Midi(vec![0x82, 55, 0])),
+            Event::new(0, EventKind::end_of_track()),
+        ]);
+        let bytes = file.write();
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let surfaces: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        host.spawn(
+            &wasm,
+            "sequencer",
+            id,
+            &[],
+            surfaces.clone(),
+            nodes.clone(),
+            Vec::new(),
+            None,
+        )
+        .expect("spawn");
+
+        // The node registers synchronously, so the file lands in its filesystem
+        // before the guest runs and goes looking for one.
+        let node = nodes
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|n| n.id == id)
+            .cloned()
+            .expect("node registered");
+        node.fs.lock().unwrap().put_file_at("riff.mid", bytes);
+
+        let inbox = crate::midi::new_inbox();
+        host.midi()
+            .lock()
+            .unwrap()
+            .connect(id, NodeId::new(), inbox.clone());
+
+        let surface = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            loop {
+                if let Some(s) = surfaces.lock().unwrap().first().cloned() {
+                    break s;
+                }
+                assert!(
+                    !node.finished.load(Ordering::Relaxed),
+                    "the sequencer exited before opening a surface"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the sequencer never opened a surface"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+        let pump_frame = || {
+            let mut s = surface.lock().unwrap();
+            s.frame_ready = true;
+            s.wake();
+        };
+        for _ in 0..5 {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let key = |code: Key, meta: bool| KeyEvent {
+            key: Some(code),
+            text: None,
+            alt_key: false,
+            ctrl_key: false,
+            meta_key: meta,
+            shift_key: false,
+            repeat: false,
+        };
+        {
+            let mut s = surface.lock().unwrap();
+            s.key_down.push_back(key(Key::Space, false));
+            s.key_up.push_back(key(Key::Space, false));
+            s.wake();
+        }
+
+        // What it plays is the file's note, on the file's channel, at the
+        // file's velocity — and its tempo, which the loop period proves.
+        let mut events: Vec<crate::midi::Event> = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            events.extend(inbox.lock().unwrap().drain());
+            let ons = events
+                .iter()
+                .filter(|e| e.data.first() == Some(&0x92))
+                .count();
+            if ons >= 2 {
+                break;
+            }
+            assert!(
+                !node.finished.load(Ordering::Relaxed),
+                "the sequencer exited while playing the file"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the file's note never played; {} events seen; log:\n{}",
+                events.len(),
+                String::from_utf8_lossy(&node.term_io.log_read(0).0)
+            );
+        }
+        let ons: Vec<&crate::midi::Event> = events
+            .iter()
+            .filter(|e| e.data.first() == Some(&0x92))
+            .collect();
+        assert_eq!(
+            ons[0].data,
+            vec![0x92, 55, 97],
+            "the note, channel and velocity all come from the file"
+        );
+        // The pattern is sixteen sixteenth-note steps; at 150 BPM that is 1.6s.
+        let cycle = ons[1].time as f64 - ons[0].time as f64;
+        assert!(
+            (cycle - 1_600_000.0).abs() < 2.0,
+            "the file's tempo and length should loop every 1.6s, got {cycle}us"
+        );
+
+        // Cmd+S writes it back, and what comes out is still a MIDI file with
+        // that note in it.
+        {
+            let mut s = surface.lock().unwrap();
+            s.key_down.push_back(key(Key::KeyS, true));
+            s.key_up.push_back(key(Key::KeyS, true));
+            s.wake();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let saved = loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let written = node
+                .fs
+                .lock()
+                .unwrap()
+                .read_file("riff.mid", 1 << 20)
+                .unwrap_or_default();
+            // The node rewrites the file, so wait for bytes it authored: its
+            // own files are 96 ticks per quarter, not the 480 that went in.
+            if let Ok(parsed) = MidiFile::parse(&written) {
+                if parsed.ppq == 96 {
+                    break parsed;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Cmd+S never wrote the file back"
+            );
+        };
+        let played: Vec<&Vec<u8>> = saved
+            .tracks
+            .iter()
+            .flatten()
+            .filter_map(|e| match &e.kind {
+                EventKind::Midi(m) if m[0] == 0x92 => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            played,
+            vec![&vec![0x92, 55, 97]],
+            "the saved file still holds the note, on its channel, at its velocity"
+        );
+        assert!(
+            (60_000_000.0 / saved.tempo() as f64 - 150.0).abs() < 0.5,
+            "and its tempo"
+        );
+
+        node.kill.store(true, Ordering::Relaxed);
+    }
+
     /// The sequencer keeps the clock's time, not the frame rate's.
     ///
     /// This is the property the node was rebuilt for. It used to count

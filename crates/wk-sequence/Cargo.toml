@@ -1,0 +1,9 @@
+[package]
+name = "wk-sequence"
+version = "0.1.0"
+edition = "2021"
+
+# Compiled into the host (where it is tested) and into the sequencer plugin's
+# wasm component, so every dependency has to build for wasm32-wasip1 too.
+[dependencies]
+wk-midifile = { path = "../wk-midifile" }

@@ -361,6 +361,15 @@ Example plugins live under `plugins/`, spanning graphics (GPU via `wasi:webgpu`
 and CPU frame buffers), audio and MIDI, terminal programs and recompiled C
 software, userspace networking, and filesystem demos.
 
+The `sequencer` is the fullest of them: an eight-track piano roll with a pattern
+bank and a song chain, recording what you play with its velocity and length, and
+sending every note stamped with the instant it belongs to so the tempo is the
+tempo rather than the frame rate rounded off. Wire a `.mid` file to it and that
+file is the document — it opens on launch and Cmd+S writes it back, so the work
+opens in any other music program. `example/midi.wk` has the whole chain: a
+hardware keyboard, the on-screen piano, the sequencer, and two synths each
+answering their own MIDI channel.
+
 Every plugin exposes the same `build` task via `mise`, and the whole build
 toolchain is pinned and installed by mise (declared in the root `mise.toml`), so
 there's no manual toolchain setup — building is uniform:

@@ -21,7 +21,8 @@ const CUT: usize = 3;
 const RES: usize = 4;
 const ATK: usize = 5;
 const REL: usize = 6;
-const NUM_KNOBS: usize = 7;
+const CHAN: usize = 7;
+const NUM_KNOBS: usize = 8;
 
 /// Unison spread of the two oscillators per voice, in cents (fixed).
 const UNISON_CENTS: f32 = 7.0;
@@ -215,6 +216,18 @@ impl Synth {
                     log: true,
                     color: [230, 210, 100],
                 },
+                Knob {
+                    // Which MIDI channel to answer. 0 is omni — every channel,
+                    // which is what one synth on the end of one cable wants.
+                    // Turn it up and the synth becomes one part of a multi-track
+                    // arrangement, ignoring everything not addressed to it.
+                    label: "CHAN",
+                    value: 0.0,
+                    min: 0.0,
+                    max: 16.0,
+                    log: false,
+                    color: [200, 140, 230],
+                },
             ],
         }
     }
@@ -326,13 +339,22 @@ impl Synth {
         });
     }
 
-    /// Apply host-saved option values (knob settings) if they match our layout.
+    /// Apply host-saved option values (knob settings).
+    ///
+    /// A saved set shorter than the current one is applied as far as it goes:
+    /// knobs are appended over time, and a workspace saved before the newest one
+    /// existed should still come back with the settings it does have rather than
+    /// snapping every knob to its default.
     fn apply_options(&mut self, vals: &[f32]) {
-        if vals.len() == NUM_KNOBS {
-            for (k, &v) in self.knobs.iter_mut().zip(vals) {
-                k.value = v.clamp(k.min, k.max);
-            }
+        for (k, &v) in self.knobs.iter_mut().zip(vals) {
+            k.value = v.clamp(k.min, k.max);
         }
+    }
+
+    /// Does this synth answer messages on `channel`?
+    fn listens_to(&self, channel: u8) -> bool {
+        let want = self.knobs[CHAN].value.round() as u8;
+        want == 0 || want == channel + 1
     }
 
     /// The current knob values, in knob order, to persist via the host.
@@ -384,7 +406,7 @@ fn layout(w: u32, h: u32) -> ([(i32, i32); NUM_KNOBS], i32) {
     let mut centers = [(0, 0); NUM_KNOBS];
     for (i, c) in centers.iter_mut().enumerate() {
         let col = (i % 4) as f32;
-        let row = i / 4;
+        let row = (i / 4).min(row_y.len() - 1);
         *c = ((cw * (col + 0.5)) as i32, row_y[row] as i32);
     }
     (centers, r)
@@ -566,7 +588,7 @@ impl Guest for Component {
             // Incoming MIDI: note-on (status 0x90, vel>0) / note-off (0x80, or
             // 0x90 vel 0), plus the channel-mode messages that silence us.
             while let Some(ev) = input.receive_event() {
-                if ev.data.len() < 3 {
+                if ev.data.len() < 3 || !synth.listens_to(ev.data[0] & 0x0F) {
                     continue;
                 }
                 let at = audio_time(ev.time);

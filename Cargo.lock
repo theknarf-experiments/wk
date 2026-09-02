@@ -10996,12 +10996,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "wk-midifile"
+version = "0.1.0"
+
+[[package]]
 name = "wk-protocol"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "wk-sequence"
+version = "0.1.0"
+dependencies = [
+ "wk-midifile",
 ]
 
 [[package]]
@@ -11040,6 +11051,7 @@ dependencies = [
  "wit-component",
  "wk-dockerfile",
  "wk-fabric",
+ "wk-midifile",
  "wk-protocol",
  "wk-token-service",
  "wk-vfs",

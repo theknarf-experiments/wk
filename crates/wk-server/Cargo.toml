@@ -40,6 +40,8 @@ smoltcp = "0.13.1"
 wk-fabric = { path = "../wk-fabric" }
 wk-dockerfile = { path = "../wk-dockerfile" }
 wk-vfs = { path = "../wk-vfs" }
+# Read back what the sequencer node writes, in the MIDI-file round-trip test.
+wk-midifile = { path = "../wk-midifile" }
 wit-component = "0.253.0"
 
 # Hardware MIDI. The cross-platform crate (midir) pulls an ALSA version that

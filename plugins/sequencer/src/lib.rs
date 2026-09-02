@@ -1,128 +1,56 @@
+//! A multi-track step sequencer as a wk node.
+//!
+//! The music lives in [`wk_sequence`]: the song, the transport arithmetic and
+//! the MIDI-file conversion are all in workspace crates, tested natively. What
+//! is here is the window — layout, painting, clicks and keys — plus the two
+//! things only a node can do: talk to wk's MIDI ports, and read and write the
+//! file wired to it on the canvas.
+
 #[allow(warnings)]
 mod bindings;
+
+mod font;
+mod paint;
+mod song_file;
 
 use std::collections::HashMap;
 
 use bindings::Guest;
-use bindings::wasi::frame_buffer::frame_buffer::{Buffer, Device};
+use bindings::wasi::frame_buffer::frame_buffer::Device;
 use bindings::wasi::graphics_context::graphics_context::Context as GfxContext;
 use bindings::wasi::surface::surface::{CreateDesc, Key, Surface};
 use bindings::wk::midi::midi::{Input, Output, now};
 
-mod font;
-use font::{text, text_width};
+use song_file::SongFile;
+use wk_sequence::{
+    Emit, MAX_BPM, MAX_CHAIN, MAX_PATTERNS, MAX_STEPS, MAX_TRACKS, MIN_BPM, MIN_STEPS, Note,
+    Pattern, Playback, Scheduler, Song,
+};
 
-/// Pitch rows shown at once, and the lowest of them. The window scrolls by an
-/// octave at a time; the notes themselves may sit anywhere in the MIDI range.
-const ROWS: i32 = 25;
+/// Pitch rows shown at once. The window scrolls by an octave; the notes
+/// themselves may sit anywhere in the MIDI range.
+pub const ROWS: i32 = 25;
 const LOWEST: i32 = 0;
 const HIGHEST: i32 = 127;
 
-/// Tempo limits. Wide enough for a ballad and for drum and bass.
-const MIN_BPM: f32 = 20.0;
-const MAX_BPM: f32 = 300.0;
-
-/// Pattern length limits, in sixteenth-note steps: a single step up to four bars.
-const MIN_STEPS: i32 = 1;
-const MAX_STEPS: i32 = 64;
-
-/// How far ahead of the clock the sequencer keeps music queued, in microseconds.
-///
-/// Nothing downstream can be precise about an event it has not been given yet:
-/// a synth needs it before it can place the note on its audio clock, and a
-/// hardware port needs it before the driver can time the byte out. So the
-/// sequencer runs ahead of itself. This is long enough to survive a slow frame
-/// and short enough that a tempo change or an edit takes effect almost at once,
-/// since it only ever invalidates music already queued inside this window.
-const LOOKAHEAD_US: f64 = 60_000.0;
-
-/// MIDI clock pulses per quarter note — 24, fixed by the MIDI specification.
-/// The sequencer is the clock master for whatever it is wired to, so an
-/// arpeggiator or an external drum machine can lock to its tempo.
-const PPQ: i32 = 24;
-/// Clock pulses per sixteenth-note step.
-const PULSES_PER_STEP: i32 = PPQ / 4;
-
-/// A safety valve on the scheduler: at most this many steps are queued in one
-/// pass, so an absurd tempo or a long stall cannot spin the loop.
-const MAX_STEPS_PER_PUMP: i32 = 256;
-
-/// The velocity a note drawn with the mouse gets. Mezzo-forte, the middle of
+/// The velocity a note drawn with the mouse gets: mezzo-forte, the middle of
 /// the range in practice.
 const DEFAULT_VEL: u8 = 100;
-
-/// Layout. The window is a stack: transport bar, ruler, roll, velocity lane,
-/// with a piano-key gutter down the left of the roll.
-const CTRL_H: f32 = 28.0;
-const RULER_H: f32 = 13.0;
-const GUTTER_W: f32 = 30.0;
-const VEL_H: f32 = 44.0;
-const PAD: f32 = 6.0;
-
-/// Button box metrics on the transport bar.
-const BTN_W: f32 = 34.0;
-const BTN_H: f32 = 20.0;
-const BTN_Y: f32 = 4.0;
-const BTN_GAP: f32 = 8.0;
-
-/// Pixels at a note's right edge that grab the resize handle.
-const RESIZE_PX: f32 = 7.0;
 
 /// Vertical pixels of drag that span a field's whole range.
 const DRAG_SPAN: f32 = 200.0;
 
-/// The saved-options layout is tagged so an older saved pattern still loads.
-/// A step is never negative, so no pattern written by the first version of this
-/// node can begin with this value.
-const SAVE_TAG: f32 = -1.0;
-const SAVE_VERSION: f32 = 1.0;
+/// Pixels at a note's right edge that grab the resize handle.
+const RESIZE_PX: f32 = 7.0;
 
-/// Is MIDI `note` a black key (used to tint the piano-roll rows)?
-fn is_black(note: i32) -> bool {
-    matches!(note.rem_euclid(12), 1 | 3 | 6 | 8 | 10)
-}
-
-/// The name of MIDI `note`, e.g. `C4` or `F#3`, with middle C as C4.
-fn note_name(note: i32) -> String {
-    const NAMES: [&str; 12] = [
-        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
-    ];
-    format!(
-        "{}{}",
-        NAMES[note.rem_euclid(12) as usize],
-        note.div_euclid(12) - 1
-    )
-}
-
-/// Microseconds per sixteenth-note step at `bpm`.
-fn step_micros(bpm: f32) -> f64 {
-    60_000_000.0 / bpm as f64 / 4.0
-}
+/// How long a message stays in the transport bar.
+const STATUS_FRAMES: u32 = 180;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Transport {
     Stopped,
     Playing,
     Recording,
-}
-
-/// A note in the roll: a `step` start column, a `pitch`, a `len` in steps
-/// (at least 1), and the `vel` it sounds at.
-#[derive(Clone, Copy, PartialEq)]
-struct Note {
-    step: i32,
-    pitch: i32,
-    len: i32,
-    vel: u8,
-}
-
-impl Note {
-    /// Is this note sounding at pattern position `p` of a `steps`-long pattern?
-    /// A note left hanging over the loop point by a shortened pattern is cut
-    /// off at the end rather than sounding into the next cycle.
-    fn covers(&self, p: i32, steps: i32) -> bool {
-        self.step <= p && p < (self.step + self.len).min(steps)
-    }
 }
 
 /// A mouse edit in progress. Offsets are captured at grab time so a note tracks
@@ -139,189 +67,173 @@ enum Drag {
     },
     /// Painting velocities in the lane under the cursor.
     Velocity,
-    /// Turning the tempo or the pattern length by dragging vertically.
-    Tempo {
-        start_y: f32,
-        start: f32,
-    },
-    Length {
+    /// Turning a transport-bar field by dragging vertically.
+    Field {
+        which: Field,
         start_y: f32,
         start: f32,
     },
 }
 
-/// The sequencer.
-///
-/// The transport is driven by wk's shared MIDI clock, not by the frame rate.
-/// Each frame it works out which step boundaries fall inside the look-ahead
-/// window and sends their notes stamped with the instant they belong to, so the
-/// music keeps the clock's time rather than the display's.
-struct Seq {
+#[derive(Clone, Copy, PartialEq)]
+enum Field {
+    Tempo,
+    Length,
+    Channel,
+}
+
+/// The sequencer node.
+struct App {
     out: Output,
     input: Input,
-    notes: Vec<Note>,
-    /// Pattern length in sixteenth-note steps.
-    steps: i32,
-    bpm: f32,
-
+    song: Song,
+    sched: Scheduler,
     transport: Transport,
-    /// Microseconds per step at the current tempo.
-    step_us: f64,
-    /// The instant of absolute step 0 under the current tempo, in microseconds
-    /// on the shared clock. Fractional, so the tempo never rounds into drift.
-    origin: f64,
-    /// The first absolute step whose events have not been sent yet. Everything
-    /// before it is already queued downstream.
-    next_step: i64,
-    /// Pitches whose note-on has been sent and note-off has not.
-    scheduled_on: Vec<i32>,
-
-    /// Notes being recorded right now: incoming pitch -> its index in `notes`
-    /// and the absolute step its note-on was quantised to.
-    pending: HashMap<i32, (usize, i64)>,
-
+    /// The pattern being edited, and looped when not in song mode.
+    pattern: usize,
+    /// The track being edited. Its notes are solid in the roll; the others ghost.
+    track: usize,
+    /// Play the chain rather than the one pattern.
+    song_mode: bool,
     /// The lowest pitch row on screen.
     low: i32,
-    /// The selected note (index into `notes`), for drag/resize/delete.
+    /// The selected note, as an index into the current pattern's current track.
     selected: Option<usize>,
-    /// Pattern states to step back to, and the ones stepped back from.
-    undo: Vec<Vec<Note>>,
-    redo: Vec<Vec<Note>>,
-    /// The pattern or its settings changed and should be re-persisted.
+    /// Songs to step back to, and the ones stepped back from.
+    undo: Vec<Song>,
+    redo: Vec<Song>,
+    /// Notes being recorded: incoming pitch -> the pattern and note it opened,
+    /// and the absolute step it started on.
+    pending: HashMap<i32, (usize, usize, i64)>,
+    /// The song changed and should be re-persisted through wk:options.
     dirty: bool,
+    /// The song differs from what the file on disk holds.
+    unsaved: bool,
+    file: Option<SongFile>,
+    status: String,
+    status_left: u32,
+    /// Whether shift is held. Pointer events carry no modifiers, so the state
+    /// is kept from the key events, which do — that is what lets a shift-click
+    /// mean something different from a click.
+    shift: bool,
 }
 
-impl Seq {
+impl App {
     fn new() -> Self {
-        Seq {
+        App {
             out: Output::new(),
             input: Input::new(),
-            notes: Vec::new(),
-            steps: 16,
-            bpm: 120.0,
+            song: Song::new(),
+            sched: Scheduler::new(120.0),
             transport: Transport::Stopped,
-            step_us: step_micros(120.0),
-            origin: 0.0,
-            next_step: 0,
-            scheduled_on: Vec::new(),
-            pending: HashMap::new(),
+            pattern: 0,
+            track: 0,
+            song_mode: false,
             low: 48,
             selected: None,
             undo: Vec::new(),
             redo: Vec::new(),
+            pending: HashMap::new(),
             dirty: false,
+            unsaved: false,
+            file: None,
+            status: String::new(),
+            status_left: 0,
+            shift: false,
         }
+    }
+
+    fn say(&mut self, message: impl Into<String>) {
+        self.status = message.into();
+        self.status_left = STATUS_FRAMES;
+    }
+
+    /// What the transport is playing.
+    fn playback(&self) -> Playback {
+        if self.song_mode {
+            Playback::Song
+        } else {
+            Playback::Pattern(self.pattern)
+        }
+    }
+
+    /// The pattern being edited.
+    fn pattern(&self) -> &Pattern {
+        &self.song.patterns[self.pattern.min(self.song.patterns.len() - 1)]
+    }
+
+    fn steps(&self) -> i32 {
+        self.pattern().steps
     }
 
     // ---- editing ----
 
-    /// Record the pattern as it is now, so the next edit can be stepped back.
-    /// Called once before a change begins, not once per pixel of a drag.
+    /// Record the song as it is, so the next edit can be stepped back. Called
+    /// once before a change begins, not once per pixel of a drag.
     fn checkpoint(&mut self) {
-        self.undo.push(self.notes.clone());
-        if self.undo.len() > 128 {
+        self.undo.push(self.song.clone());
+        if self.undo.len() > 64 {
             self.undo.remove(0);
         }
         self.redo.clear();
     }
 
     fn undo(&mut self) {
-        if let Some(prev) = self.undo.pop() {
-            self.redo.push(std::mem::replace(&mut self.notes, prev));
-            self.after_pattern_change();
+        if let Some(previous) = self.undo.pop() {
+            self.redo.push(std::mem::replace(&mut self.song, previous));
+            self.after_replace();
+            self.say("undo");
         }
     }
 
     fn redo(&mut self) {
         if let Some(next) = self.redo.pop() {
-            self.undo.push(std::mem::replace(&mut self.notes, next));
-            self.after_pattern_change();
+            self.undo.push(std::mem::replace(&mut self.song, next));
+            self.after_replace();
+            self.say("redo");
         }
     }
 
-    /// Selection and in-flight recording both index into `notes`, so neither
+    /// Selection and in-flight recording index into the song, so neither
     /// survives a wholesale replacement of it.
-    fn after_pattern_change(&mut self) {
+    fn after_replace(&mut self) {
         self.selected = None;
         self.pending.clear();
+        self.pattern = self.pattern.min(self.song.patterns.len() - 1);
+        self.track = self.track.min(MAX_TRACKS - 1);
+        self.sched.set_bpm(self.song.bpm);
         self.dirty = true;
+        self.unsaved = true;
     }
 
-    /// Add a note (clamping its length inside the pattern) and return its index.
-    fn add_note(&mut self, step: i32, pitch: i32, len: i32, vel: u8) -> usize {
-        let len = len.clamp(1, (self.steps - step).max(1));
-        self.notes.push(Note {
-            step,
-            pitch,
-            len,
-            vel,
-        });
+    /// Note that the music changed: it needs persisting, and it no longer
+    /// matches the file.
+    fn touched(&mut self) {
         self.dirty = true;
-        self.notes.len() - 1
+        self.unsaved = true;
     }
 
-    /// The topmost note under `(step, pitch)`, if any.
-    fn note_at(&self, step: i32, pitch: i32) -> Option<usize> {
-        (0..self.notes.len())
-            .rev()
-            .find(|&i| self.notes[i].pitch == pitch && self.notes[i].covers(step, self.steps))
-    }
-
-    /// Remove the selected note.
     fn delete_selected(&mut self) {
-        if let Some(i) = self.selected.take() {
-            if i < self.notes.len() {
-                self.checkpoint();
-                self.notes.remove(i);
-                self.dirty = true;
-            }
-            self.pending.clear();
-        }
-    }
-
-    // ---- settings ----
-
-    fn set_bpm(&mut self, bpm: f32) {
-        let bpm = bpm.clamp(MIN_BPM, MAX_BPM);
-        if (bpm - self.bpm).abs() < 0.005 {
+        let Some(index) = self.selected.take() else {
             return;
+        };
+        self.checkpoint();
+        let (pattern, track) = (self.pattern, self.track);
+        if let Some(notes) = self.song.patterns[pattern]
+            .notes
+            .get_mut(track)
+            .filter(|n| index < n.len())
+        {
+            notes.remove(index);
         }
-        // Re-anchor the clock on the next boundary still to be scheduled, so it
-        // stays exactly where it is and the new rate applies from there on.
-        // Nothing already sent is invalidated and no boundary is sent twice.
-        let pivot = self.step_instant(self.next_step);
-        self.bpm = bpm;
-        self.step_us = step_micros(bpm);
-        self.origin = pivot - self.next_step as f64 * self.step_us;
-        self.dirty = true;
-    }
-
-    fn set_steps(&mut self, steps: i32) {
-        let steps = steps.clamp(MIN_STEPS, MAX_STEPS);
-        if steps != self.steps {
-            self.steps = steps;
-            self.dirty = true;
-        }
+        self.pending.clear();
+        self.touched();
     }
 
     // ---- transport ----
 
-    /// The instant absolute step `i` falls on.
-    fn step_instant(&self, i: i64) -> f64 {
-        self.origin + i as f64 * self.step_us
-    }
-
-    /// The pattern position the playhead is on at `now`.
-    fn playhead(&self, now: u64) -> i32 {
-        if self.transport == Transport::Stopped {
-            return 0;
-        }
-        let f = ((now as f64 - self.origin) / self.step_us).floor() as i64;
-        f.rem_euclid(self.steps as i64) as i32
-    }
-
-    fn start(&mut self, mode: Transport, now: u64) {
-        // Pressing the button of the running mode stops; pressing the other one
+    fn start(&mut self, mode: Transport, clock: u64) {
+        // Pressing the button of the running mode stops; pressing the other
         // switches mode without disturbing the clock.
         if self.transport == mode {
             self.stop();
@@ -330,10 +242,9 @@ impl Seq {
         let from_stopped = self.transport == Transport::Stopped;
         self.transport = mode;
         if from_stopped {
-            self.origin = now as f64;
-            self.next_step = 0;
-            self.scheduled_on.clear();
-            self.out.send_at(&[0xFA], now); // MIDI start
+            let mut out = Vec::new();
+            self.sched.start(clock, &mut out);
+            self.emit(out);
         }
     }
 
@@ -341,325 +252,304 @@ impl Seq {
         if self.transport == Transport::Stopped {
             return;
         }
-        // Release at the end of what is already queued. Sending note-offs for
-        // "now" would put them before note-ons already scheduled ahead of the
-        // clock, and those notes would sound forever.
-        let at = self.step_instant(self.next_step).max(0.0) as u64;
-        for pitch in std::mem::take(&mut self.scheduled_on) {
-            self.out.send_at(&[0x80, pitch as u8, 0], at);
-        }
-        self.out.send_at(&[0xFC], at); // MIDI stop
+        let mut out = Vec::new();
+        self.sched.stop(&mut out);
+        self.emit(out);
         self.transport = Transport::Stopped;
         self.pending.clear();
     }
 
-    /// Queue every step boundary that falls inside the look-ahead window.
-    fn pump(&mut self, now: u64) {
-        if self.transport == Transport::Stopped {
-            return;
-        }
-        let horizon = now as f64 + LOOKAHEAD_US;
-        let mut budget = MAX_STEPS_PER_PUMP;
-        while self.step_instant(self.next_step) < horizon && budget > 0 {
-            self.schedule_step(self.next_step);
-            self.next_step += 1;
-            budget -= 1;
+    fn emit(&self, events: Vec<Emit>) {
+        for event in events {
+            self.out.send_at(&event.data, event.time);
         }
     }
 
-    /// Send everything that happens on absolute step `i`, stamped for the
-    /// instant that step falls on.
-    fn schedule_step(&mut self, i: i64) {
-        let t = self.step_instant(i);
-        let p = i.rem_euclid(self.steps as i64) as i32;
-
-        // The clock runs whether or not there are notes, so anything slaved to
-        // this sequencer keeps time through an empty bar.
-        for k in 0..PULSES_PER_STEP {
-            let tick = t + k as f64 * self.step_us / PULSES_PER_STEP as f64;
-            self.out.send_at(&[0xF8], tick.max(0.0) as u64);
-        }
-
-        // What should be sounding on this step. While recording, a pitch being
-        // played live is left alone: MIDI thru is already sounding it, and
-        // re-triggering it here would double the note.
-        let live: Vec<i32> = self.pending.keys().copied().collect();
-        let recording = self.transport == Transport::Recording;
-        let mut want: Vec<(i32, u8)> = Vec::new();
-        for n in &self.notes {
-            if n.covers(p, self.steps)
-                && !(recording && live.contains(&n.pitch))
-                && !want.iter().any(|&(pitch, _)| pitch == n.pitch)
-            {
-                want.push((n.pitch, n.vel));
-            }
-        }
-
-        let at = t.max(0.0) as u64;
-        let offs: Vec<i32> = self
-            .scheduled_on
-            .iter()
-            .copied()
-            .filter(|p| !want.iter().any(|&(pitch, _)| pitch == *p))
+    /// Queue the music falling inside the look-ahead window.
+    fn pump(&mut self, clock: u64) {
+        // Pitches the player is holding down: MIDI thru is already sounding
+        // them, so the scheduler must not trigger them a second time.
+        let channel = self.song.channel(self.track);
+        let suppress: Vec<(u8, u8)> = self
+            .pending
+            .keys()
+            .map(|&pitch| (channel, pitch as u8))
             .collect();
-        for pitch in offs {
-            self.out.send_at(&[0x80, pitch as u8, 0], at);
-        }
-        self.scheduled_on
-            .retain(|p| want.iter().any(|&(pitch, _)| pitch == *p));
-        for (pitch, vel) in want {
-            if !self.scheduled_on.contains(&pitch) {
-                self.out.send_at(&[0x90, pitch as u8, vel.max(1)], at);
-                self.scheduled_on.push(pitch);
-            }
-        }
-    }
-
-    /// The absolute step an instant is nearest to.
-    fn step_of(&self, instant: u64) -> i64 {
-        ((instant as f64 - self.origin) / self.step_us).round() as i64
+        let mut out = Vec::new();
+        let play = self.playback();
+        self.sched
+            .pump(clock, &self.song, play, &suppress, &mut out);
+        self.emit(out);
     }
 
     /// Drain incoming MIDI: while recording, open a note on note-on and close it
     /// on note-off, both placed by the instant the message carries rather than
     /// by the frame it was drained on. Every message is passed through to the
-    /// output, so the node is a MIDI thru as well (that is what lets you hear
-    /// what you are playing while it records).
+    /// output, which is what lets you hear what you are playing.
     fn pump_input(&mut self) {
-        while let Some(ev) = self.input.receive_event() {
-            let msg = &ev.data;
+        while let Some(event) = self.input.receive_event() {
+            let msg = &event.data;
             if self.transport == Transport::Recording && msg.len() >= 3 {
                 let status = msg[0] & 0xF0;
                 let pitch = msg[1] as i32;
                 let vel = msg[2];
-                let on = status == 0x90 && vel > 0;
-                let off = status == 0x80 || (status == 0x90 && vel == 0);
-                let when = if ev.time == 0 { now() } else { ev.time };
-                if on && (LOWEST..=HIGHEST).contains(&pitch) && !self.pending.contains_key(&pitch) {
-                    let abs = self.step_of(when);
-                    let p = abs.rem_euclid(self.steps as i64) as i32;
-                    if self.pending.is_empty() {
-                        self.checkpoint();
-                    }
-                    let idx = self.add_note(p, pitch, 1, vel);
-                    self.pending.insert(pitch, (idx, abs));
-                } else if let Some((idx, abs_on)) =
-                    off.then(|| self.pending.remove(&pitch)).flatten()
-                {
-                    // Length comes from when the key was actually released, so
-                    // a held note records as held.
-                    let held = (self.step_of(when) - abs_on).max(1) as i32;
-                    if let Some(n) = self.notes.get_mut(idx) {
-                        n.len = held.clamp(1, (self.steps - n.step).max(1));
-                        self.dirty = true;
-                    }
+                let when = if event.time == 0 { now() } else { event.time };
+                if status == 0x90 && vel > 0 {
+                    self.record_on(pitch, vel, when);
+                } else if status == 0x80 || (status == 0x90 && vel == 0) {
+                    self.record_off(pitch, when);
                 }
             }
-            self.out.send_at(msg, ev.time);
+            self.out.send_at(msg, event.time);
         }
     }
 
-    // ---- persistence ----
-
-    /// Restore saved settings and pattern.
-    ///
-    /// A tagged list carries the tempo, the pattern length and four values per
-    /// note. An untagged one is a pattern saved before velocity and tempo
-    /// existed: bare `(step, pitch, len)` triples, which still load.
-    fn load(&mut self, vals: &[f32]) {
-        let (body, tagged) = match vals {
-            [tag, version, bpm, steps, rest @ ..]
-                if *tag == SAVE_TAG && *version <= SAVE_VERSION =>
-            {
-                self.set_steps(*steps as i32);
-                self.bpm = bpm.clamp(MIN_BPM, MAX_BPM);
-                self.step_us = step_micros(self.bpm);
-                (rest, true)
-            }
-            _ => (vals, false),
+    fn record_on(&mut self, pitch: i32, vel: u8, when: u64) {
+        if !(LOWEST..=HIGHEST).contains(&pitch) || self.pending.contains_key(&pitch) {
+            return;
+        }
+        let abs = self.sched.step_of(when);
+        // In song mode the note belongs to whichever pattern is playing.
+        let Some(position) = wk_sequence::locate(&self.song, self.playback(), abs) else {
+            return;
         };
-        let stride = if tagged { 4 } else { 3 };
-        for t in body.chunks_exact(stride) {
-            let (step, pitch, len) = (t[0] as i32, t[1] as i32, t[2] as i32);
-            let vel = if tagged {
-                (t[3] as i32).clamp(1, 127) as u8
-            } else {
-                DEFAULT_VEL
-            };
-            if (0..self.steps).contains(&step)
-                && (LOWEST..=HIGHEST).contains(&pitch)
-                && len >= 1
-                && step + len <= self.steps
-            {
-                self.notes.push(Note {
-                    step,
-                    pitch,
-                    len,
-                    vel,
-                });
+        if self.pending.is_empty() {
+            self.checkpoint();
+        }
+        let track = self.track;
+        let note = Note::new(position.step, pitch, 1, vel);
+        if let Some(index) = self.song.patterns[position.pattern].add_note(track, note) {
+            self.pending.insert(pitch, (position.pattern, index, abs));
+            self.touched();
+        }
+    }
+
+    fn record_off(&mut self, pitch: i32, when: u64) {
+        let Some((pattern, index, started)) = self.pending.remove(&pitch) else {
+            return;
+        };
+        // Length comes from when the key was actually released, so a held note
+        // records as held.
+        let held = (self.sched.step_of(when) - started).max(1) as i32;
+        let steps = self.song.patterns[pattern].steps;
+        if let Some(note) = self.song.patterns[pattern]
+            .notes
+            .get_mut(self.track)
+            .and_then(|t| t.get_mut(index))
+        {
+            note.len = held.clamp(1, (steps - note.step).max(1));
+            self.dirty = true;
+            self.unsaved = true;
+        }
+    }
+
+    // ---- the file ----
+
+    /// Look for a MIDI file wired to this node, and open it.
+    ///
+    /// Called at startup and then periodically, because a file can be wired to
+    /// a node that is already running — noticing it is the same courtesy the
+    /// canvas extends everywhere else. A file that turns up while there is
+    /// unsaved work here is adopted as the place to save *to* rather than read
+    /// from: nobody wants their bar replaced by a wire.
+    fn open_file(&mut self) {
+        let Some(mut file) = song_file::find() else {
+            return;
+        };
+        let name = file.name();
+        if self.unsaved {
+            self.say(format!("{name} wired — Cmd+S writes to it"));
+            self.file = Some(file);
+            return;
+        }
+        match file.load(self.steps()) {
+            Ok(Some(song)) => {
+                self.song = song;
+                self.sched.set_bpm(self.song.bpm);
+                self.pattern = 0;
+                self.track = 0;
+                self.song_mode = !self.song.chain.is_empty();
+                self.selected = None;
+                self.focus_on_the_music();
+                self.say(format!("opened {name}"));
+                self.dirty = true;
+                self.unsaved = false;
+            }
+            // An empty file is a place to save to, not a failure.
+            Ok(None) => self.say(format!("{name} is empty — Cmd+S writes to it")),
+            Err(e) => self.say(format!("{name}: {e}")),
+        }
+        self.file = Some(file);
+    }
+
+    /// Write the song to the wired file.
+    fn save_file(&mut self) {
+        let order = self.export_order();
+        let Some(mut file) = self.file.take() else {
+            self.say("no MIDI file wired to this node");
+            return;
+        };
+        let name = file.name();
+        match file.save(&self.song, &order) {
+            Ok(()) => {
+                self.unsaved = false;
+                self.say(format!("saved {name}"));
+            }
+            Err(e) => self.say(format!("{name}: {e}")),
+        }
+        self.file = Some(file);
+    }
+
+    /// Which patterns an export lays end to end: the chain in song mode, or the
+    /// pattern being looped. Exporting what you hear surprises nobody.
+    fn export_order(&self) -> Vec<usize> {
+        if self.song_mode && !self.song.chain.is_empty() {
+            self.song.chain.clone()
+        } else {
+            vec![self.pattern]
+        }
+    }
+
+    /// Pick the file up again if it changed under us — but only when there is
+    /// nothing here that would be lost by doing so.
+    fn reload_if_changed(&mut self) {
+        if self.unsaved || self.transport != Transport::Stopped {
+            return;
+        }
+        let Some(file) = &self.file else { return };
+        if !file.changed_on_disk() {
+            return;
+        }
+        let mut file = self.file.take().expect("just checked");
+        let name = file.name();
+        if let Ok(Some(song)) = file.load(self.steps()) {
+            self.song = song;
+            self.sched.set_bpm(self.song.bpm);
+            self.after_replace();
+            self.unsaved = false;
+            self.say(format!("reloaded {name}"));
+        }
+        self.file = Some(file);
+    }
+
+    /// Scroll the pitch window to the track being edited, if none of its notes
+    /// are on screen.
+    ///
+    /// Selecting a part and finding an empty grid — because the bass is two
+    /// octaves below what the window happens to show — reads as "this track is
+    /// empty", which is the wrong answer to a question nobody asked.
+    fn focus_on_the_music(&mut self) {
+        let mut pitches: Vec<i32> = self
+            .song
+            .patterns
+            .iter()
+            .flat_map(|p| p.track(self.track))
+            .map(|n| n.pitch)
+            .collect();
+        if pitches.is_empty() {
+            // Nothing on this track: fall back to wherever the song sits, so a
+            // fresh track opens in the same register as the rest of it.
+            pitches = self
+                .song
+                .patterns
+                .iter()
+                .flat_map(|p| p.notes.iter().flatten())
+                .map(|n| n.pitch)
+                .collect();
+        }
+        let (Some(&low), Some(&high)) = (pitches.iter().min(), pitches.iter().max()) else {
+            return;
+        };
+        // Only leave the view alone when the whole part is already on screen.
+        // "One note visible" is not good enough: a bass with its top note in
+        // range and the rest below it looks like an almost-empty track.
+        if low >= self.low && high < self.low + ROWS {
+            return;
+        }
+        // Centre the part's range in the window as best it fits.
+        let middle = (low + high) / 2;
+        self.low = (middle - ROWS / 2).clamp(LOWEST, HIGHEST - ROWS + 1);
+    }
+
+    // ---- settings ----
+
+    fn set_bpm(&mut self, bpm: f32) {
+        let bpm = bpm.clamp(MIN_BPM, MAX_BPM);
+        if (bpm - self.song.bpm).abs() < 0.005 {
+            return;
+        }
+        self.song.set_bpm(bpm);
+        self.sched.set_bpm(bpm);
+        self.touched();
+    }
+
+    fn set_steps(&mut self, steps: i32) {
+        let steps = steps.clamp(MIN_STEPS, MAX_STEPS);
+        let pattern = self.pattern;
+        if self.song.patterns[pattern].steps != steps {
+            self.song.patterns[pattern].steps = steps;
+            self.touched();
+        }
+    }
+
+    fn set_channel(&mut self, channel: i32) {
+        let channel = channel.clamp(0, 15) as u8;
+        if self.song.tracks[self.track].channel != channel {
+            self.song.tracks[self.track].channel = channel;
+            self.touched();
+        }
+    }
+
+    /// Select a pattern, creating it if the slot is the next empty one.
+    fn select_pattern(&mut self, index: usize) {
+        if index < self.song.patterns.len() {
+            self.pattern = index;
+            self.selected = None;
+        } else if index == self.song.patterns.len() && index < MAX_PATTERNS {
+            self.checkpoint();
+            if let Some(new) = self.song.add_pattern(self.pattern) {
+                self.pattern = new;
+                self.selected = None;
+                self.touched();
             }
         }
-        // Show the octave the pattern is actually in.
-        if let Some(min) = self.notes.iter().map(|n| n.pitch).min() {
-            self.low = (min - 2).clamp(LOWEST, HIGHEST - ROWS + 1);
+    }
+
+    fn append_to_chain(&mut self, index: usize) {
+        if index >= self.song.patterns.len() || self.song.chain.len() >= MAX_CHAIN {
+            return;
         }
+        self.checkpoint();
+        self.song.chain.push(index);
+        self.touched();
+        self.say(format!("pattern {} added to the song", index + 1));
     }
 
-    /// Settings and pattern, flattened for the host to persist.
-    fn options(&self) -> Vec<f32> {
-        let mut v = vec![SAVE_TAG, SAVE_VERSION, self.bpm, self.steps as f32];
-        for n in &self.notes {
-            v.extend_from_slice(&[n.step as f32, n.pitch as f32, n.len as f32, n.vel as f32]);
+    fn remove_from_chain(&mut self, at: usize) {
+        if at >= self.song.chain.len() {
+            return;
         }
-        v
-    }
-}
-
-// ---- pixel drawing ----
-
-fn put(buf: &mut [u8], w: u32, h: u32, x: i32, y: i32, c: [u8; 3]) {
-    if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
-        return;
-    }
-    let i = ((y as u32 * w + x as u32) * 4) as usize;
-    buf[i] = c[0];
-    buf[i + 1] = c[1];
-    buf[i + 2] = c[2];
-    buf[i + 3] = 255;
-}
-
-fn fill_rect(buf: &mut [u8], w: u32, h: u32, x0: i32, y0: i32, x1: i32, y1: i32, c: [u8; 3]) {
-    for y in y0..y1 {
-        for x in x0..x1 {
-            put(buf, w, h, x, y, c);
+        self.checkpoint();
+        self.song.chain.remove(at);
+        if self.song.chain.is_empty() {
+            self.song_mode = false;
         }
+        self.touched();
     }
 }
 
-/// A 1px outline of the box `x0,y0..x1,y1`.
-fn stroke_rect(buf: &mut [u8], w: u32, h: u32, x0: i32, y0: i32, x1: i32, y1: i32, c: [u8; 3]) {
-    for x in x0..x1 {
-        put(buf, w, h, x, y0, c);
-        put(buf, w, h, x, y1 - 1, c);
-    }
-    for y in y0..y1 {
-        put(buf, w, h, x0, y, c);
-        put(buf, w, h, x1 - 1, y, c);
-    }
-}
+// ---- the window ----
 
-fn disc(buf: &mut [u8], w: u32, h: u32, cx: i32, cy: i32, r: i32, c: [u8; 3]) {
-    for dy in -r..=r {
-        for dx in -r..=r {
-            if dx * dx + dy * dy <= r * r {
-                put(buf, w, h, cx + dx, cy + dy, c);
-            }
-        }
-    }
-}
-
-/// A right-pointing "play" triangle filling the box `x0,y0..x1,y1`.
-fn play_icon(buf: &mut [u8], w: u32, h: u32, x0: i32, y0: i32, x1: i32, y1: i32, c: [u8; 3]) {
-    let bw = (x1 - x0) as f32;
-    let bh = (y1 - y0) as f32;
-    for y in y0..y1 {
-        // Distance from the vertical centre folds the triangle to a point.
-        let t = ((y - y0) as f32 / bh - 0.5).abs() * 2.0;
-        let right = x0 as f32 + bw * (1.0 - t);
-        for x in x0..(right as i32) {
-            put(buf, w, h, x, y, c);
-        }
-    }
-}
-
-/// Scale a colour by `f`, so a note's velocity reads as its brightness.
-fn dim(c: [u8; 3], f: f32) -> [u8; 3] {
-    let f = f.clamp(0.0, 1.0);
-    [
-        (c[0] as f32 * f) as u8,
-        (c[1] as f32 * f) as u8,
-        (c[2] as f32 * f) as u8,
-    ]
-}
-
-// ---- geometry ----
-
-/// Where everything sits for the current surface size. Input and painting both
-/// read this, so a click always lands on what was drawn.
-struct Layout {
-    /// The piano roll, right of the key gutter and below the ruler.
-    gx0: f32,
-    gy0: f32,
-    gw: f32,
-    gh: f32,
-    cell_w: f32,
-    cell_h: f32,
-    /// The velocity lane along the bottom.
-    vel_y0: f32,
-    vel_y1: f32,
-    /// Transport-bar hit boxes.
-    play_x: f32,
-    rec_x: f32,
-    bpm_x: f32,
-    len_x: f32,
-    field_w: f32,
-}
-
-const FIELD_W: f32 = 62.0;
-
-fn layout(w: u32, h: u32, steps: i32) -> Layout {
-    let (wf, hf) = (w as f32, h as f32);
-    let vel_y1 = hf - PAD;
-    let vel_y0 = (vel_y1 - VEL_H).max(CTRL_H + RULER_H + 20.0);
-    let gy0 = CTRL_H + RULER_H;
-    let gx0 = GUTTER_W;
-    let gw = (wf - GUTTER_W - PAD).max(1.0);
-    let gh = (vel_y0 - gy0 - 4.0).max(1.0);
-    let play_x = PAD;
-    let rec_x = play_x + BTN_W + BTN_GAP;
-    let bpm_x = rec_x + BTN_W + BTN_GAP * 2.0;
-    let len_x = bpm_x + FIELD_W + BTN_GAP;
-    Layout {
-        gx0,
-        gy0,
-        gw,
-        gh,
-        cell_w: gw / steps as f32,
-        cell_h: gh / ROWS as f32,
-        vel_y0,
-        vel_y1,
-        play_x,
-        rec_x,
-        bpm_x,
-        len_x,
-        field_w: FIELD_W,
-    }
-}
-
-impl Layout {
-    /// The step column a pixel x falls in. May be outside the pattern.
-    fn to_step(&self, px: f32) -> i32 {
-        ((px - self.gx0) / self.cell_w).floor() as i32
-    }
-
-    /// The pitch a pixel y falls on, given the lowest row on screen.
-    fn to_pitch(&self, py: f32, low: i32) -> i32 {
-        let row = ((py - self.gy0) / self.cell_h).floor() as i32;
-        low + (ROWS - 1 - row)
-    }
-
-    fn in_box(&self, px: f32, py: f32, x0: f32, wide: f32) -> bool {
-        px >= x0 && px < x0 + wide && py >= BTN_Y && py < BTN_Y + BTN_H
-    }
-}
+use bindings::wasi::frame_buffer::frame_buffer::Buffer;
+use paint::{BTN_W, CTRL_H, FIELD_W, Layout, TRACK_H, layout};
 
 struct Component;
 
 impl Guest for Component {
     fn run() {
         let surface = Surface::new(CreateDesc {
-            width: Some(720),
-            height: Some(420),
+            width: Some(820),
+            height: Some(560),
         });
         let ctx = GfxContext::new();
         surface.connect_graphics_context(&ctx);
@@ -667,470 +557,356 @@ impl Guest for Component {
         device.connect_graphics_context(&ctx);
         let frame = surface.subscribe_frame();
 
-        let mut seq = Seq::new();
-        seq.load(&bindings::wk::options::options::load());
+        let mut app = App::new();
+        app.song = Song::from_options(&bindings::wk::options::options::load());
+        app.sched = Scheduler::new(app.song.bpm);
+        app.song_mode = !app.song.chain.is_empty();
+        app.focus_on_the_music();
+        // A wired MIDI file is the document, so it wins over the saved options.
+        app.open_file();
+
         let mut drag = Drag::None;
+        // Checking the file's timestamp every frame would be wasteful; twice a
+        // second is faster than anyone can switch windows.
+        let mut until_file_check = 0u32;
 
         loop {
             frame.block();
             let _ = surface.get_frame();
             let w = surface.width().max(1);
             let h = surface.height().max(1);
-            let lay = layout(w, h, seq.steps);
-            let t = now();
+            let lay = layout(w, h, app.steps());
+            let clock = now();
 
-            // ---- pointer ----
-            while let Some(ev) = surface.get_pointer_down() {
-                let (px, py) = (ev.x as f32, ev.y as f32);
-                if py < CTRL_H {
-                    if lay.in_box(px, py, lay.play_x, BTN_W) {
-                        seq.start(Transport::Playing, t);
-                    } else if lay.in_box(px, py, lay.rec_x, BTN_W) {
-                        seq.start(Transport::Recording, t);
-                    } else if lay.in_box(px, py, lay.bpm_x, lay.field_w) {
-                        drag = Drag::Tempo {
-                            start_y: py,
-                            start: seq.bpm,
-                        };
-                    } else if lay.in_box(px, py, lay.len_x, lay.field_w) {
-                        drag = Drag::Length {
-                            start_y: py,
-                            start: seq.steps as f32,
-                        };
-                    }
-                    continue;
+            // Keys first: a shift held down this frame has to be known before
+            // the click that it modifies is read.
+            keyboard(&mut app, &surface, &mut drag, clock);
+            pointer(&mut app, &surface, &lay, &mut drag, clock);
+
+            // Incoming MIDI (record capture and thru), then queue the music
+            // falling inside the look-ahead window.
+            app.pump_input();
+            app.pump(clock);
+
+            if until_file_check == 0 {
+                if app.file.is_none() {
+                    // A file may be wired to the node after it starts, and the
+                    // node it is wired to should open it.
+                    app.open_file();
+                } else {
+                    app.reload_if_changed();
                 }
-                if py >= lay.vel_y0 {
-                    // The velocity lane: drag across it to shape the pattern's
-                    // dynamics, the way a piano roll has done for thirty years.
-                    seq.checkpoint();
-                    paint_velocity(&mut seq, &lay, px, py);
-                    drag = Drag::Velocity;
-                    continue;
-                }
-                if px < lay.gx0 {
-                    continue; // the key gutter is a label, not a control
-                }
-                let step = lay.to_step(px);
-                let pitch = lay.to_pitch(py, seq.low);
-                if !(0..seq.steps).contains(&step) || !(LOWEST..=HIGHEST).contains(&pitch) {
-                    continue;
-                }
-                match seq.note_at(step, pitch) {
-                    Some(idx) => {
-                        seq.selected = Some(idx);
-                        seq.checkpoint();
-                        let n = seq.notes[idx];
-                        let right_px = lay.gx0 + (n.step + n.len) as f32 * lay.cell_w;
-                        drag = if px >= right_px - RESIZE_PX {
-                            Drag::Resize { idx }
-                        } else {
-                            Drag::Move {
-                                idx,
-                                doff: n.step - step,
-                                poff: n.pitch - pitch,
-                            }
-                        };
-                    }
-                    None => {
-                        // Empty space: draw a new one-step note and grab its
-                        // edge, so a horizontal drag sets its length.
-                        seq.checkpoint();
-                        let idx = seq.add_note(step, pitch, 1, DEFAULT_VEL);
-                        seq.selected = Some(idx);
-                        drag = Drag::Resize { idx };
-                    }
+                until_file_check = 30;
+            }
+            until_file_check -= 1;
+
+            if app.dirty {
+                bindings::wk::options::options::store(&app.song.to_options());
+                app.dirty = false;
+            }
+            if app.status_left > 0 {
+                app.status_left -= 1;
+                if app.status_left == 0 {
+                    app.status.clear();
                 }
             }
 
-            while let Some(ev) = surface.get_pointer_move() {
-                let (px, py) = (ev.x as f32, ev.y as f32);
-                match drag {
-                    Drag::Move { idx, doff, poff } if idx < seq.notes.len() => {
-                        let len = seq.notes[idx].len;
-                        let step = (lay.to_step(px) + doff).clamp(0, (seq.steps - len).max(0));
-                        let pitch = (lay.to_pitch(py, seq.low) + poff).clamp(LOWEST, HIGHEST);
-                        let n = &mut seq.notes[idx];
-                        if n.step != step || n.pitch != pitch {
-                            n.step = step;
-                            n.pitch = pitch;
-                            seq.dirty = true;
-                        }
-                    }
-                    Drag::Resize { idx } if idx < seq.notes.len() => {
-                        let start = seq.notes[idx].step;
-                        let len = (lay.to_step(px) - start + 1).clamp(1, seq.steps - start);
-                        let n = &mut seq.notes[idx];
-                        if n.len != len {
-                            n.len = len;
-                            seq.dirty = true;
-                        }
-                    }
-                    Drag::Velocity => paint_velocity(&mut seq, &lay, px, py),
-                    Drag::Tempo { start_y, start } => {
-                        seq.set_bpm(start + (start_y - py) / DRAG_SPAN * (MAX_BPM - MIN_BPM));
-                    }
-                    Drag::Length { start_y, start } => {
-                        let span = (MAX_STEPS - MIN_STEPS) as f32;
-                        seq.set_steps((start + (start_y - py) / DRAG_SPAN * span).round() as i32);
-                    }
-                    _ => {}
-                }
-            }
-
-            while surface.get_pointer_up().is_some() {
-                drag = Drag::None;
-            }
-
-            // ---- keyboard ----
-            while let Some(ev) = surface.get_key_down() {
-                let cmd = ev.meta_key || ev.ctrl_key;
-                match ev.key {
-                    Some(Key::Space) => seq.start(Transport::Playing, t),
-                    Some(Key::KeyR) => seq.start(Transport::Recording, t),
-                    Some(Key::KeyZ) if cmd && ev.shift_key => seq.redo(),
-                    Some(Key::KeyZ) if cmd => seq.undo(),
-                    Some(Key::Backspace) | Some(Key::Delete) => {
-                        seq.delete_selected();
-                        drag = Drag::None;
-                    }
-                    // Scroll the pitch window an octave at a time.
-                    Some(Key::ArrowUp) => seq.low = (seq.low + 12).min(HIGHEST - ROWS + 1),
-                    Some(Key::ArrowDown) => seq.low = (seq.low - 12).max(LOWEST),
-                    // Nudge the selected note along the bar.
-                    Some(Key::ArrowLeft) | Some(Key::ArrowRight) => {
-                        let delta = if ev.key == Some(Key::ArrowLeft) {
-                            -1
-                        } else {
-                            1
-                        };
-                        if let Some(i) = seq.selected.filter(|&i| i < seq.notes.len()) {
-                            seq.checkpoint();
-                            let len = seq.notes[i].len;
-                            let n = &mut seq.notes[i];
-                            n.step = (n.step + delta).clamp(0, (seq.steps - len).max(0));
-                            seq.dirty = true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            while surface.get_key_up().is_some() {}
-
-            // Incoming MIDI (record capture + thru), then queue the music that
-            // falls inside the look-ahead window.
-            seq.pump_input();
-            seq.pump(t);
-
-            if seq.dirty {
-                bindings::wk::options::options::store(&seq.options());
-                seq.dirty = false;
-            }
-
-            paint(&surface, &ctx, &seq, &lay, t);
+            let at = paint::playing_at(&app, clock);
+            let pixels = paint::paint(&app, &lay, w, h, at);
+            Buffer::from_graphics_buffer(ctx.get_current_buffer()).set(&pixels);
+            ctx.present();
         }
+    }
+}
+
+fn pointer(app: &mut App, surface: &Surface, lay: &Layout, drag: &mut Drag, clock: u64) {
+    while let Some(ev) = surface.get_pointer_down() {
+        let (px, py) = (ev.x as f32, ev.y as f32);
+        let shift = app.shift;
+
+        if py < CTRL_H {
+            transport_click(app, lay, drag, px, py, clock);
+        } else if py < CTRL_H + TRACK_H {
+            if let Some(index) = lay.to_track(px) {
+                // Shift picks the mute, because muting is the thing you do
+                // *without* wanting to move the edit cursor.
+                if shift {
+                    app.checkpoint();
+                    app.song.tracks[index].muted = !app.song.tracks[index].muted;
+                    app.touched();
+                } else {
+                    app.track = index;
+                    app.selected = None;
+                    app.focus_on_the_music();
+                }
+            }
+        } else if py >= lay.chain_y {
+            if let Some(slot) = lay.to_slot(px, app.song.chain.len()) {
+                app.remove_from_chain(slot);
+            }
+        } else if py >= lay.pat_y {
+            if let Some(index) = lay.to_slot(px, MAX_PATTERNS) {
+                if shift {
+                    app.append_to_chain(index);
+                } else {
+                    app.select_pattern(index);
+                }
+            }
+        } else if py >= lay.vel_y0 {
+            // The velocity lane: drag across it to shape the dynamics, the way
+            // a piano roll has done for thirty years.
+            app.checkpoint();
+            paint_velocity(app, lay, px, py);
+            *drag = Drag::Velocity;
+        } else if px >= lay.gx0 {
+            roll_click(app, lay, drag, px, py);
+        }
+    }
+
+    while let Some(ev) = surface.get_pointer_move() {
+        let (px, py) = (ev.x as f32, ev.y as f32);
+        let (pattern, track) = (app.pattern, app.track);
+        let steps = app.steps();
+        match *drag {
+            Drag::Move { idx, doff, poff } => {
+                let step = (lay.to_step(px) + doff).max(0);
+                let pitch = (lay.to_pitch(py, app.low) + poff).clamp(LOWEST, HIGHEST);
+                if let Some(note) = app.song.patterns[pattern]
+                    .notes
+                    .get_mut(track)
+                    .and_then(|t| t.get_mut(idx))
+                {
+                    let step = step.min((steps - note.len).max(0));
+                    if note.step != step || note.pitch != pitch {
+                        note.step = step;
+                        note.pitch = pitch;
+                        app.touched();
+                    }
+                }
+            }
+            Drag::Resize { idx } => {
+                if let Some(note) = app.song.patterns[pattern]
+                    .notes
+                    .get_mut(track)
+                    .and_then(|t| t.get_mut(idx))
+                {
+                    let len = (lay.to_step(px) - note.step + 1).clamp(1, steps - note.step);
+                    if note.len != len {
+                        note.len = len;
+                        app.touched();
+                    }
+                }
+            }
+            Drag::Velocity => paint_velocity(app, lay, px, py),
+            Drag::Field {
+                which,
+                start_y,
+                start,
+            } => {
+                let travel = (start_y - py) / DRAG_SPAN;
+                match which {
+                    Field::Tempo => app.set_bpm(start + travel * (MAX_BPM - MIN_BPM)),
+                    Field::Length => {
+                        let span = (MAX_STEPS - MIN_STEPS) as f32;
+                        app.set_steps((start + travel * span).round() as i32);
+                    }
+                    Field::Channel => app.set_channel((start + travel * 16.0).round() as i32),
+                }
+            }
+            Drag::None => {}
+        }
+    }
+
+    while surface.get_pointer_up().is_some() {
+        *drag = Drag::None;
+    }
+}
+
+fn transport_click(app: &mut App, lay: &Layout, drag: &mut Drag, px: f32, py: f32, clock: u64) {
+    if lay.in_button(px, py, lay.play_x, BTN_W) {
+        app.start(Transport::Playing, clock);
+    } else if lay.in_button(px, py, lay.rec_x, BTN_W) {
+        app.start(Transport::Recording, clock);
+    } else if lay.in_button(px, py, lay.bpm_x, FIELD_W) {
+        *drag = Drag::Field {
+            which: Field::Tempo,
+            start_y: py,
+            start: app.song.bpm,
+        };
+    } else if lay.in_button(px, py, lay.len_x, FIELD_W) {
+        *drag = Drag::Field {
+            which: Field::Length,
+            start_y: py,
+            start: app.steps() as f32,
+        };
+    } else if lay.in_button(px, py, lay.chan_x, FIELD_W) {
+        *drag = Drag::Field {
+            which: Field::Channel,
+            start_y: py,
+            start: app.song.channel(app.track) as f32,
+        };
+    } else if lay.in_button(px, py, lay.song_x, FIELD_W) {
+        app.song_mode = !app.song_mode;
+        if app.song_mode && app.song.chain.is_empty() {
+            app.song_mode = false;
+            app.say("the song is empty — shift-click a pattern to add it");
+        }
+    }
+}
+
+fn roll_click(app: &mut App, lay: &Layout, drag: &mut Drag, px: f32, py: f32) {
+    let step = lay.to_step(px);
+    let pitch = lay.to_pitch(py, app.low);
+    let steps = app.steps();
+    if !(0..steps).contains(&step) || !(LOWEST..=HIGHEST).contains(&pitch) {
+        return;
+    }
+    let (pattern, track) = (app.pattern, app.track);
+    match app.song.patterns[pattern].note_at(track, step, pitch) {
+        Some(idx) => {
+            app.selected = Some(idx);
+            app.checkpoint();
+            let note = app.song.patterns[pattern].track(track)[idx];
+            let right = lay.gx0 + (note.step + note.len) as f32 * lay.cell_w;
+            *drag = if px >= right - RESIZE_PX {
+                Drag::Resize { idx }
+            } else {
+                Drag::Move {
+                    idx,
+                    doff: note.step - step,
+                    poff: note.pitch - pitch,
+                }
+            };
+        }
+        None => {
+            // Empty space: draw a one-step note and grab its edge, so a
+            // horizontal drag sets its length.
+            app.checkpoint();
+            let note = Note::new(step, pitch, 1, DEFAULT_VEL);
+            if let Some(idx) = app.song.patterns[pattern].add_note(track, note) {
+                app.selected = Some(idx);
+                *drag = Drag::Resize { idx };
+                app.touched();
+            }
+        }
+    }
+}
+
+fn keyboard(app: &mut App, surface: &Surface, drag: &mut Drag, clock: u64) {
+    // The wheel scrolls the pitch window, a semitone at a time.
+    while let Some(ev) = surface.get_pointer_scroll() {
+        if ev.delta_y != 0.0 {
+            let delta = if ev.delta_y > 0.0 { 1 } else { -1 };
+            app.low = (app.low + delta).clamp(LOWEST, HIGHEST - ROWS + 1);
+        }
+    }
+    while let Some(ev) = surface.get_key_down() {
+        let cmd = ev.meta_key || ev.ctrl_key;
+        app.shift = ev.shift_key;
+        match ev.key {
+            Some(Key::Space) => app.start(Transport::Playing, clock),
+            Some(Key::KeyR) if !cmd => app.start(Transport::Recording, clock),
+            Some(Key::KeyS) if cmd => app.save_file(),
+            Some(Key::KeyZ) if cmd && ev.shift_key => app.redo(),
+            Some(Key::KeyZ) if cmd => app.undo(),
+            Some(Key::KeyD) if cmd => {
+                // Duplicate the bar: how a variation gets made.
+                app.checkpoint();
+                if let Some(new) = app.song.clone_pattern(app.pattern) {
+                    app.pattern = new;
+                    app.selected = None;
+                    app.touched();
+                    app.say(format!("pattern {} duplicated", new + 1));
+                }
+            }
+            Some(Key::Backspace) | Some(Key::Delete) => {
+                app.delete_selected();
+                *drag = Drag::None;
+            }
+            // Scroll the pitch window an octave at a time.
+            Some(Key::ArrowUp) => app.low = (app.low + 12).min(HIGHEST - ROWS + 1),
+            Some(Key::ArrowDown) => app.low = (app.low - 12).max(LOWEST),
+            Some(Key::ArrowLeft) | Some(Key::ArrowRight) => {
+                let delta = if ev.key == Some(Key::ArrowLeft) {
+                    -1
+                } else {
+                    1
+                };
+                nudge_selected(app, delta);
+            }
+            // Number keys pick a track, the way a groovebox does.
+            Some(key) => {
+                if let Some(index) = track_key(key) {
+                    app.track = index;
+                    app.selected = None;
+                    app.focus_on_the_music();
+                }
+            }
+            None => {}
+        }
+    }
+    while let Some(ev) = surface.get_key_up() {
+        app.shift = ev.shift_key;
+    }
+}
+
+/// The track a number key selects.
+fn track_key(key: Key) -> Option<usize> {
+    Some(match key {
+        Key::Digit1 => 0,
+        Key::Digit2 => 1,
+        Key::Digit3 => 2,
+        Key::Digit4 => 3,
+        Key::Digit5 => 4,
+        Key::Digit6 => 5,
+        Key::Digit7 => 6,
+        Key::Digit8 => 7,
+        _ => return None,
+    })
+}
+
+fn nudge_selected(app: &mut App, delta: i32) {
+    let Some(index) = app.selected.filter(|_| true) else {
+        return;
+    };
+    let (pattern, track) = (app.pattern, app.track);
+    let steps = app.steps();
+    app.checkpoint();
+    if let Some(note) = app.song.patterns[pattern]
+        .notes
+        .get_mut(track)
+        .and_then(|t| t.get_mut(index))
+    {
+        note.step = (note.step + delta).clamp(0, (steps - note.len).max(0));
+        app.touched();
+    } else {
+        app.undo.pop(); // nothing changed, so do not leave an empty undo step
     }
 }
 
 /// Set the velocity of the notes starting in the column under the cursor, from
 /// how high in the lane it is.
-fn paint_velocity(seq: &mut Seq, lay: &Layout, px: f32, py: f32) {
+fn paint_velocity(app: &mut App, lay: &Layout, px: f32, py: f32) {
     let step = lay.to_step(px);
-    if !(0..seq.steps).contains(&step) {
+    let steps = app.steps();
+    if !(0..steps).contains(&step) {
         return;
     }
     let f = ((lay.vel_y1 - py) / (lay.vel_y1 - lay.vel_y0)).clamp(0.0, 1.0);
     let vel = (f * 126.0) as u8 + 1;
-    for n in seq.notes.iter_mut().filter(|n| n.step == step) {
-        if n.vel != vel {
-            n.vel = vel;
-            seq.dirty = true;
+    let (pattern, track) = (app.pattern, app.track);
+    let mut changed = false;
+    if let Some(notes) = app.song.patterns[pattern].notes.get_mut(track) {
+        for note in notes.iter_mut().filter(|n| n.step == step) {
+            if note.vel != vel {
+                note.vel = vel;
+                changed = true;
+            }
         }
     }
-}
-
-/// Paint a frame.
-fn paint(surface: &Surface, ctx: &GfxContext, seq: &Seq, lay: &Layout, t: u64) {
-    let w = surface.width().max(1);
-    let h = surface.height().max(1);
-    let buffer = Buffer::from_graphics_buffer(ctx.get_current_buffer());
-    let mut px = vec![0u8; (w * h * 4) as usize];
-    for p in px.chunks_exact_mut(4) {
-        p.copy_from_slice(&[20, 20, 26, 255]);
+    if changed {
+        app.touched();
     }
-
-    let running = seq.transport != Transport::Stopped;
-    let playhead = seq.playhead(t);
-    let (gx0, gy0, gw, gh) = (lay.gx0, lay.gy0, lay.gw, lay.gh);
-
-    // Row backgrounds, tinted by black/white key.
-    for row in 0..ROWS {
-        let pitch = seq.low + (ROWS - 1 - row);
-        let y0 = (gy0 + row as f32 * lay.cell_h) as i32;
-        let y1 = (gy0 + (row + 1) as f32 * lay.cell_h) as i32;
-        let c = if is_black(pitch) {
-            [30, 30, 40]
-        } else {
-            [44, 44, 56]
-        };
-        fill_rect(&mut px, w, h, gx0 as i32, y0, (gx0 + gw) as i32, y1, c);
-
-        // The key gutter: a piano keyboard turned on its side, named so you can
-        // see which octave you are looking at.
-        let key = if is_black(pitch) {
-            [26, 26, 32]
-        } else {
-            [200, 200, 210]
-        };
-        fill_rect(&mut px, w, h, 0, y0, gx0 as i32 - 1, y1, key);
-        if lay.cell_h >= 9.0 {
-            let label = note_name(pitch);
-            let col = if is_black(pitch) {
-                [170, 170, 180]
-            } else {
-                [40, 40, 48]
-            };
-            text(&mut px, w, h, 2, y0 + 1, &label, 1, col);
-        }
-    }
-
-    // Playhead column highlight.
-    if running {
-        let x0 = (gx0 + playhead as f32 * lay.cell_w) as i32;
-        let x1 = (gx0 + (playhead + 1) as f32 * lay.cell_w) as i32;
-        fill_rect(
-            &mut px,
-            w,
-            h,
-            x0,
-            gy0 as i32,
-            x1,
-            (gy0 + gh) as i32,
-            [56, 58, 70],
-        );
-    }
-
-    // Beat dividers, and the ruler that numbers the beats.
-    fill_rect(
-        &mut px,
-        w,
-        h,
-        0,
-        CTRL_H as i32,
-        w as i32,
-        (CTRL_H + RULER_H) as i32,
-        [26, 26, 34],
-    );
-    for step in (0..=seq.steps).step_by(4) {
-        let x = (gx0 + step as f32 * lay.cell_w) as i32;
-        fill_rect(
-            &mut px,
-            w,
-            h,
-            x,
-            gy0 as i32,
-            x + 1,
-            (gy0 + gh) as i32,
-            [70, 70, 84],
-        );
-        if step < seq.steps {
-            // Beats numbered from one, the way a musician counts them.
-            let label = format!("{}", step / 4 + 1);
-            text(
-                &mut px,
-                w,
-                h,
-                x + 2,
-                CTRL_H as i32 + 3,
-                &label,
-                1,
-                [130, 130, 150],
-            );
-        }
-    }
-
-    // Notes. Brightness carries velocity, so the dynamics are visible in the
-    // roll and not only in the lane below it.
-    for (i, n) in seq.notes.iter().enumerate() {
-        let row = ROWS - 1 - (n.pitch - seq.low);
-        if !(0..ROWS).contains(&row) || n.step >= seq.steps {
-            continue;
-        }
-        let end = (n.step + n.len).min(seq.steps);
-        let x0 = (gx0 + n.step as f32 * lay.cell_w) as i32 + 1;
-        let x1 = (gx0 + end as f32 * lay.cell_w) as i32 - 1;
-        let y0 = (gy0 + row as f32 * lay.cell_h) as i32 + 1;
-        let y1 = (gy0 + (row + 1) as f32 * lay.cell_h) as i32 - 1;
-        let base = if running && n.covers(playhead, seq.steps) {
-            [160, 255, 200]
-        } else {
-            [90, 200, 250]
-        };
-        // Never fully dark: a quiet note still has to be visible to be edited.
-        let shade = dim(base, 0.4 + 0.6 * (n.vel as f32 / 127.0));
-        fill_rect(&mut px, w, h, x0, y0, x1, y1, shade);
-        if seq.selected == Some(i) {
-            stroke_rect(
-                &mut px,
-                w,
-                h,
-                x0 - 1,
-                y0 - 1,
-                x1 + 1,
-                y1 + 1,
-                [240, 245, 255],
-            );
-        }
-    }
-
-    // Playhead line on top.
-    if running {
-        let x = (gx0 + playhead as f32 * lay.cell_w) as i32;
-        fill_rect(
-            &mut px,
-            w,
-            h,
-            x,
-            gy0 as i32,
-            x + 2,
-            (gy0 + gh) as i32,
-            [230, 235, 120],
-        );
-    }
-
-    // ---- velocity lane ----
-    fill_rect(
-        &mut px,
-        w,
-        h,
-        0,
-        lay.vel_y0 as i32,
-        w as i32,
-        lay.vel_y1 as i32,
-        [26, 26, 34],
-    );
-    text(
-        &mut px,
-        w,
-        h,
-        3,
-        lay.vel_y0 as i32 + 2,
-        "VEL",
-        1,
-        [110, 110, 130],
-    );
-    let lane_h = lay.vel_y1 - lay.vel_y0;
-    for n in seq.notes.iter().filter(|n| n.step < seq.steps) {
-        let x0 = (gx0 + n.step as f32 * lay.cell_w) as i32 + 1;
-        let x1 = (gx0 + (n.step + 1) as f32 * lay.cell_w) as i32 - 1;
-        let bar = lane_h * (n.vel as f32 / 127.0);
-        let y0 = (lay.vel_y1 - bar) as i32;
-        fill_rect(
-            &mut px,
-            w,
-            h,
-            x0,
-            y0,
-            x1.max(x0 + 1),
-            lay.vel_y1 as i32,
-            [90, 160, 210],
-        );
-    }
-
-    // ---- transport bar ----
-    fill_rect(&mut px, w, h, 0, 0, w as i32, CTRL_H as i32, [30, 30, 38]);
-
-    let playing = seq.transport == Transport::Playing;
-    fill_rect(
-        &mut px,
-        w,
-        h,
-        lay.play_x as i32,
-        BTN_Y as i32,
-        (lay.play_x + BTN_W) as i32,
-        (BTN_Y + BTN_H) as i32,
-        [46, 48, 58],
-    );
-    play_icon(
-        &mut px,
-        w,
-        h,
-        (lay.play_x + 9.0) as i32,
-        (BTN_Y + 4.0) as i32,
-        (lay.play_x + BTN_W - 7.0) as i32,
-        (BTN_Y + BTN_H - 4.0) as i32,
-        if playing {
-            [110, 240, 150]
-        } else {
-            [80, 150, 100]
-        },
-    );
-
-    let recording = seq.transport == Transport::Recording;
-    fill_rect(
-        &mut px,
-        w,
-        h,
-        lay.rec_x as i32,
-        BTN_Y as i32,
-        (lay.rec_x + BTN_W) as i32,
-        (BTN_Y + BTN_H) as i32,
-        [46, 48, 58],
-    );
-    disc(
-        &mut px,
-        w,
-        h,
-        (lay.rec_x + BTN_W / 2.0) as i32,
-        (BTN_Y + BTN_H / 2.0) as i32,
-        (BTN_H / 2.0 - 4.0) as i32,
-        if recording {
-            [255, 90, 90]
-        } else {
-            [150, 70, 70]
-        },
-    );
-
-    // Tempo and pattern length, each a field you drag vertically to set.
-    for (x, label, value) in [
-        (lay.bpm_x, "BPM", format!("{}", seq.bpm.round() as i32)),
-        (lay.len_x, "LEN", format!("{}", seq.steps)),
-    ] {
-        fill_rect(
-            &mut px,
-            w,
-            h,
-            x as i32,
-            BTN_Y as i32,
-            (x + lay.field_w) as i32,
-            (BTN_Y + BTN_H) as i32,
-            [46, 48, 58],
-        );
-        text(
-            &mut px,
-            w,
-            h,
-            x as i32 + 4,
-            BTN_Y as i32 + 7,
-            label,
-            1,
-            [120, 122, 140],
-        );
-        let vw = text_width(&value, 2);
-        text(
-            &mut px,
-            w,
-            h,
-            (x + lay.field_w) as i32 - 4 - vw,
-            BTN_Y as i32 + 3,
-            &value,
-            2,
-            [225, 230, 245],
-        );
-    }
-
-    buffer.set(&px);
-    ctx.present();
 }
 
 bindings::export!(Component with_types_in bindings);

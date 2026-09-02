@@ -1,65 +1,76 @@
 // vim: set filetype=kdl :
-// Hardware MIDI into a step sequencer. A physical keyboard drives the on-screen
-// piano (which lights the notes and passes them through); the piano feeds a
-// sequencer that can record what you play and loop it back; the sequencer drives
-// a synth.
+// A multi-track step sequencer driving two synths, with a hardware keyboard
+// playing into it and a Standard MIDI File as the document.
+//
+// riff.mid is wired to the sequencer, so it opens on launch: two bars, a bass
+// part on MIDI channel 1 and a lead on channel 2, chained into a four-bar song.
+// Each synth's CHAN knob picks the channel it answers, which is what makes the
+// parts separate instruments rather than one pile of notes. Cmd+S writes the
+// song back to the file, and any other music program will open it.
 //
 // The `midiin` node opens the first connected MIDI input device (`wk midi
 // devices` lists the inputs and outputs; set a name with the node's device
 // field to pick one). `wk create midiout` adds the other direction: wire the
-// sequencer to it and it plays an external synth instead of, or alongside, the
-// software one.
+// sequencer to it and it plays external gear too.
 //
 // Every MIDI message carries the instant it belongs to, on a clock all nodes
-// share. The sequencer schedules each note slightly ahead of the beat and the
-// synth places it on its audio clock, so the tempo is the tempo rather than the
-// frame rate rounded off. The sequencer is also the clock master: it sends MIDI
-// clock, start and stop, so external gear can lock to it.
+// share, so the tempo is the tempo rather than the frame rate rounded off. The
+// sequencer is the clock master: it sends MIDI clock, start and stop.
 //
-// Play the keyboard to hear it live. Hit Record (or R) and play — notes land
-// where you played them, at the velocity you played them, with the length you
-// held them. Hit Play (or Space) to loop.
+// Playing:  Space plays, R records. Record and play the keyboard — notes land
+// where you played them, at the velocity you played them, for as long as you
+// held them, on the selected track.
 //
-// On the roll: click empty space to draw a note, drag it to move, drag its right
-// edge to resize, Backspace to delete, arrow left/right to nudge, Cmd+Z to undo.
-// Drag the BPM and LEN fields up and down to set the tempo and the pattern
-// length. Drag in the velocity lane along the bottom to shape the dynamics.
-// Arrow up/down scrolls the keyboard an octave at a time.
+// Editing:  click empty space to draw a note, drag to move, drag the right edge
+// to resize, Backspace to delete, arrow left/right to nudge, Cmd+Z to undo.
+// Drag the BPM, LEN and CH fields up and down. Drag the lane at the bottom to
+// shape velocities. The wheel scrolls the keyboard.
+//
+// Arranging:  the TRK row picks the part being edited (or press 1-8);
+// shift-click a track to mute it. The PAT row picks the bar, and + adds one;
+// Cmd+D duplicates the bar you are on. Shift-click a bar to append it to the
+// song, click it in the SNG row to take it out, and SONG plays the chain
+// instead of the one bar.
 //
 // From the repo root:  wk run example/midi.wk
 import "../workspace.wk"
 workspace "01KZKMAB00000000000000WS01" {
     node "piano" "01KZKMAE00000000000000PN04" {
-        pos 444.58355712890625 47.561798095703125
+        pos 470.0 40.0
         size 560.0 220.0
     }
+    // The bass: answers MIDI channel 1 (the sequencer's track 1).
     node "synth" "01KZKMAF00000000000000SY05" {
-        pos 1029.6160888671875 289.2599182128906
+        pos 1090.0 300.0
         size 360.0 260.0
-        options 0.30000001192092896 2.0 0.0 1800.0 3.0 0.019999999552965164 0.3499999940395355
+        options 0.3 2.0 -12.0 900.0 6.0 0.01 0.28 1.0
+    }
+    // The lead: answers MIDI channel 2 (track 2).
+    node "synth" "01N5MID100000000000000SY08" {
+        pos 1090.0 590.0
+        size 360.0 260.0
+        options 0.22 1.0 0.0 2600.0 2.0 0.02 0.45 2.0
     }
     node "sequencer" "01KZKMAG00000000000000SQ06" {
-        pos 421.06134033203125 299.4991149902344
-        size 720.0 420.0
-        options -1.0 1.0 112.0 16.0 \
-            0.0 52.0 2.0 112.0 \
-            5.0 64.0 1.0 88.0 \
-            7.0 64.0 1.0 68.0 \
-            8.0 52.0 2.0 100.0 \
-            9.0 67.0 2.0 104.0 \
-            11.0 69.0 2.0 92.0 \
-            14.0 71.0 2.0 120.0
+        pos 420.0 300.0
+        size 820.0 560.0
     }
     note "01KZKMAC00000000000000NT02" {
-        text "Hardware MIDI -> piano -> sequencer -> synth.\n\nMIDI In opens a physical keyboard\n(a built-in host node). The piano\nlights the notes and passes them on.\n\nEvery message carries the instant it\nbelongs to, so the sequencer keeps the\nclock's time and not the frame rate's.\n\nRecord (R) captures what you play,\nvelocity and length included.\nPlay (Space) loops it.\n\nClick to draw, drag to move, drag the\nedge to resize, Backspace to delete,\narrows to nudge, Cmd+Z to undo.\nDrag BPM and LEN to set the tempo and\nthe bar length; drag the lane at the\nbottom to shape the velocities."
+        text "Hardware MIDI -> piano -> sequencer -> two synths.\n\nriff.mid is the document: it opens on\nlaunch and Cmd+S writes it back, so the\nwork leaves as a normal MIDI file.\n\nTRK picks the part (1-8); shift-click\nto mute. CH sets its MIDI channel, and\neach synth's CHAN knob picks the one it\nanswers — that is what keeps the bass\nand the lead separate.\n\nPAT picks the bar, + adds one, Cmd+D\nduplicates. Shift-click a bar to append\nit to SNG; SONG plays the chain.\n\nSpace plays, R records. Recording keeps\nvelocity and note length."
         pos 40.0 40.0
-        size 340.0 400.0
+        size 360.0 520.0
     }
     midiin "" "01KZKMAD00000000000000MD03" {
-        pos 60.0 330.0
+        pos 60.0 600.0
         size 130.0 44.0
     }
+    bindmount "example/riff.mid" "01N5MID100000000000000BM07" {
+        pos 230.0 600.0
+        size 130.0 44.0
+    }
+    connection "01N5MID100000000000000BM07" "01KZKMAG00000000000000SQ06"
     midi "01KZKMAD00000000000000MD03" "01KZKMAE00000000000000PN04"
     midi "01KZKMAE00000000000000PN04" "01KZKMAG00000000000000SQ06"
     midi "01KZKMAG00000000000000SQ06" "01KZKMAF00000000000000SY05"
+    midi "01KZKMAG00000000000000SQ06" "01N5MID100000000000000SY08"
 }

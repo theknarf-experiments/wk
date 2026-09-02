@@ -1,0 +1,9 @@
+[package]
+name = "wk-midifile"
+version = "0.1.0"
+edition = "2021"
+
+# Deliberately dependency-free: this crate is compiled both into the host
+# (where it is tested) and into the sequencer plugin's wasm component, so
+# anything it pulls in has to build for wasm32-wasip1 too.
+[dependencies]

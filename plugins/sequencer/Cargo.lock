@@ -13,6 +13,8 @@ name = "sequencer"
 version = "0.1.0"
 dependencies = [
  "wit-bindgen-rt",
+ "wk-midifile",
+ "wk-sequence",
 ]
 
 [[package]]
@@ -22,4 +24,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "653c85dd7aee6fe6f4bded0d242406deadae9819029ce6f7d258c920c384358a"
 dependencies = [
  "bitflags",
+]
+
+[[package]]
+name = "wk-midifile"
+version = "0.1.0"
+
+[[package]]
+name = "wk-sequence"
+version = "0.1.0"
+dependencies = [
+ "wk-midifile",
 ]

@@ -1655,6 +1655,82 @@ pub fn remove(name: String, path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    /// The MIDI example wires what its comments claim: a file feeding the
+    /// sequencer, and the sequencer feeding two synths on different channels.
+    ///
+    /// The wire keywords are easy to get wrong and a wrong one is *silent* —
+    /// an unrecognised line parses fine and simply does nothing, so the example
+    /// opens looking right and the file never reaches the node. Asserting the
+    /// wires is the only way that gets caught.
+    #[test]
+    fn midi_example_wires_a_file_and_two_synths_to_the_sequencer() {
+        let example = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example/midi.wk"
+        ));
+        let doc = Document::load_resolved(example).expect("midi.wk resolves");
+        let ws = doc
+            .workspaces
+            .iter()
+            .find(|w| !w.nodes.is_empty())
+            .expect("midi workspace");
+
+        let id_of = |dep: &str| -> Vec<NodeId> {
+            ws.nodes
+                .iter()
+                .filter(|n| matches!(&n.kind, SnapKind::App { dep: d, .. } if d == dep))
+                .map(|n| n.id)
+                .collect()
+        };
+        let sequencer = *id_of("sequencer").first().expect("a sequencer node");
+        let synths = id_of("synth");
+        assert_eq!(synths.len(), 2, "two synths, one per part");
+
+        // The MIDI file is bind-mounted into the sequencer, which is how the
+        // node finds a document to open.
+        let file = ws
+            .nodes
+            .iter()
+            .find(|n| matches!(&n.kind, SnapKind::BindMount { path } if path.ends_with("riff.mid")))
+            .expect("riff.mid is wired in");
+        assert!(
+            ws.connections.contains(&(file.id, sequencer)),
+            "the file mounts into the sequencer"
+        );
+        assert!(
+            Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../example/riff.mid"
+            ))
+            .exists(),
+            "and the file it points at is actually shipped"
+        );
+
+        // The sequencer drives both synths; each answers its own channel.
+        for synth in &synths {
+            assert!(
+                ws.midi.contains(&(sequencer, *synth)),
+                "the sequencer is wired to every synth"
+            );
+        }
+        let channels: Vec<i32> = ws
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.kind {
+                SnapKind::App { dep, options, .. } if dep == "synth" => {
+                    // The channel filter is the synth's last knob; 0 is omni.
+                    options.last().map(|v| *v as i32)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            channels,
+            vec![1, 2],
+            "the two synths listen on different channels, or the parts pile up"
+        );
+    }
+
     /// A hardware MIDI output node survives the `.wk` file, device name and
     /// all, and keeps the wire feeding it. A node kind is only really added
     /// once the reader, the writer and the wiring all agree.
