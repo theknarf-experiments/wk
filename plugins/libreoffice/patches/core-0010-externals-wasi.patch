@@ -61,7 +61,7 @@ index 000000000..ed7a0e89b
 + .PHONY: clean
 + clean:
 diff --git a/external/cairo/ExternalProject_cairo.mk b/external/cairo/ExternalProject_cairo.mk
-index 681544068..eb1a7190e 100644
+index 681544068..fd3139a1e 100644
 --- a/external/cairo/ExternalProject_cairo.mk
 +++ b/external/cairo/ExternalProject_cairo.mk
 @@ -24,30 +24,6 @@ $(eval $(call gb_ExternalProject_use_externals,cairo,\
@@ -104,6 +104,15 @@ index 681544068..eb1a7190e 100644
  	$(call gb_ExternalProject_run,build,\
  		PYTHONWARNINGS= \
  		PKG_CONFIG_TOP_BUILD_DIR= \
+@@ -99,7 +75,7 @@ $(call gb_ExternalProject_get_state_target,cairo,build) :
+ 			$(if $(debug),-Dstrip=false,-Dstrip=true) \
+ 			$(if $(filter -fsanitize=%,$(CC)),-Db_lundef=false) \
+ 			$(if $(filter TRUE,$(DISABLE_DYNLOADING)),-Ddefault_library=static,-Ddefault_library=shared) \
+-			$(if $(filter EMSCRIPTEN ANDROID iOS MACOSX,$(OS)),-Dxlib=disabled -Dxcb=disabled,$(if $(filter TRUE,$(DISABLE_GUI)),-Dxlib=disabled -Dxcb=disabled,-Dxlib=enabled -Dxcb=enabled)) \
++			$(if $(filter EMSCRIPTEN ANDROID iOS MACOSX WASI,$(OS)),-Dxlib=disabled -Dxcb=disabled,$(if $(filter TRUE,$(DISABLE_GUI)),-Dxlib=disabled -Dxcb=disabled,-Dxlib=enabled -Dxcb=enabled)) \
+ 			$(if $(filter iOS,$(OS)),-Dquartz=enabled) \
+ 			$(if $(filter iOS,$(OS)),-Dfreetype=disabled,-Dfreetype=enabled -Dfontconfig=enabled) \
+ 			-Dgtk_doc=false -Dtests=disabled \
 diff --git a/external/cairo/ExternalProject_pixman.mk b/external/cairo/ExternalProject_pixman.mk
 index c92599478..f68913e89 100644
 --- a/external/cairo/ExternalProject_pixman.mk

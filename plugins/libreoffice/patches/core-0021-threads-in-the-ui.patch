@@ -1,0 +1,163 @@
+diff --git a/framework/source/helper/wakeupthread.cxx b/framework/source/helper/wakeupthread.cxx
+index b1a9b81cb..d1848dae7 100644
+--- a/framework/source/helper/wakeupthread.cxx
++++ b/framework/source/helper/wakeupthread.cxx
+@@ -31,12 +31,119 @@
+ 
+ #include <helper/wakeupthread.hxx>
+ 
++#if defined WASI
++#include <vcl/timer.hxx>
++#endif
++
+ using namespace std::chrono_literals;
+ 
+ /// We only need one thread to wake everyone up.
+ 
+ namespace
+ {
++#if defined WASI
++
++/* A wasm component has one thread, and it is the one running the main loop, so
++ * there is nobody to be woken up FROM. What this class is actually for is a
++ * 200 ms tick that calls XUpdatable::update() on whoever registered -- in
++ * practice StatusIndicatorFactory, repainting the progress bar while a document
++ * loads -- and VCL's scheduler already delivers exactly that on the main loop.
++ *
++ * So on WASI the tick is an AutoTimer instead of a thread. The period, the set
++ * of updatables and the stop-when-empty behaviour are the same; what differs is
++ * that update() now runs on the main thread, which for a progress bar is where
++ * it wanted to be anyway.
++ *
++ * This is not an optimisation. salhelper::Thread::launch() throws when
++ * osl::Thread::create fails, which on WASI is always, and the throw comes out
++ * of a document import as a "General Error" box with the document unopened.
++ */
++class SharedWakeUpTimer final : public AutoTimer
++{
++    static std::vector<css::uno::WeakReference<css::util::XUpdatable>> updatables;
++
++public:
++    static std::unique_ptr<SharedWakeUpTimer> wakeupTimer;
++
++    static std::mutex& getMutex()
++    {
++        static std::mutex mutex;
++        return mutex;
++    }
++
++    SharedWakeUpTimer()
++        : AutoTimer("framework::SharedWakeUpTimer")
++    {
++        SetTimeout(200);
++        Start();
++    }
++
++    virtual void Invoke() override
++    {
++        std::vector<css::uno::WeakReference<css::util::XUpdatable>> copyOfUpdatables;
++        {
++            std::unique_lock g(getMutex());
++            if (updatables.empty())
++            {
++                Stop();
++                return;
++            }
++            copyOfUpdatables = updatables;
++        }
++        for (auto& it : copyOfUpdatables)
++        {
++            css::uno::Reference<css::util::XUpdatable> up(it);
++            if (up.is()) // check weak
++                up->update();
++        }
++    }
++
++    static void startThread()
++    {
++        std::unique_lock g(getMutex());
++        if (!updatables.empty() && !wakeupTimer)
++            wakeupTimer.reset(new SharedWakeUpTimer());
++    }
++
++    static void add(css::uno::WeakReference<css::util::XUpdatable> up)
++    {
++        std::unique_lock g(getMutex());
++        updatables.push_back(up);
++        if (!wakeupTimer)
++            wakeupTimer.reset(new SharedWakeUpTimer());
++    }
++
++    static void remove(css::uno::WeakReference<css::util::XUpdatable> up)
++    {
++        std::unique_lock g(getMutex());
++        auto it = updatables.begin();
++        for (; it != updatables.end(); ++it)
++        {
++            css::uno::Reference<css::util::XUpdatable> itValid(*it);
++            if (!itValid || *it == up)
++            {
++                updatables.erase(it);
++                break;
++            }
++        }
++        if (updatables.empty())
++            wakeupTimer.reset();
++    }
++
++    static void joinThread()
++    {
++        std::unique_lock g(getMutex());
++        wakeupTimer.reset();
++    }
++};
++
++std::unique_ptr<SharedWakeUpTimer> SharedWakeUpTimer::wakeupTimer;
++std::vector<css::uno::WeakReference<css::util::XUpdatable>> SharedWakeUpTimer::updatables;
++
++using SharedWakeUpThread = SharedWakeUpTimer;
++
++#else
++
+ class SharedWakeUpThread final : public salhelper::Thread
+ {
+     static std::vector<css::uno::WeakReference<css::util::XUpdatable>> updatables;
+@@ -152,6 +259,8 @@ public:
+ 
+ rtl::Reference<SharedWakeUpThread> SharedWakeUpThread::wakeupThread;
+ std::vector<css::uno::WeakReference<css::util::XUpdatable>> SharedWakeUpThread::updatables;
++
++#endif // !WASI
+ }
+ 
+ namespace framework
+diff --git a/salhelper/source/thread.cxx b/salhelper/source/thread.cxx
+index 66713a2a3..02b894647 100644
+--- a/salhelper/source/thread.cxx
++++ b/salhelper/source/thread.cxx
+@@ -23,11 +23,23 @@ void salhelper::Thread::launch() {
+     // Assumption is that osl::Thread::create returns normally with a true
+     // return value iff it causes osl::Thread::run to start executing:
+     acquire();
+-    comphelper::ScopeGuard g([this] { release(); });
+     if (!create()) {
++        // Deliberately NOT release(): this reference is the only one, so
++        // releasing it would take the count to zero and `delete this` -- and
++        // launch() is conventionally called from the subclass's own
++        // constructor, so the storage is then freed a second time by the `new`
++        // expression as the exception leaves it. The result is a corrupted
++        // heap and a fault somewhere else entirely, which is a poor way to
++        // report "no threads".
++        //
++        // Dropping the count without deleting leaves the object exactly as it
++        // was before launch() was called, which is what the caller's own
++        // cleanup expects. Upstream never reaches this line, because
++        // osl::Thread::create does not fail on a platform that has threads;
++        // on WASI it never succeeds.
++        osl_atomic_decrement(&m_nCount);
+         throw std::runtime_error("osl::Thread::create failed");
+     }
+-    g.dismiss();
+ }
+ 
+ salhelper::Thread::~Thread() {}

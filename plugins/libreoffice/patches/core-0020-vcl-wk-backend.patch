@@ -1,3 +1,16 @@
+diff --git a/postprocess/Module_postprocess.mk b/postprocess/Module_postprocess.mk
+index 0fbede6a9..5b2f5f2c1 100644
+--- a/postprocess/Module_postprocess.mk
++++ b/postprocess/Module_postprocess.mk
+@@ -40,7 +40,7 @@ endif
+ # contain content from at least one of external/more_fonts/fc_local.snippet
+ # (conditional on MORE_FONTS in BUILD_TYPE) and
+ # extras/source/truetype/symbol/fc_local.snippet (unconditional):
+-ifneq ($(USING_X11)$(DISABLE_GUI)$(filter ANDROID EMSCRIPTEN,$(OS)),)
++ifneq ($(USING_X11)$(DISABLE_GUI)$(filter ANDROID EMSCRIPTEN WASI,$(OS)),)
+ $(eval $(call gb_Module_add_targets,postprocess, \
+     CustomTarget_fontconfig \
+     Package_fontconfig \
 diff --git a/vcl/Library_vcl.mk b/vcl/Library_vcl.mk
 index 1452533b7..2e971e36c 100644
 --- a/vcl/Library_vcl.mk
@@ -33,12 +46,30 @@ index 1452533b7..2e971e36c 100644
  $(eval $(call gb_Library_add_exception_objects,vcl,\
      vcl/headless/headlessinst \
  ))
+diff --git a/vcl/inc/headless/svpframe.hxx b/vcl/inc/headless/svpframe.hxx
+index 94f7951d6..68386af09 100644
+--- a/vcl/inc/headless/svpframe.hxx
++++ b/vcl/inc/headless/svpframe.hxx
+@@ -71,6 +71,13 @@ public:
+     bool isVisible() const { return m_bVisible; }
+     bool hasFocus() const { return s_pFocusFrame == this; }
+ 
++#ifndef IOS
++    // The pixels. A backend built on the headless graphics has to be able to
++    // present what was drawn, and until now nothing outside this class could
++    // reach the surface at all -- vcl/wk is the first caller.
++    cairo_surface_t* GetSurface() const { return m_pSurface; }
++#endif
++
+     // SalFrame
+     virtual SalGraphics*        AcquireGraphics() override;
+     virtual void                ReleaseGraphics( SalGraphics* pGraphics ) override;
 diff --git a/vcl/wk/wkinst.cxx b/vcl/wk/wkinst.cxx
 new file mode 100644
-index 000000000..391830ea9
+index 000000000..bda74c782
 --- /dev/null
 +++ b/vcl/wk/wkinst.cxx
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,180 @@
 +/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 +/*
 + * This file is part of the LibreOffice project.
@@ -60,35 +91,73 @@ index 000000000..391830ea9
 + * what a wasm component needs: cairo drawing into an image surface, freetype
 + * and fontconfig for glyphs, and no assumption of a windowing system. What
 + * headless does not have is anywhere to put the pixels or anywhere to get input
-+ * from, and that -- a frame that owns a surface, a compositor that presents it
-+ * to wk, and a translation of wk's input events into VCL's -- is what this
-+ * directory is for.
++ * from. This file is growing into that.
 + *
-+ * At this commit it is the headless instance under another name, which is the
-+ * point: --disable-gui is gone and HAVE_FEATURE_UI is on, so the whole UI layer
-+ * now compiles for wasm32, and this file exists to prove that the build shape
-+ * is right before any of it is asked to draw. The conversion filters still work
-+ * through it, because --headless sets bitmap rendering in salplug.cxx and then
-+ * falls through to exactly this instance.
++ * What is here now is the frame register: every SalFrame LibreOffice creates,
++ * in creation order, with the surface it draws into. A compositor needs exactly
++ * that list -- VCL gives each menu, tooltip and dialog its own frame, so
++ * presenting "the window" means presenting a stack of them -- and so does
++ * hit-testing input, which arrives in one surface-local coordinate space and has
++ * to be routed to whichever frame owns that point.
++ *
++ * Until the wk surface is wired up, the register can be dumped to PNG:
++ *
++ *     WK_LO_DUMP_FRAMES=/work/frame   write /work/frame-N.png per visible frame
++ *     WK_LO_DUMP_AFTER=<n>            do it after n yields, then quit
++ *
++ * which is how this backend is tested at all before it can present anything.
 + */
 +
 +#include <headless/svpinst.hxx>
++#include <headless/svpframe.hxx>
 +#include <headless/svpdummies.hxx>
 +#include <headless/svpdata.hxx>
 +
++#include <vcl/svapp.hxx>
 +#include <sal/log.hxx>
++#include <rtl/ustrbuf.hxx>
++
++#include <cairo.h>
++
++#include <algorithm>
++#include <cstdlib>
++#include <vector>
 +
 +namespace
 +{
 +class WkSalInstance : public SvpSalInstance
 +{
++    // Creation order, which is also back-to-front order: VCL creates a popup
++    // after the window it belongs to. Good enough to composite by until
++    // something proves otherwise.
++    std::vector<SvpSalFrame*> m_aFrames;
++
++    OString m_aDumpPath;
++    int m_nDumpAfter = 0;
++    int m_nYields = 0;
++
 +public:
 +    explicit WkSalInstance(std::unique_ptr<SalYieldMutex> pMutex)
 +        : SvpSalInstance(std::move(pMutex))
 +    {
++        if (const char* pPath = std::getenv("WK_LO_DUMP_FRAMES"))
++            m_aDumpPath = OString(pPath, strlen(pPath));
++        if (const char* pAfter = std::getenv("WK_LO_DUMP_AFTER"))
++            m_nDumpAfter = std::atoi(pAfter);
 +    }
 +
++    virtual SalFrame* CreateFrame(SalFrame* pParent, SalFrameStyleFlags nStyle) override;
++    virtual SalFrame* CreateChildFrame(SystemParentData* pParent,
++                                       SalFrameStyleFlags nStyle) override;
++    virtual void DestroyFrame(SalFrame* pFrame) override;
++    virtual bool DoYield(bool bWait, bool bHandleAllCurrentEvents) override;
++
 +    virtual SalSystem* CreateSalSystem() override;
++
++    const std::vector<SvpSalFrame*>& frames() const { return m_aFrames; }
++
++private:
++    void dumpFrames();
 +};
 +
 +class WkSalSystem : public SvpSalSystem
@@ -113,6 +182,64 @@ index 000000000..391830ea9
 +};
 +
 +SalSystem* WkSalInstance::CreateSalSystem() { return new WkSalSystem(); }
++
++SalFrame* WkSalInstance::CreateFrame(SalFrame* pParent, SalFrameStyleFlags nStyle)
++{
++    SalFrame* pFrame = SvpSalInstance::CreateFrame(pParent, nStyle);
++    m_aFrames.push_back(static_cast<SvpSalFrame*>(pFrame));
++    SAL_INFO("vcl.wk", "frame " << pFrame << " created, style " << static_cast<sal_uInt64>(nStyle)
++                                << ", " << m_aFrames.size() << " now live");
++    return pFrame;
++}
++
++SalFrame* WkSalInstance::CreateChildFrame(SystemParentData* pParent, SalFrameStyleFlags nStyle)
++{
++    SalFrame* pFrame = SvpSalInstance::CreateChildFrame(pParent, nStyle);
++    m_aFrames.push_back(static_cast<SvpSalFrame*>(pFrame));
++    return pFrame;
++}
++
++void WkSalInstance::DestroyFrame(SalFrame* pFrame)
++{
++    std::erase(m_aFrames, static_cast<SvpSalFrame*>(pFrame));
++    SvpSalInstance::DestroyFrame(pFrame);
++}
++
++void WkSalInstance::dumpFrames()
++{
++    int nIndex = 0;
++    for (const SvpSalFrame* pFrame : m_aFrames)
++    {
++        cairo_surface_t* pSurface = pFrame->GetSurface();
++        tools::Long nWidth = 0, nHeight = 0;
++        const_cast<SvpSalFrame*>(pFrame)->GetClientSize(nWidth, nHeight);
++        SAL_WARN("vcl.wk", "frame " << nIndex << ": " << nWidth << "x" << nHeight << " visible="
++                                    << pFrame->isVisible() << " surface=" << pSurface);
++        if (pSurface && pFrame->isVisible())
++        {
++            OString aName = m_aDumpPath + "-" + OString::number(nIndex) + ".png";
++            cairo_status_t eStatus = cairo_surface_write_to_png(pSurface, aName.getStr());
++            SAL_WARN("vcl.wk",
++                     "  wrote " << aName << ": " << cairo_status_to_string(eStatus));
++        }
++        ++nIndex;
++    }
++}
++
++bool WkSalInstance::DoYield(bool bWait, bool bHandleAllCurrentEvents)
++{
++    const bool bAny = SvpSalInstance::DoYield(bWait, bHandleAllCurrentEvents);
++
++    if (m_nDumpAfter > 0 && ++m_nYields >= m_nDumpAfter)
++    {
++        m_nDumpAfter = 0; // once
++        if (!m_aDumpPath.isEmpty())
++            dumpFrames();
++        Application::Quit();
++    }
++
++    return bAny;
++}
 +}
 +
 +extern "C" SalInstance* create_SalInstance()

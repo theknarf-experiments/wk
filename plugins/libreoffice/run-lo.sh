@@ -52,6 +52,15 @@ mkdir -p "$WORK" "$TMP" || lo_die "cannot create $WORK"
 
 command -v wasmtime >/dev/null 2>&1 || lo_die "wasmtime not on PATH"
 
+# Every WK_LO_* variable set in the host environment is forwarded, so a knob
+# added to the shim or to vcl/wk needs no change here. wasmtime does not inherit
+# the environment; anything not named is simply absent inside the guest, which
+# is a confusing way to find out a trace is off.
+wk_env=()
+while IFS='=' read -r name _; do
+    case "$name" in WK_LO_*) wk_env+=(--env "$name=${!name}") ;; esac
+done < <(env)
+
 # UserInstallation is passed as a -env: argument rather than an environment
 # variable because that is the only form rtl::Bootstrap reads before the ini
 # files are found, and the profile has to exist before the first service is
@@ -63,9 +72,7 @@ exec wasmtime run \
     --env HOME=/work \
     --env TMPDIR=/tmp \
     ${SAL_LOG:+--env "SAL_LOG=$SAL_LOG"} \
-    ${WK_LO_TRACE_THROW:+--env "WK_LO_TRACE_THROW=$WK_LO_TRACE_THROW"} \
-    ${WK_LO_TRAP_THROW:+--env "WK_LO_TRAP_THROW=$WK_LO_TRAP_THROW"} \
-    ${WK_LO_TRACE_ALLOC:+--env "WK_LO_TRACE_ALLOC=$WK_LO_TRACE_ALLOC"} \
+    ${wk_env[@]+"${wk_env[@]}"} \
     "$SOFFICE" \
     -env:UserInstallation=file:///work/.profile \
     "$@"
