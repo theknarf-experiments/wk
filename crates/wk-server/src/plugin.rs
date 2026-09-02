@@ -6284,6 +6284,93 @@ mod tests {
         };
         eprintln!("impress frame: {dark} dark, {light} light, {white} white px");
 
+        // Now input. The layout has to settle first: for the first seconds
+        // after the document opens, panels appear and toolbars reflow, and a
+        // pixel change during that proves nothing about input at all -- the
+        // click that "worked" in the first draft of this test landed on empty
+        // canvas and was credited with the Slides panel arriving.
+        let snapshot = |s: &std::sync::MutexGuard<'_, VirtualSurface>| -> Vec<u8> {
+            s.pixels
+                .chunks_exact(4)
+                .flat_map(|p| [p[0], p[1], p[2]])
+                .collect::<Vec<u8>>()
+        };
+        let differing = |a: &[u8], b: &[u8]| -> usize {
+            a.chunks_exact(3)
+                .zip(b.chunks_exact(3))
+                .filter(|(x, y)| x != y)
+                .count()
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        let mut settled = snapshot(&surface.lock().unwrap());
+        let mut stable = 0;
+        loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let now = snapshot(&surface.lock().unwrap());
+            stable = if differing(&settled, &now) < 50 {
+                stable + 1
+            } else {
+                0
+            };
+            settled = now;
+            if stable >= 10 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the window never stopped changing on its own, so no input test can be \
+                 attributed; node log:\n{}",
+                String::from_utf8_lossy(&node.term_io.log_read(0).0)
+            );
+        }
+        eprintln!("impress: layout settled");
+
+        // Tab, which in Impress's editing view selects the next object on the
+        // slide and draws handles around it. A key rather than a click because
+        // it needs no coordinates and so cannot be aimed at the wrong thing;
+        // and it exercises the half of the input path a click does not -- the
+        // key translation, the modifier mapping, and delivery to the frame the
+        // Router last decided was focused.
+        {
+            let mut s = surface.lock().unwrap();
+            let ev = KeyEvent {
+                key: Some(Key::Tab),
+                text: None,
+                alt_key: false,
+                ctrl_key: false,
+                meta_key: false,
+                shift_key: false,
+                repeat: false,
+            };
+            s.key_down.push_back(ev.clone());
+            s.key_up.push_back(ev);
+            s.wake();
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let changed = loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let n = differing(&settled, &snapshot(&surface.lock().unwrap()));
+            if n > 300 {
+                break n;
+            }
+            assert!(
+                !node.finished.load(Ordering::Relaxed),
+                "soffice exited during the key test; node log:\n{}",
+                String::from_utf8_lossy(&node.term_io.log_read(0).0)
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Tab changed nothing on a settled window -- key input never reached sd; \
+                 node log:\n{}",
+                String::from_utf8_lossy(&node.term_io.log_read(0).0)
+            );
+        };
+        eprintln!("impress: Tab selected an object, {changed} px changed");
+
         // A histogram proves "not blank", never "a window". WK_LO_DUMP=/tmp/f.ppm
         // writes the composited surface out so a human can look at it, which is
         // the only way to catch a backend that paints something plausible and
@@ -6294,6 +6381,14 @@ mod tests {
             ppm.extend(s.pixels.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
             std::fs::write(&path, ppm).expect("write frame dump");
             eprintln!("impress frame dumped to {path}");
+            // With the dump comes the log, because the interesting half of
+            // "does it look right" is vcl/wk's frame census -- which frames
+            // exist, where, and which are visible -- and a passing test prints
+            // nothing otherwise.
+            eprintln!(
+                "--- libreoffice node log ---\n{}",
+                String::from_utf8_lossy(&node.term_io.log_read(0).0)
+            );
         }
 
         node.kill.store(true, Ordering::Relaxed);

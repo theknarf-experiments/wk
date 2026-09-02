@@ -37,6 +37,63 @@ index 000000000..39aa4e177
 +}
 +
 +/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/include/vcl/wk/wkinput.hxx b/include/vcl/wk/wkinput.hxx
+new file mode 100644
+index 000000000..4b97f5c69
+--- /dev/null
++++ b/include/vcl/wk/wkinput.hxx
+@@ -0,0 +1,51 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This file is part of the LibreOffice project.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++#pragma once
++
++#include <sal/types.h>
++
++// wkgfx.h declares wkgfx_event as a typedef of an ANONYMOUS struct, which is
++// exactly the shape that cannot be forward-declared -- so the header comes in
++// here rather than only in the .cxx.
++#include <wkgfx.h>
++
++#include <vector>
++
++class SvpSalFrame;
++
++namespace vcl::wk
++{
++/** Turns wk's input events into VCL's, and decides which SalFrame each one
++    belongs to. See wkinput.cxx for why the routing is the hard part. */
++class Router
++{
++    /// Buttons currently held. wk sends the one that changed; VCL wants the
++    /// whole set on every event, moves included.
++    sal_uInt16 m_nButtons = 0;
++    /// The frame the pointer is over, which is also where key events go.
++    SvpSalFrame* m_pMouseFrame = nullptr;
++
++public:
++    /** Deliver one wk event, back-to-front hit-tested against @p rFrames. */
++    void dispatch(const std::vector<SvpSalFrame*>& rFrames, const wkgfx_event& rEv);
++
++    /** The topmost visible frame containing the surface-local point, or null. */
++    static SvpSalFrame* frameAt(const std::vector<SvpSalFrame*>& rFrames, double fX, double fY);
++
++    /** Forget a frame that is going away, so a stale pointer is never used. */
++    void forget(const SvpSalFrame* pFrame)
++    {
++        if (m_pMouseFrame == pFrame)
++            m_pMouseFrame = nullptr;
++    }
++};
++}
++
++/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
 diff --git a/postprocess/Module_postprocess.mk b/postprocess/Module_postprocess.mk
 index 0fbede6a9..5b2f5f2c1 100644
 --- a/postprocess/Module_postprocess.mk
@@ -51,7 +108,7 @@ index 0fbede6a9..5b2f5f2c1 100644
      CustomTarget_fontconfig \
      Package_fontconfig \
 diff --git a/vcl/Library_vcl.mk b/vcl/Library_vcl.mk
-index 1452533b7..41af42ce4 100644
+index 1452533b7..e51af3523 100644
 --- a/vcl/Library_vcl.mk
 +++ b/vcl/Library_vcl.mk
 @@ -29,6 +29,12 @@ else ifeq ($(OS),ANDROID)
@@ -67,7 +124,7 @@ index 1452533b7..41af42ce4 100644
  else ifeq ($(DISABLE_GUI),TRUE)
  $(eval $(call gb_Library_add_componentimpl,vcl,headless))
  else
-@@ -674,7 +680,17 @@ $(eval $(call gb_Library_add_libs,vcl,\
+@@ -674,7 +680,18 @@ $(eval $(call gb_Library_add_libs,vcl,\
  ))
  endif
  
@@ -80,6 +137,7 @@ index 1452533b7..41af42ce4 100644
 +$(eval $(call gb_Library_add_exception_objects,vcl,\
 +    vcl/wk/wkinst \
 +    vcl/wk/wkcompositor \
++    vcl/wk/wkinput \
 +))
 +
 +else ifeq ($(DISABLE_GUI),TRUE)
@@ -252,12 +310,333 @@ index 000000000..0ff5fdf62
 +}
 +
 +/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/vcl/wk/wkinput.cxx b/vcl/wk/wkinput.cxx
+new file mode 100644
+index 000000000..51f1d7d23
+--- /dev/null
++++ b/vcl/wk/wkinput.cxx
+@@ -0,0 +1,315 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This file is part of the LibreOffice project.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * wk's input events, in VCL's vocabulary.
++ *
++ * wk delivers one flat event struct per input, pulled rather than pushed, in
++ * ONE surface-local coordinate space -- there are no child windows to address.
++ * VCL wants events delivered to the SalFrame that owns the point, in that
++ * frame's own coordinates, which is why routing is the first thing that
++ * happens here and not an afterthought: a click on an open menu belongs to the
++ * menu's frame, and sending it to the document window instead is how a menu
++ * that draws correctly still cannot be used.
++ *
++ * The key story is two fields, not one. wkgfx gives `key`, which physical key
++ * was pressed (a W3C UIEvents `code` -- WASD stays WASD on AZERTY), and `ch`,
++ * what it types (layout- and shift-aware). VCL wants both as well:
++ * SalKeyEvent::mnCode is the key and mnCharCode is the character. Using `ch`
++ * for both would break every accelerator on a non-US layout; using `key` for
++ * both would type the wrong letters.
++ */
++
++#include <vcl/wk/wkinput.hxx>
++
++#include <headless/svpframe.hxx>
++#include <vcl/event.hxx>
++#include <vcl/keycodes.hxx>
++#include <sal/log.hxx>
++
++#include <cmath>
++
++namespace vcl::wk
++{
++namespace
++{
++/// WKGFX_K_* (W3C UIEvents code names) to VCL's KEY_*.
++///
++/// Transcribed from plugins/qt/qpa/qwkkeytranslator.cpp, which does the same
++/// job for Qt against the same enum. Only keys VCL has a code for appear; the
++/// rest fall through to 0, which is correct -- a key with no VCL code is still
++/// delivered, carrying only its character, which is what typing needs.
++sal_uInt16 toVclKey(int32_t nWkKey)
++{
++    switch (nWkKey)
++    {
++        case WKGFX_K_DIGIT0: return KEY_0;
++        case WKGFX_K_DIGIT1: return KEY_1;
++        case WKGFX_K_DIGIT2: return KEY_2;
++        case WKGFX_K_DIGIT3: return KEY_3;
++        case WKGFX_K_DIGIT4: return KEY_4;
++        case WKGFX_K_DIGIT5: return KEY_5;
++        case WKGFX_K_DIGIT6: return KEY_6;
++        case WKGFX_K_DIGIT7: return KEY_7;
++        case WKGFX_K_DIGIT8: return KEY_8;
++        case WKGFX_K_DIGIT9: return KEY_9;
++
++        case WKGFX_K_KEY_A: return KEY_A;
++        case WKGFX_K_KEY_B: return KEY_B;
++        case WKGFX_K_KEY_C: return KEY_C;
++        case WKGFX_K_KEY_D: return KEY_D;
++        case WKGFX_K_KEY_E: return KEY_E;
++        case WKGFX_K_KEY_F: return KEY_F;
++        case WKGFX_K_KEY_G: return KEY_G;
++        case WKGFX_K_KEY_H: return KEY_H;
++        case WKGFX_K_KEY_I: return KEY_I;
++        case WKGFX_K_KEY_J: return KEY_J;
++        case WKGFX_K_KEY_K: return KEY_K;
++        case WKGFX_K_KEY_L: return KEY_L;
++        case WKGFX_K_KEY_M: return KEY_M;
++        case WKGFX_K_KEY_N: return KEY_N;
++        case WKGFX_K_KEY_O: return KEY_O;
++        case WKGFX_K_KEY_P: return KEY_P;
++        case WKGFX_K_KEY_Q: return KEY_Q;
++        case WKGFX_K_KEY_R: return KEY_R;
++        case WKGFX_K_KEY_S: return KEY_S;
++        case WKGFX_K_KEY_T: return KEY_T;
++        case WKGFX_K_KEY_U: return KEY_U;
++        case WKGFX_K_KEY_V: return KEY_V;
++        case WKGFX_K_KEY_W: return KEY_W;
++        case WKGFX_K_KEY_X: return KEY_X;
++        case WKGFX_K_KEY_Y: return KEY_Y;
++        case WKGFX_K_KEY_Z: return KEY_Z;
++
++        case WKGFX_K_F1: return KEY_F1;
++        case WKGFX_K_F2: return KEY_F2;
++        case WKGFX_K_F3: return KEY_F3;
++        case WKGFX_K_F4: return KEY_F4;
++        case WKGFX_K_F5: return KEY_F5;
++        case WKGFX_K_F6: return KEY_F6;
++        case WKGFX_K_F7: return KEY_F7;
++        case WKGFX_K_F8: return KEY_F8;
++        case WKGFX_K_F9: return KEY_F9;
++        case WKGFX_K_F10: return KEY_F10;
++        case WKGFX_K_F11: return KEY_F11;
++        case WKGFX_K_F12: return KEY_F12;
++
++        case WKGFX_K_ARROW_DOWN: return KEY_DOWN;
++        case WKGFX_K_ARROW_UP: return KEY_UP;
++        case WKGFX_K_ARROW_LEFT: return KEY_LEFT;
++        case WKGFX_K_ARROW_RIGHT: return KEY_RIGHT;
++        case WKGFX_K_HOME: return KEY_HOME;
++        case WKGFX_K_END: return KEY_END;
++        case WKGFX_K_PAGE_UP: return KEY_PAGEUP;
++        case WKGFX_K_PAGE_DOWN: return KEY_PAGEDOWN;
++        case WKGFX_K_ENTER: return KEY_RETURN;
++        case WKGFX_K_NUMPAD_ENTER: return KEY_RETURN;
++        case WKGFX_K_ESCAPE: return KEY_ESCAPE;
++        case WKGFX_K_TAB: return KEY_TAB;
++        case WKGFX_K_BACKSPACE: return KEY_BACKSPACE;
++        case WKGFX_K_SPACE: return KEY_SPACE;
++        case WKGFX_K_INSERT: return KEY_INSERT;
++        case WKGFX_K_DELETE: return KEY_DELETE;
++
++        case WKGFX_K_NUMPAD_ADD: return KEY_ADD;
++        case WKGFX_K_NUMPAD_SUBTRACT: return KEY_SUBTRACT;
++        case WKGFX_K_NUMPAD_MULTIPLY: return KEY_MULTIPLY;
++        case WKGFX_K_NUMPAD_DIVIDE: return KEY_DIVIDE;
++        case WKGFX_K_PERIOD: return KEY_POINT;
++        case WKGFX_K_COMMA: return KEY_COMMA;
++        case WKGFX_K_MINUS: return KEY_SUBTRACT;
++        case WKGFX_K_EQUAL: return KEY_EQUAL;
++        case WKGFX_K_SEMICOLON: return KEY_SEMICOLON;
++        case WKGFX_K_QUOTE: return KEY_QUOTERIGHT;
++        case WKGFX_K_BRACKET_LEFT: return KEY_BRACKETLEFT;
++        case WKGFX_K_BRACKET_RIGHT: return KEY_BRACKETRIGHT;
++        case WKGFX_K_SLASH: return KEY_DIVIDE;
++        case WKGFX_K_BACKQUOTE: return KEY_QUOTELEFT;
++        // No KEY_BACKSLASH in VCL: the physical key has no code of its own, so
++        // it falls through to 0 below and arrives carrying only its character,
++        // which is all that typing one needs.
++
++        default: return 0;
++    }
++}
++
++/// The modifier half of VCL's key code, shared by key and mouse events.
++sal_uInt16 modifiers(const wkgfx_event& rEv)
++{
++    sal_uInt16 nCode = 0;
++    if (rEv.shift)
++        nCode |= KEY_SHIFT;
++    // MOD1 is the accelerator modifier. wk reports ctrl and meta separately and
++    // VCL's MOD1/MOD3 split is per-platform; ctrl is MOD1 here because that is
++    // what the menus this build shows are labelled with.
++    if (rEv.ctrl)
++        nCode |= KEY_MOD1;
++    if (rEv.alt)
++        nCode |= KEY_MOD2;
++    if (rEv.meta)
++        nCode |= KEY_MOD3;
++    return nCode;
++}
++}
++
++SvpSalFrame* Router::frameAt(const std::vector<SvpSalFrame*>& rFrames, double fX, double fY)
++{
++    // Front to back: the compositor paints in creation order, so the last
++    // visible frame containing the point is the one on top and the one that
++    // owns the click.
++    for (auto it = rFrames.rbegin(); it != rFrames.rend(); ++it)
++    {
++        SvpSalFrame* pFrame = *it;
++        if (!pFrame->isVisible())
++            continue;
++        const SalFrameGeometry aGeom = pFrame->GetUnmirroredGeometry();
++        const double fLeft = static_cast<double>(aGeom.x());
++        const double fTop = static_cast<double>(aGeom.y());
++        if (fX >= fLeft && fY >= fTop && fX < fLeft + aGeom.width()
++            && fY < fTop + aGeom.height())
++        {
++            return pFrame;
++        }
++    }
++    return nullptr;
++}
++
++void Router::dispatch(const std::vector<SvpSalFrame*>& rFrames, const wkgfx_event& rEv)
++{
++    switch (rEv.type)
++    {
++        case WKGFX_POINTER_MOVE:
++        case WKGFX_POINTER_DOWN:
++        case WKGFX_POINTER_UP:
++        {
++            SvpSalFrame* pFrame = frameAt(rFrames, rEv.x, rEv.y);
++            if (!pFrame)
++                return;
++            const SalFrameGeometry aGeom = pFrame->GetUnmirroredGeometry();
++
++            // Which buttons are held is state, not part of the event: wk sends
++            // the button that changed, and VCL wants the whole set on every
++            // event including moves.
++            if (rEv.type == WKGFX_POINTER_DOWN || rEv.type == WKGFX_POINTER_UP)
++            {
++                const sal_uInt16 nBit = rEv.button == 0   ? MOUSE_LEFT
++                                        : rEv.button == 1 ? MOUSE_MIDDLE
++                                        : rEv.button == 2 ? MOUSE_RIGHT
++                                                          : 0;
++                if (rEv.type == WKGFX_POINTER_DOWN)
++                    m_nButtons |= nBit;
++                else
++                    m_nButtons &= ~nBit;
++            }
++
++            SalMouseEvent aEvent;
++            aEvent.mnTime = 0;
++            aEvent.mnX = static_cast<tools::Long>(rEv.x) - aGeom.x();
++            aEvent.mnY = static_cast<tools::Long>(rEv.y) - aGeom.y();
++            aEvent.mnCode = m_nButtons | modifiers(rEv);
++            aEvent.mnButton = rEv.type == WKGFX_POINTER_MOVE
++                                  ? 0
++                                  : (rEv.button == 0   ? MOUSE_LEFT
++                                     : rEv.button == 1 ? MOUSE_MIDDLE
++                                     : rEv.button == 2 ? MOUSE_RIGHT
++                                                       : 0);
++
++            // A frame that has just been entered gets the focus. wk has no
++            // focus event of its own -- there is one surface and it either has
++            // the host's focus or the node is not being interacted with -- so
++            // the frame under the pointer standing in for it is the closest
++            // thing to what VCL expects, and it is what makes a menu take key
++            // input once opened.
++            if (pFrame != m_pMouseFrame)
++            {
++                if (m_pMouseFrame)
++                    m_pMouseFrame->CallCallback(SalEvent::MouseLeave, &aEvent);
++                m_pMouseFrame = pFrame;
++            }
++
++            const SalEvent eType = rEv.type == WKGFX_POINTER_MOVE ? SalEvent::MouseMove
++                                   : rEv.type == WKGFX_POINTER_DOWN
++                                       ? SalEvent::MouseButtonDown
++                                       : SalEvent::MouseButtonUp;
++            pFrame->CallCallback(eType, &aEvent);
++            break;
++        }
++
++        case WKGFX_SCROLL:
++        {
++            SvpSalFrame* pFrame = frameAt(rFrames, rEv.x, rEv.y);
++            if (!pFrame)
++                return;
++            const SalFrameGeometry aGeom = pFrame->GetUnmirroredGeometry();
++
++            // wk's deltas are in lines, which is what VCL calls a notch. Both
++            // axes can move in one event; VCL takes one axis per event.
++            auto send = [&](double fDelta, bool bHorz) {
++                if (fDelta == 0.0)
++                    return;
++                SalWheelMouseEvent aEvent;
++                aEvent.mnTime = 0;
++                aEvent.mnX = static_cast<tools::Long>(rEv.x) - aGeom.x();
++                aEvent.mnY = static_cast<tools::Long>(rEv.y) - aGeom.y();
++                aEvent.mnCode = m_nButtons | modifiers(rEv);
++                aEvent.mnDelta = static_cast<tools::Long>(fDelta * -120.0);
++                aEvent.mnNotchDelta = fDelta < 0 ? 1 : -1;
++                aEvent.mnScrollLines = std::abs(fDelta);
++                aEvent.mbHorz = bHorz;
++                aEvent.mbDeltaIsPixel = false;
++                pFrame->CallCallback(SalEvent::WheelMouse, &aEvent);
++            };
++            send(rEv.dy, false);
++            send(rEv.dx, true);
++            break;
++        }
++
++        case WKGFX_KEY_DOWN:
++        case WKGFX_KEY_UP:
++        {
++            // To the frame the pointer last visited, which for a menu is the
++            // menu. Falls back to the last visible frame, so a keystroke before
++            // the mouse has ever moved still lands somewhere sensible.
++            SvpSalFrame* pFrame = m_pMouseFrame;
++            if (!pFrame)
++            {
++                for (auto it = rFrames.rbegin(); it != rFrames.rend(); ++it)
++                {
++                    if ((*it)->isVisible())
++                    {
++                        pFrame = *it;
++                        break;
++                    }
++                }
++            }
++            if (!pFrame)
++                return;
++
++            SalKeyEvent aEvent;
++            aEvent.mnCode = toVclKey(rEv.key) | modifiers(rEv);
++            // Not the character when a command modifier is held: Ctrl+S must
++            // arrive as the S key and not as U+0013, or every accelerator turns
++            // into a control character in the document.
++            aEvent.mnCharCode = (rEv.ctrl || rEv.meta) ? 0 : static_cast<sal_uInt16>(rEv.ch);
++            aEvent.mnRepeat = 0;
++            pFrame->CallCallback(rEv.type == WKGFX_KEY_DOWN ? SalEvent::KeyInput
++                                                            : SalEvent::KeyUp,
++                                 &aEvent);
++            break;
++        }
++
++        case WKGFX_RESIZE:
++        case WKGFX_NONE:
++        default:
++            break;
++    }
++}
++}
++
++/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
 diff --git a/vcl/wk/wkinst.cxx b/vcl/wk/wkinst.cxx
 new file mode 100644
-index 000000000..7faf5a290
+index 000000000..06fb05bcd
 --- /dev/null
 +++ b/vcl/wk/wkinst.cxx
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,273 @@
 +/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 +/*
 + * This file is part of the LibreOffice project.
@@ -306,6 +685,7 @@ index 000000000..7faf5a290
 +#include <rtl/ustrbuf.hxx>
 +
 +#include <vcl/wk/wkcompositor.hxx>
++#include <vcl/wk/wkinput.hxx>
 +
 +#include <cairo.h>
 +#include <wkgfx.h>
@@ -324,6 +704,7 @@ index 000000000..7faf5a290
 +    std::vector<SvpSalFrame*> m_aFrames;
 +
 +    vcl::wk::Compositor m_aCompositor;
++    vcl::wk::Router m_aRouter;
 +    bool m_bSurfaceOpen = false;
 +    bool m_bPresented = false;
 +
@@ -354,6 +735,7 @@ index 000000000..7faf5a290
 +private:
 +    void dumpFrames();
 +    void present();
++    void resizeTo(uint32_t nWidth, uint32_t nHeight);
 +};
 +
 +class WkSalSystem : public SvpSalSystem
@@ -398,6 +780,7 @@ index 000000000..7faf5a290
 +void WkSalInstance::DestroyFrame(SalFrame* pFrame)
 +{
 +    std::erase(m_aFrames, static_cast<SvpSalFrame*>(pFrame));
++    m_aRouter.forget(static_cast<SvpSalFrame*>(pFrame));
 +    SAL_INFO("vcl.wk", "frame " << pFrame << " destroyed, " << m_aFrames.size() << " left");
 +    SvpSalInstance::DestroyFrame(pFrame);
 +}
@@ -421,6 +804,23 @@ index 000000000..7faf5a290
 +        }
 +        ++nIndex;
 +    }
++}
++
++void WkSalInstance::resizeTo(uint32_t nWidth, uint32_t nHeight)
++{
++    // The host is resize-authoritative: a wk node is sized on the canvas, and
++    // the guest is told what it got. Only top-level frames follow it -- a menu
++    // or a tooltip is sized by its content and would be destroyed by this.
++    for (SvpSalFrame* pFrame : m_aFrames)
++    {
++        if (pFrame->GetParent() != nullptr)
++            continue;
++        pFrame->SetPosSize(0, 0, static_cast<tools::Long>(nWidth),
++                           static_cast<tools::Long>(nHeight),
++                           SAL_FRAME_POSSIZE_X | SAL_FRAME_POSSIZE_Y | SAL_FRAME_POSSIZE_WIDTH
++                               | SAL_FRAME_POSSIZE_HEIGHT);
++    }
++    SAL_INFO("vcl.wk", "surface resized to " << nWidth << "x" << nHeight);
 +}
 +
 +void WkSalInstance::present()
@@ -450,17 +850,41 @@ index 000000000..7faf5a290
 +    if (!m_bPresented)
 +    {
 +        m_bPresented = true;
-+        size_t nVisible = 0;
++        // Every frame, with what the compositor sees of it. PORTING.md's E6
++        // census in one line per frame: this is how a window that draws but
++        // looks wrong -- two top-levels stacked, a popup at the wrong place --
++        // is told apart from one that draws wrong.
 +        for (const SvpSalFrame* p : m_aFrames)
-+            nVisible += p->isVisible() ? 1 : 0;
-+        SAL_INFO("vcl.wk", "first present: " << nVisible << " of " << m_aFrames.size()
-+                                             << " frames visible");
++        {
++            const SalFrameGeometry aGeom = p->GetUnmirroredGeometry();
++            SAL_INFO("vcl.wk", "  frame " << p << " style "
++                                          << static_cast<sal_uInt64>(p->style()) << " visible "
++                                          << p->isVisible() << " at " << aGeom.x() << ","
++                                          << aGeom.y() << " " << aGeom.width() << "x"
++                                          << aGeom.height());
++        }
 +    }
 +}
 +
 +bool WkSalInstance::DoYield(bool bWait, bool bHandleAllCurrentEvents)
 +{
 +    const bool bAny = SvpSalInstance::DoYield(bWait, bHandleAllCurrentEvents);
++
++    // Input first: wk's queue is drained without blocking, the events are
++    // delivered as VCL events, and the present below then shows what they did.
++    // Draining before the present rather than after is the difference between
++    // a click being visible this frame and next.
++    if (m_bSurfaceOpen)
++    {
++        wkgfx_event ev;
++        while (wkgfx_poll_event(&ev))
++        {
++            if (ev.type == WKGFX_RESIZE)
++                resizeTo(ev.width, ev.height);
++            else
++                m_aRouter.dispatch(m_aFrames, ev);
++        }
++    }
 +
 +    // Present after dispatching, so what goes to the host is the state the
 +    // events just produced rather than the one before them.
