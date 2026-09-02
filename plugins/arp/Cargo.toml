@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# One complete bitmap font, shared and tested, instead of a private `match`
+# holding only the letters this plugin's labels happened to spell.
+wk-pixelfont = { path = "../../crates/wk-pixelfont" }
 wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
 
 [lib]

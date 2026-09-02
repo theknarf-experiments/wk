@@ -14,6 +14,7 @@ version = "0.1.0"
 dependencies = [
  "wit-bindgen-rt",
  "wk-midifile",
+ "wk-pixelfont",
  "wk-sequence",
 ]
 
@@ -28,6 +29,10 @@ dependencies = [
 
 [[package]]
 name = "wk-midifile"
+version = "0.1.0"
+
+[[package]]
+name = "wk-pixelfont"
 version = "0.1.0"
 
 [[package]]

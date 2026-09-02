@@ -469,56 +469,15 @@ fn line(buf: &mut [u8], w: u32, h: u32, mut x0: i32, mut y0: i32, x1: i32, y1: i
     }
 }
 
-/// A 3x5 bitmap glyph: 5 rows, each holding 3 bits (4=left, 2=mid, 1=right).
-fn glyph(c: char) -> [u8; 5] {
-    match c {
-        'A' => [0b010, 0b101, 0b111, 0b101, 0b101],
-        'C' => [0b111, 0b100, 0b100, 0b100, 0b111],
-        'E' => [0b111, 0b100, 0b111, 0b100, 0b111],
-        'K' => [0b101, 0b101, 0b110, 0b101, 0b101],
-        'L' => [0b100, 0b100, 0b100, 0b100, 0b111],
-        'N' => [0b101, 0b111, 0b111, 0b111, 0b101],
-        'O' => [0b111, 0b101, 0b101, 0b101, 0b111],
-        'R' => [0b110, 0b101, 0b110, 0b101, 0b101],
-        'S' => [0b111, 0b100, 0b111, 0b001, 0b111],
-        'T' => [0b111, 0b010, 0b010, 0b010, 0b010],
-        'U' => [0b101, 0b101, 0b101, 0b101, 0b111],
-        'V' => [0b101, 0b101, 0b101, 0b101, 0b010],
-        'W' => [0b101, 0b101, 0b101, 0b111, 0b101],
-        _ => [0; 5],
-    }
-}
-
-/// Draw `s` (uppercase) with its top-left at `x,y`, each cell `scale` px.
+/// Draw `s` with its top-left at `x,y`, each font pixel `scale` px.
+#[allow(clippy::too_many_arguments)]
 fn text(buf: &mut [u8], w: u32, h: u32, x: i32, y: i32, s: &str, scale: i32, c: [u8; 3]) {
-    let mut cx = x;
-    for ch in s.chars() {
-        let g = glyph(ch);
-        for (row, bits) in g.iter().enumerate() {
-            for col in 0..3 {
-                if bits & (1 << (2 - col)) != 0 {
-                    for sy in 0..scale {
-                        for sx in 0..scale {
-                            put(
-                                buf,
-                                w,
-                                h,
-                                cx + col * scale + sx,
-                                y + row as i32 * scale + sy,
-                                c,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        cx += 4 * scale; // 3 px glyph + 1 px gap
-    }
+    wk_pixelfont::SMALL.draw(buf, w, h, x, y, s, scale, c);
 }
 
 /// Pixel width of `s` at `scale`.
 fn text_w(s: &str, scale: i32) -> i32 {
-    (s.chars().count() as i32 * 4 - 1) * scale
+    wk_pixelfont::SMALL.measure(s, scale)
 }
 
 /// Draw a knob: dark body, coloured ring, an indicator from the value (270°

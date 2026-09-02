@@ -9,7 +9,6 @@
 #[allow(warnings)]
 mod bindings;
 
-mod font;
 mod paint;
 mod song_file;
 
@@ -400,6 +399,20 @@ impl App {
         self.file = Some(file);
     }
 
+    /// What to persist through `wk:options`.
+    ///
+    /// Nothing, when a MIDI file is the document. The file already holds the
+    /// song and wins at startup, so writing it here too would bloat every
+    /// workspace file with a copy of the music and leave two sources of truth
+    /// to drift apart. A track mute is the one thing a MIDI file cannot carry;
+    /// losing it on reload is a smaller cost than that divergence.
+    fn options(&self) -> Vec<f32> {
+        match self.file {
+            Some(_) => Vec::new(),
+            None => self.song.to_options(),
+        }
+    }
+
     /// Which patterns an export lays end to end: the chain in song mode, or the
     /// pattern being looped. Exporting what you hear surprises nobody.
     fn export_order(&self) -> Vec<usize> {
@@ -601,7 +614,7 @@ impl Guest for Component {
             until_file_check -= 1;
 
             if app.dirty {
-                bindings::wk::options::options::store(&app.song.to_options());
+                bindings::wk::options::options::store(&app.options());
                 app.dirty = false;
             }
             if app.status_left > 0 {

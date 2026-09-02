@@ -11000,6 +11000,10 @@ name = "wk-midifile"
 version = "0.1.0"
 
 [[package]]
+name = "wk-pixelfont"
+version = "0.1.0"
+
+[[package]]
 name = "wk-protocol"
 version = "0.1.0"
 dependencies = [

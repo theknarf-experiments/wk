@@ -3,7 +3,17 @@
 //! [`Layout`] is computed once a frame and read by both the input code and the
 //! painting code, so a click always lands on what was drawn.
 
-use crate::font::{text, text_width};
+use wk_pixelfont::REGULAR as FONT;
+
+/// Draw `s` at `(x, y)`. A thin wrapper so the call sites stay short.
+#[allow(clippy::too_many_arguments)]
+fn text(buf: &mut [u8], w: u32, h: u32, x: i32, y: i32, s: &str, scale: i32, color: [u8; 3]) {
+    FONT.draw(buf, w, h, x, y, s, scale, color);
+}
+
+fn text_width(s: &str, scale: i32) -> i32 {
+    FONT.measure(s, scale)
+}
 use crate::{App, ROWS, Transport};
 use wk_sequence::{MAX_PATTERNS, MAX_TRACKS, Playback, Position};
 

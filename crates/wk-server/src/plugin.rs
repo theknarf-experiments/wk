@@ -5622,6 +5622,15 @@ mod tests {
             "and its tempo"
         );
 
+        // With a file wired, the node's own options stay empty: the file is the
+        // document. Writing the song here as well would put a copy of the music
+        // into every `.wk` that uses the node, and leave two sources of truth
+        // free to drift apart.
+        assert!(
+            node.options.lock().unwrap().is_empty(),
+            "the song is in the file, not duplicated into the workspace"
+        );
+
         node.kill.store(true, Ordering::Relaxed);
     }
 

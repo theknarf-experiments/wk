@@ -1,0 +1,8 @@
+[package]
+name = "wk-pixelfont"
+version = "0.1.0"
+edition = "2021"
+
+# Deliberately dependency-free: compiled into the host (where it is tested) and
+# into several plugins' wasm components.
+[dependencies]

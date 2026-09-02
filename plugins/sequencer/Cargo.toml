@@ -9,6 +9,7 @@ edition = "2024"
 # What is left here is the window: drawing, clicks, and talking to wk.
 wk-sequence = { path = "../../crates/wk-sequence" }
 wk-midifile = { path = "../../crates/wk-midifile" }
+wk-pixelfont = { path = "../../crates/wk-pixelfont" }
 wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
 
 [lib]
