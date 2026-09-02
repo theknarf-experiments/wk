@@ -6078,4 +6078,224 @@ mod tests {
 
         node.kill.store(true, Ordering::Relaxed);
     }
+    /// LibreOffice Impress, drawing its own window through vcl/wk.
+    ///
+    /// This is the whole port's observable: an office suite that has never had
+    /// a windowing system compiled into it, presenting a composited frame to a
+    /// wk surface. vcl/wk is a SvpSalInstance subclass -- cairo, freetype and
+    /// fontconfig do the drawing exactly as they do headless -- plus a
+    /// compositor that flattens VCL's many SalFrames (a menu, a tooltip and a
+    /// dialog are each their own frame) into the one RGBA8 buffer a node has.
+    ///
+    /// instdir is bind-mounted rather than layered into an image because the
+    /// install tree is ~1 GB of build output and the port hardcodes /instdir --
+    /// nothing at run time can discover where it is, since wasm has no dladdr,
+    /// wasi-libc's realpath is a stub, and a guest gets only a basename in
+    /// argv[0]. Skipped when the artifact isn't built.
+    #[test]
+    fn libreoffice_impress_paints_its_window_through_vcl_wk() {
+        let plugin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/libreoffice");
+        let instdir = plugin.join("build/instdir");
+        let wasm = instdir.join("program/soffice.bin");
+        if !wasm.exists() {
+            eprintln!("skipping: build plugins/libreoffice first (./build-lo.sh)");
+            return;
+        }
+
+        // A writable place for the user profile and for temp files. osl's
+        // mkdir walks up looking for a parent that exists, and on wasi every
+        // path outside a preopen answers ENOENT, so /tmp has to be real.
+        // std::env::temp_dir rather than a tempfile crate, matching the shader
+        // test: the directories outlive the guest by design, because a node log
+        // is worth reading after a failure.
+        let base = std::env::temp_dir().join(format!("wk-lo-{}", std::process::id()));
+        let work = base.join("work");
+        let tmp = base.join("tmp");
+        std::fs::create_dir_all(&work).expect("workdir");
+        std::fs::create_dir_all(&tmp).expect("tmpdir");
+        std::fs::copy(plugin.join("work/mini.fodp"), work.join("mini.fodp"))
+            .expect("the test document; run plugins/libreoffice/run-lo.sh once to create work/");
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let surfaces: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        host.spawn(
+            &wasm,
+            "libreoffice",
+            id,
+            &[],
+            surfaces.clone(),
+            nodes.clone(),
+            Vec::new(),
+            Some(crate::images::ContainerSetup {
+                layers: Vec::new(),
+                env: {
+                    let mut env = vec![
+                        ("HOME".into(), "/work".into()),
+                        ("TMPDIR".into(), "/tmp".into()),
+                        // The build is configured with --enable-sal-log, and a
+                        // silent LibreOffice is indistinguishable from one that
+                        // never started. These warnings are the progress report.
+                        (
+                            "SAL_LOG".into(),
+                            std::env::var("WK_LO_SAL_LOG").unwrap_or_else(|_| "+WARN".into()),
+                        ),
+                    ];
+                    // The shim's own trace knobs (WK_LO_TRACE_THROW,
+                    // WK_LO_TRAP_THROW, WK_LO_TRACE_ALLOC and vcl/wk's frame
+                    // dumps) are forwarded rather than named, exactly as
+                    // plugins/libreoffice/run-lo.sh forwards them: a knob added
+                    // to the guest should not need a change here to be usable.
+                    for (k, v) in std::env::vars() {
+                        if k.starts_with("WK_LO_") && k != "WK_LO_SAL_LOG" && k != "WK_LO_DUMP" {
+                            env.push((k, v));
+                        }
+                    }
+                    env
+                },
+            }),
+        )
+        .expect("spawn");
+
+        // soffice.bin links curl, so it imports wasi:sockets, so wk classes it
+        // as a networked node -- and networked nodes wait to be Run rather than
+        // auto-starting. Without run_node below, the node sits compiled and
+        // idle forever and the only symptom is an empty log.
+        //
+        // Compiling 190 MB of wasm is minutes on a cold cache, so the wait for
+        // is_runnable() is generous.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+        let node = loop {
+            if let Some(n) = nodes.lock().unwrap().iter().find(|n| n.id == id).cloned() {
+                if n.is_runnable() {
+                    break n;
+                }
+                assert!(
+                    !n.finished.load(Ordering::Relaxed),
+                    "libreoffice node failed to compile"
+                );
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "libreoffice node never compiled"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+
+        // The filesystem has to be there before the guest runs, which is easy
+        // here and is why the mounts are between compile and run rather than
+        // racing the guest as the shader test's single file can afford to.
+        // Writable, though nothing should write to it: fontconfig wants a
+        // cache directory inside it, and read-only turns that into a warning
+        // on every start.
+        crate::vfs::mount_host(&node.fs, "/instdir", instdir.clone(), true);
+        crate::vfs::mount_host(&node.fs, "/work", work.clone(), true);
+        crate::vfs::mount_host(&node.fs, "/tmp", tmp.clone(), true);
+
+        // The arguments belong to run_node, not to spawn: a networked node's
+        // spawn arguments are the ones it would have auto-started with, and it
+        // does not auto-start. Passing them here is what a Run from the UI does.
+        host.run_node(
+            &node,
+            &[
+                "-env:UserInstallation=file:///work/.profile".into(),
+                "/work/mini.fodp".into(),
+            ],
+        )
+        .expect("run libreoffice");
+
+        // Cranelift on a 190 MB component, then UNO bootstrap, then the
+        // document. Generous, and the assert reports the node's own log.
+        let started = std::time::Instant::now();
+        let mut last_report = 0u64;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+        let surface = loop {
+            if let Some(s) = surfaces.lock().unwrap().first().cloned() {
+                break s;
+            }
+            assert!(
+                !node.finished.load(Ordering::Relaxed),
+                "soffice exited before opening a surface; node log:\n{}",
+                String::from_utf8_lossy(&node.term_io.log_read(0).0)
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "soffice never opened a surface; node log:\n{}",
+                String::from_utf8_lossy(&node.term_io.log_read(0).0)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if started.elapsed().as_secs() / 30 != last_report {
+                last_report = started.elapsed().as_secs() / 30;
+                eprintln!(
+                    "  [{}s] still waiting for a surface; {} bytes of node log",
+                    started.elapsed().as_secs(),
+                    node.term_io.log_read(0).0.len()
+                );
+            }
+        };
+
+        let pump_frame = || {
+            let mut s = surface.lock().unwrap();
+            s.frame_ready = true;
+            s.wake();
+        };
+
+        // What an Impress window is, as a histogram: mostly VCL's light grey
+        // face colour, a substantial white area (the slide and the sidebar),
+        // and thousands of dark pixels (menu text, toolbar glyphs, borders).
+        // A blank fill passes none of those three; the compositor's own
+        // mid-grey background passes none of them either, which is why it is
+        // mid-grey and not black.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        let (dark, light, white) = loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            {
+                let s = surface.lock().unwrap();
+                let mut dark = 0usize;
+                let mut light = 0usize;
+                let mut white = 0usize;
+                for px in s.pixels.chunks_exact(4) {
+                    let lum = px[0] as u32 + px[1] as u32 + px[2] as u32;
+                    if lum < 200 {
+                        dark += 1;
+                    } else if lum > 750 {
+                        white += 1;
+                        light += 1;
+                    } else if lum > 600 {
+                        light += 1;
+                    }
+                }
+                if dark > 2_000 && light > 100_000 && white > 20_000 {
+                    break (dark, light, white);
+                }
+            }
+            assert!(
+                !node.finished.load(Ordering::Relaxed),
+                "soffice exited before painting; node log:\n{}",
+                String::from_utf8_lossy(&node.term_io.log_read(0).0)
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "soffice never painted a window; node log:\n{}",
+                String::from_utf8_lossy(&node.term_io.log_read(0).0)
+            );
+        };
+        eprintln!("impress frame: {dark} dark, {light} light, {white} white px");
+
+        // A histogram proves "not blank", never "a window". WK_LO_DUMP=/tmp/f.ppm
+        // writes the composited surface out so a human can look at it, which is
+        // the only way to catch a backend that paints something plausible and
+        // wrong.
+        if let Ok(path) = std::env::var("WK_LO_DUMP") {
+            let s = surface.lock().unwrap();
+            let mut ppm = format!("P6\n{} {}\n255\n", s.width, s.height).into_bytes();
+            ppm.extend(s.pixels.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
+            std::fs::write(&path, ppm).expect("write frame dump");
+            eprintln!("impress frame dumped to {path}");
+        }
+
+        node.kill.store(true, Ordering::Relaxed);
+    }
 }

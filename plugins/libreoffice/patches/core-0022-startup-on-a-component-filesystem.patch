@@ -1,0 +1,64 @@
+diff --git a/desktop/source/app/userinstall.cxx b/desktop/source/app/userinstall.cxx
+index 7243db43e..83c3308c1 100644
+--- a/desktop/source/app/userinstall.cxx
++++ b/desktop/source/app/userinstall.cxx
+@@ -27,7 +27,7 @@
+ #include <officecfg/Setup.hxx>
+ #include <osl/file.h>
+ #include <osl/file.hxx>
+-#if defined ANDROID || defined IOS || defined EMSCRIPTEN
++#if defined ANDROID || defined IOS || defined EMSCRIPTEN || defined WASI
+ #include <rtl/bootstrap.hxx>
+ #endif
+ #include <rtl/ustring.hxx>
+@@ -104,7 +104,14 @@ Status create(OUString const & uri) {
+     if (e != osl::FileBase::E_None && e != osl::FileBase::E_EXIST) {
+         return ERROR_OTHER;
+     }
+-#if !(defined ANDROID || defined IOS || defined EMSCRIPTEN)
++// WASI joins them, and for their reason: the block below copies the whole
++// presets tree into the profile and sets POSIX permissions on it, and a
++// component has neither a use for the copy -- /instdir is right there and is
++// never going to be edited underneath it -- nor a permission model to set.
++// osl_copyFile across wk's vfs also has to materialise every file through the
++// host, which is a lot of work to produce a second copy of something already
++// mounted.
++#if !(defined ANDROID || defined IOS || defined EMSCRIPTEN || defined WASI)
+ #if defined UNIX
+     // Set safer permissions for the user directory by default:
+     osl::File::setAttributes(
+@@ -132,7 +139,7 @@ Status create(OUString const & uri) {
+         return ERROR_OTHER;
+     }
+ #else
+-    // On (Android and) iOS, just create the user directory. Later code fails mysteriously if it
++    // On (Android, iOS and WASI), just create the user directory. Later code fails mysteriously if it
+     // doesn't exist.
+     OUString userDir("${$BRAND_BASE_DIR/" LIBO_ETC_FOLDER "/" SAL_CONFIGFILE("bootstrap") ":UserInstallation}/user");
+     rtl::Bootstrap::expandMacros(userDir);
+diff --git a/framework/source/accelerators/presethandler.cxx b/framework/source/accelerators/presethandler.cxx
+index e30a1b468..9f31204d2 100644
+--- a/framework/source/accelerators/presethandler.cxx
++++ b/framework/source/accelerators/presethandler.cxx
+@@ -35,6 +35,7 @@
+ #include <cppuhelper/exc_hlp.hxx>
+ #include <rtl/ustrbuf.hxx>
+ #include <osl/diagnose.h>
++#include <sal/log.hxx>
+ #include <i18nlangtag/languagetag.hxx>
+ 
+ const ::sal_Int32 ID_CORRUPT_UICONFIG_SHARE   = 1;
+@@ -165,6 +166,13 @@ void lcl_throwCorruptedUIConfigurationException(
+     css::uno::Exception e;
+     bool ok = (exception >>= e);
+     OSL_ASSERT(ok);
++    // Logged as well as thrown: this exception aborts startup, the handler far
++    // above turns it into a generic "corrupt configuration" dialog, and the
++    // only thing that says WHICH storage failed is the inner exception right
++    // here.
++    SAL_WARN("fwk.accelerators", "corrupt UI configuration (id "
++             << static_cast<sal_Int32>(id) << "): " << exception.getValueTypeName() << ": "
++             << e.Message);
+     throw css::configuration::CorruptedUIConfigurationException(
+         lcl_getLocalizedMessage(id),
+         css::uno::Reference< css::uno::XInterface >(),

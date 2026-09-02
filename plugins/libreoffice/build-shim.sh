@@ -27,11 +27,14 @@ SHIM_LIB="$LO_SHIM_LIB"   # common.sh owns the path; the makefile patch uses the
 
 [ -f "$SHIM_SRC" ] || lo_die "missing $SHIM_SRC"
 
+# A skip rather than an exit: there is a second shim below, and an early exit
+# here used to mean the graphics one was silently never built.
 if [ -f "$SHIM_LIB" ] && [ "$SHIM_LIB" -nt "$SHIM_SRC" ]; then
     echo "=== shim: up to date ($SHIM_LIB)"
-    exit 0
+    SHIM_UP_TO_DATE=1
 fi
 
+if [ "${SHIM_UP_TO_DATE:-0}" != 1 ]; then
 echo "=== shim: $SHIM_SRC -> $SHIM_LIB"
 
 # The same target and exception flags as everything else in the build. The shim
@@ -57,3 +60,58 @@ for sym in pthread_cond_timedwait pthread_cond_wait __wrap___cxa_throw __wrap_ma
         || lo_die "$SHIM_LIB does not define $sym"
 done
 echo "    defines pthread_cond_timedwait, pthread_cond_wait, __wrap___cxa_throw, __wrap_malloc ($(wc -c <"$SHIM_LIB" | tr -d ' ') bytes)"
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 0b: the wk graphics shim.
+#
+# plugins/gfx-compat is the C API every wk GUI port draws through — doom,
+# quake, mupdf, netsurf and the Qt QPA all include the same wkgfx.h — and
+# vcl/wk is now one of them. It is built here, beside the thread shim, for the
+# same reason: WASI_INTEL_GCC.mk names the archive on every link line, so it
+# has to exist before make is first invoked.
+#
+# Two objects, not one archive, because they are not the same kind of thing:
+#
+#   libwkgfx.a                 wkgfx.c and the wit-bindgen output. Ordinary
+#                              code, pulled in by reference from vcl/wk.
+#   wkgfx_component_type.o     linked DIRECTLY, never through the archive: it
+#                              exists only for a custom section describing the
+#                              component's imports, nothing references a symbol
+#                              in it, and a static-archive member nothing
+#                              references is exactly what a linker drops.
+#                              plugins/qt/qpa/CMakeLists.txt:36-39 says the
+#                              same thing in its own words.
+#
+# gen/ is regenerated every build, like every other gfx-compat consumer does
+# it. It is shared and disposable and never the source of truth.
+GFXCOMPAT="$LO_ROOT/../gfx-compat"
+GFXGEN="$GFXCOMPAT/gen"
+GFX_LIB="$LO_ROOT/shim/libwkgfx.a"
+
+[ -d "$GFXCOMPAT" ] || lo_die "missing $GFXCOMPAT (plugins/gfx-compat)"
+command -v wit-bindgen >/dev/null 2>&1 || lo_die "wit-bindgen not on PATH (mise install)"
+
+echo "=== gfx shim: wit-bindgen (wkgfx world)"
+mkdir -p "$GFXGEN"
+wit-bindgen c --world wkgfx "$GFXCOMPAT/wit" --out-dir "$GFXGEN" >/dev/null \
+    || lo_die "wit-bindgen failed"
+
+# Distinct member names: gfx-compat/wkgfx.c and gen/wkgfx.c share a basename,
+# and `ar r` replaces members BY basename -- so naming both objects wkgfx.o
+# silently produces an archive with one of them in it.
+rm -f "$GFX_LIB"
+gfx_obj() {
+    "$WASI_SDK/bin/clang" --target="$LO_HOST_TRIPLE" $LO_EH_FLAGS \
+        -O2 -I"$GFXCOMPAT" -I"$GFXGEN" -c "$1" -o "$2" || lo_die "compile failed: $1"
+    "$LO_AR" crs "$GFX_LIB" "$2" || lo_die "ar failed"
+}
+gfx_obj "$GFXCOMPAT/wkgfx.c" "$LO_ROOT/shim/wkgfx-shim.o"
+gfx_obj "$GFXGEN/wkgfx.c"    "$LO_ROOT/shim/wkgfx-bindings.o"
+[ -f "$GFXGEN/wkgfx_component_type.o" ] || lo_die "$GFXGEN/wkgfx_component_type.o missing"
+
+for sym in wkgfx_open wkgfx_present wkgfx_poll_event; do
+    "$LO_NM" --defined-only "$GFX_LIB" | grep -q " T $sym\$" \
+        || lo_die "$GFX_LIB does not define $sym"
+done
+echo "    defines wkgfx_open, wkgfx_present, wkgfx_poll_event ($(wc -c <"$GFX_LIB" | tr -d ' ') bytes)"

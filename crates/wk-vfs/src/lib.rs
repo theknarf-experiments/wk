@@ -810,7 +810,18 @@ fn resolve_at(fs: &Fs, start: u64, path: &str, follow_final: bool) -> Option<u64
         .map(str::to_string)
         .collect();
     let mut cur = if path.starts_with('/') { ROOT } else { start };
+    // Ancestors of `cur`, so `..` can go back up. A stack rather than a parent
+    // pointer in the node, because a directory reached through a symlink has
+    // no single parent: POSIX says `..` follows the path actually walked, and
+    // this is that path.
+    let mut ancestors: Vec<u64> = Vec::new();
     while let Some(comp) = todo.pop() {
+        if comp == ".." {
+            // At the root, `..` is the root — the same answer a POSIX kernel
+            // gives, and the reason "/.." is not a way out of a chroot.
+            cur = ancestors.pop().unwrap_or(ROOT);
+            continue;
+        }
         let next = match fs.nodes.get(&cur)? {
             Node::Dir(children) => *children.get(&comp)?,
             // A non-directory in the middle of a path is an error.
@@ -825,13 +836,17 @@ fn resolve_at(fs: &Fs, start: u64, path: &str, follow_final: bool) -> Option<u64
                 }
                 if target.starts_with('/') {
                     cur = ROOT;
+                    ancestors.clear();
                 }
                 // The link's own components run before whatever is left.
                 for c in components(target).into_iter().rev() {
                     todo.push(c.to_string());
                 }
             }
-            Some(_) => cur = next,
+            Some(_) => {
+                ancestors.push(cur);
+                cur = next;
+            }
             None => return None,
         }
     }
@@ -1003,7 +1018,16 @@ fn resolve_place(fs: &Fs, start: u64, path: &str, follow_final: bool) -> Resolve
             readonly: fs.readonly.contains(&cur),
         };
     }
+    // See resolve_at: `..` follows the path actually walked, so it needs the
+    // ancestors of `cur` rather than a parent pointer. Both resolvers do this,
+    // because both are reachable from a guest -- resolve_at from read_file and
+    // friends, this one from every path_open and stat the guest makes.
+    let mut ancestors: Vec<u64> = Vec::new();
     while let Some(comp) = todo.pop() {
+        if comp == ".." {
+            cur = ancestors.pop().unwrap_or(ROOT);
+            continue;
+        }
         let next = match fs.nodes.get(&cur) {
             Some(Node::Dir(children)) => match children.get(&comp) {
                 Some(id) => *id,
@@ -1030,12 +1054,16 @@ fn resolve_place(fs: &Fs, start: u64, path: &str, follow_final: bool) -> Resolve
                 }
                 if target.starts_with('/') {
                     cur = ROOT;
+                    ancestors.clear();
                 }
                 for c in components(target).into_iter().rev() {
                     todo.push(c.to_string());
                 }
             }
-            Some(_) => cur = next,
+            Some(_) => {
+                ancestors.push(cur);
+                cur = next;
+            }
             None => return Resolved::Missing,
         }
     }
@@ -3345,6 +3373,101 @@ mod tests {
     /// survive being pointed at directories, and can't loop forever. This is
     /// how a multicall binary provides its command names: one executable,
     /// many links.
+    /// `..` walks back up, and does it against the directory actually
+    /// reached rather than lexically — which is the difference that matters
+    /// once a symlink is in the path. LibreOffice found this one: its
+    /// fundamentalrc sets BRAND_BASE_DIR to `${ORIGIN}/..`, so every
+    /// configuration layer it reads is an `/instdir/program/../share/...`
+    /// path, and with `..` treated as an ordinary name the whole registry
+    /// silently read as empty.
+    #[test]
+    fn parent_links_walk_up_the_path_actually_taken() {
+        let fs = new_fs();
+        {
+            let mut g = fs.lock().unwrap();
+            g.ensure_dir_path("instdir/program");
+            g.ensure_dir_path("instdir/share/registry");
+            g.put_file_at("instdir/share/registry/main.xcd", b"<oor:data/>".to_vec());
+            // A symlink whose target is somewhere else entirely: `..` from
+            // inside it must return to where the WALK was, not to the link's
+            // own directory.
+            g.ensure_dir_path("elsewhere/deep");
+            g.put_file_at("elsewhere/deep/marker", b"deep".to_vec());
+            g.put_symlink_at("instdir/program/link", "/elsewhere/deep".into());
+        }
+        let read = |path: &str| -> Option<Vec<u8>> { fs.lock().unwrap().read_file(path, 4096) };
+
+        assert_eq!(
+            read("/instdir/program/../share/registry/main.xcd").as_deref(),
+            Some(&b"<oor:data/>"[..]),
+            "the exact shape of every LibreOffice configuration layer path"
+        );
+        assert_eq!(
+            read("/instdir/share/registry/../../share/registry/main.xcd").as_deref(),
+            Some(&b"<oor:data/>"[..]),
+            "several .. in a row"
+        );
+        assert_eq!(
+            read("/instdir/program/link/marker").as_deref(),
+            Some(&b"deep"[..]),
+            "the symlink itself still resolves"
+        );
+        assert_eq!(
+            read("/instdir/program/link/../deep/marker").as_deref(),
+            Some(&b"deep"[..]),
+            ".. from inside a followed symlink goes to the TARGET's parent, \
+             which is what a POSIX kernel does and what a lexical rewrite \
+             would get wrong"
+        );
+        assert_eq!(
+            read("/../../../../instdir/share/registry/main.xcd").as_deref(),
+            Some(&b"<oor:data/>"[..]),
+            ".. at the root is the root, so it is not a way out"
+        );
+
+        // The guest does not call read_file; it calls path_open and stat, and
+        // those go through a SECOND resolver. Fixing only the first one is why
+        // LibreOffice's configuration started loading while its UI
+        // configuration still reported
+        //   URL ".../program/../share/config/soffice.cfg" does not denote an
+        //   existing directory
+        // -- a file read through .. worked and a directory stat through .. did
+        // not.
+        use wasi::filesystem::types::HostDescriptor;
+        let mut store = VfsImpl(TestStore {
+            table: ResourceTable::new(),
+            fs: fs.clone(),
+        });
+        let root = store
+            .0
+            .table
+            .push(Descriptor::open(fs.clone(), ROOT))
+            .unwrap();
+        let stat = |store: &mut VfsImpl<TestStore>, path: &str| {
+            HostDescriptor::stat_at(
+                store,
+                Resource::new_own(root.rep()),
+                PathFlags::SYMLINK_FOLLOW,
+                path.into(),
+            )
+            .unwrap()
+            .map(|s| s.type_)
+        };
+        assert_eq!(
+            stat(&mut store, "instdir/program/../share/registry"),
+            Ok(DescriptorType::Directory),
+            "a directory reached through .. must stat as a directory"
+        );
+        assert_eq!(
+            stat(&mut store, "instdir/program/../share/registry/main.xcd"),
+            Ok(DescriptorType::RegularFile),
+        );
+        assert!(
+            stat(&mut store, "instdir/program/../share/nope").is_err(),
+            ".. does not conjure entries that are not there"
+        );
+    }
+
     #[test]
     fn symlinks_resolve_and_bound_loops() {
         use wasi::filesystem::types::HostDescriptor;

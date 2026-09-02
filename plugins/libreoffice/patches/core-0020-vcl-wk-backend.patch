@@ -1,3 +1,42 @@
+diff --git a/include/vcl/wk/wkcompositor.hxx b/include/vcl/wk/wkcompositor.hxx
+new file mode 100644
+index 000000000..39aa4e177
+--- /dev/null
++++ b/include/vcl/wk/wkcompositor.hxx
+@@ -0,0 +1,33 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This file is part of the LibreOffice project.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++#pragma once
++
++#include <sal/types.h>
++
++#include <vector>
++
++class SvpSalFrame;
++
++namespace vcl::wk
++{
++/** Flattens VCL's per-frame cairo surfaces into the single RGBA8 buffer a wk
++    node presents. See wkcompositor.cxx for why that is necessary at all. */
++class Compositor
++{
++    std::vector<sal_uInt8> m_aBuffer;
++
++public:
++    /** Composite every visible frame, back to front, and present the result.
++        @param rFrames frames in creation order, which is the paint order. */
++    void composite(const std::vector<SvpSalFrame*>& rFrames);
++};
++}
++
++/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
 diff --git a/postprocess/Module_postprocess.mk b/postprocess/Module_postprocess.mk
 index 0fbede6a9..5b2f5f2c1 100644
 --- a/postprocess/Module_postprocess.mk
@@ -12,7 +51,7 @@ index 0fbede6a9..5b2f5f2c1 100644
      CustomTarget_fontconfig \
      Package_fontconfig \
 diff --git a/vcl/Library_vcl.mk b/vcl/Library_vcl.mk
-index 1452533b7..2e971e36c 100644
+index 1452533b7..41af42ce4 100644
 --- a/vcl/Library_vcl.mk
 +++ b/vcl/Library_vcl.mk
 @@ -29,6 +29,12 @@ else ifeq ($(OS),ANDROID)
@@ -28,7 +67,7 @@ index 1452533b7..2e971e36c 100644
  else ifeq ($(DISABLE_GUI),TRUE)
  $(eval $(call gb_Library_add_componentimpl,vcl,headless))
  else
-@@ -674,7 +680,16 @@ $(eval $(call gb_Library_add_libs,vcl,\
+@@ -674,7 +680,17 @@ $(eval $(call gb_Library_add_libs,vcl,\
  ))
  endif
  
@@ -40,6 +79,7 @@ index 1452533b7..2e971e36c 100644
 +# not have.
 +$(eval $(call gb_Library_add_exception_objects,vcl,\
 +    vcl/wk/wkinst \
++    vcl/wk/wkcompositor \
 +))
 +
 +else ifeq ($(DISABLE_GUI),TRUE)
@@ -64,12 +104,160 @@ index 94f7951d6..68386af09 100644
      // SalFrame
      virtual SalGraphics*        AcquireGraphics() override;
      virtual void                ReleaseGraphics( SalGraphics* pGraphics ) override;
+diff --git a/vcl/wk/wkcompositor.cxx b/vcl/wk/wkcompositor.cxx
+new file mode 100644
+index 000000000..0ff5fdf62
+--- /dev/null
++++ b/vcl/wk/wkcompositor.cxx
+@@ -0,0 +1,142 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This file is part of the LibreOffice project.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Flattening VCL's frames into wk's one surface.
++ *
++ * A wk node has exactly one surface: no child windows, no popups, no
++ * decorations. VCL has the opposite arrangement -- every menu, tooltip, dialog
++ * and floating toolbar is its own SalFrame with its own cairo surface, placed
++ * in a shared screen coordinate space. Something has to flatten one into the
++ * other, and that is this file. It is the role QFbScreen plays for Qt
++ * (plugins/qt/qpa/qwkcompositor.cpp is the same three steps in Qt's vocabulary).
++ *
++ * Order is creation order, which is also back-to-front: VCL creates a popup
++ * after the window it belongs to, and a dialog after the document window it
++ * covers. That is not guaranteed by anything, but nothing in Impress has yet
++ * produced a counter-example, and the alternative -- tracking z-order through
++ * ToTop and SetAlwaysOnTop -- can wait until something looks wrong.
++ *
++ * Pixels: cairo gives us premultiplied ARGB32, and --enable-cairo-rgba makes
++ * that [r,g,b,a] in memory order, which is exactly what wkgfx_present wants.
++ * So the common case -- an opaque frame, alpha 255 -- is a straight row copy,
++ * and only genuinely translucent pixels need the compositing arithmetic below.
++ */
++
++#include <vcl/wk/wkcompositor.hxx>
++
++#include <headless/svpframe.hxx>
++#include <sal/log.hxx>
++
++#include <cairo.h>
++#include <wkgfx.h>
++
++#include <algorithm>
++#include <cstring>
++
++namespace vcl::wk
++{
++namespace
++{
++// Composite one premultiplied RGBA source row over a destination row.
++// Both are [r,g,b,a]; the destination is opaque, so its alpha stays 255.
++void blendRow(sal_uInt8* pDst, const sal_uInt8* pSrc, int nPixels)
++{
++    for (int i = 0; i < nPixels; ++i, pDst += 4, pSrc += 4)
++    {
++        const sal_uInt8 nAlpha = pSrc[3];
++        if (nAlpha == 255)
++        {
++            pDst[0] = pSrc[0];
++            pDst[1] = pSrc[1];
++            pDst[2] = pSrc[2];
++        }
++        else if (nAlpha != 0)
++        {
++            // Source is premultiplied, so this is src + dst*(1-a).
++            const int nInv = 255 - nAlpha;
++            pDst[0] = static_cast<sal_uInt8>(pSrc[0] + (pDst[0] * nInv + 127) / 255);
++            pDst[1] = static_cast<sal_uInt8>(pSrc[1] + (pDst[1] * nInv + 127) / 255);
++            pDst[2] = static_cast<sal_uInt8>(pSrc[2] + (pDst[2] * nInv + 127) / 255);
++        }
++        pDst[3] = 255;
++    }
++}
++}
++
++void Compositor::composite(const std::vector<SvpSalFrame*>& rFrames)
++{
++    // The surface the host gave us. It is resize-authoritative and may have
++    // changed since the last frame, so this is re-read every time rather than
++    // cached.
++    const int nWidth = static_cast<int>(wkgfx_width());
++    const int nHeight = static_cast<int>(wkgfx_height());
++    if (nWidth <= 0 || nHeight <= 0)
++        return;
++
++    const size_t nNeeded = static_cast<size_t>(nWidth) * nHeight * 4;
++    if (m_aBuffer.size() != nNeeded)
++        m_aBuffer.resize(nNeeded);
++
++    // Opaque mid-grey rather than black: anything that shows through is a
++    // compositing bug, and it should look like one rather than like a border.
++    for (size_t i = 0; i < nNeeded; i += 4)
++    {
++        m_aBuffer[i] = 0x30;
++        m_aBuffer[i + 1] = 0x30;
++        m_aBuffer[i + 2] = 0x30;
++        m_aBuffer[i + 3] = 0xff;
++    }
++
++    for (SvpSalFrame* pFrame : rFrames)
++    {
++        if (!pFrame->isVisible())
++            continue;
++        cairo_surface_t* pSurface = pFrame->GetSurface();
++        if (!pSurface || cairo_surface_status(pSurface) != CAIRO_STATUS_SUCCESS)
++            continue;
++
++        cairo_surface_flush(pSurface);
++        const sal_uInt8* pSrcBase = cairo_image_surface_get_data(pSurface);
++        if (!pSrcBase)
++            continue;
++
++        const int nSrcStride = cairo_image_surface_get_stride(pSurface);
++        const int nSrcWidth = cairo_image_surface_get_width(pSurface);
++        const int nSrcHeight = cairo_image_surface_get_height(pSurface);
++
++        const SalFrameGeometry aGeom = pFrame->GetUnmirroredGeometry();
++        const int nLeft = static_cast<int>(aGeom.x());
++        const int nTop = static_cast<int>(aGeom.y());
++
++        // Clip to the surface. A frame may legitimately hang off the edge --
++        // VCL places popups against a screen whose size it believes, and the
++        // host may have shrunk us since.
++        const int nX0 = std::max(0, nLeft);
++        const int nY0 = std::max(0, nTop);
++        const int nX1 = std::min(nWidth, nLeft + nSrcWidth);
++        const int nY1 = std::min(nHeight, nTop + nSrcHeight);
++        if (nX0 >= nX1 || nY0 >= nY1)
++            continue;
++
++        for (int y = nY0; y < nY1; ++y)
++        {
++            const sal_uInt8* pSrc = pSrcBase + static_cast<size_t>(y - nTop) * nSrcStride
++                                    + static_cast<size_t>(nX0 - nLeft) * 4;
++            sal_uInt8* pDst = m_aBuffer.data() + (static_cast<size_t>(y) * nWidth + nX0) * 4;
++            blendRow(pDst, pSrc, nX1 - nX0);
++        }
++    }
++
++    wkgfx_present(m_aBuffer.data(), static_cast<uint32_t>(nWidth),
++                  static_cast<uint32_t>(nHeight));
++}
++}
++
++/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
 diff --git a/vcl/wk/wkinst.cxx b/vcl/wk/wkinst.cxx
 new file mode 100644
-index 000000000..bda74c782
+index 000000000..7faf5a290
 --- /dev/null
 +++ b/vcl/wk/wkinst.cxx
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,228 @@
 +/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 +/*
 + * This file is part of the LibreOffice project.
@@ -117,7 +305,10 @@ index 000000000..bda74c782
 +#include <sal/log.hxx>
 +#include <rtl/ustrbuf.hxx>
 +
++#include <vcl/wk/wkcompositor.hxx>
++
 +#include <cairo.h>
++#include <wkgfx.h>
 +
 +#include <algorithm>
 +#include <cstdlib>
@@ -131,6 +322,10 @@ index 000000000..bda74c782
 +    // after the window it belongs to. Good enough to composite by until
 +    // something proves otherwise.
 +    std::vector<SvpSalFrame*> m_aFrames;
++
++    vcl::wk::Compositor m_aCompositor;
++    bool m_bSurfaceOpen = false;
++    bool m_bPresented = false;
 +
 +    OString m_aDumpPath;
 +    int m_nDumpAfter = 0;
@@ -158,6 +353,7 @@ index 000000000..bda74c782
 +
 +private:
 +    void dumpFrames();
++    void present();
 +};
 +
 +class WkSalSystem : public SvpSalSystem
@@ -202,6 +398,7 @@ index 000000000..bda74c782
 +void WkSalInstance::DestroyFrame(SalFrame* pFrame)
 +{
 +    std::erase(m_aFrames, static_cast<SvpSalFrame*>(pFrame));
++    SAL_INFO("vcl.wk", "frame " << pFrame << " destroyed, " << m_aFrames.size() << " left");
 +    SvpSalInstance::DestroyFrame(pFrame);
 +}
 +
@@ -226,9 +423,48 @@ index 000000000..bda74c782
 +    }
 +}
 +
++void WkSalInstance::present()
++{
++    if (m_aFrames.empty())
++        return;
++
++    if (!m_bSurfaceOpen)
++    {
++        // Opened on the first frame rather than at startup, so that a
++        // --headless conversion -- which creates no frames -- never asks the
++        // host for a surface it will not draw on.
++        const SalFrameGeometry aGeom = m_aFrames.front()->GetUnmirroredGeometry();
++        if (wkgfx_open(static_cast<uint32_t>(aGeom.width()),
++                       static_cast<uint32_t>(aGeom.height()))
++            != 0)
++        {
++            SAL_WARN("vcl.wk", "wkgfx_open failed");
++            return;
++        }
++        m_bSurfaceOpen = true;
++        SAL_INFO("vcl.wk", "surface opened, " << wkgfx_width() << "x" << wkgfx_height());
++    }
++
++    m_aCompositor.composite(m_aFrames);
++
++    if (!m_bPresented)
++    {
++        m_bPresented = true;
++        size_t nVisible = 0;
++        for (const SvpSalFrame* p : m_aFrames)
++            nVisible += p->isVisible() ? 1 : 0;
++        SAL_INFO("vcl.wk", "first present: " << nVisible << " of " << m_aFrames.size()
++                                             << " frames visible");
++    }
++}
++
 +bool WkSalInstance::DoYield(bool bWait, bool bHandleAllCurrentEvents)
 +{
 +    const bool bAny = SvpSalInstance::DoYield(bWait, bHandleAllCurrentEvents);
++
++    // Present after dispatching, so what goes to the host is the state the
++    // events just produced rather than the one before them.
++    present();
 +
 +    if (m_nDumpAfter > 0 && ++m_nYields >= m_nDumpAfter)
 +    {

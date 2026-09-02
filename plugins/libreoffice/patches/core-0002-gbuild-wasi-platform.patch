@@ -1,9 +1,9 @@
 diff --git a/solenv/gbuild/platform/WASI_INTEL_GCC.mk b/solenv/gbuild/platform/WASI_INTEL_GCC.mk
 new file mode 100644
-index 000000000..b8ac2e14e
+index 000000000..aeb3bc191
 --- /dev/null
 +++ b/solenv/gbuild/platform/WASI_INTEL_GCC.mk
-@@ -0,0 +1,246 @@
+@@ -0,0 +1,272 @@
 +# -*- Mode: makefile-gmake; tab-width: 4; indent-tabs-mode: t -*-
 +#
 +# This file is part of the LibreOffice project.
@@ -46,6 +46,19 @@ index 000000000..b8ac2e14e
 +# is worth having.
 +
 +include $(GBUILDDIR)/platform/unxgcc.mk
++
++# plugins/gfx-compat, the C API every wk GUI port draws through. vcl/wk includes
++# its header, so the include path is public here rather than set per-library.
++gb_WASI_GFX_DIR := $(SRCDIR)/../../gfx-compat
++gb_WASI_GFX_INC := -I$(gb_WASI_GFX_DIR) -I$(gb_WASI_GFX_DIR)/gen
++gb_WASI_GFX_LIB := $(SRCDIR)/../shim/libwkgfx.a
++# Linked as a bare object, never through the archive: it exists only for the
++# custom section naming the component's imports, nothing references a symbol in
++# it, and an archive member nothing references is what a linker drops.
++gb_WASI_GFX_CTYPE := $(gb_WASI_GFX_DIR)/gen/wkgfx_component_type.o
++ifeq ($(wildcard $(gb_WASI_GFX_LIB)),)
++$(error the wk graphics shim $(gb_WASI_GFX_LIB) does not exist. Run plugins/libreoffice/build-shim.sh)
++endif
 +
 +gb_RUN_CONFIGURE := $(SRCDIR)/solenv/bin/run-configure
 +
@@ -103,6 +116,16 @@ index 000000000..b8ac2e14e
 +# anything in this file runs — and LinkTarget.mk:68 puts *that* on the compile
 +# command. Filtering only gb_CXXFLAGS changes nothing at all; verified by
 +# reading the command back out of `make verbose=t`.
++# The gfx header is reachable from every compile, not just vcl/wk's: gbuild has
++# no per-directory include hook, and one -I costs nothing.
++#
++# gb_LinkTarget_CFLAGS, not gb_CFLAGS: unxgcc.mk has already snapshotted
++# gb_CFLAGS into gb_LinkTarget_CFLAGS by the time this file gets to say
++# anything, so appending to the former is silently ignored -- as the exception
++# flags below have to do the same thing for the same reason.
++gb_LinkTarget_CFLAGS += $(gb_WASI_GFX_INC)
++gb_LinkTarget_CXXFLAGS += $(gb_WASI_GFX_INC)
++
 +gb_CXXFLAGS := $(filter-out -pthread,$(gb_CXXFLAGS))
 +gb_LinkTarget_CXXFLAGS := $(filter-out -pthread,$(gb_LinkTarget_CXXFLAGS))
 +
@@ -167,6 +190,7 @@ index 000000000..b8ac2e14e
 +$(error the wasip2 thread shim $(gb_WASI_SHIM) does not exist. Run plugins/libreoffice/build-shim.sh (about a second). Without it, pthread_cond_timedwait returns ENOTSUP and libc++ aborts the moment anything waits with a timeout)
 +endif
 +
++
 +# The link half. -l flags cannot live in CC/CXX (they would be passed on every
 +# compile step too), which is why EMSCRIPTEN_INTEL_GCC.mk:58 puts its own here.
 +#
@@ -190,6 +214,8 @@ index 000000000..b8ac2e14e
 +#                      WK_LO_TRACE_ALLOC is set to a byte threshold.
 +gb_LinkTarget_LDFLAGS += \
 +	-Wl,--whole-archive $(gb_WASI_SHIM) -Wl,--no-whole-archive \
++	$(gb_WASI_GFX_LIB) \
++	$(gb_WASI_GFX_CTYPE) \
 +	-lunwind \
 +	-lsetjmp \
 +	-lwasi-emulated-signal \
