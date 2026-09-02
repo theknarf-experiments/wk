@@ -270,6 +270,27 @@ impl wk::webaudio::audio::HostGain for HostState {
         Ok(())
     }
 
+    fn ramp_at(
+        &mut self,
+        this: Resource<Gain>,
+        start_value: f32,
+        end_value: f32,
+        seconds: f32,
+        when: f64,
+    ) -> Result<()> {
+        let g = self.table().get(&this)?;
+        // An instant already past is the caller running late; start at once
+        // rather than schedule into the past, which the param would ignore.
+        let at = when.max(g.ctx.current_time());
+        let param = g.node.gain();
+        // Cancel only from `at` onward, so an envelope segment already running
+        // keeps its shape right up to the moment this one takes over.
+        param.cancel_scheduled_values(at);
+        param.set_value_at_time(start_value, at);
+        param.linear_ramp_to_value_at_time(end_value, at + seconds as f64);
+        Ok(())
+    }
+
     fn connect(&mut self, this: Resource<Gain>, dst: Resource<Gain>) -> Result<()> {
         let table = self.table();
         let target = table.get(&dst)?;

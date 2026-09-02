@@ -4,15 +4,24 @@ mod bindings;
 use std::collections::BTreeSet;
 use std::f32::consts::PI;
 
+use bindings::Guest;
 use bindings::wasi::frame_buffer::frame_buffer::{Buffer, Device};
 use bindings::wasi::graphics_context::graphics_context::Context as GfxContext;
 use bindings::wasi::surface::surface::{CreateDesc, Surface};
-use bindings::wk::midi::midi::{Input, Output};
-use bindings::Guest;
+use bindings::wk::midi::midi::{Input, Output, now};
 
-/// The compositor signals roughly this many frames per second; the arp clock
-/// counts frames, so this sets the time base for the rate knob.
-const FPS: f32 = 60.0;
+/// How far ahead of the clock the arp queues its notes, in microseconds.
+///
+/// The arp is driven by keys the player is holding right now, so it looks only
+/// a little way ahead: far enough that a note reaches the synth before it is
+/// due, not so far that it commits to a chord already let go of. What matters
+/// is that the *instant* is exact — the note is stamped with the step boundary
+/// it belongs to, so the rate is the rate rather than the frame rate rounded.
+const LOOKAHEAD_US: f64 = 20_000.0;
+
+/// A cap on how many steps one pass may queue, so a high rate after a long
+/// stall cannot spin the loop.
+const MAX_STEPS_PER_TICK: i32 = 64;
 
 /// Lowest note shown in the on-screen strip (C4 = MIDI 60) and how many
 /// semitones it spans (two octaves).
@@ -69,7 +78,11 @@ impl Knob {
 }
 
 /// The arpeggiator: a set of held input notes, the derived step sequence, and a
-/// frame clock that emits one note at a time out of the MIDI output port.
+/// clock that emits one note at a time out of the MIDI output port.
+///
+/// The clock is wk's shared MIDI clock, not the frame rate: each step boundary
+/// is computed from the rate and the note is stamped with the instant it falls
+/// on, so the arp keeps its own time whatever the display is doing.
 struct Arp {
     out: Output,
     /// Currently-held input notes (ascending — `BTreeSet` keeps them sorted).
@@ -79,10 +92,15 @@ struct Arp {
     /// Position in `seq`, and the up/down direction for the UPDN mode.
     idx: usize,
     dir: i32,
-    /// Frames elapsed in the current step.
-    frame: f32,
-    /// The output note currently sounding (so it can be turned off).
-    sounding: Option<u8>,
+    /// The instant of the next step boundary, in microseconds on the shared
+    /// clock. `None` between runs, so the next held note starts a fresh one.
+    next_at: Option<f64>,
+    /// The output note currently sounding, and the instant its gate ends (so it
+    /// can be released exactly there rather than whenever a frame notices).
+    sounding: Option<(u8, f64)>,
+    /// The velocity of the last key pressed, which the arp's own notes take —
+    /// so playing harder arpeggiates harder.
+    vel: u8,
     /// True until the first step after the held set became non-empty, so the
     /// arp starts on the bottom note rather than skipping it.
     restart: bool,
@@ -97,8 +115,9 @@ impl Arp {
             seq: Vec::new(),
             idx: 0,
             dir: 1,
-            frame: 0.0,
+            next_at: None,
             sounding: None,
+            vel: 100,
             restart: true,
             knobs: [
                 Knob {
@@ -137,7 +156,8 @@ impl Arp {
         }
     }
 
-    fn note_on(&mut self, note: u8) {
+    fn note_on(&mut self, note: u8, vel: u8) {
+        self.vel = vel;
         self.held.insert(note);
     }
     fn note_off(&mut self, note: u8) {
@@ -175,42 +195,54 @@ impl Arp {
         }
     }
 
-    /// Advance one frame of the arp clock, sending MIDI as steps fire.
-    fn tick(&mut self) {
+    /// Queue every step boundary that falls inside the look-ahead window.
+    fn tick(&mut self, clock: u64) {
         if self.held.is_empty() {
-            // All keys released: silence the held output note and reset.
-            if let Some(n) = self.sounding.take() {
-                self.out.send(&[0x80, n, 0]);
-            }
-            self.frame = 0.0;
+            // All keys released: release the output note at the end of its gate
+            // (which may still be ahead of the clock) and reset.
+            self.release();
+            self.next_at = None;
             self.restart = true;
             self.dir = 1;
             return;
         }
 
-        let rate = self.knobs[RATE].value;
-        let step_frames = (FPS / rate).max(1.0);
-        let gate = self.knobs[GATE].value;
-
-        // Gate: end the current note partway through the step (staccato).
-        if self.sounding.is_some() && self.frame >= step_frames * gate {
-            let n = self.sounding.take().unwrap();
-            self.out.send(&[0x80, n, 0]);
+        let step_us = 1_000_000.0 / self.knobs[RATE].value as f64;
+        let gate_us = step_us * self.knobs[GATE].value as f64;
+        let horizon = clock as f64 + LOOKAHEAD_US;
+        // The first step of a run starts as soon as the key goes down.
+        let mut at = self.next_at.unwrap_or(clock as f64);
+        let mut budget = MAX_STEPS_PER_TICK;
+        while at < horizon && budget > 0 {
+            // The previous note ends at its gate, or at this boundary if the
+            // gate is wide open — never after the next note starts.
+            self.release_before(at);
+            self.fire_step(at, gate_us);
+            at += step_us;
+            budget -= 1;
         }
-
-        // Step boundary: move to the next note and play it.
-        if self.restart || self.frame >= step_frames {
-            if let Some(n) = self.sounding.take() {
-                self.out.send(&[0x80, n, 0]);
-            }
-            self.fire_step();
-            self.frame = 0.0;
-        }
-        self.frame += 1.0;
+        self.next_at = Some(at);
     }
 
-    /// Pick the next note in the pattern and send its note-on.
-    fn fire_step(&mut self) {
+    /// Release the sounding note at the end of its gate.
+    fn release(&mut self) {
+        if let Some((note, off_at)) = self.sounding.take() {
+            self.out.send_at(&[0x80, note, 0], off_at.max(0.0) as u64);
+        }
+    }
+
+    /// Release the sounding note at its gate end, or at `limit` if its gate
+    /// would run past there.
+    fn release_before(&mut self, limit: f64) {
+        if let Some((note, off_at)) = self.sounding.take() {
+            self.out
+                .send_at(&[0x80, note, 0], off_at.min(limit).max(0.0) as u64);
+        }
+    }
+
+    /// Pick the next note in the pattern and send its note-on, stamped for the
+    /// instant `at` and gated to last `gate_us`.
+    fn fire_step(&mut self, at: f64, gate_us: f64) {
         if self.seq.is_empty() {
             return;
         }
@@ -224,7 +256,7 @@ impl Arp {
             self.idx = 0;
         } else {
             match mode {
-                0 => self.idx = (self.idx + 1) % len, // up
+                0 => self.idx = (self.idx + 1) % len,       // up
                 1 => self.idx = (self.idx + len - 1) % len, // down
                 _ => {
                     // Up/down bounce: reverse at each end.
@@ -241,8 +273,9 @@ impl Arp {
             }
         }
         let note = self.seq[self.idx.min(len - 1)];
-        self.out.send(&[0x90, note, 100]);
-        self.sounding = Some(note);
+        self.out
+            .send_at(&[0x90, note, self.vel.max(1)], at.max(0.0) as u64);
+        self.sounding = Some((note, at + gate_us));
     }
 }
 
@@ -342,7 +375,14 @@ fn text(buf: &mut [u8], w: u32, h: u32, x: i32, y: i32, s: &str, scale: i32, c: 
                 if bits & (1 << (2 - col)) != 0 {
                     for sy in 0..scale {
                         for sx in 0..scale {
-                            put(buf, w, h, cx + col * scale + sx, y + row as i32 * scale + sy, c);
+                            put(
+                                buf,
+                                w,
+                                h,
+                                cx + col * scale + sx,
+                                y + row as i32 * scale + sy,
+                                c,
+                            );
                         }
                     }
                 }
@@ -416,15 +456,21 @@ impl Guest for Component {
             let h = surface.height().max(1);
             let (centers, r) = layout(w, h);
 
-            // Incoming MIDI: note-on (0x90, vel>0) / note-off (0x80 or 0x90 v0).
+            let clock = now();
+
+            // Incoming MIDI: note-on (0x90, vel>0) / note-off (0x80 or 0x90 v0),
+            // plus the channel-mode messages that clear everything held.
             while let Some(msg) = input.receive() {
                 if msg.len() >= 3 {
                     let status = msg[0] & 0xF0;
                     let note = msg[1];
                     let vel = msg[2];
                     match status {
-                        0x90 if vel > 0 => arp.note_on(note),
+                        0x90 if vel > 0 => arp.note_on(note, vel),
                         0x80 | 0x90 => arp.note_off(note),
+                        // All sound off / all notes off: the host sends these
+                        // when a MIDI cable is unplugged.
+                        0xB0 if matches!(note, 120 | 123) => arp.held.clear(),
                         _ => {}
                     }
                 }
@@ -456,9 +502,9 @@ impl Guest for Component {
             while surface.get_key_down().is_some() {}
             while surface.get_key_up().is_some() {}
 
-            // Advance the arpeggiator one frame (emits MIDI as steps fire).
+            // Queue the steps that fall inside the look-ahead window.
             arp.rebuild_seq();
-            arp.tick();
+            arp.tick(clock);
 
             // Persist the current knob settings (the host saves them per node).
             bindings::wk::options::options::store(&arp.options());
@@ -494,7 +540,7 @@ impl Guest for Component {
             let cell = sw / STRIP_LEN as i32;
             let play_cell = arp
                 .sounding
-                .map(|n| (n.saturating_sub(STRIP_LOW)) as i32)
+                .map(|(note, _)| (note.saturating_sub(STRIP_LOW)) as i32)
                 .filter(|&c| (0..STRIP_LEN as i32).contains(&c));
             for c in 0..STRIP_LEN as i32 {
                 let note = STRIP_LOW + c as u8;

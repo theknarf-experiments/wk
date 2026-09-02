@@ -250,6 +250,9 @@ enum CreateKind {
     Api,
     /// A hardware MIDI input node (value = device name; omit for the default)
     Midi,
+    /// A hardware MIDI output node: whatever is wired into it plays out of a
+    /// physical MIDI port (value = device name; omit for the default)
+    Midiout,
     Note,
     /// A host TCP service published into a Network (value = `<name>=<addr:port>`,
     /// e.g. `subduction=127.0.0.1:8080`; a bare `addr:port` keeps the default name)
@@ -271,6 +274,7 @@ impl CreateKind {
             CreateKind::Clipboard => NodeKind::Clipboard,
             CreateKind::Api => NodeKind::Api,
             CreateKind::Midi => NodeKind::MidiIn,
+            CreateKind::Midiout => NodeKind::MidiOut,
             CreateKind::Note => NodeKind::Note,
             CreateKind::Hostservice => NodeKind::HostService,
         }
@@ -279,7 +283,7 @@ impl CreateKind {
 
 #[derive(Subcommand)]
 enum MidiCmd {
-    /// List connected hardware MIDI input devices (their port names)
+    /// List connected hardware MIDI devices, inputs and outputs (port names)
     Devices,
 }
 
@@ -461,12 +465,19 @@ fn main() -> Result<(), String> {
         Some(Commands::Images { cmd }) => images_cmd(cmd),
         Some(Commands::Midi { cmd }) => {
             let MidiCmd::Devices = cmd;
-            let devices = wk_server::midihw::input_devices();
-            if devices.is_empty() {
-                println!("(no MIDI input devices connected)");
-            } else {
+            // Inputs and outputs are separate lists on every platform, and a
+            // device is often in both: `wk create midi "<name>"` takes a name
+            // from the first list, `wk create midiout "<name>"` from the second.
+            for (label, devices) in [
+                ("inputs", wk_server::midihw::input_devices()),
+                ("outputs", wk_server::midihw::output_devices()),
+            ] {
+                println!("{label}:");
+                if devices.is_empty() {
+                    println!("  (none connected)");
+                }
                 for d in devices {
-                    println!("{d}");
+                    println!("  {d}");
                 }
             }
             Ok(())

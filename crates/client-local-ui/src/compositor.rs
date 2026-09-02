@@ -592,6 +592,8 @@ impl App {
             g.ports.iter().map(|p| port(p.kind, p.dir)).collect()
         } else if v.midi_ins.contains_key(&id) {
             one(Midi, Out) // a hardware MIDI input drives apps
+        } else if v.midi_outs.contains_key(&id) {
+            one(Midi, In) // a hardware MIDI output is driven by them
         } else {
             // An app node. Every app can mount a volume (Bind); the other ports
             // appear only on apps whose component actually imports the matching
@@ -1345,6 +1347,11 @@ impl App {
             PaletteCmd::AddMidiIn,
         ));
         v.push(PaletteRow::new(
+            "Add MIDI Out",
+            d("a hardware MIDI output — wire the sequencer to it to play external gear"),
+            PaletteCmd::AddMidiOut,
+        ));
+        v.push(PaletteRow::new(
             "Add Host Service",
             d("publish a host TCP service into a Network (the reverse of a HostPort)"),
             PaletteCmd::AddHostService,
@@ -1445,6 +1452,8 @@ impl App {
             u.kind.label().to_lowercase()
         } else if self.view.midi_ins.contains_key(&id) {
             "midi in".into()
+        } else if self.view.midi_outs.contains_key(&id) {
+            "midi out".into()
         } else if let Some(svc) = self.view.host_services.get(&id) {
             svc.name.clone()
         } else if let Some(p) = self.view.boundary_ports.get(&id) {
@@ -1734,6 +1743,14 @@ impl App {
                 let pos = self.view_center([FILE_W, FILE_H], self.view.midi_ins.len());
                 self.conn.send(Command::Create(Resource::Node {
                     kind: NodeKind::MidiIn,
+                    pos,
+                    ws,
+                }));
+            }
+            PaletteCmd::AddMidiOut => {
+                let pos = self.view_center([FILE_W, FILE_H], self.view.midi_outs.len());
+                self.conn.send(Command::Create(Resource::Node {
+                    kind: NodeKind::MidiOut,
                     pos,
                     ws,
                 }));
@@ -2809,7 +2826,13 @@ impl App {
                     group_status(g),
                     GROUP_BORDER,
                 ))
-            } else if let Some(device) = self.view.midi_ins.get(&id) {
+            } else if let Some((device, title)) = self
+                .view
+                .midi_ins
+                .get(&id)
+                .map(|d| (d, "MIDI in"))
+                .or_else(|| self.view.midi_outs.get(&id).map(|d| (d, "MIDI out")))
+            {
                 let (status, status_col) = if device.is_empty() {
                     ("no device".to_string(), [0.8, 0.65, 0.5, 1.0])
                 } else {
@@ -2818,7 +2841,7 @@ impl App {
                 Some(Chrome(
                     MIDI_BORDER,
                     MIDI_BG,
-                    "MIDI in".to_string(),
+                    title.to_string(),
                     TEXT,
                     status,
                     status_col,
@@ -4877,9 +4900,20 @@ impl App {
                 continue;
             }
 
-            // A hardware MIDI input node: a capability widget whose status shows
-            // the connected device (or that it's waiting for one).
-            if let Some(device) = self.view.midi_ins.get(&id).cloned() {
+            // A hardware MIDI node, input or output: a capability widget whose
+            // status shows the connected device (or that it's waiting for one).
+            if let Some((device, title)) = self
+                .view
+                .midi_ins
+                .get(&id)
+                .map(|d| (d.clone(), "MIDI in"))
+                .or_else(|| {
+                    self.view
+                        .midi_outs
+                        .get(&id)
+                        .map(|d| (d.clone(), "MIDI out"))
+                })
+            {
                 let (status, status_col): (String, [f32; 4]) = if device.is_empty() {
                     (
                         "no MIDI device — plug one in".to_string(),
@@ -4901,7 +4935,7 @@ impl App {
                         r,
                         border: MIDI_BORDER,
                         bg: MIDI_BG,
-                        title: "MIDI in",
+                        title,
                         title_col: TEXT,
                         status: &status,
                         status_col,

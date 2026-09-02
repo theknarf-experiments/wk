@@ -1,11 +1,11 @@
 #[allow(warnings)]
 mod bindings;
 
+use bindings::Guest;
 use bindings::wasi::frame_buffer::frame_buffer::{Buffer, Device};
 use bindings::wasi::graphics_context::graphics_context::Context as GfxContext;
 use bindings::wasi::surface::surface::{CreateDesc, Key, Surface};
 use bindings::wk::midi::midi::{Input, Output};
-use bindings::Guest;
 
 /// Two octaves of keys. White-key semitone offsets (C D E F G A B, twice, plus
 /// the closing C); the black keys sit on the white-key boundaries.
@@ -127,8 +127,14 @@ impl Keyboard {
 
     /// Drain MIDI arriving on the input port: light up note-ons within the
     /// displayed range, and pass every message through to the output (MIDI thru).
+    ///
+    /// Pass-through keeps each message's instant. The piano usually sits in the
+    /// middle of a chain — a hardware keyboard on one side, a sequencer
+    /// recording on the other — and re-stamping here would throw away when the
+    /// key was actually struck and replace it with when this node woke up.
     fn pump_input(&mut self) {
-        while let Some(msg) = self.input.receive() {
+        while let Some(ev) = self.input.receive_event() {
+            let msg = &ev.data;
             if msg.len() >= 3 {
                 let status = msg[0] & 0xF0;
                 let note = msg[1] as i32 - self.base;
@@ -140,8 +146,13 @@ impl Keyboard {
                         self.ext[n] = false;
                     }
                 }
+                // All sound off / all notes off: the host sends these when a
+                // MIDI cable is unplugged, so clear the lit keys too.
+                if status == 0xB0 && matches!(msg[1], 120 | 123) {
+                    self.ext = [false; NKEYS];
+                }
             }
-            self.out.send(&msg);
+            self.out.send_at(msg, ev.time);
         }
     }
 }
@@ -271,8 +282,7 @@ impl Guest for Component {
                         // Control strip: octave-down button (left), up (right).
                         let on_down = fx < BTN_W;
                         let on_up = fx >= wf - BTN_W;
-                        let minus =
-                            on_down && (fy - cy).abs() < 1.6 && (fx - dcx).abs() < gr;
+                        let minus = on_down && (fy - cy).abs() < 1.6 && (fx - dcx).abs() < gr;
                         let plus = on_up
                             && (((fy - cy).abs() < 1.6 && (fx - ucx).abs() < gr)
                                 || ((fx - ucx).abs() < 1.6 && (fy - cy).abs() < gr));

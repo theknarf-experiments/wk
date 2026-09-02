@@ -80,8 +80,8 @@ const MODELINE: &str = "// vim: set filetype=kdl :";
 /// line its comments on every save.
 fn id_arg_index(keyword: &str) -> usize {
     match keyword {
-        "node" | "volume" | "virtualfile" | "bindmount" | "hostfile" | "midiin" | "hostservice"
-        | "group" => 1,
+        "node" | "volume" | "virtualfile" | "bindmount" | "hostfile" | "midiin" | "midiout"
+        | "hostservice" | "group" => 1,
         "inport" | "outport" => 2,
         _ => 0,
     }
@@ -420,6 +420,10 @@ pub enum SnapKind {
     /// A hardware MIDI input node: the host opens the named device (empty = the
     /// first available) and routes its messages to the apps it's wired to.
     MidiIn { device: String },
+    /// A hardware MIDI output node: the host opens the named destination (empty
+    /// = the first available) and plays everything wired into it out of that
+    /// port.
+    MidiOut { device: String },
     /// A host TCP service published into the Network it's wired to, as fabric
     /// peer `name`; connections bridge to the host `target` (`addr:port`).
     HostService { name: String, target: String },
@@ -1212,6 +1216,13 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
                 .unwrap_or("")
                 .to_string(),
         },
+        "midiout" => SnapKind::MidiOut {
+            device: n
+                .get(0)
+                .and_then(|v| v.as_string())
+                .unwrap_or("")
+                .to_string(),
+        },
         // The fabric name leads (like an app's dependency name); the host
         // target is a child so the line reads `hostservice "subduction" <id>`.
         "hostservice" => SnapKind::HostService {
@@ -1321,6 +1332,7 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         SnapKind::Clipboard => "clipboard",
         SnapKind::Api => "api",
         SnapKind::MidiIn { .. } => "midiin",
+        SnapKind::MidiOut { .. } => "midiout",
         SnapKind::HostService { .. } => "hostservice",
         SnapKind::InPort { .. } => "inport",
         SnapKind::OutPort { .. } => "outport",
@@ -1335,7 +1347,7 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         SnapKind::BindMount { path } => {
             node.push(str_entry(&path.to_string_lossy()));
         }
-        SnapKind::MidiIn { device } => {
+        SnapKind::MidiIn { device } | SnapKind::MidiOut { device } => {
             node.push(str_entry(device));
         }
         SnapKind::HostService { name, .. } => {
@@ -1643,6 +1655,88 @@ pub fn remove(name: String, path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    /// A hardware MIDI output node survives the `.wk` file, device name and
+    /// all, and keeps the wire feeding it. A node kind is only really added
+    /// once the reader, the writer and the wiring all agree.
+    #[test]
+    fn a_midi_output_node_round_trips_with_its_wire() {
+        let src = r#"
+workspace "01KZKMAB00000000000000WS01" {
+    node "sequencer" "01KZKMAG00000000000000SQ06" {
+        pos 10.0 10.0
+        size 720.0 420.0
+    }
+    midiout "IAC Driver Bus 1" "01KZKMAD00000000000000MO07" {
+        pos 60.0 330.0
+        size 130.0 44.0
+    }
+    midi "01KZKMAG00000000000000SQ06" "01KZKMAD00000000000000MO07"
+}
+"#;
+        let doc = Document::from_kdl(src).expect("parses");
+        let ws = &doc.workspaces[0];
+        let out = ws
+            .nodes
+            .iter()
+            .find(|n| matches!(n.kind, SnapKind::MidiOut { .. }))
+            .expect("the midiout node is read back");
+        let SnapKind::MidiOut { device } = &out.kind else {
+            unreachable!()
+        };
+        assert_eq!(device, "IAC Driver Bus 1", "the chosen device is kept");
+        assert_eq!(ws.midi.len(), 1, "the wire into it survives");
+
+        // And it writes back out the same way.
+        let again = Document::from_kdl(&doc.to_kdl()).expect("re-parses");
+        let out2 = again.workspaces[0]
+            .nodes
+            .iter()
+            .find(|n| matches!(n.kind, SnapKind::MidiOut { .. }))
+            .expect("still a midiout after a save");
+        assert_eq!(out2.id, out.id);
+        assert_eq!(again.workspaces[0].midi, ws.midi);
+    }
+
+    /// Every `.wk` file shipped in `example/` parses, and round-trips through
+    /// serialization unchanged in meaning.
+    ///
+    /// The examples are the documentation people run first, so a file that no
+    /// longer loads is a broken front door. This also catches a node kind added
+    /// to the writer but not to the reader, which is the easy half of the pair
+    /// to forget.
+    #[test]
+    fn shipped_examples_parse_and_round_trip() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../example");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("example/ exists") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("wk") {
+                continue;
+            }
+            let doc = Document::load(&path)
+                .unwrap_or_else(|e| panic!("{} does not parse: {e}", path.display()));
+            // Writing it out and reading it back must land in the same place.
+            let again = Document::from_kdl(&doc.to_kdl())
+                .unwrap_or_else(|e| panic!("{} does not re-parse: {e}", path.display()));
+            assert_eq!(
+                again.workspaces.len(),
+                doc.workspaces.len(),
+                "{} lost a workspace on round trip",
+                path.display()
+            );
+            for (a, b) in doc.workspaces.iter().zip(&again.workspaces) {
+                assert_eq!(
+                    a.nodes.len(),
+                    b.nodes.len(),
+                    "{} lost a node on round trip",
+                    path.display()
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no examples found to check");
+    }
+
     use super::*;
 
     #[test]

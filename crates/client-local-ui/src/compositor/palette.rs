@@ -22,6 +22,7 @@ pub(super) enum PaletteCmd {
     AddClipboard,
     AddApi,
     AddMidiIn,
+    AddMidiOut,
     AddHostService,
     NewWorkspace,
     CloseWorkspace,

@@ -57,6 +57,8 @@ The shared-resource kinds:
 | ----------------------- | ---------------------------------------------------- |
 | File → node             | mounts the file into the node's sandboxed filesystem |
 | node → node             | a MIDI link (source out → destination in)            |
+| MidiIn → node           | plays a hardware MIDI keyboard into the node         |
+| node → MidiOut          | plays the node out of a hardware MIDI port           |
 | HTTP node → HostPort    | serves the node on `127.0.0.1:<port>`                |
 | node → Network/Gateway  | joins the node to that virtual network               |
 | Router → Network        | bridges that network with the router's others        |

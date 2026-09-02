@@ -193,6 +193,9 @@ pub struct View {
     /// MidiIn nodes (canvas id -> the resolved/target device name), for the UI
     /// to label them.
     pub midi_ins: HashMap<NodeId, String>,
+    /// MidiOut nodes (canvas id -> the resolved/target device name), for the UI
+    /// to label them.
+    pub midi_outs: HashMap<NodeId, String>,
     /// HostService nodes (canvas id -> fabric name + host target), for the UI
     /// to label and edit them.
     pub host_services: HashMap<NodeId, HostService>,
@@ -369,6 +372,7 @@ impl View {
             host_ports: keep_map(&self.host_ports, mine),
             notes: keep_map(&self.notes, mine),
             midi_ins: keep_map(&self.midi_ins, mine),
+            midi_outs: keep_map(&self.midi_outs, mine),
             host_services: keep_map(&self.host_services, mine),
             boundary_ports: keep_map(&self.boundary_ports, mine),
             groups: keep_map(&self.groups, mine),
@@ -591,11 +595,15 @@ pub enum Kind {
     /// A `group` node: one **instance** of another workspace. The node itself
     /// runs nothing — it is the handle for the nodes the expansion placed under
     /// derived ids (see [`crate::instancing`] and `Server::instances`).
+    Group,
+    /// A hardware MIDI output node: the host opens a physical MIDI destination
+    /// and plays everything wired into it out of that port, so the canvas can
+    /// drive an external synth. The mirror of [`Kind::MidiIn`].
     ///
     /// New variants go at the END of this enum: [`Server::save`] orders a
     /// workspace's nodes by `kind as u8`, so inserting one anywhere else would
     /// rewrite the node order of every existing `.wk` file on its next save.
-    Group,
+    MidiOut,
 }
 
 impl Kind {
@@ -657,6 +665,9 @@ pub struct Graph {
     /// MidiIn nodes' target device name (canvas id -> device; empty = default),
     /// persisted so the node reconnects to the same hardware on reload.
     pub midi_ins: HashMap<NodeId, String>,
+    /// MidiOut nodes' target device name (canvas id -> device; empty = default),
+    /// persisted so the node reconnects to the same hardware on reload.
+    pub midi_outs: HashMap<NodeId, String>,
     /// HostService nodes: the fabric name members dial and the host
     /// `addr:port` the connection bridges to. The fabric side listens on the
     /// target's port.
@@ -895,6 +906,11 @@ pub struct Server {
     /// MIDI router as the node. Pure runtime state, rebuilt from `graph.midi_ins`
     /// on load.
     midi_devices: HashMap<NodeId, crate::midihw::MidiDevice>,
+    /// Open hardware MIDI outputs, one per MidiOut node. Each holds the device
+    /// connection alive (dropping it closes the device and stops its pump) and
+    /// owns the inbox the router delivers into. Pure runtime state, rebuilt
+    /// from `graph.midi_outs` on load.
+    midi_out_devices: HashMap<NodeId, crate::midihw::MidiOutDevice>,
     /// Nodes a CLI client has `attach`ed to (owning their terminal I/O). The
     /// windowed UI treats these as detached: it stops draining/feeding their
     /// terminal so the two don't fight over the stream. Pure runtime state.
@@ -1017,6 +1033,7 @@ impl Server {
             capture_feeds: HashMap::new(),
             clipboard_boards: HashMap::new(),
             midi_devices: HashMap::new(),
+            midi_out_devices: HashMap::new(),
             attached: std::collections::HashSet::new(),
             unplaced: Vec::new(),
             unplaced_wires: Vec::new(),
@@ -1634,14 +1651,21 @@ impl Server {
         self.open_midi_device(id, "");
     }
 
-    /// Point a MidiIn node at a device by name (empty = first available),
-    /// (re)opening its hardware connection.
+    /// Point a MidiIn or MidiOut node at a device by name (empty = first
+    /// available), (re)opening its hardware connection. The node's kind decides
+    /// whether the name names a MIDI source or a MIDI destination.
     fn set_midi_device(&mut self, id: NodeId, want: String) {
-        if self.kind_of(id) != Some(Kind::MidiIn) {
-            return; // only MidiIn nodes have a device
+        match self.kind_of(id) {
+            Some(Kind::MidiIn) => {
+                self.graph.midi_ins.insert(id, want.clone());
+                self.open_midi_device(id, &want);
+            }
+            Some(Kind::MidiOut) => {
+                self.graph.midi_outs.insert(id, want.clone());
+                self.open_midi_out_device(id, &want);
+            }
+            _ => {} // no other kind has a device
         }
-        self.graph.midi_ins.insert(id, want.clone());
-        self.open_midi_device(id, &want);
     }
 
     /// Open (or reopen) the hardware device for MidiIn node `id`, feeding the
@@ -1663,6 +1687,55 @@ impl Server {
         self.midi_devices.remove(&id); // close the device
         self.graph.midi_ins.remove(&id);
         // Drop it from MIDI routing (as a source) and its desired wires.
+        self.host.midi().lock().unwrap().remove_node(id);
+        self.graph.midi_links.retain(|&(s, d)| s != id && d != id);
+        self.routed.retain(|&(s, d)| s != id && d != id);
+        self.forget(id);
+    }
+
+    /// Add a hardware MIDI output node, opening the first available device now.
+    fn add_midi_out_node(&mut self, pos: [f32; 2], ws: NodeId) {
+        let id = self.alloc_id();
+        self.place(id, Kind::MidiOut, ws, pos, [FILE_W, FILE_H]);
+        self.graph.midi_outs.insert(id, String::new());
+        self.open_midi_out_device(id, "");
+    }
+
+    /// Open (or reopen) the hardware destination for MidiOut node `id`. On
+    /// success the persisted name is set to the resolved device so it
+    /// reconnects to the same one; a failure is logged and leaves the node
+    /// placed-but-disconnected.
+    ///
+    /// Reopening gives the node a new inbox, so the routes feeding the old one
+    /// would deliver into nothing. They are dropped here and `sync_midi`
+    /// rebuilds them against the new inbox on the next tick.
+    fn open_midi_out_device(&mut self, id: NodeId, want: &str) {
+        self.midi_out_devices.remove(&id); // drop any existing connection
+        match crate::midihw::open_output(want) {
+            Ok(dev) => {
+                self.graph.midi_outs.insert(id, dev.name.clone());
+                self.midi_out_devices.insert(id, dev);
+            }
+            Err(e) => eprintln!("MIDI output node {id}: {e}"),
+        }
+        let stale: Vec<(NodeId, NodeId)> = self
+            .routed
+            .iter()
+            .copied()
+            .filter(|&(_, d)| d == id)
+            .collect();
+        let router = self.host.midi();
+        let mut routes = router.lock().unwrap();
+        for (src, dst) in stale {
+            routes.disconnect(src, dst);
+        }
+        drop(routes);
+        self.routed.retain(|&(_, d)| d != id);
+    }
+
+    fn remove_midi_out_node(&mut self, id: NodeId) {
+        self.midi_out_devices.remove(&id); // close the device, stop its pump
+        self.graph.midi_outs.remove(&id);
         self.host.midi().lock().unwrap().remove_node(id);
         self.graph.midi_links.retain(|&(s, d)| s != id && d != id);
         self.routed.retain(|&(s, d)| s != id && d != id);
@@ -1849,6 +1922,7 @@ impl Server {
             Some(Kind::Clipboard) => self.remove_clipboard_node(id),
             Some(Kind::Api) => self.remove_api_node(id),
             Some(Kind::MidiIn) => self.remove_midi_in_node(id),
+            Some(Kind::MidiOut) => self.remove_midi_out_node(id),
             // Its net wire lives in net_links with the service as the "member"
             // side; forget() kills the listener and drops the config.
             Some(Kind::HostService) => {
@@ -2187,6 +2261,7 @@ impl Server {
             Some(Kind::Clipboard) => NodeClass::Clipboard,
             Some(Kind::Api) => NodeClass::Api,
             Some(Kind::MidiIn) => NodeClass::MidiSource,
+            Some(Kind::MidiOut) => NodeClass::MidiSink,
             Some(Kind::HostService) => NodeClass::HostSvc,
             // A boundary port's class is *declared*, not inferred: it comes
             // from the side table placed alongside the node record.
@@ -3144,8 +3219,15 @@ impl Server {
             self.routed.remove(&(src, dst));
         }
         for (src, dst) in plan.add {
-            if let Some(dst_node) = self.app_node(dst) {
-                routes.connect(src, dst, dst_node.midi_in.clone());
+            // A MIDI link ends either at an app's input port or at a hardware
+            // output node, which is a destination on the canvas the same way an
+            // app is.
+            let inbox = self
+                .app_node(dst)
+                .map(|n| n.midi_in.clone())
+                .or_else(|| self.midi_out_devices.get(&dst).map(|d| d.inbox.clone()));
+            if let Some(inbox) = inbox {
+                routes.connect(src, dst, inbox);
                 self.routed.insert((src, dst));
             }
         }
@@ -3738,6 +3820,7 @@ impl Server {
                 NodeKind::Clipboard => self.add_clipboard_node(pos, ws),
                 NodeKind::Api => self.add_api_node(pos, ws),
                 NodeKind::MidiIn => self.add_midi_in_node(pos, ws),
+                NodeKind::MidiOut => self.add_midi_out_node(pos, ws),
                 NodeKind::HostService => self.add_host_service(pos, ws),
             },
             // Create is create only: a wire that already exists is left alone
@@ -3997,6 +4080,9 @@ impl Server {
             Kind::Api => SnapKind::Api,
             Kind::MidiIn => SnapKind::MidiIn {
                 device: self.graph.midi_ins.get(&id).cloned().unwrap_or_default(),
+            },
+            Kind::MidiOut => SnapKind::MidiOut {
+                device: self.graph.midi_outs.get(&id).cloned().unwrap_or_default(),
             },
             Kind::HostService => {
                 let svc = self.graph.host_services.get(&id)?;
@@ -4312,6 +4398,11 @@ impl Server {
                 // Reconnect to the saved device (or the first available).
                 self.open_midi_device(s.id, device);
             }
+            SnapKind::MidiOut { device } => {
+                self.place(s.id, Kind::MidiOut, ws, s.pos, s.size);
+                self.graph.midi_outs.insert(s.id, device.clone());
+                self.open_midi_out_device(s.id, device);
+            }
             SnapKind::HostService { name, target } => {
                 self.place(s.id, Kind::HostService, ws, s.pos, s.size);
                 self.graph.host_services.insert(
@@ -4607,6 +4698,7 @@ impl Server {
             host_ports: self.graph.host_ports.clone(),
             notes: self.graph.note_text.clone(),
             midi_ins: self.graph.midi_ins.clone(),
+            midi_outs: self.graph.midi_outs.clone(),
             host_services: self.graph.host_services.clone(),
             boundary_ports: self.graph.boundary_ports.clone(),
             groups: self.group_infos(),
@@ -4705,6 +4797,7 @@ impl Server {
                 Some(Kind::Clipboard) => "clipboard",
                 Some(Kind::Api) => "api",
                 Some(Kind::MidiIn) => "midiin",
+                Some(Kind::MidiOut) => "midiout",
                 Some(Kind::HostService) => "hostservice",
                 Some(Kind::Boundary) => match self.graph.boundary_ports.get(&id).map(|p| p.dir) {
                     Some(PortDir::Out) => "outport",

@@ -253,6 +253,10 @@ pub enum NodeKind {
     /// `name:port` and the connection is bridged to the host address it
     /// targets (e.g. a server in a Docker container on host localhost).
     HostService,
+    /// A hardware MIDI output node: whatever is wired into it is played out of
+    /// a physical MIDI port, so the canvas can drive an external synth (a MIDI
+    /// destination, the mirror of [`NodeKind::MidiIn`]).
+    MidiOut,
 }
 
 /// A resource to create.
@@ -346,8 +350,10 @@ pub struct NodePatch {
     /// Point a BindMount node at a host path — a file or a folder (requires
     /// `Update`).
     pub host_path: Option<String>,
-    /// Point a MidiIn node at a hardware MIDI input device by name (empty =
-    /// the first available) (requires `Update`).
+    /// Point a MidiIn or MidiOut node at a hardware MIDI device by name (empty
+    /// = the first available). Which list the name is matched against follows
+    /// from the node's kind: sources for a MidiIn, destinations for a MidiOut
+    /// (requires `Update`).
     pub midi_device: Option<String>,
     /// Toggle a Volume node's persistence (bytes saved to a sidecar and
     /// restored on load) (requires `Update`).

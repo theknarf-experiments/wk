@@ -4,6 +4,7 @@ mod bindings;
 use std::collections::HashMap;
 use std::f32::consts::PI;
 
+use bindings::Guest;
 use bindings::wasi::frame_buffer::frame_buffer::{Buffer, Device};
 use bindings::wasi::graphics_context::graphics_context::Context as GfxContext;
 use bindings::wasi::surface::surface::{CreateDesc, Surface};
@@ -11,7 +12,6 @@ use bindings::wk::midi::midi::Input;
 use bindings::wk::webaudio::audio::{
     BiquadFilter, Context as Audio, FilterType, Gain, Oscillator, OscillatorType,
 };
-use bindings::Guest;
 
 // Knob indices.
 const VOL: usize = 0;
@@ -25,6 +25,14 @@ const NUM_KNOBS: usize = 7;
 
 /// Unison spread of the two oscillators per voice, in cents (fixed).
 const UNISON_CENTS: f32 = 7.0;
+
+/// How loud a note played at MIDI velocity `vel` should be, as a fraction of
+/// the VOL knob. Squared rather than linear because loudness is perceived
+/// roughly that way, so a soft touch reads as soft rather than merely quieter.
+fn level(vel: u8) -> f32 {
+    let v = vel as f32 / 127.0;
+    v * v
+}
 
 /// Equal-temperament frequency of a MIDI `note`, shifted by `tune` semitones.
 fn freq(note: u8, tune: f32) -> f32 {
@@ -101,7 +109,40 @@ struct Voice {
     osc_b: Oscillator,
     filter: BiquadFilter,
     gain: Gain,
+    /// The envelope segment currently scheduled on the gain.
+    seg: Seg,
+    /// How loud this note asked to be, from its velocity — kept so a turn of
+    /// the VOL knob rescales a sounding voice without flattening its dynamics.
+    vel: f32,
     release_end: Option<f64>,
+}
+
+/// A linear envelope segment: `v0` at `t0` moving to `v1` at `t1`, on the audio
+/// clock.
+///
+/// The voice keeps the segment it last scheduled so it can answer "what will
+/// the gain be at time t?". A note-off scheduled slightly ahead needs that: it
+/// has to start its release from where the attack will actually have got to,
+/// not from the peak it may never reach, or a short note clicks.
+#[derive(Clone, Copy)]
+struct Seg {
+    v0: f32,
+    t0: f64,
+    v1: f32,
+    t1: f64,
+}
+
+impl Seg {
+    fn value_at(&self, t: f64) -> f32 {
+        if t <= self.t0 {
+            self.v0
+        } else if t >= self.t1 {
+            self.v1
+        } else {
+            let f = ((t - self.t0) / (self.t1 - self.t0)) as f32;
+            self.v0 + (self.v1 - self.v0) * f
+        }
+    }
 }
 
 /// The synth: a bank of voices keyed by MIDI note, plus knobs whose values are
@@ -178,13 +219,28 @@ impl Synth {
         }
     }
 
-    fn note_on(&mut self, note: u8) {
-        let peak = self.knobs[VOL].value;
+    /// Start `note` at velocity `vel`, at audio-clock time `at`.
+    ///
+    /// `at` may be slightly in the future: a sequencer says when a note belongs
+    /// and the envelope is scheduled there, so the note sounds on the beat
+    /// rather than on whichever frame the message was drained.
+    fn note_on(&mut self, note: u8, vel: u8, at: f64) {
+        let vel = level(vel);
+        let peak = self.knobs[VOL].value * vel;
         let attack = self.knobs[ATK].value;
         if let Some(v) = self.voices.get_mut(&note) {
-            // Retrigger a still-releasing voice instead of stacking a new one.
+            // Retrigger a still-releasing voice instead of stacking a new one,
+            // picking the attack up from wherever the release will have got to.
+            let from = v.seg.value_at(at);
             v.release_end = None;
-            v.gain.ramp_to(peak, attack);
+            v.vel = vel;
+            v.gain.ramp_at(from, peak, attack, at);
+            v.seg = Seg {
+                v0: from,
+                t0: at,
+                v1: peak,
+                t1: at + attack as f64,
+            };
             return;
         }
 
@@ -207,10 +263,10 @@ impl Synth {
             osc.set_frequency(f);
             osc.set_detune(sign * UNISON_CENTS);
             osc.connect_filter(&filter);
-            osc.start(0.0);
+            osc.start(at);
         }
-        // Attack: ramp from silence to the volume peak.
-        gain.ramp_to(peak, attack);
+        // Attack: ramp from silence to the volume peak, starting at `at`.
+        gain.ramp_at(0.0, peak, attack, at);
 
         self.voices.insert(
             note,
@@ -219,17 +275,41 @@ impl Synth {
                 osc_b,
                 filter,
                 gain,
+                seg: Seg {
+                    v0: 0.0,
+                    t0: at,
+                    v1: peak,
+                    t1: at + attack as f64,
+                },
+                vel,
                 release_end: None,
             },
         );
     }
 
-    fn note_off(&mut self, note: u8) {
+    /// Release `note` at audio-clock time `at`.
+    fn note_off(&mut self, note: u8, at: f64) {
         let release = self.knobs[REL].value;
-        let end = self.audio.current_time() + release as f64;
         if let Some(v) = self.voices.get_mut(&note) {
-            v.gain.ramp_to(0.0, release);
-            v.release_end = Some(end);
+            let from = v.seg.value_at(at);
+            v.gain.ramp_at(from, 0.0, release, at);
+            v.seg = Seg {
+                v0: from,
+                t0: at,
+                v1: 0.0,
+                t1: at + release as f64,
+            };
+            v.release_end = Some(at + release as f64);
+        }
+    }
+
+    /// Release every sounding note at once — the response to "all notes off"
+    /// and "all sound off", which is what the host sends when a MIDI cable is
+    /// unplugged. Without it, pulling a wire mid-chord leaves the chord playing.
+    fn all_notes_off(&mut self, at: f64) {
+        let notes: Vec<u8> = self.voices.keys().copied().collect();
+        for note in notes {
+            self.note_off(note, at);
         }
     }
 
@@ -267,7 +347,8 @@ impl Synth {
         let cut = self.knobs[CUT].value;
         let res = self.knobs[RES].value;
         let vol = self.knobs[VOL].value;
-        for (note, v) in &self.voices {
+        let now = self.audio.current_time();
+        for (note, v) in &mut self.voices {
             let f = freq(*note, tune);
             v.osc_a.set_type(wave);
             v.osc_b.set_type(wave);
@@ -275,9 +356,21 @@ impl Synth {
             v.osc_b.set_frequency(f);
             v.filter.set_frequency(cut);
             v.filter.set_q(res);
-            // Volume tracks the sustaining level; don't fight an active release.
+            // Volume tracks the sustaining level; don't fight an active
+            // release. The note keeps its own dynamics: the knob scales the
+            // level its velocity earned, it does not flatten every note to one.
             if v.release_end.is_none() {
-                v.gain.set_gain(vol);
+                let from = v.seg.value_at(now);
+                let peak = vol * v.vel;
+                // A short ramp rather than a jump, so turning the knob while
+                // holding a chord doesn't click.
+                v.gain.ramp_at(from, peak, 0.02, now);
+                v.seg = Seg {
+                    v0: from,
+                    t0: now,
+                    v1: peak,
+                    t1: now + 0.02,
+                };
             }
         }
     }
@@ -455,18 +548,35 @@ impl Guest for Component {
 
             synth.reap();
 
+            // Relate wk's shared MIDI clock to this context's audio clock,
+            // once per frame and back to back so the pair is taken at
+            // effectively one instant. Everything below converts an event's
+            // instant through it, which is what lets a scheduled note land on
+            // the beat instead of on this frame.
+            let midi_now = bindings::wk::midi::midi::now() as f64;
+            let audio_now = synth.audio.current_time();
+            let audio_time = |instant: u64| {
+                if instant == 0 {
+                    audio_now // "as soon as possible"
+                } else {
+                    audio_now + (instant as f64 - midi_now) / 1_000_000.0
+                }
+            };
+
             // Incoming MIDI: note-on (status 0x90, vel>0) / note-off (0x80, or
-            // 0x90 vel 0).
-            while let Some(msg) = input.receive() {
-                if msg.len() >= 3 {
-                    let status = msg[0] & 0xF0;
-                    let note = msg[1];
-                    let vel = msg[2];
-                    match status {
-                        0x90 if vel > 0 => synth.note_on(note),
-                        0x80 | 0x90 => synth.note_off(note),
-                        _ => {}
-                    }
+            // 0x90 vel 0), plus the channel-mode messages that silence us.
+            while let Some(ev) = input.receive_event() {
+                if ev.data.len() < 3 {
+                    continue;
+                }
+                let at = audio_time(ev.time);
+                let (status, note, vel) = (ev.data[0] & 0xF0, ev.data[1], ev.data[2]);
+                match status {
+                    0x90 if vel > 0 => synth.note_on(note, vel, at),
+                    0x80 | 0x90 => synth.note_off(note, at),
+                    // All sound off / all notes off.
+                    0xB0 if matches!(note, 120 | 123) => synth.all_notes_off(at),
+                    _ => {}
                 }
             }
 

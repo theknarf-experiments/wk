@@ -598,6 +598,7 @@ fn kind_label(kind: NodeKind) -> &'static str {
         NodeKind::Clipboard => "clipboard",
         NodeKind::Api => "api",
         NodeKind::MidiIn => "midiin",
+        NodeKind::MidiOut => "midiout",
         NodeKind::HostService => "hostservice",
     }
 }
@@ -658,7 +659,7 @@ pub fn create(
             text: value.map(str::to_string),
             ..Default::default()
         },
-        NodeKind::MidiIn => NodePatch {
+        NodeKind::MidiIn | NodeKind::MidiOut => NodePatch {
             // A specific device name; None keeps the default the node opened.
             midi_device: value.map(str::to_string),
             ..Default::default()

@@ -1,11 +1,21 @@
-//! Host side of wk's MIDI transport: plugins send/receive raw MIDI messages
-//! through `output`/`input` ports, and the server wires a source node's
-//! output to the inputs of the nodes it is connected to (a "midi" connection on
-//! the canvas). A keyboard plugin can thus drive a separate synth plugin — the
-//! same split as real MIDI gear joined by a cable.
+//! Host side of wk's MIDI transport: plugins send/receive MIDI messages through
+//! `output`/`input` ports, and the server wires a source node's output to the
+//! inputs of the nodes it is connected to (a "midi" connection on the canvas).
+//! A keyboard plugin can thus drive a separate synth plugin — the same split as
+//! real MIDI gear joined by a cable.
+//!
+//! Two things make this more than a queue of byte strings:
+//!
+//! * Every message carries an instant on a clock shared by all nodes, so a
+//!   sequencer can say when a note belongs instead of leaving it to land
+//!   wherever the receiving node next happens to wake up. See [`now`].
+//! * The router remembers which notes each link has turned on, so unplugging a
+//!   cable or deleting a node releases them instead of leaving the synth
+//!   holding a chord forever.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 use wk_protocol::NodeId;
 
 use wasmtime::component::{HasData, Linker, Resource};
@@ -13,6 +23,8 @@ use wasmtime::Result;
 use wasmtime_wasi_io::IoView;
 
 use crate::plugin::HostState;
+
+pub mod stream;
 
 wasmtime::component::bindgen!({
     path: "wit-midi",
@@ -28,18 +40,83 @@ wasmtime::component::bindgen!({
 /// One MIDI message: raw status + data bytes, as in the MIDI 1.0 spec.
 pub type Message = Vec<u8>;
 
+/// An instant on wk's shared MIDI clock, in microseconds.
+pub type Instant64 = u64;
+
+/// The origin of the shared clock. Fixed on first read and never reset, so
+/// every node in the workspace measures from the same zero.
+static ORIGIN: OnceLock<Instant> = OnceLock::new();
+
+/// Read wk's shared monotonic MIDI clock, in microseconds.
+///
+/// This is the one clock MIDI instants are expressed on. It is deliberately not
+/// any node's audio clock: nodes come and go and each audio context starts its
+/// own timeline, whereas a MIDI instant has to mean the same moment in the
+/// sequencer that scheduled it and the synth that plays it.
+pub fn now() -> Instant64 {
+    ORIGIN.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
+
+/// A MIDI message and when it belongs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Event {
+    pub data: Message,
+    /// Microseconds on the shared clock; `0` means "as soon as possible".
+    pub time: Instant64,
+}
+
+impl Event {
+    /// A message to take effect immediately.
+    pub fn now(data: Message) -> Self {
+        Event { data, time: 0 }
+    }
+
+    /// Is this a note-off — either a note-off status or the note-on-with-zero-
+    /// velocity spelling of one? Those must not be dropped under load, or the
+    /// note they release stays stuck on.
+    fn is_note_off(&self) -> bool {
+        match self.data.as_slice() {
+            [status, _, velocity] => {
+                status & 0xF0 == 0x80 || (status & 0xF0 == 0x90 && *velocity == 0)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// How many messages a node may fall behind before the router starts shedding.
+const BACKLOG: usize = 1024;
+
 /// A node's MIDI input queue: connected sources push, the guest drains.
 #[derive(Default)]
 pub struct Inbox {
-    queue: VecDeque<Message>,
+    queue: VecDeque<Event>,
 }
 
 impl Inbox {
-    fn push(&mut self, msg: Message) {
+    fn push(&mut self, event: Event) {
         // Bound the backlog so a node that never reads can't grow it forever.
-        if self.queue.len() < 1024 {
-            self.queue.push_back(msg);
+        // When shedding, drop something that is not a note-off: a lost note-on
+        // is a missing note, but a lost note-off is a note that sounds forever.
+        if self.queue.len() >= BACKLOG {
+            let victim = self.queue.iter().position(|e| !e.is_note_off());
+            match victim {
+                Some(i) => {
+                    self.queue.remove(i);
+                }
+                None => {
+                    self.queue.pop_front();
+                }
+            }
         }
+        self.queue.push_back(event);
+    }
+
+    /// Take everything queued, leaving the inbox empty. Used by a hardware
+    /// output port, which drains on its own thread rather than through a
+    /// guest's `receive`.
+    pub fn drain(&mut self) -> Vec<Event> {
+        self.queue.drain(..).collect()
     }
 }
 
@@ -49,50 +126,114 @@ pub fn new_inbox() -> SharedInbox {
     Arc::new(Mutex::new(Inbox::default()))
 }
 
+/// One wire from a source node to a destination node.
+struct Link {
+    dst: NodeId,
+    inbox: SharedInbox,
+    /// The notes this wire has turned on and not yet turned off, as
+    /// `(channel, note)`. Kept so the wire can release them if it is cut.
+    held: HashSet<(u8, u8)>,
+}
+
+impl Link {
+    /// Track what `msg` does to the set of sounding notes, so a later
+    /// disconnect knows what to release.
+    fn observe(&mut self, msg: &Message) {
+        let [status, a, b] = msg[..] else { return };
+        let channel = status & 0x0F;
+        match status & 0xF0 {
+            0x90 if b > 0 => {
+                self.held.insert((channel, a));
+            }
+            0x80 | 0x90 => {
+                self.held.remove(&(channel, a));
+            }
+            // All notes off / all sound off / reset all controllers all release
+            // the channel's notes at the receiver, so stop tracking them.
+            0xB0 if matches!(a, 120 | 121 | 123) => {
+                self.held.retain(|&(c, _)| c != channel);
+            }
+            _ => {}
+        }
+    }
+
+    /// Release every note this wire is holding, then ask the destination to
+    /// clear anything it is still sounding on those channels.
+    fn release(&mut self) {
+        let mut inbox = self.inbox.lock().unwrap();
+        let channels: HashSet<u8> = self.held.iter().map(|&(c, _)| c).collect();
+        for (channel, note) in self.held.drain() {
+            inbox.push(Event::now(vec![0x80 | channel, note, 0]));
+        }
+        // Belt and braces for a destination that tracks its own notes: the
+        // explicit note-offs above cover a synth that only understands notes,
+        // and "all notes off" covers one that has notes we never saw start.
+        for channel in channels {
+            inbox.push(Event::now(vec![0xB0 | channel, 123, 0]));
+        }
+    }
+}
+
 /// Routes MIDI from each source node to the inboxes of the nodes it is wired to.
 /// Owned by `PluginHost`; the server edits it as connections are made and
 /// broken, and guest `output.send` calls read it.
 #[derive(Default)]
 pub struct Routes {
-    /// Source node id -> connected (destination id, destination inbox).
-    links: HashMap<NodeId, Vec<(NodeId, SharedInbox)>>,
+    /// Source node id -> the wires leaving it.
+    links: HashMap<NodeId, Vec<Link>>,
 }
 
 impl Routes {
     pub fn connect(&mut self, src: NodeId, dst: NodeId, inbox: SharedInbox) {
         let v = self.links.entry(src).or_default();
-        if !v.iter().any(|(id, _)| *id == dst) {
-            v.push((dst, inbox));
+        if !v.iter().any(|l| l.dst == dst) {
+            v.push(Link {
+                dst,
+                inbox,
+                held: HashSet::new(),
+            });
         }
     }
 
+    /// Cut a wire, releasing any notes it left sounding.
     pub fn disconnect(&mut self, src: NodeId, dst: NodeId) {
         if let Some(v) = self.links.get_mut(&src) {
-            v.retain(|(id, _)| *id != dst);
-        }
-    }
-
-    /// Drop a node entirely, as a source and as any destination.
-    pub fn remove_node(&mut self, id: NodeId) {
-        self.links.remove(&id);
-        for v in self.links.values_mut() {
-            v.retain(|(d, _)| *d != id);
-        }
-    }
-
-    fn send(&self, src: NodeId, msg: &Message) {
-        if let Some(v) = self.links.get(&src) {
-            for (_, inbox) in v {
-                inbox.lock().unwrap().push(msg.clone());
+            for link in v.iter_mut().filter(|l| l.dst == dst) {
+                link.release();
             }
+            v.retain(|l| l.dst != dst);
+        }
+    }
+
+    /// Drop a node entirely, as a source and as any destination. Notes the node
+    /// was sounding elsewhere are released; notes played *into* a node that is
+    /// going away need no cleanup, since the node and its voices go with it.
+    pub fn remove_node(&mut self, id: NodeId) {
+        if let Some(mut v) = self.links.remove(&id) {
+            for link in v.iter_mut() {
+                link.release();
+            }
+        }
+        for v in self.links.values_mut() {
+            v.retain(|l| l.dst != id);
+        }
+    }
+
+    fn send(&mut self, src: NodeId, event: &Event) {
+        let Some(v) = self.links.get_mut(&src) else {
+            return;
+        };
+        for link in v.iter_mut() {
+            link.observe(&event.data);
+            link.inbox.lock().unwrap().push(event.clone());
         }
     }
 
     /// Inject a message from a non-guest source (a hardware MIDI device node),
     /// routed to that node's connected destinations exactly like a guest's
     /// `output.send`.
-    pub fn send_from(&self, src: NodeId, msg: &Message) {
-        self.send(src, msg);
+    pub fn send_from(&mut self, src: NodeId, event: &Event) {
+        self.send(src, event);
     }
 }
 
@@ -119,7 +260,11 @@ impl HasData for HasMidi {
     type Data<'a> = &'a mut HostState;
 }
 
-impl wk::midi::midi::Host for HostState {}
+impl wk::midi::midi::Host for HostState {
+    fn now(&mut self) -> Result<u64> {
+        Ok(now())
+    }
+}
 
 impl wk::midi::midi::HostInput for HostState {
     fn new(&mut self) -> Result<Resource<MidiInput>> {
@@ -130,7 +275,19 @@ impl wk::midi::midi::HostInput for HostState {
     fn receive(&mut self, this: Resource<MidiInput>) -> Result<Option<Vec<u8>>> {
         let input = self.table().get(&this)?;
         let msg = input.inbox.lock().unwrap().queue.pop_front();
-        Ok(msg)
+        Ok(msg.map(|e| e.data))
+    }
+
+    fn receive_event(
+        &mut self,
+        this: Resource<MidiInput>,
+    ) -> Result<Option<wk::midi::midi::Event>> {
+        let input = self.table().get(&this)?;
+        let event = input.inbox.lock().unwrap().queue.pop_front();
+        Ok(event.map(|e| wk::midi::midi::Event {
+            data: e.data,
+            time: e.time,
+        }))
     }
 
     fn drop(&mut self, this: Resource<MidiInput>) -> Result<()> {
@@ -145,7 +302,18 @@ impl wk::midi::midi::HostOutput for HostState {
     }
 
     fn send(&mut self, _this: Resource<MidiOutput>, data: Vec<u8>) -> Result<()> {
-        self.midi_router.lock().unwrap().send(self.node_id, &data);
+        self.midi_router
+            .lock()
+            .unwrap()
+            .send(self.node_id, &Event::now(data));
+        Ok(())
+    }
+
+    fn send_at(&mut self, _this: Resource<MidiOutput>, data: Vec<u8>, time: u64) -> Result<()> {
+        self.midi_router
+            .lock()
+            .unwrap()
+            .send(self.node_id, &Event { data, time });
         Ok(())
     }
 
@@ -159,8 +327,17 @@ impl wk::midi::midi::HostOutput for HostState {
 mod tests {
     use super::*;
 
+    fn drain(inbox: &SharedInbox) -> Vec<Message> {
+        let mut q = inbox.lock().unwrap();
+        q.queue.drain(..).map(|e| e.data).collect()
+    }
+
     fn len(inbox: &SharedInbox) -> usize {
         inbox.lock().unwrap().queue.len()
+    }
+
+    fn note_on(note: u8) -> Event {
+        Event::now(vec![0x90, note, 100])
     }
 
     #[test]
@@ -172,24 +349,124 @@ mod tests {
 
         // Wire keyboard -> synth; leave the unrelated node unconnected.
         routes.connect(kbd, synth, to_synth.clone());
-        routes.send(kbd, &vec![0x90, 60, 100]);
+        routes.send(kbd, &note_on(60));
         assert_eq!(len(&to_synth), 1, "connected destination receives");
         assert_eq!(len(&unrelated), 0, "unconnected node receives nothing");
 
         // Idempotent connect doesn't duplicate delivery.
         routes.connect(kbd, synth, to_synth.clone());
-        routes.send(kbd, &vec![0x80, 60, 0]);
+        routes.send(kbd, &Event::now(vec![0x80, 60, 0]));
         assert_eq!(len(&to_synth), 2);
 
         // Disconnecting stops delivery.
         routes.disconnect(kbd, synth);
-        routes.send(kbd, &vec![0x90, 62, 100]);
-        assert_eq!(len(&to_synth), 2);
+        drain(&to_synth);
+        routes.send(kbd, &note_on(62));
+        assert_eq!(len(&to_synth), 0);
 
         // Removing the source node also stops delivery.
         routes.connect(kbd, synth, to_synth.clone());
+        drain(&to_synth);
         routes.remove_node(kbd);
-        routes.send(kbd, &vec![0x90, 64, 100]);
-        assert_eq!(len(&to_synth), 2);
+        routes.send(kbd, &note_on(64));
+        assert_eq!(len(&to_synth), 0);
+    }
+
+    #[test]
+    fn instants_travel_with_the_message() {
+        let mut routes = Routes::default();
+        let inbox = new_inbox();
+        let (src, dst) = (NodeId::nil(), NodeId::new());
+        routes.connect(src, dst, inbox.clone());
+
+        routes.send(
+            src,
+            &Event {
+                data: vec![0x90, 60, 100],
+                time: 12_345,
+            },
+        );
+        let got = inbox.lock().unwrap().queue.pop_front().unwrap();
+        assert_eq!(
+            got.time, 12_345,
+            "the destination sees when the note belongs"
+        );
+    }
+
+    #[test]
+    fn cutting_a_wire_releases_the_notes_it_was_holding() {
+        let mut routes = Routes::default();
+        let inbox = new_inbox();
+        let (kbd, synth) = (NodeId::nil(), NodeId::new());
+        routes.connect(kbd, synth, inbox.clone());
+
+        // Two notes down, one released, then the cable is pulled.
+        routes.send(kbd, &note_on(60));
+        routes.send(kbd, &note_on(64));
+        routes.send(kbd, &Event::now(vec![0x80, 60, 0]));
+        drain(&inbox);
+        routes.disconnect(kbd, synth);
+
+        let after = drain(&inbox);
+        assert!(
+            after.contains(&vec![0x80, 64, 0]),
+            "the note still down is released, got {after:?}"
+        );
+        assert!(
+            !after.contains(&vec![0x80, 60, 0]),
+            "the note already released is not released twice, got {after:?}"
+        );
+        assert!(
+            after.contains(&vec![0xB0, 123, 0]),
+            "and the channel is told to clear anything else, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn deleting_a_source_node_releases_its_notes() {
+        let mut routes = Routes::default();
+        let inbox = new_inbox();
+        let (kbd, synth) = (NodeId::nil(), NodeId::new());
+        routes.connect(kbd, synth, inbox.clone());
+        routes.send(kbd, &note_on(60));
+        drain(&inbox);
+
+        routes.remove_node(kbd);
+        assert!(
+            drain(&inbox).contains(&vec![0x80, 60, 0]),
+            "deleting the keyboard must not leave the synth droning"
+        );
+    }
+
+    #[test]
+    fn an_all_notes_off_stops_the_router_tracking_that_channel() {
+        let mut routes = Routes::default();
+        let inbox = new_inbox();
+        let (kbd, synth) = (NodeId::nil(), NodeId::new());
+        routes.connect(kbd, synth, inbox.clone());
+        routes.send(kbd, &note_on(60));
+        routes.send(kbd, &Event::now(vec![0xB0, 123, 0]));
+        drain(&inbox);
+
+        routes.disconnect(kbd, synth);
+        assert!(
+            drain(&inbox).is_empty(),
+            "nothing is sounding, so nothing needs releasing"
+        );
+    }
+
+    #[test]
+    fn a_flooded_inbox_sheds_notes_but_keeps_note_offs() {
+        let mut inbox = Inbox::default();
+        // One note-off, then far more note-ons than the backlog holds.
+        inbox.push(Event::now(vec![0x80, 60, 0]));
+        for i in 0..BACKLOG * 2 {
+            inbox.push(Event::now(vec![0x90, (i % 128) as u8, 100]));
+        }
+        assert_eq!(inbox.queue.len(), BACKLOG, "the backlog stays bounded");
+        assert!(
+            inbox.queue.iter().any(|e| e.data == vec![0x80, 60, 0]),
+            "the note-off survived the flood, so nothing is left stuck on"
+        );
     }
 }

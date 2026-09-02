@@ -5401,9 +5401,13 @@ mod tests {
         // Note-on and note-off round-trip: router -> inbox -> wk:midi receive
         // -> midi-compat shim -> fluid_synth_noteon/noteoff, each logged.
         let midi = host.midi();
-        midi.lock().unwrap().send_from(kbd, &vec![0x90, 60, 100]);
+        midi.lock()
+            .unwrap()
+            .send_from(kbd, &crate::midi::Event::now(vec![0x90, 60, 100]));
         wait_for("note-on ch=0 key=60 vel=100", 60);
-        midi.lock().unwrap().send_from(kbd, &vec![0x80, 60, 0]);
+        midi.lock()
+            .unwrap()
+            .send_from(kbd, &crate::midi::Event::now(vec![0x80, 60, 0]));
         wait_for("note-off ch=0 key=60", 60);
 
         // Still rendering — no trap on the way.
@@ -5412,6 +5416,204 @@ mod tests {
             "fluidsynth trapped after the notes; log:\n{}",
             log()
         );
+        node.kill.store(true, Ordering::Relaxed);
+    }
+
+    /// The sequencer keeps the clock's time, not the frame rate's.
+    ///
+    /// This is the property the node was rebuilt for. It used to count
+    /// compositor frames and assume sixty a second, so at 120 BPM a sixteenth
+    /// note came out as seven or eight whole frames — a tempo that was not the
+    /// tempo, jittering by up to a frame either way, and moving with the
+    /// display. Now every event is stamped with the instant it belongs to, so
+    /// the test can read the *stamps* and check the arithmetic exactly, with no
+    /// dependence on how fast this machine happens to pump frames.
+    #[test]
+    fn sequencer_stamps_its_notes_on_the_clock_not_the_frame_rate() {
+        let wasm = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../plugins/sequencer/target/wasm32-wasip1/debug/sequencer.wasm");
+        if !wasm.exists() {
+            eprintln!("skipping: build plugins/sequencer first (mise run build)");
+            return;
+        }
+
+        // A saved pattern, in the node's own persisted layout: tag, version,
+        // 150 BPM, 8 steps long, then one note — C4 at step 0, one step, at
+        // velocity 96. Deliberately not the defaults, so the numbers below can
+        // only come from the saved tempo and length.
+        const BPM: f64 = 150.0;
+        const STEPS: i64 = 8;
+        let options = vec![-1.0, 1.0, BPM as f32, STEPS as f32, 0.0, 60.0, 1.0, 96.0];
+        // Microseconds per sixteenth-note step, and per MIDI clock pulse (24
+        // per quarter note, so six per sixteenth).
+        let step_us = 60_000_000.0 / BPM / 4.0;
+        let pulse_us = step_us / 6.0;
+
+        let host = PluginHost::new().expect("host");
+        let nodes: NodeRegistry = Arc::new(Mutex::new(Vec::new()));
+        let surfaces: SurfaceRegistry = Arc::new(Mutex::new(Vec::new()));
+        let id = NodeId::new();
+        host.spawn(
+            &wasm,
+            "sequencer",
+            id,
+            &[],
+            surfaces.clone(),
+            nodes.clone(),
+            options,
+            None,
+        )
+        .expect("spawn");
+
+        let node = nodes
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|n| n.id == id)
+            .cloned()
+            .expect("node registered");
+
+        // Wire the sequencer's output into an inbox we can read, exactly the
+        // way the server wires a canvas "midi" connection to a synth.
+        let inbox = crate::midi::new_inbox();
+        host.midi()
+            .lock()
+            .unwrap()
+            .connect(id, NodeId::new(), inbox.clone());
+
+        // Wait for the surface, then drive frames by hand.
+        let surface = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            loop {
+                if let Some(s) = surfaces.lock().unwrap().first().cloned() {
+                    break s;
+                }
+                assert!(
+                    !node.finished.load(Ordering::Relaxed),
+                    "the sequencer exited before opening a surface"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the sequencer never opened a surface"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+        let pump_frame = || {
+            let mut s = surface.lock().unwrap();
+            s.frame_ready = true;
+            s.wake();
+        };
+        // A few frames so the guest reaches its loop before the keystroke.
+        for _ in 0..5 {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Space starts the transport, the same key a player would press.
+        {
+            let mut s = surface.lock().unwrap();
+            let space = KeyEvent {
+                key: Some(Key::Space),
+                text: Some(" ".into()),
+                alt_key: false,
+                ctrl_key: false,
+                meta_key: false,
+                shift_key: false,
+                repeat: false,
+            };
+            s.key_down.push_back(space.clone());
+            s.key_up.push_back(space);
+            s.wake();
+        }
+
+        // Collect until two full cycles of the pattern have been queued. The
+        // sequencer runs ahead of the clock, so this takes a bit less than two
+        // pattern lengths of real time.
+        let mut events: Vec<crate::midi::Event> = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            pump_frame();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            events.extend(inbox.lock().unwrap().drain());
+            let note_ons = events
+                .iter()
+                .filter(|e| e.data.first() == Some(&0x90))
+                .count();
+            if note_ons >= 3 {
+                break;
+            }
+            assert!(
+                !node.finished.load(Ordering::Relaxed),
+                "the sequencer exited while playing"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the sequencer never played its pattern; got {} events",
+                events.len()
+            );
+        }
+
+        // It announced the start, so anything slaved to it knows to run.
+        assert!(
+            events.iter().any(|e| e.data == vec![0xFA]),
+            "no MIDI start message"
+        );
+
+        // The clock pulses are evenly spaced at exactly 24 per quarter note.
+        // This is the arithmetic that used to be frame counting.
+        let clocks: Vec<u64> = events
+            .iter()
+            .filter(|e| e.data == vec![0xF8])
+            .map(|e| e.time)
+            .collect();
+        assert!(
+            clocks.len() > 20,
+            "expected a run of clock pulses, got {}",
+            clocks.len()
+        );
+        for pair in clocks.windows(2) {
+            let gap = pair[1] as f64 - pair[0] as f64;
+            assert!(
+                (gap - pulse_us).abs() < 2.0,
+                "clock pulses {pulse_us:.1}us apart, got {gap:.1}us"
+            );
+        }
+
+        // The note lands at velocity 96 — the sequencer plays what was written,
+        // it does not flatten every note to one loudness.
+        let note_ons: Vec<&crate::midi::Event> = events
+            .iter()
+            .filter(|e| e.data.first() == Some(&0x90))
+            .collect();
+        assert_eq!(
+            note_ons[0].data,
+            vec![0x90, 60, 96],
+            "the saved velocity reaches the synth"
+        );
+
+        // And the loop comes round after exactly the pattern's length, at the
+        // saved tempo: eight sixteenths at 150 BPM is 800ms to the microsecond.
+        let cycle_us = STEPS as f64 * step_us;
+        for pair in note_ons.windows(2) {
+            let gap = pair[1].time as f64 - pair[0].time as f64;
+            assert!(
+                (gap - cycle_us).abs() < 2.0,
+                "the pattern should come round every {cycle_us:.1}us, got {gap:.1}us"
+            );
+        }
+
+        // The note is released one step later, not left hanging.
+        let off = events
+            .iter()
+            .find(|e| e.data == vec![0x80, 60, 0])
+            .expect("the note is released");
+        let gap = off.time as f64 - note_ons[0].time as f64;
+        assert!(
+            (gap - step_us).abs() < 2.0,
+            "a one-step note should last {step_us:.1}us, got {gap:.1}us"
+        );
+
         node.kill.store(true, Ordering::Relaxed);
     }
 

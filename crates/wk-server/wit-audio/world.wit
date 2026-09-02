@@ -57,6 +57,18 @@ interface audio {
         /// Linearly ramp the gain to `value` over `seconds` from now, anchored
         /// at the current value — for click-free envelopes.
         ramp-to: func(value: f32, seconds: f32);
+        /// Schedule an envelope segment on the context clock: hold
+        /// `start-value` until `when`, then move linearly to `end-value` over
+        /// `seconds`.
+        ///
+        /// `ramp-to` starts the moment it is called, which is whenever the node
+        /// happened to wake up — fine for a key the player just pressed, and
+        /// the wrong tool for a note a sequencer decided the time of. This one
+        /// puts the segment where the music wants it. The starting value is
+        /// given rather than read, because the value at a future instant is not
+        /// knowable now; a caller that scheduled the previous segment can work
+        /// it out exactly.
+        ramp-at: func(start-value: f32, end-value: f32, seconds: f32, when: f64);
         /// Route this gain into another gain node.
         connect: func(dst: borrow<gain>);
         /// Route this gain to the speakers.

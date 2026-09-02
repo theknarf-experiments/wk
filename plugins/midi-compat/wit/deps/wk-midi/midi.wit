@@ -1,13 +1,73 @@
 package wk:midi;
 
+/// wk's MIDI transport. A plugin sends MIDI messages out of an `output` port
+/// and receives them on an `input` port; wk routes messages from a source
+/// node's output to the inputs of the nodes it is wired to on the canvas (a
+/// "midi" connection). So a keyboard plugin can drive a separate synth plugin,
+/// the way two pieces of MIDI gear connect with a cable.
+///
+/// Every message carries an instant on a clock all nodes share, because a
+/// musical tool cannot be built on "whenever the node next runs". A node that
+/// generates time — a sequencer, an arpeggiator — decides when each note
+/// belongs and says so; a node that consumes time — a synth, a hardware port —
+/// places it there. Without that, every event is quantised to whenever the
+/// receiving node happens to wake up, which is the frame rate, and the music
+/// inherits the display's jitter.
 interface midi {
-    resource input {
-        constructor();
-        receive: func() -> option<list<u8>>;
+    /// Microseconds on wk's shared monotonic clock. The origin is arbitrary but
+    /// fixed for the life of the workspace, and every node reads the same one,
+    /// so an instant means the same moment in every node.
+    type instant = u64;
+
+    /// Read the shared clock.
+    ///
+    /// To place MIDI on an audio timeline, read this and the audio context's
+    /// `current-time` back to back: the pair relates the two clocks closely
+    /// enough to convert, and a scheduled event's audio time is then
+    /// `audio-now + (event.time - midi-now) / 1_000_000`.
+    now: func() -> instant;
+
+    /// One MIDI message and the instant it belongs to.
+    record event {
+        /// Exactly one complete message: a status byte and its data bytes, or a
+        /// whole system-exclusive dump. Never a fragment, and never two
+        /// messages run together.
+        data: list<u8>,
+        /// For input, when the message arrived. For output, when it should take
+        /// effect; `0` means as soon as possible.
+        ///
+        /// wk does not hold a message back until its instant — delaying
+        /// delivery would add latency without removing jitter. The instant
+        /// travels with the message so the destination can be early rather than
+        /// late: a synth schedules the note on its audio clock, and a hardware
+        /// port hands the timestamp to the driver, which is what makes the note
+        /// land where it was meant to.
+        time: instant,
     }
 
+    /// A MIDI input port: messages from connected sources queue here until the
+    /// plugin drains them.
+    resource input {
+        constructor();
+        /// Pop the next pending message, discarding its instant. Convenient for
+        /// a node that only passes messages along or reacts on arrival; a node
+        /// that cares when a note sounds wants `receive-event`.
+        receive: func() -> option<list<u8>>;
+        /// Pop the next pending message with its instant.
+        receive-event: func() -> option<event>;
+    }
+
+    /// A MIDI output port: messages sent here are delivered to every node this
+    /// node is wired to.
     resource output {
         constructor();
+        /// Send a message to take effect as soon as possible (e.g. note-on
+        /// `90 3c 64` from a key the player just pressed).
         send: func(data: list<u8>);
+        /// Send a message stamped for `time`, which may be slightly in the
+        /// future. A sequencer works this way: each frame it schedules the
+        /// events falling in the next short window, so its timing comes from
+        /// the clock rather than from when it happened to wake up.
+        send-at: func(data: list<u8>, time: instant);
     }
 }

@@ -45,6 +45,7 @@ interface audio {
     resource gain {
         set-gain: func(value: f32);
         ramp-to: func(value: f32, seconds: f32);
+        ramp-at: func(start-value: f32, end-value: f32, seconds: f32, when: f64);
         connect: func(dst: borrow<gain>);
         connect-destination: func();
     }

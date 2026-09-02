@@ -34,6 +34,10 @@ pub enum NodeClass {
     /// A hardware MIDI input node — a MIDI *source* only (wires to an app's MIDI
     /// input, never a destination).
     MidiSource,
+    /// A hardware MIDI output node — a MIDI *destination* only. Whatever is
+    /// wired into it is played out of a physical MIDI port, so the canvas can
+    /// drive an external synth or drum machine.
+    MidiSink,
     /// A workspace **boundary port**: a placed stand-in for a node on the other
     /// side of the workspace's edge. Unlike every other class it is *declared*
     /// rather than inferred, so it carries its own connection kind and the end
@@ -95,6 +99,14 @@ pub fn classify(a: NodeId, b: NodeId, ca: NodeClass, cb: NodeClass) -> Option<Wi
         // the first element of the MIDI link (it can't be a destination).
         (MidiSource, Other) => Some(Wire::Midi(a, b)),
         (Other, MidiSource) => Some(Wire::Midi(b, a)),
+        // A hardware MIDI sink is the mirror image: always the link's
+        // destination, never its source.
+        (MidiSink, Other) => Some(Wire::Midi(b, a)),
+        (Other, MidiSink) => Some(Wire::Midi(a, b)),
+        // The two hardware ends wire to each other, which is a MIDI thru box:
+        // a keyboard playing an external sound module, with wk in between.
+        (MidiSource, MidiSink) => Some(Wire::Midi(a, b)),
+        (MidiSink, MidiSource) => Some(Wire::Midi(b, a)),
         (Other, Other) => Some(Wire::Midi(a, b)),
         _ => None,
     }
@@ -128,7 +140,7 @@ fn boundary_wire(
     match (dir, kind) {
         // An in-port supplies what an app consumes.
         (In, PortKind::Bind) => fits(Other).then_some(Wire::Bind(port, other)),
-        (In, PortKind::Midi) => fits(Other).then_some(Wire::Midi(port, other)),
+        (In, PortKind::Midi) => (fits(Other) || oc == MidiSink).then_some(Wire::Midi(port, other)),
         (In, PortKind::Capture) => fits(Other).then_some(Wire::Capture(other, port)),
         (In, PortKind::Clipboard) => fits(Other).then_some(Wire::Clipboard(other, port)),
         (In, PortKind::Api) => fits(Other).then_some(Wire::Api(other, port)),
@@ -305,6 +317,14 @@ mod tests {
             (Other, MidiSource, Some(Wire::Midi(b, a))),
             (MidiSource, MidiSource, None),
             (MidiSource, Net, None),
+            // A hardware MIDI sink is the mirror: always the destination.
+            (MidiSink, Other, Some(Wire::Midi(b, a))),
+            (Other, MidiSink, Some(Wire::Midi(a, b))),
+            (MidiSink, MidiSink, None),
+            (MidiSink, Net, None),
+            // Hardware in straight to hardware out: a MIDI thru box.
+            (MidiSource, MidiSink, Some(Wire::Midi(a, b))),
+            (MidiSink, MidiSource, Some(Wire::Midi(b, a))),
             // An API node grants an app API access; the app is always the
             // wire's first element, and it never wires to another special node.
             (Api, Other, Some(Wire::Api(b, a))),
@@ -344,6 +364,7 @@ mod tests {
             Just(NodeClass::Clipboard),
             Just(NodeClass::Api),
             Just(NodeClass::MidiSource),
+            Just(NodeClass::MidiSink),
             Just(NodeClass::Instance),
             Just(NodeClass::Other),
         ]
@@ -447,6 +468,12 @@ mod tests {
                 boundary(Out, PortKind::Midi),
                 Some(Wire::Midi(a, b)),
                 "inner hardware MIDI leaving",
+            ),
+            (
+                MidiSink,
+                boundary(In, PortKind::Midi),
+                Some(Wire::Midi(b, a)),
+                "notes arriving from outside, played out of a hardware port",
             ),
             (
                 Capture,
@@ -579,12 +606,14 @@ mod tests {
         }
 
         /// A wire forms if and only if one side is an app node paired with a
-        /// non-Uplink node, or the pair is an Uplink uplink and a Network — two
-        /// special nodes otherwise never wire. A `group` node is outside all of
-        /// it: an instance is wired through the definition's ports, by name, in
-        /// the file — never by a live wire to the instance node. (Boundary
-        /// ports have their own rule above; this one is about the inferred
-        /// classes.)
+        /// non-Uplink node, or the pair is one of the two special-to-special
+        /// pairs that mean something on their own: an Uplink and a Network, or
+        /// a hardware MIDI input and a hardware MIDI output (a thru box — a
+        /// keyboard playing an external sound module through wk). A `group`
+        /// node is outside all of it: an instance is wired through the
+        /// definition's ports, by name, in the file — never by a live wire to
+        /// the instance node. (Boundary ports have their own rule above; this
+        /// one is about the inferred classes.)
         #[test]
         fn classify_requires_an_app_or_uplink_endpoint(a in any_id(), b in any_id(), ca in any_plain_class(), cb in any_plain_class()) {
             use NodeClass::*;
@@ -592,7 +621,8 @@ mod tests {
             let instance = ca == Instance || cb == Instance;
             let app_pair = (ca == Other || cb == Other) && ca != Uplink && cb != Uplink;
             let uplink_pair = matches!((ca, cb), (Uplink, Net) | (Net, Uplink));
-            prop_assert_eq!(wired, !instance && (app_pair || uplink_pair));
+            let midi_thru = matches!((ca, cb), (MidiSource, MidiSink) | (MidiSink, MidiSource));
+            prop_assert_eq!(wired, !instance && (app_pair || uplink_pair || midi_thru));
         }
 
         /// Toggling the same pair twice restores the original link set, and a
