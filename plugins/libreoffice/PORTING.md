@@ -30,7 +30,15 @@ and does not repeat the reasoning.
   the header comment says why. Fold it into the root file later if you prefer
   the convention.
 * `clone.log` — the fetch.
-* `PORTING.md` — this file.
+* `PORTING.md` — this file. **The plan; `## Current state` near the end is what
+  actually happened.** Impress runs, draws and takes input; the design sections
+  below were written before any of it was built and are kept because the
+  reasoning still holds, not because every sentence is still current.
+* `run-lo.sh` — run the built `soffice.bin` under wasmtime with the mounts it
+  cannot do without. Not how it runs in wk (that is `example/impress.wk`), but
+  how it is debugged.
+* `shim/` — two shims on every link line: the wasip2 thread shim, and the
+  gfx-compat archive that `vcl/wk` draws through.
 * `common.sh` — the shared preamble every stage sources: the `WASI_SDK` guard,
   the layout, the exception/sjlj flag set, the two PATHs, and the rule about
   which flags may travel through the environment (`CFLAGS`/`LDFLAGS` may not —
@@ -994,7 +1002,10 @@ Proves Cairo + FreeType + fontconfig + the whole svp graphics stack with **no
 wk graphics involved**. Qt's M1 was exactly this rung and for exactly this
 reason: it produces an artifact you can look at.
 
-**M6 — Impress's UI paints into the wk surface.** Switch off `--disable-gui`,
+**M6 — Impress's UI paints into the wk surface.** *(Done. The rungs below were
+written before any of this was built; they are left as written because the
+reasoning still holds and because what actually happened is in `## Current
+state` and in the commit messages, not here.)* Switch off `--disable-gui`,
 register `wk` as the single VCL plugin, add `vcl/wk/` (`WkSalInstance`,
 `WkSalFrame`, the compositor, the input translator). *Observable:* a wk-server
 harness pumps frames and dumps one, and the dump is a LibreOffice Impress
@@ -1342,68 +1353,103 @@ Reported, not installed, per the house rules:
 
 ## Current state
 
-**Last re-verified end to end on 2026-09-01, from a pristine `src/` and a wiped
-build tree.** Until that run, every artefact in `build/` had been produced by a
-*working tree* — a `src/` that a session had patched, built in, and then
-reverted — and no one had ever checked that the eight files in `patches/` were
-what produced them. They are. The procedure, so it can be repeated:
+**LibreOffice Impress runs as a wk node, draws its own window, and takes
+input.** Verified by `cargo test -p wk-server libreoffice_impress_paints`,
+which spawns `soffice.bin` on `PluginHost`, bind-mounts the install tree,
+pumps frames, and asserts on the pixels wk gets back — then waits for the
+window to stop changing on its own and presses Tab, which selects a shape.
+Set `WK_LO_DUMP=/tmp/f.ppm` to keep the frame and look at it.
 
-1. `git -C src checkout . && git -C src clean -fd` → `git -C src status
-   --porcelain` empty, `git -C src log -1` = `ad5cf9fd4`.
-2. `git -C src apply --check <ABSOLUTE path>` for each of the eight patches
-   against that pristine tree → **8/8 OK**.
-3. `rm -rf build/workdir build/instdir build/instdir_for_build` and every
-   gbuild-produced directory under `build/workdir_for_build` (`CxxObject`,
-   `CObject`, `GenCxxObject`, `GenCObject`, `LinkTarget`, `Dep`,
-   `CustomTarget`, `Executable`, `Misc`, `YaccTarget`, `LexTarget`).
-4. `./build-configure.sh` → `./build-host.sh` → `./build-lo.sh
-   <module>.allbuild` for `sal`, `salhelper`, `store`, `registry`, `unoidl`,
-   `cppu`, in that order. Zero `error:` lines in any of the six.
-5. **All eleven wasm archives came back byte-identical to the ones the earlier
-   sessions left behind** — same SHA-256, same size, same member list
-   (`llvm-ar` writes deterministically). The port's artefacts are a function of
-   the committed patch set and nothing else.
-6. The `cppu` runtime probe was recompiled against the rebuilt archives and
-   re-run: **8/8 checks, exit 0**. `bridges` was re-attempted and failed with
-   **exactly one** `error:` line, the same one.
+The detail of how each rung fell is in the commit messages, which are the
+running log this section used to be; what follows is only where things stand.
 
-What that run deliberately did **not** re-derive — stated so that nobody reads
-more into "clean-room" than is there:
+| milestone | state |
+|---|---|
+| M0 configure completes | **done** — `config_host.mk` has `OS=WASI` |
+| M1 native bootstrap | **done** — `wasmbridgegen` and ~39 build-side tools |
+| M2 `sal`, `salhelper`, `store`, `registry`, `unoidl`, `cppu` cross-build | **done** |
+| the C++/UNO bridge (`bridges`) | **done** — `gcc3_wasm` with real RTTI rather than a lookup table, plus the fix that mattered: `VtableFactory`'s arena mmaps read-write and then mprotects `PROT_EXEC`, which wasi-libc answers `ENOSYS`, so **every UNO exception that had to cross the bridge killed the process and reported itself as `std::bad_alloc`** |
+| M3 `soffice.bin` links | **done** — a 190 MB wasm **component**; `wasm-tools validate` passes and `wasm-tools component wit` parses it |
+| M4 `.odp` → PDF, headless | **done** — one A4-landscape page, an embedded LiberationSerif subset, text and bezier operators |
+| M5 svp renders a slide to PNG | **done** — 1058x595, the page white, the shapes their own colours |
+| M6 the GUI build shape | **done** — `--disable-gui` is gone, `HAVE_FEATURE_UI` is 1, `VCL_PLUGIN_INFO=wk`, and the headless conversions are unchanged to the pixel |
+| M7 Impress paints into the wk surface | **done** — `vcl/wk/wkcompositor.cxx` flattens VCL's many SalFrames into the one surface a node has |
+| M8 input | **done** — `vcl/wk/wkinput.cxx`; hit-tested against the frame register, keys carrying both the physical code and the character |
+| M9 a shipped node | **done enough to use** — `libreoffice` is a node type in `workspace.wk` and `example/impress.wk` opens a deck. It is a BindMount of `build/instdir`, not an image; see that file for why |
 
-* `build/workdir_for_build/UnpackedTarball` (706 MB of external sources) was
-  kept. No patch in `patches/` touches an external, so nothing in there is
-  under test and re-unpacking it would only re-measure `tar`.
-* `ccache` was warm (65 % hits), so the rebuild took 25 s for the native
-  bootstrap and 49 s for the six modules. **1,214 native and 155 wasm object
-  files were nevertheless regenerated from deleted state** — nothing was
-  reused off disk; only the *compiler* work was cached. **The "20–40 minutes"
-  estimate in `build-host.sh`'s header is still unmeasured on a cold cache**
-  — treat it as a guess, not a number.
-* Nothing above `cppu` was built, because `bridges` still does not compile.
-  Every "not started" row below is exactly as untouched as it was.
+### What is not done
 
-| milestone | state | how this was verified |
-|---|---|---|
-| source pinned at `libreoffice-26.2.6.2` | **done** — `./src`, 1.8 GB, gitignored, never edited in place; patches are applied by `build-configure.sh` and reverted once regenerated | `git -C src log -1` → `ad5cf9fd4 Version 26.2.6.2`; `git -C src status --porcelain` empty at both ends of the session |
-| build scaffolding (`common.sh`, `preflight.sh`, three stages, `mise.toml`, `patches/`) | **done** — every script runs, refuses correctly, and touches nothing outside the plugin | **clean-room** — all three stages ran in order from a wiped build tree |
-| `./preflight.sh` | **green except the two host tools** — `mise run deps` builds `gmake` and `gperf` into `.hosttools` | *inherited* — not re-run on 2026-09-01; the two tools it provides were exercised by `build-configure.sh` |
-| the patch set | **done — EIGHT patches, 1,443 lines**, each verified to apply to a pristine tree *with an absolute path* (a relative one resolves inside `src/` and silently fails to open) | **clean-room** — 8/8 `git -C src apply --check` forward against pristine at the start of the session, and again after `src/` was restored at the end |
-| the wasip2 thread shim | **done** — `shim/wk-wasi-threads.c` → `libwkwasithreads.a`, on every link line via `gb_WASI_SHIM`, force-included with `--whole-archive` | *build* re-verified clean-room (`build-shim.sh` runs in all three stages; the `$(error)` guard fires when the archive is absent). *Behaviour* — the 51.9 ms / 201.3 ms timing harness and the `--why-extract` proof — is **inherited from the session that wrote it**, not re-run |
-| E1 circular-archive link probe | **partially answered, and "not started" understated it** — gbuild's *own* link recipe produced a real wasm component this session: `build/workdir/LinkTarget/Executable/osl_process_child`, **3,330,577 bytes**, from `sal` + `salhelper` + `zlib` + the shim, and it runs under wasmtime with exit 0. That is six archives in a chain, **not** the ~200-archive cycle `static.mk:26-51` describes, so the real question is still open | **clean-room** — the link is in `logs/verify-sal.out`; the component was executed |
-| E2 182 MB component on `PluginHost` | **not started** | — |
-| M0 configure completes | **done** — `build/config_host.mk` has `export OS=WASI` | **clean-room** — `./build-configure.sh` from pristine `src/`, `=== configured: OS=WASI` |
-| M1 native bootstrap | **done, and as of this session it is no longer an inherited claim** — every gbuild output under `workdir_for_build` was deleted and rebuilt: **520 `[build CXX]`, 55 links, 0 errors, 39 executables** in `workdir_for_build/LinkTarget/Executable`, **`wasmbridgegen` among them and freshly relinked**. 24.8 s on a warm ccache | **clean-room** — `logs/host-20260901-144746.log` |
-| M2 `libsal.a` cross-builds **and runs** | **done, both halves.** `./build-lo.sh sal.allbuild` → `[build MOD] sal`, zero errors. **`build/instdir/program/libuno_sal.a`, 2,394,402 bytes, 85 members** (not `workdir/LinkTarget/Library/` — under `DISABLE_DYNLOADING` a gbuild Library's target *is* `instdir/program/lib<name>.a`; `workdir/LinkTarget/Library/` holds only the `.objectlist` and `.exports`). `llvm-objdump -h` → `file format wasm`; `llvm-ar t` shows `pipe_wasi.o`, `process_wasi.o`, `signal_wasi.o` and **none** of `pipe.o`, `process.o`, `signal.o`. `zlib` (**102,012 B / 14 members**) and the UNO bridge's non-`gcc3_wasm` half cross-compile alongside | **clean-room**, byte-identical to the pre-existing archive. The earlier "the *+ a wasip2 program that runs* half is NOT done" is **no longer true** and has been deleted — it was overtaken at M2⅞ and again by the `osl_process_child` component above |
-| M2½ `salhelper` cross-builds | **done, and it needed no patch at all** — zero `error:` lines on the first attempt. **`libuno_salhelpergcc3.a`, 36,052 bytes, 5 members** (`condition.o`, `dynload.o`, `simplereferenceobject.o`, `thread.o`, `timer.o`). The `uno_`/`gcc3` decoration comes from `gb_Library_set_is_ure_library_or_dependency`, not from anything we did. See decision 17 for what a clean build does and does not prove | **clean-room**, byte-identical |
-| M2¾ `store` + `registry` cross-build | **done, and neither needed a patch** — **`libstorelo.a`, 172,782 bytes, 11 members** and **`libreglo.a`, 128,298 bytes, 6 members**, both `file format wasm`. The rung's content is **file-format portability, not compilation**: these are the two libraries that read `services.rdb`/`types.rdb`, and decision 18 is where the on-disk layout was measured rather than assumed | **clean-room**, both byte-identical. The record-layout diff itself is *inherited* — not re-run |
-| M2⅞ `unoidl` cross-builds, **and the port ran its first LibreOffice code** | **done; no source patch, but one platform-makefile fix that invalidated every object built before it** — **`libunoidllo.a`, 983,308 bytes, 7 members**. The rung's result is that a wasm32 binary read back an `.rdb` written by the native arm64 `unoidl-write`, and that doing so exposed the `-pthread` miscompile of exception handling (decision 16). See decision 19 | **clean-room** build, byte-identical. The `unoidl-write` → wasmtime round trip is *inherited* — not re-run this session |
-| the `-pthread` compile-flag fix | **done** — `core-0002` filters `-pthread` out of `gb_LinkTarget_CXXFLAGS` as well as `gb_CXXFLAGS`, because `unxgcc.mk:107` copies the value before `WASI_INTEL_GCC.mk` is ever read. **gbuild does NOT rebuild when a platform makefile changes**, which is why the first attempt at this fix looked like a no-op | **directly re-verified this session**: `touch src/sal/rtl/crc.cxx`, then `make verbose=t sal.allbuild`, then reading the actual `wasi-clang++` command line — `-pthread` appears **nowhere** on it. This is a stronger check than the byte-comparison, because it reads the flag rather than inferring it |
-| M2¹⁵⁄₁₆ `cppu` cross-builds, **and the UNO runtime core runs** | **done — one `osl` patch (`random.cxx`/`getentropy`, decision 20), none in `cppu` itself.** Five archives, all `file format wasm`: **`libuno_cppu.a` 354,092 B / 20 members**, **`libuno_purpenvhelpergcc3.a` 22,272 B / 3**, **`libaffine_uno_uno.a` 10,904 B / 1**, **`liblog_uno_uno.a` 6,186 B / 1**, **`libunsafe_uno_uno.a` 4,882 B / 1** | **clean-room** build, all five byte-identical, **and the run was repeated**: the probe from `logs/probes-cppu/cppu-runtime.cxx` recompiled against the rebuilt archives and executed under wasmtime — typelib static types, `XInterface`'s 3 members with no `.rdb`, `Any` over long/string/hyper/double, `Sequence` copy-on-write, `uno_getEnvironment("uno")`, the identity mapping, and a `css::uno::RuntimeException` caught by `css::uno::Exception&`. **8/8, exit 0** |
-| the C++/UNO bridge (`bridges`) | **BLOCKED — the only open blocker below M3.** `abi.cxx`, `uno2cpp.cxx`, all six `cpp_uno/shared/*.cxx` and `StaticLibrary_emscriptencxxabi` compile; `gcc3_wasm/cpp2uno.cxx:15` dies on `'emscripten.h' file not found`, the `EM_JS jsGetExportedSymbol` RTTI lookup. `core-0005` selected this bridge **correctly** — the failure is not the selection. **Do not "fix" it by returning `nullptr`**: the synthesized-RTTI fallback cannot be caught at all on wasi-sdk 34. See E4 | **clean-room** — `./build-lo.sh bridges.allbuild` → rc=1 with **exactly one** `error:` line, unchanged. The RTTI measurements behind E4 are *inherited* |
-| M3 `soffice.wasm` links headless | **not started** — but three of its blockers fell out of M2: `unxgcc.mk`'s `echo -n` (decision 15), `-pthread` on the link line and `-pthread` on the *compile* line (decision 16). All three hit every object or executable, not just `sal`'s test helpers, and the third one silently | — |
-| M4 `.pptx` → PDF | **not started** | — |
-| M5 svp renders a slide to PNG | **not started** | — |
-| M6–M10 the wk VCL backend and the node | **not started** | — |
+* **A slideshow (F5) has never been run**, and neither has a transition. The
+  animation timing against a host-driven frame clock is untested.
+* **The clipboard is not wired.** `plugins/clipboard-compat` exists and the Qt
+  port uses it; vcl/wk does not.
+* **No image.** The node needs `build/instdir` bind-mounted from the repo, so
+  it is not something you can hand to someone else. 644 MB is the number to
+  beat, and most of it is not needed at run time (`.a` files, the SDK).
+* **Resize is written but barely exercised.** `WKGFX_RESIZE` resizes top-level
+  frames; nothing has yet resized the node on the canvas and watched.
+* **The user profile does not persist** in the example — it lives in the node's
+  in-memory filesystem. A Volume at `/profile` would fix it.
+* **Cold-cache build times are still unmeasured.** Everything here was built
+  with a warm `ccache`, and wasmtime's compile cache makes the test 3 s warm
+  against minutes cold.
+
+### Two bugs found in wk itself
+
+Worth separating from the port, because they were never LibreOffice's:
+
+* **wk's vfs did not resolve `..`.** `components()` dropped `.` and passed `..`
+  through as an ordinary name. LibreOffice is built on such paths —
+  `fundamentalrc` sets `BRAND_BASE_DIR` to `${ORIGIN}/..` — so its configuration
+  registry, UI configuration and presets are all read through a parent link.
+  There were **two** resolvers, and fixing one was worse than fixing neither: a
+  file read through `..` worked while a directory stat through `..` did not, so
+  the configuration loaded and the UI configuration then failed with "does not
+  denote an existing directory", which reads like a missing file.
+* **`salhelper::Thread::launch()` double-frees when thread creation fails.** It
+  acquires a reference and a ScopeGuard releases it on failure, taking the count
+  to zero and `delete this` — while the subclass constructor that called it is
+  still on the stack, so the `new` expression frees the same storage again.
+  Upstream never sees it because `osl::Thread::create` does not fail where there
+  are threads. Here it never succeeds, and the result was a corrupted heap and a
+  fault half a second later in unrelated code.
+
+### Diagnostics this port had to build
+
+On wasm there is no core dump, no debugger, and `std::current_exception()` is
+NULL inside a `std::terminate` handler — verified with a five-line test case, so
+the usual rethrow-and-print cannot name an uncaught exception and it reaches the
+host as a bare `wasm trap: unreachable`. `shim/wk-wasi-threads.c` therefore
+wraps `__cxa_throw` and `malloc` through `wasm-ld --wrap`:
+
+| variable | what it does |
+|---|---|
+| `WK_LO_TRACE_THROW=1` | print every exception's mangled type as it is thrown |
+| `WK_LO_TRAP_THROW=<substring>` | `abort()` **at** the throw, so the backtrace names the code that threw rather than wherever `terminate` was reached |
+| `WK_LO_TRACE_ALLOC=<bytes>` | print allocations at least this large |
+| `WK_LO_DUMP_FRAMES=<path>` `WK_LO_DUMP_AFTER=<n>` | write each visible SalFrame's own surface to PNG after n yields |
+| `SAL_LOG=+INFO.vcl.wk` | vcl/wk's frame census: every frame with its style, geometry and visibility |
+
+A failed `malloc` always reports its size and the linear memory it failed
+against, with no flag to ask for it. `WK_LO_TRAP_THROW=bad_alloc` is what turned
+"`std::bad_alloc`, somewhere" into sixteen named frames ending in
+`VtableFactory::createVtables`, which is the bridge bug above.
+
+One scar in the shim worth reading before touching it: the flags are resolved in
+a constructor rather than lazily, and the malloc trace formats its own decimal
+rather than calling `snprintf`, because **wasi-libc's `getenv` allocates**.
+Reading the environment from inside `malloc` is unbounded recursion, and it
+presents as the trace being silent and the process dying somewhere else.
+
+### A record of the 2026-09-01 mid-port verification
+
+Everything from here to the end of the section describes the port **as it stood
+on 2026-09-01**, when `bridges` was the open blocker and nothing above `cppu`
+had been built. It is kept because the method is worth repeating -- wipe the
+build tree, apply only what is in `patches/`, and check that the artefacts come
+back byte-identical -- and because a plan that edits away its own wrong turns
+teaches nothing. Read the numbers as history: there were eight patches then and
+there are twenty-two now, and the state table above is the current one.
 
 ### Claims this document used to make that the re-verification retired
 
