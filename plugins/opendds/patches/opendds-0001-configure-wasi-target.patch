@@ -1,0 +1,23 @@
+diff --git a/configure b/configure
+index 323c078..96711bf 100755
+--- a/configure
++++ b/configure
+@@ -96,6 +96,18 @@ my %platforminfo =
+                                  'cross-compiler binary',
+                                 ],
+                     },
++   'wasi' => {
++              'libpath' => 'LD_LIBRARY_PATH',
++              'aceplatform' => 'wasi',
++              'aceconfig' => 'wasi',
++              'no_host' => 1,
++              'usage' => ['wasm32-wasip2, for the wk runtime. Supply the SDK ' .
++                          'with --macros=WASI_SDK=<wasi-sdk root>; ' .
++                          'ace/config-wasi.h and platform_wasi.GNU come from ' .
++                          'plugins/opendds/ace/ and are installed by ' .
++                          'plugins/opendds/build-target.sh',
++                         ],
++             },
+    'freebsd' => {
+                     'compilers' => ['clang++'],
+                     'libpath' => 'LD_LIBRARY_PATH',

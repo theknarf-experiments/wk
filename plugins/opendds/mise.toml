@@ -1,0 +1,68 @@
+# Build this plugin: `mise run fetch`, then `build-host`, then `build-target`.
+#
+# Three stages, because none can start until the previous one has finished:
+#
+#   fetch         clone OpenDDS at the pinned tag. Seconds.
+#   build-host    the NATIVE build: ACE, TAO and the two IDL compilers
+#                 (tao_idl, opendds_idl) that the cross build has to RUN.
+#                 ~20 min on an M-series Mac. Milestone M1.
+#   build-target  the wasm32-wasip2 build. Long, and the rung most likely to
+#                 fail. Milestones M2 (ACE) and M3 (TAO + OpenDDS).
+#
+# `./build-target.sh ace` builds ACE only and is where you should start —
+# every wasi-libc gap this port has to close lives in ACE, and finding them
+# there costs minutes instead of at the end of a TAO build. Same advice, and
+# the same reason, as plugins/libreoffice's `./build-lo.sh sal`.
+#
+# No [tools] of its own: OpenDDS's build needs perl, make and a native
+# clang++, all of which macOS ships, plus the wasi-sdk pinned in the root
+# mise.toml. The scripts resolve wasi-sdk at task time (`mise where` cannot be
+# used in an [env] template — it would recurse), the same shape as
+# plugins/qt and plugins/libreoffice.
+
+[tasks.fetch]
+description = "Clone OpenDDS at the pinned tag into ./src"
+dir = "{{config_root}}"
+run = "./fetch.sh"
+
+[tasks.build-host]
+description = "Native ACE + tao_idl + opendds_idl into ./host (M1) — ~20 min"
+dir = "{{config_root}}"
+depends = ["fetch"]
+run = "./build-host.sh"
+
+[tasks.build-target]
+description = "Cross-build ACE, TAO and OpenDDS for wasm32-wasip2 (M2/M3) — long"
+dir = "{{config_root}}"
+depends = ["build-host"]
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-target.sh"
+
+[tasks.build-target-ace]
+description = "Cross-build ACE only — the short, high-yield rung. Start here"
+dir = "{{config_root}}"
+depends = ["build-host"]
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-target.sh ace"
+
+# The repo-wide `mise run build-plugins` (root mise.toml) invokes every
+# plugin's `build` task. This one must not turn that sweep into an hours-long
+# ACE+TAO+OpenDDS build — and right now it would not even be a SUCCESSFUL one:
+# the port is at M2. Explicit opt-in until a full build is known to complete,
+# which is the guard plugins/libreoffice arrived at after its "skip while
+# patches/ is empty" version stopped guarding anything.
+[tasks.build]
+description = "Build the OpenDDS port (opt-in: hours, and does not link yet)"
+dir = "{{config_root}}"
+run = """
+set -e
+if [ "${WK_OPENDDS_BUILD:-0}" != "1" ]; then
+  echo "opendds: skipping -- the full build is hours long and does not link yet."
+  echo "    The port is at M2 (ACE for wasm32-wasip2); see PORTING.md"
+  echo "    'Current state' for exactly where."
+  echo "    Per-stage: ./fetch.sh, ./build-host.sh, ./build-target.sh [ace]"
+  echo "    To run the whole thing anyway: WK_OPENDDS_BUILD=1 mise run build"
+  exit 0
+fi
+./fetch.sh
+./build-host.sh
+WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-target.sh
+"""

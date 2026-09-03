@@ -1,0 +1,211 @@
+--- a/ACE_wrappers/ace/Handle_Set.h
++++ b/ACE_wrappers/ace/Handle_Set.h
+@@ -36,10 +36,29 @@
+ #  define ACE_DEFAULT_SELECT_REACTOR_SIZE ACE_FD_SETSIZE
+ #endif /* ACE_DEFAULT_SELECT_REACTOR_SIZE */
+ 
+-#if defined (ACE_WIN32) || defined (ACE_MQX)
++#if defined (ACE_WIN32) || defined (ACE_MQX) || defined (ACE_WASI)
+ # define ACE_HANDLE_SET_USES_FD_ARRAY
+ #endif
+ 
++#if defined (ACE_HANDLE_SET_USES_FD_ARRAY)
++// The member names of an fd_set that is a COUNT plus an ARRAY OF HANDLES
++// rather than a bitmask. Win32's is
++//    struct fd_set { u_int fd_count; SOCKET fd_array[FD_SETSIZE]; };
++// and everything below assumed those two names, which excluded any other
++// platform whose fd_set has the same shape under different names — for
++// instance wasm32-wasip2's
++//    typedef struct { size_t __nfds; int __fds[FD_SETSIZE]; } fd_set;
++// A platform config can now name them instead of being pushed onto the
++// bitmask path, which for such an fd_set does not merely misbehave: there is
++// no fd_mask, no NFDBITS and no fds_bits member to compile against.
++# if !defined (ACE_FD_SET_COUNT)
++#   define ACE_FD_SET_COUNT fd_count
++# endif
++# if !defined (ACE_FD_SET_ARRAY)
++#   define ACE_FD_SET_ARRAY fd_array
++# endif
++#endif /* ACE_HANDLE_SET_USES_FD_ARRAY */
++
+ ACE_BEGIN_VERSIONED_NAMESPACE_DECL
+ 
+ /**
+--- a/ACE_wrappers/ace/Handle_Set.inl
++++ b/ACE_wrappers/ace/Handle_Set.inl
+@@ -96,9 +96,31 @@
+       && (!this->is_set (handle)))
+     {
+ #if defined (ACE_HANDLE_SET_USES_FD_ARRAY)
++      // The cast is Win32's: FD_SET there takes a SOCKET. Every other
++      // array-fd_set platform (WASI, MQX) has an int-handled FD_SET and no
++      // such type, so casting is both unnecessary and unbuildable.
++# if defined (ACE_WIN32)
+       FD_SET ((SOCKET) handle,
+               &this->mask_);
++# else
++      FD_SET (handle,
++              &this->mask_);
++# endif /* ACE_WIN32 */
+       ++this->size_;
++
++      // Track max_handle_ here as well, NOT only on the bitmask path.
++      // Win32 never needed it -- its select() ignores the width argument --
++      // so this branch left max_handle_ at ACE_INVALID_HANDLE forever, and
++      // max_set() therefore answered 0 for a non-empty set. On a platform
++      // whose select() DOES honour the width (wasi-libc's does; verified by
++      // probe: width 0 reports nothing ready) that is fatal, and quietly so:
++      // ACE_Select_Reactor_Handler_Repository::unbind_i() recomputes the
++      // reactor's max_handlep1_ as the maximum of six max_set() calls
++      // (Select_Reactor_Base.cpp), so the FIRST handler removal collapses the
++      // select width to zero and the reactor goes deaf for good -- no error,
++      // no dispatch, ever again.
++      if (handle > this->max_handle_)
++        this->max_handle_ = handle;
+ #else /* ACE_HANDLE_SET_USES_FD_ARRAY */
+ #if defined (ACE_HAS_BIG_FD_SET)
+       if (this->size_ == 0)
+@@ -131,10 +153,11 @@
+               &this->mask_);
+       --this->size_;
+ 
+-#if !defined (ACE_HANDLE_SET_USES_FD_ARRAY)
++      // Recompute the maximum when the handle just cleared WAS the maximum.
++      // Both forms need this, for the reason set_bit() explains: a stale
++      // max_handle_ is what the reactor's select width is rebuilt from.
+       if (handle == this->max_handle_)
+         this->set_max (this->max_handle_);
+-#endif /* !ACE_HANDLE_SET_USES_FD_ARRAY */
+     }
+ }
+ 
+@@ -144,7 +167,7 @@
+ {
+   ACE_TRACE ("ACE_Handle_Set::num_set");
+ #if defined (ACE_HANDLE_SET_USES_FD_ARRAY)
+-  return this->mask_.fd_count;
++  return this->mask_.ACE_FD_SET_COUNT;
+ #else /* !ACE_HANDLE_SET_USES_FD_ARRAY */
+   return this->size_;
+ #endif /* ACE_HANDLE_SET_USES_FD_ARRAY */
+--- a/ACE_wrappers/ace/Handle_Set.cpp
++++ b/ACE_wrappers/ace/Handle_Set.cpp
+@@ -44,8 +44,8 @@
+   ACELIB_DEBUG ((LM_DEBUG, ACE_TEXT ("\n[ ")));
+ 
+ #if defined (ACE_HANDLE_SET_USES_FD_ARRAY)
+-  for (size_t i = 0; i < (size_t) this->mask_.fd_count + 1; i++)
+-    ACELIB_DEBUG ((LM_DEBUG, ACE_TEXT (" %x "), this->mask_.fd_array[i]));
++  for (size_t i = 0; i < (size_t) this->mask_.ACE_FD_SET_COUNT + 1; i++)
++    ACELIB_DEBUG ((LM_DEBUG, ACE_TEXT (" %x "), this->mask_.ACE_FD_SET_ARRAY[i]));
+ #else /* !ACE_HANDLE_SET_USES_FD_ARRAY */
+   for (ACE_HANDLE i = 0; i < this->max_handle_ + 1; i++)
+     if (this->is_set (i))
+@@ -236,7 +236,21 @@
+   if (this->max_handle_ >= ACE_Handle_Set::MAXSIZE)
+     this->max_handle_ = ACE_Handle_Set::MAXSIZE - 1;
+ #else
++  // The array form: max_handle_ is the largest handle still in the set, so
++  // recompute it by scanning -- at most num_set() entries, and only when a
++  // handle is cleared. Doing nothing here (which is what this branch used to
++  // do) leaves max_handle_ describing a handle that has been removed, which
++  // makes the select width larger than necessary but never smaller, so it was
++  // harmless on Win32 where the width is ignored entirely. It is not harmless
++  // where the width is honoured: see the note in set_bit().
+   ACE_UNUSED_ARG (current_max);
++  this->max_handle_ = ACE_INVALID_HANDLE;
++  for (size_t i = 0; i < (size_t) this->mask_.ACE_FD_SET_COUNT; ++i)
++    {
++      ACE_HANDLE const h = (ACE_HANDLE) this->mask_.ACE_FD_SET_ARRAY[i];
++      if (h > this->max_handle_)
++        this->max_handle_ = h;
++    }
+ #endif /* !ACE_HANDLE_SET_USES_FD_ARRAY */
+ }
+ 
+@@ -265,11 +279,34 @@
+ {
+   ACE_TRACE ("ACE_Handle_Set_Iterator::operator");
+ #if defined (ACE_HANDLE_SET_USES_FD_ARRAY)
+-  if (this->handle_index_ < this->handles_.mask_.fd_count)
+-    // Return the handle and advance the iterator.
+-    return (ACE_HANDLE) this->handles_.mask_.fd_array[this->handle_index_++];
+-  else
+-    return ACE_INVALID_HANDLE;
++  // Walk the array from the END DOWNWARD, and note that this is not a stylistic
++  // choice -- it is what makes the walk safe while the set is being modified.
++  //
++  // ACE_Select_Reactor_T::dispatch_io_set() calls clear_dispatch_mask() on each
++  // handle it dispatches, INSIDE the loop that is iterating this very set. On
++  // the bitmask representation that is harmless: clearing a bit moves nothing.
++  // On an array representation removal is a swap-with-the-last-element
++  // (wasi-libc's FD_CLR does exactly that, and Win32's compacts), so elements
++  // MOVE under the iterator.
++  //
++  // Going upward, removing the element just returned at index k drops the
++  // former last element into slot k while the iterator has already advanced to
++  // k+1 -- so that handle is silently skipped and never dispatched. Going
++  // downward, the element just returned IS the last one, so the swap is a
++  // self-assignment and the next index (k-1) is still the right one. Nothing is
++  // skipped and nothing is visited twice.
++  //
++  // The clamp handles the general case where the set shrank by more than one
++  // (a handler that removed several handles).
++  {
++    u_int const count = (u_int) this->handles_.mask_.ACE_FD_SET_COUNT;
++    if (this->handle_index_ > count)
++      this->handle_index_ = count;
++    if (this->handle_index_ == 0)
++      return ACE_INVALID_HANDLE;
++    --this->handle_index_;
++    return (ACE_HANDLE) this->handles_.mask_.ACE_FD_SET_ARRAY[this->handle_index_];
++  }
+ 
+ #elif !defined (ACE_HAS_BIG_FD_SET) /* !ACE_HANDLE_SET_USES_FD_ARRAY */
+   // No sense searching further than the max_handle_ + 1;
+@@ -415,6 +452,12 @@
+ #endif /* ACE_HAS_BIG_FD_SET */
+ {
+   ACE_TRACE ("ACE_Handle_Set_Iterator::ACE_Handle_Set_Iterator");
++#if defined (ACE_HANDLE_SET_USES_FD_ARRAY)
++  // Start past the end: operator() walks the array downward, which is what
++  // keeps the walk correct while dispatch_io_set() removes handles from under
++  // it. See the note in operator().
++  this->handle_index_ = (u_int) this->handles_.mask_.ACE_FD_SET_COUNT;
++#endif
+ #if !defined (ACE_HANDLE_SET_USES_FD_ARRAY) && !defined (ACE_HAS_BIG_FD_SET)
+   // No sense searching further than the max_handle_ + 1;
+   ACE_HANDLE maxhandlep1 = this->handles_.max_handle_ + 1;
+@@ -461,7 +504,11 @@
+ {
+   ACE_TRACE ("ACE_Handle_Set_Iterator::reset_state");
+ 
+-#if !defined (ACE_HAS_BIG_FD_SET) || defined (ACE_HANDLE_SET_USES_FD_ARRAY)
++#if defined (ACE_HANDLE_SET_USES_FD_ARRAY)
++  // Start past the end: operator() walks downward. See the note there.
++  this->handle_index_ = (u_int) this->handles_.mask_.ACE_FD_SET_COUNT;
++  this->word_num_ = -1;
++#elif !defined (ACE_HAS_BIG_FD_SET)
+   this->handle_index_  = 0;
+   this->word_num_ = -1;
+ #elif defined (ACE_HAS_BIG_FD_SET)
+--- a/ACE_wrappers/ace/os_include/sys/os_select.h
++++ b/ACE_wrappers/ace/os_include/sys/os_select.h
+@@ -40,10 +40,15 @@
+ {
+ #endif /* __cplusplus */
+ 
+-#if defined (ACE_WIN32)
++#if defined (ACE_WIN32) || defined (ACE_WASI)
+    // This will help until we figure out everything:
++   // (WASI is here for the same reason as Win32: its fd_set is a count
++   // plus an array of handles, so there is no fd_mask and no NFDBITS to
++   // pick up from <sys/select.h> -- and ACE_Handle_Set still names
++   // NFDBITS in an enum and in ACE_MSB_MASK, neither of which the
++   // ACE_HANDLE_SET_USES_FD_ARRAY paths ever read.)
+ #  define NFDBITS 32 /* only used in unused functions... */
+-#endif /* ACE_WIN32 */
++#endif /* ACE_WIN32 || ACE_WASI */
+ 
+ #ifdef __cplusplus
+ }

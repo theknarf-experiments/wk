@@ -1,0 +1,67 @@
+--- a/dds/DCPS/NetworkResource.cpp
++++ b/dds/DCPS/NetworkResource.cpp
+@@ -387,6 +387,25 @@
+ 
+ bool set_socket_multicast_ttl(const ACE_SOCK_Dgram& socket, const unsigned char& ttl)
+ {
++#ifdef ACE_WASI
++  // wasm32-wasip2 has no multicast at all: wasi:sockets does not expose the
++  // IP_MULTICAST_* / IPV6_MULTICAST_* options in its interface, so setsockopt
++  // for them cannot succeed on any guest, ever. A multicast TTL is a hint
++  // about how far a MULTICAST send may travel, and this participant will never
++  // send one -- Spdp calls this on its UNICAST socket, unconditionally and
++  // with no configuration to skip it, which is the only reason we are here.
++  //
++  // So report success. This is not the same permission as pretending a GROUP
++  // JOIN succeeded: a participant that believes it joined a group and then
++  // receives nothing is silently broken, whereas one that cannot set a TTL it
++  // will never use has lost nothing. Group joins are left to fail, which is
++  // what forces the unicast SPDP configuration (SpdpSendAddrs) that wk's
++  // fabric actually supports. See plugins/opendds/PORTING.md, "rtps_udp, and
++  // unicast discovery".
++  ACE_UNUSED_ARG(socket);
++  ACE_UNUSED_ARG(ttl);
++  return true;
++#else
+   ACE_HANDLE handle = socket.get_handle();
+   const void* ttlp = &ttl;
+ #if defined(ACE_LINUX) || defined(__linux__) || defined(ACE_HAS_MAC_OSX)
+@@ -432,11 +451,38 @@
+                      false);
+   }
+   return true;
++#endif // ACE_WASI
+ }
+ 
+ bool set_recvpktinfo(ACE_SOCK_Dgram& sock, bool ipv4)
+ {
+   bool success = true;
++#ifdef ACE_WASI
++  // Nothing to configure, and nothing lost by not configuring it.
++  //
++  // RECVPKTINFO asks the stack to attach the datagram's DESTINATION address to
++  // each receive as ancillary data, which matters on a multi-homed host that
++  // binds the wildcard address. On wasm32-wasip2 it cannot work and does not
++  // need to:
++  //
++  //   * wasi:sockets has no ancillary data. ACE's recvmsg here is supplied by
++  //     plugins/opendds/shim/wk-opendds-net.c over recvfrom, which sets
++  //     msg_controllen = 0, so no control message can ever arrive no matter
++  //     what the socket was asked for. ACE already falls back to
++  //     get_local_addr() in that case (SOCK_Dgram.cpp), which is the answer.
++  //   * a wk node is not multi-homed. It has exactly one address on the one
++  //     Network it is wired to (10.0.0.x / fd00::x, assigned by the host), so
++  //     the destination address of anything it receives is already known.
++  //
++  // ACE nevertheless defines ACE_RECVPKTINFO, because wasi-libc's
++  // <netinet/in.h> defines IP_PKTINFO as a CONSTANT while implementing none of
++  // it -- the same "the header says yes, the libc says no" split documented in
++  // ace/config-wasi.h -- so without this the setsockopt below is attempted,
++  // returns ENOTSUP, and Spdp treats it as fatal.
++  ACE_UNUSED_ARG(sock);
++  ACE_UNUSED_ARG(ipv4);
++  return true;
++#endif
+ #if defined ACE_RECVPKTINFO || defined ACE_RECVPKTINFO6
+   if (ipv4) {
+ #  ifdef ACE_RECVPKTINFO

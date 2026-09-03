@@ -1,0 +1,37 @@
+# opendds (real OpenDDS — DDS/RTPS pub/sub — as wk nodes talking over the
+# userspace network fabric).
+#
+# Placement follows plugins/libreoffice: the derived tree here is large (an
+# OpenDDS checkout, ACE+TAO beside it, and then a SECOND native copy of both
+# for the host tools), and a nested .gitignore is in force from the moment the
+# directory exists — there is no window in which a `git add -A` from the repo
+# root could sweep it in.
+#
+# Upstream OpenDDS and ACE/TAO are FETCHED, never vendored. Only the build
+# scripts, patches/, shim/, the demo node sources, mise.toml and PORTING.md
+# belong in git.
+
+# The target checkout (OpenDDS at the pinned tag) and the ACE/TAO that
+# OpenDDS's own configure downloads into it. configure builds in-tree, so the
+# object files land here too.
+src/
+
+# The native second checkout that produces tao_idl and opendds_idl. Same
+# split as plugins/qt/host and plugins/libreoffice/host.
+host/
+
+# The wasm32-wasip2 build and its install prefix.
+build-target/
+sysroot/
+
+# wit-bindgen output for wk interfaces the demo nodes import, if they grow any.
+gen/
+
+# Per-stage build logs. Large and machine-specific.
+logs/
+*.log
+
+# Built artifacts.
+*.wasm
+*.a
+*.o

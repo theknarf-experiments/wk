@@ -1,0 +1,34 @@
+--- a/ACE_wrappers/ace/ACE.cpp
++++ b/ACE_wrappers/ace/ACE.cpp
+@@ -2816,12 +2816,28 @@
+ #endif /* RLIMIT_NOFILE && !ACE_LACKS_RLIMIT */
+ 
+ #if defined (_SC_OPEN_MAX) && !defined (ACE_LACKS_SYSCONF)
+-  return static_cast<int> (ACE_OS::sysconf (_SC_OPEN_MAX));
+-#elif defined (FD_SETSIZE)
++  {
++    // POSIX: sysconf() returning -1 WITHOUT setting errno means the value is
++    // indeterminate, not that the call failed -- so -1 must not be handed back
++    // to callers as a count. It is what wasm32-wasip2 answers for
++    // _SC_OPEN_MAX (verified: sysconf returns -1 with errno untouched, while
++    // _SC_PAGESIZE, _SC_NPROCESSORS_ONLN and _SC_CLK_TCK all answer normally),
++    // and ACE_Select_Reactor's default constructor passes this straight to
++    // ACE_Select_Reactor_Handler_Repository::open() as a size_t -- so -1
++    // becomes a request for 4 billion handles, the open fails, the constructor
++    // runs close(), and the reactor is left with no timer queue. The only
++    // symptom is a trap inside dispatch_timer_handlers on the first timer.
++    int const open_max = static_cast<int> (ACE_OS::sysconf (_SC_OPEN_MAX));
++    if (open_max != -1)
++      return open_max;
++    // else fall through to the FD_SETSIZE answer below
++  }
++#endif /* _SC_OPEN_MAX */
++#if defined (FD_SETSIZE)
+   return FD_SETSIZE;
+ #else
+   ACE_NOTSUP_RETURN (-1);
+-#endif /* _SC_OPEN_MAX */
++#endif /* FD_SETSIZE */
+ }
+ 
+ // Set the number of currently open handles in the process.

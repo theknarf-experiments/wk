@@ -1,0 +1,38 @@
+--- a/ACE_wrappers/ace/SOCK_Dgram.cpp
++++ b/ACE_wrappers/ace/SOCK_Dgram.cpp
+@@ -155,6 +155,35 @@
+   if (error)
+     this->close ();
+ 
++#ifdef ACE_WASI
++  // A datagram socket on wasm32-wasip2 is ALWAYS non-blocking, and this is a
++  // platform fact rather than a preference.
++  //
++  // wasip2 reports a UDP socket readable until a receive finds nothing: after
++  // the last datagram has been read, select() still says "ready" exactly once
++  // more, and it is that empty read which clears the readiness. Verified with
++  // a five-line probe --
++  //
++  //     select before read      -> 1
++  //     recv                    -> 5
++  //     select after read       -> 1     <-- still ready
++  //     recv again              -> -1 (EAGAIN)
++  //     select after empty read -> 0
++  //
++  // Any code that trusts select() and does ONE BLOCKING read per readable
++  // event therefore performs one read too many, and on this runtime that read
++  // never returns: there is no second thread to deliver a datagram and no
++  // signal to interrupt the wait, so the process simply stops. (That is
++  // exactly how it presented -- an OpenDDS participant that announced itself
++  // once and then went silent, blocked in recvfrom on its SPDP socket.)
++  //
++  // Non-blocking makes the extra readiness harmless: the extra read returns
++  // EAGAIN, which every caller already handles, and which is also what clears
++  // the readiness for the next round.
++  if (!error)
++    this->enable (ACE_NONBLOCK);
++#endif
++
+   return error ? -1 : 0;
+ }
+ 

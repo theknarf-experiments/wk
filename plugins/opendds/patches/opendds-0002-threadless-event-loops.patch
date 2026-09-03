@@ -1,0 +1,394 @@
+--- a/dds/DCPS/ThreadPool.h
++++ b/dds/DCPS/ThreadPool.h
+@@ -57,6 +57,19 @@
+    */
+   bool contains(ACE_thread_t id) const;
+ 
++  /**
++   * True when NO thread could be created, so the pool is empty and whatever
++   * loop it was going to run must be driven some other way.
++   *
++   * On a target with no threads (wasm32-wasip2, where pthread_create returns
++   * ENOTSUP) the constructor cannot wait for threads to check in -- nothing
++   * will ever check in -- so it records that here instead of hanging. The
++   * owner of the pool is then responsible for arranging that its loop runs;
++   * see DispatchService, which registers one pass of run_event_loop() with
++   * the caller's pump.
++   */
++  bool empty() const { return empty_; }
++
+ private:
+ 
+   void join_all();
+@@ -67,6 +80,7 @@
+   mutable ConditionVariable<ACE_Thread_Mutex> cv_;
+   ThreadStatusManager tsm_;
+   size_t active_threads_;
++  bool empty_;
+ #if defined OPENDDS_NO_THREAD_JOIN
+   size_t finished_threads_;
+ #endif
+--- a/dds/DCPS/ThreadPool.cpp
++++ b/dds/DCPS/ThreadPool.cpp
+@@ -25,20 +25,41 @@
+  , mutex_()
+  , cv_(mutex_)
+  , active_threads_(0)
++ , empty_(false)
+ #ifdef OPENDDS_NO_THREAD_JOIN
+  , finished_threads_(0)
+ #endif
+  , ids_(count)
+ {
++  size_t spawned = 0;
+   {
+     ACE_Guard<ACE_Thread_Mutex> guard(mutex_);
+     for (size_t i = 0; i < count; ++i) {
+-      ACE_Thread::spawn(run, this, THR_NEW_LWP | THR_JOINABLE, 0, &(ids_[i]));
++      if (ACE_Thread::spawn(run, this, THR_NEW_LWP | THR_JOINABLE, 0, &(ids_[i])) == 0) {
++        ++spawned;
++      }
+     }
+   }
+-  if (count) {
++
++  // A platform with no threads at all -- wasm32-wasip2, where pthread_create
++  // is a stub returning ENOTSUP -- spawns none of them. The barrier below
++  // waits for every thread to check in, and there that wait can never end:
++  // nobody checks in and nobody signals the condition variable. Record the
++  // pool as empty and skip the barrier, so construction completes and the
++  // OWNER of the pool can arrange to run the work itself.
++  //
++  // The test is on the spawn RESULT rather than on a build-time #ifdef, so
++  // that this stays a runtime property of the platform instead of a second
++  // configuration to keep in step with the first.
++  if (count && spawned == 0) {
++    ids_.clear();
++    empty_ = true;
++    return;
++  }
++
++  if (spawned) {
+     ACE_Guard<ACE_Thread_Mutex> guard(mutex_);
+-    while (active_threads_ != count) {
++    while (active_threads_ != spawned) {
+       cv_.wait(tsm_);
+     }
+   }
+@@ -78,6 +99,13 @@
+ 
+ void ThreadPool::join_all()
+ {
++  // Nothing was ever started, so there is nothing to join -- and the
++  // OPENDDS_NO_THREAD_JOIN branch below would otherwise wait forever for
++  // finished_threads_ to reach a count no thread will ever contribute to.
++  if (empty_) {
++    return;
++  }
++
+ #ifdef OPENDDS_NO_THREAD_JOIN
+   ACE_Guard<ACE_Thread_Mutex> guard(mutex_);
+   while (finished_threads_ != ids_.size()) {
+--- a/dds/DCPS/DispatchService.h
++++ b/dds/DCPS/DispatchService.h
+@@ -154,6 +154,24 @@
+   static ACE_THR_FUNC_RETURN run(void* arg);
+   void run_event_loop();
+ 
++  /**
++   * One pass of run_event_loop()'s body: move due timers into the event
++   * queue, then dispatch at most one event. Returns with the lock released
++   * and NEVER blocks -- where run_event_loop() would wait on cv_ for
++   * something to do, this simply returns.
++   *
++   * It exists for platforms with no threads, where the pool_ below is empty
++   * and nothing is running the loop. There the caller's pump calls this
++   * instead, through inline_pass() -- see the constructor.
++   */
++  void run_event_loop_once();
++
++  /// Trampoline for the inline-runnable registry (a C API, so no member ptr).
++  static void inline_pass(void* arg);
++
++  /// Registry slot when pool_ is empty, or -1. See the constructor.
++  int inline_slot_;
++
+   typedef std::pair<FunArgPair, TimerId> TimerPair;
+   typedef OPENDDS_MULTIMAP(MonotonicTimePoint, TimerPair) TimerQueueMap;
+   typedef OPENDDS_MAP(TimerId, TimerQueueMap::iterator) TimerIdMap;
+--- a/dds/DCPS/DispatchService.cpp
++++ b/dds/DCPS/DispatchService.cpp
+@@ -14,6 +14,12 @@
+ 
+ #include <ace/Reverse_Lock_T.h>
+ 
++#ifdef ACE_WASI
++#  include <wk-opendds-inline.h>
++#  include <cstdio>
++#  include <cstdlib>
++#endif
++
+ OPENDDS_BEGIN_VERSIONED_NAMESPACE_DECL
+ 
+ namespace OpenDDS {
+@@ -26,12 +32,30 @@
+  , running_(true)
+  , running_threads_(0)
+  , max_timer_id_(LONG_MAX)
++ , inline_slot_(-1)
+  , pool_(count, run, this)
+ {
++  // A platform with no threads (wasm32-wasip2) leaves the pool empty, so
++  // nobody is running run_event_loop() and every dispatched event and every
++  // timer would sit in the queue forever. Register one non-blocking pass with
++  // the caller's pump instead; it is called from pthread_cond_wait and from
++  // the node's own loop. See plugins/opendds/shim/include/wk-opendds-inline.h.
++#ifdef ACE_WASI
++  if (pool_.empty()) {
++    inline_slot_ = wk_inline_register(inline_pass, this);
++    if (getenv("WK_DDS_TRACE")) { fprintf(stderr, "[wk] DispatchService inline slot=%d count=%d\n", inline_slot_, wk_inline_count()); }
++  }
++#endif
+ }
+ 
+ DispatchService::~DispatchService()
+ {
++#ifdef ACE_WASI
++  if (inline_slot_ != -1) {
++    wk_inline_unregister(inline_slot_);
++    inline_slot_ = -1;
++  }
++#endif
+   shutdown();
+ }
+ 
+@@ -160,6 +184,62 @@
+   DispatchService& dispatcher = *static_cast<DispatchService*>(arg);
+   dispatcher.run_event_loop();
+   return 0;
++}
++
++void DispatchService::inline_pass(void* arg)
++{
++  static_cast<DispatchService*>(arg)->run_event_loop_once();
++}
++
++// One pass of the loop below, with the two cv_ waits replaced by "return".
++// Deliberately a separate function rather than a flag threaded through
++// run_event_loop(): the loop's waits are what make it a loop, and a version
++// that must not wait is clearer written out than hidden behind a predicate.
++// The two must be kept in step; the ordering comment in run_event_loop()
++// applies to both.
++void DispatchService::run_event_loop_once()
++{
++  ThreadStatusManager& thread_status_manager = TheServiceParticipant->get_thread_status_manager();
++  ACE_Reverse_Lock<ACE_Thread_Mutex> rev_lock(mutex_);
++  ACE_Guard<ACE_Thread_Mutex> guard(mutex_);
++
++  if (!running_) {
++    return;
++  }
++
++  if (allow_dispatch_ && !timer_queue_map_.empty()) {
++    const MonotonicTimePoint now = MonotonicTimePoint::now();
++
++    TimerQueueMap::iterator last = timer_queue_map_.upper_bound(now), pos = last;
++    while (pos != timer_queue_map_.begin()) {
++      --pos;
++      event_queue_.push_back(pos->second.first);
++      timer_id_map_.erase(pos->second.second);
++    }
++    if (last != timer_queue_map_.begin()) {
++      timer_queue_map_.erase(timer_queue_map_.begin(), last);
++    }
++  }
++
++  if (event_queue_.empty()) {
++    if (stop_when_empty_) {
++      running_ = false;
++      cv_.notify_all();
++    }
++    return;
++  }
++
++  FunArgPair pair = event_queue_.front();
++  event_queue_.pop_front();
++  {
++    static long n = 0;
++    if (getenv("WK_DDS_TRACE") && ++n % 20 == 0) {
++      fprintf(stderr, "[wk] dispatch events=%ld timers_pending=%zu\n", n, timer_queue_map_.size());
++    }
++  }
++  ACE_Guard<ACE_Reverse_Lock<ACE_Thread_Mutex> > rev_guard(rev_lock);
++  ThreadStatusManager::Event ev(thread_status_manager);
++  pair.first(pair.second);
+ }
+ 
+ void DispatchService::run_event_loop()
+--- a/dds/DCPS/ReactorTask.h
++++ b/dds/DCPS/ReactorTask.h
+@@ -188,7 +188,21 @@
+       return ACE_OS::thr_equal(lhs, rhs);
+     }
+   };
++
++  /**
++   * One non-blocking pass of the reactor's event loop, for platforms with no
++   * threads: where open_reactor_task() would hand the reactor to a thread of
++   * its own running run_reactor_event_loop(), it instead registers this with
++   * the caller's pump. See the constructor comment in open_reactor_task().
++   */
++  void run_reactor_once();
+ 
++  /// Trampoline for the inline-runnable registry (a C API, so no member ptr).
++  static void inline_pass(void* arg);
++
++  /// Registry slot when the reactor runs inline, or -1.
++  int inline_slot_;
++
+   mutable LockType lock_;
+   mutable ConditionVariableType condition_;
+   enum State { STATE_UNINITIALIZED, STATE_RUNNING, STATE_SHUT_DOWN };
+--- a/dds/DCPS/ReactorTask.cpp
++++ b/dds/DCPS/ReactorTask.cpp
+@@ -6,6 +6,12 @@
+ #include <DCPS/DdsDcps_pch.h> // Only the _pch include should start with DCPS/
+ 
+ #include "ReactorTask.h"
++
++#ifdef ACE_WASI
++#  include <wk-opendds-inline.h>
++#  include <cstdio>
++#  include <cstdlib>
++#endif
+ #if !defined (__ACE_INLINE__)
+ #include "ReactorTask.inl"
+ #endif /* __ACE_INLINE__ */
+@@ -50,7 +56,8 @@
+ namespace DCPS {
+ 
+ ReactorTask::ReactorTask(bool useAsyncSend)
+-  : condition_(lock_)
++  : inline_slot_(-1)
++  , condition_(lock_)
+   , state_(STATE_UNINITIALIZED)
+   , reactor_(0)
+   , proactor_(0)
+@@ -162,10 +169,39 @@
+   init_i(thread_status_manager, name, reactor);
+ 
+   if (activate(THR_NEW_LWP | THR_JOINABLE, 1) != 0) {
++#ifdef ACE_WASI
++    // No threads on this target -- ACE_Task::activate() bottoms out in
++    // pthread_create, which is a stub returning ENOTSUP. This reactor carries
++    // the rtps_udp transport's socket I/O, so it has to run somehow.
++    //
++    // Do here what svc() would have done as its prologue -- take ownership of
++    // the reactor for THIS thread, since there is only one, and declare the
++    // task running so that the wait below (and every other waiter on state_)
++    // completes -- and then register one non-blocking pass of the event loop
++    // with the caller's pump. The pump runs it from pthread_cond_wait and from
++    // the node's own loop. See plugins/opendds/shim/include/wk-opendds-inline.h.
++    //
++    // The two things svc() does that are deliberately NOT done here:
++    //   * masking signals -- there are none on this target;
++    //   * the ThreadStatusManager Sleeper/Start bookkeeping, which describes a
++    //     thread that does not exist.
++    const ACE_thread_t self = ACE_Thread_Manager::instance()->thr_self();
++    if (reactor_->owner(self) != 0) {
++      ACE_ERROR((LM_ERROR, "(%P|%t) ERROR: Failed to change the reactor's owner().\n"));
++    }
++    reactor_owners_.bind(self, 1);
++    ACE_Event_Handler::reactor(reactor_);
++    state_ = STATE_RUNNING;
++    condition_.notify_all();
++    inline_slot_ = wk_inline_register(inline_pass, this);
++    if (getenv("WK_DDS_TRACE")) { fprintf(stderr, "[wk] ReactorTask inline slot=%d count=%d\n", inline_slot_, wk_inline_count()); }
++    return 0;
++#else
+     ACE_ERROR_RETURN((LM_ERROR,
+                       "(%P|%t) ERROR: ReactorTask Failed to activate "
+                       "itself.\n"),
+                      -1);
++#endif
+   }
+ 
+   while (state_ != STATE_RUNNING) {
+@@ -173,6 +209,37 @@
+   }
+ 
+   return 0;
++}
++
++void ReactorTask::inline_pass(void* arg)
++{
++  static_cast<ReactorTask*>(arg)->run_reactor_once();
++}
++
++void ReactorTask::run_reactor_once()
++{
++  ACE_Reactor* reactor = 0;
++  {
++    GuardType guard(lock_);
++    if (state_ != STATE_RUNNING) {
++      return;
++    }
++    reactor = reactor_;
++  }
++  if (reactor) {
++    static long calls = 0, dispatched = 0;
++    ++calls;
++    // Zero timeout: poll what is ready and return. handle_events() with a
++    // non-zero timeout would block the single thread of the process, which is
++    // exactly what a pump must not do -- the caller may have work of its own
++    // and other registered passes are waiting behind this one.
++    ACE_Time_Value now = ACE_Time_Value::zero;
++    const int n = reactor->handle_events(&now);
++    if (n > 0) dispatched += n;
++    if (getenv("WK_DDS_TRACE") && calls % 2000 == 0) {
++      fprintf(stderr, "[wk] reactor passes=%ld dispatched=%ld\n", calls, dispatched);
++    }
++  }
+ }
+ 
+ int ReactorTask::svc()
+@@ -305,6 +372,13 @@
+     GuardType guard(lock_);
+     reactor_owners_.unbind_all();
+     state_ = STATE_SHUT_DOWN;
++
++#ifdef ACE_WASI
++    if (inline_slot_ != -1) {
++      wk_inline_unregister(inline_slot_);
++      inline_slot_ = -1;
++    }
++#endif
+     condition_.notify_all();
+   }
+   return EXIT_SUCCESS;
+--- a/dds/DCPS/ReactorEvent.cpp
++++ b/dds/DCPS/ReactorEvent.cpp
+@@ -26,7 +26,23 @@
+ {
+   ACE_Reactor* reactor = reactor_.load();
+   if (reactor) {
++#ifdef ACE_WASI
++    // The whole purpose of the round trip through reactor->notify() is THREAD
++    // AFFINITY: it hands the event to the reactor's own thread, which then
++    // calls handle_exception() below, which runs it. With one thread in the
++    // process that guarantee is already met by whoever is calling us, so run
++    // it here and skip the trip.
++    //
++    // Skipping is not an optimisation, it is required. The notification is
++    // delivered by writing to the reactor's notification pipe, and this port
++    // has no pipe -- ACE_DISABLE_NOTIFY_PIPE_DEFAULT is 1, because a pipe
++    // exists to wake a reactor blocked in select() on another thread, and
++    // there is no other thread. With no pipe, notify() sends to
++    // ACE_INVALID_HANDLE and traps.
++    this->handle_exception(ACE_INVALID_HANDLE);
++#else
+     reactor->notify(this);
++#endif
+   }
+ }
+ 
