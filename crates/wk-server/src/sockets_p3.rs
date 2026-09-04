@@ -31,9 +31,9 @@ use wasmtime::component::{
 use wasmtime::StoreContextMut;
 
 use crate::sockets::{
-    fabric_tcp_socket, host_sockaddr, local_ip_for, on_fabric, resolve_name, smol_addr,
-    udp_packet_buffer, ConnReady, HostConn, HostUdp, NetCtx, SharedHostUdp, SharedPipe, UdpReady,
-    Want, WantReady, HOST_BUF_CAP, LISTEN_BACKLOG, TCP_BUF, UDP_BUF,
+    fabric_tcp_socket, host_sockaddr, is_multicast, local_ip_for, on_fabric, resolve_name,
+    smol_addr, udp_packet_buffer, ConnReady, HostConn, HostUdp, NetCtx, SharedHostUdp, SharedPipe,
+    UdpReady, Want, WantReady, HOST_BUF_CAP, LISTEN_BACKLOG, TCP_BUF, UDP_BUF,
 };
 use wk_fabric::netstack::{NodeStack, SharedStack, SockKind};
 
@@ -1428,7 +1428,9 @@ impl<T: NetView + Send + 'static> wasi::sockets::types::HostUdpSocketWithStore<T
         // Off-fabric: bridge to the real host network, but only for a node
         // wired to a Gateway — the same rule connect() applies for TCP, and
         // the same bridge the 0.2 path uses.
-        if !on_fabric(dest.0) {
+        // Multicast is fabric traffic: a group belongs to no node, so
+        // `on_fabric` (which asks about unicast ownership) says no for it.
+        if !on_fabric(dest.0) && !is_multicast(dest.0) {
             if !stack.lock().unwrap().host_access {
                 return Err(ErrorCode::AccessDenied.into());
             }

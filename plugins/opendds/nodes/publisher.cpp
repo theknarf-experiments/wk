@@ -1,6 +1,9 @@
 // dds-publisher — a wk node that publishes on a DDS topic.
 //
-//   dds-publisher --peer <node-name> [--count N] [--forever]
+//   dds-publisher [--count N] [--forever]
+//
+// No peer, no addresses: RTPS discovery is multicast and wk's fabric carries
+// it, so a node finds every other participant on its Network by itself.
 //
 // Below the argument parsing and the pump, this is ordinary OpenDDS: create a
 // participant, register a type, create a topic, a publisher and a DataWriter,
@@ -20,7 +23,7 @@ int ACE_TMAIN(int argc, ACE_TCHAR* argv[])
   wk_dds::Options opt;
   if (!wk_dds::parse(argc, argv, opt)) {
     std::fprintf(stderr,
-      "usage: dds-publisher --peer <node-name> [--self <addr>] [--count N] [--forever]\n");
+      "usage: dds-publisher [--count N] [--forever] [--self <addr>] [--peer <node>]\n");
     return 1;
   }
 

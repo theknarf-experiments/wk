@@ -69,6 +69,9 @@ CXXFLAGS=(
 # and whole-archive so its overrides win — see shim/wk-opendds-threads.c.
 LDLIBS=(
   -Wl,--whole-archive "$HERE/shim/libwkopendds.a" -Wl,--no-whole-archive
+  # Lets the shim accept the multicast socket options and pass every other one
+  # through to wasi-libc; see shim/wk-opendds-mcast.c.
+  -Wl,--wrap=setsockopt
   -L"$SRC/lib" -L"$ACE_ROOT/lib"
   -lOpenDDS_Rtps_Udp -lOpenDDS_Rtps -lOpenDDS_Dcps
   -lTAO_BiDirGIOP -lTAO_PI -lTAO_CodecFactory -lTAO_Valuetype

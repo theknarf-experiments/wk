@@ -43,6 +43,18 @@ fn frame_dst(frame: &[u8]) -> Option<IpAddress> {
     }
 }
 
+/// A multicast group — IPv4 `224.0.0.0/4`, IPv6 `ff00::/8`.
+///
+/// A group is not any node's address, so the owner lookup in `step` can never
+/// match one. Such a frame goes to every member of the network instead; see
+/// the multicast branch there.
+fn is_multicast(dst: IpAddress) -> bool {
+    match dst {
+        IpAddress::Ipv4(v4) => v4.octets()[0] & 0xf0 == 0xe0,
+        IpAddress::Ipv6(v6) => v6.octets()[0] == 0xff,
+    }
+}
+
 /// A destination a node reaches by talking to itself: `127.0.0.0/8` or `::1`.
 /// Such a frame never leaves the node — the hub loops it straight back into the
 /// sender's own receive queue, so `localhost` works inside a node the way it
@@ -615,6 +627,59 @@ impl NetHub {
             .collect();
         let deliver = |net: NodeId, frame: Frame, from_trunk: bool| {
             let Some(dst) = frame_dst(&frame) else { return };
+
+            // Multicast: no node owns a group address, so instead of looking
+            // for one owner, copy the frame to every member of this network
+            // and of anything a router bridges it to.
+            //
+            // This is what a switch without IGMP snooping does — flood the
+            // segment and let each host filter — and here it is the whole of
+            // multicast, because the two jobs that make POSIX's
+            // IP_ADD_MEMBERSHIP necessary do not exist on the fabric: there is
+            // no NIC whose MAC filter must be programmed (the medium is raw IP,
+            // with no Ethernet header at all), and no snooping switch to inform
+            // by IGMP. What is left is only "which of my members get a copy",
+            // and that is the hub's decision to make.
+            //
+            // Membership is therefore IMPLICIT: a node receives a group it
+            // never joined, and its UDP port matching does the filtering a
+            // kernel would otherwise have done by group. Within one Network —
+            // an isolated segment whose members are wired together on purpose —
+            // that is the same exposure they already have to each other's
+            // unicast traffic.
+            //
+            // The sender gets a copy too, which is IP_MULTICAST_LOOP's default
+            // and what RTPS discovery expects.
+            if is_multicast(dst) {
+                let mut nets = vec![net];
+                nets.extend(Self::routed_nets(&routers, net));
+                for (n, _, _, stack) in routes.iter() {
+                    if !nets.contains(n) {
+                        continue;
+                    }
+                    let mut g = stack.lock().unwrap();
+                    // smoltcp drops a multicast packet for a group it has not
+                    // joined (interface/ipv4.rs: "Ignore IP packets not
+                    // directed at us, or broadcast, or any of the multicast
+                    // groups"). We own that Interface, so we join on the
+                    // node's behalf rather than making the guest ask — which
+                    // it could not do anyway: wasi:sockets 0.2 has no
+                    // multicast surface. Idempotent, and cheap after the
+                    // first frame of a group.
+                    let _ = g.iface.join_multicast_group(dst);
+                    g.device.deliver(frame.clone());
+                }
+                // Off to the trunks as well, so a group crosses an uplink the
+                // way unicast does. Not `from_trunk`, or a group would echo
+                // back to the side it arrived from.
+                if !from_trunk {
+                    for t in trunks.iter().filter(|t| t.net() == net) {
+                        t.deliver_outbound(frame.clone());
+                    }
+                }
+                return;
+            }
+
             let owner = |on: NodeId| {
                 routes
                     .iter()
@@ -991,6 +1056,80 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(&got, b"hello udp");
+    }
+
+    /// One datagram to a group address reaches EVERY member of the network,
+    /// including the sender — which is IP_MULTICAST_LOOP's default and what
+    /// RTPS discovery expects.
+    ///
+    /// Nobody joined anything: membership on the fabric is implicit, because
+    /// the hub joins the group on each node's smoltcp for it. Without that the
+    /// receiving stack silently drops the packet, so this test is really about
+    /// the join as much as the routing — a "delivered to all" that forgot it
+    /// would pass the send and fail here.
+    #[test]
+    fn multicast_reaches_every_member_of_the_network() {
+        let group = Ipv4Address::new(239, 255, 0, 1);
+        let hub = NetHub::new();
+        let net = NodeId::nil();
+        let sender = hub.attach(net, Ipv4Address::new(10, 0, 0, 1), "sender");
+        let peer = hub.attach(net, Ipv4Address::new(10, 0, 0, 2), "peer");
+        // A third node on a DIFFERENT network must not hear it: flooding stops
+        // at the segment boundary, exactly as unicast does.
+        let other_net = NodeId::from_u128(1);
+        let outsider = hub.attach(other_net, Ipv4Address::new(10, 0, 0, 3), "outsider");
+
+        let bind = |stack: &SharedStack| {
+            let mut g = stack.lock().unwrap();
+            let h = g.sockets.add(udp_socket());
+            g.sockets.get_mut::<udp::Socket>(h).bind(7400).unwrap();
+            h
+        };
+        let sender_h = bind(&sender);
+        let peer_h = bind(&peer);
+        let outsider_h = bind(&outsider);
+
+        let recv = |stack: &SharedStack, h| {
+            let mut g = stack.lock().unwrap();
+            let s = g.sockets.get_mut::<udp::Socket>(h);
+            s.recv().ok().map(|(d, _)| d.to_vec())
+        };
+
+        let mut sent = false;
+        let (mut at_peer, mut at_sender) = (None, None);
+        for _ in 0..500 {
+            hub.step();
+            if !sent {
+                let mut g = sender.lock().unwrap();
+                let s = g.sockets.get_mut::<udp::Socket>(sender_h);
+                if s.can_send() {
+                    s.send_slice(b"spdp", (group, 7400)).unwrap();
+                    sent = true;
+                }
+            }
+            if at_peer.is_none() {
+                at_peer = recv(&peer, peer_h);
+            }
+            if at_sender.is_none() {
+                at_sender = recv(&sender, sender_h);
+            }
+            if at_peer.is_some() && at_sender.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_eq!(at_peer.as_deref(), Some(&b"spdp"[..]), "peer on the net");
+        assert_eq!(
+            at_sender.as_deref(),
+            Some(&b"spdp"[..]),
+            "sender loops back"
+        );
+        assert_eq!(
+            recv(&outsider, outsider_h),
+            None,
+            "a node on another network must not hear the group"
+        );
     }
 
     /// Two nodes on the same virtual network exchange a TCP stream, driven by the

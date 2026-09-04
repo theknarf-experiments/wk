@@ -989,6 +989,22 @@ pub(crate) fn on_fabric(ip: smoltcp::wire::IpAddress) -> bool {
     }
 }
 
+/// Is `ip` a multicast group — IPv4 `224.0.0.0/4`, IPv6 `ff00::/8`?
+///
+/// Deliberately NOT folded into `on_fabric`, which answers a different
+/// question ("is this a unicast address belonging to a node on the fabric?")
+/// and also gates TCP connect, where a group address is meaningless.
+///
+/// A group is not any node's address, so it is nobody's to "own" — the hub
+/// copies such a frame to every member of the network instead of looking for a
+/// single owner. See `wk-fabric`'s `NetHub::step`.
+pub(crate) fn is_multicast(ip: smoltcp::wire::IpAddress) -> bool {
+    match ip {
+        smoltcp::wire::IpAddress::Ipv4(v4) => v4.octets()[0] & 0xf0 == 0xe0,
+        smoltcp::wire::IpAddress::Ipv6(v6) => v6.octets()[0] == 0xff,
+    }
+}
+
 impl wasi::sockets::network::Host for HostState {
     fn network_error_code(
         &mut self,
@@ -2007,7 +2023,9 @@ impl wasi::sockets::udp::HostOutgoingDatagramStream for HostState {
                 }
             };
             let (ip, port) = to_smol(dest);
-            if on_fabric(ip) {
+            // A group address belongs to no node, so it is fabric traffic even
+            // though `on_fabric` (which asks about unicast ownership) says no.
+            if on_fabric(ip) || is_multicast(ip) {
                 let s = g.sockets.get_mut::<udp::Socket>(handle);
                 if s.send_slice(&dg.data, (ip, port)).is_err() {
                     break; // send buffer full: stop, report what we queued

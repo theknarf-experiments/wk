@@ -1,6 +1,9 @@
 // dds-subscriber — a wk node that subscribes to a DDS topic.
 //
-//   dds-subscriber --peer <node-name> [--count N] [--forever]
+//   dds-subscriber [--count N] [--forever]
+//
+// No peer, no addresses: RTPS discovery is multicast and wk's fabric carries
+// it, so a node finds every other participant on its Network by itself.
 //
 // The mirror of publisher.cpp, and equally ordinary DDS: participant, type,
 // topic, subscriber, DataReader, then read what arrives. It uses a WaitSet
@@ -22,7 +25,7 @@ int ACE_TMAIN(int argc, ACE_TCHAR* argv[])
   opt.count = 10;
   if (!wk_dds::parse(argc, argv, opt)) {
     std::fprintf(stderr,
-      "usage: dds-subscriber --peer <node-name> [--self <addr>] [--count N] [--forever]\n");
+      "usage: dds-subscriber [--count N] [--forever] [--self <addr>] [--peer <node>]\n");
     return 1;
   }
 

@@ -124,6 +124,12 @@ LIBS += -lunwind -lsetjmp \
 # threading overrides in wk-opendds-threads.c would lose to libc's weak
 # definitions if left lazy. See ../shim/wk-opendds-threads.c, "ARCHIVE ORDER".
 LIBS += -Wl,--whole-archive $(WK_OPENDDS_SHIM)/libwkopendds.a -Wl,--no-whole-archive
+
+# Interpose on setsockopt so the shim can accept the multicast options and pass
+# everything else through to wasi-libc. Without --wrap a shim can only REPLACE
+# a libc function, never call it -- and SO_RCVBUF, SO_REUSEADDR and TCP_NODELAY
+# all have to keep working. See shim/wk-opendds-mcast.c.
+LDFLAGS += -Wl,--wrap=setsockopt
 LDFLAGS += -Wl,-z,stack-size=8388608
 
 # --- static only -------------------------------------------------------------

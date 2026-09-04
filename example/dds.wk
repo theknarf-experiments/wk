@@ -6,15 +6,14 @@
 // not a lookalike. They find each other with RTPS discovery and exchange
 // samples as UDP datagrams that wk's fabric routes between them.
 //
-// Each node is told only its PEER'S NAME. It works out its own fabric address
-// by asking the stack which one it would use to reach that peer, and it
-// resolves the peer through the fabric's DNS — so nothing here names an
-// address, and the file stays correct however wk assigns them.
+// No node is told ANYTHING — no peer, no address, no port. RTPS discovery
+// announces to a multicast group fixed by the spec, wk's fabric carries
+// multicast between the members of a Network, and so every participant finds
+// every other one by itself.
 //
-// Discovery is unicast. RTPS normally announces participants by UDP multicast
-// and the fabric has none, so each node announces straight to the other
-// (SpdpSendAddrs) — the configuration OpenDDS itself recommends for any
-// network without multicast.
+// Which is why there are TWO subscribers: the second one is the same node type
+// wired to the same Network, with no configuration anywhere saying it exists.
+// One DataWriter, one write, both readers get it.
 //
 // From the repo root:
 //   wk run example/dds.wk           then press play on each node
@@ -24,14 +23,20 @@ import "../workspace.wk"
 workspace "01DDSNET00000000000000WS00" {
     node "dds_publisher" "01DDSNET00000000000000PB01" {
         name "dds-pub"
-        args "--peer" "dds-sub" "--forever"
+        args "--forever"
         pos 60.0 60.0
         size 420.0 260.0
     }
     node "dds_subscriber" "01DDSNET00000000000000SB02" {
         name "dds-sub"
-        args "--peer" "dds-pub" "--forever"
+        args "--forever"
         pos 60.0 380.0
+        size 420.0 260.0
+    }
+    node "dds_subscriber" "01DDSNET00000000000000SB05" {
+        name "dds-sub2"
+        args "--forever"
+        pos 60.0 700.0
         size 420.0 260.0
     }
     network "01DDSNET00000000000000NW03" {
@@ -39,10 +44,11 @@ workspace "01DDSNET00000000000000WS00" {
         size 130.0 44.0
     }
     note "01DDSNET00000000000000NT04" {
-        text "Real DDS, node to node.\n\nOpenDDS 3.34 on ACE/TAO, built for\nwasm32-wasip2 and running on ONE\nthread — a condition variable that\npumps the reactor stands in for the\nthreads the middleware expects.\n\nBoth nodes are wired to the Network.\nEach is told only the other's NAME;\nit finds its own address by asking\nthe stack, and the peer through the\nfabric's DNS.\n\nStart them, then:\n  wk -f example/dds.wk logs dds-sub"
+        text "Real DDS, node to node.\n\nOpenDDS 3.34 on ACE/TAO, built for\nwasm32-wasip2 and running on ONE\nthread — a condition variable that\npumps the reactor stands in for the\nthreads the middleware expects.\n\nNeither node is configured at all.\nThey are wired to the Network, and\nRTPS discovery finds the other over\nmulticast, which the fabric routes\nto every member of a Network.\n\nTwo subscribers, and nothing is\nconfigured to know about either.\n\nStart them, then:\n  wk -f example/dds.wk logs dds-sub2"
         pos 740.0 60.0
         size 360.0 380.0
     }
     netlink "01DDSNET00000000000000PB01" "01DDSNET00000000000000NW03"
     netlink "01DDSNET00000000000000SB02" "01DDSNET00000000000000NW03"
+    netlink "01DDSNET00000000000000SB05" "01DDSNET00000000000000NW03"
 }

@@ -12,6 +12,11 @@
 #                          when there are none. OpenDDS's DispatchService and
 #                          ReactorTask register one pass of their event loop
 #                          here (patches/opendds-0002) and the pump runs them.
+#   wk-opendds-mcast.c     the multicast socket options, which succeed because
+#                          the fabric delivers a group to every member of a
+#                          Network without being asked. Needs -Wl,--wrap, and
+#                          the link lines below and in ace/platform_wasi.GNU
+#                          pass it.
 #
 # Every OpenDDS node links this archive with
 #   -Wl,--whole-archive shim/libwkopendds.a -Wl,--no-whole-archive
@@ -44,11 +49,11 @@ CFLAGS=(
 )
 
 log "building the shim archive"
-for src in wk-opendds-threads.c wk-opendds-net.c wk-opendds-inline.c; do
+for src in wk-opendds-threads.c wk-opendds-net.c wk-opendds-inline.c wk-opendds-mcast.c; do
   "$WASI_SDK/bin/clang" "${CFLAGS[@]}" -c "$src" -o "${src%.c}.o"
   echo "  $src"
 done
 
 rm -f libwkopendds.a
-"$WASI_SDK/bin/llvm-ar" rcs libwkopendds.a wk-opendds-threads.o wk-opendds-net.o wk-opendds-inline.o
+"$WASI_SDK/bin/llvm-ar" rcs libwkopendds.a wk-opendds-threads.o wk-opendds-net.o wk-opendds-inline.o wk-opendds-mcast.o
 echo "built plugins/opendds/shim/libwkopendds.a"

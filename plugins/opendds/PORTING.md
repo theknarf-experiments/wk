@@ -121,38 +121,77 @@ testable on its own.
 Two OpenDDS patches then make the threads that must *run a loop* — as opposed
 to merely blocking — unnecessary; see [Patches](#patches).
 
-### 3. rtps_udp, and unicast discovery
+### 3. rtps_udp, and multicast that the fabric carries
 
 The port builds the **rtps_udp** transport and RTPS discovery. Not `shmem`
 (there is no shared memory and no second process), not `tcp` (works, but is not
 the interesting case), and not `InfoRepo` (a CORBA service, and a second
 process again).
 
-RTPS discovery normally announces participants by **UDP multicast** (SPDP).
-wk's fabric has no multicast today — `Network` is a hub that routes unicast IP
-between its members — so the demo nodes use unicast SPDP:
+RTPS announces participants by **UDP multicast** (SPDP), and wk's fabric now
+carries multicast, so discovery is the stock, unconfigured thing: a node
+announces to the well-known group, hears every other participant on its
+Network, and needs to be told nothing at all. `example/dds.wk` has a publisher
+and two subscribers with no arguments and no addresses anywhere in the file.
+
+That took three changes, none of them in DDS:
+
+* **The fabric routes groups.** `NetHub::step`'s delivery looked for the one
+  member owning the destination address; a group is owned by nobody. It now
+  copies such a frame to every member of the network (and of anything a router
+  bridges to it), sender included — `IP_MULTICAST_LOOP`'s default, and what
+  RTPS expects. `on_fabric()` also had to stop treating `224.0.0.0/4` as
+  off-fabric traffic that needs a Gateway.
+* **The hub joins on the node's behalf.** smoltcp drops a multicast packet for
+  a group it has not joined (`interface/ipv4.rs`: *"Ignore IP packets not
+  directed at us, or broadcast, or any of the multicast groups"*), so the hub
+  calls `join_multicast_group` on the member's `Interface` as it delivers.
+  Membership is therefore **implicit**: a node receives a group it never joined
+  and its UDP port matching does the filtering. That is what a switch without
+  IGMP snooping does — flood the segment, let each host sort it out — and
+  within one Network, whose members are wired together on purpose, it is the
+  same exposure they already have to each other's unicast traffic.
+* **The socket options say yes.** See below.
+
+Nothing about this needed a new WIT interface, which is the part worth
+dwelling on. POSIX makes `IP_ADD_MEMBERSHIP` mandatory for *receiving* a group,
+but for three reasons that are all absent here: a NIC's MAC filter must be
+programmed (the fabric's medium is raw IP, with no Ethernet header at all), a
+snooping switch must be told by IGMP (the hub already sees every frame), and
+the kernel must accept a packet not addressed to it (each node's "kernel" is a
+smoltcp instance the host owns). Only the third is real, and it is wk's to
+decide. `wasi:sockets@0.2` has no multicast surface — and does not need one.
+
+### The one option that hid all of it
+
+`shim/wk-opendds-mcast.c` interposes on `setsockopt` (with `-Wl,--wrap`, so
+every other option still reaches wasi-libc) and accepts the multicast family —
+`IP_ADD_MEMBERSHIP`, `IP_MULTICAST_TTL`, `IP_MULTICAST_LOOP`, `IP_MULTICAST_IF`
+and their IPv6 spellings. Those are easy to justify: the join has nothing to
+do, and the send-side options configure a send that needs no configuring.
+
+The one that mattered was **`SO_REUSEPORT`**. wasi-libc refuses it
+(`ENOPROTOOPT`), `ACE_SOCK_Dgram_Mcast::open_i()` treats that refusal as fatal,
+and so the multicast socket never opened — and the failure surfaced several
+frames later as
 
 ```
-[rtps_discovery/wk]
-SedpMulticast=0
-SpdpSendAddrs=<the other node>:7400
-
-[transport/wk_rtps]
-transport_type=rtps_udp
-use_multicast=0
-local_address=<this node>:<port>
+MulticastManager::join: failed to join group 239.255.0.1:17900 …: Not supported
 ```
 
-`SpdpSendAddrs` does not *disable* multicast — a participant still emits SPDP
-to the multicast address, where it is dropped — it adds unicast announcements
-to named peers, and those are what actually carry discovery here. That is the
-supported configuration for any network without multicast, which is what
-OpenDDS's own docs recommend for NAT and WAN deployments.
+with an errno left over from an unrelated `ioctl`. It reads exactly like "this
+platform cannot join multicast groups", which is what sent the first attempt at
+this off to patch ACE's interface enumeration and OpenDDS's interface naming.
+Both of those patches turned out to be unnecessary and were reverted; the whole
+fix is one socket option. The trace that finally showed it is now permanent:
+`WK_DDS_TRACE=1` reports every socket option wasi-libc **refuses**, because a
+refused option is a common way for a library to abandon a feature quietly.
 
-Making the fabric carry real IP multicast is the better answer and is the
-obvious next capability (the hub already sees every member's packets); it would
-let stock RTPS discovery work unmodified, with no per-node peer list. It is not
-a prerequisite for this port and is not attempted here.
+`SO_REUSEPORT` asks the stack to let several sockets share a port, which
+matters when several participants run on one host. On the fabric each node *is*
+a host, so nothing else is contending and the hint has no work to do. Two
+sockets in one node still cannot share a port — the bind fails, as it would
+anywhere — so accepting it grants nothing that was not already true.
 
 ### Which address am I
 
@@ -181,7 +220,7 @@ Seven, none of them large.
 | `ace-0002-max-handles-indeterminate.patch` | `ACE::max_handles()` returned `sysconf(_SC_OPEN_MAX)` verbatim, including POSIX's -1 "indeterminate". Falls through to `FD_SETSIZE` instead. Not WASI-specific; see "What the smoke test caught". |
 | `ace-0003-wasi-nonblocking-datagrams.patch` | every datagram socket is non-blocking at `open()`, because wasip2 reports a UDP socket readable one time too many — see [The readiness that outlives the datagram](#the-readiness-that-outlives-the-datagram). |
 | `opendds-0002-threadless-event-loops.patch` | `DispatchService` and `ReactorTask` expose one non-blocking pass of their loop and register it with the pump when no thread can be spawned; `ThreadPool` stops waiting at a barrier nothing can reach; `ReactorEvent` runs inline instead of through `reactor->notify()`. |
-| `opendds-0003-no-ancillary-data.patch` | `set_socket_multicast_ttl` and `set_recvpktinfo` report success on a platform that has neither multicast options nor ancillary data. Both are fatal to participant creation otherwise. |
+| `opendds-0003-no-ancillary-data.patch` | `set_recvpktinfo` reports success on a platform with no ancillary data; it is fatal to participant creation otherwise. (It used to stub out `set_socket_multicast_ttl` too — `shim/wk-opendds-mcast.c` now handles that generally, so that half is gone.) |
 | `opendds-0004-eagain-is-not-a-broken-link.patch` | an `EWOULDBLOCK` read is "nothing to read", not a dead link. Three call sites; see [The empty read that killed the transport](#the-empty-read-that-killed-the-transport). |
 
 ### The fd_set that is not a bitmask
@@ -304,66 +343,53 @@ not found`.
 
 ## Current state
 
-**Two wk nodes exchange DDS samples over the fabric, through a DataWriter and
-a DataReader, running real OpenDDS on one thread.**
+**Three wk nodes — a publisher and two subscribers — exchange DDS samples over
+the fabric with no configuration at all.** Not a peer, not an address, not a
+port appears in `example/dds.wk`.
 
 ```
 $ wk run example/dds.wk --headless &
 $ wk -f example/dds.wk up
 $ wk -f example/dds.wk logs dds-pub
-wk-dds: 10.0.0.157 -> dds-sub (10.0.0.212:17910), domain 42
-dds-publisher: waiting for a subscriber...
+wk-dds: 10.0.0.157 on domain 42, discovering via 239.255.0.1
 dds-publisher: subscriber found, publishing
 sent  #0
-...
-$ wk -f example/dds.wk logs dds-sub
-wk-dds: 10.0.0.212 -> dds-pub (10.0.0.157:17910), domain 42
-recv  #0  id=1 from=dds-publisher  "hello from a wasm node"
+$ wk -f example/dds.wk logs dds-sub2
+wk-dds: 10.0.0.215 on domain 42, discovering via 239.255.0.1
 recv  #1  id=1 from=dds-publisher  "hello from a wasm node"
-...
 ```
 
-Neither address appears anywhere in `example/dds.wk`. Each node is told only
-its peer's NAME; it resolves that through the fabric's DNS and works out its
-own address by asking the stack which one it would use to reach it (see
-`nodes/wk_dds_node.h`).
+The second subscriber is the same node type wired to the same Network, and
+nothing anywhere says it exists — which is the point of carrying multicast on
+the fabric rather than listing peers.
 
-* **M1 — host tools: done.** `tao_idl` 4.0.6 and `opendds_idl` 3.34.0.
-* **M2 — ACE for wasm32-wasip2: done.** 307 wasm objects, a 2.0 MB `libACE.a`,
-  and `./build-smoke.sh run` passes eighteen checks under
-  `wasmtime run -W exceptions`.
-* **M3 — TAO and OpenDDS: done.** `make` completes with **zero errors** across
-  ACE, all of TAO, and every OpenDDS library — `libOpenDDS_Dcps.a` (25 MB),
-  `libOpenDDS_Rtps.a`, `libOpenDDS_Rtps_Udp.a`, and the rest. Upstream's own
-  `DevGuideExamples` link and run too: its unmodified Messenger publisher and
-  subscriber discover each other and exchange samples on loopback.
-* **M4 — the shims: done.**
-* **M5/M6 — a participant runs, and two of them discover each other** over
-  unicast SPDP, with SEDP associating in both directions.
-* **M7 — user endpoints match and samples flow.** DataWriter to DataReader,
-  RELIABLE with KEEP_ALL history, so the reliability protocol (heartbeats,
-  ACKNACKs, retransmission) is exercised rather than avoided.
+* **M1–M4 — host tools, ACE, TAO, OpenDDS, the shims: done.** `make` completes
+  with zero errors across all three trees; `./build-smoke.sh run` passes twenty
+  checks under `wasmtime run -W exceptions`.
+* **M5–M7 — participants run, discover, and exchange samples.** RELIABLE with
+  KEEP_ALL, so heartbeats, ACKNACKs and retransmission are exercised rather
+  than avoided.
 * **M8 — the wk nodes: done.** `nodes/publisher.cpp` and `nodes/subscriber.cpp`
-  build to `dds-publisher.wasm` and `dds-subscriber.wasm`
-  (`./build-nodes.sh`), are registered in `workspace.wk`, and
-  `example/dds.wk` wires them to one `Network`. Below the argument parsing
-  they are ordinary DDS code — participant, type, topic, writer/reader — which
-  is the point.
+  build to `dds-publisher.wasm` and `dds-subscriber.wasm` (`./build-nodes.sh`)
+  and take no arguments. Below the option parsing they are ordinary DDS.
+* **M9 — multicast on the fabric: done.** See
+  [rtps_udp, and multicast that the fabric carries](#3-rtps_udp-and-multicast-that-the-fabric-carries).
 
 ### What is not done
 
-* **Multicast.** The fabric has none, so RTPS discovery runs unicast: each node
-  announces straight to its peer with `SpdpSendAddrs`. That is the supported
-  configuration for any network without multicast, but it means each node must
-  be told one peer, and a third node would have to be told about the others.
-  Carrying real IP multicast in the `Network` hub is the obvious next
-  capability and would let stock RTPS discovery work with no peer list at all.
 * **A node that computes.** The pump runs when something waits on a condition
   variable. `wk_dds::pump()` is provided for a node's own idle loop, but a node
   that goes away and computes for a second stalls its participant for a second.
   Making `sleep`/`nanosleep` pump would remove the footgun for good.
+* **Multicast across an uplink.** The hub sends groups to a network's trunks,
+  so the shape is right, but a group crossing an iroh/Veilid uplink to another
+  machine has not been tested.
+* **Explicit membership.** Joining is implicit — flood the Network, filter by
+  port. If a Network ever needs to carry groups that some members must *not*
+  see, that becomes a real distinction and would need a join the guest can
+  actually express. Nothing needs it today.
 * **Security, shmem, InfoRepo.** Not built; none is needed for DDS over the
-  fabric. `--security` in particular would pull in OpenSSL and Xerces.
+  fabric.
 
 ### What the smoke test caught that a successful compile did not
 

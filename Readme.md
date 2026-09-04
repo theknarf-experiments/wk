@@ -370,8 +370,10 @@ software, userspace networking, and filesystem demos.
 on real ACE/TAO, cross-compiled to wasm32-wasip2, so two nodes can talk OMG
 DDS to each other over the fabric — RTPS discovery, a DataWriter and a
 DataReader, reliable delivery, all as ordinary UDP that wk routes.
-`example/dds.wk` wires a publisher and a subscriber to one Network; each node
-is told only its peer's *name* and works out the rest. It runs on **one
+`example/dds.wk` wires a publisher and two subscribers to one Network and
+configures **nothing** — no peer, no address, no port: the fabric carries RTPS
+multicast, so participants find each other the way DDS expects, and a fourth
+node would join in with no edit to the file. It runs on **one
 thread**, which DDS is not built for: a condition variable that pumps the
 reactor stands in for the threads the middleware expects, so every
 `while (!ready) cv.wait()` in OpenDDS becomes a polling loop and almost nothing

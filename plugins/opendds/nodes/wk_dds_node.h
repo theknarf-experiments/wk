@@ -69,6 +69,10 @@ namespace wk_dds {
 /// use; nothing here depends on the number.
 const DDS::DomainId_t DOMAIN = 42;
 
+/// The well-known SPDP multicast group, and the address a node probes to find
+/// its own. RTPS fixes this group in the spec; wk's fabric carries it.
+inline const char* spdp_group() { return "239.255.0.1"; }
+
 /// SPDP's unicast port for participant 0 of a domain, by the RTPS formula
 /// PB + DG*domain + d1 + PG*participant = 7400 + 250*domain + 10.
 /// Each node on the fabric has an address of its own, so every node can use
@@ -139,8 +143,7 @@ inline std::string local_address_towards(const std::string& peer)
 /// user already knows, and because it can be read out of the node with
 /// `wk attach` when something is wrong. It goes in the node's own filesystem,
 /// which is private to it.
-inline std::string write_config(const std::string& self, const std::string& peer_addr,
-                                int peer_port)
+inline std::string write_config(const std::string& self)
 {
   // A wk node's filesystem is its own and starts nearly empty -- an image
   // built on wk-shell has /bin, /etc and /run and nothing else, and a bare
@@ -164,23 +167,26 @@ inline std::string write_config(const std::string& self, const std::string& peer
     "DCPSDefaultAddress=%s\n"
     "\n"
     "[rtps_discovery/wk]\n"
-    // No multicast on the fabric, so SEDP goes unicast too...
-    "SedpMulticast=0\n"
-    // ...and SPDP reaches the peer by an explicit address. A participant still
-    // emits SPDP to the multicast address as well, where the fabric drops it;
-    // these unicast announcements are what actually carry discovery here.
-    "SpdpSendAddrs=%s:%d\n"
+    // Stock RTPS discovery: SPDP announces to the well-known multicast group
+    // and SEDP uses multicast too. Nothing here names a peer -- wk's fabric
+    // carries multicast, so a Network behaves like the small LAN segment RTPS
+    // was designed for, and any number of participants find each other with no
+    // configuration at all.
+    //
+    // Before the fabric could do that, this had to be `SedpMulticast=0` plus
+    // an explicit `SpdpSendAddrs=<peer>`, which is OpenDDS's supported answer
+    // for a network without multicast -- and which meant every node had to be
+    // told about every other one.
     // One second rather than the 30s default: a demo should find its peer
     // while someone is watching it.
     "ResendPeriod=1\n"
     "\n"
     "[transport/wk_rtps]\n"
     "transport_type=rtps_udp\n"
-    "use_multicast=0\n"
     // Port 0: the transport takes any free port and advertises it through
     // discovery. Only SPDP needs a fixed, agreed port.
     "local_address=%s:0\n",
-    self.c_str(), peer_addr.c_str(), peer_port, self.c_str());
+    self.c_str(), self.c_str());
   std::fclose(f);
   return std::string(path);
 }
@@ -223,7 +229,7 @@ inline bool parse(int& argc, char** argv, Options& out)
     else if (a == "--count" && i + 1 < argc) { out.count = std::atoi(argv[++i]); }
     else if (a == "--forever") { out.forever = true; }
   }
-  return !out.peer.empty();
+  return true;   // --peer is optional: discovery is multicast
 }
 
 /// Everything between "the node started" and "there is a DomainParticipant":
@@ -231,42 +237,33 @@ inline bool parse(int& argc, char** argv, Options& out)
 /// Returns a null participant on failure, having said why.
 inline DDS::DomainParticipant_var start(int argc, char** argv, Options& opt)
 {
+  // Which address are we? A wasm guest has no interface table (see (1) at the
+  // top of this file), so ask the stack: connect a datagram socket towards
+  // somewhere and read back the local endpoint it chose.
+  //
+  // The somewhere is the SPDP GROUP by default, which is why this node needs
+  // no arguments at all -- the group is fixed by the RTPS spec and every
+  // participant already talks to it. `--peer` remains accepted for the
+  // loopback rehearsal, where there is no fabric and the group is not routed.
   if (opt.self.empty()) {
-    opt.self = local_address_towards(opt.peer);
+    opt.self = local_address_towards(opt.peer.empty() ? spdp_group() : opt.peer);
   }
   if (opt.self.empty()) {
     std::fprintf(stderr,
-      "wk-dds: cannot work out this node's own address on the way to '%s'.\n"
-      "        Is the node wired to a Network, and is the peer's name resolvable\n"
-      "        on it? (Pass --self <addr> to say it outright.)\n",
-      opt.peer.c_str());
+      "wk-dds: cannot work out this node's own address.\n"
+      "        Is the node wired to a Network? (Pass --self <addr> to say it\n"
+      "        outright, or --peer <node> to probe towards a named peer.)\n");
     return DDS::DomainParticipant_var();
   }
 
-  std::string peer_host = opt.peer;
-  int peer_port = spdp_port();
-  const std::string::size_type colon = peer_host.rfind(':');
-  if (colon != std::string::npos) {
-    peer_port = std::atoi(peer_host.c_str() + colon + 1);
-    peer_host.erase(colon);
-  }
-
-  ACE_INET_Addr peer_addr;
-  if (peer_addr.set(static_cast<u_short>(peer_port), peer_host.c_str()) != 0) {
-    std::fprintf(stderr, "wk-dds: cannot resolve peer '%s'\n", peer_host.c_str());
-    return DDS::DomainParticipant_var();
-  }
-  char peer_ip[64];
-  peer_addr.get_host_addr(peer_ip, sizeof peer_ip);
-
-  const std::string ini = write_config(opt.self, peer_ip, peer_port);
+  const std::string ini = write_config(opt.self);
   if (ini.empty()) {
     std::fprintf(stderr, "wk-dds: cannot write the OpenDDS config\n");
     return DDS::DomainParticipant_var();
   }
 
-  std::fprintf(stderr, "wk-dds: %s -> %s (%s:%d), domain %d\n",
-               opt.self.c_str(), peer_host.c_str(), peer_ip, peer_port, (int)DOMAIN);
+  std::fprintf(stderr, "wk-dds: %s on domain %d, discovering via %s\n",
+               opt.self.c_str(), (int)DOMAIN, spdp_group());
 
   // Hand OpenDDS its own argv with the config file appended. It parses and
   // removes what it understands, which is why argc/argv are taken by value
