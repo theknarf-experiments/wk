@@ -30,8 +30,22 @@ use crate::netstack::{NetHub, TrunkPort};
 const TAG_FRAME: u8 = 0x00;
 const TAG_HELLO: u8 = 0x01;
 const TAG_HELLO_ACK: u8 = 0x02;
+/// Goodbye, carrying the sender's route blob so the receiver can identify
+/// which of its peer routes just went away. A peer too old to know the tag
+/// ignores it (the message match has a catch-all) and prunes the dead route
+/// the slow way, when a send to it starts failing.
+const TAG_BYE: u8 = 0x03;
 
-type Peers = Arc<Mutex<Vec<RouteId>>>;
+/// A peer route, tagged with which side sought it out — the Veilid twin of
+/// [`crate::uplink::Conn`], and clearing the peer means the same thing here:
+/// let go of the routes we dialed, keep the ones a remote brought us.
+#[derive(Clone)]
+struct Peer {
+    route: RouteId,
+    dialed: bool,
+}
+
+type Peers = Arc<Mutex<Vec<Peer>>>;
 
 /// A running Veilid uplink: a dedicated Veilid node tunneling one network's
 /// trunk. Dropping it shuts the node down and detaches the trunk.
@@ -140,7 +154,9 @@ impl VeilidUplink {
 
     /// Dial a remote uplink by its ticket (a DHT record key). The driver keeps
     /// retrying while unconnected, so a peer that isn't up yet is fine. An empty
-    /// ticket *undials*: the driver stops re-connecting to any prior target.
+    /// ticket *undials*: it stops re-connecting AND releases the routes it
+    /// dialed, telling the far side ([`TAG_BYE`]) so its count falls too. A
+    /// route a remote brought us is left alone — see [`Peer`].
     pub fn dial(&self, ticket: &str) -> Result<()> {
         let ticket = ticket.trim();
         if ticket.is_empty() {
@@ -172,12 +188,18 @@ impl Drop for VeilidUplink {
     }
 }
 
-/// Add a freshly imported peer route (deduplicated).
-fn add_peer(peers: &Peers, route: RouteId) {
+/// Add a freshly imported peer route (deduplicated). `dialed` records that we
+/// went looking for this one rather than being introduced to it. Importing the
+/// same blob twice yields the same [`RouteId`], which is what makes both the
+/// dedup and [`TAG_BYE`]'s "drop the route this blob names" work.
+fn add_peer(peers: &Peers, route: RouteId, dialed: bool) {
     let mut g = peers.lock().unwrap();
-    if !g.contains(&route) {
-        g.push(route);
+    if let Some(p) = g.iter_mut().find(|p| p.route == route) {
+        // Re-dialing a route we were introduced to makes it ours to hang up on.
+        p.dialed |= dialed;
+        return;
     }
+    g.push(Peer { route, dialed });
 }
 
 /// Allocate a private route and publish its blob in our DHT record, returning
@@ -227,7 +249,7 @@ async fn send_to(rc: &RoutingContext, peers: &Peers, route: &RouteId, msg: Vec<u
         .await
         .is_err()
     {
-        peers.lock().unwrap().retain(|r| r != route);
+        peers.lock().unwrap().retain(|p| &p.route != route);
     }
 }
 
@@ -284,7 +306,7 @@ async fn drive(
                                 if let Ok(route) =
                                     api.import_remote_private_route(msg[1..].to_vec())
                                 {
-                                    add_peer(&peers, route.clone());
+                                    add_peer(&peers, route.clone(), false);
                                     // Answer a hello with our blob so the peer
                                     // holds a live route back to us.
                                     if ack {
@@ -298,6 +320,18 @@ async fn drive(
                                     }
                                 }
                             }
+                            Some(&TAG_BYE) => {
+                                // The peer cleared its dial target. Let go of
+                                // the route it is naming — it re-imports to the
+                                // same id we stored — so the count here falls
+                                // with the count there and we stop pushing
+                                // frames down a tunnel nobody is reading.
+                                if let Ok(route) =
+                                    api.import_remote_private_route(msg[1..].to_vec())
+                                {
+                                    peers.lock().unwrap().retain(|p| p.route != route);
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -305,7 +339,7 @@ async fn drive(
                         peers
                             .lock()
                             .unwrap()
-                            .retain(|r| !ch.dead_remote_routes.contains(r));
+                            .retain(|p| !ch.dead_remote_routes.contains(&p.route));
                         let ours_died =
                             matches!(&local, Some((id, _)) if ch.dead_routes.contains(id));
                         if ours_died {
@@ -313,7 +347,7 @@ async fn drive(
                             if let Some((_, blob)) = &local {
                                 // Refresh every live peer with the new route.
                                 let routes: Vec<RouteId> =
-                                    peers.lock().unwrap().clone();
+                                    peers.lock().unwrap().iter().map(|p| p.route.clone()).collect();
                                 for r in routes {
                                     let mut m = vec![TAG_HELLO_ACK];
                                     m.extend_from_slice(blob);
@@ -329,13 +363,35 @@ async fn drive(
                 // `Some(new)` sets/clears the target (undial); `None` = closed.
                 let Some(new) = t else { return };
                 target = new;
+                if target.is_none() {
+                    // Undial: let go of the routes we dialed, and say so. There
+                    // is no connection here to close and no equivalent of QUIC's
+                    // CONNECTION_CLOSE, so without the goodbye the far side
+                    // would keep a route to us and keep sending frames into a
+                    // fabric that had disowned it.
+                    let dialed: Vec<RouteId> = {
+                        let mut g = peers.lock().unwrap();
+                        let d = g.iter().filter(|p| p.dialed)
+                            .map(|p| p.route.clone()).collect();
+                        g.retain(|p| !p.dialed);
+                        d
+                    };
+                    if let Some((_, blob)) = &local {
+                        let mut m = vec![TAG_BYE];
+                        m.extend_from_slice(blob);
+                        for r in &dialed {
+                            let _ = rc.app_message(Target::RouteId(r.clone()), m.clone()).await;
+                        }
+                    }
+                }
             }
             _ = pump.tick() => {
                 let frames = trunk.drain_outbound();
                 if frames.is_empty() {
                     continue;
                 }
-                let routes: Vec<RouteId> = peers.lock().unwrap().clone();
+                let routes: Vec<RouteId> =
+                    peers.lock().unwrap().iter().map(|p| p.route.clone()).collect();
                 for frame in frames {
                     let mut m = Vec::with_capacity(frame.len() + 1);
                     m.push(TAG_FRAME);
@@ -361,7 +417,7 @@ async fn drive(
                 if attached && unconnected {
                     if let Some(key) = &target {
                         if let Some(route) = fetch_peer(api, &rc, key).await {
-                            add_peer(&peers, route.clone());
+                            add_peer(&peers, route.clone(), true);
                             if let Some((_, blob)) = &local {
                                 let mut m = vec![TAG_HELLO];
                                 m.extend_from_slice(blob);

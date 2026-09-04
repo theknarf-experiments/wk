@@ -611,7 +611,7 @@ pub fn set_node(
         },
     )?;
     match peer {
-        Some("") => println!("{} stopped dialing", short(id)),
+        Some("") => println!("{} hung up", short(id)),
         Some(_) => println!("{} dialing peer", short(id)),
         None => println!("updated {}", short(id)),
     }

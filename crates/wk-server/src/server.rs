@@ -2236,8 +2236,9 @@ impl Server {
     /// Set a node's launch args from a whitespace-separated string. Guarded to
     /// existing nodes so an `Update` on an unknown id can't grow `node_args`
     /// without bound. For an uplink the args are its peer ticket — this dials
-    /// it live (or *undials*, stopping the dialer, when cleared), so undo and
-    /// clearing stay in sync with the running uplink instead of diverging.
+    /// it live (or *undials* — stopping the dialer and hanging up on what it
+    /// dialed — when cleared), so undo and clearing stay in sync with the
+    /// running uplink instead of diverging.
     fn set_node_args(&mut self, id: NodeId, text: &str) {
         if !self.graph.nodes.contains_key(&id) {
             return;
@@ -2245,7 +2246,7 @@ impl Server {
         let args = text.split_whitespace().map(str::to_string).collect();
         self.graph.node_args.insert(id, args);
         if let Some(up) = self.uplinks.get(&id) {
-            // Empty ticket → undial (Uplink::dial treats "" as "stop dialing").
+            // Empty ticket → undial (Uplink::dial treats "" as "hang up").
             if let Err(e) = up.dial(text.trim()) {
                 eprintln!("[uplink] {e:#}");
             }

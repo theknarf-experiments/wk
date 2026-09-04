@@ -26,7 +26,21 @@ use crate::netstack::{NetHub, TrunkPort};
 /// The ALPN for wk fabric tunnels — any wk v1 uplink accepts it.
 pub const ALPN: &[u8] = b"wk/fabric/0";
 
-type Conns = Arc<Mutex<Vec<Connection>>>;
+/// A live tunnel connection, tagged with which side opened it.
+///
+/// The tag exists for *undialing*. Clearing this side's peer means "stop
+/// connecting to that remote", so it closes the connections this side dialed —
+/// but not one a remote dialed *in*. The remote holds our ticket and never
+/// asked us to stop; closing it would only make its dialer re-open the same
+/// connection two seconds later. When both sides hold each other's ticket,
+/// clearing one of them therefore leaves the tunnel up, carried by the ticket
+/// that is still set. Clear both (or delete the uplink) to part company.
+struct Conn {
+    conn: Connection,
+    dialed: bool,
+}
+
+type Conns = Arc<Mutex<Vec<Conn>>>;
 
 /// A running uplink: an iroh endpoint tunneling one network's trunk. Dropping
 /// it closes the endpoint and detaches the trunk.
@@ -119,7 +133,9 @@ impl Uplink {
 
     /// Dial a remote uplink by its ticket. The dialer keeps retrying (and
     /// re-dials after a drop), so a peer that isn't up yet is fine. An empty
-    /// ticket *undials*: the dialer stops re-connecting to any prior target.
+    /// ticket *undials*: it stops re-connecting AND closes the connection it
+    /// dialed, so both sides' peer counts fall (a connection a remote dialed in
+    /// is left alone — see [`Conn`]).
     pub fn dial(&self, ticket: &str) -> Result<()> {
         let ticket = ticket.trim();
         if ticket.is_empty() {
@@ -142,7 +158,7 @@ impl Uplink {
             .lock()
             .unwrap()
             .iter()
-            .filter(|c| c.close_reason().is_none())
+            .filter(|c| c.conn.close_reason().is_none())
             .count()
     }
 }
@@ -157,10 +173,14 @@ impl Drop for Uplink {
 }
 
 /// Register a live connection: track it and read its datagrams into the net.
-fn register(conn: Connection, conns: &Conns, trunk: &Arc<TrunkPort>) {
+/// `dialed` records that *this* side opened it (see [`Conn`]).
+fn register(conn: Connection, conns: &Conns, trunk: &Arc<TrunkPort>, dialed: bool) {
     let mut g = conns.lock().unwrap();
-    g.retain(|c| c.close_reason().is_none());
-    g.push(conn.clone());
+    g.retain(|c| c.conn.close_reason().is_none());
+    g.push(Conn {
+        conn: conn.clone(),
+        dialed,
+    });
     let trunk = trunk.clone();
     tokio::spawn(async move {
         while let Ok(frame) = conn.read_datagram().await {
@@ -173,7 +193,7 @@ fn register(conn: Connection, conns: &Conns, trunk: &Arc<TrunkPort>) {
 async fn accept_loop(ep: &Endpoint, conns: &Conns, trunk: &Arc<TrunkPort>) {
     while let Some(incoming) = ep.accept().await {
         if let Ok(conn) = incoming.await {
-            register(conn, conns, trunk);
+            register(conn, conns, trunk, false);
         }
     }
 }
@@ -193,8 +213,8 @@ async fn pump(trunk: Arc<TrunkPort>, conns: Conns) {
             .lock()
             .unwrap()
             .iter()
-            .filter(|c| c.close_reason().is_none())
-            .cloned()
+            .filter(|c| c.conn.close_reason().is_none())
+            .map(|c| c.conn.clone())
             .collect();
         for frame in frames {
             for c in &live {
@@ -208,6 +228,9 @@ async fn pump(trunk: Arc<TrunkPort>, conns: Conns) {
 
 /// Hold the current dial target and keep a connection to it alive: dial when
 /// there's no live connection, re-dial (2s cadence) after drops or failures.
+/// Clearing the target also closes what this side dialed, so an undial
+/// actually parts the fabrics rather than just declining to re-dial (see
+/// [`Conn`] for why an inbound connection survives it).
 async fn dialer(
     ep: Endpoint,
     mut rx: mpsc::UnboundedReceiver<Option<EndpointAddr>>,
@@ -220,7 +243,20 @@ async fn dialer(
         tokio::select! {
             // `Some(new)` sets/clears the target (undial); `None` = channel closed.
             t = rx.recv() => match t {
-                Some(new) => target = new,
+                Some(new) => {
+                    target = new;
+                    if target.is_none() {
+                        // Undial: hang up on the peer we dialed. QUIC's
+                        // CONNECTION_CLOSE carries this to the remote, so its
+                        // peer count drops with ours instead of holding a
+                        // connection nobody is using.
+                        let mut g = conns.lock().unwrap();
+                        for c in g.iter().filter(|c| c.dialed) {
+                            c.conn.close(0u32.into(), b"undialed");
+                        }
+                        g.retain(|c| !c.dialed);
+                    }
+                }
                 None => return,
             },
             _ = retry.tick() => {}
@@ -229,10 +265,10 @@ async fn dialer(
             .lock()
             .unwrap()
             .iter()
-            .any(|c| c.close_reason().is_none());
+            .any(|c| c.conn.close_reason().is_none());
         if let (Some(addr), false) = (&target, connected) {
             if let Ok(conn) = ep.connect(addr.clone(), ALPN).await {
-                register(conn, &conns, &trunk);
+                register(conn, &conns, &trunk, true);
             }
         }
     }
@@ -407,5 +443,70 @@ mod tests {
 
         assert_eq!(n_local, 1, "same fabric: one datagram, one delivery");
         assert_eq!(n_remote, 1, "across the uplink: one datagram, one delivery");
+    }
+
+    /// Wait up to five seconds for both uplinks to agree on a peer count.
+    fn settle_at(up_a: &Uplink, up_b: &Uplink, n: usize) {
+        for _ in 0..5000 {
+            if up_a.peers() == n && up_b.peers() == n {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Clearing the peer hangs up, rather than merely declining to re-dial.
+    ///
+    /// The distinction is invisible until you look: `dial("")` used to stop the
+    /// dialer and leave the QUIC connection open, so `wk ps` went on reporting
+    /// `1 peer(s)` on BOTH sides and the two fabrics stayed joined — a node on
+    /// A could still reach B after the peer that put them together was gone.
+    #[test]
+    fn clearing_the_peer_hangs_up_on_both_sides() {
+        let hub_a = NetHub::new();
+        let hub_b = NetHub::new();
+        let net = NodeId::nil();
+        let up_a = Uplink::start(hub_a, net, None, false).unwrap();
+        let up_b = Uplink::start(hub_b, net, None, false).unwrap();
+
+        up_a.dial(up_b.ticket()).unwrap();
+        settle_at(&up_a, &up_b, 1);
+        assert_eq!(up_a.peers(), 1, "dialer never connected");
+        assert_eq!(up_b.peers(), 1, "acceptor never saw the connection");
+
+        up_a.dial("").unwrap();
+        settle_at(&up_a, &up_b, 0);
+        assert_eq!(up_a.peers(), 0, "the dialed connection outlived the peer");
+        // The remote learns from QUIC's CONNECTION_CLOSE — nothing in wk tells
+        // it, which is what makes this work for a peer on another machine.
+        assert_eq!(up_b.peers(), 0, "the remote was never told to hang up");
+
+        // And the undial is not permanent: the same ticket dials again.
+        up_a.dial(up_b.ticket()).unwrap();
+        settle_at(&up_a, &up_b, 1);
+        assert_eq!(up_a.peers(), 1, "re-dialing after an undial failed");
+    }
+
+    /// An uplink that a remote dialed *in* keeps its connection when its own
+    /// (empty) peer is cleared: it has nothing to hang up on, and the remote
+    /// still holds its ticket. Clearing a peer must not disconnect a peering
+    /// this side never asked for and cannot stop the other end from re-making.
+    #[test]
+    fn clearing_an_empty_peer_leaves_an_inbound_connection_alone() {
+        let hub_a = NetHub::new();
+        let hub_b = NetHub::new();
+        let net = NodeId::nil();
+        let up_a = Uplink::start(hub_a, net, None, false).unwrap();
+        let up_b = Uplink::start(hub_b, net, None, false).unwrap();
+
+        up_a.dial(up_b.ticket()).unwrap();
+        settle_at(&up_a, &up_b, 1);
+        assert_eq!(up_b.peers(), 1, "acceptor never saw the connection");
+
+        // B never dialed anyone, so clearing B's peer is a no-op...
+        up_b.dial("").unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(up_b.peers(), 1, "B hung up on a connection it did not dial");
+        assert_eq!(up_a.peers(), 1, "A's dialed connection was closed by B");
     }
 }
