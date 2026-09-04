@@ -69,6 +69,13 @@ and click its `ch:` label, or run `wk channel <src> <dst> <n>`. A narrowed wire
 keeps showing the channel it carries, so a multi-track sequencer feeding several
 synths reads off the canvas instead of out of each synth's settings.
 
+A node → node wire also does one more thing when both ends import
+`wasi:sockets`: it joins them onto a private point-to-point network of their
+own, with no Network node needed and no host access (a private link is never
+a Gateway). Two apps wired directly this way can talk TCP/UDP over it exactly
+as if a Network sat between them, and any MIDI carried on the same wire keeps
+working unchanged.
+
 A document can hold several workspaces (shown as tabs); edits are undoable.
 
 ### Node capability tokens

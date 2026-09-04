@@ -239,6 +239,11 @@ pub struct View {
     /// that carry one. Absent means all sixteen, so a channel shown on a wire
     /// always means the stream down it has been narrowed to one part.
     pub midi_channels: HashMap<(NodeId, NodeId), u8>,
+    /// The private per-pair fabric net two directly-wired, net-importing app
+    /// nodes share (see `Graph::app_link_nets`). Kept as its own field rather
+    /// than left inside `net_links` (which excludes it) so a client can tell
+    /// the two apart without mistaking one for a wire to a placed Network.
+    pub app_link_nets: HashMap<(NodeId, NodeId), NodeId>,
     /// Nodes a CLI client has attached to — the UI treats these as detached
     /// (it stops draining/feeding their terminal).
     pub attached: std::collections::HashSet<NodeId>,
@@ -398,6 +403,7 @@ impl View {
             api_links: keep_pairs(&self.api_links, mine),
             serve_ports: keep_pair_map(&self.serve_ports, mine),
             midi_channels: keep_pair_map(&self.midi_channels, mine),
+            app_link_nets: keep_pair_map(&self.app_link_nets, mine),
             capture_feeds: keep_map(&self.capture_feeds, mine),
             clipboard_boards: keep_map(&self.clipboard_boards, mine),
             api_nodes: keep_set(&self.api_nodes, mine),
@@ -482,6 +488,17 @@ fn wire_ends(w: Wire) -> (NodeId, NodeId) {
 fn prune_side_map<V>(map: &mut HashMap<(NodeId, NodeId), V>, live: &[(NodeId, NodeId)]) {
     let live: HashSet<(NodeId, NodeId)> = live.iter().copied().collect();
     map.retain(|pair, _| live.contains(pair));
+}
+
+/// Canonicalize an unordered node pair as `(min, max)` — the key shape for a
+/// map indexed by an undirected relation (e.g. `Graph::app_link_nets`), whose
+/// two sides can otherwise be toggled/wired in either order.
+fn canonical_pair(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
+    if a < b {
+        (a, b)
+    } else {
+        (b, a)
+    }
 }
 
 /// The in-app mount name for a host-mapped file: the path's base name.
@@ -716,6 +733,17 @@ pub struct Graph {
     pub midi_channels: HashMap<(NodeId, NodeId), u8>,
     /// Network membership wires, as (app node id, Network node id).
     pub net_links: Vec<(NodeId, NodeId)>,
+    /// The private per-pair fabric net two directly-wired app nodes share once
+    /// both import `wasi:sockets` — keyed by the pair's canonical `(min, max)`
+    /// node ids, mapping to the synthetic net id minted for them. Membership
+    /// itself lives in `net_links`, exactly like a real Network wire (see
+    /// `Server::sync_app_link_nets`); this map is only bookkeeping so it can
+    /// be found again and parted. The id is placed nowhere on the canvas and
+    /// never persisted — `Server::view` and `Server::save` filter its
+    /// `net_links` entries back out so it never reads as a wire to a node
+    /// that doesn't exist, and a reload simply mints a fresh one once both
+    /// sides are wired and ready again.
+    pub app_link_nets: HashMap<(NodeId, NodeId), NodeId>,
     /// Screen-capture grants, as (app node id, Capture node id).
     pub capture_links: Vec<(NodeId, NodeId)>,
     /// Host-clipboard grants, as (app node id, Clipboard node id).
@@ -1566,6 +1594,16 @@ impl Server {
         self.kind_of(id) == Some(Kind::Gateway)
     }
 
+    /// Whether `net` is a private per-pair link's synthetic id
+    /// (`Graph::app_link_nets`) rather than a placed Network/Gateway node.
+    /// `net_links` carries both kinds of membership identically, so anything
+    /// that exposes `net_links` outward (`Server::view`, `Server::save`)
+    /// filters through this first — a synthetic id is bookkeeping, not a wire
+    /// to a node that exists on the canvas.
+    fn is_private_link_net(&self, net: NodeId) -> bool {
+        self.graph.app_link_nets.values().any(|&id| id == net)
+    }
+
     fn alloc_id(&mut self) -> NodeId {
         NodeId::new()
     }
@@ -1858,6 +1896,7 @@ impl Server {
         // Drop it from MIDI routing (as a source) and its desired wires.
         self.host.midi().lock().unwrap().remove_node(id);
         self.graph.midi_links.retain(|&(s, d)| s != id && d != id);
+        self.prune_app_link_net(id);
         self.routed.retain(|&(s, d)| s != id && d != id);
         self.forget(id);
     }
@@ -1907,6 +1946,7 @@ impl Server {
         self.graph.midi_outs.remove(&id);
         self.host.midi().lock().unwrap().remove_node(id);
         self.graph.midi_links.retain(|&(s, d)| s != id && d != id);
+        self.prune_app_link_net(id);
         self.routed.retain(|&(s, d)| s != id && d != id);
         self.forget(id);
     }
@@ -2117,6 +2157,7 @@ impl Server {
         let untouched = |&(a, b): &(NodeId, NodeId)| a != id && b != id;
         self.graph.connections.retain(untouched);
         self.graph.midi_links.retain(untouched);
+        self.prune_app_link_net(id);
         self.graph.capture_links.retain(untouched);
         self.graph.clipboard_links.retain(untouched);
         self.graph.api_links.retain(untouched);
@@ -3381,6 +3422,83 @@ impl Server {
     fn toggle_midi(&mut self, src: NodeId, dst: NodeId) {
         wiring::toggle_pair(&mut self.graph.midi_links, src, dst);
         self.sync_midi();
+        self.sync_app_link_nets();
+    }
+
+    /// Reconcile every direct app↔app MIDI wire's private fabric net (see
+    /// `Graph::app_link_nets`) against whether both endpoints currently import
+    /// `wasi:sockets`: mint and join a synthetic net the first time both sides
+    /// are ready, part it the moment either side no longer is (the wire was
+    /// removed, or an endpoint that used to import net doesn't any more —
+    /// including simply not having finished compiling yet). This is purely
+    /// additive on top of `sync_midi` — a wire that also carries MIDI keeps
+    /// doing so regardless; joining a private net is never a reclassification
+    /// of the wire, the way a `serves_fs` mount is.
+    ///
+    /// Idempotent and cheap when nothing changed. Called from `toggle_midi`
+    /// for an immediate join/part, and once per tick so an endpoint that
+    /// finishes compiling *after* the wire was made — interactively deferred
+    /// in `pending_app_wires`, or loaded straight off a saved `midi` line,
+    /// neither of which re-runs `toggle_midi` once compiling finishes — still
+    /// gets its link established.
+    fn sync_app_link_nets(&mut self) {
+        let want: HashSet<(NodeId, NodeId)> = self
+            .graph
+            .midi_links
+            .iter()
+            .copied()
+            .filter(|&(a, b)| {
+                self.app_node(a).is_some_and(|n| n.imports_net())
+                    && self.app_node(b).is_some_and(|n| n.imports_net())
+            })
+            .map(|(a, b)| canonical_pair(a, b))
+            .collect();
+        let stale: Vec<(NodeId, NodeId)> = self
+            .graph
+            .app_link_nets
+            .keys()
+            .copied()
+            .filter(|key| !want.contains(key))
+            .collect();
+        for key in stale {
+            if let Some(net) = self.graph.app_link_nets.remove(&key) {
+                self.toggle_net(key.0, net);
+                self.toggle_net(key.1, net);
+            }
+        }
+        for key in want {
+            if !self.graph.app_link_nets.contains_key(&key) {
+                let net = self.alloc_id();
+                self.toggle_net(key.0, net);
+                self.toggle_net(key.1, net);
+                self.graph.app_link_nets.insert(key, net);
+            }
+        }
+    }
+
+    /// Part `id`'s side of any private per-pair fabric link it holds (see
+    /// `Graph::app_link_nets`) and drop the bookkeeping entry — called
+    /// wherever a node that might be one of these two apps goes away, so the
+    /// link (and the survivor's membership in it) can't outlive it.
+    ///
+    /// Only the *other* side needs unwiring here: the departing id's own
+    /// `net_links` entry is stripped by whichever removal site calls this (or
+    /// it's already gone from the node registry, making a `toggle_net` on it a
+    /// silent no-op) — re-toggling it here too would read as "not currently
+    /// joined" and wrongly re-add it.
+    fn prune_app_link_net(&mut self, id: NodeId) {
+        let mine: Vec<((NodeId, NodeId), NodeId)> = self
+            .graph
+            .app_link_nets
+            .iter()
+            .filter(|(&(a, b), _)| a == id || b == id)
+            .map(|(&k, &v)| (k, v))
+            .collect();
+        for ((a, b), net) in mine {
+            self.graph.app_link_nets.remove(&(a, b));
+            let other = if a == id { b } else { a };
+            self.toggle_net(other, net);
+        }
     }
 
     /// Reconcile the MIDI router against the desired `midi_links`: add each new
@@ -3562,6 +3680,7 @@ impl Server {
         self.sync_pending_app_wires();
         self.sync_mounts();
         self.sync_midi();
+        self.sync_app_link_nets();
         self.sync_net_membership();
         // A router's bridge follows its wires and its token, both of which can
         // change between ticks without a command ever reaching this server.
@@ -3593,6 +3712,7 @@ impl Server {
         self.graph.connections.retain(|&(_, app)| app != id);
         self.graph.net_links.retain(|&(app, _)| app != id);
         self.graph.midi_links.retain(|&(s, d)| s != id && d != id);
+        self.prune_app_link_net(id);
         self.graph
             .serve_links
             .retain(|&(h, hp)| h != id && hp != id);
@@ -3742,7 +3862,15 @@ impl Server {
                 let connections = ws_wires(&self.graph.connections, WireRel::Connection);
                 let midi = ws_wires(&self.graph.midi_links, WireRel::Midi);
                 let serves = ws_wires(&self.graph.serve_links, WireRel::Serve);
-                let net_links = ws_wires(&self.graph.net_links, WireRel::NetLink);
+                // A private per-pair link's synthetic net (`app_link_nets`)
+                // never gets a `netlink` line — it names no node on the
+                // canvas, and is re-minted on load once both sides are ready
+                // again (see `is_private_link_net`).
+                let net_links: Vec<(NodeId, NodeId)> =
+                    ws_wires(&self.graph.net_links, WireRel::NetLink)
+                        .into_iter()
+                        .filter(|&(_, n)| !self.is_private_link_net(n))
+                        .collect();
                 let capture_links = ws_wires(&self.graph.capture_links, WireRel::CaptureLink);
                 let clipboard_links = ws_wires(&self.graph.clipboard_links, WireRel::ClipboardLink);
                 let api_links = ws_wires(&self.graph.api_links, WireRel::ApiLink);
@@ -4965,12 +5093,21 @@ impl Server {
             mount_paths: self.graph.mount_paths.clone(),
             fs_providers,
             midi_links: self.graph.midi_links.clone(),
-            net_links: self.graph.net_links.clone(),
+            // A private per-pair link's synthetic net never appears here — see
+            // `is_private_link_net` — it surfaces only via `app_link_nets`.
+            net_links: self
+                .graph
+                .net_links
+                .iter()
+                .copied()
+                .filter(|&(_, n)| !self.is_private_link_net(n))
+                .collect(),
             capture_links: self.graph.capture_links.clone(),
             clipboard_links: self.graph.clipboard_links.clone(),
             api_links: self.graph.api_links.clone(),
             serve_ports: self.graph.serve_ports.clone(),
             midi_channels: self.graph.midi_channels.clone(),
+            app_link_nets: self.graph.app_link_nets.clone(),
             capture_feeds: self.capture_feeds.clone(),
             clipboard_boards: self.clipboard_boards.clone(),
             api_nodes,
@@ -6868,6 +7005,310 @@ mod model_tests {
             "classified as a provider mount once decidable"
         );
         assert!(s.graph.midi_links.is_empty());
+    }
+
+    /// A registry stub for an app node that imports `wasi:sockets`: a real
+    /// fabric stack, attached to the server's own hub exactly like a freshly
+    /// compiled networked node (isolated on its own id — see
+    /// `PluginHost::load_and_setup`), plus a published `net: true` setup.
+    /// Enough for `Node::imports_net`/`net_stack` to read true/`Some` without
+    /// a real wasm component, so `Server::sync_app_link_nets` can be exercised
+    /// directly (the fixture style `view_reports_fs_provider_apps` and
+    /// `provider_wires_survive_a_compiling_provider` use for `fs_provider`,
+    /// extended with a real attached stack for `net`).
+    fn net_stub(s: &Server, id: NodeId, name: &str) -> Arc<crate::plugin::Node> {
+        use crate::plugin::{Node, NodeSetup};
+        let ip = s.host.hub().alloc_ip((2 + (id.as_u128() % 250)) as u8);
+        let stack = s.host.hub().attach(id, ip, name);
+        let node = Arc::new(Node {
+            id,
+            name: name.to_string(),
+            term_io: crate::terminal::TermIo::new(),
+            fs: crate::vfs::new_fs(),
+            midi_in: crate::midi::new_inbox(),
+            options: crate::options::new_options(Vec::new()),
+            finished: Arc::new(AtomicBool::new(false)),
+            running: Arc::new(AtomicBool::new(false)),
+            kill: Arc::new(AtomicBool::new(false)),
+            setup: std::sync::OnceLock::new(),
+            env: Vec::new(),
+            layers: Vec::new(),
+            capture_src: crate::capture::new_src(),
+            clip_src: crate::clipboard::new_src(),
+            clip_read: crate::clipboard::new_permit(),
+            clip_write: crate::clipboard::new_permit(),
+            exec_permit: crate::exec::new_permit(true),
+            fs_serve: wk_vfs::ProviderConn::new(),
+        });
+        let _ = node.setup.set(NodeSetup {
+            net_stack: Some(stack),
+            http_path: None,
+            run: None,
+            midi: false,
+            net: true,
+            capture: false,
+            clipboard: false,
+            fs_provider: false,
+        });
+        node
+    }
+
+    /// Two ordinary app nodes wired DIRECTLY to each other (no Network node
+    /// anywhere on the canvas) share a private point-to-point fabric net the
+    /// moment BOTH import `wasi:sockets` — riding the very same wire a plain
+    /// MIDI thru-box forms between two apps, with zero new wiring vocabulary.
+    /// The link is bookkeeping, not a wire to a placed node, so it never
+    /// shows up in `net_links`/`view().net_links`; disconnecting tears it back
+    /// down (each stack isolated on its own id again); and a synthetic link id
+    /// is never a Gateway, so host access stays off throughout.
+    #[test]
+    fn two_networked_apps_wired_directly_share_a_private_net() {
+        let mut s = fresh_server();
+        let ws = s.graph.workspaces[0];
+        let a = NodeId::new();
+        let b = NodeId::new();
+        s.place(a, Kind::App, ws, [0.0, 0.0], [100.0, 100.0]);
+        s.place(b, Kind::App, ws, [100.0, 0.0], [100.0, 100.0]);
+        let na = net_stub(&s, a, "a");
+        let nb = net_stub(&s, b, "b");
+        s.node_reg.lock().unwrap().push(na.clone());
+        s.node_reg.lock().unwrap().push(nb.clone());
+
+        // Isolated before wiring: each stack is its own private net.
+        assert_eq!(na.net_stack().unwrap().lock().unwrap().net, a);
+        assert_eq!(nb.net_stack().unwrap().lock().unwrap().net, b);
+
+        s.apply(Command::Create(Resource::Wire { a, b }));
+        assert!(
+            s.graph.midi_links.contains(&(a, b)),
+            "still an ordinary MIDI wire too — additive, not a reclassification"
+        );
+
+        let net_a = na.net_stack().unwrap().lock().unwrap().net;
+        let net_b = nb.net_stack().unwrap().lock().unwrap().net;
+        assert_eq!(net_a, net_b, "joined the same private net");
+        assert_ne!(net_a, a, "not just its own isolated net any more");
+        assert_ne!(net_a, b);
+        assert!(!na.net_stack().unwrap().lock().unwrap().host_access);
+        assert!(!nb.net_stack().unwrap().lock().unwrap().host_access);
+
+        // Bookkeeping only — not a wire to a placed node, so it's absent from
+        // the client-facing `net_links`, and present only in its own field.
+        let view = s.view();
+        assert!(
+            !view.net_links.iter().any(|&(x, _)| x == a || x == b),
+            "a synthetic link never reads as a wire to a placed Network"
+        );
+        assert_eq!(
+            view.app_link_nets.get(&canonical_pair(a, b)).copied(),
+            Some(net_a)
+        );
+
+        // Disconnect: the wire (and with it, the private link) comes down.
+        s.apply(Command::Delete(ResourceRef::Wire(Wire::Midi(a, b))));
+        assert!(!s.graph.midi_links.contains(&(a, b)));
+        assert_eq!(
+            na.net_stack().unwrap().lock().unwrap().net,
+            a,
+            "back to its own isolated net"
+        );
+        assert_eq!(nb.net_stack().unwrap().lock().unwrap().net, b);
+        assert!(!s.graph.app_link_nets.contains_key(&canonical_pair(a, b)));
+    }
+
+    /// Two app nodes wired directly that do NOT import `wasi:sockets` — the
+    /// ordinary MIDI case (e.g. a keyboard app into a synth app) — get no
+    /// fabric net at all: `imports_net()` gates the whole mechanism, so plain
+    /// MIDI wiring between two apps is completely unaffected by this feature
+    /// existing.
+    #[test]
+    fn midi_only_apps_wired_directly_get_no_private_net() {
+        let mut s = fresh_server();
+        let ws = s.graph.workspaces[0];
+        let a = NodeId::new();
+        let b = NodeId::new();
+        s.place(a, Kind::App, ws, [0.0, 0.0], [100.0, 100.0]);
+        s.place(b, Kind::App, ws, [100.0, 0.0], [100.0, 100.0]);
+        // No node_reg entry at all — same as a still-compiling app, or one
+        // whose component never imports `wasi:sockets`: `imports_net()`
+        // reads false either way.
+
+        s.apply(Command::Create(Resource::Wire { a, b }));
+        assert!(
+            s.graph.midi_links.contains(&(a, b)),
+            "the plain MIDI wire still forms"
+        );
+        assert!(s.graph.net_links.is_empty(), "no private net joined");
+        assert!(s.graph.app_link_nets.is_empty());
+    }
+
+    /// Deleting either endpoint of a directly-wired, net-importing pair drops
+    /// the `app_link_nets` bookkeeping entry — the survivor doesn't stay
+    /// wired to a net whose other half is gone.
+    #[test]
+    fn deleting_an_endpoint_drops_its_private_link_bookkeeping() {
+        let mut s = fresh_server();
+        let ws = s.graph.workspaces[0];
+        let a = NodeId::new();
+        let b = NodeId::new();
+        s.place(a, Kind::App, ws, [0.0, 0.0], [100.0, 100.0]);
+        s.place(b, Kind::App, ws, [100.0, 0.0], [100.0, 100.0]);
+        let na = net_stub(&s, a, "a");
+        let nb = net_stub(&s, b, "b");
+        s.node_reg.lock().unwrap().push(na.clone());
+        s.node_reg.lock().unwrap().push(nb.clone());
+        s.apply(Command::Create(Resource::Wire { a, b }));
+        assert!(s.graph.app_link_nets.contains_key(&canonical_pair(a, b)));
+
+        s.apply(Command::Delete(ResourceRef::Node(b)));
+        assert!(
+            !s.graph.app_link_nets.contains_key(&canonical_pair(a, b)),
+            "no leak once an endpoint is gone"
+        );
+        assert_eq!(
+            na.net_stack().unwrap().lock().unwrap().net,
+            a,
+            "the survivor returns to isolation"
+        );
+    }
+
+    /// A directly-wired pair of net-importing apps persists as nothing more
+    /// than the plain `midi "a" "b"` line an ordinary two-app wire always
+    /// was: the private link's synthetic net id is bookkeeping the `.wk` file
+    /// never needs (see `Graph::app_link_nets`'s doc comment) — it's minted
+    /// fresh once both sides are wired and ready again after a reload.
+    #[test]
+    fn a_directly_wired_net_pair_survives_a_reload_as_a_plain_midi_wire() {
+        let path = std::env::temp_dir().join("wk-app-link-net-save-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let doc = Document {
+            dependencies: vec![Dependency {
+                name: "netapp".into(),
+                source: crate::workspace::Source::Path(PathBuf::from("/nonexistent/netapp.wasm")),
+                args: Vec::new(),
+                description: None,
+            }],
+            ..Document::empty()
+        };
+        let mut s = Server::new(&doc, path.clone()).expect("server constructs");
+        let ws = s.graph.workspaces[0];
+        let a = NodeId::new();
+        let b = NodeId::new();
+        s.place(a, Kind::App, ws, [0.0, 0.0], [100.0, 100.0]);
+        s.place(b, Kind::App, ws, [100.0, 0.0], [100.0, 100.0]);
+        s.graph.node_deps.insert(a, "netapp".into());
+        s.graph.node_deps.insert(b, "netapp".into());
+        let na = net_stub(&s, a, "a");
+        let nb = net_stub(&s, b, "b");
+        s.node_reg.lock().unwrap().push(na);
+        s.node_reg.lock().unwrap().push(nb);
+
+        s.apply(Command::Create(Resource::Wire { a, b }));
+        assert!(s.graph.app_link_nets.contains_key(&canonical_pair(a, b)));
+
+        s.save();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("midi \""),
+            "the wire is a plain midi line:\n{text}"
+        );
+        assert!(
+            !text.contains("netlink"),
+            "the private link's synthetic net id is never persisted:\n{text}"
+        );
+
+        let back = Document::load(&path).expect("reloads");
+        let saved = &back.workspaces[0];
+        assert!(saved.midi.contains(&(a, b)));
+        assert!(saved.net_links.is_empty());
+        assert_eq!(
+            Document::load(&path).expect("reloads"),
+            back,
+            "a second save/load cycle is a fixpoint"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An actual TCP byte crosses a private link established purely by wiring
+    /// two net-importing apps directly to each other — no Network node, no
+    /// uplink. Mirrors `iroh_uplinks_tunnel_tcp_between_fabrics`
+    /// (`wk-fabric`'s uplink test) minus the tunnel: both stacks already
+    /// share the server's one hub, so once `sync_app_link_nets` puts them on
+    /// the same net id, the hub's own local delivery does the rest.
+    #[test]
+    fn two_wired_apps_actually_carry_tcp_over_their_private_net() {
+        use smoltcp::socket::tcp;
+
+        let mut s = fresh_server();
+        let ws = s.graph.workspaces[0];
+        let a = NodeId::new();
+        let b = NodeId::new();
+        s.place(a, Kind::App, ws, [0.0, 0.0], [100.0, 100.0]);
+        s.place(b, Kind::App, ws, [100.0, 0.0], [100.0, 100.0]);
+        let na = net_stub(&s, a, "server");
+        let nb = net_stub(&s, b, "client");
+        s.node_reg.lock().unwrap().push(na.clone());
+        s.node_reg.lock().unwrap().push(nb.clone());
+
+        s.apply(Command::Create(Resource::Wire { a, b }));
+        let server = na.net_stack().unwrap();
+        let client = nb.net_stack().unwrap();
+        assert_eq!(
+            server.lock().unwrap().net,
+            client.lock().unwrap().net,
+            "joined the same private net"
+        );
+
+        let tcp_socket = || {
+            tcp::Socket::new(
+                tcp::SocketBuffer::new(vec![0u8; 4096]),
+                tcp::SocketBuffer::new(vec![0u8; 4096]),
+            )
+        };
+        let server_ip = server.lock().unwrap().ip;
+        let server_h = {
+            let mut g = server.lock().unwrap();
+            let h = g.sockets.add(tcp_socket());
+            g.sockets.get_mut::<tcp::Socket>(h).listen(9000).unwrap();
+            h
+        };
+        let client_h = {
+            let mut g = client.lock().unwrap();
+            let h = g.sockets.add(tcp_socket());
+            let wk_fabric::netstack::NodeStack { iface, sockets, .. } = &mut *g;
+            sockets
+                .get_mut::<tcp::Socket>(h)
+                .connect(iface.context(), (server_ip, 9000), 49200)
+                .unwrap();
+            h
+        };
+
+        let mut sent = false;
+        let mut got: Vec<u8> = Vec::new();
+        for _ in 0..5000 {
+            {
+                let mut g = client.lock().unwrap();
+                let cs = g.sockets.get_mut::<tcp::Socket>(client_h);
+                if cs.can_send() && !sent {
+                    cs.send_slice(b"private link").unwrap();
+                    sent = true;
+                }
+            }
+            {
+                let mut g = server.lock().unwrap();
+                let ss = g.sockets.get_mut::<tcp::Socket>(server_h);
+                if ss.can_recv() {
+                    let mut buf = [0u8; 64];
+                    let n = ss.recv_slice(&mut buf).unwrap();
+                    got.extend_from_slice(&buf[..n]);
+                }
+            }
+            if got.len() >= 12 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(&got, b"private link");
     }
 
     /// Dropping a file from the OS creates a BindMount already pointed at
