@@ -1,0 +1,75 @@
+// vim: set filetype=kdl :
+// DDS discovery leaving the machine: a multicast bridge on the Network.
+//
+// example/dds.wk keeps everything inside wk — the fabric carries RTPS
+// discovery between the members of a Network and stops at the edge of the
+// process. This file adds one node, and the same unmodified participants are
+// suddenly audible on the host's real network: the `multicast` node joins the
+// Network's multicast domain to the host's, so the SPDP announcements OpenDDS
+// was already sending to 239.255.0.1:17900 also leave through a real socket,
+// and anything a real peer sends to that group arrives on the fabric.
+//
+// 17900 rather than the 7400 you may expect: the RTPS discovery port is
+// 7400 + 250*domain, and these nodes meet in domain 42 (see
+// plugins/opendds/nodes/wk_dds_node.h). Listen on the wrong port and you will
+// conclude the bridge is broken.
+//
+// Nothing about the DDS nodes changes. They are not told the bridge exists,
+// any more than they are told about each other.
+//
+// The bridge is pinned to the LOOPBACK interface here, deliberately: this
+// example is something to run, and multicast RTPS put on a real office LAN
+// would introduce these participants to every DDS system on it. Watch it with
+//
+//   wk run example/dds-multicast.wk --headless &
+//   wk -f example/dds-multicast.wk up
+//   wk -f example/dds-multicast.wk ps          # the bridge shows its groups
+//
+// and, on the host, anything joined to the group on 127.0.0.1 — a native DDS
+// participant, `tcpdump -i lo0 -n 'udp port 17900'`, or a few lines of Python
+// that join 239.255.0.1 on 127.0.0.1 and print what arrives (every datagram
+// starts with the four bytes `RTPS`). To reach a real LAN instead, drop the
+// `iface` line (or set it to that interface's own address).
+//
+// WHAT THIS DOES AND DOESN'T GIVE YOU
+// A real peer HEARS these participants and can be heard by them: discovery is
+// multicast and the bridge carries it. It cannot then open the unicast side of
+// RTPS back to them, because SPDP announces each participant's *fabric*
+// address (10.0.0.x) inside the payload, and the bridge translates addresses
+// on packets, not inside them. Rewriting locators needs an RTPS-aware gateway
+// and is not this node's job.
+import "../workspace.wk"
+workspace "01DDSMC000000000000000WS00" {
+    node "dds_publisher" "01DDSMC000000000000000PB01" {
+        name "dds-pub"
+        pos 60.0 60.0
+        size 420.0 260.0
+        args "--forever"
+    }
+    node "dds_subscriber" "01DDSMC000000000000000SB02" {
+        name "dds-sub"
+        pos 60.0 380.0
+        size 420.0 260.0
+        args "--forever"
+    }
+    network "01DDSMC000000000000000NW03" {
+        pos 560.0 220.0
+        size 130.0 44.0
+    }
+    note "01DDSMC000000000000000NT05" {
+        text "The same two DDS nodes as dds.wk,\nplus one multicast bridge.\n\nThe bridge joins this Network's\nmulticast domain to the host's real\none. RTPS discovery already went to\n239.255.0.1:17900; now it also leaves\nthrough a real socket.\n\nNeither participant is configured,\nand neither knows the bridge is\nthere.\n\nPinned to 127.0.0.1 on purpose — a\nreal LAN would meet every one of\nthese participants.\n\n  wk -f example/dds-multicast.wk ps"
+        pos 760.0 320.0
+        size 360.0 400.0
+    }
+    // No groups listed: the bridge learns 239.255.0.1:17900 the first time a
+    // participant announces itself. A Network that only *listened* to a group
+    // would need it named here, since nothing on the fabric would reveal it.
+    multicast "01DDSMC000000000000000MC04" {
+        iface "127.0.0.1"
+        pos 760.0 220.0
+        size 200.0 60.0
+    }
+    netlink "01DDSMC000000000000000PB01" "01DDSMC000000000000000NW03"
+    netlink "01DDSMC000000000000000SB02" "01DDSMC000000000000000NW03"
+    netlink "01DDSMC000000000000000MC04" "01DDSMC000000000000000NW03"
+}

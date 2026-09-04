@@ -1619,6 +1619,19 @@ impl PluginHost {
             .map_err(wasmtime::Error::from_anyhow)
     }
 
+    /// Start a host multicast bridge on virtual network `net` (see
+    /// [`wk_fabric::hostmcast`]): the groups that network uses also travel on
+    /// the host's real network.
+    pub fn multicast_bridge(
+        &self,
+        net: NodeId,
+        iface: Option<std::net::Ipv4Addr>,
+        groups: &[wk_fabric::hostmcast::Group],
+    ) -> Result<wk_fabric::hostmcast::HostMulticast> {
+        wk_fabric::hostmcast::HostMulticast::start(self.hub.clone(), net, iface, groups)
+            .map_err(wasmtime::Error::from_anyhow)
+    }
+
     /// Start a Veilid uplink tunneling virtual network `net` (see
     /// [`wk_fabric::veilid`]). `node` namespaces its store; `identity` is the
     /// persisted DHT owner keypair (fresh if `None`).

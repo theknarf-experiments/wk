@@ -273,7 +273,12 @@ fn class_of(kind: &SnapKind) -> NodeClass {
         SnapKind::Port { .. } => NodeClass::Port,
         SnapKind::Net { .. } => NodeClass::Net,
         SnapKind::Router => NodeClass::Router,
-        SnapKind::Iroh { .. } | SnapKind::Veilid { .. } => NodeClass::Uplink,
+        // A multicast bridge is an uplink in every way that wiring cares
+        // about: it attaches a trunk to one Network and extends it. What
+        // differs is only what sits on the far side (the LAN, not a fabric).
+        SnapKind::Iroh { .. } | SnapKind::Veilid { .. } | SnapKind::Multicast { .. } => {
+            NodeClass::Uplink
+        }
         SnapKind::Capture => NodeClass::Capture,
         SnapKind::Clipboard => NodeClass::Clipboard,
         SnapKind::Api => NodeClass::Api,
@@ -307,6 +312,7 @@ fn kind_word(kind: &SnapKind) -> &'static str {
         SnapKind::MidiIn { .. } => "midiin",
         SnapKind::MidiOut { .. } => "midiout",
         SnapKind::HostService { .. } => "hostservice",
+        SnapKind::Multicast { .. } => "multicast",
         SnapKind::InPort { .. } => "inport",
         SnapKind::OutPort { .. } => "outport",
         SnapKind::Group { .. } => "group",

@@ -257,6 +257,12 @@ pub enum NodeKind {
     /// a physical MIDI port, so the canvas can drive an external synth (a MIDI
     /// destination, the mirror of [`NodeKind::MidiIn`]).
     MidiOut,
+    /// A host multicast bridge: joins its Network's multicast domain to the
+    /// host's real one, so a group a node sends to also leaves the machine and
+    /// a group a real peer sends to arrives on the fabric. Like an uplink it
+    /// wires to a Network and extends it — the far side being the LAN rather
+    /// than another fabric.
+    Multicast,
 }
 
 /// A resource to create.
@@ -403,6 +409,17 @@ pub enum Command {
         hostport: NodeId,
         container: u16,
     },
+    /// Reconfigure a Multicast bridge: `iface` is the local address of the host
+    /// interface to carry groups on (`None`/empty = the kernel's choice), and
+    /// `groups` (`addr:port`) are joined up front. Its own command rather than
+    /// a [`NodePatch`] field because both settings are fixed when the bridge's
+    /// sockets are set up, so applying them means restarting it — and doing
+    /// that once for the pair, not once per field.
+    SetMulticast {
+        id: NodeId,
+        iface: Option<String>,
+        groups: Vec<String>,
+    },
     /// Replace an app node's capability token — the Biscuit whose Datalog
     /// decides what the node's wires may grant it (see `wk token`). Empty
     /// bytes reset the node to the workspace's default token.
@@ -497,8 +514,11 @@ impl Command {
             | Command::SetServePort { .. }
             | Command::SetMidiChannel { .. } => (ResourceKind::Wire, Action::Update),
             Command::Delete(ResourceRef::Workspace(_)) => (ResourceKind::Workspace, Action::Delete),
-            // Swapping a node's capability token reconfigures the node.
-            Command::SetToken { .. } => (ResourceKind::Node, Action::Update),
+            // Swapping a node's capability token reconfigures the node, and so
+            // does pointing a multicast bridge at an interface or a group.
+            Command::SetToken { .. } | Command::SetMulticast { .. } => {
+                (ResourceKind::Node, Action::Update)
+            }
             Command::Run(_) | Command::Stop(_) => (ResourceKind::Node, Action::Run),
             Command::Duplicate(_) => (ResourceKind::Node, Action::Create),
             // Undo can restore or remove anything it previously recorded, so it

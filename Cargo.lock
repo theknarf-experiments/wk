@@ -10980,6 +10980,7 @@ dependencies = [
  "iroh",
  "iroh-tickets",
  "smoltcp",
+ "socket2",
  "tokio",
  "veilid-core",
  "veilid-tools",

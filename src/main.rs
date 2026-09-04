@@ -274,6 +274,12 @@ enum CreateKind {
     /// A host TCP service published into a Network (value = `<name>=<addr:port>`,
     /// e.g. `subduction=127.0.0.1:8080`; a bare `addr:port` keeps the default name)
     Hostservice,
+    /// A host multicast bridge: joins the Network it's wired to onto the host's
+    /// real multicast domain. Usually needs no value — it learns the groups
+    /// from the Network's own traffic. Value = `239.255.0.1:7400` to join a
+    /// group up front (space-separate several), or `<iface>=<groups>` to pin
+    /// the host interface by its local address too.
+    Multicast,
 }
 
 impl CreateKind {
@@ -294,6 +300,7 @@ impl CreateKind {
             CreateKind::Midiout => NodeKind::MidiOut,
             CreateKind::Note => NodeKind::Note,
             CreateKind::Hostservice => NodeKind::HostService,
+            CreateKind::Multicast => NodeKind::Multicast,
         }
     }
 }

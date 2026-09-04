@@ -24,6 +24,7 @@ pub(super) enum PaletteCmd {
     AddMidiIn,
     AddMidiOut,
     AddHostService,
+    AddMulticast,
     NewWorkspace,
     CloseWorkspace,
     /// Jump the camera to this zoom factor.

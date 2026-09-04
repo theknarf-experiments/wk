@@ -149,6 +149,10 @@ const MIDI_BORDER: [f32; 4] = [0.35, 0.75, 0.45, 1.0];
 /// the reverse of a HostPort).
 const HOSTSVC_BG: [f32; 4] = [0.07, 0.19, 0.18, 1.0];
 const HOSTSVC_BORDER: [f32; 4] = [0.25, 0.80, 0.70, 1.0];
+/// Multicast bridge nodes: indigo chrome. A trunk node like an uplink, so it
+/// sits near the uplink family visually without being mistaken for one.
+const MCAST_BG: [f32; 4] = [0.10, 0.12, 0.24, 1.0];
+const MCAST_BORDER: [f32; 4] = [0.45, 0.52, 0.95, 1.0];
 /// `group` nodes: violet chrome. An instance is a whole workspace standing in
 /// one node, so it gets a colour no single capability owns.
 const GROUP_BG: [f32; 4] = [0.14, 0.10, 0.22, 1.0];
@@ -1426,6 +1430,11 @@ impl App {
             PaletteCmd::AddHostService,
         ));
         v.push(PaletteRow::new(
+            "Add Multicast Bridge",
+            d("carry a Network's multicast groups on the host's real network"),
+            PaletteCmd::AddMulticast,
+        ));
+        v.push(PaletteRow::new(
             "New Workspace  (Cmd+T)",
             None,
             PaletteCmd::NewWorkspace,
@@ -1828,6 +1837,14 @@ impl App {
                 let pos = self.view_center([FILE_W, FILE_H], self.view.host_services.len());
                 self.conn.send(Command::Create(Resource::Node {
                     kind: NodeKind::HostService,
+                    pos,
+                    ws,
+                }));
+            }
+            PaletteCmd::AddMulticast => {
+                let pos = self.view_center([FILE_W, FILE_H], self.view.mcast_groups.len());
+                self.conn.send(Command::Create(Resource::Node {
+                    kind: NodeKind::Multicast,
                     pos,
                     ws,
                 }));
@@ -5031,6 +5048,48 @@ impl App {
                         border: MIDI_BORDER,
                         bg: MIDI_BG,
                         title,
+                        title_col: TEXT,
+                        status: &status,
+                        status_col,
+                        status_scale: 0.7,
+                        copy_ticket: false,
+                    },
+                );
+                continue;
+            }
+
+            // A Multicast bridge: the status is what it is actually carrying,
+            // which is the only thing about it that changes. "no group yet" is
+            // the ordinary early state, not an error — a bridge learns its
+            // groups from the Network's traffic, so it has none until a node
+            // sends to one.
+            if let Some(groups) = self.view.mcast_groups.get(&id).cloned() {
+                let wired = self.view.net_links.iter().any(|&(s, _)| s == id);
+                let status = match groups.len() {
+                    0 if !wired => "wire to a Network".to_string(),
+                    0 => "no group yet".to_string(),
+                    1 => groups[0].clone(),
+                    n => format!("{} +{}", groups[0], n - 1),
+                };
+                let status_col = if wired && !groups.is_empty() {
+                    [0.62, 0.68, 1.0, 1.0]
+                } else {
+                    [0.55, 0.58, 0.72, 1.0]
+                };
+                self.draw_widget(
+                    &mut quads,
+                    &mut gfx,
+                    white,
+                    zf,
+                    mp,
+                    clip,
+                    full,
+                    WidgetChrome {
+                        id,
+                        r,
+                        border: MCAST_BORDER,
+                        bg: MCAST_BG,
+                        title: "multicast",
                         title_col: TEXT,
                         status: &status,
                         status_col,

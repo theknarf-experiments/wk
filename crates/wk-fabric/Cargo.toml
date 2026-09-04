@@ -8,6 +8,10 @@ description = "wk's userspace network fabric: per-node smoltcp stacks routed by 
 wk-protocol = { path = "../wk-protocol" }
 anyhow = "1"
 bytes = "1"
+# For SO_REUSEPORT and the multicast socket options std::net::UdpSocket does
+# not expose — the host multicast bridge needs both to share a group's port
+# with another process on the same machine.
+socket2 = "0.6"
 # iface-max-addr-count-4: each node carries its fabric v4+v6 addresses AND a
 # v4+v6 loopback (127.0.0.1 / ::1); smoltcp's default cap is 2.
 smoltcp = { version = "0.13.1", features = ["iface-max-addr-count-4"] }

@@ -153,6 +153,26 @@ That took three changes, none of them in DDS:
   same exposure they already have to each other's unicast traffic.
 * **The socket options say yes.** See below.
 
+**And now off the machine too.** A `multicast` node
+(`crates/wk-fabric/src/hostmcast.rs`) joins a Network's multicast domain to the
+host's real one, which is what lets these participants meet a DDS that is not
+this build. It is a trunk like an iroh uplink — `NetHub::step` already copies
+groups to the trunks — but where an uplink forwards frames verbatim to another
+fabric, the LAN has never heard of `10.0.0.0/24`, so the bridge reads the
+datagram out of the frame, sends it from a real socket, and builds a fresh
+frame around each one coming back. Nobody configures the groups: the first
+frame a Network sends to a group is what tells the bridge to join it on the
+host, which is the only signal there is when membership on the fabric is
+implicit. `example/dds-multicast.wk` puts one on the DDS Network, and real
+`RTPS`-magic SPDP datagrams arrive on a host socket from participants that were
+told nothing.
+
+What it deliberately does not do is rewrite addresses *inside* payloads, and
+for DDS that is the whole remaining gap: SPDP announces each participant's
+fabric locator, so a real peer hears a fabric participant and can be heard by
+it, but cannot open the unicast half of RTPS back. That needs an RTPS-aware
+gateway, not a packet-level bridge.
+
 Nothing about this needed a new WIT interface, which is the part worth
 dwelling on. POSIX makes `IP_ADD_MEMBERSHIP` mandatory for *receiving* a group,
 but for three reasons that are all absent here: a NIC's MAC filter must be
@@ -372,6 +392,11 @@ the fabric rather than listing peers.
 * **M8 — the wk nodes: done.** `nodes/publisher.cpp` and `nodes/subscriber.cpp`
   build to `dds-publisher.wasm` and `dds-subscriber.wasm` (`./build-nodes.sh`)
   and take no arguments. Below the option parsing they are ordinary DDS.
+* **M10 — multicast off the machine: done.** A `multicast` bridge node carries
+  a Network's groups on the host's real network, verified with real host
+  sockets in both directions and with actual RTPS discovery from the wasm
+  participants landing on a host socket. See
+  [multicast that the fabric carries](#3-rtps_udp-and-multicast-that-the-fabric-carries).
 * **M9 — multicast on the fabric: done.** See
   [rtps_udp, and multicast that the fabric carries](#3-rtps_udp-and-multicast-that-the-fabric-carries).
 
@@ -398,7 +423,16 @@ the fabric rather than listing peers.
 * **Explicit membership.** Joining is implicit — flood the Network, filter by
   port. If a Network ever needs to carry groups that some members must *not*
   see, that becomes a real distinction and would need a join the guest can
-  actually express. Nothing needs it today.
+  actually express. Nothing needs it today. The host bridge is the one place
+  where an up-front join IS expressible (`groups` on the node), because a
+  Network that only *listens* to a group never reveals it by sending.
+* **Interop with a DDS that is not this build.** Everything demonstrated so far
+  goes from this build to this build — same compiler, same patches, same
+  assumptions at both ends — which proves self-consistency, not RTPS
+  conformance. The multicast bridge gets discovery across the machine boundary;
+  what is left is the unicast half, which needs the announced locators
+  rewritten (above). Until that exists, "OpenDDS on wasm speaks RTPS correctly"
+  is untested against an independent implementation.
 * **Security, shmem, InfoRepo.** Not built; none is needed for DDS over the
   fabric.
 

@@ -19,7 +19,10 @@ pub enum NodeClass {
     File,
     Port,
     Net,
-    /// An uplink node (Iroh/Veilid) — wires only to a Network (the net it extends).
+    /// An uplink node — wires only to a Network (the net it extends). Iroh and
+    /// Veilid extend it to a remote fabric; a Multicast bridge extends its
+    /// multicast domain to the host's real network. All three attach a trunk to
+    /// exactly one Network, which is the whole of what wiring needs to know.
     Uplink,
     /// A HostService node — wires only to a Network (the net it publishes a
     /// host TCP service into, as a named fabric peer).

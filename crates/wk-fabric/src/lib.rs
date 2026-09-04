@@ -9,6 +9,7 @@
 //!
 //! - [`netstack::TrunkPort`] — a tap for frames with no local destination,
 //!   the primitive uplinks and future middleboxes (VPN/proxy) build on;
+//! - [`hostmcast`] — join a network's multicast domain to the host's real one;
 //! - [`portfwd`] — publish a fabric TCP service on a localhost port;
 //! - [`uplink`] — extend a network to a remote fabric over iroh p2p QUIC;
 //! - [`veilid`] — the same, over Veilid's onion-routed network.
@@ -17,6 +18,7 @@
 //! lives with the wasm host (wk-server), not here; this crate's boundary is
 //! [`netstack::SharedStack`].
 
+pub mod hostmcast;
 pub mod listen;
 pub mod netstack;
 pub mod portfwd;

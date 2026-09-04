@@ -427,6 +427,15 @@ pub enum SnapKind {
     /// A host TCP service published into the Network it's wired to, as fabric
     /// peer `name`; connections bridge to the host `target` (`addr:port`).
     HostService { name: String, target: String },
+    /// A host multicast bridge on the Network it's wired to: `iface` is the
+    /// local address of the host interface to carry groups on (`None` = the
+    /// default route's), and `groups` are `addr:port` groups to join up front.
+    /// Groups the Network sends to need no listing — they are joined as they
+    /// are seen — so `groups` is for a Network that only listens.
+    Multicast {
+        iface: Option<String>,
+        groups: Vec<String>,
+    },
     /// A workspace **boundary in-port**: the named, typed edge through which a
     /// connection enters this workspace. It is a placed node so it can be
     /// wired to inner nodes with ordinary wire lines — the wiring is what
@@ -1306,6 +1315,23 @@ fn parse_snap(n: &KdlNode) -> Option<NodeSnap> {
                 .unwrap_or("")
                 .to_string(),
         },
+        // Both settings are children and both optional, so the bare line
+        // `multicast "<id>"` is the whole of the common case: bridge this
+        // Network's groups on the default interface, learning them as they go.
+        "multicast" => SnapKind::Multicast {
+            iface: text("iface"),
+            groups: n
+                .children()
+                .map(|d| {
+                    d.nodes()
+                        .iter()
+                        .filter(|c| c.name().value() == "group")
+                        .filter_map(|c| c.get(0).and_then(|v| v.as_string()))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        },
         // The fabric name leads (like an app's dependency name); the host
         // target is a child so the line reads `hostservice "subduction" <id>`.
         "hostservice" => SnapKind::HostService {
@@ -1417,6 +1443,7 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         SnapKind::MidiIn { .. } => "midiin",
         SnapKind::MidiOut { .. } => "midiout",
         SnapKind::HostService { .. } => "hostservice",
+        SnapKind::Multicast { .. } => "multicast",
         SnapKind::InPort { .. } => "inport",
         SnapKind::OutPort { .. } => "outport",
         SnapKind::Group { .. } => "group",
@@ -1484,6 +1511,14 @@ fn snap_kdl(s: &NodeSnap) -> KdlNode {
         }
         SnapKind::Note { text } => child_str("text", text),
         SnapKind::HostService { target, .. } => child_str("target", target),
+        SnapKind::Multicast { iface, groups } => {
+            if let Some(i) = iface {
+                child_str("iface", i);
+            }
+            for g in groups {
+                child_str("group", g);
+            }
+        }
         // The boundary wires lead the block, like every other kind's own
         // content, with the geometry after them.
         SnapKind::Group {
@@ -3172,6 +3207,11 @@ workspace "01KZKMAB00000000000000WS01" {
             Just(SnapKind::Api),
             (value_str(), value_str())
                 .prop_map(|(name, target)| SnapKind::HostService { name, target }),
+            (
+                prop::option::of(value_str()),
+                prop::collection::vec(value_str(), 0..3),
+            )
+                .prop_map(|(iface, groups)| SnapKind::Multicast { iface, groups }),
             (value_str(), port_kind()).prop_map(|(name, kind)| SnapKind::InPort { name, kind }),
             (value_str(), port_kind()).prop_map(|(name, kind)| SnapKind::OutPort { name, kind }),
             (

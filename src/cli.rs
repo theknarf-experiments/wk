@@ -637,6 +637,7 @@ fn kind_label(kind: NodeKind) -> &'static str {
         NodeKind::MidiIn => "midiin",
         NodeKind::MidiOut => "midiout",
         NodeKind::HostService => "hostservice",
+        NodeKind::Multicast => "multicast",
     }
 }
 
@@ -722,6 +723,28 @@ pub fn create(
     // Only send a follow-up if there's actually something to configure.
     if !is_empty_patch(&patch) {
         send_command(&mut stream, Command::Update { id, patch })?;
+    }
+    // A multicast bridge configures through its own command, not a patch —
+    // both settings are fixed when its sockets are set up, so they arrive
+    // together and restart it once. `wk create multicast` usually carries no
+    // value at all: the bridge learns its groups from the Network's traffic.
+    if matches!(kind, NodeKind::Multicast) {
+        if let Some(v) = value.filter(|v| !v.trim().is_empty()) {
+            // `<iface>=<groups>` pins the host interface too; a bare value is
+            // just groups.
+            let (iface, groups) = match v.split_once('=') {
+                Some((i, g)) => (Some(i.to_string()), g),
+                None => (None, v),
+            };
+            send_command(
+                &mut stream,
+                Command::SetMulticast {
+                    id,
+                    iface,
+                    groups: groups.split_whitespace().map(str::to_string).collect(),
+                },
+            )?;
+        }
     }
     println!("created {} ({})", short(id), kind_label(kind));
     Ok(())
@@ -946,6 +969,13 @@ pub fn ps(workspace: &Path) -> Result<(), String> {
                 0 => "dialing".to_string(),
                 p => format!("{p} peer(s)"),
             }
+        } else if let Some(groups) = &n.mcast_groups {
+            // A bridge is never "runnable" either; what it is doing is which
+            // groups it carries.
+            match groups.len() {
+                0 => "no group".to_string(),
+                g => format!("{g} group(s)"),
+            }
         } else if !n.runnable {
             "-".to_string()
         } else if n.running {
@@ -958,13 +988,16 @@ pub fn ps(workspace: &Path) -> Result<(), String> {
         // HostPort has no args of its own), else the launch args. An uplink's
         // args are a ~200-char ticket, which would wrap the whole table — it
         // is elided here and printed in full by `wk inspect`.
-        let detail = match (&n.error, n.peers.is_some()) {
-            (Some(e), _) => e.clone(),
-            (None, true) => match n.args.join(" ") {
+        let detail = match (&n.error, n.peers.is_some(), &n.mcast_groups) {
+            (Some(e), _, _) => e.clone(),
+            (None, true, _) => match n.args.join(" ") {
                 t if t.is_empty() => String::new(),
                 t => format!("dials {}…", ellipsis(&t, 16)),
             },
-            (None, false) => n.args.join(" "),
+            // The groups themselves, which is the whole of what a bridge is
+            // carrying and short enough to print.
+            (None, false, Some(g)) => g.join(" "),
+            (None, false, None) => n.args.join(" "),
         };
         // TYPE is what the node runs, NAME is what it is called — the same
         // split docker ps draws between IMAGE and NAMES. They read alike for a
@@ -1016,6 +1049,7 @@ mod tests {
             peers: None,
             ip: None,
             ip6: None,
+            mcast_groups: None,
         }
     }
 

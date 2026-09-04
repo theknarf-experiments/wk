@@ -84,6 +84,13 @@ pub struct NodeInfo {
     /// host octet so the two stay in lock-step.
     #[serde(default)]
     pub ip6: Option<String>,
+    /// A Multicast bridge's groups, `addr:port`, as currently joined on the
+    /// host — the ones it was given plus the ones it learned from the
+    /// Network's own traffic. `Some(empty)` is the honest and common early
+    /// state: the bridge is up and nothing has sent to a group yet. `None` for
+    /// every other kind.
+    #[serde(default)]
+    pub mcast_groups: Option<Vec<String>>,
 }
 
 /// One wire between two nodes.
@@ -236,6 +243,7 @@ mod tests {
                 error: None,
                 token: None,
                 ticket: None,
+                mcast_groups: None,
                 peers: None,
                 ip: None,
                 ip6: None,

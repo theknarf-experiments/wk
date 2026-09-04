@@ -215,6 +215,8 @@ pub struct View {
     pub node_labels: HashMap<NodeId, String>,
     pub gateways: HashSet<NodeId>,
     pub uplinks: HashMap<NodeId, UplinkMeta>,
+    /// Each Multicast bridge's currently joined groups, `addr:port`.
+    pub mcast_groups: HashMap<NodeId, Vec<String>>,
     pub connections: Vec<(NodeId, NodeId)>,
     /// Per-bind mount-path overrides as (volume, app) → in-app path. Absent = the
     /// default (the volume's name at the root); the UI shows/edits these.
@@ -385,6 +387,7 @@ impl View {
             node_labels: keep_map(&self.node_labels, mine),
             gateways: keep_set(&self.gateways, mine),
             uplinks: keep_map(&self.uplinks, mine),
+            mcast_groups: keep_map(&self.mcast_groups, mine),
             connections: keep_pairs(&self.connections, mine),
             mount_paths: keep_pair_map(&self.mount_paths, mine),
             fs_providers: keep_set(&self.fs_providers, mine),
@@ -609,6 +612,11 @@ pub enum Kind {
     /// workspace's nodes by `kind as u8`, so inserting one anywhere else would
     /// rewrite the node order of every existing `.wk` file on its next save.
     MidiOut,
+    /// A host multicast bridge: joins its Network's multicast domain to the
+    /// host's real one. A trunk node like an uplink — see [`Kind::Iroh`] — but
+    /// the far side is the LAN, so datagrams are translated rather than
+    /// tunnelled (see [`wk_fabric::hostmcast`]).
+    Multicast,
 }
 
 impl Kind {
@@ -673,6 +681,8 @@ pub struct Graph {
     /// MidiOut nodes' target device name (canvas id -> device; empty = default),
     /// persisted so the node reconnects to the same hardware on reload.
     pub midi_outs: HashMap<NodeId, String>,
+    /// Multicast bridge nodes (canvas id -> its configuration).
+    pub multicasts: HashMap<NodeId, Mcast>,
     /// HostService nodes: the fabric name members dial and the host
     /// `addr:port` the connection bridges to. The fabric side listens on the
     /// target's port.
@@ -736,6 +746,50 @@ pub struct Graph {
     pub workspace_names: HashMap<NodeId, String>,
     /// The workspace's launchable dependencies.
     pub available: Vec<Dependency>,
+}
+
+/// A Multicast bridge node's configuration.
+///
+/// Both fields are usually empty, and that is the point: the bridge learns the
+/// groups its Network uses from the traffic itself, and the kernel picks the
+/// interface. `iface` pins the interface on a multi-homed host; `groups`
+/// (`addr:port`) are joined up front, for a Network that only ever *listens* to
+/// a group and so never reveals it by sending.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Mcast {
+    /// The local address of the host interface to carry groups on.
+    pub iface: Option<String>,
+    /// Groups to join without waiting to see them, as `addr:port`.
+    pub groups: Vec<String>,
+}
+
+impl Mcast {
+    /// The interface address, or `None` for "let the kernel choose". An
+    /// unparseable one is `None` too — the bridge still runs, on the default
+    /// interface, rather than not at all.
+    fn iface_addr(&self) -> Option<std::net::Ipv4Addr> {
+        self.iface.as_ref()?.trim().parse().ok()
+    }
+
+    /// The up-front groups, dropping any that don't parse as `addr:port` with
+    /// a multicast address. A typo costs that one group, not the bridge.
+    fn group_list(&self) -> Vec<wk_fabric::hostmcast::Group> {
+        self.groups
+            .iter()
+            .filter_map(|g| {
+                let (a, p) = g.trim().rsplit_once(':')?;
+                let addr: std::net::Ipv4Addr = a.parse().ok()?;
+                if !addr.is_multicast() {
+                    eprintln!("[multicast] {a} is not a group address (224.0.0.0/4); ignoring");
+                    return None;
+                }
+                Some((
+                    smoltcp::wire::Ipv4Address::from(addr.octets()),
+                    p.parse().ok()?,
+                ))
+            })
+            .collect()
+    }
 }
 
 /// A HostService node's configuration: a host TCP service published into a
@@ -901,6 +955,13 @@ pub struct Server {
     /// Running uplinks (Iroh or Veilid), one per uplink node. Dropping one
     /// closes its endpoint and detaches its trunk.
     uplinks: HashMap<NodeId, UplinkHandle>,
+    /// Running multicast bridges, one per Multicast node. Dropping one leaves
+    /// the groups it joined and detaches its trunk. Kept apart from `uplinks`
+    /// deliberately: the two share the "trunk on one Network" shape (see
+    /// [`Self::set_trunk_net`]) but nothing else — a bridge has no ticket and
+    /// no peer to dial, and folding it in would have made `node set --peer`
+    /// mean something for a node that has no peer.
+    mcasts: HashMap<NodeId, wk_fabric::hostmcast::HostMulticast>,
     /// Each Capture node's frame slot (the client fills it; wired apps read
     /// it through their `capture_src`, kept in sync by [`Self::sync_captures`]).
     capture_feeds: HashMap<NodeId, crate::capture::SharedFrameSlot>,
@@ -1039,6 +1100,7 @@ impl Server {
             port_errors: HashMap::new(),
             routers: HashMap::new(),
             uplinks: HashMap::new(),
+            mcasts: HashMap::new(),
             capture_feeds: HashMap::new(),
             clipboard_boards: HashMap::new(),
             midi_devices: HashMap::new(),
@@ -1655,6 +1717,101 @@ impl Server {
         );
     }
 
+    /// Add a Multicast bridge node. No configuration: the bridge learns its
+    /// groups from the Network's traffic and the kernel picks the interface, so
+    /// wiring it to a Network is the whole of the common case.
+    fn add_multicast_node(&mut self, pos: [f32; 2], ws: NodeId) {
+        let id = self.alloc_id();
+        self.create_multicast(id, Mcast::default(), pos, [FILE_W, FILE_H], ws);
+    }
+
+    /// Create (or restore) a Multicast bridge node with a known id. Until it is
+    /// wired to a Network the bridge trunks the node's own (empty) net, so it
+    /// carries nothing — the same idle state an uplink starts in.
+    fn create_multicast(
+        &mut self,
+        id: NodeId,
+        cfg: Mcast,
+        pos: [f32; 2],
+        size: [f32; 2],
+        ws: NodeId,
+    ) {
+        match self
+            .host
+            .multicast_bridge(id, cfg.iface_addr(), &cfg.group_list())
+        {
+            Ok(br) => {
+                self.mcasts.insert(id, br);
+                self.graph.multicasts.insert(id, cfg);
+                self.place(id, Kind::Multicast, ws, pos, size);
+            }
+            // The usual cause is a group in `groups` whose port is already
+            // held by something that did not ask for SO_REUSEPORT. Say so and
+            // place nothing: a bridge node that is not bridging would be worse
+            // than an absent one.
+            Err(e) => eprintln!("failed to start multicast bridge: {e:#}"),
+        }
+    }
+
+    /// Remove a Multicast bridge node; dropping the bridge leaves its groups
+    /// and detaches its trunk from the fabric.
+    fn remove_multicast_node(&mut self, id: NodeId) {
+        self.mcasts.remove(&id);
+        self.graph.multicasts.remove(&id);
+        self.graph.net_links.retain(|&(a, _)| a != id);
+        self.forget(id);
+    }
+
+    /// Reconfigure a Multicast bridge: restart it on the new interface/groups,
+    /// on whichever Network it is currently wired to.
+    ///
+    /// A restart rather than an adjustment, because both settings are fixed at
+    /// socket-setup time — the interface is a socket option on the send socket
+    /// and each group is a joined socket. Restarting loses only the groups
+    /// *learned* from traffic, which the next datagram to each re-learns.
+    fn set_multicast_config(&mut self, id: NodeId, cfg: Mcast) {
+        if self.kind_of(id) != Some(Kind::Multicast) {
+            return;
+        }
+        let net = self
+            .graph
+            .net_links
+            .iter()
+            .find(|&&(a, _)| a == id)
+            .map(|&(_, n)| n)
+            .unwrap_or(id);
+        // Drop the old bridge first: it holds the group ports, and rebinding
+        // them while it still lives would fail for a reason that looks like a
+        // configuration error and is not.
+        self.mcasts.remove(&id);
+        match self
+            .host
+            .multicast_bridge(net, cfg.iface_addr(), &cfg.group_list())
+        {
+            Ok(br) => {
+                self.mcasts.insert(id, br);
+                self.graph.multicasts.insert(id, cfg);
+            }
+            Err(e) => eprintln!("[multicast] {e:#}"),
+        }
+    }
+
+    /// Point a trunk node — an uplink or a multicast bridge — at `net`, and say
+    /// whether `id` was one. Both attach a trunk to exactly one Network and
+    /// follow the wire the same way, so every rewire path asks this once
+    /// instead of checking two maps.
+    fn set_trunk_net(&self, id: NodeId, net: NodeId) -> bool {
+        if let Some(up) = self.uplinks.get(&id) {
+            up.set_net(net);
+            return true;
+        }
+        if let Some(br) = self.mcasts.get(&id) {
+            br.set_net(net);
+            return true;
+        }
+        false
+    }
+
     /// Add a hardware MIDI input node, opening the first available device now.
     fn add_midi_in_node(&mut self, pos: [f32; 2], ws: NodeId) {
         let id = self.alloc_id();
@@ -1927,6 +2084,7 @@ impl Server {
             Some(Kind::Port) => self.remove_host_port(id),
             Some(Kind::Network | Kind::Gateway) => self.remove_net_node(id),
             Some(Kind::Iroh | Kind::Veilid) => self.remove_uplink_node(id),
+            Some(Kind::Multicast) => self.remove_multicast_node(id),
             Some(Kind::App) => self.close_node(id),
             // A note wires to nothing and runs nothing; just drop it.
             Some(Kind::Note) => self.forget(id),
@@ -2269,7 +2427,9 @@ impl Server {
             Some(Kind::Port) => NodeClass::Port,
             Some(Kind::Network | Kind::Gateway) => NodeClass::Net,
             Some(Kind::Router) => NodeClass::Router,
-            Some(Kind::Iroh | Kind::Veilid) => NodeClass::Uplink,
+            // A multicast bridge attaches a trunk to one Network, which is all
+            // wiring needs of an uplink.
+            Some(Kind::Iroh | Kind::Veilid | Kind::Multicast) => NodeClass::Uplink,
             Some(Kind::Capture) => NodeClass::Capture,
             Some(Kind::Clipboard) => NodeClass::Clipboard,
             Some(Kind::Api) => NodeClass::Api,
@@ -2351,9 +2511,9 @@ impl Server {
             // The immediate join is gated on the member's token too, not just
             // the per-tick sync — no one-tick window on the network.
             && self.node_may_use(app_id, net_kind, net_id, "use");
-        // An uplink member: its trunk follows the wire (own empty net = idle).
-        if let Some(up) = self.uplinks.get(&app_id) {
-            up.set_net(if joined { net_id } else { app_id });
+        // A trunk member (uplink or multicast bridge): its trunk follows the
+        // wire (own empty net = idle).
+        if self.set_trunk_net(app_id, if joined { net_id } else { app_id }) {
             return;
         }
         if joined {
@@ -2382,8 +2542,7 @@ impl Server {
                 "net"
             };
             let allowed = self.node_may_use(app, kind, net, "use");
-            if let Some(up) = self.uplinks.get(&app) {
-                up.set_net(if allowed { net } else { app });
+            if self.set_trunk_net(app, if allowed { net } else { app }) {
                 continue;
             }
             let Some(stack) = nodes
@@ -2476,8 +2635,7 @@ impl Server {
             .map(|&(a, _)| a)
             .collect();
         for app in members {
-            if let Some(up) = self.uplinks.get(&app) {
-                up.set_net(app);
+            if self.set_trunk_net(app, app) {
                 continue;
             }
             self.set_node_net(app, app);
@@ -3782,10 +3940,12 @@ impl Server {
                     self.record(Undo::Token(*id, self.graph.node_tokens.get(id).cloned()));
                 }
             }
-            // Not undoable: run, mount-path / serve-port edits, and undo itself.
+            // Not undoable: run, mount-path / serve-port edits, a multicast
+            // bridge's interface and groups, and undo itself.
             Command::SetMount { .. }
             | Command::SetServePort { .. }
             | Command::SetMidiChannel { .. }
+            | Command::SetMulticast { .. }
             | Command::Run(_)
             | Command::Stop(_)
             | Command::SetView(_)
@@ -3866,6 +4026,7 @@ impl Server {
                 NodeKind::MidiIn => self.add_midi_in_node(pos, ws),
                 NodeKind::MidiOut => self.add_midi_out_node(pos, ws),
                 NodeKind::HostService => self.add_host_service(pos, ws),
+                NodeKind::Multicast => self.add_multicast_node(pos, ws),
             },
             // Create is create only: a wire that already exists is left alone
             // (removal is Delete, so a create-only token can never disconnect).
@@ -3938,6 +4099,12 @@ impl Server {
             Command::SetMount { volume, app, path } => self.set_mount(volume, app, path),
             Command::SetMidiChannel { src, dst, channel } => {
                 self.set_midi_channel(src, dst, channel)
+            }
+            Command::SetMulticast { id, iface, groups } => {
+                let iface = iface
+                    .map(|i| i.trim().to_string())
+                    .filter(|i| !i.is_empty());
+                self.set_multicast_config(id, Mcast { iface, groups });
             }
             Command::SetServePort {
                 served,
@@ -4136,6 +4303,13 @@ impl Server {
                 SnapKind::HostService {
                     name: svc.name.clone(),
                     target: svc.target.clone(),
+                }
+            }
+            Kind::Multicast => {
+                let m = self.graph.multicasts.get(&id).cloned().unwrap_or_default();
+                SnapKind::Multicast {
+                    iface: m.iface,
+                    groups: m.groups,
                 }
             }
             Kind::Boundary => {
@@ -4450,6 +4624,13 @@ impl Server {
                 self.graph.midi_outs.insert(s.id, device.clone());
                 self.open_midi_out_device(s.id, device);
             }
+            SnapKind::Multicast { iface, groups } => {
+                let cfg = Mcast {
+                    iface: iface.clone(),
+                    groups: groups.clone(),
+                };
+                self.create_multicast(s.id, cfg, s.pos, s.size, ws);
+            }
             SnapKind::HostService { name, target } => {
                 self.place(s.id, Kind::HostService, ws, s.pos, s.size);
                 self.graph.host_services.insert(
@@ -4721,6 +4902,19 @@ impl Server {
                 )
             })
             .collect();
+        let mcast_groups = self
+            .mcasts
+            .iter()
+            .map(|(&id, br)| {
+                (
+                    id,
+                    br.joined()
+                        .into_iter()
+                        .map(|(a, p)| format!("{a}:{p}"))
+                        .collect(),
+                )
+            })
+            .collect();
         View {
             node_ids: self.node_ids(),
             win_pos,
@@ -4766,6 +4960,7 @@ impl Server {
                 .collect(),
             gateways,
             uplinks,
+            mcast_groups,
             connections: self.graph.connections.clone(),
             mount_paths: self.graph.mount_paths.clone(),
             fs_providers,
@@ -4840,6 +5035,7 @@ impl Server {
                 Some(Kind::Router) => "router",
                 Some(Kind::Iroh) => "iroh",
                 Some(Kind::Veilid) => "veilid",
+                Some(Kind::Multicast) => "multicast",
                 Some(Kind::Note) => "note",
                 Some(Kind::Capture) => "capture",
                 Some(Kind::Clipboard) => "clipboard",
@@ -4941,6 +5137,7 @@ impl Server {
                     // only ever printed to the server's stderr at startup.
                     ticket: v.uplinks.get(&id).map(|u| u.ticket.clone()),
                     peers: v.uplinks.get(&id).map(|u| u.peers),
+                    mcast_groups: v.mcast_groups.get(&id).cloned(),
                     // Addressing a node across an uplink means using its
                     // fabric IP (names don't cross a trunk), and until now
                     // nothing reported it — you had to derive it from the
@@ -7456,6 +7653,114 @@ mod model_tests {
             s.graph.workspace_names.get(&ws2).map(String::as_str),
             Some("voice"),
             "undo restored the tab but forgot what it was called"
+        );
+    }
+
+    /// A Multicast bridge through the whole client path: created from the
+    /// palette, wired to a Network, configured, saved and reloaded.
+    ///
+    /// The configuration is what makes the save worth asserting. A bridge's
+    /// *learned* groups are deliberately not persisted — they come back from
+    /// traffic — so the only thing a `.wk` file can carry is what someone
+    /// chose, and if that didn't round-trip the node would come back subtly
+    /// different from the one that was saved.
+    #[test]
+    fn a_multicast_bridge_wires_to_a_network_and_survives_a_reload() {
+        let path = std::env::temp_dir().join("wk-multicast-save-test.wk");
+        let _ = std::fs::remove_file(&path);
+        let mut s = Server::new(&Document::empty(), path.clone()).expect("server constructs");
+        let ws = s.graph.workspaces[0];
+
+        s.apply(Command::Create(Resource::Node {
+            kind: NodeKind::Multicast,
+            pos: [0.0, 0.0],
+            ws,
+        }));
+        s.apply(Command::Create(Resource::Node {
+            kind: NodeKind::Network,
+            pos: [100.0, 0.0],
+            ws,
+        }));
+        let br = *s.graph.multicasts.keys().next().expect("multicast node");
+        let net = s
+            .graph
+            .nodes
+            .iter()
+            .find(|(_, r)| r.kind == Kind::Network)
+            .map(|(&id, _)| id)
+            .expect("network node");
+        // The bridge is live from the moment it is created — it just trunks its
+        // own empty net until wired, like an uplink.
+        assert!(s.mcasts.contains_key(&br), "the bridge started");
+        assert_eq!(
+            s.view().mcast_groups.get(&br).map(Vec::len),
+            Some(0),
+            "nothing has sent to a group yet"
+        );
+
+        s.apply(Command::Create(Resource::Wire { a: br, b: net }));
+        assert!(
+            s.graph.net_links.contains(&(br, net)),
+            "a bridge wires to a Network, like every other trunk node"
+        );
+
+        // Two groups and a pinned interface, applied as one change. Loopback,
+        // so the test joins nothing on a real network.
+        s.apply(Command::SetMulticast {
+            id: br,
+            iface: Some("127.0.0.1".into()),
+            groups: vec!["239.255.99.9:17402".into(), "239.255.99.10:17403".into()],
+        });
+        let mut joined = s.view().mcast_groups[&br].clone();
+        joined.sort();
+        assert_eq!(
+            joined,
+            vec!["239.255.99.10:17403", "239.255.99.9:17402"],
+            "both groups joined on the host"
+        );
+        // Still on the Network: reconfiguring restarts the bridge, and a
+        // restart that forgot the wire would silently stop carrying anything.
+        assert!(s.graph.net_links.contains(&(br, net)));
+
+        s.save();
+        let back = Document::load(&path).expect("reloads");
+        let saved = back.workspaces[0]
+            .nodes
+            .iter()
+            .find(|n| n.id == br)
+            .expect("the bridge is in the file");
+        assert_eq!(
+            saved.kind,
+            crate::workspace::SnapKind::Multicast {
+                iface: Some("127.0.0.1".into()),
+                groups: vec!["239.255.99.9:17402".into(), "239.255.99.10:17403".into()],
+            }
+        );
+        assert_eq!(
+            Document::load(&path).expect("reloads"),
+            back,
+            "a second save/load cycle is a fixpoint"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A group that is not a group address is refused rather than joined — a
+    /// unicast address in `groups` is a typo, and a bridge that "joined" one
+    /// would sit there carrying nothing with no sign of why.
+    #[test]
+    fn a_unicast_address_is_not_a_group() {
+        let m = Mcast {
+            iface: None,
+            groups: vec![
+                "239.255.99.11:17404".into(),
+                "10.0.0.1:17405".into(), // unicast — not a group
+                "nonsense".into(),       // no port at all
+            ],
+        };
+        assert_eq!(
+            m.group_list(),
+            vec![(smoltcp::wire::Ipv4Address::new(239, 255, 99, 11), 17404)],
+            "only the real group survives"
         );
     }
 

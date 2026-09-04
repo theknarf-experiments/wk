@@ -375,7 +375,14 @@ configures **nothing** — no peer, no address, no port: the fabric carries RTPS
 multicast, so participants find each other the way DDS expects, and a fourth
 node would join in with no edit to the file. `example/dds-uplink-a.wk` and
 `-b.wk` do the same across two *separate* wk processes joined by an iroh
-uplink, so a participant finds one on another machine the same way. It runs on **one
+uplink, so a participant finds one on another machine the same way, and
+`example/dds-multicast.wk` adds a `multicast` node — a bridge that joins a
+Network's multicast domain to the **host's real one**, so the same unmodified
+participants become audible to a DDS outside wk altogether. (It carries
+discovery, not the addresses *inside* it: SPDP announces each participant's
+fabric address, so a real peer hears these participants and can be heard by
+them, but cannot open the unicast side of RTPS back — that needs a locator
+rewrite, which a packet-level bridge has no business doing.) It runs on **one
 thread**, which DDS is not built for: a condition variable that pumps the
 reactor stands in for the threads the middleware expects, so every
 `while (!ready) cv.wait()` in OpenDDS becomes a polling loop and almost nothing
