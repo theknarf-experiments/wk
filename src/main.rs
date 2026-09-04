@@ -219,13 +219,19 @@ enum NodeCmd {
     },
     /// (Re)start an idle/exited node's guest
     Start { node: String },
-    /// Reconfigure a node: launch args, a BindMount's host path, a Volume's
-    /// persistence, or a HostPort's localhost port
+    /// Reconfigure a node: launch args, an uplink's peer ticket, a BindMount's
+    /// host path, a Volume's persistence, or a HostPort's localhost port
     Set {
         node: String,
         /// The full argument string (quote it)
         #[arg(long)]
         args: Option<String>,
+        /// For an Iroh or Veilid uplink: the peer ticket to dial, which joins
+        /// this fabric to the one that printed it (`wk inspect <uplink>` shows
+        /// a ticket). Dialed immediately and saved with the workspace; pass an
+        /// empty string to stop dialing
+        #[arg(long)]
+        peer: Option<String>,
         /// For a BindMount: the host file or folder to expose
         #[arg(long)]
         host_path: Option<String>,
@@ -438,6 +444,7 @@ fn main() -> Result<(), String> {
             NodeCmd::Set {
                 node,
                 args,
+                peer,
                 host_path,
                 persist,
                 port,
@@ -445,6 +452,7 @@ fn main() -> Result<(), String> {
                 file,
                 node,
                 args.as_deref(),
+                peer.as_deref(),
                 host_path.as_deref(),
                 *persist,
                 *port,

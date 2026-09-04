@@ -554,22 +554,55 @@ pub fn set_node(
     workspace: &Path,
     node: &str,
     args: Option<&str>,
+    peer: Option<&str>,
     host_path: Option<&str>,
     persist: Option<bool>,
     port: Option<u16>,
 ) -> Result<(), String> {
-    if args.is_none() && host_path.is_none() && persist.is_none() && port.is_none() {
-        return Err("nothing to set — pass --args, --host-path, --persist, and/or --port".into());
+    if args.is_none()
+        && peer.is_none()
+        && host_path.is_none()
+        && persist.is_none()
+        && port.is_none()
+    {
+        return Err(
+            "nothing to set — pass --args, --peer, --host-path, --persist, and/or --port".into(),
+        );
+    }
+    if args.is_some() && peer.is_some() {
+        // They are the same field underneath (below), so accepting both would
+        // silently drop one.
+        return Err("--args and --peer set the same thing on an uplink; pass one".into());
     }
     let mut stream = connect(workspace)?;
     let snap = get_snapshot(&mut stream)?;
-    let id = resolve(&snap, node)?.id;
+    let target = resolve(&snap, node)?;
+    let id = target.id;
+
+    // An uplink's peer ticket IS its args — the server dials `node_args` for
+    // uplink nodes and undials when they are cleared, so `--peer` needs no new
+    // protocol field. What it adds is the check below: `--args` on the wrong
+    // node quietly rewrites an app's launch arguments instead of saying that
+    // the node cannot dial anything, and a 120-character ticket pasted at the
+    // wrong id is not something anyone spots by reading it back.
+    if peer.is_some() && !matches!(target.kind.as_str(), "iroh" | "veilid") {
+        let article = if target.kind.starts_with(['a', 'e', 'i', 'o', 'u']) {
+            "an"
+        } else {
+            "a"
+        };
+        return Err(format!(
+            "{node:?} is {article} {} node, not an uplink — only an Iroh or Veilid node dials a peer",
+            target.kind
+        ));
+    }
+
     send_command(
         &mut stream,
         Command::Update {
             id,
             patch: NodePatch {
-                args: args.map(str::to_string),
+                args: args.or(peer).map(str::to_string),
                 host_path: host_path.map(str::to_string),
                 persist,
                 port_set: port,
@@ -577,7 +610,11 @@ pub fn set_node(
             },
         },
     )?;
-    println!("updated {}", short(id));
+    match peer {
+        Some("") => println!("{} stopped dialing", short(id)),
+        Some(_) => println!("{} dialing peer", short(id)),
+        None => println!("updated {}", short(id)),
+    }
     Ok(())
 }
 

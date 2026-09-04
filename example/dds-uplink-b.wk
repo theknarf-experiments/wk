@@ -2,7 +2,12 @@
 // DDS across two machines, part B — the subscriber. See dds-uplink-a.wk for
 // the whole story and the run order.
 //
-// Give the iroh node below the ticket that fabric A's uplink printed:
+// Give the iroh node below the ticket that fabric A's uplink printed, either
+// live once this workspace is running:
+//
+//   wk -f example/dds-uplink-b.wk node set 01DDSXB000000000000000PX03 --peer "endpoint…"
+//
+// or in the file, so it dials on load:
 //
 //   iroh "01DDSXB000000000000000PX03" {
 //       peer "endpoint…"

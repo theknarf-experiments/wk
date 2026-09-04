@@ -14,9 +14,12 @@
 //   wk run example/dds-uplink-a.wk --headless &
 //   wk -f example/dds-uplink-a.wk inspect 01DDSXA000000000000000PX03
 //
-// Copy the `ticket` from that JSON into dds-uplink-b.wk's iroh node as
-//   peer "endpoint…"
-// then start the other side and both nodes:
+// Then hand it to the other side, either live:
+//
+//   wk -f example/dds-uplink-b.wk node set 01DDSXB000000000000000PX03 --peer "endpoint…"
+//
+// or by writing `peer "endpoint…"` into its iroh node so it dials on load.
+// Then start the other side and both nodes:
 //
 //   wk run example/dds-uplink-b.wk --headless &
 //   wk -f example/dds-uplink-a.wk up

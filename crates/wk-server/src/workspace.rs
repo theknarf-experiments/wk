@@ -923,8 +923,56 @@ fn uint(v: &KdlValue) -> Option<u64> {
 }
 
 /// Parse a node id from its Crockford base32 string form.
+/// Why a node id might be rejected, in the terms someone editing a `.wk` by
+/// hand needs — the alphabet is the surprising part.
+///
+/// Node ids are ULIDs, so Crockford base32, whose alphabet omits `I`, `L`, `O`
+/// and `U`. Only `U` is actually an ERROR, and that asymmetry is worth knowing:
+/// the decoder follows Crockford in *accepting* `O` as `0` and `I`/`L` as `1`,
+/// so those three are silently folded rather than refused — which means two ids
+/// differing only by `I` versus `1` are the same id. `U` has no such alias, so
+/// it is the one that fails, and nothing about `01DDSUPA…` looks wrong until it
+/// does.
+fn id_hint(s: &str) -> Option<String> {
+    if s.to_ascii_uppercase().contains('U') {
+        return Some(
+            " — node ids are Crockford base32, whose alphabet has no 'U' (unlike \
+             I, L and O, which are accepted as aliases for 1, 1 and 0)"
+                .to_string(),
+        );
+    }
+    if s.trim().chars().count() != 26 {
+        return Some(format!(
+            " — a node id is exactly 26 characters, this one is {}",
+            s.trim().chars().count()
+        ));
+    }
+    None
+}
+
+/// A node id from a KDL value, complaining if it cannot be read.
+///
+/// The complaint is the point. A `.wk` is loaded leniently — anything that
+/// cannot be understood is skipped rather than failing the whole file — and an
+/// unreadable id used to be skipped in SILENCE, taking its node with it. A
+/// workspace whose own id is malformed loses every node inside it, so the
+/// symptom is `wk ps` printing "no nodes" for a file that plainly has some,
+/// with nothing anywhere saying why.
 fn node_id(v: &KdlValue) -> Option<NodeId> {
-    v.as_string()?.parse().ok()
+    let Some(s) = v.as_string() else {
+        eprintln!("[workspace] {v} is not a node id (expected a 26-character string)");
+        return None;
+    };
+    match s.parse() {
+        Ok(id) => Some(id),
+        Err(e) => {
+            eprintln!(
+                "[workspace] ignoring node id {s:?}: {e}{}",
+                id_hint(s).unwrap_or_default()
+            );
+            None
+        }
+    }
 }
 
 /// Check every `inport`/`outport`/`group` line before the document becomes a
@@ -1034,7 +1082,17 @@ fn validate_group(n: &KdlNode) -> Result<(), String> {
 
 /// Parse a `workspace "<id>" { ...canvas... }` block.
 fn parse_workspace(n: &KdlNode) -> Option<Workspace> {
-    let id = node_id(n.get(0)?)?;
+    let Some(id) = n.get(0).and_then(node_id) else {
+        // Losing a workspace loses every node in it, so say so: `node_id` has
+        // already explained what is wrong with the id, and this explains the
+        // consequence.
+        eprintln!(
+            "[workspace] skipping a workspace with an unreadable id — \
+             all {} node(s) in it are lost",
+            n.children().map(|c| c.nodes().len()).unwrap_or(0)
+        );
+        return None;
+    };
     let pair = |n: &KdlNode| match (n.get(0).and_then(node_id), n.get(1).and_then(node_id)) {
         (Some(a), Some(b)) => Some((a, b)),
         _ => None,
@@ -1093,7 +1151,13 @@ fn parse_workspace(n: &KdlNode) -> Option<Workspace> {
             "capturelink" => ws.capture_links.extend(pair(c)),
             "clipboardlink" => ws.clipboard_links.extend(pair(c)),
             "apilink" => ws.api_links.extend(pair(c)),
-            _ => ws.nodes.extend(parse_snap(c)),
+            kind => match parse_snap(c) {
+                Some(snap) => ws.nodes.push(snap),
+                // Same reasoning as the workspace above: a node that cannot be
+                // read is skipped, and skipping it quietly is how a file ends
+                // up loading with fewer nodes than it has lines.
+                None => eprintln!("[workspace] skipping {kind:?} node — it could not be read"),
+            },
         }
     }
     Some(ws)
@@ -1674,6 +1738,84 @@ pub fn remove(name: String, path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    /// `U` is the letter that actually breaks an id, and the hint says so.
+    ///
+    /// Worth a test because the failure it guards is invisible: nothing about
+    /// `01DDSUPA…` looks wrong, and an id containing a `U` used to be skipped
+    /// in silence — taking its node, or with a workspace id, every node in the
+    /// file. `wk ps` then printed "no nodes" for a file plainly full of them.
+    #[test]
+    fn a_u_in_a_node_id_is_rejected_and_the_hint_names_it() {
+        let id = "01DDSUPA00000000000000WS00";
+        assert!(id.parse::<NodeId>().is_err(), "{id} must not parse");
+        let hint = super::id_hint(id).unwrap_or_default();
+        assert!(
+            hint.contains("Crockford") && hint.contains('U'),
+            "hint should name U, got {hint:?}"
+        );
+    }
+
+    /// I, L and O do NOT fail — Crockford folds them into 1, 1 and 0 — so two
+    /// ids differing only in those characters are the SAME node.
+    ///
+    /// This is the other half of the alphabet story and the sneakier half: a
+    /// hand-written file can name what looks like two nodes and mean one. It
+    /// is pinned here because it is decoder behaviour nothing else asserts,
+    /// and because it is the reason `id_hint` names only `U`.
+    #[test]
+    fn i_l_and_o_are_aliases_not_errors() {
+        let ones: NodeId = "01DDSI1A00000000000000WS00".parse().expect("I parses");
+        let elles: NodeId = "01DDSL1A00000000000000WS00".parse().expect("L parses");
+        let digits: NodeId = "01DDS11A00000000000000WS00".parse().expect("1 parses");
+        assert_eq!(ones, digits, "I is an alias for 1");
+        assert_eq!(elles, digits, "L is an alias for 1");
+
+        let oh: NodeId = "01DDSO1A00000000000000WS00".parse().expect("O parses");
+        let zero: NodeId = "01DDS01A00000000000000WS00".parse().expect("0 parses");
+        assert_eq!(oh, zero, "O is an alias for 0");
+
+        // ...and so none of them earns a hint.
+        assert_eq!(super::id_hint("01DDSI1A00000000000000WS00"), None);
+    }
+
+    /// A well-formed alphabet but the wrong length says the length instead —
+    /// the other way a hand-written id goes wrong.
+    #[test]
+    fn a_node_id_of_the_wrong_length_says_the_length() {
+        let hint = super::id_hint("01DDS").unwrap_or_default();
+        assert!(hint.contains("26") && hint.contains(" 5"), "got {hint:?}");
+        // A correct id has nothing to complain about.
+        assert_eq!(super::id_hint("01DDSXA000000000000000WS00"), None);
+    }
+
+    /// A workspace whose own id cannot be read is skipped whole, and takes its
+    /// nodes with it. Loading stays lenient — a `.wk` with one bad line still
+    /// opens — so what this pins is that the loss is *total* for that
+    /// workspace, which is why it is now announced on stderr rather than done
+    /// quietly.
+    #[test]
+    fn a_workspace_with_an_unreadable_id_is_skipped_whole() {
+        let kdl: kdl::KdlDocument = r#"
+workspace "01DDSUPA00000000000000WS00" {
+    network "01DDSXA000000000000000NW02" {
+        pos 1.0 2.0
+        size 3.0 4.0
+    }
+}
+"#
+        .parse()
+        .expect("kdl parses -- the file is well-formed, the id is not");
+        let ws: Vec<_> = kdl
+            .nodes()
+            .iter()
+            .filter_map(super::parse_workspace)
+            .collect();
+        assert!(
+            ws.is_empty(),
+            "a workspace with a bad id yields nothing, nodes included"
+        );
+    }
+
     /// The MIDI example wires what its comments claim: a file feeding the
     /// sequencer, and the sequencer feeding two synths on different channels.
     ///
