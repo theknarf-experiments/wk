@@ -381,13 +381,20 @@ the fabric rather than listing peers.
   variable. `wk_dds::pump()` is provided for a node's own idle loop, but a node
   that goes away and computes for a second stalls its participant for a second.
   Making `sleep`/`nanosleep` pump would remove the footgun for good.
-* ~~Multicast across an uplink.~~ Done and tested:
+* ~~Multicast across an uplink.~~ Done, tested, and demonstrated end to end.
   `iroh_uplinks_carry_multicast_between_fabrics` joins two fabrics over a real
   iroh QUIC tunnel and sends one datagram to a group, asserting that members on
-  *both* fabrics receive it exactly once. The "exactly once" is the load-bearing
-  half — a group that nobody owns has no natural stopping point, so without the
-  `from_trunk` split horizon the two fabrics flood each other's copies back and
-  forth. Verified by breaking it deliberately: 224 deliveries instead of 1.
+  *both* fabrics receive it exactly once. The "exactly once" is the
+  load-bearing half — a group that nobody owns has no natural stopping point,
+  so without the `from_trunk` split horizon the two fabrics flood each other's
+  copies back and forth. Verified by breaking it deliberately: 224 deliveries
+  instead of 1.
+
+  Above that, `example/dds-uplink-a.wk` and `-b.wk` are two SEPARATE wk
+  processes, each with its own fabric, joined by an iroh uplink: a DDS
+  publisher on one and a subscriber on the other, neither configured, finding
+  each other over multicast SPDP that crosses the QUIC tunnel. A participant
+  discovers one on another machine exactly as it discovers one next door.
 * **Explicit membership.** Joining is implicit — flood the Network, filter by
   port. If a Network ever needs to carry groups that some members must *not*
   see, that becomes a real distinction and would need a join the guest can

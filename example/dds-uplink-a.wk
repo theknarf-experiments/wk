@@ -1,0 +1,52 @@
+// vim: set filetype=kdl :
+// DDS across two machines, part A — the publisher.
+//
+// Two SEPARATE wk processes, each with its own fabric, joined by an iroh
+// uplink over QUIC. The publisher runs here; the subscriber runs in
+// dds-uplink-b.wk. Neither DDS node is configured: RTPS discovery announces to
+// a multicast group, the fabric carries multicast between the members of a
+// Network, and the uplink carries it on to the other fabric. So a participant
+// finds one on another machine the same way it finds one next door.
+//
+// The two halves have to be introduced, because an uplink is dialled by
+// TICKET — a public identity, not an address. Start this side first:
+//
+//   wk run example/dds-uplink-a.wk --headless &
+//   wk -f example/dds-uplink-a.wk inspect 01DDSXA000000000000000PX03
+//
+// Copy the `ticket` from that JSON into dds-uplink-b.wk's iroh node as
+//   peer "endpoint…"
+// then start the other side and both nodes:
+//
+//   wk run example/dds-uplink-b.wk --headless &
+//   wk -f example/dds-uplink-a.wk up
+//   wk -f example/dds-uplink-b.wk up
+//   wk -f example/dds-uplink-b.wk logs dds-sub
+//
+// The ticket is not committed here on purpose. Pinning it would mean pinning
+// this uplink's `secret` — its private identity — and anyone holding that can
+// impersonate the uplink. A fresh one is generated per run instead.
+import "../workspace.wk"
+workspace "01DDSXA000000000000000WS00" {
+    node "dds_publisher" "01DDSXA000000000000000ND01" {
+        name "dds-pub"
+        args "--forever"
+        pos 60.0 60.0
+        size 420.0 260.0
+    }
+    network "01DDSXA000000000000000NW02" {
+        pos 560.0 60.0
+        size 130.0 44.0
+    }
+    iroh "01DDSXA000000000000000PX03" {
+        pos 560.0 200.0
+        size 130.0 44.0
+    }
+    note "01DDSXA000000000000000NT04" {
+        text "Fabric A — the publisher.\n\nRead this uplink's ticket:\n  wk -f example/dds-uplink-a.wk \\\n     inspect 01DDSXA000000000000000PX03\n\nand paste it into dds-uplink-b.wk\nas the iroh node's `peer`."
+        pos 740.0 60.0
+        size 340.0 220.0
+    }
+    netlink "01DDSXA000000000000000ND01" "01DDSXA000000000000000NW02"
+    netlink "01DDSXA000000000000000PX03" "01DDSXA000000000000000NW02"
+}

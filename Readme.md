@@ -373,7 +373,9 @@ DataReader, reliable delivery, all as ordinary UDP that wk routes.
 `example/dds.wk` wires a publisher and two subscribers to one Network and
 configures **nothing** — no peer, no address, no port: the fabric carries RTPS
 multicast, so participants find each other the way DDS expects, and a fourth
-node would join in with no edit to the file. It runs on **one
+node would join in with no edit to the file. `example/dds-uplink-a.wk` and
+`-b.wk` do the same across two *separate* wk processes joined by an iroh
+uplink, so a participant finds one on another machine the same way. It runs on **one
 thread**, which DDS is not built for: a condition variable that pumps the
 reactor stands in for the threads the middleware expects, so every
 `while (!ready) cv.wait()` in OpenDDS becomes a polling loop and almost nothing

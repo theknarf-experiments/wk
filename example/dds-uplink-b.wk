@@ -1,0 +1,36 @@
+// vim: set filetype=kdl :
+// DDS across two machines, part B — the subscriber. See dds-uplink-a.wk for
+// the whole story and the run order.
+//
+// Give the iroh node below the ticket that fabric A's uplink printed:
+//
+//   iroh "01DDSXB000000000000000PX03" {
+//       peer "endpoint…"
+//       ...
+//   }
+//
+// Only one side needs to dial; the other accepts.
+import "../workspace.wk"
+workspace "01DDSXB000000000000000WS00" {
+    node "dds_subscriber" "01DDSXB000000000000000ND01" {
+        name "dds-sub"
+        args "--forever"
+        pos 60.0 60.0
+        size 420.0 260.0
+    }
+    network "01DDSXB000000000000000NW02" {
+        pos 560.0 60.0
+        size 130.0 44.0
+    }
+    iroh "01DDSXB000000000000000PX03" {
+        pos 560.0 200.0
+        size 130.0 44.0
+    }
+    note "01DDSXB000000000000000NT04" {
+        text "Fabric B — the subscriber.\n\nThis uplink needs fabric A's ticket\nas its `peer` before the two\nfabrics can find each other.\n\nNothing about DDS is configured:\ndiscovery is multicast, and the\nuplink carries it."
+        pos 740.0 60.0
+        size 340.0 220.0
+    }
+    netlink "01DDSXB000000000000000ND01" "01DDSXB000000000000000NW02"
+    netlink "01DDSXB000000000000000PX03" "01DDSXB000000000000000NW02"
+}
