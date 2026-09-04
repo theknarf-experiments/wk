@@ -241,7 +241,7 @@ async fn dialer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smoltcp::socket::tcp;
+    use smoltcp::socket::{tcp, udp};
     use smoltcp::wire::Ipv4Address;
 
     fn tcp_socket() -> tcp::Socket<'static> {
@@ -249,6 +249,11 @@ mod tests {
             tcp::SocketBuffer::new(vec![0u8; 4096]),
             tcp::SocketBuffer::new(vec![0u8; 4096]),
         )
+    }
+
+    fn udp_socket() -> udp::Socket<'static> {
+        let buf = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 4096]);
+        udp::Socket::new(buf(), buf())
     }
 
     /// Two independent fabrics joined by real iroh uplinks over loopback (no
@@ -312,5 +317,95 @@ mod tests {
         assert_eq!(&got, b"over quic");
         assert_eq!(up_a.peers(), 1);
         assert_eq!(up_b.peers(), 1);
+    }
+
+    /// A multicast group crosses an uplink: one datagram sent on fabric A
+    /// reaches a member of the same virtual network on fabric B, and a member
+    /// of fabric A as well.
+    ///
+    /// The two directions are separate code paths in `NetHub::step`, and the
+    /// second is the one worth pinning. A locally-originated group goes out to
+    /// the trunks; a group that ARRIVED on a trunk is flooded to local members
+    /// but must NOT be sent back out, or two uplinked fabrics would bounce
+    /// every SPDP announcement between them forever. That is `from_trunk`.
+    #[test]
+    fn iroh_uplinks_carry_multicast_between_fabrics() {
+        let group = Ipv4Address::new(239, 255, 0, 1);
+        let hub_a = NetHub::new();
+        let hub_b = NetHub::new();
+        let net = NodeId::nil();
+        let sender = hub_a.attach(net, Ipv4Address::new(10, 0, 0, 1), "sender");
+        let local = hub_a.attach(net, Ipv4Address::new(10, 0, 0, 2), "local");
+        let remote = hub_b.attach(net, Ipv4Address::new(10, 0, 0, 3), "remote");
+
+        let up_a = Uplink::start(hub_a.clone(), net, None, false).unwrap();
+        let up_b = Uplink::start(hub_b.clone(), net, None, false).unwrap();
+        up_a.dial(up_b.ticket()).unwrap();
+
+        let bind = |stack: &crate::netstack::SharedStack| {
+            let mut g = stack.lock().unwrap();
+            let h = g.sockets.add(udp_socket());
+            g.sockets.get_mut::<udp::Socket>(h).bind(7400).unwrap();
+            h
+        };
+        let sender_h = bind(&sender);
+        let local_h = bind(&local);
+        let remote_h = bind(&remote);
+
+        let recv = |stack: &crate::netstack::SharedStack, h| {
+            let mut g = stack.lock().unwrap();
+            g.sockets
+                .get_mut::<udp::Socket>(h)
+                .recv()
+                .ok()
+                .map(|(d, _)| d.to_vec())
+        };
+
+        // Wait for the QUIC handshake before sending, so that exactly ONE
+        // datagram is ever put on the wire. That is what lets the counts below
+        // mean something.
+        for _ in 0..5000 {
+            if up_a.peers() == 1 && up_b.peers() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(up_a.peers(), 1, "uplink A never connected");
+        assert_eq!(up_b.peers(), 1, "uplink B never connected");
+
+        {
+            let mut g = sender.lock().unwrap();
+            let s = g.sockets.get_mut::<udp::Socket>(sender_h);
+            assert!(s.can_send());
+            s.send_slice(b"spdp", (group, 7400)).unwrap();
+        }
+
+        // Count copies rather than stopping at the first, and keep counting
+        // after both have arrived: one datagram must produce ONE delivery at
+        // each member. Anything more is the bounce this design has to avoid --
+        // two uplinked fabrics each flooding what the other sent them, which
+        // for a group that nobody owns has no natural stopping point.
+        let (mut n_local, mut n_remote) = (0, 0);
+        let mut settle = 0;
+        for _ in 0..3000 {
+            if let Some(d) = recv(&local, local_h) {
+                assert_eq!(&d, b"spdp");
+                n_local += 1;
+            }
+            if let Some(d) = recv(&remote, remote_h) {
+                assert_eq!(&d, b"spdp");
+                n_remote += 1;
+            }
+            if n_local > 0 && n_remote > 0 {
+                settle += 1;
+                if settle > 500 {
+                    break; // both arrived, then half a second of quiet
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_eq!(n_local, 1, "same fabric: one datagram, one delivery");
+        assert_eq!(n_remote, 1, "across the uplink: one datagram, one delivery");
     }
 }
