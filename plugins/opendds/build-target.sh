@@ -114,6 +114,17 @@ for pair in "ace/config-wasi.h:$ACE_ROOT/ace/config-wasi.h" \
   fi
 done
 
+# A patch newer than the last completed build means the objects predate it.
+STAMP="$HERE/build-target/.patched-stamp"
+mkdir -p "$(dirname "$STAMP")"
+for p in "$HERE"/patches/*.patch; do
+  [ -e "$p" ] || continue
+  if [ ! -e "$STAMP" ] || [ "$p" -nt "$STAMP" ]; then
+    echo "  patch newer than the last build: $(basename "$p")"
+    platform_changed=1
+  fi
+done
+
 # ACE's makefiles do NOT depend on ace/config.h — they have no generated
 # dependency file unless `make depend` has been run — so an edit to
 # config-wasi.h leaves every previously-built object in place, compiled against
@@ -131,6 +142,16 @@ done
 # unaffected by their arrival, and including them here would turn every added
 # constant into a full ACE+TAO rebuild. If you ever CHANGE or remove something
 # there, clean by hand.
+#
+# The PATCHES are in the check, below, and that is not belt and braces either:
+# several of them touch .inl files and template bodies (ACE's Handle_Set.inl,
+# OpenDDS's TransportReceiveStrategy_T.cpp), which are #included rather than
+# compiled on their own. Editing one and rebuilding produces a tree where the
+# patch is applied in the source and absent from every object -- a state that
+# looks fixed, builds clean, and behaves exactly as it did before. That cost a
+# whole debugging round: the "EAGAIN is not a broken link" fix appeared to do
+# nothing, twice, because the transport objects that instantiate the template
+# were never recompiled.
 if [ "$platform_changed" = 1 ] && [ "${WK_OPENDDS_KEEP_OBJECTS:-0}" = 1 ]; then
   log "platform files changed, but WK_OPENDDS_KEEP_OBJECTS=1 — keeping objects"
   # The escape hatch, for a change that provably cannot affect any object
@@ -207,6 +228,9 @@ case "$STAGE" in
   all)
     log "make everything (ACE, TAO, OpenDDS) — long"
     ( cd "$SRC" && make -j"$JOBS" ) 2>&1 | tee "$LOGS/target.log"
+    # Stamp only a full build: a stage build leaves parts of the tree older
+    # than the patches, and claiming otherwise is how stale objects survive.
+    touch "$HERE/build-target/.patched-stamp"
     ;;
   *)
     echo "opendds: unknown stage '$STAGE' (want: ace, all)" >&2

@@ -366,6 +366,19 @@ Example plugins live under `plugins/`, spanning graphics (GPU via `wasi:webgpu`
 and CPU frame buffers), audio and MIDI, terminal programs and recompiled C
 software, userspace networking, and filesystem demos.
 
+**DDS** is the furthest the networking goes: `plugins/opendds` is real OpenDDS
+on real ACE/TAO, cross-compiled to wasm32-wasip2, so two nodes can talk OMG
+DDS to each other over the fabric — RTPS discovery, a DataWriter and a
+DataReader, reliable delivery, all as ordinary UDP that wk routes.
+`example/dds.wk` wires a publisher and a subscriber to one Network; each node
+is told only its peer's *name* and works out the rest. It runs on **one
+thread**, which DDS is not built for: a condition variable that pumps the
+reactor stands in for the threads the middleware expects, so every
+`while (!ready) cv.wait()` in OpenDDS becomes a polling loop and almost nothing
+upstream had to change. `plugins/opendds/PORTING.md` has the whole account,
+including the wasip2 socket behaviour that makes a blocking datagram read a
+process-ending mistake.
+
 The `sequencer` is the fullest of them: an eight-track piano roll with a pattern
 bank and a song chain, recording what you play with its velocity and length, and
 sending every note stamped with the instant it belongs to so the tempo is the

@@ -100,6 +100,12 @@ dependencies {
         description "UDP echo (server or client mode)"
         args "server" "4242"
     }
+    dds_publisher "plugins/opendds/dds-publisher.wasm" {
+        description "OpenDDS DataWriter on the fabric (real DDS/RTPS; --peer <node>)"
+    }
+    dds_subscriber "plugins/opendds/dds-subscriber.wasm" {
+        description "OpenDDS DataReader on the fabric (real DDS/RTPS; --peer <node>)"
+    }
     echo6 "plugins/echo6/echo6.wasm" {
         description "IPv6 TCP echo (server or client mode)"
         args "server" "80"

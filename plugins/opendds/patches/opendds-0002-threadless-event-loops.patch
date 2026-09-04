@@ -251,7 +251,7 @@
    enum State { STATE_UNINITIALIZED, STATE_RUNNING, STATE_SHUT_DOWN };
 --- a/dds/DCPS/ReactorTask.cpp
 +++ b/dds/DCPS/ReactorTask.cpp
-@@ -6,6 +6,12 @@
+@@ -6,6 +6,13 @@
  #include <DCPS/DdsDcps_pch.h> // Only the _pch include should start with DCPS/
  
  #include "ReactorTask.h"
@@ -259,12 +259,13 @@
 +#ifdef ACE_WASI
 +#  include <wk-opendds-inline.h>
 +#  include <cstdio>
++#  include <cerrno>
 +#  include <cstdlib>
 +#endif
  #if !defined (__ACE_INLINE__)
  #include "ReactorTask.inl"
  #endif /* __ACE_INLINE__ */
-@@ -50,7 +56,8 @@
+@@ -50,7 +57,8 @@
  namespace DCPS {
  
  ReactorTask::ReactorTask(bool useAsyncSend)
@@ -274,7 +275,7 @@
    , state_(STATE_UNINITIALIZED)
    , reactor_(0)
    , proactor_(0)
-@@ -162,10 +169,39 @@
+@@ -162,10 +170,39 @@
    init_i(thread_status_manager, name, reactor);
  
    if (activate(THR_NEW_LWP | THR_JOINABLE, 1) != 0) {
@@ -303,7 +304,7 @@
 +    state_ = STATE_RUNNING;
 +    condition_.notify_all();
 +    inline_slot_ = wk_inline_register(inline_pass, this);
-+    if (getenv("WK_DDS_TRACE")) { fprintf(stderr, "[wk] ReactorTask inline slot=%d count=%d\n", inline_slot_, wk_inline_count()); }
++    if (getenv("WK_DDS_TRACE")) { fprintf(stderr, "[wk] ReactorTask %p inline slot=%d count=%d\n", (void*)this, inline_slot_, wk_inline_count()); }
 +    return 0;
 +#else
      ACE_ERROR_RETURN((LM_ERROR,
@@ -314,12 +315,10 @@
    }
  
    while (state_ != STATE_RUNNING) {
-@@ -173,6 +209,37 @@
-   }
- 
+@@ -175,6 +212,68 @@
    return 0;
-+}
-+
+ }
+ 
 +void ReactorTask::inline_pass(void* arg)
 +{
 +  static_cast<ReactorTask*>(arg)->run_reactor_once();
@@ -334,6 +333,37 @@
 +      return;
 +    }
 +    reactor = reactor_;
++
++    // Drain the command queue here, because nothing else can.
++    //
++    // execute_or_enqueue() runs a command inline only when the caller owns the
++    // reactor AND nothing is being processed AND the queue is empty. Otherwise
++    // it queues the command and wakes the reactor thread with
++    // reactor_->notify(), which the reactor then services in handle_exception().
++    //
++    // There is no reactor thread here, and no notification pipe to wake it with
++    // (ACE_DISABLE_NOTIFY_PIPE_DEFAULT is 1 -- see ace/config-wasi.h), so that
++    // notify goes nowhere. And it is worse than a dropped wakeup: the function
++    // sets reactor_notified_ = true before notifying and only
++    // process_command_queue_i() clears it, so after the first lost
++    // notification NO later enqueue will even try again. The queue stalls
++    // permanently, and the very first command to arrive while another is being
++    // processed takes the whole transport with it.
++    //
++    // That is how it presented: the rtps_udp socket received exactly one
++    // datagram, ever, while the peer sent dozens -- the receive strategy's
++    // RegisterHandler command was sitting in a queue nobody would ever drain.
++    //
++    // Draining from the pump makes the queue behave the way it does with a
++    // reactor thread: commands run promptly, in order, on the thread that owns
++    // the reactor. `processing_` still guards against re-entering it from a
++    // command's own execute().
++    if (!processing_ && !command_queue_.empty()) {
++      if (getenv("WK_DDS_TRACE")) {
++        fprintf(stderr, "[wk] pump draining %zu queued commands\n", command_queue_.size());
++      }
++      process_command_queue_i();
++    }
 +  }
 +  if (reactor) {
 +    static long calls = 0, dispatched = 0;
@@ -349,10 +379,12 @@
 +      fprintf(stderr, "[wk] reactor passes=%ld dispatched=%ld\n", calls, dispatched);
 +    }
 +  }
- }
- 
++}
++
  int ReactorTask::svc()
-@@ -305,6 +372,13 @@
+ {
+   // Every activated ACE task thread ends with close(), which drops a
+@@ -305,6 +404,13 @@
      GuardType guard(lock_);
      reactor_owners_.unbind_all();
      state_ = STATE_SHUT_DOWN;
@@ -366,6 +398,31 @@
      condition_.notify_all();
    }
    return EXIT_SUCCESS;
+@@ -582,7 +688,12 @@
+                                      ACE_Event_Handler* event_handler,
+                                      ACE_Reactor_Mask mask)
+ {
+-  return reactor_->register_handler(io_handle, event_handler, mask);
++  const int r = reactor_->register_handler(io_handle, event_handler, mask);
++  if (getenv("WK_DDS_TRACE")) {
++    fprintf(stderr, "[wk] ReactorWrapper::register_handler fd=%d mask=%x reactor=%p -> %d (errno %d)\n",
++            (int)io_handle, (unsigned)mask, (void*)reactor_, r, r < 0 ? errno : 0);
++  }
++  return r;
+ }
+ 
+ int ReactorWrapper::register_handler(ACE_Event_Handler* event_handler,
+@@ -594,6 +705,10 @@
+ int ReactorWrapper::remove_handler(ACE_HANDLE io_handle,
+                                    ACE_Reactor_Mask mask)
+ {
++  if (getenv("WK_DDS_TRACE")) {
++    fprintf(stderr, "[wk] ReactorWrapper::remove_handler fd=%d mask=%x reactor=%p\n",
++            (int)io_handle, (unsigned)mask, (void*)reactor_);
++  }
+   return reactor_->remove_handler(io_handle, mask);
+ }
+ 
 --- a/dds/DCPS/ReactorEvent.cpp
 +++ b/dds/DCPS/ReactorEvent.cpp
 @@ -26,7 +26,23 @@

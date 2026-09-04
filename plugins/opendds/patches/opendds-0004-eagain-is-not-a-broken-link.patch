@@ -1,0 +1,76 @@
+--- a/dds/DCPS/transport/framework/TransportReceiveStrategy_T.cpp
++++ b/dds/DCPS/transport/framework/TransportReceiveStrategy_T.cpp
+@@ -326,6 +326,27 @@
+   }
+ 
+   if (bytes_remaining < 0) {
++    // EWOULDBLOCK is not a broken link, it is "nothing to read right now".
++    //
++    // A reactor may report a socket readable and the read that follows may
++    // still find nothing: POSIX permits it explicitly and Linux's select(2)
++    // documents it. On wasm32-wasip2 it is not an edge case at all -- a UDP
++    // socket there stays reported readable until a receive finds nothing, so
++    // the EMPTY READ is precisely what clears the readiness, and it therefore
++    // happens after every single datagram.
++    //
++    // Treating that as a link failure calls relink() and returns -1, which
++    // makes the reactor REMOVE this handler -- so the transport receives its
++    // first datagram and then goes permanently deaf. That is exactly how it
++    // presented: SEDP sent ~15 datagrams in each direction and each side read
++    // one, so no endpoint ever matched.
++    //
++    // Returning 0 keeps the handler and waits for the next event, which is
++    // what the caller wants on any platform.
++    if (errno == EWOULDBLOCK || errno == EAGAIN) {
++      return 0;
++    }
++
+     ACE_ERROR((LM_WARNING, ACE_TEXT("(%P|%t) WARNING: Problem ")
+               ACE_TEXT("with data link detected: %p.\n"),
+               ACE_TEXT("receive_bytes")));
+--- a/dds/DCPS/transport/rtps_udp/RtpsUdpReceiveStrategy.cpp
++++ b/dds/DCPS/transport/rtps_udp/RtpsUdpReceiveStrategy.cpp
+@@ -114,6 +114,24 @@
+   }
+ 
+   if (bytes_remaining < 0) {
++    // EWOULDBLOCK is not a broken link, it is "nothing to read right now" --
++    // and returning -1 here does not merely log, it makes the reactor REMOVE
++    // this handler. The socket is then never polled again: one datagram is
++    // read, the next read finds nothing, and the transport goes permanently
++    // deaf while datagrams pile up unread in the kernel (1552 bytes of them,
++    // by netstat, when this was diagnosed).
++    //
++    // A reactor may report a socket readable and the read that follows may
++    // still find nothing: POSIX permits it and Linux's select(2) documents it.
++    // On wasm32-wasip2 it is not an edge case but the rule -- a UDP socket
++    // there stays reported readable until a receive finds nothing, so the
++    // EMPTY READ is what clears the readiness and it happens after every
++    // single datagram.
++    //
++    // Returning 0 keeps the handler and waits for the next event.
++    if (errno == EWOULDBLOCK || errno == EAGAIN) {
++      return 0;
++    }
+     relink();
+     return -1;
+   }
+--- a/dds/DCPS/RTPS/Spdp.cpp
++++ b/dds/DCPS/RTPS/Spdp.cpp
+@@ -3159,6 +3159,16 @@
+   if (bytes > 0) {
+     buff_.wr_ptr(static_cast<size_t>(bytes));
+   } else if (bytes == 0) {
++    return 0;
++  } else if (errno == EWOULDBLOCK || errno == EAGAIN) {
++    // Nothing to read, which is not an error and must not be logged as one.
++    //
++    // A reactor may report a socket readable and the read that follows may
++    // still find nothing (POSIX permits it; Linux's select(2) documents it).
++    // On wasm32-wasip2 it happens after EVERY datagram: a UDP socket there
++    // stays reported readable until a receive finds nothing, so the empty read
++    // is what clears the readiness. Logging it at WARNING turns normal
++    // operation into thousands of lines a second and buries everything else.
+     return 0;
+   } else {
+     ACE_DEBUG((

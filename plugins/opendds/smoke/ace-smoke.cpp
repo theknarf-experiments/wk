@@ -301,6 +301,76 @@ int main ()
     h.sock.close ();
   }
 
+  // 6. TWO sockets on one reactor, each receiving repeatedly. This is the
+  //    shape a DDS participant actually has -- a discovery socket that is busy
+  //    every second and a transport socket that goes quiet and then speaks
+  //    again -- and it is where this port's reactor stopped dispatching the
+  //    second socket after its first datagram.
+  {
+    class Counter : public ACE_Event_Handler
+    {
+    public:
+      ACE_SOCK_Dgram sock;
+      int reads = 0;
+      ACE_HANDLE get_handle () const override { return sock.get_handle (); }
+      int handle_input (ACE_HANDLE) override
+      {
+        char buf[64];
+        ACE_INET_Addr from;
+        if (sock.recv (buf, sizeof buf, from) > 0) ++reads;
+        return 0;
+      }
+    };
+
+    ACE_Select_Reactor impl;
+    ACE_Reactor reactor (&impl);
+    Counter a, b;
+    ACE_INET_Addr any (static_cast<u_short> (0), INADDR_LOOPBACK);
+    a.sock.open (any);
+    b.sock.open (any);
+    ACE_INET_Addr addr_a, addr_b;
+    a.sock.get_local_addr (addr_a);
+    b.sock.get_local_addr (addr_b);
+    check ("two handlers registered on one reactor",
+           reactor.register_handler (&a, ACE_Event_Handler::READ_MASK) == 0 &&
+           reactor.register_handler (&b, ACE_Event_Handler::READ_MASK) == 0);
+
+    ACE_SOCK_Dgram tx;
+    ACE_INET_Addr tx_any (static_cast<u_short> (0), INADDR_LOOPBACK);
+    tx.open (tx_any);
+
+    // Three rounds. Round 1 feeds both; rounds 2 and 3 feed only B, which is
+    // the case that failed: a socket that has already been drained once must
+    // still be dispatched when new data turns up.
+    bool sends_ok = true;
+    for (int round = 0; round < 3; ++round)
+      {
+        if (round == 0 && tx.send ("a", 1, addr_a) != 1) sends_ok = false;
+        if (tx.send ("b", 1, addr_b) != 1) sends_ok = false;
+
+        // Five seconds is generous on purpose. This check exists to catch a
+        // handler that has been REMOVED -- a permanent condition -- so a long
+        // budget costs nothing when things work and removes the flakiness that
+        // a one-second budget had on a loaded machine.
+        const ACE_Time_Value deadline = ACE_OS::gettimeofday () + ACE_Time_Value (5, 0);
+        const int want_b = round + 1;
+        while (b.reads < want_b && ACE_OS::gettimeofday () < deadline)
+          {
+            ACE_Time_Value zero = ACE_Time_Value::zero;
+            reactor.handle_events (&zero);
+            ACE_OS::sleep (ACE_Time_Value (0, 1000));
+          }
+      }
+
+    check ("all rehearsal datagrams were sent", sends_ok);
+    if (b.reads != 3)
+      std::printf ("   (socket A read %d, socket B read %d of 3)\n", a.reads, b.reads);
+    check ("a quiet socket is still dispatched on later datagrams", b.reads == 3);
+
+    reactor.remove_handler (&a, ACE_Event_Handler::READ_MASK | ACE_Event_Handler::DONT_CALL);
+    reactor.remove_handler (&b, ACE_Event_Handler::READ_MASK | ACE_Event_Handler::DONT_CALL);
+  }
+
   std::printf ("\n%s\n", failures == 0 ? "all checks passed" : "SOME CHECKS FAILED");
   return failures == 0 ? 0 : 1;
 }

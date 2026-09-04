@@ -55,6 +55,7 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
 #include <sys/uio.h>
 
 #include <fcntl.h>
@@ -78,8 +79,46 @@ static void wk_trace_recv (int fd)
     if (!on)
         return;
     fl = fcntl (fd, F_GETFL, 0);
-    n = snprintf (b, sizeof b, "[wk] recvmsg fd=%d nonblock=%d\n",
-                  fd, fl >= 0 && (fl & O_NONBLOCK) ? 1 : 0);
+    {
+        struct sockaddr_in me;
+        socklen_t ml = sizeof me;
+        unsigned myport = 0;
+        if (getsockname (fd, (struct sockaddr *) &me, &ml) == 0)
+            myport = (unsigned) ((((const unsigned char *) &me)[2] << 8)
+                                 | ((const unsigned char *) &me)[3]);
+        n = snprintf (b, sizeof b, "[wk] recvmsg fd=%d :%u nonblock=%d\n",
+                      fd, myport, fl >= 0 && (fl & O_NONBLOCK) ? 1 : 0);
+    }
+    (void)!write (2, b, (size_t) n);
+}
+
+/* Counterpart to wk_trace_recv: which descriptor sent how much, and where.
+ * "Discovery announces but nothing else moves" is a question about SENDS, and
+ * the answer is one line per datagram. */
+static void wk_trace_send (int fd, size_t len, const struct sockaddr *to, ssize_t sent)
+{
+    static int on = -1;
+    char b[128];
+    int n;
+    unsigned port = 0;
+    if (on < 0)
+        on = getenv ("WK_DDS_TRACE") != 0;
+    if (!on)
+        return;
+    if (to != 0 && to->sa_family == AF_INET) {
+        const unsigned char *p = (const unsigned char *) to;
+        port = (unsigned) ((p[2] << 8) | p[3]);   /* sockaddr_in.sin_port, net order */
+    }
+    {
+        struct sockaddr_in me;
+        socklen_t ml = sizeof me;
+        unsigned myport = 0;
+        if (getsockname (fd, (struct sockaddr *) &me, &ml) == 0)
+            myport = (unsigned) ((((const unsigned char *) &me)[2] << 8)
+                                 | ((const unsigned char *) &me)[3]);
+        n = snprintf (b, sizeof b, "[wk] sendmsg fd=%d :%u -> :%u len=%zu sent=%zd errno=%d\n",
+                      fd, myport, port, len, sent, sent < 0 ? errno : 0);
+    }
     (void)!write (2, b, (size_t) n);
 }
 
@@ -122,8 +161,13 @@ ssize_t sendmsg (int fd, const struct msghdr *msg, int flags)
         buf = gather;
     }
 
-    return sendto (fd, buf, len, 0,
-                   (const struct sockaddr *)msg->msg_name, msg->msg_namelen);
+    {
+        const ssize_t sent = sendto (fd, buf, len, 0,
+                                     (const struct sockaddr *)msg->msg_name,
+                                     msg->msg_namelen);
+        wk_trace_send (fd, len, (const struct sockaddr *) msg->msg_name, sent);
+        return sent;
+    }
 }
 
 ssize_t recvmsg (int fd, struct msghdr *msg, int flags)

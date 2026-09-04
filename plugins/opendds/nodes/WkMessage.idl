@@ -1,0 +1,19 @@
+/*
+ * The topic type the wk DDS demo nodes exchange.
+ *
+ * Deliberately plain IDL with no OpenDDS-specific extensions: the point of the
+ * port is that ordinary DDS types and ordinary DDS code work, so this is the
+ * kind of struct any DDS tutorial starts with. @key makes `id` the instance
+ * key, which is what lets a reader tell one publisher's stream from another's.
+ */
+
+module wk {
+
+  @topic
+  struct Message {
+    @key long id;
+    string from;
+    string text;
+    long count;
+  };
+};

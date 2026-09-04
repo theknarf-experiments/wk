@@ -43,26 +43,41 @@ dir = "{{config_root}}"
 depends = ["build-host"]
 run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-target.sh ace"
 
+[tasks.build-nodes]
+description = "Build the two DDS nodes (dds-publisher.wasm, dds-subscriber.wasm)"
+dir = "{{config_root}}"
+depends = ["build-target"]
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-nodes.sh"
+
+[tasks.smoke]
+description = "Build and run the ACE smoke test under wasmtime (needs build-target)"
+dir = "{{config_root}}"
+run = "WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-smoke.sh run"
+
 # The repo-wide `mise run build-plugins` (root mise.toml) invokes every
 # plugin's `build` task. This one must not turn that sweep into an hours-long
-# ACE+TAO+OpenDDS build — and right now it would not even be a SUCCESSFUL one:
-# the port is at M2. Explicit opt-in until a full build is known to complete,
-# which is the guard plugins/libreoffice arrived at after its "skip while
-# patches/ is empty" version stopped guarding anything.
+# ACE + TAO + OpenDDS build, so it is explicit opt-in. Unlike the same guard in
+# plugins/libreoffice, this is NOT because the build fails — it completes and
+# the nodes work end to end. It is only about the clock: a native bootstrap
+# plus a full cross build is the better part of an hour on a fast machine, and
+# nobody sweeping the repo's plugins is asking for that.
 [tasks.build]
-description = "Build the OpenDDS port (opt-in: hours, and does not link yet)"
+description = "Build the OpenDDS port end to end (opt-in: hours)"
 dir = "{{config_root}}"
 run = """
 set -e
 if [ "${WK_OPENDDS_BUILD:-0}" != "1" ]; then
-  echo "opendds: skipping -- the full build is hours long and does not link yet."
-  echo "    The port is at M2 (ACE for wasm32-wasip2); see PORTING.md"
-  echo "    'Current state' for exactly where."
-  echo "    Per-stage: ./fetch.sh, ./build-host.sh, ./build-target.sh [ace]"
+  echo "opendds: skipping -- ACE + TAO + OpenDDS is an hours-long build."
+  echo "    It DOES work end to end (see PORTING.md 'Current state'); it is"
+  echo "    just far too long to run as part of a repo-wide sweep."
+  echo "    Per-stage: ./fetch.sh, ./build-host.sh, ./build-target.sh [ace],"
+  echo "               ./build-nodes.sh"
   echo "    To run the whole thing anyway: WK_OPENDDS_BUILD=1 mise run build"
   exit 0
 fi
 ./fetch.sh
 ./build-host.sh
-WASI_SDK=$(mise where github:WebAssembly/wasi-sdk) ./build-target.sh
+SDK=$(mise where github:WebAssembly/wasi-sdk)
+WASI_SDK="$SDK" ./build-target.sh
+WASI_SDK="$SDK" ./build-nodes.sh
 """

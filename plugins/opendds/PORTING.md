@@ -172,7 +172,7 @@ discovery would collapse. The demo nodes set `GuidInterface` explicitly.
 
 ## Patches
 
-Six, none of them large.
+Seven, none of them large.
 
 | patch | what |
 | --- | --- |
@@ -182,6 +182,7 @@ Six, none of them large.
 | `ace-0003-wasi-nonblocking-datagrams.patch` | every datagram socket is non-blocking at `open()`, because wasip2 reports a UDP socket readable one time too many — see [The readiness that outlives the datagram](#the-readiness-that-outlives-the-datagram). |
 | `opendds-0002-threadless-event-loops.patch` | `DispatchService` and `ReactorTask` expose one non-blocking pass of their loop and register it with the pump when no thread can be spawned; `ThreadPool` stops waiting at a barrier nothing can reach; `ReactorEvent` runs inline instead of through `reactor->notify()`. |
 | `opendds-0003-no-ancillary-data.patch` | `set_socket_multicast_ttl` and `set_recvpktinfo` report success on a platform that has neither multicast options nor ancillary data. Both are fatal to participant creation otherwise. |
+| `opendds-0004-eagain-is-not-a-broken-link.patch` | an `EWOULDBLOCK` read is "nothing to read", not a dead link. Three call sites; see [The empty read that killed the transport](#the-empty-read-that-killed-the-transport). |
 
 ### The fd_set that is not a bitmask
 
@@ -244,6 +245,42 @@ caller already handles, and which is also what clears the readiness for the
 next round. `smoke/ace-smoke.cpp` asserts both halves, so a future wasi-sdk
 that changes this behaviour fails a test rather than hanging a node.
 
+### The empty read that killed the transport
+
+The readiness quirk above has a second half, and it is the one that cost the
+most: **what the extra empty read is then treated as.**
+
+`RtpsUdpReceiveStrategy::handle_input()` — and the generic
+`TransportReceiveStrategy::handle_dds_input()` behind it, and
+`Spdp::SpdpTransport::handle_input()` beside it — all end a short read with
+
+```cpp
+if (bytes_remaining < 0) { relink(); return -1; }
+```
+
+Returning -1 to the reactor does not merely log. `ACE_Select_Reactor_T::notify_handle()`
+reads it as "this handler is finished" and **removes the handler**. So the
+transport read its first datagram, read again, got `EAGAIN`, and was
+unregistered — silently, with no message at any debug level. Everything after
+that looked like a network fault: `netstat` showed 1552 bytes sitting unread in
+the socket's receive queue while the peer went on sending.
+
+It was slow to find because every layer looked healthy. Discovery worked. The
+participants found each other. SEDP's built-in endpoints associated in both
+directions. Heartbeats were processed — a single datagram can carry a bundle of
+RTPS submessages, so *one* delivered datagram produced five `process_heartbeat_i`
+lines and the transport looked alive. The publisher wrote its publication
+announcement and the write succeeded. Only a socket-level census
+(`WK_DDS_TRACE=1`, which counts every `sendmsg` and `recvmsg` per descriptor)
+made it obvious: 23–45 datagrams sent each way, exactly **two** `recvmsg` calls
+received — one datagram and one `EAGAIN`.
+
+Three things had to be true at once for this to bite, which is why upstream has
+never hit it: the socket must be non-blocking (this port made it so, to fix the
+hang), the platform must report a spurious readiness (wasip2 always does), and
+the receive path must treat a short read as fatal (OpenDDS does). Take away any
+one and it disappears.
+
 ## Building
 
 ```
@@ -267,59 +304,66 @@ not found`.
 
 ## Current state
 
-**Real OpenDDS runs on wasm32-wasip2, single-threaded, and two participants
-discover each other over RTPS on real UDP.**
+**Two wk nodes exchange DDS samples over the fabric, through a DataWriter and
+a DataReader, running real OpenDDS on one thread.**
+
+```
+$ wk run example/dds.wk --headless &
+$ wk -f example/dds.wk up
+$ wk -f example/dds.wk logs dds-pub
+wk-dds: 10.0.0.157 -> dds-sub (10.0.0.212:17910), domain 42
+dds-publisher: waiting for a subscriber...
+dds-publisher: subscriber found, publishing
+sent  #0
+...
+$ wk -f example/dds.wk logs dds-sub
+wk-dds: 10.0.0.212 -> dds-pub (10.0.0.157:17910), domain 42
+recv  #0  id=1 from=dds-publisher  "hello from a wasm node"
+recv  #1  id=1 from=dds-publisher  "hello from a wasm node"
+...
+```
+
+Neither address appears anywhere in `example/dds.wk`. Each node is told only
+its peer's NAME; it resolves that through the fabric's DNS and works out its
+own address by asking the stack which one it would use to reach it (see
+`nodes/wk_dds_node.h`).
 
 * **M1 — host tools: done.** `tao_idl` 4.0.6 and `opendds_idl` 3.34.0.
-* **M2 — ACE for wasm32-wasip2: done, verified running.** 307 wasm objects, a
-  2.0 MB `libACE.a`, and `./build-smoke.sh run` passes all eighteen checks
-  under `wasmtime run -W exceptions`.
+* **M2 — ACE for wasm32-wasip2: done.** 307 wasm objects, a 2.0 MB `libACE.a`,
+  and `./build-smoke.sh run` passes eighteen checks under
+  `wasmtime run -W exceptions`.
 * **M3 — TAO and OpenDDS: done.** `make` completes with **zero errors** across
   ACE, all of TAO, and every OpenDDS library — `libOpenDDS_Dcps.a` (25 MB),
-  `libOpenDDS_Rtps.a`, **`libOpenDDS_Rtps_Udp.a`**, `Multicast`, `Shmem`,
-  `Tcp`, `Udp`, `InfoRepoDiscovery`, `FACE`, `Model`, `monitor`, `Federator`.
-  Upstream's own `DevGuideExamples` programs link too, because
-  `ace/platform_wasi.GNU` puts the shim archive on every link line.
-* **M4 — the shims: done and exercised.**
-* **M5 — a participant runs, and keeps running.** Upstream's *unmodified*
-  OpenDDS `publisher` creates a DomainParticipant, Topic, Publisher and
-  DataWriter and announces itself on schedule — ten SPDP datagrams in ten
-  seconds at `ResendPeriod=1`, confirmed from outside the sandbox by a host
-  listener:
+  `libOpenDDS_Rtps.a`, `libOpenDDS_Rtps_Udp.a`, and the rest. Upstream's own
+  `DevGuideExamples` link and run too: its unmodified Messenger publisher and
+  subscriber discover each other and exchange samples on loopback.
+* **M4 — the shims: done.**
+* **M5/M6 — a participant runs, and two of them discover each other** over
+  unicast SPDP, with SEDP associating in both directions.
+* **M7 — user endpoints match and samples flow.** DataWriter to DataReader,
+  RELIABLE with KEEP_ALL history, so the reliability protocol (heartbeats,
+  ACKNACKs, retransmission) is exercised rather than avoided.
+* **M8 — the wk nodes: done.** `nodes/publisher.cpp` and `nodes/subscriber.cpp`
+  build to `dds-publisher.wasm` and `dds-subscriber.wasm`
+  (`./build-nodes.sh`), are registered in `workspace.wk`, and
+  `example/dds.wk` wires them to one `Network`. Below the argument parsing
+  they are ordinary DDS code — participant, type, topic, writer/reader — which
+  is the point.
 
-  ```
-  RECV 232 bytes from ('127.0.0.1', 17910) magic=b'RTPS'
-  ```
+### What is not done
 
-* **M6 — two participants discover each other.** Mutual, over unicast SPDP:
-
-  ```
-  [sub] Spdp::handle_participant_data - 010366ea... discovered 010302a5... from 127.0.0.1:17912
-  [pub] Spdp::handle_participant_data - 010302a5... discovered 010366ea... from 127.0.0.1:17910
-  ```
-
-  and SEDP's built-in endpoints then associate in both directions (ten pending
-  associations, all completing). All of it on one thread, with the reactor and
-  the event dispatcher driven entirely by the pumping condition variable.
-* **M7 — user endpoints matching, and samples: NOT YET.** The application's
-  DataWriter and DataReader do not match, so no `Message` is delivered. Both
-  sides log
-
-  ```
-  Sedp::write_publication_data_unsecure: not currently associated, dropping msg.
-  ```
-
-  at start-up — expected, since the endpoints are created before SEDP has
-  associated — and the durable re-send that `Sedp::association_complete_i`
-  makes once the SEDP publications writer pairs with the remote reader does not
-  appear to reach the peer. Discovery, the transport handshake and the built-in
-  association all work, so the remaining question is narrow: whether the
-  *reliable* RTPS writer path (DATA plus HEARTBEAT/ACKNACK, driven by transport
-  timers) is delivering. That is the next thing to instrument.
-* **M8 — the wk nodes: not started.** A publisher and a subscriber built as wk
-  plugins, and an `example/dds.wk` wiring them to one `Network`. Everything
-  they need now exists; on the fabric each node has its own address, so the
-  `SpdpSendAddrs` list is one peer rather than two ports on loopback.
+* **Multicast.** The fabric has none, so RTPS discovery runs unicast: each node
+  announces straight to its peer with `SpdpSendAddrs`. That is the supported
+  configuration for any network without multicast, but it means each node must
+  be told one peer, and a third node would have to be told about the others.
+  Carrying real IP multicast in the `Network` hub is the obvious next
+  capability and would let stock RTPS discovery work with no peer list at all.
+* **A node that computes.** The pump runs when something waits on a condition
+  variable. `wk_dds::pump()` is provided for a node's own idle loop, but a node
+  that goes away and computes for a second stalls its participant for a second.
+  Making `sleep`/`nanosleep` pump would remove the footgun for good.
+* **Security, shmem, InfoRepo.** Not built; none is needed for DDS over the
+  fabric. `--security` in particular would pull in OpenSSL and Xerces.
 
 ### What the smoke test caught that a successful compile did not
 
